@@ -72,7 +72,7 @@ These principles are derived from 13 specific problems identified in the scrappe
 | **Show-o2** | Unified (understand + generate) | ODE Flow Matching (50 steps) | Interleaved -- each flow step is a FULL LLM forward pass | No -- LLM + diffusion head must be co-located |
 | **Janus Pro** | Unified (understand + generate) | Autoregressive VQ (576 tokens) | N/A -- pure AR | Yes -- just standard AR decode |
 | **Qwen2.5-Omni** | Omni (text+image+audio in, text+speech out) | AR text + AR speech codec + Flow DiT | Thinker streams last-layer hidden states + input embeddings (element-wise sum, 3584-dim/token) and text token IDs to Talker before `<EOS>`. Talker recomputes TMRoPE internally from token IDs. | Yes -- Thinker and Talker are separate models on separate GPUs |
-| **Qwen3-Omni** | Omni (text+image+audio+video in, text+speech out) | AR text + AR speech codec (16-layer RVQ, MTP for residual codebooks) + ConvNet Code2Wav | Thinker streams layer-0 embeddings (text, via `text_projection`) and layer-24 hidden states (multimodal, via `hidden_projection`, `accept_hidden_layer=24`) to Talker. Text and multimodal decoupled. | Yes -- Thinker (30B-A3B MoE) and Talker (3B-A0.3B MoE) are separate |
+| **Qwen3-Omni** | Omni (text+image+audio+video in, text+speech out) | AR text + AR speech codec (16-layer RVQ, MTP for residual codebooks) + ConvNet Code2Wav | Thinker streams **both** layer-0 embeddings and layer-24 hidden states (`accept_hidden_layer=24`) for **all** tokens, plus token IDs. The Talker selectively routes: `text_projection(layer_0_embed)` for text tokens, `hidden_projection(layer_24_hidden)` for multimodal tokens (audio/image/video). Assistant-turn and decode tokens always use `text_projection`. | Yes -- Thinker (30B-A3B MoE) and Talker (3B-A0.3B MoE) are separate |
 | **Qwen3-VL** | VLM (text+image+video in, text out) | Autoregressive text only | N/A -- but DeepStack injects ViT (SigLIP-2) features at the first three LLM layers | Standard LLM serving with vision encoder + multi-level feature injection |
 | **VoxServe SpeechLMs** | SpeechLM (text in, audio out) | AR text→codec + detokenizer | LLM + detokenizer pipeline | Yes -- LLM and detokenizer can be disaggregated |
 | **World Models** | RL world model | RSSM / Diffusion U-Net | N/A | Yes -- encoder, dynamics, actor are separable |
@@ -110,7 +110,7 @@ Inputs → Encoders (ViT, Audio) → Thinker (AR text) ──RELAY──→ Talk
                                        ↓                              ↓
                                  Text output                    Audio stream
 ```
-Thinker streams hidden states + text token IDs to Talker before finishing its own generation. RELAY flag enables this inter-worker producer-consumer pattern. What exactly gets streamed differs: Qwen2.5-Omni sends last-layer hidden states + input embeddings (element-wise sum); Qwen3-Omni sends layer-0 embeddings (text) and layer-24 hidden states (multimodal) through two separate projection MLPs. See Section 10.2 for the full comparison.
+Thinker streams hidden states + text token IDs to Talker before finishing its own generation. RELAY flag enables this inter-worker producer-consumer pattern. What exactly gets streamed differs: Qwen2.5-Omni sends last-layer hidden states + input embeddings (element-wise sum); Qwen3-Omni sends both layer-0 embeddings and layer-24 hidden states for all tokens (the Talker-side selectively routes them through `text_projection` or `hidden_projection` depending on token type). See Section 10.2 for the full comparison.
 
 **Pattern 4: Standard SpeechLM (VoxServe Models)**
 ```
@@ -1058,15 +1058,15 @@ These two models share the Thinker-Talker pattern but differ substantially in ar
 
 | | **Qwen2.5-Omni** | **Qwen3-Omni** |
 |---|---|---|
-| **Which hidden states?** | **Last-layer** output + input embeddings (element-wise sum): `final_hidden[i] + input_embed[i]`, 3584-dim per token. Multimodal positions (audio/image/video) are zeroed out in the input embeddings before summing. | **Two separate streams**: layer-0 embeddings (for text tokens, via `text_projection` MLP) and **layer 24** hidden states (for multimodal tokens, via `hidden_projection` MLP). Configured via `accept_hidden_layer=24` in the model config (note: the HuggingFace Transformers default is 18, but the actual released model overrides this to 24). |
+| **Which hidden states?** | **Last-layer** output + input embeddings (element-wise sum): `final_hidden[i] + input_embed[i]`, 3584-dim per token. Multimodal positions (audio/image/video) are zeroed out in the input embeddings before summing. | **Both** layer-0 embeddings **and** layer-24 hidden states are transferred for **all** tokens (full-sequence tensors). `accept_hidden_layer=24` in the released model config (note: the HuggingFace Transformers default is 18, but the actual model overrides to 24). The **selective routing** happens on the **Talker side**: text tokens → `text_projection(layer_0_embed)`, multimodal tokens (audio/image/video) → `hidden_projection(layer_24_hidden)`. Assistant-turn and streaming decode tokens always use `text_projection(layer_0_embed)`. |
 | **Text token IDs** | Original prompt token IDs + generated token IDs. The Talker uses these to **recompute TMRoPE position IDs internally** via its own `get_rope_index()`. TMRoPE IDs are NOT directly transferred. | Full sequence token IDs (prompt + generated). Used for ChatML segment parsing and positional encoding. |
-| **Text/multimodal decoupling** | Talker consumes Thinker's hidden states + text token embeddings **together** (coupled — same representation for all tokens). | Talker conditions on **multimodal features only** from Thinker hidden states; text is supplied as discrete tokens only (decoupled). This enables separate system prompts for Thinker and Talker, and allows RAG/safety filters to intervene on text before it reaches the Talker. |
-| **Projection** | Single `nn.Linear(3584→3584)` (`thinker_to_talker_proj`). | Two separate MLPs: `text_projection` and `hidden_projection`, each `Linear(2048→2048)→SiLU→Linear(2048→1024)`. |
-| **Talker input formula** | `talker_input = thinker_to_talker_proj(codec_embed(codec_token) + thinker_hidden)` — element-wise add then project. | For text: `text_projection(layer_0_embed)`. For multimodal: `hidden_projection(layer_24_hidden)`. Codec embeddings added separately. |
+| **Text/multimodal decoupling** | Talker consumes Thinker's hidden states + text token embeddings **together** (coupled — same representation for all tokens). | Decoupled: text tokens use shallow layer-0 embeddings (via `text_projection`), multimodal tokens use deep layer-24 hidden states (via `hidden_projection`). The Talker builds a `multimodal_mask` from token IDs to route each token. This decoupling enables separate system prompts for Thinker and Talker, and allows RAG/safety filters to intervene on text before it reaches the Talker. |
+| **Projection** | Single `nn.Linear(3584→896)` (`thinker_to_talker_proj`). The 3584 is the shared `embedding_size` (both codec embeddings and thinker hidden states live in this space); the 896 is the talker's internal transformer `hidden_size`. | Two separate MLPs: `text_projection` and `hidden_projection`, each `Linear(2048→2048)→SiLU→Linear(2048→1024)`. |
+| **Talker input formula** | `talker_input = thinker_to_talker_proj(codec_embed(codec_token) + thinker_hidden)` — element-wise add then project. | User-turn text: `text_projection(layer_0_embed)`. User-turn multimodal: `hidden_projection(layer_24_hidden)`. Assistant-turn: always `text_projection(layer_0_embed)`. Streaming decode: always `text_projection(layer_0_embed)`. Codec embeddings added separately. |
 | **Speech decoder** | AR codec → Flow-Matching DiT (10 ODE steps) + BigVGAN → waveform | AR codec (codebook 0) → MTP module (codebooks 1–15) → Code2Wav ConvNet → waveform |
-| **Data volume per token** | Dense: ~3584 × 2 bytes (fp16) ≈ **7 KB/token** | Dense: ~2048 × 2 bytes (fp16) ≈ **4 KB/token** (per stream) |
+| **Data volume per token** | Dense: ~3584 × 2 bytes (fp16) ≈ **7 KB/token** | Dense: ~2048 × 2 bytes (fp16) × 2 streams (layer-0 + layer-24) ≈ **8 KB/token** total |
 
-**Key insight**: The RELAY stream carries **dense hidden-state vectors**, not lightweight position IDs. For a 200-token response, that is ~1.4 MB of hidden states for Qwen2.5-Omni, ~0.8 MB for Qwen3-Omni. This has bandwidth implications for inter-GPU transfer.
+**Key insight**: The RELAY stream carries **dense hidden-state vectors**, not lightweight position IDs. For Qwen3-Omni, both layer-0 and layer-24 tensors are sent (so ~2 × 2048 × 2 bytes ≈ **8 KB/token** total). For a 200-token response, that is ~1.4 MB of hidden states for Qwen2.5-Omni, ~1.6 MB for Qwen3-Omni (two streams). This has bandwidth implications for inter-GPU transfer.
 
 **Qwen3-Omni RELAY consideration**: Because Qwen3-Omni extracts hidden states from an intermediate layer (layer 24 out of 48) rather than the final layer, the Thinker's text generation (which uses all 48 layers) is architecturally decoupled from the Talker's input. This means RELAY could theoretically be replaced by DONE_WITH_FWD + Conductor forwarding. However, the whiteboard notes present this as a trade-off rather than a settled decision. RELAY avoids the conductor communication hit but adds complexity. For Qwen2.5-Omni, the last-layer hidden states are tightly coupled to the Thinker's text generation, making RELAY more clearly necessary.
 
@@ -1317,7 +1317,7 @@ This supports:
 6. Dispatch thinker → Worker 0
 7. Worker 0 runs thinker decode loop:
    - Streams text tokens → API Server (STREAM_OUT)
-   - Streams hidden states from layer 24 (accept_hidden_layer) + token IDs → Worker 1 (RELAY)
+   - Streams layer-0 embeddings + layer-24 hidden states (accept_hidden_layer) + token IDs → Worker 1 (RELAY)
    - At <EOS>: sends DONE_WITH_FWD → Conductor
 8. Worker 1 (talker loop, running concurrently):
    - Buffers incoming hidden states + token IDs from RELAY
@@ -1331,7 +1331,7 @@ This supports:
 **Key features**:
 - Thinker and Talker run CONCURRENTLY on different GPUs
 - RELAY enables hidden state streaming before thinker finishes
-- Hidden states from layer 24 + text token IDs travel via RELAY (see Section 10.2 for Qwen2.5-Omni vs. Qwen3-Omni differences)
+- Layer-0 embeddings + layer-24 hidden states + text token IDs travel via RELAY (see Section 10.2 for Qwen2.5-Omni vs. Qwen3-Omni differences)
 - Talker maintains per-request buffer with WAITING/TALKING status
 
 ### 13.5 SpeechLM -- VoxServe Pattern (Orpheus, CosyVoice, etc.)
@@ -1477,7 +1477,7 @@ Not an expanded view of the same thing.
 | JanusFlow | No (interleaved) | 2 × 30 if separated | MUST co-locate |
 | Janus Pro | N/A (pure AR) | 0 | Standard AR |
 | Qwen2.5-Omni | Yes (separate Thinker/Talker models) | Dense hidden states (~3584-dim/token) + token IDs, streamed via RELAY | Separate workers OK |
-| Qwen3-Omni | Yes (separate Thinker/Talker models) | Dense hidden states from layer 24 + token IDs, streamed via RELAY | Separate workers OK |
+| Qwen3-Omni | Yes (separate Thinker/Talker models) | Both layer-0 embeddings + layer-24 hidden states (~2048-dim/token each, both sent for all tokens) + token IDs, streamed via RELAY. Talker-side routes text→`text_projection`, multimodal→`hidden_projection`. | Separate workers OK |
 
 ---
 
