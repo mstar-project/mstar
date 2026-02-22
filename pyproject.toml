@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mminf"
+version = "0.1.0"
+description = "Multimodal inference engine"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.12"
+
+dependencies = [
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mminf*"]
+exclude = ["tests*", "benchmark*", "examples*"]
