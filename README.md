@@ -209,7 +209,7 @@ Workers ──ZMQ PUSH──→ API Server (result socket) ──HTTP stream─�
 
 - Generalize message format from audio-only to arbitrary modality chunks
 - Support multiple output streams per request (e.g., text + audio simultaneously for Omni models)
-- Add input streaming support for incremental inputs (text chunks, video frames)
+- ~Add input streaming support for incremental inputs (text chunks, video frames)~ (already implemented in VoxServe)
 - Result socket receives from Workers directly (not through Conductor) for streaming data
 
 ### 4.4 What to Reuse
@@ -221,6 +221,8 @@ Workers ──ZMQ PUSH──→ API Server (result socket) ──HTTP stream─�
 | Streaming response pattern (async generator + Queue) | Generalize to multi-modality |
 | Request timeout enforcement | Copy directly |
 | Multi-process spawning of Conductor subprocess | Adapt directly |
+
+NOTE: We need to double check if zmq works for inter-node communication later.
 
 ---
 
@@ -263,6 +265,8 @@ cluster:
     llm: "H100"
     vae: "A100"
 ```
+
+Capability names are defined by the system in per-model basis. In other words, users can't use custom modules (i.e., something finer than what the system defines) in a computation graph.
 
 ### 5.3 Responsibilities
 
@@ -320,9 +324,9 @@ The scheduler contains two distinct phases that operate at different timescales:
 |------|--------|--------|
 | a | Get request from queue, extract metadata | `model_name`, modalities |
 | b | Call `request.model.get_execution_strategy()` → Strategy object + full graph | Model object |
-| c | Determine co-location requirements | Config, request state, worker registry |
-| d | Determine dispatch grouping (subgraphs) | Execution plan, SLO targets |
-| e | Assign stages to workers | Config, request state, worker registry/availability |
+| c | Determine stage plan for request | Request config (input/output modalities), server config (stage->worker mapping) |
+| d | Determine worker plan for request (e.g., random routing for DP) | server config (worker->gpu mappings) |
+| e | N/A | N/A |
 | f | Produce the needs/produces/ptr graph for stage groups. Add stages to **ready queue** (all inputs available) or **waiting queue** (missing inputs) | Execution plan, provided inputs |
 
 **Stage Management (steps g-i)** -- Runs every conductor loop iteration:
@@ -417,9 +421,10 @@ while True:
 
 The conductor does NOT recompute the execution plan every forward pass. Instead:
 
-1. On first forward pass: compute full graph, derive active graph, assign workers
-2. On subsequent forward passes: retrieve existing plan. Only recompute IF input/output modalities change (e.g., `<BOI>` triggers adding flow subgraph)
-3. Changes are expressed as additions/subtractions from the current graph
+1. On server initialization phase: determine stage->worker and worker->gpu mappings from yaml file
+2. On a new request arriving: compute the execution plan based on input/output modalities, stored in the request state. Only recompute IF input/output modalities change (e.g., `<BOI>` triggers adding flow subgraph)
+
+The worker needs to know only (1) what the computation subgraphs are to compute, (2) what's in the incoming request queue, and (3) where to send the output, which is decided by the conductor as metadata for each request. This is assuming subgraph-to-worker mapping is static (i.e., there never exists LLM-only worker and LLM+flow worker at the same time)
 
 This enables:
 - Reduced recomputation overhead
