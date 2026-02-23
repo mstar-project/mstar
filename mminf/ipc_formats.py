@@ -3,6 +3,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 
 from mminf.graph.base import SignalToDests, SignalToDestsAndFlags
+from mminf.model.base import TensorData
 
 class Status(Enum):
     WAITING = "waiting"
@@ -24,7 +25,7 @@ class MessageBody(ABC):
 # Requests to workers
 ######################################
 
-class WorkerRequestType(Enum):
+class WorkerMessageType(Enum):
     NEW_REQUEST = "new_request"
     REMOVE_REQUEST = "remove_request"
     INPUT_TENSORS = "input_tensors"
@@ -57,7 +58,7 @@ class InputTensors(MessageBody):
 
 @dataclass
 class WorkerMessage:
-    request_type: WorkerRequestType
+    request_type: WorkerMessageType
     request_body: MessageBody
 
 
@@ -65,15 +66,26 @@ class WorkerMessage:
 # Requests to conductor
 ######################################
 
-class ConductorRequestType(Enum):
+class ConductorMessageType(Enum):
+    NEW_REQUEST = "new_request"
     TENSORS = "tensors"
     SUBGRAPHS_DONE = "subgraphs_done"
+
+
+@dataclass
+class NewRequestConductor(MessageBody):
+    request_id: str
+    initial_inputs: dict[str, TensorData]
+    initial_input_modalities: list[str]
+    initial_output_modalities: list[str]
+    # TODO: transfer initial input data
 
 
 @dataclass
 class ConductorTensors(MessageBody):
     request_id: str
     tensors: SignalToDestsAndFlags
+    # TODO: transfer actual tensor data
 
 @dataclass
 class SubgraphsDone(MessageBody):
@@ -83,5 +95,5 @@ class SubgraphsDone(MessageBody):
 
 @dataclass
 class ConductorMessage:
-    request_type: ConductorRequestType
+    request_type: ConductorMessageType
     request_body: MessageBody

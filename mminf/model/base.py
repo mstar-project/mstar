@@ -8,7 +8,7 @@ from uuid import uuid4
 import torch
 import yaml
 
-from mminf.graph.base import GraphSection, GraphStage, Loop, Parallel, Sequential
+from mminf.graph.base import GraphSection, GraphStage, Loop, Parallel, Sequential, SignalToDestsAndFlags
 
 
 STREAM_OUT = "stream_out"
@@ -26,7 +26,7 @@ class Subgraph:
 
 @dataclass
 class TensorData:
-    tensor: torch.Tensor
+    tensor: torch.Tensor | None
 
     # list of segment boundaries (e.g., [(0, 10), (50, 100)] means tokens
     # 0 (inclusive) to 10 (exclusive) and 50 to 100.
@@ -142,6 +142,20 @@ def _divide_into_subgraphs(
         return loop_section_subgraphs
 
 
+@dataclass
+class CurrentForwardMetadata:
+    input_modalities: list[str]
+    output_modalities: list[str]
+    phase: str
+    is_prefill: bool
+    kwargs: dict = field(default_factory=dict)
+
+
+@dataclass
+class ForwardPassInputs:
+    tensors: dict[str, TensorData]
+    pointers: SignalToDestsAndFlags
+
 
 class Model(ABC):
     def _get_subgraphs_for_phase(
@@ -172,25 +186,44 @@ class Model(ABC):
         
         return sum([
             self._get_subgraphs_for_phase(phase, graph, stage_groups) \
-                for phase, graph in self.get_phases().items()
+                for phase, graph in self.get_phase_graphs().items()
         ], start=[])
         
 
     @abstractmethod
-    def get_phases(self) -> dict[str, GraphSection]:
+    def get_phase_graphs(self) -> dict[str, GraphSection]:
         pass
 
     @abstractmethod
-    def get_active_subgraph_ids(
+    def get_initial_forward_metadata(
         self, input_modalities: list[str],
-        output_modalities: list[str],
-        **kwargs
-    ) -> list[str]:
+        output_modalities: list[str]
+    ) -> CurrentForwardMetadata:
+        pass
+
+    @abstractmethod
+    def get_forward_pass_inputs(
+        self, input_tensors: dict[str, TensorData],
+        metadata: CurrentForwardMetadata,
+    ) -> ForwardPassInputs:
+        pass
+
+    @abstractmethod
+    def update_for_next_forward(
+        self, metadata: CurrentForwardMetadata,
+        input_tensors: dict[str, TensorData],
+        new_outputs: dict[str, TensorData]
+    ):
+        # e.g., check for BOI token, check if image was generated and should
+        # be added to the input modalities and input tensors, adds new token
+        # to the input text, etc...
+        # Mutate metadata and input_tensors
         pass
 
     @abstractmethod
     def step(
         self, stage_name: str,
+        phase: str,
         input_tensors: dict[str, TensorData],
         state, # TODO: figure out state
         **kwargs
