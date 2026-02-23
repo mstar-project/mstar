@@ -57,7 +57,7 @@ These principles are derived from 13 specific problems identified in the scrappe
 | P6 | **Conductor is the inter-worker coordinator** | The conductor orchestrates lifecycle, selects workers, coordinates handoffs. It never touches GPU tensors and never manages batching. |
 | P7 | **Workers handle internal batching** | Each worker has its own micro-scheduler for continuous batching. The conductor dispatches work; the worker decides when to execute. |
 | P8 | **Start fresh, borrow primitives** | Build a clean architecture for multimodal disaggregation from day one. Copy proven primitives from VoxServe (FlashInfer, paged KV cache, CUDA graphs, ZMQ) and vLLM (scheduler interface, cache management, executor abstraction). |
-| P9 | **Stage as the fundamental unit** | Every computation is a stage with `(inputs, state, step_function)`. Stages compose into graphs via `Sequential`, `Parallel`, and `Loop` primitives. |
+| P9 | **Stage as the fundamental unit** | Every computation is a stage with: `(inputs, outputs, pointers)`. Stages compose into graphs via `Sequential`, `Parallel`, and `Loop` primitives. Stages are run via a step function with `(inputs, state, metadata)`. |
 | P10 | **Graph-driven scheduling** | The computation graph (not hardcoded phase enums) drives all scheduling. Ready/waiting queues operate on graph stages, enabling arbitrary DAGs. |
 
 ---
@@ -602,10 +602,9 @@ full_graph = Sequential([
             outputs={
                 "text_tokens": [GraphPointer("STREAM_OUT")],
                 "hidden_states": [GraphPointer("talker", back_to_conductor=False)],
-                    # RELAY: streams directly to talker worker.
-                    # Note: whether RELAY goes direct (back_to_conductor=False) or
-                    # through conductor is still an open design decision per Note 5.
-                "done_signal": [GraphPointer("DONE_WITH_FWD", back_to_conductor=True)]
+                # Note: in a producer-consumer stream, only the consumer needs to
+                # know that this is a streaming operation. The producer can just send
+                # outputs via IPC as normal.
             }
         ),
         # Talker branch (AR speech codec generation)
@@ -616,6 +615,7 @@ full_graph = Sequential([
         Sequential([
             GraphStage(
                 name="talker",
+                consumes_stream=True,
                 input_ids=["hidden_states"],  # from thinker via RELAY
                 outputs={
                     "codec_tokens": [GraphPointer("mtp_module")]
@@ -640,7 +640,7 @@ full_graph = Sequential([
 ])
 ```
 
-### 7.6 Open Question: needs/produces/ptr in Full Graph Construction
+### 7.6 Note: needs/produces/ptr in Full Graph Construction
 
 The whiteboard raised: "Do we have needs/produces/ptr as part of the full graph in construction?" The answer from the evolved design: **Yes**. The `GraphStage.outputs` field merges the old `produces` and `ptr` concepts. Each output maps to a list of `(destination_stage, flags)` pairs. The `input_ids` field is the `needs`.
 
