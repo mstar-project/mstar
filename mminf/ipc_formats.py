@@ -38,10 +38,7 @@ class NewRequest(MessageBody):
     subgraph_to_worker: dict[str, str]
     initial_phase: str
     initial_inputs: SignalToDestsAndFlags
-    # TODO: actual tensors will be transferred via Ray. This metadata may be
-    # transferred via Ray as well, but we are using ZMQ for the sake of
-    # initial testing.
-
+    initial_tensors: dict[str, TensorData]
 
 @dataclass
 class RemoveRequest(MessageBody):
@@ -53,7 +50,7 @@ class InputTensors(MessageBody):
     request_id: str
     phase: str
     inputs: SignalToDests
-    # TODO: actual tensors to be transferred via Ray
+    tensors: dict[str, TensorData]
 
 
 @dataclass
@@ -78,14 +75,13 @@ class NewRequestConductor(MessageBody):
     initial_inputs: dict[str, TensorData]
     initial_input_modalities: list[str]
     initial_output_modalities: list[str]
-    # TODO: transfer initial input data
 
 
 @dataclass
 class ConductorTensors(MessageBody):
     request_id: str
-    tensors: SignalToDestsAndFlags
-    # TODO: transfer actual tensor data
+    pointers: SignalToDestsAndFlags
+    tensors: dict[str, TensorData]
 
 @dataclass
 class SubgraphsDone(MessageBody):

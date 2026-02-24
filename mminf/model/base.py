@@ -26,7 +26,7 @@ class Subgraph:
 
 @dataclass
 class TensorData:
-    tensor: torch.Tensor | None
+    tensor: torch.Tensor | None # this should be replaced by a Ray reference
 
     # list of segment boundaries (e.g., [(0, 10), (50, 100)] means tokens
     # 0 (inclusive) to 10 (exclusive) and 50 to 100.
@@ -55,6 +55,9 @@ def _divide_into_subgraphs(
     stage_to_group_idx: dict[str, int],
     stage_groups: list[dict]
 ) -> list[Subgraph]:
+    """
+    Given a graph, break it into subgraphs 
+    """
     if isinstance(graph, GraphStage):
         return [Subgraph(
             section=graph,
@@ -229,14 +232,14 @@ class Model(ABC):
         self, metadata: CurrentForwardMetadata,
         input_tensors: dict[str, TensorData],
         new_outputs: dict[str, TensorData]
-    ):
+    ) -> tuple[CurrentForwardMetadata, dict[str, TensorData]]:
         """
         Called by the conductor at the end of a full model fwd pass.
         """
         # e.g., check for BOI token, check if image was generated and should
         # be added to the input modalities and input tensors, adds new token
         # to the input text, etc...
-        # Mutate metadata and input_tensors
+        # Returns the metadata and input tensors for the new forward pass
         pass
 
     @abstractmethod
@@ -247,4 +250,7 @@ class Model(ABC):
         state, # TODO: figure out state
         **kwargs
     ) -> dict[str, TensorData]:
+        """
+        Called by the worker to execute a stage
+        """
         pass

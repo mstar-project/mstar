@@ -5,9 +5,12 @@ import time
 import numpy as np
 import zmq
 
-from mminf.graph.base import GraphSection, SignalToDestsAndFlags
-from mminf.ipc_formats import ConductorMessage, ConductorMessageType, ConductorTensors, InputTensors, NewRequest, NewRequestConductor, SubgraphsDone, WorkerMessage, WorkerMessageType
-from mminf.model.base import CurrentForwardMetadata, Model, TensorData
+from mminf.ipc_formats import (
+    ConductorMessage, ConductorMessageType, ConductorTensors, InputTensors,
+    NewRequest, NewRequestConductor, SubgraphsDone, WorkerMessage,
+    WorkerMessageType
+)
+from mminf.model.base import CurrentForwardMetadata, ForwardPassInputs, Model, TensorData
 
 
 @dataclass
@@ -26,6 +29,11 @@ class RequestData:
 
 
 class DummyConductor:
+    """
+    Initial in-progress conductor implementation. TODO: this is extremely
+    un-optimized, but it provides a sense of the data movement between the
+    conductor and the workers
+    """
     def __init__(
         self,
         worker_ids: list[str],
@@ -42,7 +50,7 @@ class DummyConductor:
             subgraph.subgraph_id: subgraph \
                 for subgraph in model.get_subgraphs(model_config_file)
         }
-        # TODO: how do we launch workers?
+        # TODO: properly launch workers via Ray
 
         self.context = zmq.Context()
         self.result_socket = self.context.socket(zmq.PULL)
@@ -58,28 +66,55 @@ class DummyConductor:
             self.worker_sockets[id].setsockopt(zmq.LINGER, 0)
 
     def _assign_subgraphs_to_workers(self) -> dict[str, str]:
+        """
+        For a request, assign subgraphs to workers. This is relevant in the
+        data parallel case, where there may be a subgraph that is replicated
+        across many workers.
+        """
         # Do a random policy for now. TODO: refine this
         return {
-            subgraph.subgraph_id: self.worker_ids[np.random.choice(subgraph.ranks)] \
-                for subgraph in self.subgraphs
+            subgraph_id: self.worker_ids[np.random.choice(subgraph.ranks)] \
+                for subgraph_id, subgraph in self.subgraphs.items()
         }
     
     def _split_inputs_to_workers(
         self, subgraph_to_worker: dict[str, str],
-        inputs: SignalToDestsAndFlags
-    ) -> dict[str, SignalToDestsAndFlags]:
-        inputs_per_worker: dict[str, SignalToDestsAndFlags] = {}
+        inputs: ForwardPassInputs
+    ) -> dict[str, ForwardPassInputs]:
+        """
+        Given the full ForwardPassInputs for kicking off a new forward pass,
+        return a mapping of worker_id to the ForwardPassInputs that are routed
+        to that worker. ForwardPassInputs consists of graph pointers and tensors.
+        """
+        inputs_per_worker: dict[str, ForwardPassInputs] = {}
         for subgraph_id, worker_id in subgraph_to_worker.items():
             stages = set(self.subgraphs[subgraph_id].section.get_stage_names())
-            inputs_per_worker[worker_id] = {
-                signal: [dest for dest in dests if dest.next_stage in stages] \
-                    for signal, dests in inputs.items()
-            }
+            pointers = {}
+            tensors = {}
+
+            for signal, dests in inputs.pointers.items():
+                dests = list(filter(lambda dest: dest.next_stage in stages, dests))
+                if len(dests) == 0:
+                    continue
+                pointers[signal] = dests
+                tensors[signal] = inputs.tensors[signal]
+            inputs_per_worker[worker_id] = ForwardPassInputs(
+                tensors=tensors,
+                pointers=pointers
+            )
+        
+        return inputs_per_worker
 
 
     def _ingest_request(
         self, body: NewRequestConductor
     ):
+        """
+        When a new request comes in from the API server, assign workers for each
+        subgraph (for all possible execution phases, e.g., prefill, decode, image_gen),
+        and notify the workers that the request has arrived + provide the appropriate
+        workers with the appropriate initial inputs for the forward pass 
+        """
         subgraph_to_worker = self._assign_subgraphs_to_workers()
         request_data = RequestData(
             current_forward_metadata=self.model.get_initial_forward_metadata(
@@ -101,7 +136,7 @@ class DummyConductor:
         worker_to_subgraph_ids: dict[str, list[str]] = {}
         inputs_per_worker = self._split_inputs_to_workers(
             subgraph_to_worker=subgraph_to_worker,
-            inputs=first_forward_inputs.pointers
+            inputs=first_forward_inputs
         )
         for subgraph_id, worker_id in subgraph_to_worker.items():
             if worker_id not in worker_to_subgraph_ids:
@@ -114,7 +149,8 @@ class DummyConductor:
                 subgraph_ids=subgraph_ids,
                 subgraph_to_worker=subgraph_to_worker,
                 initial_phase=request_data.current_forward_metadata.phase,
-                initial_inputs=inputs_per_worker[worker]
+                initial_inputs=inputs_per_worker[worker].pointers,
+                initial_tensors=inputs_per_worker[worker].tensors
             )
             self.worker_sockets[worker].send_pyobj(WorkerMessage(
                 message_type=WorkerMessageType.NEW_REQUEST,
@@ -124,6 +160,14 @@ class DummyConductor:
     def _process_subgraphs_done(
         self, body: SubgraphsDone
     ):
+        """
+        When some subgraphs have completed (the worker notifies the conductor that
+        the subgraphs have completed), update the metadata for this request. If this
+        is the end of a forward pass (i.e., all subgraphs for the current computation
+        phase have completed), then start a new forward pass (determine the input and
+        output modalities for the new forward pass, wrangle input tensors and send
+        them to the appropriate workers)
+        """
         request_data = self.requests[body.request_id]
         request_data.completed_subgraph_ids.update(
             body.subgraph_ids
@@ -132,6 +176,7 @@ class DummyConductor:
         done_with_forward = request_data.all_subgraph_ids.issubset(
             request_data.completed_subgraph_ids
         )
+
         if done_with_forward:
             # start a new forward pass
             # TODO: look for EOS
@@ -148,7 +193,7 @@ class DummyConductor:
 
             inputs_per_worker = self._split_inputs_to_workers(
                 subgraph_to_worker=request_data.subgraph_to_worker,
-                inputs=fwd_inputs.pointers
+                inputs=fwd_inputs
             )
 
             for worker, inputs in inputs_per_worker.items():
@@ -157,13 +202,17 @@ class DummyConductor:
                     body=InputTensors(
                         request_id=body.request_id,
                         phase=request_data.current_forward_metadata.phase,
-                        inputs=inputs
+                        inputs=inputs.pointers,
+                        tensors=inputs.tensors
                     )
                 )
                 self.worker_sockets[worker].send_pyobj(message)
 
     def _process_new_tensors(self, body: ConductorTensors):
-        pass # TODO: implement this once we figure out how tensors are transferred
+        """
+        If worker has sent tensors back to the conductor, process those.
+        """
+        self.requests[body.request_id].tensors.update(body.tensors)
 
     def run(self):
         while True:

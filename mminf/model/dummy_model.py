@@ -125,6 +125,7 @@ class DummyModel(Model):
             metadata.output_modalities = ["text"]
         else:
             metadata.output_modalities = ["image"]
+        return metadata, input_tensors
 
     def step(
         self, stage_name: str,
