@@ -2,7 +2,9 @@ from abc import ABC
 from dataclasses import asdict, dataclass
 from enum import Enum
 
-from mminf.graph.base import GraphPointer
+from attrs import field
+
+from mminf.graph.base import GraphPointer, TensorPointerInfo
 
 
 class Status(Enum):
@@ -73,14 +75,14 @@ class WorkerMessage:
 
 class ConductorMessageType(Enum):
     NEW_REQUEST = "new_request"
-    PERSIST_SIGNAL = "persist_signal"
+    PERSIST_SIGNALS = "persist_signal"
     SUBGRAPHS_DONE = "subgraphs_done"
 
 
 @dataclass
 class NewRequestConductor(MessageBody):
     request_id: str
-    initial_inputs: list[GraphPointer]
+    initial_signals: dict[str, TensorPointerInfo]
     initial_input_modalities: list[str]
     initial_output_modalities: list[str]
 
@@ -89,6 +91,13 @@ class NewRequestConductor(MessageBody):
 class SubgraphsDone(MessageBody):
     request_id: str
     subgraph_ids: list[str]
+
+
+@dataclass
+class PersistSignals(MessageBody):
+    request_id: str
+    signals: dict[str, TensorPointerInfo]
+    new_tokens: list[int] = field(default=None)
 
 
 @dataclass

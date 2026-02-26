@@ -55,7 +55,7 @@ class PerRequestStageQueues:
         
         self._update_ready_waiting()
         return ProcessedInputs(
-            for_other_subgraphs=get_signal_to_dest_mapping(external_outputs),
+            for_other_subgraphs=external_outputs,
             routed_to_this_subgraph=ingested
         )
 

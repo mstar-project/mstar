@@ -29,6 +29,7 @@ class GraphPointer:
 
     # Flags
     back_to_conductor: bool = field(default=False)
+    is_new_token: bool = field(default=False)
 
 
 # Two different ways of defining graph edges

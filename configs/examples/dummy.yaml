@@ -1,11 +1,13 @@
 stage_groups:
   - stage_names:
       - text_emb
+      - concat_text
     ranks:
       - 0
   
   - stage_names:
       - image_emb
+      - concat_img
     ranks:
       - 0
   

@@ -83,9 +83,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             metadata_server,
             protocol,
             ""
-        )
-        self.copy_event = None
-        
+        )        
         # request_id: EventAndPointers
         self.pending: dict[str, EventAndPointers] = {}
 
@@ -159,4 +157,8 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 
         Kicks of the engine transfer read on cuda. Updates self.pending.
         """
+        # This also probably needs to handle None pointer.tensor_info, in which
+        # case the tensor becomes ready immediately and is available in
+        # self.tensors. Maybe this function should also read the corresponding
+        # tensor names
         pass # TODO Atindra

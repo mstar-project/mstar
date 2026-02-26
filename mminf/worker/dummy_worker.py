@@ -261,7 +261,7 @@ class DummyWorker:
         all_subgraph_ids_to_phases: dict[str, set[str]], # for all subgraphs
         all_subgraph_ids_to_stages: dict[str, list[str]], # for all subgraphs
         hostname: str="localhost", # TODO: figure this out
-        socket_path_prefix: str="/tmp/mminf/",
+        socket_path_prefix: str="/tmp/mminf",
         tensor_comm_protocol=CommProtocol.RDMA,
     ):
         """
