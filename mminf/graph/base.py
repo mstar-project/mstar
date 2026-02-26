@@ -268,8 +268,9 @@ class Loop(GraphSection):
         # so exclude external inputs from populating nxt_iter_section. This logic
         # is required to make nested loops work.
         external_inputs = {
-            dest: [i for i in inputs if dest in self.external_inputs.get(i, [])] \
-                for dest, inputs in stage_to_inputs.items()
+            dest: [
+                ptr for ptr in inputs if ptr.name in self.external_inputs
+            ] for dest, inputs in stage_to_inputs.items()
         }
         for dest in stage_to_inputs:
             stage_to_inputs[dest] = [
@@ -282,26 +283,27 @@ class Loop(GraphSection):
         )
         update_list_dicts(stage_to_inputs, external_inputs)
         return ingested
-    
+
     def _get_external_inputs(self):
         inputs = self.section.get_inputs()
         internal_outputs = self.section.get_outputs()
+        output_names = set([ptr.name for ptr in internal_outputs])
 
         # compute "external inputs", i.e., ones that don't come from looping
         # back, and make sure those are populated for the next loop iter
-        return {
-            i: inputs[i] for i in inputs if i not in internal_outputs
-        }
+        return set([
+            inp for inp in inputs if inp not in output_names
+        ])
 
-    def _get_loop_back_signals(self) -> SignalToDests:
+    def _get_loop_back_signals(self) -> list[GraphPointer]:
         # these inputs and outputs only include external and loop-back signals;
         # they do not include signals that are purely internal to the section
         inputs = self.section.get_inputs()
         outputs = self.section.get_outputs()
 
-        return {
-            i: inputs[i] for i in inputs if i in outputs
-        }
+        return [
+            ptr for ptr in outputs if ptr.name in inputs
+        ]
 
     def _replace_outputs_for_final_iter(
         self, section: GraphSection,
@@ -311,16 +313,14 @@ class Loop(GraphSection):
         from the graph, and (2) add in self.outputs where appropriate
         """
         loop_back_signals = self.loop_back_signals
-        def replace_outputs(stage_outputs: SignalToGraphPointers):
-            for output in stage_outputs:
-                # remove loop backs
-                stage_outputs[output] = [
-                    pointer for pointer in stage_outputs[output] \
-                        if pointer.next_stage not in loop_back_signals.get(output, [])
-                ]
-                if output in self.outputs:
-                    # add in final output
-                    stage_outputs[output].extend(self.outputs[output])
+        loop_back_name_dests = set([
+            (ptr.name, ptr.next_stage) for ptr in loop_back_signals
+        ])
+        def replace_outputs(stage_outputs: list[GraphPointer]):
+            return [
+                ptr for ptr in stage_outputs \
+                    if (ptr.name, ptr.next_stage) not in loop_back_name_dests
+            ]
         if isinstance(section, GraphStage) or isinstance(section, Loop):
             replace_outputs(section.outputs)
         elif isinstance(section, Sequential) or isinstance(section, Parallel):

@@ -3,14 +3,14 @@
 from dataclasses import dataclass, field
 
 from mminf.graph.base import (
-    GraphSection, GraphStage, SignalToGraphPointers,
-    get_signal_to_dest_mapping, get_stage_to_inputs_mapping, remove_flags
+    DestToGraphPointers, GraphPointer, GraphSection, GraphStage,
+    get_stage_to_inputs_mapping
 )
 
 @dataclass
 class ProcessedInputs:
     routed_to_this_subgraph: set[str]
-    for_other_subgraphs: SignalToGraphPointers
+    for_other_subgraphs: list[GraphPointer]
 
 
 @dataclass
@@ -37,7 +37,7 @@ class PerRequestStageQueues:
     
     def process_new_inputs(
         self,
-        new_inputs: SignalToGraphPointers
+        new_inputs: list[GraphPointer]
     ) -> ProcessedInputs:
         """
         Processes all outputs that feed into the waiting graph section, and
@@ -47,9 +47,11 @@ class PerRequestStageQueues:
         if self.waiting is None:
             return new_inputs
 
-        new_inputs = get_stage_to_inputs_mapping(new_inputs)
+        new_inputs: DestToGraphPointers = get_stage_to_inputs_mapping(new_inputs)
         ingested = self.waiting.ingest_inputs(new_inputs)
-        external_outputs = new_inputs
+        external_outputs = sum(
+            new_inputs.values(), start=[]
+        )
         
         self._update_ready_waiting()
         return ProcessedInputs(
