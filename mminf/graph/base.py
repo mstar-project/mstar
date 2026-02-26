@@ -53,7 +53,7 @@ class GraphSection(ABC):
         pass
 
     @abstractmethod
-    def get_inputs(self) -> set[str]:
+    def get_inputs(self) -> list[GraphPointer]:
         """
         All external or "loop-back" inputs into a subgraph
         """
@@ -106,9 +106,11 @@ class GraphStage(GraphSection):
     def get_stage_names(self) -> list[str]:
         return [self.name]
 
-    def get_inputs(self) -> set[str]:
-        return self.input_ids
-    
+    def get_inputs(self) -> list[GraphPointer]:
+        return [
+            GraphPointer(next_stage=self.name, name=id) for id in self.input_ids
+        ]
+            
     def get_outputs(self) -> list[GraphPointer]:
         return self.outputs
     
@@ -149,15 +151,15 @@ class Sequential(GraphSection):
     def _get_inputs_outputs(self):
         # In the case that this section is part of a loop, "loop-back"
         # variables are included in the list of inputs and outputs
-        inputs: set[str] = []
-        outputs: list[GraphPointer]
+        inputs: list[GraphPointer] = []
+        outputs: list[GraphPointer] = []
         output_names = set()
         for s in self.sections:
             stage_names = s.get_stage_names()
             inputs_of_s = s.get_inputs()
 
             # filter out internal signals from the new inputs
-            inputs.update([id for id in inputs_of_s if id not in output_names])
+            inputs += ([inp for inp in inputs_of_s if inp.name not in output_names])
             # filter internal output signals from the output list
             outputs = [ptr for ptr in outputs if not (
                 ptr.name not in inputs_of_s and ptr.next_stage in stage_names
@@ -169,7 +171,7 @@ class Sequential(GraphSection):
             output_names.update([ptr.name for ptr in outputs_of_s])
         return inputs, outputs
     
-    def get_inputs(self) -> set[str]:
+    def get_inputs(self) -> list[GraphPointer]:
         return self._get_inputs_outputs()[0]
     
     def get_outputs(self) -> list[GraphPointer]:
@@ -204,10 +206,9 @@ class Parallel(GraphSection):
         ], start=[])
     
     def get_inputs(self):
-        inputs = set()
-        for s in self.sections:
-            inputs.update(s.get_inputs())
-        return inputs
+        return sum(
+            [s.get_inputs() for s in self.sections], start=[]
+        )
     
     def get_outputs(self):
         return sum(
@@ -241,7 +242,7 @@ class Loop(GraphSection):
     n_iters: int
     outputs: list[GraphPointer]
     curr_iter: int = field(default=0)
-    external_inputs: set[str] = field(default=None)
+    external_inputs: list[GraphPointer] = field(default=None)
     loop_back_signals: list[GraphPointer] = field(default=None)
     curr_iter_section: GraphSection = field(default=None)
     nxt_iter_section: GraphSection = field(default=None)
@@ -268,9 +269,12 @@ class Loop(GraphSection):
         # we should only be populating the nxt_iter_section with loop-back inputs,
         # so exclude external inputs from populating nxt_iter_section. This logic
         # is required to make nested loops work.
+        ext_inp_name_dest = [
+            (ptr.name, ptr.next_stage) for ptr in self.external_inputs
+        ]
         external_inputs = {
             dest: [
-                ptr for ptr in inputs if ptr.name in self.external_inputs
+                ptr for ptr in inputs if (ptr.name, dest) in ext_inp_name_dest
             ] for dest, inputs in stage_to_inputs.items()
         }
         for dest in stage_to_inputs:
@@ -288,22 +292,25 @@ class Loop(GraphSection):
     def _get_external_inputs(self):
         inputs = self.section.get_inputs()
         internal_outputs = self.section.get_outputs()
-        output_names = set([ptr.name for ptr in internal_outputs])
+        output_names_dests = set([(ptr.name, ptr.next_stage) for ptr in internal_outputs])
 
         # compute "external inputs", i.e., ones that don't come from looping
         # back, and make sure those are populated for the next loop iter
-        return set([
-            inp for inp in inputs if inp not in output_names
-        ])
+        return [
+            inp for inp in inputs if (inp.name, inp.next_stage) not in output_names_dests
+        ]
 
     def _get_loop_back_signals(self) -> list[GraphPointer]:
         # these inputs and outputs only include external and loop-back signals;
         # they do not include signals that are purely internal to the section
         inputs = self.section.get_inputs()
+        input_names_dests = [
+            (ptr.name, ptr.next_stage) for ptr in inputs
+        ]
         outputs = self.section.get_outputs()
 
         return [
-            ptr for ptr in outputs if ptr.name in inputs
+            ptr for ptr in outputs if (ptr.name, ptr.next_stage) in input_names_dests
         ]
 
     def _replace_outputs_for_final_iter(
@@ -317,13 +324,22 @@ class Loop(GraphSection):
         loop_back_name_dests = set([
             (ptr.name, ptr.next_stage) for ptr in loop_back_signals
         ])
+        full_outputs = self.outputs
+
         def replace_outputs(stage_outputs: list[GraphPointer]):
-            return [
+            stage_output_names = set([
+                ptr.name for ptr in stage_outputs
+            ])
+            outputs_to_add = [
+                ptr for ptr in full_outputs if ptr.name in stage_output_names
+            ]
+
+            return outputs_to_add + [
                 ptr for ptr in stage_outputs \
                     if (ptr.name, ptr.next_stage) not in loop_back_name_dests
             ]
         if isinstance(section, GraphStage) or isinstance(section, Loop):
-            replace_outputs(section.outputs)
+            section.outputs = replace_outputs(section.outputs)
         elif isinstance(section, Sequential) or isinstance(section, Parallel):
             for sec in section.sections:
                 self._replace_outputs_for_final_iter(sec)
