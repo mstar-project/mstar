@@ -50,14 +50,15 @@ class SubgraphQueues:
         return self.per_request_queues[request_id].process_new_inputs(inputs)
     
     def is_done(self, request_id) -> bool:
-        return self.per_request_queues[request_id].waiting is None
+        q = self.per_request_queues[request_id]
+        return q.waiting is None and len(q.ready) == 0
     
     def add_request(self, request_id: str):
         """
         Initialize queues for a new request
         """
         self.per_request_queues[request_id] = PerRequestStageQueues(
-            waiting=deepcopy(self.subgraph),
+            waiting=deepcopy(self.subgraph.section),
             subgraph_id=self.subgraph_id
         )
 
@@ -99,7 +100,7 @@ class SubgraphQueues:
         At the end of a subgraph, reset the queues for that request so that it
         can be used for the next full model forward pass
         """
-        self.per_request_queues[request_id].waiting = deepcopy(self.subgraph)
+        self.per_request_queues[request_id].waiting = deepcopy(self.subgraph.section)
         self.per_request_queues[request_id].ready = []
 
 
@@ -202,11 +203,18 @@ class SubgraphsManager:
         # in different workers)
 
         # (3) get mapping of worker to external outputs
+        # Filter out back_to_conductor pointers (e.g., stream_out) — they
+        # don't route to any worker
         to_workers: dict[str, list[GraphPointer]] = {}
         for ptr in outputs:
-            worker_id = self.per_request_info[request_id].stage_to_worker[StageAndPhase(
+            if ptr.back_to_conductor:
+                continue
+            stage_phase = StageAndPhase(
                 stage=ptr.next_stage, phase=self.get_phase(request_id)
-            )]
+            )
+            if stage_phase not in self.per_request_info[request_id].stage_to_worker:
+                continue
+            worker_id = self.per_request_info[request_id].stage_to_worker[stage_phase]
             if worker_id not in to_workers:
                 to_workers[worker_id] = []
             to_workers[worker_id].append(ptr)
