@@ -345,126 +345,80 @@ For each request, the scheduler contains multiple roles that operate at differen
 | c | Initialize a `RequestData` object for this request to track the progress of the current request, as well as signals that persist between forward passes |  Worker plan from (b), initial input/output modalities |
 | d | Communicate to the relevant workers the subgraph IDs for this request, as well as the subgraph to worker mapping (so that the workers can route their outputs properly to other workers) | outputs from (b) and (c) | 
 
-<!-- TODO EDIT FROM HERE -->
-
 **Intra-forward Pass Management** -- Runs every conductor full model forward pass (i.e., when all subgraphs have been completed).
 
 | Step | Action | Details |
 |------|--------|---------|
-| f | Check for tensors from workers | The workers may push tensors to the conductor if they will be used in future forward passes |
-| g | Check for "subgraph done" signals from workers | Update what subgraphs have been completed for the current request forward pass. If all subgraphs have been completed, we have completed a forward pass. |
+| e | Check for "persistent signals" from workers | The workers may push information about tensors that will be used in future forward passes, which will be used as inputs in future forward passes |
+| f | Check for "subgraph done" signals from workers | Update what subgraphs have been completed for the current request forward pass. If all subgraphs for the current computation phase have been completed, we have completed a forward pass. |
 
 **At the end of each forward pass and beginning of the next**:
 
 | Step | Action | Details |
 |------|--------|---------|
-| h | Update request lifecycle | Update lifecycle state (saw `<BOI>`, saw `<EOS>`, etc.), wrangle inputs for next forward pass. If `<EOS>`, end request (send signals to workers and API server) |
-| i | `execution_strategy.get_forward_pass_inputs()` | Get the inputs for the current forward pass (e.g., if we are doing image generation, this will include noisy latents) |
-| j | Dispatch inputs to workers | Send the input tensors for the current forward pass to thj appropriate workers. Also include metadata of which phase we are in (e.g. prefill, decode, image_gen), because that is required for routing |
+| g | Update request lifecycle | Update lifecycle state (saw `<BOI>`, saw `<EOS>`, etc.), wrangle inputs for next forward pass. If `<EOS>`, end request (send signals to workers and API server). Also set which subgraphs are active for the next model forward pass (used to track when the fwd pass is done) |
+| h | `model.get_forward_pass_inputs(...)` | Get the inputs for the current forward pass (e.g., if we are doing image generation, this will include noisy latents). This will be in the form of `GraphPointer` objects, which include tensor name, what graph stage it is routed to, and the current tensor location (IP address, memory address, size)  |
+| i | Dispatch inputs to workers | Send the input `GraphPointer`s for the current forward pass to thj appropriate workers. Also include metadata of which phase we are in (e.g. prefill, decode, image_gen), because that is required for routing |
+
+**Note**: sending the current computation phase may be replaced by a more detailed "request state", which will additionally include information about, e.g., what input token indices are text vs. image vs. video.
+
 
 **Key data structures**:
-<!-- - `ready_queue: list[GraphStage]` -- stages whose inputs are all available
-- `waiting: GraphSection` -- remaining graph structure waiting for inputs -->
-- `{req_id → {stage_name: worker_id}}` -- current stage-to-worker assignments
-- `{req_id → talker_id}` -- for RELAY relationships (Qwen-Omni)
-- `{req_id → request_state}` -- lifecycle tracking (seen_BOI, kv_location, num_tokens, etc.)
 
-<!-- #### 6.2.3 Ready/Waiting Queue Management
-
-The `RequestQueues` class (from `computation_graph_scratch_work.py`) manages the transition of stages from waiting to ready:
-
+- `{subgraph_id: subgraph}`:
 ```python
 @dataclass
-class RequestQueues:
-    ready: list[GraphStage]
-    waiting: GraphSection  # The remaining computation graph
-
-    def process_new_inputs(self, new_inputs: SignalToDestsAndFlags) -> SignalToDests:
-        """
-        When a stage completes and produces outputs:
-        1. Ingest those outputs into the waiting graph (marking stages that receive them)
-        2. Split off any stages that are now fully ready
-        3. Move them to the ready queue
-        4. Return any external outputs (STREAM, DONE_WITH_FWD, etc.)
-        """
+class Subgraph:
+    section: GraphSection
+    phases: set[str] # e.g., prefill, decode, image_gen 
+    consumes_stream: bool # for thinker-talker
+    ranks: list[int] # one-to-one mapping of worker to rank
+    subgraph_id: str
 ```
-
-The `ingest_inputs` → `split_off_ready` pattern recursively propagates through `Sequential`, `Parallel`, and `Loop` graph structures, correctly handling nested loops with loop-back signals. -->
-
-<!-- ### 6.3 Conductor Loop Pseudocode
-
+- `{req_id: request_data}`:
 ```python
-while True:
-    # --- Request Management (one-time per new/requeued request) ---
-    for req in new_requests + requeued_requests:
-        strategy = req.model.get_execution_strategy()                      # step b
-        active_graph = strategy.get_active_graph(
-            req.input_modalities, req.output_modalities, req.flags)        # step b
-        worker_assignments = assign_workers(active_graph, worker_registry) # steps c-e
-        queues[req.id] = RequestQueues(ready=[], waiting=active_graph)
-        queues[req.id].process_new_inputs(req.provided_inputs)            # step f
-        push_assignments_to_workers(req.id, worker_assignments)
+@dataclass
+class RequestData:
+    current_forward_metadata: CurrentForwardMetadata
+    fwd_inputs: list[GraphPointer] # inputs that the conductor has sent to the current fwd pass
+    persist_signals: dict[str, TensorPointerInfo] # signals passed back to conductor
+    subgraph_to_worker: dict[str, str] # subgraph id to worker id
+    new_tokens: list[int] # for this fwd pass, used to check for BOI, EOS, etc.
 
-    # --- Stage Management (every iteration) ---
-    # step g: dispatch ready stages
-    for req_id, rq in queues.items():
-        for stage in rq.ready:
-            dispatch_to_worker(req_id, stage, worker_assignments[req_id])
-        rq.ready.clear()
+    # for tracking progress
+    all_subgraph_ids: set[str] # across all phases
+    current_subgraph_ids: set[str] # for the current fwd pass computation phase
+    completed_subgraph_ids: set[str] # for the current full model fwd pass
+```
+where `CurrentForwardMetadata` is:
+```python
+@dataclass
+class CurrentForwardMetadata:
+    input_modalities: list[str]
+    output_modalities: list[str]
+    phase: str
+    is_prefill: bool
+```
+See the **computation graph model** section for information about `GraphPointer` and `TensorPointerMetadata`.
 
-    # step h: check for completions
-    for completion in recv_completions_from_workers():
-        req_id, stage_name, outputs = completion
-        external = queues[req_id].process_new_inputs(outputs)
-
-        # Handle external outputs (flags)
-        if "STREAM_OUT" in external:
-            # Worker already streamed to API Server directly
-            pass
-        if "DONE_WITH_FWD" in external:
-            # step i: end of forward pass
-            update_lifecycle(req_id)  # e.g., saw_BOI, saw_EOS, etc.
-            if not saw_eos(req_id):
-                # Wrangle inputs for next forward pass:
-                # - pass along enc_img from this forward pass
-                # - add newly generated text tokens to input
-                # - if saw <BOI>, enable image generation subgraph
-                wrangle_inputs_for_next_fwd(req_id)
-                requeue(req_id)  # triggers steps a-f on next iteration
-            else:
-                # Send STOP signal to talker if RELAY is active
-                if req_id in relay_mappings:
-                    talker_id = relay_mappings[req_id]
-                    send_stop_to_talker(talker_id, req_id)
-                finish_request(req_id)
-        if "RELAY" in external:
-            # Push tensors to talker worker
-            push_relay_data(req_id, external["RELAY"])
-``` -->
 
 ### 6.4 Subgraph Persistence (Note 7)
 
 The conductor does NOT recompute the execution plan every forward pass. Instead:
 
 1. On server initialization phase: determine stage->worker and worker->gpu mappings from yaml file. This results in a static list of subgraphs that are being handled by each worker.
-2. On a new request arriving: compute the execution plan based on input/output modalities, stored in the request state. Only recompute IF input/output modalities change (e.g., `<BOI>` triggers adding flow subgraph). The conductor only to inform the workers about the mapping of subgraphs to workers for this request; the execution of the proper subgraphs for each forward pass can be handled via tensor routing between workers.
+2. On a new request arriving: compute the execution plan based on input/output modalities, stored in the request state. Only recompute IF input/output modalities change (e.g., `<BOI>` triggers adding flow subgraph). The conductor only sends the inputs to the proper workers for this forward pass, as well as what phase of computation we are in (it does **not** need to send new subgraph information to workers); the execution of the proper subgraphs for each forward pass can be handled via tensor routing between workers.
 
 The worker needs to know only (1) what the computation subgraphs are to compute, (2) what's in the incoming request queue, and (3) where to send the output, which is decided by the conductor as metadata for each request. This is assuming subgraph-to-worker mapping is static (i.e., there never exists LLM-only worker and LLM+flow worker at the same time)
 
 This enables:
 - Reduced recomputation overhead
 - "Talker stays alive for duration of request" paradigm
-- Preference for request0's decode always running on GPU1 (avoids KV cache transfer)
-
-**Function signature**: `model.get_active_graph(input_modalities, output_modalities, metadata)` where metadata includes prefill vs. decode, number of flow steps, etc.
-
-### 6.5 Worker Notification on Subgraph Changes (Note 10)
-
-Whenever subgraphs change, the conductor sends workers: "when you receive tensors X and Y, run subgraph Z." This pushes routing information to workers so they know where to forward outputs.
-
-The conductor maintains and distributes: `{stage_name: worker_id}` -- so each worker knows where to send its outputs.
+- Preference for, e.g., request0's decode always running on GPU1 (avoids KV cache transfer)
 
 ---
+
+<!-- TODO EDIT FROM HERE -->
 
 ## 7. Execution Strategy
 
