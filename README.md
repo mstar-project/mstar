@@ -324,26 +324,30 @@ Indexes all workers by capability and tracks their state.
 
 #### 6.2.2 Scheduling
 
-<!-- TODO EDIT FROM HERE -->
-
 At **initialization** time, the conductor assigns subgraphs to workers.
 In the data-parallel case, a subgraph may be assigned to multiple workers, and requests will be routed to one of the data-parallel ranks per subgraph.
 If there are multiple "phases" of computation (e.g., prefill, decode, image generation), components of those will have separate subgraphs where appropriate.
 Subgraphs for all phases will be assigned to workers at the beginning of a request, though only the subgraphs for one phase will be run by workers during each forward pass.
 
+Specifically, upon instatiation, the conductor calls `model.get_subgraphs(model_config_file)` and creates a mapping of subgraph id to subgraph.
+A **subgraph** is a contiguous section of a model computation graph that will be assigned to a worker. `model.get_subgraphs` populates the subgraphs with a list of what workers can execute that subgraph (i.e., have the right sub-models loaded) and what computation phase the subgraph is active for.
+
+Then, it communicates to each worker what subgraphs they will be processing, as well as what graph stages are in other subgraphs (required for output routing).
+
 For each request, the scheduler contains multiple roles that operate at different timescales:
 
-**Request Management (steps a-e)** -- Runs once per new request:
+**Request Management** -- Runs once per new request:
 
 | Step | Action | Inputs |
 |------|--------|--------|
 | a | Get request from queue, extract metadata | `model_name`, initial input/output modalities |
-| b | Call `request.model.get_execution_strategy()` → Strategy object + full graph | Model object |
-| c | Determine stage plan for request | Request config (input/output modalities), server config (stage->worker mapping) |
-| d | Determine worker plan for request (e.g., random routing for DP) to get a subgraph to worker mapping for this request | server config (worker->gpu mappings) |
-| e | Communicate to the relevant workers the subgraph IDs for this request, as well as the subgraph to worker mapping (so that the workers can route their outputs properly to other workers) | outputs from c and d | 
+| b | Determine worker plan for request (e.g., random routing for DP, though we should use a more sophisticated system in the future) to get a subgraph to worker mapping for this request | server config (worker->gpu mappings) |
+| c | Initialize a `RequestData` object for this request to track the progress of the current request, as well as signals that persist between forward passes |  Worker plan from (b), initial input/output modalities |
+| d | Communicate to the relevant workers the subgraph IDs for this request, as well as the subgraph to worker mapping (so that the workers can route their outputs properly to other workers) | outputs from (b) and (c) | 
 
-**Forward Pass Management (steps f-j)** -- Runs every conductor full model forward pass (i.e., when all subgraphs have been completed).
+<!-- TODO EDIT FROM HERE -->
+
+**Intra-forward Pass Management** -- Runs every conductor full model forward pass (i.e., when all subgraphs have been completed).
 
 | Step | Action | Details |
 |------|--------|---------|
