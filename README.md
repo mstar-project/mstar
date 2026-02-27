@@ -161,7 +161,7 @@ VoxServe's existing pattern. Detokenizer runs at intervals (every 10-50 tokens) 
 
                      ┌─────────────────────────────────────┐
                      │        Execution Strategy           │
-                     │  (per model, lives on model obj)    │
+                     │  (per model, part of model obj)     │
                      │                                     │
                      │  • Full Graph (all possible stages) │
                      │  • f(inp_modalities, out_modalities │
@@ -177,9 +177,9 @@ VoxServe's existing pattern. Detokenizer runs at intervals (every 10-50 tokens) 
 |-----------|---------------|---------------------|
 | **API Server** | HTTP endpoints, streaming responses, ZMQ communication with Conductor | Touch GPU tensors, manage batching |
 | **Cluster Manager** | Deployment-time GPU allocation, autoscaling policy, config loading | Runtime request routing (deployment-time only) |
-| **Conductor** | Request lifecycle, worker selection, stage dispatching, ready/waiting queues, inter-worker coordination | GPU computation, batching, tensor operations |
-| **Execution Strategy** | Define computation graph per model, map modalities to active graph, provide `run_stage()` | Scheduling, worker selection, communication |
-| **Workers** | GPU computation, internal batching, continuous batching, KV cache management, streaming output, inter-worker communication | Request lifecycle, cross-worker scheduling |
+| **Conductor** | Request lifecycle, worker selection, subgraph dispatching (i.e., dispatches contiguous graph sections to each worker), routing of inputs to the graph (e.g., input text, image, embeddings from the prev forward pass), determining computation path (prefill vs. decode vs. image gen, e.g.) | GPU computation, batching, tensor operations |
+| **Execution Strategy** | Defines a list of computation graphs for every "execution phase" of the model, where an execution phase is, e.g., prefill, autoregressive decode, image generation (for models that have different inference paths for image generation), map modalities to active phase, provide `run_stage()` or `step()` function. This is currently _not_ a separate class but lives on the `Model` class. | Scheduling, worker selection, communication. |
+| **Workers** | GPU computation, internal batching, continuous batching, KV cache management, streaming output, inter-worker communication. Handles input/output queues for its own subgraphs, and sends outputs to other workers when computation finishes. | Request lifecycle (e.g., checking for BOI or EOS tokens), cross-worker scheduling / batching. |
 
 ---
 
@@ -222,7 +222,7 @@ Workers ──ZMQ PUSH──→ API Server (result socket) ──HTTP stream─�
 | Request timeout enforcement | Copy directly |
 | Multi-process spawning of Conductor subprocess | Adapt directly |
 
-NOTE: We need to double check if zmq works for inter-node communication later.
+NOTE: We might want to rethink ZMQ for inter-node communication. ZMQ does have support for TCP, but TCP is probably not the most performant communication solution.
 
 ---
 
@@ -288,7 +288,15 @@ This was explicitly corrected from an earlier design that incorrectly placed the
 
 ## 6. Conductor
 
-The Conductor is the central runtime coordinator. It is the most complex component and the primary focus of custom development.
+The Conductor is the central runtime coordinator.
+As we have opted for a more decentralized, IPC-heavy scheduling procedure, the coordinator:
+
+1. Assigns workers to subgraphs (contiguous computation graph sections) upon receiving a new request, and sends the workers information about what subgraph(s) they are handing for a request, and what workers are handling other subgraphs (for output routing),
+2. During a forward pass, receives information from workers about subgraph completion, and also information about tensors that will persist across forward passes (e.g., a newly-generated token will need to be added to the inputs of the next forward pass, and image embeddings may also persist for the next forward pass),
+3. At the end of each full model forward pass, updates the current input/output modalities and computation "phase" (e.g., checks for BOI or EOS tokens),
+4. At the beginning of each full model forward pass, sends inputs and state information (e.g., which computation phase we are in) to the appropriate graph stages on the appropriate workers.
+
+The intra-forward-pass communication, scheduling, and batching is being handled on the worker level for now, and workers send their outputs directly to other workers (and to the API server when appropriate).
 
 ### 6.1 Inputs
 
@@ -314,11 +322,14 @@ Indexes all workers by capability and tracks their state.
 - Per-request SLOs: Target latencies
 - Per-request flags: pending / processing / completed
 
-#### 6.2.2 Scheduler
+#### 6.2.2 Scheduling
+
+<!-- TODO EDIT FROM HERE -->
 
 At **initialization** time, the conductor assigns subgraphs to workers.
 In the data-parallel case, a subgraph may be assigned to multiple workers, and requests will be routed to one of the data-parallel ranks per subgraph.
 If there are multiple "phases" of computation (e.g., prefill, decode, image generation), components of those will have separate subgraphs where appropriate.
+Subgraphs for all phases will be assigned to workers at the beginning of a request, though only the subgraphs for one phase will be run by workers during each forward pass.
 
 For each request, the scheduler contains multiple roles that operate at different timescales:
 
@@ -326,7 +337,7 @@ For each request, the scheduler contains multiple roles that operate at differen
 
 | Step | Action | Inputs |
 |------|--------|--------|
-| a | Get request from queue, extract metadata | `model_name`, modalities |
+| a | Get request from queue, extract metadata | `model_name`, initial input/output modalities |
 | b | Call `request.model.get_execution_strategy()` → Strategy object + full graph | Model object |
 | c | Determine stage plan for request | Request config (input/output modalities), server config (stage->worker mapping) |
 | d | Determine worker plan for request (e.g., random routing for DP) to get a subgraph to worker mapping for this request | server config (worker->gpu mappings) |
