@@ -1,31 +1,34 @@
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import time
 
 import numpy as np
-import zmq
 
+from mminf.communication.communicator import ZMQCommunicator
+from mminf.graph.base import GraphPointer, TensorPointerInfo
 from mminf.ipc_formats import (
-    ConductorMessage, ConductorMessageType, ConductorTensors, InputTensors,
-    NewRequest, NewRequestConductor, SubgraphsDone, WorkerMessage,
+    ConductorMessageType, InputSignals,
+    NewRequest, NewRequestConductor, PersistSignals, SubgraphsDone, WorkerMessage,
     WorkerMessageType
 )
-from mminf.model.base import CurrentForwardMetadata, ForwardPassInputs, Model, TensorData
+from mminf.model.base import CurrentForwardMetadata, Model
 
 
 @dataclass
 class RequestData:
     current_forward_metadata: CurrentForwardMetadata
-    tensors: dict[str, TensorData]
-    new_outputs: dict[str, TensorData] # tensors passed back to conductor
+    fwd_inputs: list[GraphPointer]
+    persist_signals: dict[str, TensorPointerInfo] # signals passed back to conductor
     subgraph_to_worker: dict[str, str]
+    new_tokens: list[int]
 
     # for tracking progress
     all_subgraph_ids: set[str]
+    current_subgraph_ids: set[str]
     completed_subgraph_ids: set[str] = field(default_factory=set)
 
     # TODO: will need to add to this as we build things out
-
 
 
 class DummyConductor:
@@ -39,8 +42,7 @@ class DummyConductor:
         worker_ids: list[str],
         model: Model,
         model_config_file: str,
-        worker_socket_path_prefix: str="/tmp/mminf/workers/",
-        conductor_socket_path: str="/tmp/mminf/conductor.ipc"
+        socket_path_prefix: str="/tmp/mminf"
     ):
         self.requests: dict[str, RequestData] = {}
         self.worker_ids = worker_ids
@@ -50,20 +52,13 @@ class DummyConductor:
             subgraph.subgraph_id: subgraph \
                 for subgraph in model.get_subgraphs(model_config_file)
         }
-        # TODO: properly launch workers via Ray
+        # TODO: properly launch workers
 
-        self.context = zmq.Context()
-        self.result_socket = self.context.socket(zmq.PULL)
-        self.result_socket.connect(f"ipc://{conductor_socket_path}")
-        self.result_socket.setsockopt(zmq.LINGER, 0)
-
-        self.worker_sockets: dict[str, zmq.SyncSocket] = {}
-        for id in worker_ids:
-            self.worker_sockets[id] = self.context.socket(zmq.PUSH)
-            self.worker_sockets[id].connect(
-                f"ipc://{worker_socket_path_prefix}/{id}.ipc"
-            )
-            self.worker_sockets[id].setsockopt(zmq.LINGER, 0)
+        self.communicator = ZMQCommunicator(
+            my_id="conductor",
+            push_ids=worker_ids + ["api_server"],
+            ipc_socket_path_prefix=socket_path_prefix
+        )
 
     def _assign_subgraphs_to_workers(self) -> dict[str, str]:
         """
@@ -79,30 +74,20 @@ class DummyConductor:
     
     def _split_inputs_to_workers(
         self, subgraph_to_worker: dict[str, str],
-        inputs: ForwardPassInputs
-    ) -> dict[str, ForwardPassInputs]:
+        inputs: list[GraphPointer]
+    ) -> dict[str, list[GraphPointer]]:
         """
         Given the full ForwardPassInputs for kicking off a new forward pass,
         return a mapping of worker_id to the ForwardPassInputs that are routed
         to that worker. ForwardPassInputs consists of graph pointers and tensors.
         """
-        inputs_per_worker: dict[str, ForwardPassInputs] = {}
+        inputs_per_worker: dict[str, list[GraphPointer]] = {}
         for subgraph_id, worker_id in subgraph_to_worker.items():
             stages = set(self.subgraphs[subgraph_id].section.get_stage_names())
-            pointers = {}
-            tensors = {}
 
-            for signal, dests in inputs.pointers.items():
-                dests = list(filter(lambda dest: dest.next_stage in stages, dests))
-                if len(dests) == 0:
-                    continue
-                pointers[signal] = dests
-                tensors[signal] = inputs.tensors[signal]
-            inputs_per_worker[worker_id] = ForwardPassInputs(
-                tensors=tensors,
-                pointers=pointers
-            )
-        
+            inputs_per_worker[worker_id] = [
+                ptr for ptr in inputs if ptr.next_stage in stages
+            ]
         return inputs_per_worker
 
 
@@ -121,15 +106,22 @@ class DummyConductor:
                 body.initial_input_modalities,
                 body.initial_output_modalities
             ),
-            tensors=body.initial_inputs,
+            fwd_inputs=[],
+            persist_signals=body.initial_signals,
             subgraph_to_worker=subgraph_to_worker,
-            all_subgraph_ids=set(subgraph_to_worker.keys())
+            all_subgraph_ids=set(subgraph_to_worker.keys()),
+            current_subgraph_ids=set(),
+            new_tokens=[],
         )
         self.requests[body.request_id] = request_data
 
         first_forward_inputs = self.model.get_forward_pass_inputs(
-            request_data.tensors,
-            request_data.current_forward_metadata
+            request_data.current_forward_metadata,
+            persist_signals=body.initial_signals
+        )
+        self._set_current_subgraph_ids(
+            body.request_id,
+            request_data.current_forward_metadata.phase
         )
 
         # send data to appropriate workers
@@ -149,14 +141,23 @@ class DummyConductor:
                 subgraph_ids=subgraph_ids,
                 subgraph_to_worker=subgraph_to_worker,
                 initial_phase=request_data.current_forward_metadata.phase,
-                initial_inputs=inputs_per_worker[worker].pointers,
-                initial_tensors=inputs_per_worker[worker].tensors
+                initial_inputs=inputs_per_worker[worker],
             )
-            self.worker_sockets[worker].send_pyobj(WorkerMessage(
-                message_type=WorkerMessageType.NEW_REQUEST,
-                body=message
-            ))
+            self.communicator.send(
+                worker, WorkerMessage(
+                    message_type=WorkerMessageType.NEW_REQUEST,
+                    body=message
+                )
+            )
     
+    def _set_current_subgraph_ids(
+        self, request_id: str, phase: str
+    ):
+        self.requests[request_id].current_subgraph_ids = set([
+            sg for sg in self.requests[request_id].all_subgraph_ids \
+                if phase in self.subgraphs[sg].phases
+        ])
+
     def _process_subgraphs_done(
         self, body: SubgraphsDone
     ):
@@ -173,22 +174,28 @@ class DummyConductor:
             body.subgraph_ids
         )
         
-        done_with_forward = request_data.all_subgraph_ids.issubset(
+        done_with_forward = request_data.current_subgraph_ids.issubset(
             request_data.completed_subgraph_ids
         )
 
         if done_with_forward:
             # start a new forward pass
             # TODO: look for EOS
-            self.model.update_for_next_forward(
-                metadata=request_data.current_forward_metadata,
-                input_tensors=request_data.tensors,
-                new_outputs=request_data.new_outputs
+            prev_forward_meta = deepcopy(request_data.current_forward_metadata)
+            request_data.current_forward_metadata = \
+                self.model.update_for_next_forward(
+                    metadata=request_data.current_forward_metadata,
+                    new_tokens=request_data.new_tokens,
+                )
+            self._set_current_subgraph_ids(
+                body.request_id,
+                request_data.current_forward_metadata.phase
             )
 
             fwd_inputs = self.model.get_forward_pass_inputs(
-                input_tensors=request_data.tensors,
-                metadata=request_data.current_forward_metadata
+                metadata=request_data.current_forward_metadata,
+                persist_signals=request_data.persist_signals,
+                prev_forward_metadata=prev_forward_meta
             )
 
             inputs_per_worker = self._split_inputs_to_workers(
@@ -198,32 +205,39 @@ class DummyConductor:
 
             for worker, inputs in inputs_per_worker.items():
                 message = WorkerMessage(
-                    message_type=WorkerMessageType.INPUT_TENSORS,
-                    body=InputTensors(
+                    message_type=WorkerMessageType.INPUT_SIGNALS,
+                    body=InputSignals(
                         request_id=body.request_id,
                         phase=request_data.current_forward_metadata.phase,
-                        inputs=inputs.pointers,
-                        tensors=inputs.tensors
+                        inputs=inputs,
                     )
                 )
-                self.worker_sockets[worker].send_pyobj(message)
+                self.communicator.send(worker, message)
+            
+            request_data.fwd_inputs = fwd_inputs
+            request_data.new_tokens = []
+            request_data.completed_subgraph_ids = set()
 
-    def _process_new_tensors(self, body: ConductorTensors):
+    def _process_new_tensors(self, body: PersistSignals):
         """
         If worker has sent tensors back to the conductor, process those.
         """
-        self.requests[body.request_id].tensors.update(body.tensors)
+        self.requests[body.request_id].persist_signals.update(
+            body.signals
+        )
+        self.requests[body.request_id].new_tokens.extend(body.new_tokens)
+        
 
     def run(self):
         while True:
-            message: ConductorMessage = self.result_socket.recv_pyobj()
-            if message.message_type == ConductorMessageType.NEW_REQUEST:
-                self._ingest_request(message.body)
-            elif message.message_type == ConductorMessageType.SUBGRAPHS_DONE:
-                self._process_subgraphs_done(message.body)
-            elif message.message_type == ConductorMessageType.TENSORS:
-                self._process_new_tensors(message.body)
-            else:
-                raise ValueError(f"Unknown message type: {message.message_type}")
+            for message in self.communicator.get_all_new_messages():
+                if message.message_type == ConductorMessageType.NEW_REQUEST:
+                    self._ingest_request(message.body)
+                elif message.message_type == ConductorMessageType.SUBGRAPHS_DONE:
+                    self._process_subgraphs_done(message.body)
+                elif message.message_type == ConductorMessageType.PERSIST_SIGNALS:
+                    self._process_new_tensors(message.body)
+                else:
+                    raise ValueError(f"Unknown message type: {message.message_type}")
             time.sleep(0.1) # just for dummy conductor!
             

@@ -8,7 +8,7 @@ from uuid import uuid4
 import torch
 import yaml
 
-from mminf.graph.base import GraphSection, GraphStage, Loop, Parallel, Sequential, SignalToDestsAndFlags
+from mminf.graph.base import GraphPointer, GraphSection, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
 
 
 STREAM_OUT = "stream_out"
@@ -22,15 +22,6 @@ class Subgraph:
     ranks: list[int] = field(default_factory=list)
     _group_id: int = field(default=-1) # used in going from config yaml to subgraphs
     subgraph_id: str = field(default_factory=lambda: str(uuid4()))
-
-
-@dataclass
-class TensorData:
-    tensor: torch.Tensor | None # this should be replaced by a Ray reference
-
-    # list of segment boundaries (e.g., [(0, 10), (50, 100)] means tokens
-    # 0 (inclusive) to 10 (exclusive) and 50 to 100.
-    token_ranges: list[tuple[int, int]]
 
 
 def _combine_sections_sequential_or_parallel(
@@ -158,16 +149,6 @@ class CurrentForwardMetadata:
     kwargs: dict = field(default_factory=dict)
 
 
-@dataclass
-class ForwardPassInputs:
-    """
-    Inputs for the current full-model forward pass, with where each input
-    is routed to.
-    """
-    tensors: dict[str, TensorData]
-    pointers: SignalToDestsAndFlags
-
-
 class Model(ABC):
     def _get_subgraphs_for_phase(
         self, phase_name: str, graph: GraphSection,
@@ -215,9 +196,10 @@ class Model(ABC):
 
     @abstractmethod
     def get_forward_pass_inputs(
-        self, input_tensors: dict[str, TensorData],
-        metadata: CurrentForwardMetadata,
-    ) -> ForwardPassInputs:
+        self, metadata: CurrentForwardMetadata,
+        persist_signals: dict[str, TensorPointerInfo],
+        prev_forward_metadata: CurrentForwardMetadata=None,
+    ) -> list[GraphPointer]:
         """
         Called by the conductor.
 
@@ -230,26 +212,25 @@ class Model(ABC):
     @abstractmethod
     def update_for_next_forward(
         self, metadata: CurrentForwardMetadata,
-        input_tensors: dict[str, TensorData],
-        new_outputs: dict[str, TensorData]
-    ) -> tuple[CurrentForwardMetadata, dict[str, TensorData]]:
+        new_tokens: list[int],
+    ) -> CurrentForwardMetadata:
         """
         Called by the conductor at the end of a full model fwd pass.
         """
         # e.g., check for BOI token, check if image was generated and should
         # be added to the input modalities and input tensors, adds new token
         # to the input text, etc...
-        # Returns the metadata and input tensors for the new forward pass
+        # Returns the metadata for the new forward pass
         pass
 
     @abstractmethod
     def step(
         self, stage_name: str,
         phase: str,
-        input_tensors: dict[str, TensorData],
+        input_tensors: dict[str, torch.Tensor],
         state, # TODO: figure out state
         **kwargs
-    ) -> dict[str, TensorData]:
+    ) -> dict[str, torch.Tensor]:
         """
         Called by the worker to execute a stage
         """
