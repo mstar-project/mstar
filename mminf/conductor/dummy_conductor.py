@@ -9,7 +9,7 @@ from mminf.communication.communicator import ZMQCommunicator
 from mminf.graph.base import GraphPointer, TensorPointerInfo
 from mminf.ipc_formats import (
     ConductorMessageType, InputSignals,
-    NewRequest, NewRequestConductor, SubgraphsDone, WorkerMessage,
+    NewRequest, NewRequestConductor, RemoveRequest, SubgraphsDone, WorkerMessage,
     WorkerMessageType
 )
 from mminf.model.base import CurrentForwardMetadata, Model
@@ -42,11 +42,13 @@ class DummyConductor:
         worker_ids: list[str],
         model: Model,
         model_config_file: str,
+        eos_token_id: int,
         socket_path_prefix: str="/tmp/mminf"
     ):
         self.requests: dict[str, RequestData] = {}
         self.worker_ids = worker_ids
         self.model = model
+        self.eos_token_id = eos_token_id
 
         self.subgraphs = {
             subgraph.subgraph_id: subgraph \
@@ -158,16 +160,83 @@ class DummyConductor:
                 if phase in self.subgraphs[sg].phases
         ])
 
+    def _process_request_done(
+        self, request_id: str
+    ):
+        """
+        Called when we see an EOS token
+        """
+        for worker_id in self.requests[request_id].subgraph_to_worker.values():
+            msg = WorkerMessage(
+                message_type=WorkerMessageType.REMOVE_REQUEST,
+                body=RemoveRequest(request_id)
+            )
+            self.communicator.send(worker_id, msg)
+        # TODO: send done signal back to the API server
+        del self.requests[request_id]
+
+    def _process_done_forward(
+        self, request_id: str
+    ) -> bool:
+        """
+        If we didn't see EOS, start a new forward pass (determine the input and
+        output modalities for the new forward pass, wrangle input tensors and send
+        them to the appropriate workers)
+
+        Returns a boolean for whether we saw a EOS token
+        """
+        request_data = self.requests[request_id]
+
+        if self.eos_token_id in self.requests[request_id].new_tokens:
+            return True
+
+        prev_forward_meta = deepcopy(request_data.current_forward_metadata)
+        request_data.current_forward_metadata = \
+            self.model.update_for_next_forward(
+                metadata=request_data.current_forward_metadata,
+                new_tokens=request_data.new_tokens,
+            )
+        self._set_current_subgraph_ids(
+            request_id,
+            request_data.current_forward_metadata.phase
+        )
+
+        fwd_inputs = self.model.get_forward_pass_inputs(
+            metadata=request_data.current_forward_metadata,
+            persist_signals=request_data.persist_signals,
+            prev_forward_metadata=prev_forward_meta
+        )
+
+        inputs_per_worker = self._split_inputs_to_workers(
+            subgraph_to_worker=request_data.subgraph_to_worker,
+            inputs=fwd_inputs
+        )
+
+        for worker, inputs in inputs_per_worker.items():
+            message = WorkerMessage(
+                message_type=WorkerMessageType.INPUT_SIGNALS,
+                body=InputSignals(
+                    request_id=request_id,
+                    phase=request_data.current_forward_metadata.phase,
+                    inputs=inputs,
+                )
+            )
+            self.communicator.send(worker, message)
+        
+        request_data.fwd_inputs = fwd_inputs
+        request_data.new_tokens = []
+        request_data.completed_subgraph_ids = set()
+        return False
+        
     def _process_subgraphs_done(
         self, body: SubgraphsDone
     ):
         """
         When some subgraphs have completed (the worker notifies the conductor that
-        the subgraphs have completed), update the metadata for this request. If this
-        is the end of a forward pass (i.e., all subgraphs for the current computation
-        phase have completed), then start a new forward pass (determine the input and
-        output modalities for the new forward pass, wrangle input tensors and send
-        them to the appropriate workers)
+        the subgraphs have completed), update the metadata for this request.
+
+        Return whether the full model forward pass has been completed (i.e., all
+        subgraphs for the current computation phase have been completed)
         """
         request_data = self.requests[body.request_id]
 
@@ -184,55 +253,31 @@ class DummyConductor:
         done_with_forward = request_data.current_subgraph_ids.issubset(
             request_data.completed_subgraph_ids
         )
-
-        if done_with_forward:
-            # start a new forward pass
-            # TODO: look for EOS
-            prev_forward_meta = deepcopy(request_data.current_forward_metadata)
-            request_data.current_forward_metadata = \
-                self.model.update_for_next_forward(
-                    metadata=request_data.current_forward_metadata,
-                    new_tokens=request_data.new_tokens,
-                )
-            self._set_current_subgraph_ids(
-                body.request_id,
-                request_data.current_forward_metadata.phase
-            )
-
-            fwd_inputs = self.model.get_forward_pass_inputs(
-                metadata=request_data.current_forward_metadata,
-                persist_signals=request_data.persist_signals,
-                prev_forward_metadata=prev_forward_meta
-            )
-
-            inputs_per_worker = self._split_inputs_to_workers(
-                subgraph_to_worker=request_data.subgraph_to_worker,
-                inputs=fwd_inputs
-            )
-
-            for worker, inputs in inputs_per_worker.items():
-                message = WorkerMessage(
-                    message_type=WorkerMessageType.INPUT_SIGNALS,
-                    body=InputSignals(
-                        request_id=body.request_id,
-                        phase=request_data.current_forward_metadata.phase,
-                        inputs=inputs,
-                    )
-                )
-                self.communicator.send(worker, message)
-            
-            request_data.fwd_inputs = fwd_inputs
-            request_data.new_tokens = []
-            request_data.completed_subgraph_ids = set()
+        return done_with_forward
 
     def run(self):
         while True:
+            done_forward_passes = []
             for message in self.communicator.get_all_new_messages():
                 if message.message_type == ConductorMessageType.NEW_REQUEST:
                     self._ingest_request(message.body)
                 elif message.message_type == ConductorMessageType.SUBGRAPHS_DONE:
-                    self._process_subgraphs_done(message.body)
+                    done_with_fwd = self._process_subgraphs_done(
+                        message.body
+                    )
+                    if done_with_fwd:
+                        done_forward_passes.append(message.body.request_id)
                 else:
                     raise ValueError(f"Unknown message type: {message.message_type}")
+            
+            eos_requests = []
+            for request_id in done_forward_passes:
+                saw_eos = self._process_done_forward(request_id)
+                if saw_eos:
+                    eos_requests.append(self.eos_token_id)
+            
+            for request_id in eos_requests:
+                self._process_request_done(request_id)
+            
             time.sleep(0.1) # just for dummy conductor!
             

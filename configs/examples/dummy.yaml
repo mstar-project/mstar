@@ -1,3 +1,7 @@
+# This is a direct definition of subgraphs and their assignment to workers.
+# This is NOT the final design; it's just a placeholder until we have a more
+# detailed discussion about configs and subgraphs and colocation/disaggregation.
+
 stage_groups:
   - stage_names:
       - text_emb

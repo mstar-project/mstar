@@ -161,7 +161,7 @@ VoxServe's existing pattern. Detokenizer runs at intervals (every 10-50 tokens) 
 
                      ┌─────────────────────────────────────┐
                      │        Execution Strategy           │
-                     │  (per model, lives on model obj)    │
+                     │  (per model, part of model obj)     │
                      │                                     │
                      │  • Full Graph (all possible stages) │
                      │  • f(inp_modalities, out_modalities │
@@ -177,9 +177,9 @@ VoxServe's existing pattern. Detokenizer runs at intervals (every 10-50 tokens) 
 |-----------|---------------|---------------------|
 | **API Server** | HTTP endpoints, streaming responses, ZMQ communication with Conductor | Touch GPU tensors, manage batching |
 | **Cluster Manager** | Deployment-time GPU allocation, autoscaling policy, config loading | Runtime request routing (deployment-time only) |
-| **Conductor** | Request lifecycle, worker selection, stage dispatching, ready/waiting queues, inter-worker coordination | GPU computation, batching, tensor operations |
-| **Execution Strategy** | Define computation graph per model, map modalities to active graph, provide `run_stage()` | Scheduling, worker selection, communication |
-| **Workers** | GPU computation, internal batching, continuous batching, KV cache management, streaming output, inter-worker communication | Request lifecycle, cross-worker scheduling |
+| **Conductor** | Request lifecycle, worker selection, subgraph dispatching (i.e., dispatches contiguous graph sections to each worker), routing of inputs to the graph (e.g., input text, image, embeddings from the prev forward pass), determining computation path (prefill vs. decode vs. image gen, e.g.) | GPU computation, batching, tensor operations |
+| **Execution Strategy** | Defines a list of computation graphs for every "execution phase" of the model, where an execution phase is, e.g., prefill, autoregressive decode, image generation (for models that have different inference paths for image generation), map modalities to active phase, provide `run_stage()` or `step()` function. This is currently _not_ a separate class but lives on the `Model` class. | Scheduling, worker selection, communication. |
+| **Workers** | GPU computation, internal batching, continuous batching, KV cache management, streaming output, inter-worker communication. Handles input/output queues for its own subgraphs, and sends outputs to other workers when computation finishes. | Request lifecycle (e.g., checking for BOI or EOS tokens), cross-worker scheduling / batching. |
 
 ---
 
@@ -222,7 +222,7 @@ Workers ──ZMQ PUSH──→ API Server (result socket) ──HTTP stream─�
 | Request timeout enforcement | Copy directly |
 | Multi-process spawning of Conductor subprocess | Adapt directly |
 
-NOTE: We need to double check if zmq works for inter-node communication later.
+NOTE: We might want to rethink ZMQ for inter-node communication. ZMQ does have support for TCP, but TCP is probably not the most performant communication solution.
 
 ---
 
@@ -288,7 +288,15 @@ This was explicitly corrected from an earlier design that incorrectly placed the
 
 ## 6. Conductor
 
-The Conductor is the central runtime coordinator. It is the most complex component and the primary focus of custom development.
+The Conductor is the central runtime coordinator.
+As we have opted for a more decentralized, IPC-heavy scheduling procedure, the coordinator:
+
+1. Assigns workers to subgraphs (contiguous computation graph sections) upon receiving a new request, and sends the workers information about what subgraph(s) they are handing for a request, and what workers are handling other subgraphs (for output routing),
+2. During a forward pass, receives information from workers about subgraph completion, and also information about tensors that will persist across forward passes (e.g., a newly-generated token will need to be added to the inputs of the next forward pass, and image embeddings may also persist for the next forward pass),
+3. At the end of each full model forward pass, updates the current input/output modalities and computation "phase" (e.g., checks for BOI or EOS tokens),
+4. At the beginning of each full model forward pass, sends inputs and state information (e.g., which computation phase we are in) to the appropriate graph stages on the appropriate workers.
+
+The intra-forward-pass communication, scheduling, and batching is being handled on the worker level for now, and workers send their outputs directly to other workers (and to the API server when appropriate).
 
 ### 6.1 Inputs
 
@@ -314,149 +322,137 @@ Indexes all workers by capability and tracks their state.
 - Per-request SLOs: Target latencies
 - Per-request flags: pending / processing / completed
 
-#### 6.2.2 Scheduler
+#### 6.2.2 Scheduling
 
 At **initialization** time, the conductor assigns subgraphs to workers.
 In the data-parallel case, a subgraph may be assigned to multiple workers, and requests will be routed to one of the data-parallel ranks per subgraph.
 If there are multiple "phases" of computation (e.g., prefill, decode, image generation), components of those will have separate subgraphs where appropriate.
+Subgraphs for all phases will be assigned to workers at the beginning of a request, though only the subgraphs for one phase will be run by workers during each forward pass.
+
+Specifically, upon instatiation, the conductor calls `model.get_subgraphs(model_config_file)` and creates a mapping of subgraph id to subgraph.
+A **subgraph** is a contiguous section of a model computation graph that will be assigned to a worker. `model.get_subgraphs` populates the subgraphs with a list of what workers can execute that subgraph (i.e., have the right sub-models loaded) and what computation phase the subgraph is active for.
+
+Then, it communicates to each worker what subgraphs they will be processing, as well as what graph stages are in other subgraphs (required for output routing).
 
 For each request, the scheduler contains multiple roles that operate at different timescales:
 
-**Request Management (steps a-e)** -- Runs once per new request:
+**Request Management** -- Runs once per new request:
 
 | Step | Action | Inputs |
 |------|--------|--------|
-| a | Get request from queue, extract metadata | `model_name`, modalities |
-| b | Call `request.model.get_execution_strategy()` → Strategy object + full graph | Model object |
-| c | Determine stage plan for request | Request config (input/output modalities), server config (stage->worker mapping) |
-| d | Determine worker plan for request (e.g., random routing for DP) to get a subgraph to worker mapping for this request | server config (worker->gpu mappings) |
-| e | Communicate to the relevant workers the subgraph IDs for this request, as well as the subgraph to worker mapping (so that the workers can route their outputs properly to other workers) | outputs from c and d | 
+| a | Get request from queue, extract metadata | `model_name`, initial input/output modalities |
+| b | Determine worker plan for request (e.g., random routing for DP, though we should use a more sophisticated system in the future) to get a subgraph to worker mapping for this request | server config (worker->gpu mappings) |
+| c | Initialize a `RequestData` object for this request to track the progress of the current request, as well as signals that persist between forward passes |  Worker plan from (b), initial input/output modalities |
+| d | Communicate to the relevant workers the subgraph IDs for this request, as well as the subgraph to worker mapping (so that the workers can route their outputs properly to other workers) | outputs from (b) and (c) | 
 
-**Forward Pass Management (steps f-j)** -- Runs every conductor full model forward pass (i.e., when all subgraphs have been completed).
+**Intra-forward Pass Management** -- Runs every conductor full model forward pass (i.e., when all subgraphs have been completed).
 
 | Step | Action | Details |
 |------|--------|---------|
-| f | Check for tensors from workers | The workers may push tensors to the conductor if they will be used in future forward passes |
-| g | Check for "subgraph done" signals from workers | Update what subgraphs have been completed for the current request forward pass. If all subgraphs have been completed, we have completed a forward pass. |
+| e | Check for "persistent signals" from workers | The workers may push information about tensors that will be used in future forward passes, which will be used as inputs in future forward passes |
+| f | Check for "subgraph done" signals from workers | Update what subgraphs have been completed for the current request forward pass. If all subgraphs for the current computation phase have been completed, we have completed a forward pass. |
 
 **At the end of each forward pass and beginning of the next**:
 
 | Step | Action | Details |
 |------|--------|---------|
-| h | Update request lifecycle | Update lifecycle state (saw `<BOI>`, saw `<EOS>`, etc.), wrangle inputs for next forward pass. If `<EOS>`, end request (send signals to workers and API server) |
-| i | `execution_strategy.get_forward_pass_inputs()` | Get the inputs for the current forward pass (e.g., if we are doing image generation, this will include noisy latents) |
-| j | Dispatch inputs to workers | Send the input tensors for the current forward pass to thj appropriate workers. Also include metadata of which phase we are in (e.g. prefill, decode, image_gen), because that is required for routing |
+| g | Update request lifecycle | Update lifecycle state (saw `<BOI>`, saw `<EOS>`, etc.), wrangle inputs for next forward pass. If `<EOS>`, end request (send signals to workers and API server). Also set which subgraphs are active for the next model forward pass (used to track when the fwd pass is done) |
+| h | `model.get_forward_pass_inputs(...)` | Get the inputs for the current forward pass (e.g., if we are doing image generation, this will include noisy latents). This will be in the form of `GraphPointer` objects, which include tensor name, what graph stage it is routed to, and the current tensor location (IP address, memory address, size)  |
+| i | Dispatch inputs to workers | Send the input `GraphPointer`s for the current forward pass to thj appropriate workers. Also include metadata of which phase we are in (e.g. prefill, decode, image_gen), because that is required for routing |
+
+**Note**: sending the current computation phase may be replaced by a more detailed "request state", which will additionally include information about, e.g., what input token indices are text vs. image vs. video.
+
 
 **Key data structures**:
-<!-- - `ready_queue: list[GraphStage]` -- stages whose inputs are all available
-- `waiting: GraphSection` -- remaining graph structure waiting for inputs -->
-- `{req_id → {stage_name: worker_id}}` -- current stage-to-worker assignments
-- `{req_id → talker_id}` -- for RELAY relationships (Qwen-Omni)
-- `{req_id → request_state}` -- lifecycle tracking (seen_BOI, kv_location, num_tokens, etc.)
 
-<!-- #### 6.2.3 Ready/Waiting Queue Management
-
-The `RequestQueues` class (from `computation_graph_scratch_work.py`) manages the transition of stages from waiting to ready:
-
+- `{subgraph_id: subgraph}`:
 ```python
 @dataclass
-class RequestQueues:
-    ready: list[GraphStage]
-    waiting: GraphSection  # The remaining computation graph
-
-    def process_new_inputs(self, new_inputs: SignalToDestsAndFlags) -> SignalToDests:
-        """
-        When a stage completes and produces outputs:
-        1. Ingest those outputs into the waiting graph (marking stages that receive them)
-        2. Split off any stages that are now fully ready
-        3. Move them to the ready queue
-        4. Return any external outputs (STREAM, DONE_WITH_FWD, etc.)
-        """
+class Subgraph:
+    section: GraphSection
+    phases: set[str] # e.g., prefill, decode, image_gen 
+    consumes_stream: bool # for thinker-talker
+    ranks: list[int] # one-to-one mapping of worker to rank
+    subgraph_id: str
 ```
-
-The `ingest_inputs` → `split_off_ready` pattern recursively propagates through `Sequential`, `Parallel`, and `Loop` graph structures, correctly handling nested loops with loop-back signals. -->
-
-<!-- ### 6.3 Conductor Loop Pseudocode
-
+- `{req_id: request_data}`:
 ```python
-while True:
-    # --- Request Management (one-time per new/requeued request) ---
-    for req in new_requests + requeued_requests:
-        strategy = req.model.get_execution_strategy()                      # step b
-        active_graph = strategy.get_active_graph(
-            req.input_modalities, req.output_modalities, req.flags)        # step b
-        worker_assignments = assign_workers(active_graph, worker_registry) # steps c-e
-        queues[req.id] = RequestQueues(ready=[], waiting=active_graph)
-        queues[req.id].process_new_inputs(req.provided_inputs)            # step f
-        push_assignments_to_workers(req.id, worker_assignments)
+@dataclass
+class RequestData:
+    current_forward_metadata: CurrentForwardMetadata
+    fwd_inputs: list[GraphPointer] # inputs that the conductor has sent to the current fwd pass
+    persist_signals: dict[str, TensorPointerInfo] # signals passed back to conductor
+    subgraph_to_worker: dict[str, str] # subgraph id to worker id
+    new_tokens: list[int] # for this fwd pass, used to check for BOI, EOS, etc.
 
-    # --- Stage Management (every iteration) ---
-    # step g: dispatch ready stages
-    for req_id, rq in queues.items():
-        for stage in rq.ready:
-            dispatch_to_worker(req_id, stage, worker_assignments[req_id])
-        rq.ready.clear()
+    # for tracking progress
+    all_subgraph_ids: set[str] # across all phases
+    current_subgraph_ids: set[str] # for the current fwd pass computation phase
+    completed_subgraph_ids: set[str] # for the current full model fwd pass
+```
+where `CurrentForwardMetadata` is:
+```python
+@dataclass
+class CurrentForwardMetadata:
+    input_modalities: list[str]
+    output_modalities: list[str]
+    phase: str
+    is_prefill: bool
+```
+See the **computation graph model** section for information about `GraphPointer` and `TensorPointerMetadata`.
 
-    # step h: check for completions
-    for completion in recv_completions_from_workers():
-        req_id, stage_name, outputs = completion
-        external = queues[req_id].process_new_inputs(outputs)
-
-        # Handle external outputs (flags)
-        if "STREAM_OUT" in external:
-            # Worker already streamed to API Server directly
-            pass
-        if "DONE_WITH_FWD" in external:
-            # step i: end of forward pass
-            update_lifecycle(req_id)  # e.g., saw_BOI, saw_EOS, etc.
-            if not saw_eos(req_id):
-                # Wrangle inputs for next forward pass:
-                # - pass along enc_img from this forward pass
-                # - add newly generated text tokens to input
-                # - if saw <BOI>, enable image generation subgraph
-                wrangle_inputs_for_next_fwd(req_id)
-                requeue(req_id)  # triggers steps a-f on next iteration
-            else:
-                # Send STOP signal to talker if RELAY is active
-                if req_id in relay_mappings:
-                    talker_id = relay_mappings[req_id]
-                    send_stop_to_talker(talker_id, req_id)
-                finish_request(req_id)
-        if "RELAY" in external:
-            # Push tensors to talker worker
-            push_relay_data(req_id, external["RELAY"])
-``` -->
 
 ### 6.4 Subgraph Persistence (Note 7)
 
 The conductor does NOT recompute the execution plan every forward pass. Instead:
 
 1. On server initialization phase: determine stage->worker and worker->gpu mappings from yaml file. This results in a static list of subgraphs that are being handled by each worker.
-2. On a new request arriving: compute the execution plan based on input/output modalities, stored in the request state. Only recompute IF input/output modalities change (e.g., `<BOI>` triggers adding flow subgraph). The conductor only to inform the workers about the mapping of subgraphs to workers for this request; the execution of the proper subgraphs for each forward pass can be handled via tensor routing between workers.
+2. On a new request arriving: compute the execution plan based on input/output modalities, stored in the request state. Only recompute IF input/output modalities change (e.g., `<BOI>` triggers adding flow subgraph). The conductor only sends the inputs to the proper workers for this forward pass, as well as what phase of computation we are in (it does **not** need to send new subgraph information to workers); the execution of the proper subgraphs for each forward pass can be handled via tensor routing between workers.
 
 The worker needs to know only (1) what the computation subgraphs are to compute, (2) what's in the incoming request queue, and (3) where to send the output, which is decided by the conductor as metadata for each request. This is assuming subgraph-to-worker mapping is static (i.e., there never exists LLM-only worker and LLM+flow worker at the same time)
 
 This enables:
 - Reduced recomputation overhead
 - "Talker stays alive for duration of request" paradigm
-- Preference for request0's decode always running on GPU1 (avoids KV cache transfer)
-
-**Function signature**: `model.get_active_graph(input_modalities, output_modalities, metadata)` where metadata includes prefill vs. decode, number of flow steps, etc.
-
-### 6.5 Worker Notification on Subgraph Changes (Note 10)
-
-Whenever subgraphs change, the conductor sends workers: "when you receive tensors X and Y, run subgraph Z." This pushes routing information to workers so they know where to forward outputs.
-
-The conductor maintains and distributes: `{stage_name: worker_id}` -- so each worker knows where to send its outputs.
+- Preference for, e.g., request0's decode always running on GPU1 (avoids KV cache transfer)
 
 ---
 
+
 ## 7. Execution Strategy
 
-### 7.1 Design
+When defining a model, the user must define a computation graph for each phase of computation, as well as: logic for determining the computation phase at each full model forward pass, the "full model" inputs at each new forward pass, and code for actually executing each graph stage.
 
-The Execution Strategy is a self-contained recipe object returned by `request.model.get_execution_strategy()`. It is defined per model class and lives on the model object.
+**Note**: This is currently in the `Model` class, but it might make more sense to pull this logic out into an `ExecutionStrategy` class, which can be retrieved via `model.get_execution_strategy`.
 
+### 7.1 Computation Graph and Subgraphs
+For each phase of computation, the user must define a **computation** graph, which specifies the discrete computation stages, their execution order, and how their outputs are routed.
+
+To make graph definition more intuitive than, e.g., a generic DAG, stages can be organized in `Sequential`, `Parallel`, and `Loop` configurations.
+
+The user must define `self.get_phase_graphs()`, which returns a mapping of computation phase name (e.g., `prefill`, `decode`, `image_gen`) to computation graph.
+
+Once the graphs are defined, the `Model` class automatically parses it, along with the cluster config, to produce a list of **Subgraphs**, or groups of stages that will be assigned to a worker together.
+This is produced by `model.get_subgraphs(config_path)`, which calls `self.get_phase_graphs()` and performs the logic to break the graphs from each phase into subgraphs.
+See the **computation graph model** section for information.
+
+### 7.2 Input Wrangling and Stage Running
+
+In addition to the computation graph, the user must define the following functions for forward pass execution:
+
+<!-- get_initial_forward_metadata, get_forward_pass_inputs, update_for_next_forward, step in model/base.py-->
+
+<!-- @Irmak TODO EDIT FROM HERE -->
+
+`get_initial_forward_metadata()` returns `CurrentForwardMetadata` object given input-output modalities (such as `image`, `text`, `audio`) with `prefill` phase and `is_prefill` flag set to `True`.
+
+`get_forward_pass_inputs()` returns a list of `GraphPointer`s with `next_stage` and `name` fields. It checks for persisting signals (outputs of the previous fwd pass) to be merged with new inputs. Called by the conductor. These are the external inputs that go from the conductor to the workers at the beginning of the current forward pass; all other signals are handled internally via IPC.
+
+`update_for_next_forward()` is called by the conductor after the full fwd pass. The metadata is updated (primarily checking for input-output modality changes to update the `phase`).
+
+**Note: these functions are subject to change, they are our best guess for what needs to be defined.**
+
+<!-- 
 ### 7.2 Three Outputs
 
 1. **Full Graph**: The complete computation graph using GraphSection primitives (GraphStage, Sequential, Parallel, Loop). Represents ALL possible stages for this model regardless of input/output modalities.
@@ -465,73 +461,155 @@ The Execution Strategy is a self-contained recipe object returned by `request.mo
    - Text-only input, text output → Only: text_tok → LLM prefill → LLM decode → STREAM
    - Text input, image output → Full pipeline including flow head and VAE
 
-3. **`run_stage(stage_id, inputs, state, flags) → {output_name: tensor}`**: Called by workers. Takes named input tensors, returns named output tensors. Flags include metadata like flow step number, prefill vs. decode, etc. Every time the active graph changes, a new `stage_id` is issued.
+3. **`run_stage(stage_id, inputs, state, flags) → {output_name: tensor}`**: Called by workers. Takes named input tensors, returns named output tensors. Flags include metadata like flow step number, prefill vs. decode, etc. Every time the active graph changes, a new `stage_id` is issued. -->
 
 ### 7.3 Full Graph Example (BAGEL)
 
+**AR Text Generation Phase**:
 ```python
-# Phase 1: Text generation (AR decode with STREAM_OUT + DONE_WITH_FWD)
-# Phase 2: Image generation (flow loop with frozen KV)
-# The active graph function selects which phase is active.
-
 full_graph = Sequential([
     Parallel([
         GraphStage(
             name="vit_encoder",
             input_ids=["image"],
-            outputs={"img_emb": [GraphPointer("LLM")]}
+            outputs=[
+                GraphPointer(next_stage="LLM", name="img_emb")
+            ]
         ),
         GraphStage(
             name="text_emb",
             input_ids=["text"],
-            outputs={"text_emb": [GraphPointer("LLM")]}
+            outputs=[
+                GraphPointer(next_stage="LLM", name="text_emb")
+            ]
         ),
     ]),
     GraphStage(
         name="LLM_text_gen",  # AR text generation phase
         input_ids=["text_emb", "img_emb"],
-        outputs={
-            "text_tokens": [GraphPointer("STREAM_OUT")],
-            "done_signal": [GraphPointer("DONE_WITH_FWD", back_to_conductor=True)]
-        }
-    ),
+        outputs=[
+            GraphPointer(next_stage="STREAM_OUT", name="text_tokens"),
+        ]
+    )
+])
+```
+
+**Image generation phase**: triggered when conductor detects `<BOI>`. Each flow step runs the full LLM backbone with frozen KV cache.
+```python
+full_graph = Sequential([
+    Parallel([
+        GraphStage(
+            name="vit_encoder",
+            input_ids=["image"],
+            outputs=[
+                GraphPointer(next_stage="LLM", name="img_emb")
+            ]
+        ),
+        GraphStage(
+            name="text_emb",
+            input_ids=["text"],
+            outputs=[
+                GraphPointer(next_stage="LLM", name="text_emb")
+            ]
+        ),
+    ]),
     # Image generation phase -- triggered when conductor detects <BOI>
     # Each flow step runs the full LLM backbone with frozen KV cache
     Loop(
         section=GraphStage(
             name="LLM_flow_step",  # Full LLM forward pass per step (frozen KV)
             input_ids=["text_emb", "img_emb", "latents"],
-            outputs={"latents": [GraphPointer("LLM_flow_step")]}  # loop-back
+            outputs=[
+                GraphPointer(
+                    next_stage="LLM_flow_step",
+                    name="latents"
+                )  # loop-back
+            ]
         ),
         n_iters=24,
-        outputs={
-            "latents": [GraphPointer("vae_decoder")]
-        }
+        outputs=[
+            GraphPointer(
+                next_stage="vae_decoder",
+                name="latents"
+            )
+        ]
     ),
     GraphStage(
         name="vae_decoder",
         input_ids=["latents"],
-        outputs={"image": [GraphPointer("STREAM_OUT")]}
+        outputs=[
+            GraphPointer(
+                next_stage="STREAM_OUT",
+                name="image",
+                back_to_conductor=True
+            )
+        ]
     )
 ])
 ```
 
+
 Note: BAGEL uses the same LLM backbone for both text generation and flow steps. During flow steps, the LLM reads frozen KV cache (`update_past_key_values=False`) and processes noised latents projected via `vae2llm`. Velocity is extracted via `llm2vae` (a linear layer), not a separate diffusion head. CFG requires 3x forward passes per step (conditional + text-CFG + image-CFG), handled at the worker level by tripling the batch size. The `text_emb` and `img_emb` inputs to the flow loop are external inputs that persist across iterations (handled by `Loop.external_inputs`).
 
 ### 7.4 Image Generation Graph (Show-o2 -- Interleaved)
-
+**AR Text Generation Phase**:
 ```python
-full_graph = Sequential([
+Sequential([
     Parallel([
         GraphStage(
             name="vit_encoder",
             input_ids=["image"],
-            outputs={"img_emb": [GraphPointer("LLM")]}
+            outputs=[
+                GraphPointer(
+                    next_stage="LLM",
+                    name="img_emb"
+                )
+            ]
         ),
         GraphStage(
             name="text_emb",
             input_ids=["text"],
-            outputs={"text_emb": [GraphPointer("LLM")]}
+            outputs=[
+                GraphPointer(
+                    next_stage="LLM",
+                    name="text_emb"
+                )
+            ]
+        ),
+    ]),
+    GraphStage(
+        name="LLM_text_gen",  # AR text generation phase
+        input_ids=["text_emb", "img_emb"],
+        outputs=[
+            GraphPointer(next_stage="STREAM_OUT", name="text_tokens"),
+        ]
+    )
+])
+```
+
+**Image generation (flow matching)**:
+```python
+Sequential([
+    Parallel([
+        GraphStage(
+            name="vit_encoder",
+            input_ids=["image"],
+            outputs=[
+                GraphPointer(
+                    next_stage="LLM",
+                    name="img_emb"
+                )
+            ]
+        ),
+        GraphStage(
+            name="text_emb",
+            input_ids=["text"],
+            outputs=[
+                GraphPointer(
+                    next_stage="LLM",
+                    name="text_emb"
+                )
+            ]
         ),
     ]),
     Loop(
@@ -539,34 +617,51 @@ full_graph = Sequential([
             GraphStage(
                 name="LLM",  # Full LLM forward pass at each flow step
                 input_ids=["text_emb", "img_emb", "latents"],
-                outputs={
-                    "hidden_states": [GraphPointer("diffusion_head")],
-                }
+                outputs=[
+                    GraphPointer(
+                        next_stage="diffusion_head",
+                        name="hidden_states"
+                    )
+                ]
             ),
             GraphStage(
                 name="diffusion_head",
                 input_ids=["hidden_states"],
-                outputs={
-                    "velocity": [GraphPointer("euler_step")]
-                }
+                outputs=[
+                    GraphPointer(
+                        next_stage="euler_step",
+                        name="velocity"
+                    )
+                ]
             ),
             GraphStage(
                 name="euler_step",
                 input_ids=["velocity", "latents"],
-                outputs={
-                    "latents": [GraphPointer("LLM")]  # loop-back
-                }
+                outputs=[
+                    GraphPointer(
+                        next_stage="LLM",
+                        name="latents"
+                    )  # loop-back
+                ]
             ),
         ]),
         n_iters=50,
-        outputs={
-            "latents": [GraphPointer("vae_decoder")]
-        }
+        outputs=[
+            GraphPointer(
+                next_stage="vae_decoder",
+                name="latents"
+            )
+        ]
     ),
     GraphStage(
         name="vae_decoder",
         input_ids=["latents"],
-        outputs={"image": [GraphPointer("STREAM_OUT")]}
+        outputs=[
+            GraphPointer(
+                next_stage="STREAM_OUT",
+                name="image"
+            )
+        ]
     )
 ])
 ```
@@ -581,17 +676,32 @@ full_graph = Sequential([
         GraphStage(
             name="text_emb",
             input_ids=["text"],
-            outputs={"text_emb": [GraphPointer("thinker")]}
+            outputs=[
+                GraphPointer(
+                    next_stage="thinker",
+                    name="text_emb"
+                )
+            ]
         ),
         GraphStage(
             name="vit_encoder",
             input_ids=["image"],
-            outputs={"img_emb": [GraphPointer("thinker")]}
+            outputs=[
+                GraphPointer(
+                    next_stage="thinker",
+                    name="img_emb"
+                )
+            ]
         ),
         GraphStage(
             name="audio_encoder",
             input_ids=["audio"],
-            outputs={"audio_emb": [GraphPointer("thinker")]}
+            outputs=[
+                GraphPointer(
+                    next_stage="thinker",
+                    name="audio_emb"
+                )
+            ]
         ),
     ]),
     Parallel([
@@ -599,13 +709,20 @@ full_graph = Sequential([
         GraphStage(
             name="thinker",
             input_ids=["text_emb", "img_emb", "audio_emb"],
-            outputs={
-                "text_tokens": [GraphPointer("STREAM_OUT")],
-                "hidden_states": [GraphPointer("talker", back_to_conductor=False)],
+            outputs=[
+                GraphPointer(
+                    next_stage="STREAM_OUT",
+                    name="text_tokens"
+                ),
+                GraphPointer(
+                    next_stage="talker",
+                    name="hidden_states",
+                    back_to_conductor=False
+                ),
                 # Note: in a producer-consumer stream, only the consumer needs to
                 # know that this is a streaming operation. The producer can just send
                 # outputs via IPC as normal.
-            }
+            ]
         ),
         # Talker branch (AR speech codec generation)
         # Note: The talker is an AR model that runs autoregressively (many forward passes),
@@ -617,32 +734,62 @@ full_graph = Sequential([
                 name="talker",
                 consumes_stream=True,
                 input_ids=["hidden_states"],  # from thinker via RELAY
-                outputs={
-                    "codec_tokens": [GraphPointer("mtp_module")]
-                }
+                outputs=[
+                    GraphPointer(
+                        next_stage="mtp_module",
+                        name="codec_tokens"
+                    )
+                ]
             ),
             GraphStage(
                 name="mtp_module",
                 input_ids=["codec_tokens"],
-                outputs={
-                    "full_codebook": [GraphPointer("code2wav")]
-                }
+                outputs=[
+                    GraphPointer(
+                        next_stage="code2wav",
+                        name="full_codebook"
+                    )
+                ]
             ),
             GraphStage(
                 name="code2wav",
                 input_ids=["full_codebook"],
-                outputs={
-                    "audio_chunk": [GraphPointer("STREAM_OUT")]
-                }
+                outputs=[
+                    GraphPointer(
+                        next_stage="STREAM_OUT",
+                        name="audio_chunk"
+                    )
+                ]
             ),
         ])
     ]),
 ])
 ```
 
-### 7.6 Note: needs/produces/ptr in Full Graph Construction
 
-The whiteboard raised: "Do we have needs/produces/ptr as part of the full graph in construction?" The answer from the evolved design: **Yes**. The `GraphStage.outputs` field merges the old `produces` and `ptr` concepts. Each output maps to a list of `(destination_stage, flags)` pairs. The `input_ids` field is the `needs`.
+### 7.6 Note: GraphPointers in Full Graph Construction
+
+The graph pointer info associated with each tensor triggers the onset of the `next_stage` as well as inter-worker or worker-to-conductor communication (tensor sharing).
+
+```python
+@dataclass
+class TensorPointerInfo:
+    dims: list[int]
+    dtype: str
+    nbytes: int
+    address: int
+    source_session_id: str # e.g., f"{HOSTNAME}:{client_engine.get_rpc_port()}"
+    source_entity: str # which {worker, api_server} the tensor is on
+
+@dataclass
+class GraphPointer:
+    next_stage: str
+    name: str
+    tensor_info: TensorPointerInfo | None = field(default=None)
+    # Flags
+    back_to_conductor: bool = field(default=False)
+    is_new_token: bool = field(default=False)
+```
 
 ---
 
@@ -756,6 +903,22 @@ Worker ──ZMQ PUSH──→ API Server result socket
 ```
 
 This avoids the conductor becoming a bottleneck for high-bandwidth data (audio waveforms, image tensors). The conductor only receives lightweight completion notifications.
+
+### 8.7 Worker Communication
+The new `BaseCommunicator` class handles tensor-level worker-worker (`next_stage` is a part of a subgraph that's in a different worker), worker-conductor (tensor has `back_to_conductor` flag set) or worker-api_server (streaming out) communication.
+
+High-level example:
+`Worker_0` has latents that are needed on the `Worker_1` subgraph. `Worker_0` sends `address` and `n_bytes` information (via ZMQ). `Worker_1` allocates the required memory for latents, uses `transfer_read_on_cuda` to pull the tensors from `Worker_0` and sends a feedback message for confirmation.
+
+```python
+self.engine.transfer_read_on_cuda(
+    info.source_session_id,
+    dst.data_ptr(),
+    info.address,
+    info.nbytes,
+    stream.cuda_stream,
+)
+```
 
 ---
 
