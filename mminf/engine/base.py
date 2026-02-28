@@ -9,6 +9,7 @@ class EngineType(Enum):
     AR = "ar"
     FLOW = "flow"
     ENC_DEC = "enc_dec"
+    AUDIO_CODEC = "audio_codec"
 
 
 @dataclass

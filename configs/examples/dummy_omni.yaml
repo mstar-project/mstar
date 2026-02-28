@@ -1,0 +1,25 @@
+stage_groups:
+  - stage_names:
+      - ThinkerLLM
+    ranks:
+      - 0
+    phases:
+      - prefill
+
+  - stage_names:
+      - ThinkerLLM
+    ranks:
+      - 1
+    phases:
+      - decode
+
+  - stage_names:
+      - TalkerLLM
+      - MTP
+    ranks:
+      - 2
+
+  - stage_names:
+      - AudioCodec
+    ranks:
+      - 3
