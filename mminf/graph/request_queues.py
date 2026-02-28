@@ -45,7 +45,10 @@ class PerRequestStageQueues:
         to different subgraphs)
         """
         if self.waiting is None:
-            return new_inputs
+            return ProcessedInputs(
+                routed_to_this_subgraph=set(),
+                for_other_subgraphs=new_inputs,
+            )
 
         new_inputs: DestToGraphPointers = get_stage_to_inputs_mapping(new_inputs)
         ingested = self.waiting.ingest_inputs(new_inputs)

@@ -1,7 +1,10 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import gc
-from mooncake.engine import TransferEngine
+try:
+    from mooncake.engine import TransferEngine
+except ImportError:
+    TransferEngine = None
 import torch
 
 
@@ -34,14 +37,16 @@ class TensorCommunicationManager(ABC):
         pass
 
     @abstractmethod
-    def start_read_tensors(self, graph_pointers: list[GraphPointer]):
+    def start_read_tensors(
+        self, request_id: str, graph_pointers: list[GraphPointer]
+    ):
         """
-        Initializes empty buffer, initializes a read. May return immediately. 
+        Initializes empty buffer, initializes a read. May return immediately.
         """
         pass
 
     @abstractmethod
-    def get_ready_tensors(self) -> dict[str, GraphPointer]:
+    def get_ready_tensors(self) -> dict[str, list[GraphPointer]]:
         """
         Returns request_id: list of the GraphPointers that are currently
         ready for that request
@@ -49,7 +54,7 @@ class TensorCommunicationManager(ABC):
         pass
 
 
-@dataclass
+@dataclass(frozen=True)
 class NameAndRequestId:
     tensor_name: str
     request_id: str
@@ -59,6 +64,7 @@ class NameAndRequestId:
 class EventAndPointers:
     event: torch.cuda.Event
     pointers: list[GraphPointer]
+    request_id: str = ""
 
 
 class MooncakeCommunicationManager(TensorCommunicationManager):
@@ -72,20 +78,23 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         
     ):
         self.my_entity_id = my_entity_id
-        self.tensors: dict[NameAndRequestId, torch.Tensor]
+        self.tensors: dict[NameAndRequestId, torch.Tensor] = {}
         self.communicator = communicator
         self.protocol = protocol
         self.my_session_id = communicator.get_session_id()
 
-        self.engine = TransferEngine()
-        self.engine.initialize(
-            hostname,
-            metadata_server,
-            protocol,
-            ""
-        )        
-        # request_id: EventAndPointers
-        self.pending: dict[str, EventAndPointers] = {}
+        if TransferEngine is not None:
+            self.engine = TransferEngine()
+            self.engine.initialize(
+                hostname,
+                metadata_server,
+                protocol,
+                ""
+            )
+        else:
+            self.engine = None
+        # Per-transfer pending list (allows partial tensor readiness)
+        self.pending: list[EventAndPointers] = []
 
     def register_and_prepare_to_send(
         self, request_id: str, tensors: dict[str, torch.Tensor],
@@ -144,21 +153,54 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             tensor_name, request_id
         )]
 
-    def get_ready_tensors(self) -> dict[str, GraphPointer]:
+    def get_ready_tensors(self) -> dict[str, list[GraphPointer]]:
         """
-        Returns request_id: list of the GraphPointers that are currently
-        ready for that request (by querying the events in self.pending)
+        Poll CUDA events. Return {request_id: [ready GraphPointers]}.
+        Remove completed entries from self.pending.
         """
-        pass # TODO Atindra
+        ready: dict[str, list[GraphPointer]] = {}
+        still_pending = []
+        for ep in self.pending:
+            if ep.event.query():
+                for ptr in ep.pointers:
+                    ready.setdefault(ep.request_id, []).append(ptr)
+            else:
+                still_pending.append(ep)
+        self.pending = still_pending
+        return ready
 
-    def start_read_tensors(self, graph_pointers: list[GraphPointer]):
+    def start_read_tensors(
+        self, request_id: str, graph_pointers: list[GraphPointer]
+    ):
         """
-        Initializes empty buffer, initializes a read. May return immediately. 
+        For each pointer with tensor_info (RDMA source): allocate dst tensor,
+        register memory, call engine.transfer_read_on_cuda(), record CUDA event.
+        For each pointer WITHOUT tensor_info (signal-only): no data to transfer.
+        """
+        stream = torch.cuda.Stream()
+        for ptr in graph_pointers:
+            if ptr.tensor_info is None:
+                continue  # signal-only pointer, no data to transfer
 
-        Kicks of the engine transfer read on cuda. Updates self.pending.
-        """
-        # This also probably needs to handle None pointer.tensor_info, in which
-        # case the tensor becomes ready immediately and is available in
-        # self.tensors. Maybe this function should also read the corresponding
-        # tensor names
-        pass # TODO Atindra
+            info = ptr.tensor_info
+            dst = torch.empty(info.dims, dtype=info.dtype, device="cuda")
+            self.tensors[NameAndRequestId(ptr.name, request_id)] = dst
+
+            if self.protocol == CommProtocol.RDMA:
+                self.engine.register_memory(dst.data_ptr(), info.nbytes)
+
+                with torch.cuda.stream(stream):
+                    self.engine.transfer_read_on_cuda(
+                        info.source_session_id,
+                        dst.data_ptr(),
+                        info.address,
+                        info.nbytes,
+                        stream.cuda_stream,
+                    )
+                event = torch.cuda.Event()
+                event.record(stream)
+                self.pending.append(
+                    EventAndPointers(
+                        event=event, pointers=[ptr], request_id=request_id
+                    )
+                )
