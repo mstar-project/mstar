@@ -809,6 +809,7 @@ Workers are long-lived GPU processes. Each worker:
 ### 8.2 Engines
 
 <!-- TODO replace with engine documentation -->
+**TODO: 8.2 needs to be updated with the new engine work.**
 Three worker types handle different computation patterns:
 
 #### 8.2.1 vLLM Engine Worker
@@ -873,7 +874,8 @@ worker_1_capabilities = [
 
 ### 8.4 Internal Batching
 
-Workers handle their own batching. The conductor dispatches work items; the worker accumulates and batches them.
+Workers handle their own batching.
+The conductor and workers from previous workers dispatch work items; the worker accumulates and batches them.
 
 **For AR decode stages** (vLLM Engine Worker):
 - Continuous batching: requests join/leave batch dynamically
@@ -924,25 +926,42 @@ See the **11. Inter-Worker Communication** section for more information.
 
 ```
 GraphSection (ABC)
-├── GraphStage          # Leaf: a single computation unit
+├── GraphStage          # Node: a single computation unit
 ├── Sequential          # Stages execute in order
 ├── Parallel            # Stages execute concurrently
 └── Loop                # Stage/subgraph repeated N times
 ```
 
-**Note on evolution from whiteboard to code**: The original whiteboard (IMG_0736) proposed `GraphSection` with concrete fields `inputs: list[str]` and `name: str`. The actual implementation evolved to use **abstract methods only** -- no concrete fields on the base class.
+A `GraphSection` is an abstract class that represents any arbitrary (contiguous) part of a graph: a single node (`GraphStage`), or different compositions of nodes.
+This abstraction is necessary for `Sequential`, `Parallel`, and `Loop` blocks to hold/organize arbitrary graphs (e.g., a `Loop` can hold a `Sequential`, `Parallel` or even another `Loop`).
+
+<!-- **Note on evolution from whiteboard to code**: The original whiteboard (IMG_0736) proposed `GraphSection` with concrete fields `inputs: list[str]` and `name: str`. The actual implementation evolved to use **abstract methods only** -- no concrete fields on the base class. -->
 
 **Abstract methods on GraphSection** (all subclasses must implement):
 ```python
+DestToInputs = dict[str, list[GraphPointer]]
+
 class GraphSection(ABC):
-    def get_stage_names(self) -> list[str]: ...       # Names of all stages in this section
-    def get_inputs(self) -> SignalToDests: ...         # External/loop-back inputs
-    def get_outputs(self) -> SignalToDests: ...        # External/loop-back outputs
+    def get_stage_names(self) -> list[str]: ...             # Names of all stages in this section
+    def get_inputs(self) -> list[GraphPointer]: ...         # External/loop-back inputs
+    def get_outputs(self) -> list[GraphPointer]: ...        # External/loop-back outputs
     def ingest_inputs(self, stage_to_inputs: DestToInputs): ...  # Mark inputs as received; MUTATES stage_to_inputs
     def split_off_ready(self) -> tuple[list[GraphStage], GraphSection | None]: ...  # Split ready stages from waiting
 ```
 
-**Critical behavior**: `ingest_inputs()` **mutates** its argument `stage_to_inputs`, removing entries that were consumed. After the call, only un-consumed (external) entries remain. This mutation-based protocol is how external outputs are computed.
+As a reminder, the `GraphPointer` is the following dataclass:
+```python
+@dataclass
+class GraphPointer:
+    next_stage: str
+    name: str
+    tensor_info: TensorPointerInfo | None = field(default=None)
+    # Flags
+    back_to_conductor: bool = field(default=False)
+    is_new_token: bool = field(default=False)
+```
+
+**Critical behavior**: `ingest_inputs()` **mutates** its argument `stage_to_inputs`, removing entries that were consumed. After the call, only un-consumed (external) entries remain. This mutation-based protocol is how external outputs (i.e., those that must be routed to other workers) are computed.
 
 ### 9.2 GraphStage
 
@@ -952,8 +971,8 @@ The fundamental computation unit (leaf node).
 @dataclass
 class GraphStage(GraphSection):
     name: str
-    input_ids: set[str]           # Named inputs this stage needs (coerced from list in __post_init__)
-    outputs: SignalToDestsAndFlags  # {output_name: [GraphPointer(dest, flags)]}
+    input_ids: set[str]              # Named inputs this stage needs (coerced from list in __post_init__)
+    outputs: list[GraphPointer]
     ready_input_ids: set[str] = field(default_factory=set)  # Populated as predecessors complete
 
     def is_ready(self) -> bool:
@@ -1022,14 +1041,18 @@ A stage or subgraph repeated N times. Handles loop-back signals (outputs that fe
 class Loop(GraphSection):
     section: GraphSection           # Template ("clean" copy, never mutated)
     n_iters: int
-    outputs: SignalToDestsAndFlags   # Final iteration outputs (replace loop-backs)
+    outputs: list[GraphPointer]   # Final iteration outputs (replace loop-backs)
     curr_iter: int = field(default=0)
-    external_inputs: SignalToDests = field(default=None)     # Inputs from OUTSIDE the loop (not loop-back)
+    external_inputs: list[GraphPointer] = field(default=None)     # Inputs from OUTSIDE the loop (not loop-back)
+    loop_back_signals: list[GraphPointer] = field(default=None)
     curr_iter_section: GraphSection = field(default=None)    # Mutable copy for current iteration
     nxt_iter_section: GraphSection = field(default=None)     # Pre-populated copy for next iteration
 ```
 
 **`external_inputs`** (critical field, computed in `__post_init__`): Identifies which inputs come from outside the loop vs. from loop-back signals. This distinction is essential for nested loops -- external inputs are re-injected each iteration, while loop-back inputs only come from the previous iteration's outputs.
+
+**`loop_back_signals`** (critical field, computed in `__post_init__`): Identifies which outputs loop back.
+These outputs must be removed in the final loop iteration.
 
 **Key internal methods**:
 - `_get_loop_back_signals()`: Identifies signals that appear in both the section's inputs AND outputs -- these are the loop-back edges.
@@ -1046,7 +1069,7 @@ Visual:
 
 **Loop dispatch granularity**: A `Loop(50)` can be dispatched as a single unit (worker runs all 50 iterations, sends one completion) or broken into `Loop(10) × 5` (enabling round-robin across workers, reducing head-of-line blocking, enabling checkpointing between chunks).
 
-### 9.6 Signal Routing (needs/produces/ptr)
+<!-- ### 9.6 Signal Routing (needs/produces/ptr)
 
 Three equivalent representations of graph edges:
 
@@ -1063,22 +1086,28 @@ These can be converted between each other:
 
 Helper: `update_list_dicts(signals, new_signals)` merges two `dict[str, list]` by extending existing keys and adding new ones. Used by `Parallel` when combining inputs/outputs across branches.
 
-**Mapping direction note**: The whiteboard (IMG_0728) uses `destination → [output_names]` notation (e.g., `DONE_W_FWD: [tokens]`). The code uses the **inverse**: `output_name → [destinations]` (e.g., `"tokens": [GraphPointer("DONE_WITH_FWD")]`). Both representations are equivalent; the code's direction was chosen because it maps naturally to a stage's `outputs` dict where each named output lists where it goes.
+**Mapping direction note**: The whiteboard (IMG_0728) uses `destination → [output_names]` notation (e.g., `DONE_W_FWD: [tokens]`). The code uses the **inverse**: `output_name → [destinations]` (e.g., `"tokens": [GraphPointer("DONE_WITH_FWD")]`). Both representations are equivalent; the code's direction was chosen because it maps naturally to a stage's `outputs` dict where each named output lists where it goes. -->
 
-### 9.7 GraphPointer
+### 9.6 GraphPointer
 
 ```python
 @dataclass
 class GraphPointer:
-    next_stage: str                        # Name of destination stage (or flag like "STREAM_OUT")
-    back_to_conductor: bool = field(default=False)  # Default: direct worker-to-worker
+    next_stage: str
+    name: str # name of the signal that is being passed (e.g., text_emb, latents, etc.)
+    tensor_info: TensorPointerInfo | None = field(default=None)
+    # Flags
+    back_to_conductor: bool = field(default=False)
+    is_new_token: bool = field(default=False)
 ```
 
-The `back_to_conductor` flag determines whether data flows:
-- **Worker-to-worker directly** (back_to_conductor=False, the default): For RELAY, inter-worker tensor transfer
-- **Worker-to-conductor-to-worker** (back_to_conductor=True): For DONE_WITH_FWD, lifecycle events
+`tensor_info` holds data required for for inter-worker tensor communication (see **Section 11**).
 
-### 9.8 RequestQueues
+The `back_to_conductor` flag is used for signals that **persist between forward passes** and need to be sent back to the conductor to be passed as inputs into the next forward pass.
+
+The `is_new_token` flag is needed so that the conductor knows where to check for `<EOS>`, `<BOI>`, etc.
+
+### 9.7 RequestQueues
 
 The conductor maintains one `RequestQueues` per in-flight request:
 
@@ -1088,27 +1117,35 @@ class RequestQueues:
     ready: list[GraphStage]   # Stages with all inputs available
     waiting: GraphSection     # Remaining graph structure
 
-    def process_new_inputs(self, new_inputs: SignalToDestsAndFlags) -> SignalToDests:
+    def process_new_inputs(
+        self,
+        new_inputs: list[GraphPointer]
+    ) -> ProcessedInputs:
         """
-        1. Convert new_inputs from SignalToDestsAndFlags to DestToInputs format
-        2. Call self.waiting.ingest_inputs(converted) -- this MUTATES the dict,
-           removing consumed entries. What remains = external (un-consumed) outputs.
-        3. Call self._update_ready_waiting() to split off newly-ready stages
-        4. Return external outputs as SignalToDests
+        Processes all outputs that feed into the waiting graph section, and
+        return a dictionary of external output pointers (ones that are feeding
+        to different subgraphs)
         """
         if self.waiting is None:
-            return remove_flags(new_inputs)
+            return ProcessedInputs(
+                routed_to_this_subgraph=set(),
+                for_other_subgraphs=new_inputs,
+            )
 
-        new_inputs = get_stage_to_inputs_mapping(remove_flags(new_inputs))
-        self.waiting.ingest_inputs(new_inputs)  # mutates new_inputs
-        external_outputs = new_inputs           # what's left = external
-        self._update_ready_waiting()            # split_off_ready internally
-        return get_signal_to_dest_mapping(external_outputs)
+        new_inputs: DestToGraphPointers = get_stage_to_inputs_mapping(new_inputs)
+        ingested = self.waiting.ingest_inputs(new_inputs)
+        external_outputs = sum( new_inputs.values(), start=[])
+        
+        self._update_ready_waiting()
+        return ProcessedInputs(
+            for_other_subgraphs=external_outputs,
+            routed_to_this_subgraph=ingested
+        )
 ```
 
 The key insight: `ingest_inputs` consumes entries from its argument. After the call, only un-consumed entries remain in the dict -- these are external outputs (like STREAM_OUT, DONE_WITH_FWD) that don't correspond to any waiting stage.
 
-A working implementation `computation_graph_scratch_work.py` of this computation graph model exists with a stress test using a Show-o2-style graph with nested loops and parallel branches.
+`test/test_request_queues.py` contains a stress test of this system using a Show-o2-style graph with nested loops and parallel branches.
 
 ---
 
@@ -1714,7 +1751,7 @@ Not an expanded view of the same thing.
 
 2. **Batching at the conductor level**: Whether the conductor should batch-select which requests' stages to dispatch together, or leave all batching to workers.
 
-3. **Model hierarchy / interface**: The concrete Python class hierarchy for models. The Execution Strategy is defined conceptually but the exact class interface (`BaseMultimodalModel.get_execution_strategy()`) needs implementation.
+3. ~~**Model hierarchy / interface**: The concrete Python class hierarchy for models. The Execution Strategy is defined conceptually but the exact class interface (`BaseMultimodalModel.get_execution_strategy()`) needs implementation.~~
 
 4. **Streaming across disaggregated stages**: How streaming chunks (audio, partial images) work when stages are on different GPUs. Currently: workers stream directly to API Server.
 
@@ -1736,7 +1773,7 @@ Not an expanded view of the same thing.
 
 2. **Full RadixAttention tree**: Start with simple prefix matching; full tree-based sharing later.
 
-3. **RDMA inter-worker communication**: Start with ZMQ/TCP; add Mooncake Transfer Engine when profiling shows transfer is the bottleneck.
+3. ~~**RDMA inter-worker communication**: Start with ZMQ/TCP; add Mooncake Transfer Engine when profiling shows transfer is the bottleneck.~~
 
 4. **CUDA MPS / MIG for GPU sharing**: Currently one process per GPU. Multi-tenant GPU sharing deferred.
 
