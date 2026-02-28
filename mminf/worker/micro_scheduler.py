@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphStage
 from mminf.worker.engine_manager import EngineManager
-from mminf.worker.dummy_worker import SubgraphsManager
+from mminf.worker.stage_manager_utils import SubgraphsManager
 
 
 @dataclass

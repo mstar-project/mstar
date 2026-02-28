@@ -9,7 +9,7 @@ from mminf.communication.communicator import ZMQCommunicator
 from mminf.graph.base import GraphPointer, TensorPointerInfo
 from mminf.ipc_formats import (
     ConductorMessageType, InputSignals,
-    NewRequest, NewRequestConductor, PersistSignals, RemoveRequest, SubgraphsDone, WorkerMessage,
+    NewRequest, NewRequestConductor, RemoveRequest, SubgraphsDone, WorkerMessage,
     WorkerMessageType
 )
 from mminf.model.base import CurrentForwardMetadata, Model
@@ -239,6 +239,13 @@ class DummyConductor:
         subgraphs for the current computation phase have been completed)
         """
         request_data = self.requests[body.request_id]
+
+        # Absorb persist signals and new tokens sent with this message
+        if body.persist_signals:
+            request_data.persist_signals.update(body.persist_signals)
+        if body.new_tokens:
+            request_data.new_tokens.extend(body.new_tokens)
+
         request_data.completed_subgraph_ids.update(
             body.subgraph_ids
         )
@@ -248,16 +255,6 @@ class DummyConductor:
         )
         return done_with_forward
 
-    def _process_new_tensors(self, body: PersistSignals):
-        """
-        If worker has sent tensors back to the conductor, process those.
-        """
-        self.requests[body.request_id].persist_signals.update(
-            body.signals
-        )
-        self.requests[body.request_id].new_tokens.extend(body.new_tokens)
-        
-
     def run(self):
         while True:
             done_forward_passes = []
@@ -265,20 +262,14 @@ class DummyConductor:
                 if message.message_type == ConductorMessageType.NEW_REQUEST:
                     self._ingest_request(message.body)
                 elif message.message_type == ConductorMessageType.SUBGRAPHS_DONE:
-                    
                     done_with_fwd = self._process_subgraphs_done(
                         message.body
                     )
                     if done_with_fwd:
                         done_forward_passes.append(message.body.request_id)
-                elif message.message_type == ConductorMessageType.PERSIST_SIGNALS:
-                    self._process_new_tensors(message.body)
                 else:
                     raise ValueError(f"Unknown message type: {message.message_type}")
             
-            # TODO: make sure all "PERSIST_SIGNALS" messages are processed before the
-            # _process_done_forward is called. Otherwise the conductor will maybe not have
-            # information about new tokens or some inputs to the next forward pass.
             eos_requests = []
             for request_id in done_forward_passes:
                 saw_eos = self._process_done_forward(request_id)

@@ -19,7 +19,7 @@ from mminf.graph.base import GraphPointer, GraphStage, Loop, Parallel, Sequentia
 from mminf.graph.request_queues import PerRequestStageQueues
 from mminf.model.dummy_model import DummyModel
 from mminf.model.base import Subgraph
-from mminf.worker.dummy_worker import (
+from mminf.worker.stage_manager_utils import (
     SubgraphQueues, SubgraphsManager, StageOutputRouting,
 )
 from mminf.worker.engine_manager import EngineManager

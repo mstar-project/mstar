@@ -12,6 +12,7 @@ from mminf.graph.base import GraphPointer, GraphSection, GraphStage, Loop, Paral
 
 
 STREAM_OUT = "stream_out"
+SPECIAL_DESTINATIONS = {STREAM_OUT}  # add RELAY etc. later
 
 
 @dataclass
