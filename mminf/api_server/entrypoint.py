@@ -1,0 +1,493 @@
+"""FastAPI server entry point for multimodal inference requests."""
+
+import asyncio
+import base64
+import collections
+import json
+import logging
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import uvicorn
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
+
+from mminf.communication.communicator import ZMQCommunicator
+from mminf.ipc_formats import (
+    ConductorMessage,
+    ConductorMessageType,
+    NewRequestConductor,
+)
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_MODALITIES = frozenset({"text", "image", "audio", "video"})
+
+# Extension-based modality detection for uploaded files.
+_EXT_TO_MODALITY: dict[str, str] = {}
+for _mod, _exts in {
+    "image": (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif"),
+    "audio": (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"),
+    "video": (".mp4", ".avi", ".mov", ".mkv", ".webm"),
+}.items():
+    for _ext in _exts:
+        _EXT_TO_MODALITY[_ext] = _mod
+
+
+def _detect_modality(filename: str) -> str:
+    return _EXT_TO_MODALITY.get(Path(filename).suffix.lower(), "unknown")
+
+
+# ------------------------------------------------------------------
+# Result messages: conductor -> API server
+#
+# The conductor sends these back via ZMQCommunicator.send("api_server", msg).
+# They are defined here (close to the consumer) rather than in ipc_formats
+# because the conductor->api_server protocol is still evolving.
+# ------------------------------------------------------------------
+
+@dataclass
+class ResultChunk:
+    """One chunk of generated output for a request."""
+    request_id: str
+    modality: str          # "text" | "image" | "audio" | "video"
+    data: bytes            # raw payload (text encoded as utf-8)
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class RequestComplete:
+    """Signals that a request has finished processing."""
+    request_id: str
+
+
+@dataclass
+class APIServerMessage:
+    """Envelope for messages received by the API server."""
+    message_type: str  # "result_chunk" | "request_complete"
+    body: ResultChunk | RequestComplete
+
+
+# ------------------------------------------------------------------
+# APIServer
+# ------------------------------------------------------------------
+
+class APIServer:
+    """Accept multimodal requests, forward to conductor, collect results."""
+
+    def __init__(
+        self,
+        socket_path_prefix: str = "/tmp/mminf",
+        upload_dir: str = "/tmp/mminf_uploads",
+        timeout_seconds: float = 600.0,
+    ):
+        self.upload_dir = Path(upload_dir)
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.timeout_seconds = timeout_seconds
+
+        # Concurrent request tracking
+        self.pending_requests: dict[str, dict] = {}
+        self.recently_completed: collections.OrderedDict[str, float] = (
+            collections.OrderedDict()
+        )
+        self._recently_completed_ttl = 5.0
+        self.request_lock = threading.Lock()
+        self.running = True
+
+        # ZMQ channel shared with conductor / workers
+        self.communicator = ZMQCommunicator(
+            my_id="api_server",
+            push_ids=["conductor"],
+            ipc_socket_path_prefix=socket_path_prefix,
+        )
+
+        # Background thread that drains results from conductor
+        self._msg_thread = threading.Thread(
+            target=self._process_messages, daemon=True
+        )
+        self._msg_thread.start()
+
+    # ----------------------------------------------------------
+    # Submitting a request
+    # ----------------------------------------------------------
+
+    def submit_request(
+        self,
+        *,
+        text: str | None = None,
+        file_paths: dict[str, list[str]] | None = None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        model_kwargs: dict | None = None,
+        streaming: bool = True,
+    ) -> str:
+        """Build a :class:`NewRequestConductor` and send it to the conductor.
+
+        Returns the ``request_id``.
+        """
+        request_id = str(uuid.uuid4())
+
+        for m in input_modalities + output_modalities:
+            if m not in SUPPORTED_MODALITIES:
+                raise ValueError(f"Unsupported modality: {m!r}")
+
+        # Register pending request
+        with self.request_lock:
+            self.pending_requests[request_id] = {
+                "chunks": [],           # list[ResultChunk]
+                "event": threading.Event(),
+                "streaming": streaming,
+                "consumed_chunks": 0,
+                "input_modalities": input_modalities,
+                "output_modalities": output_modalities,
+            }
+
+        # initial_signals: in a full pipeline a preprocessor worker would
+        # convert raw files into GPU tensors and produce TensorPointerInfo
+        # entries here.  For now we leave it empty — the conductor receives
+        # the modality lists and can arrange preprocessing itself.
+        initial_signals: dict = {}
+
+        msg = ConductorMessage(
+            message_type=ConductorMessageType.NEW_REQUEST,
+            body=NewRequestConductor(
+                request_id=request_id,
+                initial_signals=initial_signals,
+                initial_input_modalities=input_modalities,
+                initial_output_modalities=output_modalities,
+            ),
+        )
+        self.communicator.send("conductor", msg)
+        logger.info(
+            "Request %s submitted  in=%s  out=%s",
+            request_id, input_modalities, output_modalities,
+        )
+        return request_id
+
+    # ----------------------------------------------------------
+    # Result collection (background thread)
+    # ----------------------------------------------------------
+
+    def _prune_recently_completed(self) -> None:
+        now = time.time()
+        stale = [
+            rid
+            for rid, ts in self.recently_completed.items()
+            if now - ts > self._recently_completed_ttl
+        ]
+        for rid in stale:
+            self.recently_completed.pop(rid, None)
+
+    def _process_messages(self) -> None:
+        """Drain the ZMQ pull socket and route results to pending requests."""
+        while self.running:
+            try:
+                for message in self.communicator.get_all_new_messages():
+                    if not isinstance(message, APIServerMessage):
+                        logger.warning("Unexpected message type: %s", type(message))
+                        continue
+
+                    rid = message.body.request_id
+
+                    with self.request_lock:
+                        self._prune_recently_completed()
+
+                        if rid in self.pending_requests:
+                            if message.message_type == "result_chunk":
+                                self.pending_requests[rid]["chunks"].append(
+                                    message.body
+                                )
+                            elif message.message_type == "request_complete":
+                                self.pending_requests[rid]["event"].set()
+                                self.recently_completed[rid] = time.time()
+                        elif rid in self.recently_completed:
+                            logger.debug("Late message for completed %s", rid)
+                        else:
+                            logger.warning(
+                                "Message for unknown request %s", rid
+                            )
+            except Exception:
+                if self.running:
+                    logger.exception("Error in message processing loop")
+            time.sleep(0.001)
+
+    # ----------------------------------------------------------
+    # Streaming helper
+    # ----------------------------------------------------------
+
+    async def async_stream_results(self, request_id: str):
+        """Yield NDJSON lines as result chunks arrive."""
+        start = time.time()
+        while True:
+            if time.time() - start > self.timeout_seconds:
+                with self.request_lock:
+                    self.pending_requests.pop(request_id, None)
+                raise HTTPException(status_code=500, detail="Request timed out")
+
+            new_chunks: list[ResultChunk] = []
+            done = False
+            with self.request_lock:
+                req = self.pending_requests.get(request_id)
+                if req:
+                    avail = len(req["chunks"])
+                    consumed = req["consumed_chunks"]
+                    new_chunks = req["chunks"][consumed:avail]
+                    req["consumed_chunks"] = avail
+                    done = req["event"].is_set()
+                else:
+                    done = True
+
+            for chunk in new_chunks:
+                yield self._chunk_to_ndjson(chunk)
+
+            if done:
+                # flush remaining
+                remaining: list[ResultChunk] = []
+                with self.request_lock:
+                    req = self.pending_requests.get(request_id)
+                    if req:
+                        remaining = req["chunks"][req["consumed_chunks"]:]
+                        self.pending_requests.pop(request_id, None)
+                for chunk in remaining:
+                    yield self._chunk_to_ndjson(chunk)
+                break
+
+            await asyncio.sleep(0.001)
+
+    @staticmethod
+    def _chunk_to_ndjson(chunk: ResultChunk) -> str:
+        return json.dumps({
+            "modality": chunk.modality,
+            "data": base64.b64encode(chunk.data).decode("ascii"),
+            "metadata": chunk.metadata,
+        }) + "\n"
+
+    # ----------------------------------------------------------
+    # Blocking helper (non-streaming)
+    # ----------------------------------------------------------
+
+    def collect_results(self, request_id: str) -> list[ResultChunk]:
+        """Block until the request completes, then return all chunks."""
+        with self.request_lock:
+            req = self.pending_requests.get(request_id)
+            if not req:
+                raise HTTPException(
+                    status_code=404, detail=f"Request {request_id} not found"
+                )
+            event = req["event"]
+
+        if not event.wait(timeout=self.timeout_seconds):
+            with self.request_lock:
+                self.pending_requests.pop(request_id, None)
+            raise HTTPException(status_code=500, detail="Request timed out")
+
+        with self.request_lock:
+            chunks = self.pending_requests[request_id]["chunks"][:]
+            self.pending_requests.pop(request_id, None)
+        return chunks
+
+    # ----------------------------------------------------------
+    # Cleanup
+    # ----------------------------------------------------------
+
+    def cleanup(self) -> None:
+        self.running = False
+        if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
+            self._msg_thread.join(timeout=2)
+
+
+# ------------------------------------------------------------------
+# FastAPI application
+# ------------------------------------------------------------------
+
+app = FastAPI(
+    title="mminf API",
+    description="Multimodal Inference API",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+api_server: APIServer | None = None
+
+
+@app.post("/generate")
+async def generate(
+    text: Optional[str] = Form(None),
+    files: Optional[list[UploadFile]] = File(None),
+    input_modalities: Optional[str] = Form(None),
+    output_modalities: str = Form("text"),
+    streaming: bool = Form(True),
+    model_kwargs: Optional[str] = Form(None),
+):
+    """Submit a multimodal generation request.
+
+    Args:
+        text: Optional text input.
+        files: Optional media files (images, audio, video).  The modality of
+            each file is inferred from its extension.
+        input_modalities: Comma-separated list of input modalities.  When
+            omitted, modalities are auto-detected from the provided data.
+        output_modalities: Comma-separated list of desired output modalities
+            (default ``"text"``).
+        streaming: If ``True``, return an NDJSON stream of result chunks.
+        model_kwargs: Optional JSON string of model-specific parameters.
+    """
+    if api_server is None:
+        raise HTTPException(status_code=503, detail="Server not ready")
+
+    out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
+
+    # --- save uploaded files, grouped by modality ----------------
+    file_paths: dict[str, list[str]] = {}
+    if files:
+        for f in files:
+            modality = _detect_modality(f.filename or "")
+            if modality == "unknown":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot determine modality for file: {f.filename}",
+                )
+            save_name = f"{uuid.uuid4()}_{f.filename}"
+            save_path = api_server.upload_dir / save_name
+            content = await f.read()
+            await run_in_threadpool(save_path.write_bytes, content)
+            file_paths.setdefault(modality, []).append(str(save_path))
+
+    # --- resolve input modalities --------------------------------
+    if input_modalities is not None:
+        in_mods = [m.strip() for m in input_modalities.split(",") if m.strip()]
+    else:
+        in_mods: list[str] = []
+        if text:
+            in_mods.append("text")
+        in_mods.extend(file_paths.keys())
+
+    parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
+
+    try:
+        request_id = api_server.submit_request(
+            text=text,
+            file_paths=file_paths or None,
+            input_modalities=in_mods,
+            output_modalities=out_mods,
+            model_kwargs=parsed_kwargs,
+            streaming=streaming,
+        )
+
+        if streaming:
+            return StreamingResponse(
+                api_server.async_stream_results(request_id),
+                media_type="application/x-ndjson",
+                headers={"Cache-Control": "no-cache"},
+            )
+
+        chunks = await run_in_threadpool(
+            api_server.collect_results, request_id
+        )
+        outputs: dict[str, list[dict]] = {}
+        for chunk in chunks:
+            outputs.setdefault(chunk.modality, []).append({
+                "data": base64.b64encode(chunk.data).decode("ascii"),
+                "metadata": chunk.metadata,
+            })
+        return JSONResponse({
+            "request_id": request_id,
+            "outputs": outputs,
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        # Deferred cleanup of uploaded files
+        if file_paths:
+            def _cleanup(paths: dict[str, list[str]]) -> None:
+                time.sleep(60)
+                for ps in paths.values():
+                    for p in ps:
+                        try:
+                            Path(p).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            threading.Thread(
+                target=_cleanup, args=(file_paths,), daemon=True
+            ).start()
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if api_server is not None:
+        api_server.cleanup()
+
+
+# ------------------------------------------------------------------
+# CLI entry point
+# ------------------------------------------------------------------
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="mminf Multimodal Inference API Server"
+    )
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--socket-path-prefix", type=str, default="/tmp/mminf",
+        help="ZMQ IPC socket path prefix (shared with conductor/workers)",
+    )
+    parser.add_argument(
+        "--upload-dir", type=str, default="/tmp/mminf_uploads",
+        help="Directory for temporary uploaded files",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=600.0,
+        help="Per-request timeout in seconds",
+    )
+    parser.add_argument(
+        "--log-level", type=str, default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    global api_server
+    api_server = APIServer(
+        socket_path_prefix=args.socket_path_prefix,
+        upload_dir=args.upload_dir,
+        timeout_seconds=args.timeout,
+    )
+
+    try:
+        logger.info("Starting mminf API server on %s:%s", args.host, args.port)
+        uvicorn.run(app, host=args.host, port=args.port, access_log=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if api_server is not None:
+            api_server.cleanup()
+
+
+if __name__ == "__main__":
+    main()
