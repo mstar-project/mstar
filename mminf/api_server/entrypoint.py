@@ -5,7 +5,6 @@ import base64
 import collections
 import json
 import logging
-import signal
 import threading
 import time
 import uuid
@@ -479,16 +478,6 @@ def main():
         upload_dir=args.upload_dir,
         timeout_seconds=args.timeout,
     )
-
-    def _signal_handler(signum, _frame):
-        logger.info("Received signal %s, shutting down...", signum)
-        if api_server is not None:
-            api_server.cleanup()
-        import os
-        os._exit(0)
-
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
 
     try:
         logger.info("Starting mminf API server on %s:%s", args.host, args.port)
