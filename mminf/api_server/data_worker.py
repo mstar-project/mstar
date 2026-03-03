@@ -1,6 +1,6 @@
 
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import queue
 import threading
 import time
@@ -8,6 +8,7 @@ import time
 import torch
 import torchvision
 import torchaudio
+from torchcodec.decoders import VideoDecoder, AudioDecoder
 
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager
@@ -71,10 +72,12 @@ class PreprocessWorkerThread:
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
+        device: str = "cpu",
     ):
         self.in_queue = in_queue
         self.out_queue = out_queue # unused at the moment
         self.stop_event = stop_event
+        self.device = device
 
         self.communicator = ZMQCommunicator(
             my_id="api_server_preprocess_worker",
@@ -99,7 +102,7 @@ class PreprocessWorkerThread:
             # Encode as UTF-8 bytes -> uint8 tensor
             byte_data = input.text.encode("utf-8")
             tensors["text_input"] = torch.tensor(
-                list(byte_data), dtype=torch.uint8
+                list(byte_data), dtype=torch.uint8, device=self.device
             )
 
         if input.file_paths is not None:
@@ -109,27 +112,29 @@ class PreprocessWorkerThread:
 
                     # ---- Image ----
                     if modality == "image":
-                        img = torchvision.io.read_image(filepath)  # uint8 CxHxW
+                        img = torchvision.io.decode_image(filepath).to(self.device)  # uint8 CxHxW
                         img = img.float() / 255.0
                         tensors[key] = img
 
                     # ---- Audio ----
                     elif modality == "audio":
-                        waveform, sample_rate = torchaudio.load(filepath)
+                        waveform, sample_rate = torchaudio.load_with_torchcodec(
+                            filepath,
+                            channels_first=True
+                        )
                         # waveform: (channels, time)
                         tensors[key] = waveform
-                        input_metadata[key] = sample_rate
+                        input_metadata[key] = dict(
+                            sample_rate=sample_rate,
+                            channels_first=True
+                        )
 
                     # ---- Video ----
                     elif modality == "video":
-                        video, audio, info = torchvision.io.read_video(
-                            filepath, pts_unit="sec"
-                        )
-                        # video: (T, H, W, C) uint8
-                        video = video.permute(0, 3, 1, 2).float() / 255.0
+                        decoder = VideoDecoder(filepath, device=self.device)
+                        video = torch.stack([frame for frame in decoder]).float() / 255.0
                         tensors[key] = video
-                        input_metadata[key] = info
-                        tensors[f"video_audio_{i}"] = audio
+                        input_metadata[key] = asdict(decoder.metadata)
         
         initial_signals = self.tensor_manager.register_and_return_tensor_info(
             request_id=input.request_id,

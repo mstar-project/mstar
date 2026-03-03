@@ -2,7 +2,7 @@ import torch
 
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameAndRequestId
-from mminf.engine.base import StageBatch
+from mminf.engine.base import StageBatch, StageOutput
 from mminf.graph.base import GraphPointer, TensorPointerInfo
 from mminf.ipc_formats import (
     ConductorMessage, ConductorMessageType, InputSignals,
