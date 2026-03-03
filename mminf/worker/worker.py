@@ -6,7 +6,8 @@ from mminf.engine.base import StageBatch
 from mminf.graph.base import GraphPointer, TensorPointerInfo
 from mminf.ipc_formats import (
     ConductorMessage, ConductorMessageType, InputSignals,
-    NewRequest, RemoveRequest, SubgraphsDone, WorkerMessage, WorkerMessageType,
+    NewRequest, RemoveRequest, SubgraphsDone, TensorReceived,
+    WorkerMessage, WorkerMessageType,
 )
 from mminf.model.base import Subgraph
 from mminf.worker.stage_manager_utils import (
@@ -102,6 +103,12 @@ class Worker:
     def _remove_request(self, body: RemoveRequest) -> None:
         self.engine_manager.remove_request(body.request_id)
         self.subgraphs_manager.remove_request(body.request_id)
+        self.tensor_manager.cleanup_request(body.request_id)
+
+    def _handle_tensor_received(self, body: TensorReceived) -> None:
+        """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
+        for tensor_name in body.successful_tensor_ids:
+            self.tensor_manager.cleanup(body.request_id, tensor_name)
 
     def _process_new_inputs(self, body: InputSignals) -> None:
         self.subgraphs_manager.update_phase(body.request_id, body.phase)
@@ -124,6 +131,8 @@ class Worker:
                 self._remove_request(message.body)
             elif message.message_type == WorkerMessageType.INPUT_SIGNALS:
                 self._process_new_inputs(message.body)
+            elif message.message_type == WorkerMessageType.TENSOR_RECEIVED:
+                self._handle_tensor_received(message.body)
 
     # ------------------------------------------------------------------
     # Tensor readiness
@@ -160,6 +169,17 @@ class Worker:
             request_ids=batch.request_ids,
             per_request_input_tensors=per_request_inputs,
         )
+
+    # ------------------------------------------------------------------
+    # Input cleanup
+    # ------------------------------------------------------------------
+
+    def _cleanup_consumed_inputs(self, batch: ScheduledBatch) -> None:
+        """Free input tensors that were consumed by the just-executed stage."""
+        for i, request_id in enumerate(batch.request_ids):
+            stage = batch.stages[i] if i < len(batch.stages) else batch.stages[0]
+            for input_name in stage.input_ids:
+                self.tensor_manager.cleanup(request_id, input_name)
 
     # ------------------------------------------------------------------
     # Output handling
@@ -273,6 +293,9 @@ class Worker:
             # 5. Execute via engine
             engine = self.engine_manager.get_engine(batch.stage_name)
             output = engine.execute_batch(stage_batch)
+
+            # 5b. Free consumed input tensors
+            self._cleanup_consumed_inputs(batch)
 
             # 6. Route outputs through SubgraphsManager first to determine routing
             routing_per_request: dict[str, StageOutputRouting] = {}
