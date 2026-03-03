@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-import gc
 try:
     from mooncake.engine import TransferEngine
 except ImportError:
@@ -10,6 +9,7 @@ import torch
 
 from mminf.communication.communicator import BaseCommunicator, CommProtocol
 from mminf.graph.base import GraphPointer, TensorPointerInfo
+from mminf.ipc_formats import TensorReceived, WorkerMessage, WorkerMessageType
 
 
 class TensorCommunicationManager(ABC):
@@ -33,6 +33,13 @@ class TensorCommunicationManager(ABC):
     def cleanup(self, request_id: str, tensor_name: str):
         """
         Removes buffer if exists. Unregisters buffers if relevant
+        """
+        pass
+
+    @abstractmethod
+    def cleanup_request(self, request_id: str):
+        """
+        Removes all tensors for a given request. Unregisters buffers if relevant.
         """
         pass
 
@@ -132,22 +139,30 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     raise RuntimeError("Mooncake memory registration failed.")
             
     def cleanup(self, request_id: str, tensor_name: str):
-        if self.protocol == CommProtocol.RDMA:
+        key = NameAndRequestId(tensor_name, request_id)
+        if key not in self.tensors:
+            return
+        if self.protocol == CommProtocol.RDMA and self.engine is not None:
             ret_value = self.engine.unregister_memory(
-                self.tensors[NameAndRequestId(
-                    tensor_name, request_id
-                )].data_ptr()
+                self.tensors[key].data_ptr()
             )
             if ret_value != 0:
-                # TODO: error handling
                 raise RuntimeError("Mooncake memory unregistration failed.")
+        del self.tensors[key]
 
-        del self.tensors[NameAndRequestId(
-            tensor_name, request_id
-        )]
-        gc.collect()
-        torch.cuda.empty_cache()
-    
+    def cleanup_request(self, request_id: str):
+        keys_to_remove = [
+            key for key in self.tensors if key.request_id == request_id
+        ]
+        for key in keys_to_remove:
+            if self.protocol == CommProtocol.RDMA and self.engine is not None:
+                self.engine.unregister_memory(self.tensors[key].data_ptr())
+            del self.tensors[key]
+        # Also remove any pending transfers for this request
+        self.pending = [
+            ep for ep in self.pending if ep.request_id != request_id
+        ]
+
     def get_tensor(self, request_id: str, tensor_name: str) -> torch.Tensor:
         return self.tensors[NameAndRequestId(
             tensor_name, request_id
@@ -157,16 +172,41 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         """
         Poll CUDA events. Return {request_id: [ready GraphPointers]}.
         Remove completed entries from self.pending.
+        Sends TENSOR_RECEIVED ACKs back to senders so they can free buffers.
         """
         ready: dict[str, list[GraphPointer]] = {}
         still_pending = []
+        # Collect ACKs to send: (source_entity, request_id) -> tensor_names
+        acks: dict[tuple[str, str], list[str]] = {}
+
         for ep in self.pending:
             if ep.event.query():
                 for ptr in ep.pointers:
                     ready.setdefault(ep.request_id, []).append(ptr)
+                    if ptr.tensor_info is not None:
+                        key = (ptr.tensor_info.source_entity, ep.request_id)
+                        acks.setdefault(key, []).append(ptr.name)
             else:
                 still_pending.append(ep)
         self.pending = still_pending
+
+        # Send ACKs to senders
+        for (source_entity, request_id), tensor_names in acks.items():
+            if source_entity == self.my_entity_id:
+                continue  # local transfer, no ACK needed
+            self.communicator.send(
+                source_entity,
+                WorkerMessage(
+                    message_type=WorkerMessageType.TENSOR_RECEIVED,
+                    body=TensorReceived(
+                        request_id=request_id,
+                        receiving_entity=self.my_entity_id,
+                        successful_tensor_ids=tensor_names,
+                        failed_tensor_ids=[],
+                    ),
+                ),
+            )
+
         return ready
 
     def start_read_tensors(
