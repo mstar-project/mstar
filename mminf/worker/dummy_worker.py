@@ -5,7 +5,8 @@ from mminf.communication.tensors import MooncakeCommunicationManager
 from mminf.model.base import Subgraph
 from mminf.ipc_formats import (
     ConductorMessage, ConductorMessageType, InputSignals,
-    NewRequest, RemoveRequest, SubgraphsDone, WorkerMessage, WorkerMessageType
+    NewRequest, RemoveRequest, SubgraphsDone, TensorReceived,
+    WorkerMessage, WorkerMessageType,
 )
 from mminf.worker.stage_manager_utils import (
     StageOutputRouting, SubgraphQueues, SubgraphsManager,
@@ -84,6 +85,12 @@ class DummyWorker:
         just completed
         """
         self.subgraphs_manager.remove_request(body.request_id)
+        self.tensor_manager.cleanup_request(body.request_id)
+
+    def _handle_tensor_received(self, body: TensorReceived):
+        """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
+        for tensor_name in body.successful_tensor_ids:
+            self.tensor_manager.cleanup(body.request_id, tensor_name)
 
     def _process_new_inputs(
         self, body: InputSignals
@@ -113,7 +120,8 @@ class DummyWorker:
                 self._remove_request(message.body)
             elif message.message_type == WorkerMessageType.INPUT_SIGNALS:
                 self._process_new_inputs(message.body)
-            # TODO: handle the tensor_received message
+            elif message.message_type == WorkerMessageType.TENSOR_RECEIVED:
+                self._handle_tensor_received(message.body)
 
     def _send_outputs(
         self,

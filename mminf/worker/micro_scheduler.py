@@ -7,6 +7,14 @@ from mminf.worker.stage_manager_utils import SubgraphsManager
 
 
 @dataclass
+class ReadyStageEntry:
+    """A ready stage entry for a single request."""
+    request_id: str
+    subgraph_id: str
+    phase: str
+
+
+@dataclass
 class ScheduledBatch:
     """A batch of stages ready to be executed."""
     stage_name: str
@@ -42,7 +50,7 @@ class MicroScheduler:
         """
         # Collect all ready (stage_name, request_id, phase) tuples
         # grouped by stage name
-        stage_name_to_requests: dict[str, list[tuple[str, str, str]]] = {}
+        stage_name_to_requests: dict[str, list[ReadyStageEntry]] = {}
 
         for subgraph_id, queue in subgraphs_manager.queues.items():
             ready_map = queue.get_ready_stage_names()
@@ -50,7 +58,7 @@ class MicroScheduler:
                 phase = subgraphs_manager.get_phase(request_id)
                 for sname in stage_names:
                     stage_name_to_requests.setdefault(sname, []).append(
-                        (request_id, subgraph_id, phase)
+                        ReadyStageEntry(request_id, subgraph_id, phase)
                     )
 
         if not stage_name_to_requests:
@@ -76,15 +84,15 @@ class MicroScheduler:
         entries = stage_name_to_requests[best_stage_name]
         request_ids = []
         all_stages = []
-        phase = entries[0][2]  # all entries for same stage share the phase
+        phase = entries[0].phase
 
-        for request_id, subgraph_id, req_phase in entries:
-            queue = subgraphs_manager.queues[subgraph_id]
-            popped = queue.pop_ready_stages(request_id, [best_stage_name])
+        for entry in entries:
+            queue = subgraphs_manager.queues[entry.subgraph_id]
+            popped = queue.pop_ready_stages(entry.request_id, [best_stage_name])
             if popped:
-                request_ids.append(request_id)
+                request_ids.append(entry.request_id)
                 all_stages.extend(popped)
-                phase = req_phase
+                phase = entry.phase
 
         if not request_ids:
             return None
