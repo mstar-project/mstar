@@ -187,7 +187,7 @@ class Worker:
         """Free input tensors that were consumed by the just-executed stage."""
         for request_id, stage in batch.stage_objects.items():
             for input in stage.ready_inputs.values():
-                if not input._persist_for_loop:
+                if not (input._persist_for_loop or input.back_to_conductor):
                     self.tensor_manager.cleanup(
                         request_id, input.name,
                         [info.uuid for info in input.tensor_info]
@@ -298,8 +298,7 @@ class Worker:
 
             # 6. Route outputs through SubgraphsManager first to determine routing
             routing_per_request: dict[str, StageOutputRouting] = {}
-            for i, request_id in enumerate(batch.request_ids):
-                stage = batch.stages[i] if i < len(batch.stages) else batch.stages[0]
+            for request_id,stage in batch.stage_objects.items():
                 routing = self.subgraphs_manager.process_stage_outputs(
                     request_id, stage.outputs
                 )
