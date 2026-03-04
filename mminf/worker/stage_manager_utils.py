@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 from mminf.graph.base import GraphPointer, GraphStage
 from mminf.graph.request_queues import PerRequestStageQueues, ProcessedInputs
-from mminf.model.base import SPECIAL_DESTINATIONS, Subgraph
+from mminf.model.base import SPECIAL_DESTINATIONS, STREAM_OUT, Subgraph
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,7 @@ class StageOutputRouting:
     to_conductor: list[GraphPointer] # outputs that are going back to the conductor
     to_workers: dict[str, list[GraphPointer]] # worker id to signals
     completed_subgraphs: list[str] = field(default_factory=list)  # list of subgraph IDs
+    stream_out: list[GraphPointer] = field(default_factory=list)
 
 
 @dataclass
@@ -208,12 +209,15 @@ class SubgraphsManager:
         # (e.g., concat_text outputs text_emb -> LLM with back_to_conductor=True),
         # so we do NOT filter on back_to_conductor here.
         to_workers: dict[str, list[GraphPointer]] = {}
+        stream_out: list[GraphPointer] = []
         for ptr in external_outputs:
             stage_phase = StageAndPhase(
                 stage=ptr.next_stage, phase=self.get_phase(request_id)
             )
             if stage_phase not in self.per_request_info[request_id].stage_to_worker:
                 if ptr.next_stage in SPECIAL_DESTINATIONS:
+                    if ptr.next_stage == STREAM_OUT:
+                        stream_out.append(ptr)
                     continue  # e.g., stream_out — already captured in to_conductor
                 raise ValueError(
                     f"Output pointer targets unknown stage/phase: {stage_phase}. "
@@ -228,6 +232,7 @@ class SubgraphsManager:
             routed_to_this_subgraph=routed_to_this_worker,
             to_conductor=to_conductor,
             to_workers=to_workers,
+            stream_out=stream_out,
             completed_subgraphs=completed_subgraphs
         )
 

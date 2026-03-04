@@ -62,16 +62,16 @@ class PreprocessWorker:
 
     def new_request(self, input: PreprocessInput):
         self.request_input_queue.put(input)
-    
+
     def new_result_tensors(self, input: ResultTensors):
         self.request_input_queue.put(input)
-    
+
     def get_result_chunks(self)-> list[ResultChunk]:
         results = []
         while not self.output_queue.empty():
             results.append(self.output_queue.get())
         return results
-    
+
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
 
@@ -186,7 +186,7 @@ class PreprocessWorkerThread:
             ),
         )
         self.communicator.send("conductor", msg)
-    
+
     def _read_result_tensor(
         self, result: ResultTensors
     ):
@@ -200,7 +200,7 @@ class PreprocessWorkerThread:
         for tensor_info in result.graph_edge.tensor_info:
             self.tensor_uuid_to_metadata_per_request[result.request_id][
                 tensor_info.uuid] = result.metadata
-    
+
 
     def _process_read_tensors(self):
         for request_id, graph_edges in self.tensor_manager.get_ready_tensors().items():
@@ -242,5 +242,5 @@ class PreprocessWorkerThread:
                 self.tensor_manager.cleanup_request(req_id)
                 del self.tensor_uuid_to_metadata_per_request[req_id]
             self._process_read_tensors()
-            
+
             time.sleep(0.001)

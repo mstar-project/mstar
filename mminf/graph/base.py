@@ -38,6 +38,8 @@ class GraphPointer:
     # Flags
     back_to_conductor: bool = field(default=False)
     is_new_token: bool = field(default=False)
+    # only for STREAM_OUT
+    output_modality: str = field(default="") # text | image | video | audio
     _persist_for_loop: bool = field(default=False)
 
 # Two different ways of defining graph edges

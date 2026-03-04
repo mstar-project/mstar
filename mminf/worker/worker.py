@@ -1,5 +1,6 @@
 import torch
 
+from mminf.api_server.entrypoint import APIServerMessage, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.engine.base import StageBatch, StageOutput
@@ -241,7 +242,11 @@ class Worker:
 
             routing = routing_per_request[request_id]
             seen_uuids = set()
-            for ptr in routing.to_conductor + sum(routing.to_workers.values(), start=[]):
+            for ptr in (
+                routing.to_conductor + \
+                sum(routing.to_workers.values(), start=[]) + \
+                routing.stream_out
+            ):
                 uuids = [
                     info.uuid for info in ptr.tensor_info \
                         if info.uuid not in seen_uuids
@@ -279,6 +284,19 @@ class Worker:
             self.subgraphs_manager.buffer_persist_signals(
                 request_id, outputs.to_conductor
             )
+
+        if outputs.stream_out:
+            for graph_edge in outputs.stream_out:
+                message = APIServerMessage(
+                    message_type="result_chunk",
+                    body=ResultTensors(
+                        request_id=request_id,
+                        modality=graph_edge.output_modality,
+                        graph_edge=graph_edge,
+                        metadata={}
+                    )
+                )
+                self.communicator.send("api_server", message)
 
         if outputs.completed_subgraphs:
             message = ConductorMessage(

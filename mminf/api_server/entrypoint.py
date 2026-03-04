@@ -67,7 +67,7 @@ class ResultTensors:
     format (e.g. PNG encoding for images).
     """
     request_id: str
-    modality: str 
+    modality: str
     graph_edge: GraphPointer
     metadata: dict = field(default_factory=dict)
 
