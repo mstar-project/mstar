@@ -21,6 +21,7 @@ from starlette.concurrency import run_in_threadpool
 
 from mminf.api_server.data_worker import PreprocessInput, PreprocessWorker
 from mminf.communication.communicator import ZMQCommunicator
+from mminf.graph.base import GraphPointer
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,19 @@ class ResultChunk:
 
 
 @dataclass
+class ResultTensors:
+    """
+    For now, expect the tensor to be pure bytes, and the model
+    handles the postprocessing to convert it to the appropriate
+    format (e.g. PNG encoding for images).
+    """
+    request_id: str
+    modality: str 
+    graph_edge: GraphPointer
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
 class RequestComplete:
     """Signals that a request has finished processing."""
     request_id: str
@@ -68,7 +82,7 @@ class RequestComplete:
 class APIServerMessage:
     """Envelope for messages received by the API server."""
     message_type: str  # "result_chunk" | "request_complete"
-    body: ResultChunk | RequestComplete
+    body: ResultTensors | RequestComplete
 
 
 # ------------------------------------------------------------------
@@ -202,6 +216,7 @@ class APIServer:
             if now - ts > self._recently_completed_ttl
         ]
         for rid in stale:
+            self.preprocess_worker.cleanup_request(rid)
             self.recently_completed.pop(rid, None)
 
     def _process_messages(self) -> None:
@@ -217,10 +232,9 @@ class APIServer:
 
                     with self.request_lock:
                         self._prune_recently_completed()
-
                         if rid in self.pending_requests:
                             if message.message_type == "result_chunk":
-                                self.pending_requests[rid]["chunks"].append(
+                                self.preprocess_worker.new_result_tensors(
                                     message.body
                                 )
                             elif message.message_type == "request_complete":
@@ -232,6 +246,11 @@ class APIServer:
                             logger.warning(
                                 "Message for unknown request %s", rid
                             )
+                for result_chunk in self.preprocess_worker.get_result_chunks():
+                    rid = result_chunk.request_id
+                    self.pending_requests[rid]["chunks"].append(
+                        result_chunk
+                    )
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")

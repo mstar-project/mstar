@@ -10,8 +10,9 @@ import torchaudio
 import torchvision
 from torchcodec.decoders import VideoDecoder
 
+from mminf.api_server.entrypoint import ResultChunk, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
-from mminf.communication.tensors import MooncakeCommunicationManager
+from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.ipc_formats import ConductorMessage, ConductorMessageType, NewRequestConductor
 
 
@@ -40,14 +41,18 @@ class PreprocessWorker:
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
     ):
         self.request_input_queue = queue.Queue()
-        self.request_output_queue = queue.Queue()
+        self.result_tensor_input_queue = queue.Queue()
+        self.cleanup_request_queue = queue.Queue()
+        self.output_queue = queue.Queue()
         self.stop_event = threading.Event()
 
         self.thread = threading.Thread(
             target=_preprocess_loop,
             kwargs=dict(
                 in_queue=self.request_input_queue,
-                out_queue=self.request_output_queue,
+                result_tensor_queue=self.result_tensor_input_queue,
+                out_queue=self.output_queue,
+                cleanup_request_queue=self.cleanup_request_queue,
                 stop_event=self.stop_event,
                 hostname=hostname,
                 socket_path_prefix=socket_path_prefix,
@@ -57,6 +62,18 @@ class PreprocessWorker:
 
     def new_request(self, input: PreprocessInput):
         self.request_input_queue.put(input)
+    
+    def new_result_tensors(self, input: ResultTensors):
+        self.request_input_queue.put(input)
+    
+    def get_result_chunks(self)-> list[ResultChunk]:
+        results = []
+        while not self.output_queue.empty():
+            results.append(self.output_queue.get())
+        return results
+    
+    def cleanup_request(self, request_id: str):
+        self.cleanup_request_queue.put(request_id)
 
     def shutdown(self):
         self.stop_event.set()
@@ -67,7 +84,9 @@ class PreprocessWorkerThread:
     def __init__(
         self,
         in_queue: queue.Queue, # for preprocessing
-        out_queue: queue.Queue, # for output streaming
+        result_tensor_queue: queue.Queue, # for output streaming
+        out_queue: queue.Queue,
+        cleanup_request_queue: queue.Queue,
         stop_event: threading.Event,
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
@@ -75,9 +94,14 @@ class PreprocessWorkerThread:
         device: str = "cpu",
     ):
         self.in_queue = in_queue
-        self.out_queue = out_queue # unused at the moment
+        self.result_tensor_queue = result_tensor_queue
+        self.cleanup_request_queue = cleanup_request_queue
+        self.out_queue = out_queue
+
         self.stop_event = stop_event
         self.device = device
+
+        self.tensor_uuid_to_metadata_per_request = {}
 
         self.communicator = ZMQCommunicator(
             my_id="api_server_preprocess_worker",
@@ -92,11 +116,10 @@ class PreprocessWorkerThread:
             protocol=tensor_comm_protocol,
         )
 
-
-    def process_input(
+    def _process_input(
         self, input: PreprocessInput
     ):
-        tensors = {}
+        tensors: NameToTensorList = {}
         input_metadata = {}
         # now everything is a list of tensors, even if there's only a single entry
         if input.text is not None:
@@ -163,9 +186,61 @@ class PreprocessWorkerThread:
             ),
         )
         self.communicator.send("conductor", msg)
+    
+    def _read_result_tensor(
+        self, result: ResultTensors
+    ):
+        result.graph_edge.name = f"{result.modality}_output"
+        self.tensor_manager.start_read_tensors(
+            request_id=result.request_id,
+            graph_pointers=[result.graph_edge]
+        )
+        if result.request_id not in self.tensor_uuid_to_metadata_per_request:
+            self.tensor_uuid_to_metadata_per_request[result.request_id] = {}
+        for tensor_info in result.graph_edge.tensor_info:
+            self.tensor_uuid_to_metadata_per_request[result.request_id][
+                tensor_info.uuid] = result.metadata
+    
+
+    def _process_read_tensors(self):
+        for request_id, graph_edges in self.tensor_manager.get_ready_tensors().items():
+            assert len(graph_edges) == 1
+            graph_edge = graph_edges[0]
+            modality = graph_edge.name.replace("_output", "")
+
+            uuids = []
+            for tensor_info in graph_edge.tensor_info:
+                tensor = self.tensor_manager.get_tensor(
+                    request_id=request_id,
+                    tensor_name=graph_edge.name,
+                    uuid=tensor_info.uuid
+                )
+                uuids.append(tensor_info.uuid)
+                self.out_queue.put(ResultChunk(
+                    request_id=request_id,
+                    modality=modality,
+                    data=tensor.numpy().tobytes(),
+                    metadata=self.tensor_uuid_to_metadata_per_request[request_id][
+                        tensor_info.uuid]
+                ))
+                del self.tensor_uuid_to_metadata_per_request[request_id][
+                    tensor_info.uuid]
+            self.tensor_manager.cleanup(
+                request_id=request_id,
+                tensor_name=graph_edge.name,
+                uuids=uuids
+            )
 
     def run(self):
         while not self.stop_event.is_set():
             if not self.in_queue.empty():
-                self.process_input(self.in_queue.get())
+                self._process_input(self.in_queue.get())
+            if not self.result_tensor_queue.empty():
+                self._read_result_tensor(self.result_tensor_queue.get())
+            if not self.cleanup_request_queue.empty():
+                req_id = self.cleanup_request_queue.get()
+                self.tensor_manager.cleanup_request(req_id)
+                del self.tensor_uuid_to_metadata_per_request[req_id]
+            self._process_read_tensors()
+            
             time.sleep(0.001)
