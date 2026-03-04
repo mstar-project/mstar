@@ -19,17 +19,56 @@ class NameAndRequestId:
     request_id: str
 
 
-# @dataclass
-# class GraphPtrAndLocalAddr:
-#     graph_pointer: GraphPointer
-#     local_address: int
-
-
 @dataclass
 class EventAndPointers:
     event: torch.cuda.Event
     pointers: list[GraphPointer]
     request_id: str = ""
+
+
+UuidToTensor = dict[str, torch.Tensor]
+
+class TensorStore:
+    def __init__(self):
+        self.stored_tensors: dict[NameAndRequestId, UuidToTensor]
+    
+    def get_first_tensor(self, request_id: str, name: str):
+        return list(self.stored_tensors[NameAndRequestId(
+            tensor_name=name, request_id=request_id
+        )].values())[0]
+    
+    def get_tensor(self, request_id: str, name: str, uuid: str):
+        return self.stored_tensors[NameAndRequestId(
+            tensor_name=name, request_id=request_id
+        )][uuid]
+    
+    def put_tensor(self, request_id: str, name: str, uuid: str, tensor: torch.Tensor):
+        key = NameAndRequestId(
+            tensor_name=name, request_id=request_id
+        )
+        if key not in self.stored_tensors:
+            self.stored_tensors[key] = {}
+        self.stored_tensors[key][uuid] = tensor
+    
+    def check_uuid_presence(self, request_id: str, name: str, uuid: str):
+        return uuid in self.stored_tensors.get(NameAndRequestId(
+            tensor_name=name, request_id=request_id
+        ), {})
+    
+    def check_name_presence(self, request_id: str, name: str):
+        return NameAndRequestId(
+            tensor_name=name, request_id=request_id
+        ) in self.stored_tensors
+    
+    def remove_tensor(self, request_id: str, name: str, uuid: str):
+        del self.stored_tensors[NameAndRequestId(
+            tensor_name=name, request_id=request_id
+        )][uuid]
+    
+    def get_all_uuids(self, request_id: str, name: str):
+        return list(self.stored_tensors[NameAndRequestId(
+            tensor_name=name, request_id=request_id
+        )].keys())
 
 
 class TensorCommunicationManager(ABC):
@@ -116,7 +155,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 
         # internal dict is uuid to tensor. this is morally the list of tensors
         # that we keep as a dict for easy indexing
-        self.tensors: dict[NameAndRequestId, dict[str, torch.Tensor]] = {}
+        self.tensor_store = TensorStore()
 
         self.communicator = communicator
         self.protocol = protocol
@@ -140,16 +179,15 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
     ) -> dict[str, list[TensorPointerInfo]]: # name to list[tensorPointerInfo]
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name in tensors:
-            name_and_req_id = NameAndRequestId(
-                name, request_id=request_id
-            )
             tensor_info[name] = []
-            # self.tensors[name_and_req_id] is uuid to tensor
-            self.tensors[name_and_req_id] = self.tensors.get(name_and_req_id, {})
-
             for tensor in tensors[name]:
                 tensor_uuid = str(uuid4())
-                self.tensors[name_and_req_id][tensor_uuid] = tensor
+                self.tensor_store.put_tensor(
+                    request_id=request_id,
+                    name=name,
+                    uuid=tensor_uuid,
+                    tensor=tensor
+                )
                 new_tensor_info = TensorPointerInfo(
                     dims=tensor.shape,
                     dtype=tensor.dtype,
@@ -186,57 +224,64 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             request_id=request_id, tensors=tensors
         )
         for name in tensors:
-            pointer.tensor_info = pointer_info[name]
-            
+            for pointer in name_to_pointers.get(name, []):
+                pointer.tensor_info = pointer_info[name]
+
+    def _cleanup_by_uuid(
+        self, request_id: str, tensor_name: str, uuid: str
+    ):
+        req_id_name_uuid = dict(
+            request_id=request_id, name=tensor_name, uuid=uuid
+        )
+        if not self.tensor_store.check_uuid_presence(**req_id_name_uuid):
+            return
+        if self.protocol == CommProtocol.RDMA and self.engine is not None:
+            ret_value = self.engine.unregister_memory(
+                self.tensor_store.get_tensor(**req_id_name_uuid).data_ptr()
+            )
+            if ret_value != 0:
+                raise RuntimeError("Mooncake memory unregistration failed.")
+        self.tensor_store.remove_tensor(**req_id_name_uuid)
+
     def cleanup(self, request_id: str, tensor_name: str, uuids: list[str] | None=None):
-        key = NameAndRequestId(tensor_name, request_id)
-        if key not in self.tensors:
+        if not self.tensor_store.check_name_presence(
+            request_id=request_id, name=tensor_name
+        ):
             return
         
         # By default, cleanup all tensors with the given key, unless the address
         # argument is provided
         if uuids is None:
-            uuids = list(self.tensors[key].keys())
-
+            uuids = self.tensor_store.get_all_uuids(
+                request_id=request_id, name=tensor_name
+            )
         for uuid in uuids:
-            if uuid not in self.tensors[key]:
-                continue
-            if self.protocol == CommProtocol.RDMA and self.engine is not None:
-                ret_value = self.engine.unregister_memory(
-                    self.tensors[key][uuid].data_ptr()
-                )
-                if ret_value != 0:
-                    raise RuntimeError("Mooncake memory unregistration failed.")
-            del self.tensors[key][uuid]
+            self._cleanup_by_uuid(request_id, tensor_name, uuid)
 
     def cleanup_request(self, request_id: str):
-        keys_to_remove = [
-            name_and_req_id for name_and_req_id in self.tensors \
-                if name_and_req_id.request_id == request_id
+        names_to_remove = [
+            key.tensor_name for key in self.tensor_store.stored_tensors \
+                if key.request_id == request_id
         ]
-        for name_and_req_id in keys_to_remove:
-            for tensor in self.tensors[name_and_req_id].values(): # uuid to tensor
-                if self.protocol == CommProtocol.RDMA and self.engine is not None:
-                    self.engine.unregister_memory(tensor.data_ptr())
-            del self.tensors[name_and_req_id] # this is already unregistered
+    
+        for name in names_to_remove:
+            for uuid in self.tensor_store.get_all_uuids(
+                request_id=request_id, name=name
+            ):
+                self._cleanup_by_uuid(request_id, name, uuid)
         # Also remove any pending transfers for this request
         self.pending = [
             ep for ep in self.pending if ep.request_id != request_id
         ]
 
     def get_tensor(self, request_id: str, tensor_name: str, uuid: str=None) -> torch.Tensor:
-        # It is the burden of the worker to access the correct uuid.
-        # For now (in our default non-thinker-talker request flow), we assume
-        #  that the element of self.tensors is a singleton; this is ensured by
-        # worker.py -> _cleanup_consumed_inputs.
-
         if uuid is None:
-            uuid = list(self.tensors[NameAndRequestId(
-                tensor_name, request_id
-            )].keys())[0] # in modern Python, this is the oldest element of the dict
-        return self.tensors[NameAndRequestId(
-            tensor_name, request_id
-        )][uuid]
+            return self.tensor_store.get_first_tensor(
+                request_id=request_id, name=tensor_name
+            )
+        return self.tensor_store.get_tensor(
+            request_id=request_id, name=tensor_name, uuid=uuid
+        )
 
     def get_ready_tensors(self) -> dict[str, list[GraphPointer]]:
         """
@@ -245,10 +290,10 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         Sends TENSOR_RECEIVED ACKs back to senders so they can free buffers.
         """
 
+        # request_id -> ready graph pointers
         ready: dict[str, list[GraphPointer]] = {}
         still_pending = []
-        # Collect ACKs to send: (source_entity, request_id) -> tensor_names and
-        # **remote (not local) address**
+        # Collect ACKs to send: (source_entity, request_id) -> tensor_names
         acks: dict[tuple[str, str], list[NameAndUuid]] = {}
 
         for ep in self.pending:
@@ -259,9 +304,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         key = (ptr.tensor_info.source_entity, ep.request_id)
                         acks.setdefault(key, []).extend([
                             NameAndUuid(
-                            tensor_id=ptr.name,
-                            uuid=tensor_info.uuid
-                        ) for tensor_info in ptr.tensor_info])
+                                tensor_id=ptr.name,
+                                uuid=tensor_info.uuid
+                            ) for tensor_info in ptr.tensor_info])
             else:
                 still_pending.append(ep)
         self.pending = still_pending
@@ -286,26 +331,23 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 
     def start_read_tensors(
         self, request_id: str, graph_pointers: list[GraphPointer]
-    ) -> list[int]:
+    ):
         """
         For each pointer with tensor_info (RDMA source): allocate dst tensor,
         register memory, call engine.transfer_read_on_cuda(), record CUDA event.
         For each pointer WITHOUT tensor_info (signal-only): no data to transfer.
-
-        Returns a list of local addresses for the tensors being read.
         """
         stream = torch.cuda.Stream()
-        addrs = []
         for graph_ptr in graph_pointers:
             if len(graph_ptr.tensor_info) == 0:
                 continue  # signal-only pointer, no data to transfer
 
             for info in graph_ptr.tensor_info:
                 buffer = torch.empty(info.dims, dtype=info.dtype, device="cuda")
-                addrs.append(buffer.data_ptr())
-                self.tensors[NameAndRequestId(
-                    graph_ptr.name, request_id
-                )][info.uuid] = buffer
+                self.tensor_store.put_tensor(
+                    request_id=request_id, name=graph_ptr.name,
+                    uuid=info.uuid, tensor=buffer
+                )
 
                 if self.protocol == CommProtocol.RDMA:
                     self.engine.register_memory(buffer.data_ptr(), info.nbytes)
@@ -326,4 +368,3 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     event=event, pointers=[graph_ptr], request_id=request_id
                 )
             )
-        return addrs

@@ -9,7 +9,7 @@ from mminf.graph.base import (
 
 @dataclass
 class ProcessedInputs:
-    routed_to_this_subgraph: set[str]
+    routed_to_this_subgraph: list[GraphPointer]
     for_other_subgraphs: list[GraphPointer]
 
 
@@ -46,7 +46,7 @@ class PerRequestStageQueues:
         """
         if self.waiting is None:
             return ProcessedInputs(
-                routed_to_this_subgraph=set(),
+                routed_to_this_subgraph=[],
                 for_other_subgraphs=new_inputs,
             )
 

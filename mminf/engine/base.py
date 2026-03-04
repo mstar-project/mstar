@@ -18,16 +18,18 @@ class StageBatch:
     stage_name: str
     phase: str
     request_ids: list[str]
-    # {request_id: {input_name: tensor}}
-    per_request_input_tensors: dict[str, dict[str, torch.Tensor]]
+
+    # {request_id: {input_name: list[tensor]}}
+    # TODO: refactor how the engine handles per_request_input_tensors now that it's a list
+    per_request_input_tensors: dict[str, dict[str, list[torch.Tensor]]]
     metadata: dict = field(default_factory=dict)
 
 
 @dataclass
 class StageOutput:
     """Output from an engine's execute_batch()."""
-    # {request_id: {output_name: tensor}}
-    per_request_output_tensors: dict[str, dict[str, torch.Tensor]]
+    # {request_id: {output_name: [tensor]}}
+    per_request_output_tensors: dict[str, dict[str, list[torch.Tensor]]]
     # {request_id: engine-specific metadata (e.g., generated token id)}
     per_request_metadata: dict[str, dict] = field(default_factory=dict)
 

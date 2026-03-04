@@ -17,7 +17,7 @@ class StageAndPhase:
 
 @dataclass
 class StageOutputRouting:
-    routed_to_this_subgraph: set[str] # set of tensor ids
+    routed_to_this_subgraph:list[GraphPointer]
     to_conductor: list[GraphPointer] # outputs that are going back to the conductor
     to_workers: dict[str, list[GraphPointer]] # worker id to signals
     completed_subgraphs: list[str] = field(default_factory=[])  # list of subgraph IDs
@@ -184,7 +184,7 @@ class SubgraphsManager:
         subgraph_ids = self.per_request_info[request_id].phase_subgraph_ids
 
         completed_subgraphs = []
-        routed_to_this_subgraph = set()
+        routed_to_this_subgraph = []
         for subgraph_id in subgraph_ids:
             queue = self.queues[subgraph_id]
             # process_new_inputs consumes outputs that are used as
@@ -192,7 +192,7 @@ class SubgraphsManager:
             # were not consumed
             processed_inputs = queue.process_new_inputs(request_id, outputs)
             outputs = processed_inputs.for_other_subgraphs
-            routed_to_this_subgraph.update(processed_inputs.routed_to_this_subgraph)
+            routed_to_this_subgraph += processed_inputs.routed_to_this_subgraph
             if queue.is_done(request_id):
                 completed_subgraphs.append(subgraph_id)
                 queue.reset(request_id)

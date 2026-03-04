@@ -75,13 +75,13 @@ class GraphSection(ABC):
         pass
 
     @abstractmethod
-    def ingest_inputs(self, stage_to_inputs: DestToGraphPointers) -> set[str]:
+    def ingest_inputs(self, stage_to_inputs: DestToGraphPointers) -> list[GraphPointer]:
         """
         Adds inputs to the appropriate "ready_input_ids", and **mutates
         stage_to_inputs** to remove the inputs that were able to be added
         to the "ready_input_ids".
 
-        Returns a set of the input tensors that were added to ready_input_ids.
+        Returns the inputs that were added to ready_input_ids.
         """
         pass
 
@@ -101,15 +101,16 @@ class GraphStage(GraphSection):
     outputs: list[GraphPointer]
     consumes_stream: bool = field(default=False)
 
-    # populated as previous stages complete
-    ready_input_ids: set[str] = field(default_factory=set)
+    # Populated as previous stages complete
+    # This will also include, e.g., tensor UUIDs associated with these inputs
+    ready_inputs: dict[str, GraphPointer] # name -> graph edge
 
     def __post_init__(self):
         # if the user inputs, e.g., a list, turn it into a set
         self.input_ids = set(self.input_ids)
     
     def is_ready(self):
-        return self.input_ids.issubset(self.ready_input_ids)
+        return self.input_ids.issubset(set(self.ready_inputs.keys()))
     
     def get_stage_names(self) -> list[str]:
         return [self.name]
@@ -126,20 +127,20 @@ class GraphStage(GraphSection):
         if self.name not in stage_to_inputs:
             return set()
 
-        ingested_ids = set([
-            ptr.name for ptr in stage_to_inputs[self.name] \
-                if ptr.name in self.input_ids and ptr.name not in self.ready_input_ids
-        ]) # ingest ids that this stage takes in, and are not already ready
-        self.ready_input_ids.update(ingested_ids)
+        ingested = {
+            ptr.name: ptr for ptr in stage_to_inputs[self.name] \
+                if ptr.name in self.input_ids and ptr.name not in self.ready_inputs
+        } # ingest ids that this stage takes in, and are not already ready
+        self.ready_inputs.update(ingested)
 
         # remove the ingested ids from the stage_to_inputs
         stage_to_inputs[self.name] = [
             ptr for ptr in stage_to_inputs[self.name] \
-                if ptr.name not in ingested_ids
+                if ptr.name not in ingested
         ]
         if len(stage_to_inputs[self.name]) == 0:
             del stage_to_inputs[self.name]
-        return ingested_ids
+        return list(ingested.values())
 
     def split_off_ready(self):
         if self.is_ready():
@@ -186,9 +187,9 @@ class Sequential(GraphSection):
         return self._get_inputs_outputs()[1]
     
     def ingest_inputs(self, stage_to_inputs: DestToGraphPointers):
-        ingested = set()
+        ingested = []
         for s in self.sections:
-            ingested.update(s.ingest_inputs(stage_to_inputs))
+            ingested += s.ingest_inputs(stage_to_inputs)
         return ingested
     
     def split_off_ready(self):
@@ -224,9 +225,9 @@ class Parallel(GraphSection):
         )
     
     def ingest_inputs(self, stage_to_inputs: DestToGraphPointers):
-        ingested = set()
+        ingested = []
         for s in self.sections:
-            ingested.update(s.ingest_inputs(stage_to_inputs))
+            ingested += s.ingest_inputs(stage_to_inputs)
         return ingested
 
     def split_off_ready(self):
@@ -268,11 +269,9 @@ class Loop(GraphSection):
         # Populate the current iteration first, then populate the next iteration
         # if there are any leftover inputs (which would signal either inputs that
         # are not for this section, or loop-back inputs)
-        ingested = set()
+        ingested = []
         if self.curr_iter_section is not None:
-            ingested.update(
-                self.curr_iter_section.ingest_inputs(stage_to_inputs)
-            )
+            ingested += self.curr_iter_section.ingest_inputs(stage_to_inputs)
 
         # we should only be populating the nxt_iter_section with loop-back inputs,
         # so exclude external inputs from populating nxt_iter_section. This logic
@@ -291,9 +290,7 @@ class Loop(GraphSection):
                     if i not in external_inputs[dest]
             ]
 
-        ingested.update(
-            self.nxt_iter_section.ingest_inputs(stage_to_inputs)
-        )
+        ingested += self.nxt_iter_section.ingest_inputs(stage_to_inputs)
         update_list_dicts(stage_to_inputs, external_inputs)
         return ingested
 

@@ -94,7 +94,7 @@ class Worker:
 
         # Signal-only pointers (tensor_info is None) can be processed immediately
         signal_only = [
-            ptr for ptr in body.initial_inputs if ptr.tensor_info is None
+            ptr for ptr in body.initial_inputs if len(ptr.tensor_info) == 0
         ]
         if signal_only:
             self.subgraphs_manager.process_new_inputs(
@@ -108,10 +108,10 @@ class Worker:
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
-        for name_addr in body.successful_tensors:
+        for name_uuid in body.successful_tensors:
             self.tensor_manager.cleanup(
-                body.request_id, name_addr.tensor_id,
-                name_addr.address
+                body.request_id, name_uuid.tensor_id,
+                [name_uuid.uuid]
             )
 
     def _process_new_inputs(self, body: InputSignals) -> None:
@@ -124,7 +124,7 @@ class Worker:
         )
 
         # Signal-only pointers can be processed immediately
-        signal_only = [ptr for ptr in body.inputs if ptr.tensor_info is None]
+        signal_only = [ptr for ptr in body.inputs if len(ptr.tensor_info) == 0]
         if signal_only:
             self.subgraphs_manager.process_new_inputs(
                 request_id=body.request_id, inputs=signal_only
@@ -150,7 +150,7 @@ class Worker:
         ready = self.tensor_manager.get_ready_tensors()
         for request_id, pointers in ready.items():
             self.subgraphs_manager.process_new_inputs(
-                request_id=request_id, inputs=[p.graph_pointer for p in pointers]
+                request_id=request_id, inputs=pointers
             )
 
     # ------------------------------------------------------------------
@@ -159,15 +159,19 @@ class Worker:
 
     def _build_stage_batch(self, batch: ScheduledBatch) -> StageBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
-        per_request_inputs: dict[str, dict[str, torch.Tensor]] = {}
+        per_request_inputs: dict[str, dict[str, list[torch.Tensor]]] = {}
 
         for i, request_id in enumerate(batch.request_ids):
             stage = batch.stages[i] if i < len(batch.stages) else batch.stages[0]
+
             tensors = {}
-            for input_name in stage.input_ids:
-                key = NameAndRequestId(input_name, request_id)
-                if key in self.tensor_manager.tensors:
-                    tensors[input_name] = self.tensor_manager.tensors[key]
+            for input_name in stage.ready_inputs:
+                tensors[input_name] = [
+                    self.tensor_manager.get_tensor(
+                        request_id=request_id, tensor_name=input_name,
+                        uuid=info.uuid
+                    ) for info in stage.ready_inputs[input_name].tensor_info
+                ]
             per_request_inputs[request_id] = tensors
 
         return StageBatch(
@@ -185,12 +189,11 @@ class Worker:
         """Free input tensors that were consumed by the just-executed stage."""
         for i, request_id in enumerate(batch.request_ids):
             stage = batch.stages[i] if i < len(batch.stages) else batch.stages[0]
-            for input_name in stage.input_ids:
-                # By default, we are cleaning up all tensors with a given input_name,
-                # as we expect the corresponding element of self.tensor_manager.tensors
-                # to be a singleton dict for now. This needs to be changed when
-                # implementing, e.g., thinker -> talker relay
-                self.tensor_manager.cleanup(request_id, input_name)
+            for input in stage.ready_inputs.values():
+                self.tensor_manager.cleanup(
+                    request_id, input.name,
+                    [info.uuid for info in input.tensor_info]
+                )
 
     # ------------------------------------------------------------------
     # Output handling
@@ -212,15 +215,17 @@ class Worker:
 
         for i, request_id in enumerate(batch.request_ids):
             stage = batch.stages[i] if i < len(batch.stages) else batch.stages[0]
+            # output name to list of tensors
             request_output_tensors = output.per_request_output_tensors.get(
                 request_id, {}
             )
 
-            # Store all output tensors locally
-            for tensor_name, tensor in request_output_tensors.items():
-                self.tensor_manager.tensors[
-                    NameAndRequestId(tensor_name, request_id)
-                ] = tensor
+            # TODO: we don't have to do the actual RDMA registration for these internal inputs
+            self.tensor_manager.register_and_populate_graph_edges(
+                request_id=request_id,
+                tensors=request_output_tensors,
+                graph_pointers=stage.ready_inputs
+            )
 
             routing = routing_per_request[request_id]
 
@@ -232,13 +237,15 @@ class Worker:
             if external_pointers and request_output_tensors:
                 # Filter to only tensors that actually go external
                 external_names = {ptr.name for ptr in external_pointers}
+
+                # name -> list of tensors
                 external_tensors = {
-                    name: t for name, t in request_output_tensors.items()
+                    name: tensors for name, tensors in request_output_tensors.items()
                     if name in external_names
                 }
                 if external_tensors:
                     self.tensor_manager.register_and_populate_graph_edges(
-                        request_id, {name: [tensor] for name, tensor in external_tensors.items()}, external_pointers
+                        request_id, external_tensors, external_pointers
                     )
 
             output_pointers[request_id] = stage.outputs
