@@ -238,7 +238,7 @@ class Worker:
 
             routing = routing_per_request[request_id]
             seen_uuids = set()
-            for ptr in routing.to_conductor + list(routing.to_workers.values()):
+            for ptr in routing.to_conductor + sum(routing.to_workers.values(), start=[]):
                 uuids = [
                     info.uuid for info in ptr.tensor_info \
                         if info.uuid not in seen_uuids
