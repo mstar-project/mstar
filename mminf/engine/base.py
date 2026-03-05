@@ -42,12 +42,38 @@ class BaseEngine(ABC):
         ...
 
     @abstractmethod
-    def load_model(self, model_config: dict, device: torch.device) -> None:
+    def load_model(
+        self,
+        submodules: dict[str, torch.nn.Module],
+        model_config: dict,
+        device: torch.device,
+    ) -> None:
+        """
+        Receive the nn.Module submodules this engine is responsible for
+        (keyed by stage name) and perform engine-specific initialization
+        (KV cache allocation, FlashInfer workspace, etc.).
+        """
         ...
 
     @abstractmethod
     def execute_batch(self, batch: StageBatch) -> StageOutput:
         ...
+
+    def execute_single_request(
+        self,
+        submodule: torch.nn.Module | None,
+        input_tensors: NameToTensorList,
+        **kwargs,
+    ) -> NameToTensorList:
+        """
+        Execute a single request through a submodule. Called by Model.step().
+        Default: simple forward pass. Override for engine-specific behavior
+        (e.g., KV cache management for AR engines).
+        """
+        if submodule is None:
+            return {}
+        with torch.no_grad():
+            return submodule(input_tensors, **kwargs)
 
     @abstractmethod
     def add_request(self, request_id: str) -> None:
