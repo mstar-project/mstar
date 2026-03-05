@@ -280,11 +280,11 @@ class SubgraphsManager:
         ):
         """Extend the pending persist signals for a request."""
         self.per_request_info[request_id].pending_persist_signals.extend(signals)
-    
+
     def buffer_new_tokens(
         self, request_id: str,
         new_tokens: dict[str, list[int]]
-    ):         
+    ):
         """Update the pending new tokens for a request."""
         for name, tokens in new_tokens.items():
             if name not in self.per_request_info[request_id].pending_new_tokens:
@@ -297,7 +297,7 @@ class SubgraphsManager:
         signals = info.pending_persist_signals
         info.pending_persist_signals = []
         return signals
-    
+
     def flush_new_tokens(self, request_id: str) -> dict[str, list[int]]:
         """Pop and return all buffered new tokens for a request."""
         info = self.per_request_info[request_id]

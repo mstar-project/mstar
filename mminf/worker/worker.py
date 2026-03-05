@@ -299,7 +299,7 @@ class Worker:
                     )
                     new_tokens.extend(tensor.cpu().numpy().tolist())
                 name_to_new_token[signal.name] = new_tokens
-            
+
             self.subgraphs_manager.buffer_new_tokens(
                 request_id, name_to_new_token
             )
