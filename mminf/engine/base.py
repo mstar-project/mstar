@@ -22,7 +22,6 @@ class StageBatch:
     request_ids: list[str]
 
     # {request_id: {input_name: list[tensor]}}
-    # TODO: refactor how the engine handles per_request_input_tensors now that it's a list
     per_request_input_tensors: dict[str, NameToTensorList]
     metadata: dict = field(default_factory=dict)
 
@@ -67,12 +66,16 @@ class BaseEngine(ABC):
     ) -> NameToTensorList:
         """
         Execute a single request through a submodule. Called by Model.step().
-        Default: simple forward pass. Override for engine-specific behavior
-        (e.g., KV cache management for AR engines).
+        Default: uses preprocess/forward pattern if submodule has preprocess(),
+        otherwise falls back to direct call.
+        Override for engine-specific behavior (e.g., KV cache management).
         """
         if submodule is None:
             return {}
         with torch.no_grad():
+            if hasattr(submodule, 'preprocess'):
+                preprocessed = submodule.preprocess(**input_tensors)
+                return submodule(**preprocessed, **kwargs)
             return submodule(input_tensors, **kwargs)
 
     @abstractmethod
