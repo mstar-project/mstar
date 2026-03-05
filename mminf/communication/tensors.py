@@ -33,7 +33,7 @@ UuidToTensor = dict[str, torch.Tensor]
 
 class TensorStore:
     def __init__(self):
-        self.stored_tensors: dict[NameAndRequestId, UuidToTensor]
+        self.stored_tensors: dict[NameAndRequestId, UuidToTensor] = {}
 
     def get_first_tensor(self, request_id: str, name: str):
         return list(self.stored_tensors[NameAndRequestId(
