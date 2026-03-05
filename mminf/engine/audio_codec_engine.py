@@ -38,13 +38,17 @@ class AudioCodecEngine(BaseEngine):
             outputs = {}
             for rid in batch.request_ids:
                 inputs = batch.per_request_input_tensors.get(rid, {})
-                result = submodule(**{k: v[0].unsqueeze(0) for k, v in inputs.items()})
-                if isinstance(result, torch.Tensor):
-                    outputs[rid] = {"output": [result.squeeze(0)]}
-                elif isinstance(result, dict):
-                    outputs[rid] = {k: [v.squeeze(0)] for k, v in result.items()}
+                if hasattr(submodule, 'preprocess'):
+                    preprocessed = submodule.preprocess(**inputs)
+                    outputs[rid] = submodule(**preprocessed)
                 else:
-                    outputs[rid] = {}
+                    result = submodule(**{k: v[0] for k, v in inputs.items()})
+                    if isinstance(result, dict):
+                        outputs[rid] = result
+                    elif isinstance(result, torch.Tensor):
+                        outputs[rid] = {"output": [result]}
+                    else:
+                        outputs[rid] = {}
             return StageOutput(per_request_output_tensors=outputs)
 
     def add_request(self, request_id: str) -> None:
