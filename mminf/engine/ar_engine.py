@@ -49,10 +49,9 @@ class AREngine(BaseEngine):
 
     def __init__(
         self,
-        model: torch.nn.Module | None = None,
         kv_cache_config: dict | None = None,
     ):
-        self.model = model
+        self.submodules: dict[str, torch.nn.Module] = {}
         self.kv_cache_config = kv_cache_config or {}
         self.device = None
         self.kv_cache = None  # [num_layers, max_pages, 2, page_size, num_kv_heads, head_dim]
@@ -67,7 +66,13 @@ class AREngine(BaseEngine):
     def engine_type(self) -> EngineType:
         return EngineType.AR
 
-    def load_model(self, model_config: dict, device: torch.device) -> None:
+    def load_model(
+        self,
+        submodules: dict[str, torch.nn.Module],
+        model_config: dict,
+        device: torch.device,
+    ) -> None:
+        self.submodules = submodules
         self.device = device
         cfg = model_config.get("kv_cache", self.kv_cache_config)
         if not cfg:
@@ -103,7 +108,8 @@ class AREngine(BaseEngine):
             pass  # Dummy mode — no FlashInfer
 
     def execute_batch(self, batch: StageBatch) -> StageOutput:
-        if self.model is None:
+        submodule = self.submodules.get(batch.stage_name)
+        if submodule is None:
             # Dummy mode: return empty output per request
             return StageOutput(
                 per_request_output_tensors={
@@ -114,11 +120,11 @@ class AREngine(BaseEngine):
         is_prefill = batch.metadata.get("is_prefill", False)
 
         if is_prefill:
-            return self._execute_prefill(batch)
+            return self._execute_prefill(batch, submodule)
         else:
-            return self._execute_decode(batch)
+            return self._execute_decode(batch, submodule)
 
-    def _execute_prefill(self, batch: StageBatch) -> StageOutput:
+    def _execute_prefill(self, batch: StageBatch, submodule: torch.nn.Module) -> StageOutput:
         """Run prefill (prompt processing) for a batch of requests."""
         if self.prefill_wrapper is None or self.kv_cache is None:
             return StageOutput(
@@ -182,9 +188,9 @@ class AREngine(BaseEngine):
             num_qo_heads, num_kv_heads, head_dim, page_size, causal=True,
         )
 
-        # Run model forward (attention handled by FlashInfer wrapper)
+        # Run submodule forward (attention handled by FlashInfer wrapper)
         with torch.no_grad():
-            output = self.model(q_tensor, self.kv_cache, self.prefill_wrapper)
+            output = submodule(q_tensor, self.kv_cache, self.prefill_wrapper)
 
         # Split outputs back per request
         per_request_outputs = {}
@@ -196,7 +202,7 @@ class AREngine(BaseEngine):
 
         return StageOutput(per_request_output_tensors=per_request_outputs)
 
-    def _execute_decode(self, batch: StageBatch) -> StageOutput:
+    def _execute_decode(self, batch: StageBatch, submodule: torch.nn.Module) -> StageOutput:
         """Run decode (single token generation) for a batch of requests."""
         if self.decode_wrapper is None or self.kv_cache is None:
             return StageOutput(
@@ -256,7 +262,7 @@ class AREngine(BaseEngine):
         )
 
         with torch.no_grad():
-            output = self.model(q_tensor, self.kv_cache, self.decode_wrapper)
+            output = submodule(q_tensor, self.kv_cache, self.decode_wrapper)
 
         per_request_outputs = {}
         for i, rid in enumerate(batch.request_ids):
