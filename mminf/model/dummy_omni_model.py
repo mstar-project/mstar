@@ -92,7 +92,7 @@ class DummyOmniModel(Model):
 
     def update_for_next_forward(
         self, metadata: CurrentForwardMetadata,
-        new_tokens: list[int],
+        new_tokens: dict[str, list[int]],
     ) -> CurrentForwardMetadata:
         if metadata.phase == "prefill":
             metadata.is_prefill = False

@@ -22,6 +22,8 @@ class StageOutputRouting:
     to_workers: dict[str, list[GraphPointer]] # worker id to signals
     completed_subgraphs: list[str] = field(default_factory=list)  # list of subgraph IDs
     stream_out: list[GraphPointer] = field(default_factory=list)
+    new_token_outputs: list[GraphPointer] = field(default_factory=list)
+    completed_subgraphs: list[str] = field(default_factory=[])  # list of subgraph IDs
 
 
 @dataclass
@@ -124,6 +126,7 @@ class PerRequestInfo:
     phase_subgraph_ids: list[str] = field(default_factory=list) # for this worker
 
     pending_persist_signals: list[GraphPointer] = field(default_factory=list)
+    pending_new_tokens: dict[str, list[int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -180,6 +183,7 @@ class SubgraphsManager:
         """
         # (1) find back_to_conductor flags
         to_conductor = [ptr for ptr in outputs if ptr.back_to_conductor]
+        new_token_outputs = [ptr for ptr in outputs if ptr.is_new_token]
 
         # (2) process all internal-facing outputs
         subgraph_ids = self.per_request_info[request_id].phase_subgraph_ids
@@ -233,7 +237,8 @@ class SubgraphsManager:
             to_conductor=to_conductor,
             to_workers=to_workers,
             stream_out=stream_out,
-            completed_subgraphs=completed_subgraphs
+            new_token_outputs=new_token_outputs,
+            completed_subgraphs=completed_subgraphs,
         )
 
     def add_request(
@@ -269,9 +274,22 @@ class SubgraphsManager:
                 self.queues[queue_id].remove_request(request_id)
             del self.per_request_info[request_id]
 
-    def buffer_persist_signals(self, request_id: str, signals: list[GraphPointer]):
+    def buffer_persist_signals(
+            self, request_id: str,
+            signals: list[GraphPointer]
+        ):
         """Extend the pending persist signals for a request."""
         self.per_request_info[request_id].pending_persist_signals.extend(signals)
+    
+    def buffer_new_tokens(
+        self, request_id: str,
+        new_tokens: dict[str, list[int]]
+    ):         
+        """Update the pending new tokens for a request."""
+        for name, tokens in new_tokens.items():
+            if name not in self.per_request_info[request_id].pending_new_tokens:
+                self.per_request_info[request_id].pending_new_tokens[name] = []
+            self.per_request_info[request_id].pending_new_tokens[name].extend(tokens)
 
     def flush_persist_signals(self, request_id: str) -> list[GraphPointer]:
         """Pop and return all buffered persist signals for a request."""
@@ -279,3 +297,10 @@ class SubgraphsManager:
         signals = info.pending_persist_signals
         info.pending_persist_signals = []
         return signals
+    
+    def flush_new_tokens(self, request_id: str) -> dict[str, list[int]]:
+        """Pop and return all buffered new tokens for a request."""
+        info = self.per_request_info[request_id]
+        new_tokens = info.pending_new_tokens
+        info.pending_new_tokens = {}
+        return new_tokens

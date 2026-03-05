@@ -249,7 +249,7 @@ class Model(ABC):
     @abstractmethod
     def update_for_next_forward(
         self, metadata: CurrentForwardMetadata,
-        new_tokens: list[int],
+        new_tokens: dict[str, list[int]],
     ) -> CurrentForwardMetadata:
         """
         Called by the conductor at the end of a full model fwd pass.

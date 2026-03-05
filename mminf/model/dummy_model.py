@@ -177,7 +177,7 @@ class DummyModel(Model):
 
     def update_for_next_forward(
         self, metadata: CurrentForwardMetadata,
-        new_tokens: list[int],
+        new_tokens: dict[str, list[int]],
     ) -> CurrentForwardMetadata:
         # dummy model doesn't actually do anything, so this function will just
         # randomly select a phase

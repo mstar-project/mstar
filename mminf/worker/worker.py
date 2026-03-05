@@ -285,6 +285,25 @@ class Worker:
                 request_id, outputs.to_conductor
             )
 
+        if outputs.new_token_outputs:
+            name_to_new_token: dict = {}
+            for signal in outputs.new_token_outputs:
+                if signal.name in name_to_new_token:
+                    continue # don't double-count new tokens
+                new_tokens = [] # list[int]
+                for tensor_info in signal.tensor_info:
+                    tensor = self.tensor_manager.get_tensor(
+                        request_id=request_id,
+                        tensor_name=signal.name,
+                        uuid=tensor_info.uuid
+                    )
+                    new_tokens.extend(tensor.cpu().numpy().tolist())
+                name_to_new_token[signal.name] = new_tokens
+            
+            self.subgraphs_manager.buffer_new_tokens(
+                request_id, name_to_new_token
+            )
+
         if outputs.stream_out:
             for graph_edge in outputs.stream_out:
                 message = APIServerMessage(
@@ -305,6 +324,7 @@ class Worker:
                     request_id=request_id,
                     subgraph_ids=outputs.completed_subgraphs,
                     persist_signals=self.subgraphs_manager.flush_persist_signals(request_id),
+                    new_tokens=self.subgraphs_manager.flush_new_tokens(request_id),
                 ),
             )
             self.communicator.send("conductor", message)

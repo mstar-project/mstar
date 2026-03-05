@@ -95,7 +95,7 @@ class SubgraphsDone(MessageBody):
     request_id: str
     subgraph_ids: list[str]
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
-    new_tokens: list[int] = field(default_factory=list)
+    new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
 
 
 @dataclass
