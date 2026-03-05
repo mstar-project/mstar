@@ -149,9 +149,10 @@ class AREngine(BaseEngine):
         for rid in batch.request_ids:
             state = self.request_states[rid]
             inputs = batch.per_request_input_tensors.get(rid, {})
-            q = inputs.get("hidden_states", inputs.get("text_emb"))
-            if q is None:
+            q_list = inputs.get("hidden_states", inputs.get("text_emb"))
+            if q_list is None:
                 continue
+            q = q_list[0]  # AR engine expects single tensor per input
             seq_len = q.shape[0]
 
             # Allocate pages for this sequence
@@ -197,7 +198,7 @@ class AREngine(BaseEngine):
         offset = 0
         for rid in batch.request_ids:
             seq_len = qo_indptr[batch.request_ids.index(rid) + 1] - qo_indptr[batch.request_ids.index(rid)]
-            per_request_outputs[rid] = {"hidden_states": output[offset:offset + seq_len]}
+            per_request_outputs[rid] = {"hidden_states": [output[offset:offset + seq_len]]}
             offset += seq_len
 
         return StageOutput(per_request_output_tensors=per_request_outputs)
@@ -225,9 +226,10 @@ class AREngine(BaseEngine):
         for rid in batch.request_ids:
             state = self.request_states[rid]
             inputs = batch.per_request_input_tensors.get(rid, {})
-            q = inputs.get("hidden_states", inputs.get("text_emb"))
-            if q is None:
+            q_list = inputs.get("hidden_states", inputs.get("text_emb"))
+            if q_list is None:
                 continue
+            q = q_list[0]  # AR engine expects single tensor per input
 
             # Allocate one more page if needed
             state.seq_len += 1
@@ -266,7 +268,7 @@ class AREngine(BaseEngine):
 
         per_request_outputs = {}
         for i, rid in enumerate(batch.request_ids):
-            per_request_outputs[rid] = {"hidden_states": output[i:i + 1]}
+            per_request_outputs[rid] = {"hidden_states": [output[i:i + 1]]}
 
         return StageOutput(per_request_output_tensors=per_request_outputs)
 
