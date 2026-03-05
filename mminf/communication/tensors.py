@@ -12,7 +12,6 @@ from mminf.communication.communicator import BaseCommunicator, CommProtocol
 from mminf.graph.base import GraphPointer, TensorPointerInfo
 from mminf.ipc_formats import NameAndUuid, TensorReceived, WorkerMessage, WorkerMessageType
 
-
 NameToTensorList = dict[str, list[torch.Tensor]]
 
 

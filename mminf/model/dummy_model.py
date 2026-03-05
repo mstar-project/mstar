@@ -1,7 +1,6 @@
 from copy import deepcopy
 
 import numpy as np
-import torch
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.graph.base import GraphPointer, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
@@ -68,6 +67,7 @@ class DummyModel(Model):
                 outputs=[
                     GraphPointer(
                         next_stage=STREAM_OUT,
+                        output_modality="text",
                         name="new_token",
                         is_new_token=True
                     )
@@ -105,6 +105,7 @@ class DummyModel(Model):
                 outputs=[
                     GraphPointer(
                         next_stage=STREAM_OUT,
+                        output_modality="image",
                         name="image_output",
                         back_to_conductor=True
                     )
@@ -176,7 +177,7 @@ class DummyModel(Model):
 
     def update_for_next_forward(
         self, metadata: CurrentForwardMetadata,
-        new_tokens: list[int],
+        new_tokens: dict[str, list[int]],
     ) -> CurrentForwardMetadata:
         # dummy model doesn't actually do anything, so this function will just
         # randomly select a phase

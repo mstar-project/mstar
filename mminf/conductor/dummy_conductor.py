@@ -61,7 +61,7 @@ class RequestData:
     # name -> list[TensorPointerInfo]
     persist_signals: dict[str, list[TensorPointerInfo]] # signals passed back to conductor
     subgraph_to_worker: dict[str, str]
-    new_tokens: list[int] # TODO: next PR (check for BOI EOS)
+    new_tokens: dict[str, list[int]]
 
     # for tracking progress
     all_subgraph_ids: set[str]
@@ -236,7 +236,7 @@ class DummyConductor:
             subgraph_to_worker=subgraph_to_worker,
             all_subgraph_ids=set(subgraph_to_worker.keys()),
             current_subgraph_ids=set(),
-            new_tokens=[],
+            new_tokens={},
         )
         self.requests[body.request_id] = request_data
 
@@ -310,7 +310,9 @@ class DummyConductor:
         """
         request_data = self.requests[request_id]
 
-        if self.eos_token_id in self.requests[request_id].new_tokens:
+        if any([
+            self.eos_token_id in tokens for tokens in request_data.new_tokens.values()
+        ]):
             return True
 
         prev_forward_meta = deepcopy(request_data.current_forward_metadata)
@@ -347,7 +349,7 @@ class DummyConductor:
             self.communicator.send(worker, message)
 
         request_data.fwd_inputs = fwd_inputs
-        request_data.new_tokens = []
+        request_data.new_tokens = {}
         request_data.completed_subgraph_ids = set()
         return False
 
@@ -367,7 +369,10 @@ class DummyConductor:
         if body.persist_signals:
             request_data.persist_signals.update(body.persist_signals)
         if body.new_tokens:
-            request_data.new_tokens.extend(body.new_tokens)
+            for name in body.new_tokens:
+                if name not in request_data.new_tokens:
+                    request_data.new_tokens[name] = []
+                request_data.new_tokens[name] += body.new_tokens[name]
 
         request_data.completed_subgraph_ids.update(
             body.subgraph_ids

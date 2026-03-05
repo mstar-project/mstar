@@ -1,4 +1,3 @@
-import torch
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.graph.base import GraphPointer, GraphStage, Loop, Sequential, TensorPointerInfo
@@ -24,7 +23,10 @@ class DummyOmniModel(Model):
                 input_ids=["input_ids"],
                 outputs=[
                     GraphPointer(next_stage="TalkerLLM", name="thinker_hidden"),
-                    GraphPointer(next_stage=STREAM_OUT, name="thinker_token", is_new_token=True),
+                    GraphPointer(
+                        next_stage=STREAM_OUT, name="thinker_token", is_new_token=True,
+                        output_modality="text"
+                    ),
                 ],
             ),
             GraphStage(
@@ -56,6 +58,7 @@ class DummyOmniModel(Model):
                     GraphPointer(
                         next_stage=STREAM_OUT,
                         name="audio_output",
+                        output_modality="audio",
                         back_to_conductor=True,
                     ),
                 ],
@@ -89,7 +92,7 @@ class DummyOmniModel(Model):
 
     def update_for_next_forward(
         self, metadata: CurrentForwardMetadata,
-        new_tokens: list[int],
+        new_tokens: dict[str, list[int]],
     ) -> CurrentForwardMetadata:
         if metadata.phase == "prefill":
             metadata.is_prefill = False

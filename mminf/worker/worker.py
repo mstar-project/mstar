@@ -1,5 +1,6 @@
 import torch
 
+from mminf.api_server.entrypoint import APIServerMessage, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.engine.base import StageBatch, StageOutput
@@ -241,7 +242,11 @@ class Worker:
 
             routing = routing_per_request[request_id]
             seen_uuids = set()
-            for ptr in routing.to_conductor + sum(routing.to_workers.values(), start=[]):
+            for ptr in (
+                routing.to_conductor + \
+                sum(routing.to_workers.values(), start=[]) + \
+                routing.stream_out
+            ):
                 uuids = [
                     info.uuid for info in ptr.tensor_info \
                         if info.uuid not in seen_uuids
@@ -280,6 +285,38 @@ class Worker:
                 request_id, outputs.to_conductor
             )
 
+        if outputs.new_token_outputs:
+            name_to_new_token: dict = {}
+            for signal in outputs.new_token_outputs:
+                if signal.name in name_to_new_token:
+                    continue # don't double-count new tokens
+                new_tokens = [] # list[int]
+                for tensor_info in signal.tensor_info:
+                    tensor = self.tensor_manager.get_tensor(
+                        request_id=request_id,
+                        tensor_name=signal.name,
+                        uuid=tensor_info.uuid
+                    )
+                    new_tokens.extend(tensor.cpu().numpy().tolist())
+                name_to_new_token[signal.name] = new_tokens
+
+            self.subgraphs_manager.buffer_new_tokens(
+                request_id, name_to_new_token
+            )
+
+        if outputs.stream_out:
+            for graph_edge in outputs.stream_out:
+                message = APIServerMessage(
+                    message_type="result_chunk",
+                    body=ResultTensors(
+                        request_id=request_id,
+                        modality=graph_edge.output_modality,
+                        graph_edge=graph_edge,
+                        metadata={}
+                    )
+                )
+                self.communicator.send("api_server", message)
+
         if outputs.completed_subgraphs:
             message = ConductorMessage(
                 message_type=ConductorMessageType.SUBGRAPHS_DONE,
@@ -287,6 +324,7 @@ class Worker:
                     request_id=request_id,
                     subgraph_ids=outputs.completed_subgraphs,
                     persist_signals=self.subgraphs_manager.flush_persist_signals(request_id),
+                    new_tokens=self.subgraphs_manager.flush_new_tokens(request_id),
                 ),
             )
             self.communicator.send("conductor", message)
