@@ -101,23 +101,23 @@ class TestEngines:
     def test_ar_engine_add_remove_request(self):
         engine = AREngine()
         engine.add_request("req1")
-        assert "req1" in engine.request_states
-        assert engine.request_states["req1"].seq_len == 0
-        assert engine.request_states["req1"].page_indices == []
+        assert ("req1", "main") in engine.request_states
+        assert engine.request_states[("req1", "main")].seq_len == 0
+        assert engine.request_states[("req1", "main")].page_indices == []
 
         engine.remove_request("req1")
-        assert "req1" not in engine.request_states
+        assert ("req1", "main") not in engine.request_states
 
     def test_ar_engine_pause_resume(self):
         engine = AREngine()
         engine.add_request("req1")
-        assert not engine.request_states["req1"].is_paused
+        assert not engine.request_states[("req1", "main")].is_paused
 
         engine.pause_request("req1")
-        assert engine.request_states["req1"].is_paused
+        assert engine.request_states[("req1", "main")].is_paused
 
         engine.resume_request("req1")
-        assert not engine.request_states["req1"].is_paused
+        assert not engine.request_states[("req1", "main")].is_paused
 
     def test_ar_engine_remove_nonexistent(self):
         engine = AREngine()
@@ -180,10 +180,10 @@ class TestEngineManager:
         mgr.add_request("req1")
         ar_engine = mgr.get_engine("LLM")
         assert isinstance(ar_engine, AREngine)
-        assert "req1" in ar_engine.request_states
+        assert ("req1", "main") in ar_engine.request_states
 
         mgr.remove_request("req1")
-        assert "req1" not in ar_engine.request_states
+        assert ("req1", "main") not in ar_engine.request_states
 
 
 # ======================================================================
