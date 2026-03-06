@@ -122,14 +122,16 @@ class APIServer:
         upload_dir: str = "/tmp/mminf_uploads",
         hostname: str="localhost",
         timeout_seconds: float = 600.0,
+        model=None,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
 
         self.preprocess_worker = PreprocessWorker(
+            model=model,
             hostname=hostname,
-            socket_path_prefix=socket_path_prefix
+            socket_path_prefix=socket_path_prefix,
         )
 
         # Concurrent request tracking
@@ -531,11 +533,17 @@ def main():
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
 
+    # Create a lightweight model instance for prompt processing
+    # (tokenization only — no GPU weights needed)
+    from mminf.model.registry import get_model_class
+    model = get_model_class(model_name)()
+
     global api_server
     api_server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
         timeout_seconds=args.timeout,
+        model=model,
     )
 
     try:
