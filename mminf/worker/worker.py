@@ -172,6 +172,7 @@ class Worker:
     def _build_stage_batch(self, batch: ScheduledBatch) -> StageBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
         per_request_inputs: dict[str, NameToTensorList] = {}
+        per_request_metadata: dict[str, dict] = {}
 
         for request_id, stage in batch.stage_objects.items():
             tensors = {}
@@ -183,12 +184,15 @@ class Worker:
                     ) for info in stage.ready_inputs[input_name].tensor_info
                 ]
             per_request_inputs[request_id] = tensors
+            per_request_metadata[request_id] = \
+                self.subgraphs_manager.get_stage_metadata(request_id)
 
         return StageBatch(
             stage_name=batch.stage_name,
             phase=batch.phase,
             request_ids=list(batch.stage_objects.keys()),
             per_request_input_tensors=per_request_inputs,
+            per_request_metadata=per_request_metadata,
         )
 
     # ------------------------------------------------------------------
@@ -352,6 +356,15 @@ class Worker:
             # 5. Execute via engine
             engine = self.engine_manager.get_engine(batch.stage_name)
             output = engine.execute_batch(stage_batch)
+
+            # 5a. Accumulate per-request metadata from stage output
+            # (e.g., modality spans produced by concat stages)
+            for request_id in batch.stage_objects:
+                stage_meta = output.per_request_metadata.get(request_id, {})
+                if stage_meta:
+                    self.subgraphs_manager.accumulate_stage_metadata(
+                        request_id, stage_meta
+                    )
 
             # 5b. Free consumed input tensors
             self._cleanup_consumed_inputs(batch)
