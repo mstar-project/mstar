@@ -39,10 +39,11 @@ class EncoderDecoderEngine(BaseEngine):
             outputs = {}
             for rid in batch.request_ids:
                 inputs = batch.per_request_input_tensors.get(rid, {})
+                metadata = batch.per_request_metadata.get(rid, {})
                 if hasattr(submodule, 'preprocess'):
                     # StageSubmodule: preprocess (list → tensor) then forward
                     preprocessed = submodule.preprocess(**inputs)
-                    outputs[rid] = submodule(**preprocessed)
+                    outputs[rid] = submodule(**preprocessed, **metadata)
                 else:
                     # Raw nn.Module: unwrap single tensors, run, re-wrap
                     result = submodule(**{k: v[0] for k, v in inputs.items()})
