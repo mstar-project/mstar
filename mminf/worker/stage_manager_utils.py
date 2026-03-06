@@ -116,7 +116,9 @@ class PerRequestInfo:
         this list only includes the decode subgraph)
     - pending_persist_signals: buffered persist signals awaiting flush on
         SUBGRAPHS_DONE
-    - tensors: TBD
+    - accumulated_stage_metadata: metadata accumulated from upstream stage
+        outputs (e.g., modality spans from concat stages), forwarded to
+        downstream engines via StageBatch.per_request_metadata
     """
     stage_to_worker: dict[StageAndPhase, str]  # for all stages
     subgraph_ids: list[str] # for this worker
@@ -127,6 +129,11 @@ class PerRequestInfo:
 
     pending_persist_signals: list[GraphPointer] = field(default_factory=list)
     pending_new_tokens: dict[str, list[int]] = field(default_factory=dict)
+
+    # Metadata from upstream stages (e.g., modality_spans from concat stages).
+    # Accumulated as stages execute, forwarded to downstream engines.
+    # Convention: {"modality_spans": list[ModalitySpan], ...}
+    accumulated_stage_metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -304,3 +311,22 @@ class SubgraphsManager:
         new_tokens = info.pending_new_tokens
         info.pending_new_tokens = {}
         return new_tokens
+
+    def accumulate_stage_metadata(
+        self, request_id: str, stage_metadata: dict
+    ):
+        """
+        Merge metadata from a stage output into accumulated_stage_metadata.
+        For 'modality_spans', extends the existing list.
+        For other keys, overwrites (last-writer-wins).
+        """
+        info = self.per_request_info[request_id]
+        for key, value in stage_metadata.items():
+            if key == "modality_spans" and key in info.accumulated_stage_metadata:
+                info.accumulated_stage_metadata[key].extend(value)
+            else:
+                info.accumulated_stage_metadata[key] = value
+
+    def get_stage_metadata(self, request_id: str) -> dict:
+        """Return accumulated metadata for a request."""
+        return self.per_request_info[request_id].accumulated_stage_metadata
