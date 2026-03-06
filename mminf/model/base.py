@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Type
 from uuid import uuid4
 
+import torch
 import yaml
 
 from mminf.communication.tensors import NameToTensorList
@@ -23,19 +24,33 @@ class StageSubmodule(torch.nn.Module):
     and CUDA graphs on the forward() path.
 
     Engine call pattern:
-        preprocessed = submodule.preprocess(**inputs)   # list → tensors
-        result = submodule(**preprocessed)              # tensor → tensor (compilable)
+        preprocessed, metadata = submodule.preprocess(**inputs)   # list → tensors + metadata
+        result = submodule(**preprocessed)                        # tensor → tensor (compilable)
+
+    Modality spans:
+        Subclasses that concatenate multi-modal inputs should return
+        modality span info in the metadata dict from preprocess():
+            return tensors, {"modality_spans": [ModalitySpan(0, 128, "text"), ...]}
+        The engine reads metadata and either passes spans to forward()
+        or propagates them to downstream stages via StageOutput.
+        Use engine.base.ModalitySpan(start, end, modality) objects.
     """
 
-    def preprocess(self, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+    def preprocess(
+        self, **inputs: list[torch.Tensor]
+    ) -> tuple[dict[str, torch.Tensor], dict]:
         """
         Convert variable-length list[Tensor] inputs to fixed tensors.
         NOT compiled — handles Python-level variability.
 
+        Returns:
+            (preprocessed_tensors, metadata) where metadata is a dict
+            that may contain "modality_spans" or other stage-produced info.
+
         Default: assert each input has exactly 1 tensor and unwrap it.
         Override for stages that handle multiple tensors (e.g., stacking images).
         """
-        return {k: v[0] for k, v in inputs.items()}
+        return {k: v[0] for k, v in inputs.items()}, {}
 
     @abstractmethod
     def forward(self, **kwargs) -> NameToTensorList:
