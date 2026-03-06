@@ -41,6 +41,7 @@ from mminf.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
+from mminf.engine.base import EngineType
 from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model, StageSubmodule
 
 
@@ -84,18 +85,55 @@ class ViTEncoderSubmodule(StageSubmodule):
         self.connector = connector
         self.vit_pos_embed = vit_pos_embed
 
+    def preprocess(self, image_inputs: list[torch.Tensor]) -> dict:
+        """Convert raw images to packed ViT input format.
+
+        Full implementation should include prepare_vit_images logic from BAGEL:
+        - Dynamic resolution computation and SigLIP2 image preprocessing
+        - Patch splitting and flattening
+        - Position ID computation from image grid
+        - Packing multiple images with cu_seqlens for FlashAttention
+
+        Currently assumes single pre-processed image tensor where
+        image_inputs[0] has shape [num_tokens, patch_dim].
+        """
+        # TODO: Full prepare_vit_images integration (SigLIP2 preprocessing)
+        pixel_values = image_inputs[0]
+        num_tokens = pixel_values.shape[0]
+        device = pixel_values.device
+
+        # Compute cu_seqlens for FlashAttention
+        vit_token_seqlens = torch.tensor(
+            [num_tokens], dtype=torch.int32, device=device
+        )
+        cu_seqlens = torch.nn.functional.pad(
+            torch.cumsum(vit_token_seqlens, dim=0), (1, 0)
+        ).to(torch.int32)
+        max_seqlen = int(num_tokens)
+
+        # TODO: compute position_ids from image grid structure
+        position_ids = torch.arange(num_tokens, dtype=torch.long, device=device)
+
+        return {
+            "packed_pixel_values": pixel_values,
+            "packed_position_ids": position_ids,
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": max_seqlen,
+        }
+
     def forward(
         self,
         packed_pixel_values: torch.Tensor,
         packed_position_ids: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        max_seqlen: torch.Tensor,
+        max_seqlen: int,
+        **kwargs,
     ) -> NameToTensorList:
         features = self.vit_model(
             packed_pixel_values=packed_pixel_values,
             packed_flattened_position_ids=packed_position_ids,
             cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen.item() if max_seqlen.dim() == 0 else max_seqlen,
+            max_seqlen=max_seqlen,
         )
         features = self.connector(features)
         pos_emb = self.vit_pos_embed(packed_position_ids)
@@ -118,6 +156,7 @@ class VAEEncoderSubmodule(StageSubmodule):
         latent_pos_embed: nn.Module,
         latent_patch_size: int,
         latent_channel: int,
+        latent_downsample: int,
     ):
         super().__init__()
         self.vae_model = vae_model
@@ -126,20 +165,57 @@ class VAEEncoderSubmodule(StageSubmodule):
         self.latent_pos_embed = latent_pos_embed
         self.latent_patch_size = latent_patch_size
         self.latent_channel = latent_channel
+        self.latent_downsample = latent_downsample
+
+    def preprocess(self, image_inputs: list[torch.Tensor]) -> dict:
+        """Convert raw images to VAE encoder input format.
+
+        Computes patchified dimensions as Python ints for CUDA graph
+        compatibility (no .item() calls in forward).
+
+        Full implementation should include:
+        - Image padding to be divisible by latent_downsample * latent_patch_size
+        - VAE position ID computation from latent grid
+        - Timestep preparation
+        """
+        padded_images = image_inputs[0]  # [B, C, H, W]
+        device = padded_images.device
+
+        # Compute patchified dimensions as ints (CUDA graph compatible)
+        p = self.latent_patch_size
+        ds = self.latent_downsample
+        _, _, img_h, img_w = padded_images.shape
+        h = (img_h // ds) // p
+        w = (img_w // ds) // p
+
+        # TODO: proper VAE position IDs based on latent grid structure
+        num_patches = h * w
+        packed_vae_position_ids = torch.arange(num_patches, device=device)
+
+        # t=0 for initial VAE encoding step
+        packed_timesteps = torch.zeros(num_patches, device=device)
+
+        return {
+            "padded_images": padded_images,
+            "packed_vae_position_ids": packed_vae_position_ids,
+            "packed_timesteps": packed_timesteps,
+            "h": h,
+            "w": w,
+        }
 
     def forward(
         self,
         padded_images: torch.Tensor,
         packed_vae_position_ids: torch.Tensor,
         packed_timesteps: torch.Tensor,
-        patchified_h: torch.Tensor,
-        patchified_w: torch.Tensor,
+        h: int,
+        w: int,
+        **kwargs,
     ) -> NameToTensorList:
         latent = self.vae_model.encode(padded_images)
 
         p = self.latent_patch_size
-        h, w = patchified_h.item(), patchified_w.item()
-        # Patchify: [batch, C, H, W] -> [num_patches, patch_dim]
+        # h, w are already ints from preprocess (CUDA graph compatible)
         packed_latent = []
         for lat in latent:
             lat = lat[:, :h * p, :w * p].reshape(
@@ -204,6 +280,27 @@ class LLMSubmodule(StageSubmodule):
         self.llm2vae = llm2vae
         self.boi_token_id = boi_token_id
         self.eoi_token_id = eoi_token_id
+
+    def preprocess(self, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Unwrap single-element tensor lists and handle latent initialization.
+
+        For image_gen phase: if "latents" input is empty (first flow matching
+        iteration), initializes random noise. The latent shape (latent_seq_len,
+        latent_dim) must be provided via per-request metadata since it depends
+        on the output image dimensions.
+
+        For all other phases: standard unwrapping of list[Tensor] -> Tensor.
+        """
+        result = {}
+        for k, v in inputs.items():
+            if k == "latents" and (not v or v[0].numel() == 0):
+                # First flow matching iteration: no latents yet.
+                # Latent noise will be initialized in forward using shape
+                # info from per-request metadata (latent_seq_len, latent_dim).
+                result[k] = None
+            elif v:
+                result[k] = v[0]
+        return result
 
     def forward(self, phase: str, cache_handle=None, **kwargs) -> NameToTensorList:
         if phase == "prefill_text":
@@ -292,12 +389,14 @@ class LLMSubmodule(StageSubmodule):
 
     def _forward_image_gen(
         self,
-        latents: torch.Tensor,
+        latents: torch.Tensor | None = None,
         cache_handle=None,
         timestep: torch.Tensor = None,
         next_timestep: torch.Tensor = None,
         cfg_text_scale: float = 4.0,
         cfg_img_scale: float = 1.5,
+        latent_seq_len: int | None = None,
+        latent_dim: int | None = None,
         **kwargs,
     ) -> NameToTensorList:
         """3-pass CFG -> llm2vae -> velocity combine -> Euler step.
@@ -305,10 +404,23 @@ class LLMSubmodule(StageSubmodule):
         Uses cache_handle to switch between the 3 frozen KV caches
         (main, cfg_text, cfg_img). write_cache=False since caches are
         frozen during flow matching.
+
+        If latents is None (first iteration), initializes random noise
+        using latent_seq_len and latent_dim from per-request metadata.
         """
         # Remove metadata keys not needed for language_model
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
+
+        # Initialize random noise for first flow matching iteration
+        if latents is None:
+            if latent_seq_len is None or latent_dim is None:
+                raise ValueError(
+                    "latent_seq_len and latent_dim must be provided via "
+                    "per-request metadata for first image_gen iteration"
+                )
+            device = next(self.parameters()).device
+            latents = torch.randn(latent_seq_len, latent_dim, device=device)
         velocities = {}
         for label in ["main", "cfg_text", "cfg_img"]:
             if cache_handle is not None:
@@ -362,13 +474,27 @@ class VAEDecoderSubmodule(StageSubmodule):
         self.latent_channel = latent_channel
         self.latent_downsample = latent_downsample
 
+    def preprocess(self, latents: list[torch.Tensor]) -> dict:
+        """Prepare VAE decoder inputs.
+
+        Unwraps latents from list. Image dimensions (image_h, image_w)
+        are provided via per-request metadata and converted to ints for
+        CUDA graph compatibility.
+        """
+        return {"latents": latents[0]}
+
     def forward(
         self,
         latents: torch.Tensor,
-        image_h: torch.Tensor,
-        image_w: torch.Tensor,
+        image_h: int | torch.Tensor = 0,
+        image_w: int | torch.Tensor = 0,
+        **kwargs,
     ) -> NameToTensorList:
-        H, W = image_h.item(), image_w.item()
+        # Convert to int if tensor (CUDA graph compatible when passed as int
+        # from metadata; tensor fallback for backwards compatibility)
+        H = image_h.item() if isinstance(image_h, torch.Tensor) else int(image_h)
+        W = image_w.item() if isinstance(image_w, torch.Tensor) else int(image_w)
+
         p = self.latent_patch_size
         h = H // self.latent_downsample
         w = W // self.latent_downsample
@@ -482,6 +608,7 @@ class BagelModel(Model):
                 latent_pos_embed=self.bagel_model.latent_pos_embed,
                 latent_patch_size=self.bagel_model.latent_patch_size,
                 latent_channel=self.bagel_model.latent_channel,
+                latent_downsample=self.bagel_model.latent_downsample,
             )
         elif stage_name == "vae_decoder":
             if self.vae_model is None:
@@ -505,12 +632,12 @@ class BagelModel(Model):
         self._submodule_cache[stage_name] = submodule
         return submodule
 
-    def get_stage_engine_types(self) -> dict[str, str]:
+    def get_stage_engine_types(self) -> dict[str, EngineType]:
         return {
-            "vit_encoder": "enc_dec",
-            "vae_encoder": "enc_dec",
-            "LLM": "ar",
-            "vae_decoder": "enc_dec",
+            "vit_encoder": EngineType.ENC_DEC,
+            "vae_encoder": EngineType.ENC_DEC,
+            "LLM": EngineType.AR,
+            "vae_decoder": EngineType.ENC_DEC,
         }
 
     def get_phase_graphs(self) -> dict[str, GraphSection]:
