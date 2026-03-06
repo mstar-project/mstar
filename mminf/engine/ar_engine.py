@@ -56,7 +56,10 @@ class AREngine(BaseEngine):
         self.device = None
         self.kv_cache = None  # [num_layers, max_pages, 2, page_size, num_kv_heads, head_dim]
         self.page_allocator: PageAllocator | None = None
-        self.request_states: dict[str, KVRequestState] = {}
+        # Keyed by (request_id, cache_label) to support multiple KV caches
+        # per request (needed for BAGEL's classifier-free guidance which
+        # maintains "main", "cfg_text", and "cfg_img" caches).
+        self.request_states: dict[tuple[str, str], KVRequestState] = {}
 
         # FlashInfer wrappers (initialized in load_model if available)
         self.prefill_wrapper = None
@@ -147,7 +150,10 @@ class AREngine(BaseEngine):
         all_q = []
 
         for rid in batch.request_ids:
-            state = self.request_states[rid]
+            cache_label = batch.per_request_metadata.get(
+                rid, {}
+            ).get("cache_label", "main")
+            state = self.request_states[(rid, cache_label)]
             inputs = batch.per_request_input_tensors.get(rid, {})
             q_list = inputs.get("hidden_states", inputs.get("text_emb"))
             if q_list is None:
@@ -224,7 +230,10 @@ class AREngine(BaseEngine):
         all_q = []
 
         for rid in batch.request_ids:
-            state = self.request_states[rid]
+            cache_label = batch.per_request_metadata.get(
+                rid, {}
+            ).get("cache_label", "main")
+            state = self.request_states[(rid, cache_label)]
             inputs = batch.per_request_input_tensors.get(rid, {})
             q_list = inputs.get("hidden_states", inputs.get("text_emb"))
             if q_list is None:
@@ -272,24 +281,37 @@ class AREngine(BaseEngine):
 
         return StageOutput(per_request_output_tensors=per_request_outputs)
 
-    def add_request(self, request_id: str) -> None:
-        self.request_states[request_id] = KVRequestState()
+    def add_request(
+        self, request_id: str, cache_labels: list[str] | None = None,
+    ) -> None:
+        labels = cache_labels or ["main"]
+        for label in labels:
+            self.request_states[(request_id, label)] = KVRequestState()
 
     def remove_request(self, request_id: str) -> None:
-        if request_id in self.request_states:
+        keys_to_remove = [
+            k for k in self.request_states if k[0] == request_id
+        ]
+        for key in keys_to_remove:
             if self.page_allocator is not None:
-                self.page_allocator.free(self.request_states[request_id].page_indices)
-            del self.request_states[request_id]
+                self.page_allocator.free(self.request_states[key].page_indices)
+            del self.request_states[key]
 
-    def pause_request(self, request_id: str) -> None:
+    def pause_request(
+        self, request_id: str, cache_label: str = "main",
+    ) -> None:
         """For interleaved loop: mark as paused, keep KV pages allocated."""
-        if request_id in self.request_states:
-            self.request_states[request_id].is_paused = True
+        key = (request_id, cache_label)
+        if key in self.request_states:
+            self.request_states[key].is_paused = True
 
-    def resume_request(self, request_id: str) -> None:
+    def resume_request(
+        self, request_id: str, cache_label: str = "main",
+    ) -> None:
         """Resume from paused state for next LLM step in loop."""
-        if request_id in self.request_states:
-            self.request_states[request_id].is_paused = False
+        key = (request_id, cache_label)
+        if key in self.request_states:
+            self.request_states[key].is_paused = False
 
     def shutdown(self) -> None:
         self.kv_cache = None
