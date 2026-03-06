@@ -5,6 +5,28 @@ BAGEL uses a Qwen2 LLM with MoT (Mixture-of-Transformers) architecture,
 SigLIP2 ViT for image understanding, and FLUX VAE for image generation.
 The LLM itself serves as the denoiser for rectified flow image generation
 (no separate diffusion model).
+
+Architecture (4 stages):
+    vit_encoder   (enc_dec) - SigLIP2 ViT + connector + pos embed
+    vae_encoder   (enc_dec) - VAE encode + patchify + projection
+    LLM           (ar)      - Fat stage: embed + Qwen2 + lm_head + CFG + Euler
+    vae_decoder   (enc_dec) - VAE decode to pixels
+
+Phases (5):
+    prefill_text  - Text token embedding + LLM prefill (causal)
+    prefill_vit   - ViT encoding + LLM prefill (bidirectional for images)
+    prefill_vae   - VAE encoding + LLM prefill (bidirectional for images)
+    decode        - Autoregressive text generation
+    image_gen     - Flow matching loop (3-pass CFG + Euler) + VAE decode
+
+The LLM stage absorbs text_emb, lm_head, and flow_proj because they are
+always colocated on the same GPU. Keeping them as separate graph stages
+would add unnecessary IPC overhead. CFG requires 3 LLM forward passes +
+velocity combination, which is easier as one atomic operation.
+
+Output mode is known upfront from the API request's output_modalities
+field (no BOI token detection). Prefill is sequential: text tokens are
+processed causally, then each image is processed bidirectionally.
 """
 
 import torch
@@ -16,7 +38,6 @@ from mminf.graph.base import (
     GraphSection,
     GraphStage,
     Loop,
-    Parallel,
     Sequential,
     TensorPointerInfo,
 )
@@ -24,26 +45,32 @@ from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model, StageSub
 
 
 # ---------------------------------------------------------------------------
+# System prompts (used when think_mode=True)
+# ---------------------------------------------------------------------------
+
+VLM_THINK_SYSTEM_PROMPT = (
+    "You should first think about the reasoning process in the mind "
+    "and then provide the user with the answer."
+)
+
+GEN_THINK_SYSTEM_PROMPT = (
+    "You should first think about the planning process in the mind "
+    "and then generate the image."
+)
+
+
+# ---------------------------------------------------------------------------
 # StageSubmodule wrappers
 # ---------------------------------------------------------------------------
 
 
-class TextEmbSubmodule(StageSubmodule):
-    """Wraps language_model.model.embed_tokens: token IDs -> embeddings."""
-
-    def __init__(self, embed_tokens: nn.Embedding):
-        super().__init__()
-        self.embed_tokens = embed_tokens
-
-    def forward(self, text_inputs: torch.Tensor) -> NameToTensorList:
-        return {"text_emb": [self.embed_tokens(text_inputs)]}
-
-
 class ViTEncoderSubmodule(StageSubmodule):
-    """Wraps vit_model + connector + vit_pos_embed: pixel patches -> features.
+    """SigLIP2 ViT + connector + vit_pos_embed: pixel patches -> ViT features.
 
-    Expects preprocessed inputs containing packed pixel values, position IDs,
-    cumulative sequence lengths, and max sequence length.
+    Receives preprocessed inputs containing packed pixel values, position IDs,
+    cumulative sequence lengths, and max sequence length. Both vit_encoder and
+    vae_encoder receive "image_inputs" as their graph input name; routing is
+    handled by the graph pointer's next_stage field.
     """
 
     def __init__(
@@ -77,7 +104,7 @@ class ViTEncoderSubmodule(StageSubmodule):
 
 
 class VAEEncoderSubmodule(StageSubmodule):
-    """Wraps VAE encode + patchify + vae2llm + time_embedder + latent_pos_embed.
+    """VAE encode + patchify + vae2llm + time_embedder + latent_pos_embed.
 
     Encodes an image tensor to VAE latents, patchifies them, and projects
     into the LLM hidden dimension with positional and timestep embeddings.
@@ -131,41 +158,140 @@ class VAEEncoderSubmodule(StageSubmodule):
         return {"vae_emb": [packed_latent]}
 
 
-class LMHeadSubmodule(StageSubmodule):
-    """Wraps lm_head: hidden states -> logits -> sampled token."""
+class LLMSubmodule(StageSubmodule):
+    """Fat LLM wrapper that dispatches based on phase.
 
-    def __init__(self, lm_head: nn.Linear):
+    Absorbs text_emb, lm_head, and flow_proj into a single stage to avoid
+    unnecessary IPC overhead. Phase-based dispatch handles:
+
+      - prefill_text: embed_tokens -> LLM forward (causal, mode="und")
+      - prefill_vit:  BOI + vit_emb + EOI -> LLM forward (bidirectional)
+      - prefill_vae:  BOI + vae_emb + EOI -> LLM forward (bidirectional)
+      - decode:       embed_tokens -> LLM forward -> lm_head -> argmax
+      - image_gen:    3-pass CFG -> llm2vae -> velocity combine -> Euler step
+
+    BOI/EOI tokens (<|vision_start|>, <|vision_end|>) are structural
+    delimiters manually inserted around image embeddings during prefill.
+    They are NOT predicted by the model (excluded from CE loss during
+    training).
+
+    During image_gen, classifier-free guidance requires 3 LLM forward
+    passes with different KV caches (main, cfg_text, cfg_img). The
+    velocities are combined via:
+        v_final = v_cfg_img + img_scale * (
+            v_cfg_text + text_scale * (v_main - v_cfg_text) - v_cfg_img
+        )
+    followed by an Euler step: x_{t+1} = x_t + v_final * dt.
+    """
+
+    def __init__(
+        self,
+        language_model: nn.Module,
+        llm2vae: nn.Linear,
+        boi_token_id: int | None = None,
+        eoi_token_id: int | None = None,
+    ):
         super().__init__()
-        self.lm_head = lm_head
+        self.language_model = language_model
+        self.embed_tokens = language_model.model.embed_tokens
+        self.lm_head = language_model.lm_head
+        self.llm2vae = llm2vae
+        self.boi_token_id = boi_token_id
+        self.eoi_token_id = eoi_token_id
 
-    def forward(self, hidden_states: torch.Tensor) -> NameToTensorList:
-        logits = self.lm_head(hidden_states)
+    def forward(self, phase: str, **kwargs) -> NameToTensorList:
+        if phase == "prefill_text":
+            return self._forward_prefill_text(**kwargs)
+        elif phase == "prefill_vit":
+            return self._forward_prefill_vit(**kwargs)
+        elif phase == "prefill_vae":
+            return self._forward_prefill_vae(**kwargs)
+        elif phase == "decode":
+            return self._forward_decode(**kwargs)
+        elif phase == "image_gen":
+            return self._forward_image_gen(**kwargs)
+        else:
+            raise ValueError(f"Unknown LLM phase: {phase!r}")
+
+    def _forward_prefill_text(self, text_inputs: torch.Tensor, **kwargs) -> NameToTensorList:
+        """embed_tokens -> LLM forward (causal, mode='und') -> KV cache update."""
+        emb = self.embed_tokens(text_inputs)
+        self.language_model(emb, is_causal=True, mode="und", **kwargs)
+        return {"prefill_text_done": [torch.tensor([1])]}
+
+    def _forward_prefill_vit(self, vit_emb: torch.Tensor, **kwargs) -> NameToTensorList:
+        """Wrap vit_emb with BOI/EOI tokens -> LLM forward (bidirectional)."""
+        combined = self._wrap_with_boi_eoi(vit_emb)
+        self.language_model(combined, is_causal=False, mode="und", **kwargs)
+        return {"prefill_vit_done": [torch.tensor([1])]}
+
+    def _forward_prefill_vae(self, vae_emb: torch.Tensor, **kwargs) -> NameToTensorList:
+        """Wrap vae_emb with BOI/EOI tokens -> LLM forward (bidirectional)."""
+        combined = self._wrap_with_boi_eoi(vae_emb)
+        self.language_model(combined, is_causal=False, mode="und", **kwargs)
+        return {"prefill_vae_done": [torch.tensor([1])]}
+
+    def _forward_decode(self, text_inputs: torch.Tensor, **kwargs) -> NameToTensorList:
+        """embed_tokens -> LLM forward -> lm_head -> argmax."""
+        emb = self.embed_tokens(text_inputs)
+        hidden = self.language_model(emb, is_causal=True, mode="und", **kwargs)
+        logits = self.lm_head(hidden[:, -1:])
         token = torch.argmax(logits, dim=-1)
         return {"new_token": [token]}
 
+    def _forward_image_gen(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        next_timestep: torch.Tensor,
+        cfg_text_scale: float = 4.0,
+        cfg_img_scale: float = 1.5,
+        **kwargs,
+    ) -> NameToTensorList:
+        """3-pass CFG -> llm2vae -> velocity combine -> Euler step."""
+        # 3 LLM forwards with different KV caches
+        v_main = self.language_model(
+            latents, is_causal=False, mode="gen",
+            cache_label="main", **kwargs,
+        )
+        v_cfg_text = self.language_model(
+            latents, is_causal=False, mode="gen",
+            cache_label="cfg_text", **kwargs,
+        )
+        v_cfg_img = self.language_model(
+            latents, is_causal=False, mode="gen",
+            cache_label="cfg_img", **kwargs,
+        )
 
-class FlowProjSubmodule(StageSubmodule):
-    """Wraps llm2vae projection + Euler step update.
+        # Project to VAE space
+        v_main = self.llm2vae(v_main)
+        v_cfg_text = self.llm2vae(v_cfg_text)
+        v_cfg_img = self.llm2vae(v_cfg_img)
 
-    Extracts velocity from LLM hidden states via the llm2vae linear
-    projection. The Euler integration step (x_t = x_t - v_t * dt) is
-    performed here using the timestep schedule carried in kwargs.
+        # CFG velocity combination
+        v_final = v_cfg_img + cfg_img_scale * (
+            v_cfg_text + cfg_text_scale * (v_main - v_cfg_text) - v_cfg_img
+        )
 
-    During CFG, this stage receives 3 velocity tensors (main, cfg_text,
-    cfg_img) and combines them via the CFG formula before the Euler step.
-    """
+        # Euler step: x_{t+1} = x_t + v * dt
+        dt = next_timestep - timestep
+        latents = latents + v_final * dt
+        return {"latents": [latents]}
 
-    def __init__(self, llm2vae: nn.Linear):
-        super().__init__()
-        self.llm2vae = llm2vae
-
-    def forward(self, hidden_states: torch.Tensor) -> NameToTensorList:
-        v_t = self.llm2vae(hidden_states)
-        return {"latents": [v_t]}
+    def _wrap_with_boi_eoi(self, emb: torch.Tensor) -> torch.Tensor:
+        """Wrap embeddings with <|vision_start|> and <|vision_end|> tokens."""
+        if self.boi_token_id is None or self.eoi_token_id is None:
+            return emb
+        device = emb.device
+        boi_ids = torch.tensor([self.boi_token_id], device=device)
+        eoi_ids = torch.tensor([self.eoi_token_id], device=device)
+        boi_emb = self.embed_tokens(boi_ids)
+        eoi_emb = self.embed_tokens(eoi_ids)
+        return torch.cat([boi_emb, emb, eoi_emb], dim=0)
 
 
 class VAEDecoderSubmodule(StageSubmodule):
-    """Wraps VAE decoder: latent grid -> pixel image."""
+    """VAE decoder: latent grid -> pixel image."""
 
     def __init__(
         self,
@@ -215,19 +341,23 @@ class BagelModel(Model):
     The LLM serves as both the autoregressive text model and the denoiser
     for rectified flow image generation (no separate diffusion model).
 
-    Stages:
-        text_emb      (enc_dec) - Token embedding
-        vit_encoder   (enc_dec) - ViT + connector for image understanding
-        vae_encoder   (enc_dec) - VAE encode for image conditioning
-        LLM           (ar)      - Qwen2 with MoT (shared self-attention)
-        lm_head       (enc_dec) - Token prediction head
-        flow_proj     (flow)    - Velocity extraction + Euler step
+    Stages (4):
+        vit_encoder   (enc_dec) - SigLIP2 ViT + connector + pos embed
+        vae_encoder   (enc_dec) - VAE encode + patchify + projection
+        LLM           (ar)      - Fat stage: embed + Qwen2 + lm_head + CFG
         vae_decoder   (enc_dec) - VAE decode to pixels
 
-    Phases:
-        prefill   - Process interleaved text + images into KV cache
-        decode    - Autoregressive text token generation
-        image_gen - Flow matching denoising loop + VAE decode
+    Phases (5):
+        prefill_text  - Text token embedding + LLM prefill (causal)
+        prefill_vit   - ViT encoding + LLM prefill (bidirectional)
+        prefill_vae   - VAE encoding + LLM prefill (bidirectional)
+        decode        - Autoregressive text generation
+        image_gen     - Flow matching loop (3-pass CFG + Euler) + VAE decode
+
+    Phase transitions are schedule-driven (no BOI token detection). The
+    output mode is known upfront from the API request's output_modalities.
+    Prefill steps are constructed as a sequential schedule that walks
+    through interleaved text and image inputs.
     """
 
     def __init__(
@@ -239,6 +369,7 @@ class BagelModel(Model):
         num_timesteps: int = 50,
         cfg_text_scale: float = 4.0,
         cfg_img_scale: float = 1.5,
+        think_mode: bool = False,
     ):
         self.bagel_model = bagel_model
         self.vae_model = vae_model
@@ -246,157 +377,171 @@ class BagelModel(Model):
         self.num_timesteps = num_timesteps
         self.cfg_text_scale = cfg_text_scale
         self.cfg_img_scale = cfg_img_scale
+        self.think_mode = think_mode
 
         # Special token IDs
         token_ids = new_token_ids or {}
-        self.boi_token_id = token_ids.get("start_of_image")
-        self.eoi_token_id = token_ids.get("end_of_image")
+        self.boi_token_id = token_ids.get("boi_token_id")   # <|vision_start|>
+        self.eoi_token_id = token_ids.get("eoi_token_id")   # <|vision_end|>
         self.eos_token_id = token_ids.get("eos_token_id")
         self.bos_token_id = token_ids.get("bos_token_id")
 
-        # Build submodule wrappers (None when no real model is provided)
-        self._text_emb_sub = None
-        self._vit_encoder_sub = None
-        self._vae_encoder_sub = None
-        self._lm_head_sub = None
-        self._flow_proj_sub = None
-        self._vae_decoder_sub = None
+        # Lazy init cache -- submodules created on first access via
+        # get_submodule(). A worker only instantiates the submodules it
+        # actually needs (e.g., a worker running only vit_encoder never
+        # creates the LLMSubmodule).
+        self._submodule_cache: dict[str, StageSubmodule | None] = {}
 
-        if bagel_model is not None:
-            self._text_emb_sub = TextEmbSubmodule(
-                bagel_model.language_model.model.embed_tokens
+    # -----------------------------------------------------------------------
+    # Lazy submodule initialization
+    # -----------------------------------------------------------------------
+
+    def _create_submodule(self, stage_name: str) -> StageSubmodule | None:
+        """Create a submodule wrapper on first access. Returns None in dummy mode."""
+        if self.bagel_model is None:
+            return None
+
+        if stage_name == "LLM":
+            return LLMSubmodule(
+                language_model=self.bagel_model.language_model,
+                llm2vae=self.bagel_model.llm2vae,
+                boi_token_id=self.boi_token_id,
+                eoi_token_id=self.eoi_token_id,
             )
-            self._lm_head_sub = LMHeadSubmodule(
-                bagel_model.language_model.lm_head
+        elif stage_name == "vit_encoder":
+            if not hasattr(self.bagel_model, "vit_model"):
+                return None
+            return ViTEncoderSubmodule(
+                vit_model=self.bagel_model.vit_model,
+                connector=self.bagel_model.connector,
+                vit_pos_embed=self.bagel_model.vit_pos_embed,
             )
-            self._flow_proj_sub = FlowProjSubmodule(bagel_model.llm2vae)
-
-            if hasattr(bagel_model, "vit_model"):
-                self._vit_encoder_sub = ViTEncoderSubmodule(
-                    bagel_model.vit_model,
-                    bagel_model.connector,
-                    bagel_model.vit_pos_embed,
-                )
-
-            if vae_model is not None:
-                self._vae_encoder_sub = VAEEncoderSubmodule(
-                    vae_model,
-                    bagel_model.vae2llm,
-                    bagel_model.time_embedder,
-                    bagel_model.latent_pos_embed,
-                    bagel_model.latent_patch_size,
-                    bagel_model.latent_channel,
-                )
-                self._vae_decoder_sub = VAEDecoderSubmodule(
-                    vae_model,
-                    bagel_model.latent_patch_size,
-                    bagel_model.latent_channel,
-                    bagel_model.latent_downsample,
-                )
+        elif stage_name == "vae_encoder":
+            if self.vae_model is None:
+                return None
+            return VAEEncoderSubmodule(
+                vae_model=self.vae_model,
+                vae2llm=self.bagel_model.vae2llm,
+                time_embedder=self.bagel_model.time_embedder,
+                latent_pos_embed=self.bagel_model.latent_pos_embed,
+                latent_patch_size=self.bagel_model.latent_patch_size,
+                latent_channel=self.bagel_model.latent_channel,
+            )
+        elif stage_name == "vae_decoder":
+            if self.vae_model is None:
+                return None
+            return VAEDecoderSubmodule(
+                vae_model=self.vae_model,
+                latent_patch_size=self.bagel_model.latent_patch_size,
+                latent_channel=self.bagel_model.latent_channel,
+                latent_downsample=self.bagel_model.latent_downsample,
+            )
+        return None
 
     # -----------------------------------------------------------------------
     # Model ABC implementation
     # -----------------------------------------------------------------------
 
+    def get_submodule(self, stage_name: str) -> torch.nn.Module | None:
+        if stage_name in self._submodule_cache:
+            return self._submodule_cache[stage_name]
+        submodule = self._create_submodule(stage_name)
+        self._submodule_cache[stage_name] = submodule
+        return submodule
+
     def get_stage_engine_types(self) -> dict[str, str]:
         return {
-            "text_emb": "enc_dec",
             "vit_encoder": "enc_dec",
             "vae_encoder": "enc_dec",
             "LLM": "ar",
-            "lm_head": "enc_dec",
-            "flow_proj": "flow",
             "vae_decoder": "enc_dec",
         }
 
     def get_phase_graphs(self) -> dict[str, GraphSection]:
-        prefill = Sequential([
-            Parallel([
-                GraphStage(
-                    name="text_emb",
-                    input_ids=["text_inputs"],
-                    outputs=[
-                        GraphPointer(next_stage="LLM", name="text_emb"),
-                    ],
+        # -- prefill_text: just the LLM stage (text embedding is internal) --
+        prefill_text = GraphStage(
+            name="LLM",
+            input_ids=["text_inputs"],
+            outputs=[
+                GraphPointer(
+                    next_stage=STREAM_OUT,
+                    name="prefill_text_done",
+                    output_modality="text",
+                    is_new_token=False,
                 ),
-                GraphStage(
-                    name="vit_encoder",
-                    input_ids=["vit_inputs"],
-                    outputs=[
-                        GraphPointer(next_stage="LLM", name="vit_emb"),
-                    ],
-                ),
-                GraphStage(
-                    name="vae_encoder",
-                    input_ids=["vae_inputs"],
-                    outputs=[
-                        GraphPointer(next_stage="LLM", name="vae_emb"),
-                    ],
-                ),
-            ]),
+            ],
+        )
+
+        # -- prefill_vit: ViT encoder -> LLM --
+        prefill_vit = Sequential([
+            GraphStage(
+                name="vit_encoder",
+                input_ids=["image_inputs"],
+                outputs=[
+                    GraphPointer(next_stage="LLM", name="vit_emb"),
+                ],
+            ),
             GraphStage(
                 name="LLM",
-                input_ids=["text_emb", "vit_emb", "vae_emb"],
+                input_ids=["vit_emb"],
                 outputs=[
                     GraphPointer(
                         next_stage=STREAM_OUT,
+                        name="prefill_vit_done",
                         output_modality="text",
-                        name="prefill_done",
-                        is_new_token=True,
+                        is_new_token=False,
                     ),
                 ],
             ),
         ])
 
-        decode = Sequential([
+        # -- prefill_vae: VAE encoder -> LLM --
+        prefill_vae = Sequential([
             GraphStage(
-                name="text_emb",
-                input_ids=["text_inputs"],
+                name="vae_encoder",
+                input_ids=["image_inputs"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="text_emb"),
+                    GraphPointer(next_stage="LLM", name="vae_emb"),
                 ],
             ),
             GraphStage(
                 name="LLM",
-                input_ids=["text_emb"],
-                outputs=[
-                    GraphPointer(next_stage="lm_head", name="hidden_states"),
-                ],
-            ),
-            GraphStage(
-                name="lm_head",
-                input_ids=["hidden_states"],
+                input_ids=["vae_emb"],
                 outputs=[
                     GraphPointer(
                         next_stage=STREAM_OUT,
+                        name="prefill_vae_done",
                         output_modality="text",
-                        name="new_token",
-                        is_new_token=True,
+                        is_new_token=False,
                     ),
                 ],
             ),
         ])
 
+        # -- decode: single LLM stage (embed + transformer + lm_head) --
+        decode = GraphStage(
+            name="LLM",
+            input_ids=["text_inputs"],
+            outputs=[
+                GraphPointer(
+                    next_stage=STREAM_OUT,
+                    name="new_token",
+                    output_modality="text",
+                    is_new_token=True,
+                ),
+            ],
+        )
+
+        # -- image_gen: denoising loop (LLM does CFG+Euler) -> VAE decode --
         image_gen = Sequential([
             Loop(
-                section=Sequential([
-                    GraphStage(
-                        name="LLM",
-                        input_ids=["latents"],
-                        outputs=[
-                            GraphPointer(
-                                next_stage="flow_proj", name="hidden_states"
-                            ),
-                        ],
-                    ),
-                    GraphStage(
-                        name="flow_proj",
-                        input_ids=["hidden_states"],
-                        outputs=[
-                            GraphPointer(next_stage="LLM", name="latents"),
-                        ],
-                    ),
-                ]),
+                section=GraphStage(
+                    name="LLM",
+                    input_ids=["latents"],
+                    outputs=[
+                        GraphPointer(next_stage="LLM", name="latents"),
+                    ],
+                ),
                 n_iters=self.num_timesteps - 1,
                 outputs=[
                     GraphPointer(next_stage="vae_decoder", name="latents"),
@@ -408,8 +553,8 @@ class BagelModel(Model):
                 outputs=[
                     GraphPointer(
                         next_stage=STREAM_OUT,
-                        output_modality="image",
                         name="image_output",
+                        output_modality="image",
                         back_to_conductor=True,
                     ),
                 ],
@@ -417,7 +562,9 @@ class BagelModel(Model):
         ])
 
         return dict(
-            prefill=prefill,
+            prefill_text=prefill_text,
+            prefill_vit=prefill_vit,
+            prefill_vae=prefill_vae,
             decode=decode,
             image_gen=image_gen,
         )
@@ -427,13 +574,43 @@ class BagelModel(Model):
         input_modalities: list[str],
         output_modalities: list[str],
     ) -> CurrentForwardMetadata:
+        target_output = output_modalities[0]  # "text" or "image"
+        is_understanding = (target_output == "text")
+
+        # Build prefill schedule: sequential list of (phase_name, step_kwargs)
+        schedule: list[tuple[str, dict]] = []
+
+        # 1. System prompt (if think mode enabled)
+        if self.think_mode:
+            prompt = VLM_THINK_SYSTEM_PROMPT if is_understanding else GEN_THINK_SYSTEM_PROMPT
+            schedule.append(("prefill_text", {"prompt": prompt}))
+
+        # 2. Walk through interleaved inputs, building sequential steps
+        text_idx, image_idx = 0, 0
+        for mod in input_modalities:
+            if mod == "text":
+                schedule.append(("prefill_text", {"input_idx": text_idx}))
+                text_idx += 1
+            elif mod == "image":
+                if is_understanding:
+                    # Understanding: ViT only (no VAE encoding needed)
+                    schedule.append(("prefill_vit", {"input_idx": image_idx}))
+                else:
+                    # Generation/editing: VAE encode the image
+                    schedule.append(("prefill_vae", {"input_idx": image_idx}))
+                image_idx += 1
+
+        first_phase = schedule[0][0] if schedule else "decode"
+
         return CurrentForwardMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            phase="prefill",
-            is_prefill=True,
+            phase=first_phase,
+            is_prefill=bool(schedule),
             kwargs={
-                "mode": "und",
+                "prefill_schedule": schedule,
+                "prefill_step": 0,
+                "target_output": target_output,
                 "num_timesteps": self.num_timesteps,
                 "cfg_text_scale": self.cfg_text_scale,
                 "cfg_img_scale": self.cfg_img_scale,
@@ -446,82 +623,109 @@ class BagelModel(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         prev_forward_metadata: CurrentForwardMetadata = None,
     ) -> list[GraphPointer]:
-        pointers: list[GraphPointer] = []
+        """Construct the external inputs for the current forward pass.
+
+        The conductor calls this to determine what tensors to send to
+        workers at the start of each forward pass. For prefill phases,
+        the schedule entry determines which input to route; for decode
+        and image_gen, the previous output feeds back in.
+
+        persist_signals key conventions:
+            "text_inputs"    - list of per-turn text TensorPointerInfos
+            "image_inputs"   - list of per-image TensorPointerInfos
+            "system_prompt"  - tokenized system prompt (if think_mode)
+            "new_token"      - last generated token (during decode)
+            "latents"        - noise latents (for image_gen entry)
+        """
+        phase = metadata.phase
 
         if metadata.is_prefill:
-            # Prefill: all three encoders receive their inputs.
-            # Signal-only pointers (empty tensor_info) for absent modalities.
-            text_ptr = GraphPointer(next_stage="text_emb", name="text_inputs")
-            text_ptr.tensor_info = persist_signals.get("text_inputs", [])
-            pointers.append(text_ptr)
+            schedule = metadata.kwargs["prefill_schedule"]
+            step = metadata.kwargs["prefill_step"]
+            _, step_kwargs = schedule[step]
 
-            vit_ptr = GraphPointer(next_stage="vit_encoder", name="vit_inputs")
-            vit_ptr.tensor_info = persist_signals.get("vit_inputs", [])
-            pointers.append(vit_ptr)
+            if phase == "prefill_text":
+                ptr = GraphPointer(next_stage="LLM", name="text_inputs")
+                if "prompt" in step_kwargs:
+                    # System prompt -- conductor tokenizes and stores it
+                    ptr.tensor_info = persist_signals.get("system_prompt", [])
+                else:
+                    idx = step_kwargs["input_idx"]
+                    all_text = persist_signals.get("text_inputs", [])
+                    ptr.tensor_info = [all_text[idx]] if idx < len(all_text) else []
+                return [ptr]
 
-            vae_ptr = GraphPointer(next_stage="vae_encoder", name="vae_inputs")
-            vae_ptr.tensor_info = persist_signals.get("vae_inputs", [])
-            pointers.append(vae_ptr)
+            elif phase == "prefill_vit":
+                idx = step_kwargs["input_idx"]
+                ptr = GraphPointer(next_stage="vit_encoder", name="image_inputs")
+                all_images = persist_signals.get("image_inputs", [])
+                ptr.tensor_info = [all_images[idx]] if idx < len(all_images) else []
+                return [ptr]
 
-        elif metadata.phase == "decode":
-            # Decode: the previously generated token feeds text_emb
-            text_ptr = GraphPointer(next_stage="text_emb", name="text_inputs")
-            text_ptr.tensor_info = persist_signals.get("new_token", [])
-            pointers.append(text_ptr)
+            elif phase == "prefill_vae":
+                idx = step_kwargs["input_idx"]
+                ptr = GraphPointer(next_stage="vae_encoder", name="image_inputs")
+                all_images = persist_signals.get("image_inputs", [])
+                ptr.tensor_info = [all_images[idx]] if idx < len(all_images) else []
+                return [ptr]
 
-        elif metadata.phase == "image_gen":
-            # Image gen: initial noise latents feed the LLM
-            latent_ptr = GraphPointer(next_stage="LLM", name="latents")
-            latent_ptr.tensor_info = persist_signals.get("latents", [])
-            pointers.append(latent_ptr)
+        elif phase == "decode":
+            # Previous token feeds back as text_inputs
+            ptr = GraphPointer(next_stage="LLM", name="text_inputs")
+            ptr.tensor_info = persist_signals.get("new_token", [])
+            return [ptr]
 
-        return pointers
+        elif phase == "image_gen":
+            # Initial noise latents feed the LLM denoising loop
+            ptr = GraphPointer(next_stage="LLM", name="latents")
+            ptr.tensor_info = persist_signals.get("latents", [])
+            return [ptr]
+
+        return []
 
     def update_for_next_forward(
         self,
         metadata: CurrentForwardMetadata,
         new_tokens: dict[str, list[int]],
     ) -> CurrentForwardMetadata:
+        """Advance phase transitions. Schedule-driven, no BOI detection.
+
+        During prefill, steps through the schedule one entry at a time.
+        After all prefill steps, transitions to decode (text output) or
+        image_gen (image output) based on target_output set at init.
+
+        During decode, checks for EOS token to mark request complete.
+        After image_gen, marks request complete (one image per request).
+        """
         if metadata.is_prefill:
-            # After prefill -> always transition to decode
-            metadata.is_prefill = False
-            metadata.phase = "decode"
-            metadata.output_modalities = ["text"]
-            metadata.kwargs["mode"] = "und"
+            step = metadata.kwargs["prefill_step"] + 1
+            schedule = metadata.kwargs["prefill_schedule"]
+
+            if step < len(schedule):
+                # More prefill steps remaining
+                metadata.kwargs["prefill_step"] = step
+                metadata.phase = schedule[step][0]
+            else:
+                # All prefill done -- transition based on target_output
+                metadata.is_prefill = False
+                target = metadata.kwargs["target_output"]
+                if target == "text":
+                    metadata.phase = "decode"
+                elif target == "image":
+                    metadata.phase = "image_gen"
             return metadata
 
         if metadata.phase == "decode":
+            # Check for EOS
             tokens = new_tokens.get("new_token", [])
-            if self.boi_token_id is not None and self.boi_token_id in tokens:
-                # BOI token detected -> switch to image generation
-                metadata.phase = "image_gen"
-                metadata.output_modalities = ["image"]
-                metadata.kwargs["mode"] = "gen"
-            elif self.eos_token_id is not None and self.eos_token_id in tokens:
-                # EOS token -> request complete
+            if self.eos_token_id is not None and self.eos_token_id in tokens:
                 metadata.kwargs["done"] = True
-            # else: stay in decode phase
+            # Otherwise stay in decode phase
             return metadata
 
         if metadata.phase == "image_gen":
-            # After image generation -> back to decode
-            metadata.phase = "decode"
-            metadata.output_modalities = ["text"]
-            metadata.kwargs["mode"] = "und"
+            # Image generation complete (one image per request)
+            metadata.kwargs["done"] = True
             return metadata
 
         return metadata
-
-    def get_submodule(self, stage_name: str) -> torch.nn.Module | None:
-        if self.bagel_model is None:
-            return None  # dummy mode
-        submodule_map = {
-            "text_emb": self._text_emb_sub,
-            "vit_encoder": self._vit_encoder_sub,
-            "vae_encoder": self._vae_encoder_sub,
-            "LLM": self.bagel_model.language_model,
-            "lm_head": self._lm_head_sub,
-            "flow_proj": self._flow_proj_sub,
-            "vae_decoder": self._vae_decoder_sub,
-        }
-        return submodule_map.get(stage_name)
