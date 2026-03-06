@@ -15,6 +15,14 @@ class EngineType(Enum):
 
 
 @dataclass
+class ModalitySpan:
+    """A contiguous span of a single modality within a concatenated sequence."""
+    start: int      # inclusive start position
+    end: int        # exclusive end position
+    modality: str   # "text", "image", "latent", etc.
+
+
+@dataclass
 class StageBatch:
     """Input to an engine's execute_batch()."""
     stage_name: str
@@ -24,6 +32,11 @@ class StageBatch:
     # {request_id: {input_name: list[tensor]}}
     per_request_input_tensors: dict[str, NameToTensorList]
     metadata: dict = field(default_factory=dict)
+
+    # {request_id: metadata dict} — carries modality spans and other
+    # per-request metadata from upstream stages to engines.
+    # Convention: {"modality_spans": list[ModalitySpan], ...}
+    per_request_metadata: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -74,7 +87,11 @@ class BaseEngine(ABC):
             return {}
         with torch.no_grad():
             if hasattr(submodule, 'preprocess'):
-                preprocessed = submodule.preprocess(**input_tensors)
+                preprocessed, metadata = submodule.preprocess(**input_tensors)
+                # Pass modality spans from preprocess() to forward()
+                modality_spans = metadata.get("modality_spans")
+                if modality_spans is not None:
+                    kwargs['modality_spans'] = modality_spans
                 return submodule(**preprocessed, **kwargs)
             return submodule(input_tensors, **kwargs)
 
