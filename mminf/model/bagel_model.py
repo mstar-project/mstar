@@ -182,6 +182,12 @@ class LLMSubmodule(StageSubmodule):
             v_cfg_text + text_scale * (v_main - v_cfg_text) - v_cfg_img
         )
     followed by an Euler step: x_{t+1} = x_t + v_final * dt.
+
+    Multi-cache orchestration is driven by per-request metadata:
+      - cache_labels: list of cache labels to iterate over (default ["main"])
+      - snapshot_after: (from_label, to_label) to snapshot after this step
+    The CacheHandle (provided by AREngine) manages label switching, page
+    allocation, and KV data copying.
     """
 
     def __init__(
@@ -199,42 +205,87 @@ class LLMSubmodule(StageSubmodule):
         self.boi_token_id = boi_token_id
         self.eoi_token_id = eoi_token_id
 
-    def forward(self, phase: str, **kwargs) -> NameToTensorList:
+    def forward(self, phase: str, cache_handle=None, **kwargs) -> NameToTensorList:
         if phase == "prefill_text":
-            return self._forward_prefill_text(**kwargs)
+            return self._forward_prefill_text(cache_handle=cache_handle, **kwargs)
         elif phase == "prefill_vit":
-            return self._forward_prefill_vit(**kwargs)
+            return self._forward_prefill_vit(cache_handle=cache_handle, **kwargs)
         elif phase == "prefill_vae":
-            return self._forward_prefill_vae(**kwargs)
+            return self._forward_prefill_vae(cache_handle=cache_handle, **kwargs)
         elif phase == "decode":
-            return self._forward_decode(**kwargs)
+            return self._forward_decode(cache_handle=cache_handle, **kwargs)
         elif phase == "image_gen":
-            return self._forward_image_gen(**kwargs)
+            return self._forward_image_gen(cache_handle=cache_handle, **kwargs)
         else:
             raise ValueError(f"Unknown LLM phase: {phase!r}")
 
-    def _forward_prefill_text(self, text_inputs: torch.Tensor, **kwargs) -> NameToTensorList:
-        """embed_tokens -> LLM forward (causal, mode='und') -> KV cache update."""
-        emb = self.embed_tokens(text_inputs)
-        self.language_model(emb, is_causal=True, mode="und", **kwargs)
-        return {"prefill_text_done": [torch.tensor([1])]}
+    def _forward_prefill_text(self, text_inputs: torch.Tensor, cache_handle=None, **kwargs) -> NameToTensorList:
+        """embed_tokens -> LLM forward (causal, mode='und') -> KV cache update.
 
-    def _forward_prefill_vit(self, vit_emb: torch.Tensor, **kwargs) -> NameToTensorList:
-        """Wrap vit_emb with BOI/EOI tokens -> LLM forward (bidirectional)."""
+        For generation mode, cache_labels specifies which caches to update
+        (e.g., ["main", "cfg_img"] for text prefill).
+        """
+        emb = self.embed_tokens(text_inputs)
+        cache_labels = kwargs.pop("cache_labels", ["main"])
+        snapshot_after = kwargs.pop("snapshot_after", None)
+        for label in cache_labels:
+            if cache_handle is not None:
+                cache_handle.set_active_label(label)
+            self.language_model(emb, is_causal=True, mode="und",
+                                cache_handle=cache_handle, **kwargs)
+        if snapshot_after and cache_handle is not None:
+            from_label, to_label = snapshot_after
+            cache_handle.snapshot(from_label, to_label)
+        return {}
+
+    def _forward_prefill_vit(self, vit_emb: torch.Tensor, cache_handle=None, **kwargs) -> NameToTensorList:
+        """Wrap vit_emb with BOI/EOI tokens -> LLM forward (bidirectional).
+
+        For generation mode, cache_labels specifies which caches to update.
+        snapshot_after triggers a KV cache deepcopy after processing.
+        """
         combined = self._wrap_with_boi_eoi(vit_emb)
-        self.language_model(combined, is_causal=False, mode="und", **kwargs)
-        return {"prefill_vit_done": [torch.tensor([1])]}
+        cache_labels = kwargs.pop("cache_labels", ["main"])
+        snapshot_after = kwargs.pop("snapshot_after", None)
+        for label in cache_labels:
+            if cache_handle is not None:
+                cache_handle.set_active_label(label)
+            self.language_model(combined, is_causal=False, mode="und",
+                                cache_handle=cache_handle, **kwargs)
+        if snapshot_after and cache_handle is not None:
+            from_label, to_label = snapshot_after
+            cache_handle.snapshot(from_label, to_label)
+        return {}
 
-    def _forward_prefill_vae(self, vae_emb: torch.Tensor, **kwargs) -> NameToTensorList:
-        """Wrap vae_emb with BOI/EOI tokens -> LLM forward (bidirectional)."""
+    def _forward_prefill_vae(self, vae_emb: torch.Tensor, cache_handle=None, **kwargs) -> NameToTensorList:
+        """Wrap vae_emb with BOI/EOI tokens -> LLM forward (bidirectional).
+
+        For generation mode, cache_labels specifies which caches to update.
+        snapshot_after triggers a KV cache deepcopy after processing.
+        """
         combined = self._wrap_with_boi_eoi(vae_emb)
-        self.language_model(combined, is_causal=False, mode="und", **kwargs)
-        return {"prefill_vae_done": [torch.tensor([1])]}
+        cache_labels = kwargs.pop("cache_labels", ["main"])
+        snapshot_after = kwargs.pop("snapshot_after", None)
+        for label in cache_labels:
+            if cache_handle is not None:
+                cache_handle.set_active_label(label)
+            self.language_model(combined, is_causal=False, mode="und",
+                                cache_handle=cache_handle, **kwargs)
+        if snapshot_after and cache_handle is not None:
+            from_label, to_label = snapshot_after
+            cache_handle.snapshot(from_label, to_label)
+        return {}
 
-    def _forward_decode(self, text_inputs: torch.Tensor, **kwargs) -> NameToTensorList:
+    def _forward_decode(self, text_inputs: torch.Tensor, cache_handle=None, **kwargs) -> NameToTensorList:
         """embed_tokens -> LLM forward -> lm_head -> argmax."""
+        # Remove metadata keys not needed for language_model
+        kwargs.pop("cache_labels", None)
+        kwargs.pop("snapshot_after", None)
         emb = self.embed_tokens(text_inputs)
-        hidden = self.language_model(emb, is_causal=True, mode="und", **kwargs)
+        if cache_handle is not None:
+            cache_handle.set_active_label("main")
+        hidden = self.language_model(emb, is_causal=True, mode="und",
+                                     cache_handle=cache_handle, **kwargs)
         logits = self.lm_head(hidden[:, -1:])
         token = torch.argmax(logits, dim=-1)
         return {"new_token": [token]}
@@ -242,31 +293,36 @@ class LLMSubmodule(StageSubmodule):
     def _forward_image_gen(
         self,
         latents: torch.Tensor,
-        timestep: torch.Tensor,
-        next_timestep: torch.Tensor,
+        cache_handle=None,
+        timestep: torch.Tensor = None,
+        next_timestep: torch.Tensor = None,
         cfg_text_scale: float = 4.0,
         cfg_img_scale: float = 1.5,
         **kwargs,
     ) -> NameToTensorList:
-        """3-pass CFG -> llm2vae -> velocity combine -> Euler step."""
-        # 3 LLM forwards with different KV caches
-        v_main = self.language_model(
-            latents, is_causal=False, mode="gen",
-            cache_label="main", **kwargs,
-        )
-        v_cfg_text = self.language_model(
-            latents, is_causal=False, mode="gen",
-            cache_label="cfg_text", **kwargs,
-        )
-        v_cfg_img = self.language_model(
-            latents, is_causal=False, mode="gen",
-            cache_label="cfg_img", **kwargs,
-        )
+        """3-pass CFG -> llm2vae -> velocity combine -> Euler step.
+
+        Uses cache_handle to switch between the 3 frozen KV caches
+        (main, cfg_text, cfg_img). write_cache=False since caches are
+        frozen during flow matching.
+        """
+        # Remove metadata keys not needed for language_model
+        kwargs.pop("cache_labels", None)
+        kwargs.pop("snapshot_after", None)
+        velocities = {}
+        for label in ["main", "cfg_text", "cfg_img"]:
+            if cache_handle is not None:
+                cache_handle.set_active_label(label)
+            hidden = self.language_model(
+                latents, is_causal=False, mode="gen",
+                cache_handle=cache_handle, write_cache=False, **kwargs,
+            )
+            velocities[label] = hidden
 
         # Project to VAE space
-        v_main = self.llm2vae(v_main)
-        v_cfg_text = self.llm2vae(v_cfg_text)
-        v_cfg_img = self.llm2vae(v_cfg_img)
+        v_main = self.llm2vae(velocities["main"])
+        v_cfg_text = self.llm2vae(velocities["cfg_text"])
+        v_cfg_img = self.llm2vae(velocities["cfg_img"])
 
         # CFG velocity combination
         v_final = v_cfg_img + cfg_img_scale * (
@@ -459,17 +515,11 @@ class BagelModel(Model):
 
     def get_phase_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM stage (text embedding is internal) --
+        # No output needed — conductor is notified when the subgraph completes.
         prefill_text = GraphStage(
             name="LLM",
             input_ids=["text_inputs"],
-            outputs=[
-                GraphPointer(
-                    next_stage=STREAM_OUT,
-                    name="prefill_text_done",
-                    output_modality="text",
-                    is_new_token=False,
-                ),
-            ],
+            outputs=[],
         )
 
         # -- prefill_vit: ViT encoder -> LLM --
@@ -484,14 +534,7 @@ class BagelModel(Model):
             GraphStage(
                 name="LLM",
                 input_ids=["vit_emb"],
-                outputs=[
-                    GraphPointer(
-                        next_stage=STREAM_OUT,
-                        name="prefill_vit_done",
-                        output_modality="text",
-                        is_new_token=False,
-                    ),
-                ],
+                outputs=[],
             ),
         ])
 
@@ -507,14 +550,7 @@ class BagelModel(Model):
             GraphStage(
                 name="LLM",
                 input_ids=["vae_emb"],
-                outputs=[
-                    GraphPointer(
-                        next_stage=STREAM_OUT,
-                        name="prefill_vae_done",
-                        output_modality="text",
-                        is_new_token=False,
-                    ),
-                ],
+                outputs=[],
             ),
         ])
 
@@ -528,11 +564,15 @@ class BagelModel(Model):
                     name="new_token",
                     output_modality="text",
                     is_new_token=True,
+                    back_to_conductor=True,
                 ),
             ],
         )
 
         # -- image_gen: denoising loop (LLM does CFG+Euler) -> VAE decode --
+        # n_iters = num_timesteps - 1 because the loop body performs one
+        # Euler step per iteration. With N timestep boundaries (e.g. 50),
+        # there are N-1 intervals, so N-1 Euler steps are needed.
         image_gen = Sequential([
             Loop(
                 section=GraphStage(
@@ -599,6 +639,26 @@ class BagelModel(Model):
                     # Generation/editing: VAE encode the image
                     schedule.append(("prefill_vae", {"input_idx": image_idx}))
                 image_idx += 1
+
+        # 3. Annotate schedule with multi-cache metadata for generation mode.
+        #    BAGEL's CFG requires 3 caches: main, cfg_img, cfg_text.
+        #    - Text prefill: write to main + cfg_img (text-only cache)
+        #    - Image prefill (vit/vae): write to main only
+        #    - After last image: snapshot main -> cfg_text (system+image cache)
+        #    Understanding mode: no annotations needed (default ["main"]).
+        if not is_understanding:
+            last_image_idx = None
+            for i, (phase, _) in enumerate(schedule):
+                if phase in ("prefill_vit", "prefill_vae"):
+                    last_image_idx = i
+
+            for i, (phase, step_kwargs) in enumerate(schedule):
+                if phase == "prefill_text":
+                    step_kwargs["cache_labels"] = ["main", "cfg_img"]
+                elif phase in ("prefill_vit", "prefill_vae"):
+                    step_kwargs["cache_labels"] = ["main"]
+                    if i == last_image_idx:
+                        step_kwargs["snapshot_after"] = ("main", "cfg_text")
 
         first_phase = schedule[0][0] if schedule else "decode"
 
@@ -676,7 +736,10 @@ class BagelModel(Model):
             return [ptr]
 
         elif phase == "image_gen":
-            # Initial noise latents feed the LLM denoising loop
+            # Initial noise latents feed the LLM denoising loop.
+            # Note: latents are typically initialized by the submodule's
+            # preprocess() (random noise), not passed through persist_signals.
+            # This lookup handles the case where latents are externally provided.
             ptr = GraphPointer(next_stage="LLM", name="latents")
             ptr.tensor_info = persist_signals.get("latents", [])
             return [ptr]
@@ -691,11 +754,19 @@ class BagelModel(Model):
         """Advance phase transitions. Schedule-driven, no BOI detection.
 
         During prefill, steps through the schedule one entry at a time.
-        After all prefill steps, transitions to decode (text output) or
-        image_gen (image output) based on target_output set at init.
+        After all prefill steps, transitions to:
+          - decode (text output)
+          - decode (image output + think_mode: think first, then generate)
+          - image_gen (image output, no think_mode)
 
-        During decode, checks for EOS token to mark request complete.
+        During decode:
+          - Text output: EOS marks request complete.
+          - Image output + think_mode: EOS transitions to image_gen
+            (thinking is done, now generate the image).
+
         After image_gen, marks request complete (one image per request).
+
+        Sets metadata.kwargs["done"] = True when the request is complete.
         """
         if metadata.is_prefill:
             step = metadata.kwargs["prefill_step"] + 1
@@ -712,14 +783,23 @@ class BagelModel(Model):
                 if target == "text":
                     metadata.phase = "decode"
                 elif target == "image":
-                    metadata.phase = "image_gen"
+                    if self.think_mode:
+                        # Think first: decode to generate reasoning, then
+                        # EOS triggers transition to image_gen.
+                        metadata.phase = "decode"
+                    else:
+                        metadata.phase = "image_gen"
             return metadata
 
         if metadata.phase == "decode":
-            # Check for EOS
             tokens = new_tokens.get("new_token", [])
             if self.eos_token_id is not None and self.eos_token_id in tokens:
-                metadata.kwargs["done"] = True
+                target = metadata.kwargs["target_output"]
+                if self.think_mode and target == "image":
+                    # Thinking phase complete — transition to image generation.
+                    metadata.phase = "image_gen"
+                else:
+                    metadata.kwargs["done"] = True
             # Otherwise stay in decode phase
             return metadata
 
