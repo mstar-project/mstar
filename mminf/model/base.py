@@ -132,8 +132,9 @@ def _divide_into_subgraphs(
         group_id_to_subgraph = {}
         for s in singleton_subgraphs:
             if s._group_id in group_id_to_subgraph:
-                group_id_to_subgraph[s._group_id] = _combine_sections_sequential_or_parallel(
-                    group_id_to_subgraph[s._group_id], s.section,
+                existing = group_id_to_subgraph[s._group_id]
+                existing.section = _combine_sections_sequential_or_parallel(
+                    existing.section, s.section,
                     comb_type=Parallel
                 )
             else:
