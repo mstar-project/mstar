@@ -190,5 +190,20 @@ class DummyModel(Model):
             metadata.output_modalities = ["image"]
         return metadata
 
+    def process_prompt(
+        self,
+        prompt: str | None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        **kwargs,
+    ) -> NameToTensorList:
+        result = {}
+        if prompt is not None:
+            byte_data = prompt.encode("utf-8")
+            result["text_inputs"] = [
+                torch.tensor(list(byte_data), dtype=torch.uint8)
+            ]
+        return result
+
     def get_submodule(self, stage_name: str) -> torch.nn.Module | None:
         return None  # dummy mode — no real computation
