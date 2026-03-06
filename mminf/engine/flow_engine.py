@@ -37,11 +37,14 @@ class FlowEngine(BaseEngine):
 
         with torch.no_grad():
             outputs = {}
+            per_request_metadata = {}
             for rid in batch.request_ids:
                 inputs = batch.per_request_input_tensors.get(rid, {})
                 if hasattr(submodule, 'preprocess'):
-                    preprocessed = submodule.preprocess(**inputs)
+                    preprocessed, metadata = submodule.preprocess(**inputs)
                     outputs[rid] = submodule(**preprocessed)
+                    if metadata:
+                        per_request_metadata[rid] = metadata
                 else:
                     result = submodule(**{k: v[0] for k, v in inputs.items()})
                     if isinstance(result, dict):
@@ -50,7 +53,10 @@ class FlowEngine(BaseEngine):
                         outputs[rid] = {"output": [result]}
                     else:
                         outputs[rid] = {}
-            return StageOutput(per_request_output_tensors=outputs)
+            return StageOutput(
+                per_request_output_tensors=outputs,
+                per_request_metadata=per_request_metadata,
+            )
 
     def add_request(self, request_id: str) -> None:
         pass
