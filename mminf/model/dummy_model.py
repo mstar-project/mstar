@@ -5,6 +5,7 @@ import torch
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.graph.base import GraphPointer, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
+from mminf.engine.base import EngineType
 from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model
 
 
@@ -48,15 +49,15 @@ class DummyModel(Model):
              )
         ])
 
-    def get_stage_engine_types(self) -> dict[str, str]:
+    def get_stage_engine_types(self) -> dict[str, EngineType]:
         return {
-            "text_emb": "enc_dec",
-            "concat_text": "enc_dec",
-            "image_emb": "enc_dec",
-            "concat_img": "enc_dec",
-            "LLM": "ar",
-            "flow": "flow",
-            "VAE_dec": "enc_dec",
+            "text_emb": EngineType.ENC_DEC,
+            "concat_text": EngineType.ENC_DEC,
+            "image_emb": EngineType.ENC_DEC,
+            "concat_img": EngineType.ENC_DEC,
+            "LLM": EngineType.AR,
+            "flow": EngineType.FLOW,
+            "VAE_dec": EngineType.ENC_DEC,
         }
 
     def get_phase_graphs(self):
