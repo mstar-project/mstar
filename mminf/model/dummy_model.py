@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 import numpy as np
+import torch
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.graph.base import GraphPointer, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
