@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from mminf.engine.base import BaseEngine, EngineType, StageBatch, StageOutput
+from mminf.engine.base import BaseEngine, EngineType, ModalitySpan, StageBatch, StageOutput
 
 
 @dataclass
@@ -124,6 +124,13 @@ class AREngine(BaseEngine):
         else:
             return self._execute_decode(batch, submodule)
 
+    def _get_modality_spans(
+        self, batch: StageBatch, rid: str
+    ) -> list[ModalitySpan] | None:
+        """Extract modality spans for a request from batch metadata."""
+        req_meta = batch.per_request_metadata.get(rid, {})
+        return req_meta.get("modality_spans")
+
     def _execute_prefill(self, batch: StageBatch, submodule: torch.nn.Module) -> StageOutput:
         """Run prefill (prompt processing) for a batch of requests."""
         if self.prefill_wrapper is None or self.kv_cache is None:
@@ -145,14 +152,26 @@ class AREngine(BaseEngine):
         paged_kv_indices = []
         paged_kv_last_page_len = []
         all_q = []
+        per_request_spans: dict[str, list[ModalitySpan] | None] = {}
 
         for rid in batch.request_ids:
             state = self.request_states[rid]
             inputs = batch.per_request_input_tensors.get(rid, {})
-            q_list = inputs.get("hidden_states", inputs.get("text_emb"))
-            if q_list is None:
-                continue
-            q = q_list[0]  # AR engine expects single tensor per input
+
+            # Use preprocess/forward pattern if submodule supports it
+            if hasattr(submodule, 'preprocess'):
+                preprocessed, metadata = submodule.preprocess(**inputs)
+                per_request_spans[rid] = metadata.get("modality_spans")
+                q = preprocessed.get(
+                    "hidden_states", next(iter(preprocessed.values()))
+                )
+            else:
+                q_list = inputs.get("hidden_states", inputs.get("text_emb"))
+                if q_list is None:
+                    continue
+                q = q_list[0]
+                per_request_spans[rid] = self._get_modality_spans(batch, rid)
+
             seq_len = q.shape[0]
 
             # Allocate pages for this sequence
@@ -190,6 +209,8 @@ class AREngine(BaseEngine):
         )
 
         # Run submodule forward (attention handled by FlashInfer wrapper)
+        # TODO: pass per_request_spans to submodule when real models
+        # need modality-aware attention masks / position IDs
         with torch.no_grad():
             output = submodule(q_tensor, self.kv_cache, self.prefill_wrapper)
 
@@ -226,10 +247,18 @@ class AREngine(BaseEngine):
         for rid in batch.request_ids:
             state = self.request_states[rid]
             inputs = batch.per_request_input_tensors.get(rid, {})
-            q_list = inputs.get("hidden_states", inputs.get("text_emb"))
-            if q_list is None:
-                continue
-            q = q_list[0]  # AR engine expects single tensor per input
+
+            # Use preprocess/forward pattern if submodule supports it
+            if hasattr(submodule, 'preprocess'):
+                preprocessed, _metadata = submodule.preprocess(**inputs)
+                q = preprocessed.get(
+                    "hidden_states", next(iter(preprocessed.values()))
+                )
+            else:
+                q_list = inputs.get("hidden_states", inputs.get("text_emb"))
+                if q_list is None:
+                    continue
+                q = q_list[0]
 
             # Allocate one more page if needed
             state.seq_len += 1
@@ -263,6 +292,8 @@ class AREngine(BaseEngine):
             num_qo_heads, num_kv_heads, head_dim, page_size,
         )
 
+        # TODO: pass modality spans to submodule when real models
+        # need modality-aware attention masks / position IDs
         with torch.no_grad():
             output = submodule(q_tensor, self.kv_cache, self.decode_wrapper)
 
