@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Type
 from uuid import uuid4
 
+import torch
 import yaml
 
 from mminf.communication.tensors import NameToTensorList
