@@ -1,0 +1,16 @@
+latent_patch_size: 2
+max_latent_size: 32
+resolution: 256
+in_channels: 3
+downsample: 8
+ch: 128
+out_ch: 3
+ch_mult: [1, 2, 4, 4]
+num_res_blocks: 2
+z_channels: 16
+scale_factor: 0.3611
+shift_factor: 0.1159
+num_timesteps: 50
+cfg_text_scale: 4.0
+cfg_img_scale: 1.5
+think_mode: false

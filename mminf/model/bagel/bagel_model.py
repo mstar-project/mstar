@@ -29,8 +29,11 @@ field (no BOI token detection). Prefill is sequential: text tokens are
 processed causally, then each image is processed bidirectionally.
 """
 
+import os
+
 import torch
 import torch.nn as nn
+import yaml
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.graph.base import (
@@ -42,6 +45,10 @@ from mminf.graph.base import (
     TensorPointerInfo,
 )
 from mminf.engine.base import EngineType
+from mminf.model.bagel.modeling_utils import PositionEmbedding, TimestepEmbedder
+from mminf.model.bagel.qwen2_navit import Qwen2Config, Qwen2ForCausalLM
+from mminf.model.bagel.tokenization_qwen2 import Qwen2Tokenizer
+from mminf.model.bagel.utils import add_special_tokens
 from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model, StageSubmodule
 
 
@@ -515,6 +522,10 @@ class VAEDecoderSubmodule(StageSubmodule):
 # ---------------------------------------------------------------------------
 
 
+LLM_CONFIG_FILE = "llm_config.json"
+MODEL_CONFIG_FILE = "model_config.yaml"
+
+
 class BagelModel(Model):
     """
     BAGEL unified multimodal model (ByteDance).
@@ -544,35 +555,72 @@ class BagelModel(Model):
 
     def __init__(
         self,
-        bagel_model=None,
-        vae_model=None,
-        tokenizer=None,
-        new_token_ids: dict | None = None,
-        num_timesteps: int = 50,
-        cfg_text_scale: float = 4.0,
-        cfg_img_scale: float = 1.5,
-        think_mode: bool = False,
+        config_dir: str,
+        model_path_hf: str,
     ):
-        self.bagel_model = bagel_model
-        self.vae_model = vae_model
-        self.tokenizer = tokenizer
-        self.num_timesteps = num_timesteps
-        self.cfg_text_scale = cfg_text_scale
-        self.cfg_img_scale = cfg_img_scale
-        self.think_mode = think_mode
+        self.llm_config = Qwen2Config.from_json_file(
+            os.path.join(config_dir, LLM_CONFIG_FILE)
+        )
+
+        with open(os.path.join(config_dir, MODEL_CONFIG_FILE), "r") as f:
+            self.config = yaml.safe_load(f)
+
+        self.model_path_hf = model_path_hf
+        self.llm_config.qk_norm = True
+        self.llm_config.tie_word_embeddings = False
+        self.llm_config.layer_module = "Qwen2MoTDecoderLayer"
+
+        self.tokenizer = Qwen2Tokenizer.from_pretrained(model_path_hf)
+        self.tokenizer, new_token_ids, _ = add_special_tokens(self.tokenizer)
+
+        self.num_timesteps = self.config["num_timesteps"]
+        self.cfg_text_scale = self.config["cfg_text_scale"]
+        self.cfg_img_scale = self.config["cfg_img_scale"]
+        self.think_mode = self.config["think_mode"]
+        self.latent_patch_size = self.config["latent_patch_size"]
+        self.latent_channel = self.config["latent_channel"]
+        self.max_latent_size = self.config["max_latent_size"]
+        self.latent_downsample = self.config["downsample"] * self.latent_patch_size
+
+        self.patch_latent_dim = self.latent_patch_size ** 2 * self.latent_channel
 
         # Special token IDs
-        token_ids = new_token_ids or {}
-        self.boi_token_id = token_ids.get("boi_token_id")   # <|vision_start|>
-        self.eoi_token_id = token_ids.get("eoi_token_id")   # <|vision_end|>
-        self.eos_token_id = token_ids.get("eos_token_id")
-        self.bos_token_id = token_ids.get("bos_token_id")
+        self.boi_token_id = new_token_ids.get("boi_token_id")   # <|vision_start|>
+        self.eoi_token_id = new_token_ids.get("eoi_token_id")   # <|vision_end|>
+        self.eos_token_id = new_token_ids.get("eos_token_id")
+        self.bos_token_id = new_token_ids.get("bos_token_id")
 
         # Lazy init cache -- submodules created on first access via
         # get_submodule(). A worker only instantiates the submodules it
         # actually needs (e.g., a worker running only vit_encoder never
         # creates the LLMSubmodule).
         self._submodule_cache: dict[str, StageSubmodule | None] = {}
+        self.language_model = None
+        self.llm2vae = None
+        self.vae_model = None
+        self.time_embedder = None
+        self.vae2llm = None
+        self.latent_pos_embed = None
+        self.vae_initialized = False
+    
+    def _init_language_model_components(self):
+        self.language_model = Qwen2ForCausalLM(self.llm_config)
+        self.llm2vae = nn.Linear(self.llm_config.hidden_size, self.patch_latent_dim)
+        
+        # TODO: properly load in weights !!!
+
+    def _init_vae_components(self):
+        if self.vae_initialized:
+            return
+        self.vae_initialized = True
+        self.latent_pos_embed = PositionEmbedding(self.max_latent_size, self.llm_config.hidden_size)
+        self.time_embedder = TimestepEmbedder(self.llm_config.hidden_size)
+        self.vae2llm = nn.Linear(self.patch_latent_dim, self.llm_config.hidden_size)
+       # TODO: set up VAE model
+        # TODO: properly load in weights !!!
+    
+    def _init_vit_components(self):
+        pass # TODO
 
     # -----------------------------------------------------------------------
     # Lazy submodule initialization
@@ -580,44 +628,42 @@ class BagelModel(Model):
 
     def _create_submodule(self, stage_name: str) -> StageSubmodule | None:
         """Create a submodule wrapper on first access. Returns None in dummy mode."""
-        if self.bagel_model is None:
-            return None
+        # if self.bagel_model is None:
+        #     return None
 
         if stage_name == "LLM":
+            self._init_language_model_components()
             return LLMSubmodule(
-                language_model=self.bagel_model.language_model,
-                llm2vae=self.bagel_model.llm2vae,
+                language_model=self.language_model,
+                llm2vae=self.llm2vae,
                 boi_token_id=self.boi_token_id,
                 eoi_token_id=self.eoi_token_id,
             )
         elif stage_name == "vit_encoder":
-            if not hasattr(self.bagel_model, "vit_model"):
-                return None
+            self._init_vit_components()
             return ViTEncoderSubmodule(
-                vit_model=self.bagel_model.vit_model,
-                connector=self.bagel_model.connector,
-                vit_pos_embed=self.bagel_model.vit_pos_embed,
+                vit_model=self.vit_model,
+                connector=self.connector,
+                vit_pos_embed=self.vit_pos_embed,
             )
         elif stage_name == "vae_encoder":
-            if self.vae_model is None:
-                return None
+            self._init_vae_components()
             return VAEEncoderSubmodule(
                 vae_model=self.vae_model,
-                vae2llm=self.bagel_model.vae2llm,
-                time_embedder=self.bagel_model.time_embedder,
-                latent_pos_embed=self.bagel_model.latent_pos_embed,
-                latent_patch_size=self.bagel_model.latent_patch_size,
-                latent_channel=self.bagel_model.latent_channel,
-                latent_downsample=self.bagel_model.latent_downsample,
+                vae2llm=self.vae2llm,
+                time_embedder=self.time_embedder,
+                latent_pos_embed=self.latent_pos_embed,
+                latent_patch_size=self.latent_patch_size,
+                latent_channel=self.latent_channel,
+                latent_downsample=self.latent_downsample,
             )
         elif stage_name == "vae_decoder":
-            if self.vae_model is None:
-                return None
+            self._init_vit_components()
             return VAEDecoderSubmodule(
                 vae_model=self.vae_model,
-                latent_patch_size=self.bagel_model.latent_patch_size,
-                latent_channel=self.bagel_model.latent_channel,
-                latent_downsample=self.bagel_model.latent_downsample,
+                latent_patch_size=self.latent_patch_size,
+                latent_channel=self.latent_channel,
+                latent_downsample=self.latent_downsample,
             )
         return None
 
