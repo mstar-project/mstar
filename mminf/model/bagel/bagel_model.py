@@ -180,7 +180,16 @@ class BagelModel(Model):
         state_dict = load_file(ema_path)
         self.language_model.load_state_dict(state_dict, strict=False)
         self.llm2vae.load_state_dict(state_dict, strict=False)
-        
+
+        if not self.vae_initialized:
+            # Need these for image gen
+            self.latent_pos_embed = PositionEmbedding(
+                self.config.max_latent_size, self.config.hidden_size
+            )
+            self.time_embedder = TimestepEmbedder(self.config.hidden_size)
+            self.time_embedder.load_state_dict(state_dict, strict=False)
+            self.latent_pos_embed.load_state_dict(state_dict, strict=False)
+
     def _init_vae_components(self):
         self._download_hf()
         if self.vae_initialized:
@@ -242,6 +251,9 @@ class BagelModel(Model):
             return LLMSubmodule(
                 language_model=self.language_model,
                 llm2vae=self.llm2vae,
+                time_embedder=self.time_embedder,
+                latent_pos_embed=self.latent_pos_embed,
+                config=self.config,
                 boi_token_id=self.boi_token_id,
                 eoi_token_id=self.eoi_token_id,
             )
@@ -398,9 +410,10 @@ class BagelModel(Model):
             Loop(
                 section=GraphStage(
                     name="LLM",
-                    input_ids=["latents"],
+                    input_ids=["latents", "time_index"],
                     outputs=[
                         GraphPointer(next_stage="LLM", name="latents"),
+                        GraphPointer(next_stage="LLM", name="time_index"),
                     ],
                 ),
                 n_iters=self.config.num_timesteps - 1,
@@ -563,7 +576,10 @@ class BagelModel(Model):
             # This lookup handles the case where latents are externally provided.
             ptr = GraphPointer(next_stage="LLM", name="latents")
             ptr.tensor_info = persist_signals.get("latents", [])
-            return [ptr]
+            return [
+                ptr,
+                GraphPointer(next_stage="LLM", name="time_index")
+            ]
 
         return []
 

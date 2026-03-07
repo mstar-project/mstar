@@ -144,3 +144,11 @@ class PositionEmbedding(nn.Module):
 
     def forward(self, position_ids):
         return self.pos_embed[position_ids]
+
+
+def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_patches_per_side):
+    num_patches_h, num_patches_w = img_h // patch_size, img_w // patch_size
+    coords_h = torch.arange(0, num_patches_h)
+    coords_w = torch.arange(0, num_patches_w)
+    pos_ids = (coords_h[:, None] * max_num_patches_per_side + coords_w).flatten()
+    return pos_ids

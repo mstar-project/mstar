@@ -9,6 +9,8 @@ import torch.nn as nn
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import CacheHandle
 from mminf.model.bagel.components.language_model import BagelForCausalLM
+from mminf.model.bagel.components.modeling_utils import PositionEmbedding, TimestepEmbedder, get_flattened_position_ids_extrapolate
+from mminf.model.bagel.config import BagelModelConfig
 from mminf.model.base import StageSubmodule
 
 
@@ -217,6 +219,9 @@ class LLMSubmodule(StageSubmodule):
         self,
         language_model: BagelForCausalLM,
         llm2vae: nn.Linear,
+        time_embedder: TimestepEmbedder,
+        latent_pos_embed: PositionEmbedding,
+        config: BagelModelConfig,
         boi_token_id: int | None = None,
         eoi_token_id: int | None = None,
     ):
@@ -225,8 +230,26 @@ class LLMSubmodule(StageSubmodule):
         self.embed_tokens = language_model.model.embed_tokens
         self.lm_head = language_model.lm_head
         self.llm2vae = llm2vae
+        self.time_embedder = time_embedder
+        self.latent_pos_embed = latent_pos_embed
+        self.config = config
         self.boi_token_id = boi_token_id
         self.eoi_token_id = eoi_token_id
+    
+    def _init_latents(
+        self,
+        device,
+        H: int=1024,
+        W: int=1024,
+    ):
+        h, w = (H // self.config.latent_downsample, 
+                W // self.config.latent_downsample)
+        num_image_tokens = h * w
+        return torch.randn(
+            num_image_tokens,
+            self.config.vae_config.z_channels * self.config.latent_patch_size ** 2,
+            device=device
+        )
 
     def preprocess(self, phase: str, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
         """Unwrap single-element tensor lists and handle latent initialization.
@@ -263,17 +286,46 @@ class LLMSubmodule(StageSubmodule):
             )
             result["vae_token_indexes"] = torch.arange(
                 1, result["combined_emb"].shape[0]-1,
-                dtype=torch.long,
+                dtype=torch.long, device=result["combined_emb"].device
             )
         
         if phase == "image_gen":
-            # First flow matching iteration: no latents yet.
-            # Latent noise will be initialized in forward using shape
-            # info from per-request metadata (latent_seq_len, latent_dim).
-            result["latents"] = inputs.get("latents", [None])[0]
-            # TODO finish this
-
-                
+            H, W = 1024, 1024 # TODO: make this configurable?
+            result["vae_position_ids"] = get_flattened_position_ids_extrapolate(
+                H, W,
+                self.config.latent_downsample, 
+                max_num_patches_per_side=self.config.max_latent_size
+            )
+            if "latents" not in inputs or len(inputs["latents"]) == 0:
+                result["latents"] = self._init_latents(
+                    device=next(self.parameters()).device,
+                    H=H, W=W
+                )
+                result["time_index"] = 0
+            else:
+               result["latents"] = inputs["latents"][0]
+               result["time_index"] = inputs["time_indexs"][0].item()
+               
+            result["empty_combined_emb"] = self._wrap_with_boi_eoi_inplace(
+                torch.zeros(
+                    (result["latents"].shape[0], self.config.hidden_size),
+                    device=result["latents"].device
+                )
+            )
+            result["text_indexes"] = torch.Tensor(
+                [0, result["empty_combined_emb"].shape[0] - 1], dtype=torch.long,
+                device=result["latents"].device
+            )
+            result["vae_token_indexes"] = torch.arange(
+                1, result["combined_emb"].shape[0]-1,
+                dtype=torch.long,
+                device=result["latents"].device
+            )
+            result["empty_position_ids"] = torch.zeros(
+                result["empty_combined_emb"].shape[0], dtype=torch.long,
+                device=result["latents"].device
+            )
+         
         return result
 
     def forward(self, phase: str, cache_handle=None, **kwargs) -> NameToTensorList:
@@ -407,13 +459,17 @@ class LLMSubmodule(StageSubmodule):
 
     def _forward_image_gen(
         self,
-        latents: torch.Tensor | None,
-        dt: float,
+        latents: torch.Tensor,
+        empty_combined_emb: torch.Tensor,
+        empty_position_ids: torch.Tensor,
+        vae_position_ids: torch.Tensor,
+        text_indexes: torch.Tensor,
+        vae_token_indexes: torch.Tensor,
+        time_index: int,
         cache_handle: CacheHandle,
         cfg_text_scale: float = 4.0,
         cfg_img_scale: float = 1.5,
-        latent_seq_len: int | None = None,
-        latent_dim: int | None = None,
+        cfg_renorm_min: float=0.0,
         **kwargs,
     ) -> NameToTensorList:
         """3-pass CFG -> llm2vae -> velocity combine -> Euler step.
@@ -429,38 +485,55 @@ class LLMSubmodule(StageSubmodule):
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
 
-        # Initialize random noise for first flow matching iteration
-        if latents is None:
-            if latent_seq_len is None or latent_dim is None:
-                raise ValueError(
-                    "latent_seq_len and latent_dim must be provided via "
-                    "per-request metadata for first image_gen iteration"
-                )
-            device = next(self.parameters()).device
-            latents = torch.randn(latent_seq_len, latent_dim, device=device)
+        pos_embed = self.latent_pos_embed(vae_position_ids)
+        timestep_embeds = self.time_embedder(timestep)
+        empty_combined_emb[1:-1] = self.llm2vae(latents) + timestep_embeds \
+            + pos_embed
+        
+        # TODO: support for timestep shift (non-uniform timesteps)
+        dt = 1 / self.config.num_timesteps
+        timestep = 1 - time_index * dt
+
         velocities = {}
         for label in ["main", "cfg_text", "cfg_img"]:
             if cache_handle is not None:
                 cache_handle.set_active_label(label)
+                empty_position_ids = range(
+                    cache_handle._get_state().seq_len,
+                    cache_handle._get_state().seq_len + empty_combined_emb.shape[0]
+                )
             hidden = self.language_model(
-                latents, is_causal=False, mode="gen",
-                cache_handle=cache_handle, write_cache=False, **kwargs,
+                empty_combined_emb, empty_position_ids,
+                is_causal=False, mode="gen",
+                cache_handle=cache_handle,
+                write_cache=False, 
+                vae_token_indexes=vae_token_indexes,
+                text_indexes=text_indexes,
+                **kwargs,
             )
             velocities[label] = hidden
 
         # Project to VAE space
-        v_main = self.llm2vae(velocities["main"])
-        v_cfg_text = self.llm2vae(velocities["cfg_text"])
-        v_cfg_img = self.llm2vae(velocities["cfg_img"])
+        v_main = self.llm2vae(velocities["main"])[1:-1]
+        v_cfg_text = self.llm2vae(velocities["cfg_text"])[1:-1]
+        v_cfg_img = self.llm2vae(velocities["cfg_img"])[1:-1]
 
         # CFG velocity combination
-        v_final = v_cfg_img + cfg_img_scale * (
+        # TODO: non-CFG case
+        v_t_ = v_cfg_img + cfg_img_scale * (
             v_cfg_text + cfg_text_scale * (v_main - v_cfg_text) - v_cfg_img
         )
+        norm_v_t_ = torch.norm(v_t_)
+        norm_v_t = torch.norm(v_main)
+        scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+        v_final = v_t_ * scale
 
         # Euler step: x_{t+1} = x_t + v * dt
         latents = latents + v_final * dt
-        return {"latents": [latents]}
+        return {
+            "latents": [latents],
+            "time_index": [torch.tensor([time_index + 1])]
+        }
 
     def _wrap_with_boi_eoi(self, emb: torch.Tensor) -> torch.Tensor:
         """Wrap embeddings with <|vision_start|> and <|vision_end|> tokens."""
@@ -472,6 +545,19 @@ class LLMSubmodule(StageSubmodule):
         boi_emb = self.embed_tokens(boi_ids)
         eoi_emb = self.embed_tokens(eoi_ids)
         return torch.cat([boi_emb, emb, eoi_emb], dim=0)
+
+    def _wrap_with_boi_eoi_inplace(self, emb: torch.Tensor) -> torch.Tensor:
+        """Wrap embeddings with <|vision_start|> and <|vision_end|> tokens."""
+        if self.boi_token_id is None or self.eoi_token_id is None:
+            return emb
+        device = emb.device
+        boi_ids = torch.tensor([self.boi_token_id], device=device)
+        eoi_ids = torch.tensor([self.eoi_token_id], device=device)
+        boi_emb = self.embed_tokens(boi_ids)
+        eoi_emb = self.embed_tokens(eoi_ids)
+        emb[0, :] = boi_emb
+        emb[-1, :] = eoi_emb
+        return emb
 
 
 class VAEDecoderSubmodule(StageSubmodule):
