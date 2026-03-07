@@ -250,10 +250,8 @@ class LLMSubmodule(StageSubmodule):
     def forward(self, phase: str, cache_handle=None, **kwargs) -> NameToTensorList:
         if phase == "prefill_text":
             return self._forward_prefill_text(cache_handle=cache_handle, **kwargs)
-        elif phase == "prefill_vit":
-            return self._forward_prefill_vit(cache_handle=cache_handle, **kwargs)
-        elif phase == "prefill_vae":
-            return self._forward_prefill_vae(cache_handle=cache_handle, **kwargs)
+        elif phase in ["prefill_vit", "prefill_vae"]:
+            return self._forward_prefill_image(cache_handle=cache_handle, **kwargs)
         elif phase == "decode":
             return self._forward_decode(cache_handle=cache_handle, **kwargs)
         elif phase == "image_gen":
@@ -280,32 +278,13 @@ class LLMSubmodule(StageSubmodule):
             cache_handle.snapshot(from_label, to_label)
         return {}
 
-    def _forward_prefill_vit(self, vit_emb: torch.Tensor, cache_handle=None, **kwargs) -> NameToTensorList:
-        """Wrap vit_emb with BOI/EOI tokens -> LLM forward (bidirectional).
+    def _forward_prefill_image(self, img_emb: torch.Tensor, cache_handle=None, **kwargs) -> NameToTensorList:
+        """Wrap img_emb with BOI/EOI tokens -> LLM forward (bidirectional).
 
         For generation mode, cache_labels specifies which caches to update.
         snapshot_after triggers a KV cache deepcopy after processing.
         """
-        combined = self._wrap_with_boi_eoi(vit_emb)
-        cache_labels = kwargs.pop("cache_labels", ["main"])
-        snapshot_after = kwargs.pop("snapshot_after", None)
-        for label in cache_labels:
-            if cache_handle is not None:
-                cache_handle.set_active_label(label)
-            self.language_model(combined, is_causal=False, mode="und",
-                                cache_handle=cache_handle, **kwargs)
-        if snapshot_after and cache_handle is not None:
-            from_label, to_label = snapshot_after
-            cache_handle.snapshot(from_label, to_label)
-        return {}
-
-    def _forward_prefill_vae(self, vae_emb: torch.Tensor, cache_handle=None, **kwargs) -> NameToTensorList:
-        """Wrap vae_emb with BOI/EOI tokens -> LLM forward (bidirectional).
-
-        For generation mode, cache_labels specifies which caches to update.
-        snapshot_after triggers a KV cache deepcopy after processing.
-        """
-        combined = self._wrap_with_boi_eoi(vae_emb)
+        combined = self._wrap_with_boi_eoi(img_emb)
         cache_labels = kwargs.pop("cache_labels", ["main"])
         snapshot_after = kwargs.pop("snapshot_after", None)
         for label in cache_labels:

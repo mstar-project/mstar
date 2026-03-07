@@ -29,7 +29,7 @@ field (no BOI token detection). Prefill is sequential: text tokens are
 processed causally, then each image is processed bidirectionally.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from safetensors.torch import load_file
@@ -51,8 +51,8 @@ from mminf.graph.base import (
 from mminf.engine.base import EngineType
 from mminf.model.bagel.components.autoencoder import BagelAutoEncoder, BagelAutoEncoderConfig
 from mminf.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
-from mminf.model.bagel.components.qwen2_navit import Qwen2ForCausalLM
-from mminf.model.bagel.components.tokenization import Qwen2Tokenizer
+from mminf.model.bagel.components.language_model import BagelForCausalLM
+from mminf.model.bagel.components.tokenization import BagelTokenizer
 from mminf.model.bagel.components.vit_encoder import BagelVisionModel
 from mminf.model.bagel.submodules import LLMSubmodule, VAEDecoderSubmodule, VAEEncoderSubmodule, ViTEncoderSubmodule
 from mminf.model.bagel.utils import add_special_tokens
@@ -160,6 +160,7 @@ class BagelModelConfig:
     freeze_und=False
     connector_act="gelu_pytorch_tanh"
     vit_max_num_patch_per_side=70
+    pad_token_id=1
 
     @classmethod
     def from_dict(
@@ -182,7 +183,6 @@ class BagelModelConfig:
             * self.vae_config.z_channels
         self.qk_norm = True
         self.tie_word_embeddings = False
-        self.layer_module = "Qwen2MoTDecoderLayer"
 
 # ---------------------------------------------------------------------------
 # BagelModel
@@ -229,10 +229,18 @@ class BagelModel(Model):
         vit_config_file = Path(config_dir) / VIT_CONFIG_PATH
         model_config_file = Path(config_dir) / MODEL_CONFIG_PATH
 
-        with open(vae_config_file) as f:
-            vae_config = BagelAutoEncoderConfig.from_dict(yaml.safe_load(f))
-        with open(vit_config_file) as f:
-            vit_config = BagelViTConfig.from_dict(yaml.safe_load(f))
+        if vae_config_file.exists():
+            with open(vae_config_file) as f:
+                vae_config = BagelAutoEncoderConfig.from_dict(yaml.safe_load(f))
+        else:
+            vae_config = BagelAutoEncoderConfig()
+        
+        if vit_config_file.exists():
+            with open(vit_config_file) as f:
+                vit_config = BagelViTConfig.from_dict(yaml.safe_load(f))
+        else:
+            vit_config = BagelViTConfig()
+
         with open(model_config_file) as f:
             self.config = BagelModelConfig.from_dict(
                 vae_config=vae_config,
@@ -242,7 +250,7 @@ class BagelModel(Model):
 
         self.model_path_hf = model_path_hf
 
-        self.tokenizer = Qwen2Tokenizer.from_pretrained(model_path_hf)
+        self.tokenizer = BagelTokenizer.from_pretrained(model_path_hf)
         self.tokenizer, new_token_ids, _ = add_special_tokens(self.tokenizer)
 
         # Special token IDs
@@ -276,7 +284,7 @@ class BagelModel(Model):
     
     def _init_language_model_components(self):
         self._download_hf()
-        self.language_model = Qwen2ForCausalLM(self.config)
+        self.language_model = BagelForCausalLM(self.config)
         self.llm2vae = nn.Linear(self.config.hidden_size, self.config.patch_latent_dim)
 
         ema_path = self.repo / "ema.safetensors"

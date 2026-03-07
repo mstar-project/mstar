@@ -260,6 +260,9 @@ class Model(ABC):
 
         **Important**: this sets metadata.request_done, which is used to end
         the request.
+
+        TODO: include default logic for setting request_done, and let models
+        override it
         """
         # e.g., check for BOI token, check if image was generated and should
         # be added to the input modalities and input tensors, adds new token

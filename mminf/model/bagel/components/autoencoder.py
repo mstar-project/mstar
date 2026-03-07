@@ -9,9 +9,6 @@
 #
 # This modified file is released under the same license.
 
-from dataclasses import dataclass
-from typing import Any
-
 import torch
 from einops import rearrange
 from torch import Tensor, nn
