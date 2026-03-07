@@ -280,7 +280,7 @@ class LLMSubmodule(StageSubmodule):
             )
         
         if phase == "prefill_vae":
-            result["text_indexes"] = torch.Tensor(
+            result["text_indexes"] = torch.tensor(
                 [0, result["combined_emb"].shape[0] - 1], dtype=torch.long,
                 device=result["combined_emb"].device
             )
@@ -304,7 +304,7 @@ class LLMSubmodule(StageSubmodule):
                 result["time_index"] = 0
             else:
                result["latents"] = inputs["latents"][0]
-               result["time_index"] = inputs["time_indexs"][0].item()
+               result["time_index"] = inputs["time_index"][0].item()
                
             result["empty_combined_emb"] = self._wrap_with_boi_eoi_inplace(
                 torch.zeros(
@@ -312,12 +312,12 @@ class LLMSubmodule(StageSubmodule):
                     device=result["latents"].device
                 )
             )
-            result["text_indexes"] = torch.Tensor(
+            result["text_indexes"] = torch.tensor(
                 [0, result["empty_combined_emb"].shape[0] - 1], dtype=torch.long,
                 device=result["latents"].device
             )
             result["vae_token_indexes"] = torch.arange(
-                1, result["combined_emb"].shape[0]-1,
+                1, result["empty_combined_emb"].shape[0]-1,
                 dtype=torch.long,
                 device=result["latents"].device
             )
@@ -485,14 +485,14 @@ class LLMSubmodule(StageSubmodule):
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
 
+        # TODO: support for timestep shift (non-uniform timesteps)
+        dt = 1 / self.config.num_timesteps
+        timestep = 1 - time_index * dt
+
         pos_embed = self.latent_pos_embed(vae_position_ids)
         timestep_embeds = self.time_embedder(timestep)
         empty_combined_emb[1:-1] = self.llm2vae(latents) + timestep_embeds \
             + pos_embed
-        
-        # TODO: support for timestep shift (non-uniform timesteps)
-        dt = 1 / self.config.num_timesteps
-        timestep = 1 - time_index * dt
 
         velocities = {}
         for label in ["main", "cfg_text", "cfg_img"]:
