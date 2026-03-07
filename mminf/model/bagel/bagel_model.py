@@ -36,7 +36,6 @@ from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download, snapshot_download
 import torch
 import torch.nn as nn
-import yaml
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.graph.base import (

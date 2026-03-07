@@ -13,7 +13,7 @@ import torch
 from einops import rearrange
 from torch import Tensor, nn
 
-from mminf.model.bagel.bagel_model import BagelAutoEncoderConfig
+from mminf.model.bagel.config import BagelAutoEncoderConfig
 
 
 def swish(x: Tensor) -> Tensor:

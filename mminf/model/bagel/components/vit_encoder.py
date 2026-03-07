@@ -15,7 +15,7 @@ import torch
 from torch import nn
 
 from transformers.activations import ACT2FN
-from mminf.model.bagel.bagel_model import BagelViTConfig
+from mminf.model.bagel.config import BagelViTConfig
 
 
 class RotaryEmbedding2D(torch.nn.Module):

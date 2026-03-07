@@ -14,12 +14,11 @@ from typing import Optional
 
 import torch
 from torch import nn
-from transformers import ROPE_INIT_FUNCTIONS
 from transformers.activations import ACT2FN
 
 from mminf.engine.ar_engine import CacheHandle
 from mminf.engine.flashinfer_utils import run_rms_norm
-from mminf.model.bagel.bagel_model import BagelModelConfig
+from mminf.model.bagel.config import BagelModelConfig
 torch._dynamo.config.cache_size_limit = 512
 torch._dynamo.config.accumulated_cache_size_limit = 4096
 
