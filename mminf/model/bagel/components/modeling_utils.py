@@ -112,7 +112,7 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class MLPconnector(nn.Module):
+class BagelMLPconnector(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_act: str):
         super().__init__()
         self.activation_fn = ACT2FN[hidden_act]
