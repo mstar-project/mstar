@@ -66,7 +66,7 @@ class EngineManager:
                 for name in stage_names:
                     submodule = model.get_submodule(name)
                     if submodule is not None:
-                        submodules[name] = submodule
+                        submodules[name] = submodule.to(device)
 
             engine.load_model(submodules, model_config, device)
 
