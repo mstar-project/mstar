@@ -53,9 +53,10 @@ from mminf.model.bagel.components.modeling_utils import BagelMLPconnector, Posit
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.tokenization import BagelTokenizer, add_special_tokens
 from mminf.model.bagel.components.vit_encoder import BagelVisionModel
-from mminf.model.bagel.config import BagelAutoEncoderConfig, BagelModelConfig, BagelViTConfig, load_bagel_config, load_bagel_configs
+from mminf.model.bagel.config import load_bagel_config
 from mminf.model.bagel.submodules import LLMSubmodule, VAEDecoderSubmodule, VAEEncoderSubmodule, ViTEncoderSubmodule
 from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model, StageSubmodule
+from mminf.model.utils import load_weights
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +139,7 @@ class BagelModel(Model):
 
         self.repo = None
         self.vae_initialized = False
+        self.llm_initialized = False
 
 
     def _download_hf(self):
@@ -148,13 +150,23 @@ class BagelModel(Model):
     
     def _init_language_model_components(self):
         self._download_hf()
+        self.llm_initialized = True
         self.language_model = BagelForCausalLM(self.config)
         self.llm2vae = nn.Linear(self.config.hidden_size, self.config.patch_latent_dim)
 
         ema_path = self.repo / "ema.safetensors"
         state_dict = load_file(ema_path)
-        self.language_model.load_state_dict(state_dict, strict=False)
-        self.llm2vae.load_state_dict(state_dict, strict=False)
+
+        load_weights(
+            state_dict=state_dict,
+            module=self.language_model,
+            prefix="language_model"
+        )
+        load_weights(
+            state_dict=state_dict,
+            module=self.llm2vae,
+            prefix="llm2vae"
+        )
 
         if not self.vae_initialized:
             # Need these for image gen
@@ -162,8 +174,17 @@ class BagelModel(Model):
                 self.config.max_latent_size, self.config.hidden_size
             )
             self.time_embedder = TimestepEmbedder(self.config.hidden_size)
-            self.time_embedder.load_state_dict(state_dict, strict=False)
-            self.latent_pos_embed.load_state_dict(state_dict, strict=False)
+
+            load_weights(
+                state_dict=state_dict,
+                module=self.time_embedder,
+                prefix="time_embedder"
+            )
+            load_weights(
+                state_dict=state_dict,
+                module=self.latent_pos_embed,
+                prefix="latent_pos_embed"
+            )
 
     def _init_vae_components(self):
         self._download_hf()
@@ -181,14 +202,34 @@ class BagelModel(Model):
         # Load in weights: VAE
         vae_path = self.repo / "ae.safetensors"
         state_dict = load_file(vae_path)
-        self.vae_model.load_state_dict(state_dict, strict=False)
+        load_weights(
+            state_dict=state_dict,
+            module=self.vae_model,
+        ) # vae model state dict does not have prefix
 
         # Load in weights: rest
         ema_path = self.repo / "ema.safetensors"
         state_dict = load_file(ema_path)
-        self.time_embedder.load_state_dict(state_dict, strict=False)
-        self.vae2llm.load_state_dict(state_dict, strict=False)
-        self.latent_pos_embed.load_state_dict(state_dict, strict=False)
+
+        load_weights(
+            state_dict=state_dict,
+            module=self.vae2llm,
+            prefix="vae2llm"
+        )
+
+        if not self.llm_initialized:
+            # LLM components also need these for image gen, so these
+            # might already be initialized by _init_language_model_components().
+            load_weights(
+                state_dict=state_dict,
+                module=self.time_embedder,
+                prefix="time_embedder"
+            )
+            load_weights(
+                state_dict=state_dict,
+                module=self.latent_pos_embed,
+                prefix="latent_pos_embed"
+            )
 
     def _init_vit_components(self):
         self._download_hf()
@@ -209,9 +250,22 @@ class BagelModel(Model):
         self.vit_model.vision_model.embeddings.convert_conv2d_to_linear(
             self.config.vit_config, meta=True
         )
-        self.vit_model.load_state_dict(state_dict, strict=False)
-        self.connector.load_state_dict(state_dict, strict=False)
-        self.vit_pos_embed.load_state_dict(state_dict, strict=False)
+
+        load_weights(
+            state_dict=state_dict,
+            module=self.vit_model,
+            prefix="vit_model"
+        )
+        load_weights(
+            state_dict=state_dict,
+            module=self.connector,
+            prefix="connector"
+        )
+        load_weights(
+            state_dict=state_dict,
+            module=self.vit_pos_embed,
+            prefix="vit_pos_embed"
+        )
 
 
     # -----------------------------------------------------------------------
