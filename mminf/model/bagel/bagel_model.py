@@ -39,6 +39,7 @@ from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.base import EngineType
+from mminf.engine.ar_engine import KVCacheConfig
 from mminf.graph.base import (
     GraphPointer,
     GraphSection,
@@ -357,6 +358,14 @@ class BagelModel(Model):
             ]
 
         return result
+
+    def get_kv_cache_config(self) -> KVCacheConfig:
+        return KVCacheConfig(
+            num_layers=self.config.num_hidden_layers,
+            num_kv_heads=self.config.num_attention_heads,
+            head_dim=self.config.hidden_size // self.config.num_attention_heads,
+            max_seq_len=self.config.max_position_embeddings,
+        )
 
     def get_submodule(self, stage_name: str) -> torch.nn.Module | None:
         if stage_name in self._submodule_cache:

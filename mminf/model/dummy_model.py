@@ -4,6 +4,8 @@ import numpy as np
 import torch
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.engine.ar_engine import KVCacheConfig
+from mminf.graph.base import GraphPointer, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphPointer, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
 from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model
@@ -119,6 +121,14 @@ class DummyModel(Model):
             prefill=prefill,
             decode=decode,
             image_gen=image_gen
+        )
+    
+    def get_kv_cache_config(self) -> KVCacheConfig:
+        return KVCacheConfig(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            max_seq_len=1,
         )
 
     def get_initial_forward_metadata(

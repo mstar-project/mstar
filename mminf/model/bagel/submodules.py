@@ -268,21 +268,11 @@ class LLMSubmodule(StageSubmodule):
         result = {}
         if phase in ["prefill_text", "decode"]:
             result["text_inputs"] = inputs["text_inputs"][0]
-            result["empty_position_ids"] = None
-            result["empty_position_ids"] = torch.zeros_like(
-                result["text_inputs"], dtype=torch.long,
-                device=result["text_inputs"].device
-            )
 
         if phase in ["prefill_vit", "prefill_vae"]:
-            img_emb = inputs.get("img_emb")
+            img_emb = inputs.get("img_emb")[0]
             result["combined_emb"] = self._wrap_with_boi_eoi(img_emb)
-            result["empty_position_ids"] = None
-            result["empty_position_ids"] = torch.zeros(
-                result["combined_emb"].shape[0], dtype=torch.long,
-                device=result["combined_emb"].device
-            )
-
+        
         if phase == "prefill_vae":
             text_len = result["combined_emb"].shape[0]
             result["text_indexes"] = torch.zeros(
@@ -329,11 +319,7 @@ class LLMSubmodule(StageSubmodule):
                 dtype=torch.long,
                 device=result["latents"].device
             )
-            result["empty_position_ids"] = torch.zeros(
-                result["empty_combined_emb"].shape[0], dtype=torch.long,
-                device=result["latents"].device
-            )
-
+         
         return result
 
     def forward(self, phase: str, cache_handle=None, **kwargs) -> NameToTensorList:
@@ -352,7 +338,6 @@ class LLMSubmodule(StageSubmodule):
 
     def _forward_prefill_text(
         self, text_inputs: torch.Tensor,
-        empty_position_ids: torch.Tensor,
         cache_handle: CacheHandle, **kwargs
     ) -> NameToTensorList:
         """embed_tokens -> LLM forward (causal, mode='und') -> KV cache update.
@@ -366,13 +351,9 @@ class LLMSubmodule(StageSubmodule):
         for label in cache_labels:
             if cache_handle is not None:
                 cache_handle.set_active_label(label)
-                empty_position_ids = range(
-                    cache_handle._get_state().seq_len,
-                    cache_handle._get_state().seq_len + text_inputs.shape[0]
-                )
+
             self.language_model(
-                emb, empty_position_ids,
-                is_causal=True, mode="und",
+                emb, is_causal=True, mode="und",
                 cache_handle=cache_handle, **kwargs
             )
         if snapshot_after and cache_handle is not None:
@@ -382,7 +363,6 @@ class LLMSubmodule(StageSubmodule):
 
     def _forward_prefill_vit(
         self, combined_emb: torch.Tensor,
-        empty_position_ids: torch.Tensor,
         cache_handle: CacheHandle,**kwargs
     ) -> NameToTensorList:
         """Wrap img_emb with BOI/EOI tokens -> LLM forward (bidirectional).
@@ -395,13 +375,9 @@ class LLMSubmodule(StageSubmodule):
         for label in cache_labels:
             if cache_handle is not None:
                 cache_handle.set_active_label(label)
-                empty_position_ids = range(
-                    cache_handle._get_state().seq_len,
-                    cache_handle._get_state().seq_len + combined_emb.shape[0]
-                )
+
             self.language_model(
-                combined_emb, empty_position_ids,
-                is_causal=False, mode="und",
+                combined_emb, is_causal=False, mode="und",
                 cache_handle=cache_handle, **kwargs
             )
         if snapshot_after and cache_handle is not None:
@@ -411,7 +387,6 @@ class LLMSubmodule(StageSubmodule):
 
     def _forward_prefill_vae(
         self, combined_emb: torch.Tensor,
-        empty_position_ids: torch.Tensor,
         vae_token_indexes: torch.Tensor,
         text_indexes: torch.Tensor,
         cache_handle: CacheHandle, **kwargs
@@ -427,8 +402,7 @@ class LLMSubmodule(StageSubmodule):
             if cache_handle is not None:
                 cache_handle.set_active_label(label)
             self.language_model(
-                combined_emb, empty_position_ids,
-                is_causal=False, mode="und",
+                combined_emb, is_causal=False, mode="und",
                 cache_handle=cache_handle,
                 vae_token_indexes=vae_token_indexes,
                 text_indexes=text_indexes,
@@ -441,7 +415,6 @@ class LLMSubmodule(StageSubmodule):
 
     def _forward_decode(
         self, text_inputs: torch.Tensor,
-        empty_position_ids: torch.Tensor,
         cache_handle: CacheHandle, **kwargs
     ) -> NameToTensorList:
         """embed_tokens -> LLM forward -> lm_head -> argmax."""
@@ -451,14 +424,10 @@ class LLMSubmodule(StageSubmodule):
         emb = self.embed_tokens(text_inputs)
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-            empty_position_ids = range(
-                cache_handle._get_state().seq_len,
-                cache_handle._get_state().seq_len + text_inputs.shape[0]
-            )
+
 
         hidden = self.language_model(
-            emb, empty_position_ids,
-            is_causal=True, mode="und",
+            emb, is_causal=True, mode="und",
             cache_handle=cache_handle, **kwargs
         )
         logits = self.lm_head(hidden[-1:])
@@ -469,7 +438,6 @@ class LLMSubmodule(StageSubmodule):
         self,
         latents: torch.Tensor,
         empty_combined_emb: torch.Tensor,
-        empty_position_ids: torch.Tensor,
         vae_position_ids: torch.Tensor,
         text_indexes: torch.Tensor,
         vae_token_indexes: torch.Tensor,
@@ -506,13 +474,9 @@ class LLMSubmodule(StageSubmodule):
         for label in ["main", "cfg_text", "cfg_img"]:
             if cache_handle is not None:
                 cache_handle.set_active_label(label)
-                empty_position_ids = range(
-                    cache_handle._get_state().seq_len,
-                    cache_handle._get_state().seq_len + empty_combined_emb.shape[0]
-                )
+
             hidden = self.language_model(
-                empty_combined_emb, empty_position_ids,
-                is_causal=False, mode="gen",
+                empty_combined_emb, is_causal=False, mode="gen",
                 cache_handle=cache_handle,
                 write_cache=False,
                 vae_token_indexes=vae_token_indexes,

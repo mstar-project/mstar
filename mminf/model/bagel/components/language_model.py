@@ -123,7 +123,6 @@ class BagelAttention(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        query_position_ids: torch.Tensor,
         cache_handle: CacheHandle,
         write_cache=True,
         is_causal=True,
@@ -145,8 +144,8 @@ class BagelAttention(nn.Module):
             key_states, self.k_norm.weight, eps=self.k_norm.variance_epsilon
         )
 
-        query_states, key_states = cache_handle.apply_rope(
-            query_states, key_states, query_position_ids,
+        query_states, key_states = cache_handle.apply_rope_default(
+            query_states, key_states,
         )
 
         query_states = query_states.to(torch.bfloat16)
@@ -214,7 +213,6 @@ class BagelAttentionMoT(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        query_position_ids: torch.Tensor,
         cache_handle: CacheHandle,
         write_cache=True,
         is_causal=True,
@@ -302,8 +300,8 @@ class BagelAttentionMoT(nn.Module):
             )
 
         # rotary embeddings
-        query_states, key_states = cache_handle.apply_rope(
-            query_states, key_states, query_position_ids,
+        query_states, key_states = cache_handle.apply_rope_default(
+            query_states, key_states,
         )
 
         query_states = query_states.to(torch.bfloat16)
@@ -404,7 +402,6 @@ class BagelMoTDecoderLayer(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        query_position_ids: torch.Tensor,
         cache_handle: CacheHandle,
         write_cache=True,
         is_causal=True,
@@ -434,7 +431,6 @@ class BagelMoTDecoderLayer(nn.Module):
         # Self Attention
         query_sequence = self.self_attn(
             query_sequence=query_sequence,
-            query_position_ids=query_position_ids,
             cache_handle=cache_handle,
             write_cache=write_cache,
             is_causal=is_causal,
@@ -494,7 +490,6 @@ class BagelLanguageModel(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        query_position_ids: torch.Tensor,
         cache_handle: CacheHandle,
         write_cache=True,
         is_causal=True,
@@ -516,7 +511,6 @@ class BagelLanguageModel(nn.Module):
         for _layer_idx, decoder_layer in enumerate(self.layers):
             query_sequence = decoder_layer(
                 query_sequence=query_sequence,
-                query_position_ids=query_position_ids,
                 cache_handle=cache_handle,
                 write_cache=write_cache,
                 is_causal=is_causal,
@@ -572,7 +566,6 @@ class BagelForCausalLM(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        query_position_ids: torch.Tensor,
         cache_handle: CacheHandle,
         write_cache=True,
         is_causal=True,
@@ -583,7 +576,6 @@ class BagelForCausalLM(nn.Module):
         assert mode in ["und", "gen"]
         outputs = self.model(
             query_sequence=query_sequence,
-            query_position_ids=query_position_ids,
             cache_handle=cache_handle,
             write_cache=write_cache,
             is_causal=is_causal,

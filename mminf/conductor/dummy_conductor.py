@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
+import yaml
 
 from mminf.communication.communicator import ZMQCommunicator
 from mminf.graph.base import GraphPointer, TensorPointerInfo
@@ -91,6 +92,11 @@ class DummyConductor:
         self.socket_path_prefix = socket_path_prefix
         self._worker_processes: list[mp.Process] = []
 
+        with open(model_config_file, "r") as f:
+            self.model_config = yaml.safe_load(f)
+        assert "max_seq_len" in self.model_config
+        assert "stage_groups" in self.model_config
+
         self.subgraphs = {
             subgraph.subgraph_id: subgraph
             for subgraph in model.get_subgraphs(model_config_file)
@@ -123,6 +129,9 @@ class DummyConductor:
         self._per_worker_subgraphs: dict[str, list[Subgraph]] = {}
         self._per_worker_engine_configs: dict[str, list[dict]] = {}
 
+        engine_model_cfg = {
+            "kv_cache": self.model.get_kv_cache_config()
+        }
         for rank in self._sorted_ranks:
             worker_id = f"worker_{rank}"
             subgraphs = rank_to_subgraphs[rank]
@@ -137,7 +146,10 @@ class DummyConductor:
                         engine_type_to_stages[etype].append(stage_name)
 
             self._per_worker_engine_configs[worker_id] = [
-                {"engine_type": etype, "stage_names": stages, "model_config": {}}
+                {
+                    "engine_type": etype, "stage_names": stages,
+                    "model_config": engine_model_cfg
+                }
                 for etype, stages in engine_type_to_stages.items()
             ]
 

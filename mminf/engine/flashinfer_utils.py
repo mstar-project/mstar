@@ -13,3 +13,20 @@ def run_rms_norm(
     return flashinfer.norm.rmsnorm(
         input, weight, eps=eps
     )
+
+
+def run_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float=1.0,
+    causal: bool=True,
+):
+    import flashinfer
+    return flashinfer.ops.attention(
+        q,
+        k,
+        v,
+        causal=causal,
+        sm_scale=scale,
+    )

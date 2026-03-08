@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
-
+from mminf.engine.flashinfer_utils import run_attention
 from mminf.model.bagel.config import BagelViTConfig
 
 
@@ -114,10 +114,8 @@ class BagelVisionEmbeddings(nn.Module):
         return embeddings
 
 
-class BagelViTAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    # Copied from transformers.models.clip.modeling_clip.CLIPAttention.__init__
+class BagelViTAttention(nn.Module):
     def __init__(self, config: BagelViTConfig):
         super().__init__()
         self.config = config
@@ -140,55 +138,54 @@ class BagelViTAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Input shape: Batch x Time x Channel"""
+        cu_seqlens: torch.IntTensor,
+        max_seqlen: int,
+        cos_h: torch.Tensor = None,
+        sin_h: torch.Tensor = None,
+        cos_w: torch.Tensor = None,
+        sin_w: torch.Tensor = None,
+        **kwargs,
+    ) -> torch.Tensor:
 
-        batch_size, q_len, _ = hidden_states.size()
+        total_q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
 
-        query_states = query_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q.view(total_q_len, self.num_heads, self.head_dim)
+        k = k.view(total_q_len, self.num_heads, self.head_dim)
+        v = v.view(total_q_len, self.num_heads, self.head_dim)
 
-        k_v_seq_len = key_states.shape[-2]
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
+        if self.config.rope:
+            qh, qw = q[:, :, :self.head_dim // 2], q[:, :, self.head_dim // 2:]
+            kh, kw = k[:, :, :self.head_dim // 2], k[:, :, self.head_dim // 2:]
 
-        if attn_weights.size() != (batch_size, self.num_heads, q_len, k_v_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(batch_size, self.num_heads, q_len, k_v_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
+            # TODO: replace this with flashinfer
+            qh, kh = apply_rotary_pos_emb(qh, kh, cos_h, sin_h)
+            qw, kw = apply_rotary_pos_emb(qw, kw, cos_w, sin_w)
 
-        if attention_mask is not None:
-            if attention_mask.size() != (batch_size, 1, q_len, k_v_seq_len):
-                raise ValueError(
-                    "Attention mask should be of size "
-                    f"{(batch_size, 1, q_len, k_v_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
+            q = torch.cat([qh, qw], dim=-1)
+            k = torch.cat([kh, kw], dim=-1)
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        # FlashInfer expects [batch, seq, heads, dim]
+        q = q.unsqueeze(0).to(torch.bfloat16)
+        k = k.unsqueeze(0).to(torch.bfloat16)
+        v = v.unsqueeze(0).to(torch.bfloat16)
 
-        if attn_output.size() != (batch_size, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(batch_size, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
+        attn_output = run_attention(
+            q,
+            k,
+            v,
+            causal=False,
+            scale=self.scale,
+        )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(batch_size, q_len, self.embed_dim)
+        # back to [tokens, hidden]
+        attn_output = attn_output.squeeze(0).reshape(total_q_len, -1)
 
         attn_output = self.out_proj(attn_output)
-
-        return attn_output, attn_weights
+        return attn_output
 
 
 class BagelViTMLP(nn.Module):

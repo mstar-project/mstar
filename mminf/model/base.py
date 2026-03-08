@@ -9,6 +9,7 @@ import torch
 import yaml
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphPointer, GraphSection, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
 
@@ -218,6 +219,9 @@ class Model(ABC):
                 for phase, graph in self.get_phase_graphs().items()
         ], start=[])
 
+    @abstractmethod
+    def get_kv_cache_config(self) -> KVCacheConfig:
+        pass
 
     @abstractmethod
     def get_phase_graphs(self) -> dict[str, GraphSection]:
