@@ -62,11 +62,6 @@ class ResultChunk:
 
 @dataclass
 class ResultTensors:
-    """
-    For now, expect the tensor to be pure bytes, and the model
-    handles the postprocessing to convert it to the appropriate
-    format (e.g. PNG encoding for images).
-    """
     request_id: str
     modality: str
     graph_edge: GraphPointer
@@ -82,7 +77,7 @@ class RequestComplete:
 @dataclass
 class APIServerMessage:
     """Envelope for messages received by the API server."""
-    message_type: str  # "result_chunk" | "request_complete"
+    message_type: str  # "result_tensors" | "request_complete"
     body: ResultTensors | RequestComplete
 
 
@@ -216,9 +211,12 @@ class APIServer:
         stale = [
             rid
             for rid, ts in self.recently_completed.items()
-            if now - ts > self._recently_completed_ttl
+            if now - ts > self._recently_completed_ttl \
+            and not self.preprocess_worker.has_pending_tensors(rid)
         ]
         for rid in stale:
+            # only set the event when there are no more pending chunks
+            self.pending_requests[rid]["event"].set()
             self.preprocess_worker.cleanup_request(rid)
             self.recently_completed.pop(rid, None)
 
@@ -236,12 +234,11 @@ class APIServer:
                     with self.request_lock:
                         self._prune_recently_completed()
                         if rid in self.pending_requests:
-                            if message.message_type == "result_chunk":
+                            if message.message_type == "result_tensors":
                                 self.preprocess_worker.new_result_tensors(
                                     message.body
                                 )
                             elif message.message_type == "request_complete":
-                                self.pending_requests[rid]["event"].set()
                                 self.recently_completed[rid] = time.time()
                         elif rid in self.recently_completed:
                             logger.debug("Late message for completed %s", rid)

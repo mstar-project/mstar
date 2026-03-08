@@ -325,7 +325,7 @@ class Worker:
         if outputs.stream_out:
             for graph_edge in outputs.stream_out:
                 message = APIServerMessage(
-                    message_type="result_chunk",
+                    message_type="result_tensors",
                     body=ResultTensors(
                         request_id=request_id,
                         modality=graph_edge.output_modality,

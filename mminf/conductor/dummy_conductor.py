@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import yaml
 
+from mminf.api_server.entrypoint import APIServerMessage, RequestComplete
 from mminf.communication.communicator import ZMQCommunicator
 from mminf.graph.base import GraphPointer, TensorPointerInfo
 from mminf.ipc_formats import (
@@ -69,8 +70,6 @@ class RequestData:
     current_subgraph_ids: set[str]
     # make sure to check all tensors in the list are completed (BLOCKING case)
     completed_subgraph_ids: set[str] = field(default_factory=set)
-
-    # TODO: will need to add to this as we build things out
 
 
 class DummyConductor:
@@ -335,7 +334,15 @@ class DummyConductor:
                 body=RemoveRequest(request_id)
             )
             self.communicator.send(worker_id, msg)
-        # TODO: send done signal back to the API server
+        self.communicator.send(
+            "api_server",
+            APIServerMessage(
+                message_type="request_complete",
+                body=RequestComplete(
+                    request_id=request_id
+                )
+            )
+        )
         del self.requests[request_id]
 
     def _process_done_forward(

@@ -48,6 +48,8 @@ class PreprocessWorker:
         self.output_queue = queue.Queue()
         self.stop_event = threading.Event()
 
+        self.per_request_reading_tensors = {}
+
         self.thread = threading.Thread(
             target=_preprocess_loop,
             kwargs=dict(
@@ -64,15 +66,22 @@ class PreprocessWorker:
         )
 
     def new_request(self, input: PreprocessInput):
+        self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
 
     def new_result_tensors(self, input: ResultTensors):
+        self.per_request_reading_tensors[input.request_id] += len(input.graph_edge.tensor_info)
         self.request_input_queue.put(input)
+
+    def has_pending_tensors(self, request_id: str):
+        return self.per_request_reading_tensors.get(request_id, 0) > 0
 
     def get_result_chunks(self)-> list[ResultChunk]:
         results = []
         while not self.output_queue.empty():
-            results.append(self.output_queue.get())
+            result: ResultChunk = self.output_queue.get()
+            self.per_request_reading_tensors[result.request_id] -= 1
+            results.append(result)
         return results
 
     def cleanup_request(self, request_id: str):
