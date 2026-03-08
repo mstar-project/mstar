@@ -41,7 +41,7 @@ class ViTEncoderSubmodule(StageSubmodule):
         self.vit_model = vit_model
         self.connector = connector
         self.vit_pos_embed = vit_pos_embed
-    
+
         self.vit_patch_size = vit_patch_size
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
         self.transform = ImageTransform(980, 224, 14)
@@ -60,8 +60,8 @@ class ViTEncoderSubmodule(StageSubmodule):
         device = image_tensor.device
 
         position_ids = get_flattened_position_ids_extrapolate(
-            image_tensor.size(1), image_tensor.size(2), 
-            self.vit_patch_size, 
+            image_tensor.size(1), image_tensor.size(2),
+            self.vit_patch_size,
             max_num_patches_per_side=self.vit_max_num_patch_per_side
         )
         pixel_values = patchify(image_tensor)
@@ -154,7 +154,7 @@ class VAEEncoderSubmodule(StageSubmodule):
 
         packed_vae_position_ids = get_flattened_position_ids_extrapolate(
             img_h, img_w,
-            self.latent_downsample, 
+            self.latent_downsample,
             max_num_patches_per_side=self.max_latent_size
         )
 

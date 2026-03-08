@@ -16,9 +16,9 @@ import math
 import numpy as np
 import torch
 from torch import nn
-from torchvision.transforms import functional as F
-from torchvision.transforms import InterpolationMode
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as F
 from transformers.activations import ACT2FN
 
 
@@ -186,12 +186,12 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
     """
 
     def __init__(
-        self, 
-        max_size: int, 
-        min_size: int, 
-        stride: int, 
+        self,
+        max_size: int,
+        min_size: int,
+        stride: int,
         max_pixels: int,
-        interpolation=InterpolationMode.BICUBIC, 
+        interpolation=InterpolationMode.BICUBIC,
         antialias=True
     ):
         super().__init__()
@@ -245,19 +245,19 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
 
 class ImageTransform:
     def __init__(
-        self, 
-        max_image_size, 
-        min_image_size, 
-        image_stride, 
+        self,
+        max_image_size,
+        min_image_size,
+        image_stride,
         max_pixels=14*14*9*1024,
-        image_mean=[0.5, 0.5, 0.5], 
+        image_mean=[0.5, 0.5, 0.5],
         image_std=[0.5, 0.5, 0.5]
     ):
         self.stride = image_stride
 
         self.resize_transform = MaxLongEdgeMinShortEdgeResize(
-            max_size=max_image_size, 
-            min_size=min_image_size, 
+            max_size=max_image_size,
+            min_size=min_image_size,
             stride=image_stride,
             max_pixels=max_pixels,
         )
