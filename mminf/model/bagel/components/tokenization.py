@@ -10,10 +10,8 @@ from functools import lru_cache
 from typing import Optional, Tuple
 
 import regex as re
-
 from transformers.tokenization_utils import AddedToken, PreTrainedTokenizer
 from transformers.utils import logging
-
 
 logger = logging.get_logger(__name__)
 
@@ -25,7 +23,15 @@ VOCAB_FILES_NAMES = {
 
 MAX_MODEL_INPUT_SIZES = {"qwen/qwen-tokenizer": 32768}
 
-PRETOKENIZE_REGEX = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+PRETOKENIZE_REGEX = (
+    r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)"""
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
 
 
 @lru_cache()
@@ -51,7 +57,7 @@ def bytes_to_unicode():
             cs.append(2**8 + n)
             n += 1
     cs = [chr(n) for n in cs]
-    return dict(zip(bs, cs))
+    return dict(zip(bs, cs, strict=False))
 
 
 # Copied from transformers.models.gpt2.tokenization_gpt2.get_pairs
@@ -121,7 +127,7 @@ class BagelTokenizer(PreTrainedTokenizer):
                 if (i == 0 and line.startswith("#version:")) or not line:
                     continue
                 bpe_merges.append(tuple(line.split()))
-        self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))
+        self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges)), strict=False))
         # NOTE: the cache can grow without bound and will get really large for long running processes
         # (esp. for texts of language that do not use space between word, e.g. Chinese); technically
         # not a memory leak but appears as one.
@@ -280,7 +286,7 @@ class BagelTokenizer(PreTrainedTokenizer):
 
 def add_special_tokens(tokenizer):
     all_special_tokens = []
-    for k, v in tokenizer.special_tokens_map.items():
+    for _k, v in tokenizer.special_tokens_map.items():
         if isinstance(v, str):
             all_special_tokens.append(v)
         elif isinstance(v, list):
@@ -307,10 +313,10 @@ def add_special_tokens(tokenizer):
     end_of_image = tokenizer.convert_tokens_to_ids('<|vision_end|>')
 
     new_token_ids = dict(
-        bos_token_id=bos_token_id, 
-        eos_token_id=eos_token_id, 
-        start_of_image=start_of_image, 
-        end_of_image=end_of_image, 
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        start_of_image=start_of_image,
+        end_of_image=end_of_image,
     )
 
     return tokenizer, new_token_ids, num_new_tokens

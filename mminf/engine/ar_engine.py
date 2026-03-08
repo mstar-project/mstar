@@ -210,7 +210,7 @@ class CacheHandle:
         seq_len = query_postion_ids.shape[0]
         self.indptr[1] = seq_len
         self.offsets[0] = self._get_state().seq_len
-    
+
         import flashinfer
         return flashinfer.rope.apply_rope(
             q, k, self.indptr,
@@ -236,9 +236,7 @@ class CacheHandle:
 
             # Copy KV data page by page across all layers
             num_layers = self.kv_cache.shape[0]
-            for i, (src_page, dst_page) in enumerate(
-                zip(from_state.page_indices, new_pages)
-            ):
+            for src_page, dst_page in zip(from_state.page_indices, new_pages, strict=False):
                 self.kv_cache[:, dst_page] = self.kv_cache[:, src_page]
 
             self.request_states[to_key] = KVRequestState(

@@ -13,8 +13,8 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
-
 from transformers.activations import ACT2FN
+
 from mminf.model.bagel.config import BagelViTConfig
 
 
@@ -101,8 +101,8 @@ class BagelVisionEmbeddings(nn.Module):
         self.patch_embedding = linear_patch_embedding
 
     def forward(
-        self, 
-        packed_pixel_values: torch.FloatTensor, 
+        self,
+        packed_pixel_values: torch.FloatTensor,
         packed_flattened_position_ids: torch.LongTensor
     ) -> torch.Tensor:
 
@@ -167,7 +167,8 @@ class BagelViTAttention(nn.Module):
         if attention_mask is not None:
             if attention_mask.size() != (batch_size, 1, q_len, k_v_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(batch_size, 1, q_len, k_v_seq_len)}, but is {attention_mask.size()}"
+                    "Attention mask should be of size "
+                    f"{(batch_size, 1, q_len, k_v_seq_len)}, but is {attention_mask.size()}"
                 )
             attn_weights = attn_weights + attention_mask
 
@@ -296,7 +297,7 @@ class BagelVisionTransformer(nn.Module):
         max_seqlen: int,
     ) -> torch.Tensor:
         hidden_states = self.embeddings(
-            packed_pixel_values=packed_pixel_values, 
+            packed_pixel_values=packed_pixel_values,
             packed_flattened_position_ids=packed_flattened_position_ids
         )
 
@@ -310,7 +311,7 @@ class BagelVisionTransformer(nn.Module):
             )
 
         last_hidden_state = self.encoder(
-            inputs_embeds=hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, 
+            inputs_embeds=hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
             **extra_inputs
         )
         last_hidden_state = self.post_layernorm(last_hidden_state)
@@ -321,7 +322,7 @@ class BagelVisionModel(nn.Module):
     def __init__(self, config: BagelViTConfig):
         super().__init__()
         self.vision_model = BagelVisionTransformer(config)
-    
+
     def get_input_embeddings(self) -> nn.Module:
         return self.vision_model.embeddings.patch_embedding
 

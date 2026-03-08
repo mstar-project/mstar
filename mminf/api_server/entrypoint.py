@@ -527,7 +527,7 @@ def main():
     ctx = mp.get_context("spawn")
     conductor_proc = ctx.Process(
         target=_conductor_process_target,
-        args=(model_name, args.config, 
+        args=(model_name, args.config,
               args.socket_path_prefix),
         daemon=True,
     )

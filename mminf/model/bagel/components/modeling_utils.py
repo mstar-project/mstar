@@ -18,6 +18,7 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 
+
 # --------------------------------------------------------
 # 2D sine-cosine position embedding
 # References:
@@ -132,7 +133,7 @@ class PositionEmbedding(nn.Module):
         self.max_num_patch_per_side = max_num_patch_per_side
         self.hidden_size = hidden_size
         self.pos_embed = nn.Parameter(
-            torch.zeros(max_num_patch_per_side ** 2, hidden_size), 
+            torch.zeros(max_num_patch_per_side ** 2, hidden_size),
             requires_grad=False
         )
         self._init_weights()

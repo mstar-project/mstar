@@ -70,7 +70,7 @@ class BaseEngine(ABC):
 
     def warmup(self) -> None:
         """Optional CUDA graph capture. Override in subclasses."""
-        pass
+        return
 
     def shutdown(self) -> None:
-        pass
+        return

@@ -4,12 +4,16 @@
 
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import CacheHandle
 from mminf.model.bagel.components.language_model import BagelForCausalLM
-from mminf.model.bagel.components.modeling_utils import PositionEmbedding, TimestepEmbedder, get_flattened_position_ids_extrapolate
+from mminf.model.bagel.components.modeling_utils import (
+    PositionEmbedding,
+    TimestepEmbedder,
+    get_flattened_position_ids_extrapolate,
+)
 from mminf.model.bagel.config import BagelModelConfig
 from mminf.model.base import StageSubmodule
 
@@ -235,14 +239,14 @@ class LLMSubmodule(StageSubmodule):
         self.config = config
         self.boi_token_id = boi_token_id
         self.eoi_token_id = eoi_token_id
-    
+
     def _init_latents(
         self,
         device,
         H: int=1024,
         W: int=1024,
     ):
-        h, w = (H // self.config.latent_downsample, 
+        h, w = (H // self.config.latent_downsample,
                 W // self.config.latent_downsample)
         num_image_tokens = h * w
         return torch.randn(
@@ -278,7 +282,7 @@ class LLMSubmodule(StageSubmodule):
                 result["combined_emb"].shape[0], dtype=torch.long,
                 device=result["combined_emb"].device
             )
-        
+
         if phase == "prefill_vae":
             text_len = result["combined_emb"].shape[0]
             result["text_indexes"] = torch.zeros(
@@ -290,12 +294,12 @@ class LLMSubmodule(StageSubmodule):
                 1, result["combined_emb"].shape[0]-1,
                 dtype=torch.long, device=result["combined_emb"].device
             )
-        
+
         if phase == "image_gen":
             H, W = 1024, 1024 # TODO: make this configurable?
             result["vae_position_ids"] = get_flattened_position_ids_extrapolate(
                 H, W,
-                self.config.latent_downsample, 
+                self.config.latent_downsample,
                 max_num_patches_per_side=self.config.max_latent_size
             )
             if "latents" not in inputs or len(inputs["latents"]) == 0:
@@ -307,7 +311,7 @@ class LLMSubmodule(StageSubmodule):
             else:
                result["latents"] = inputs["latents"][0]
                result["time_index"] = inputs["time_index"][0].item()
-               
+
             result["empty_combined_emb"] = self._wrap_with_boi_eoi_inplace(
                 torch.zeros(
                     (result["latents"].shape[0], self.config.hidden_size),
@@ -329,7 +333,7 @@ class LLMSubmodule(StageSubmodule):
                 result["empty_combined_emb"].shape[0], dtype=torch.long,
                 device=result["latents"].device
             )
-         
+
         return result
 
     def forward(self, phase: str, cache_handle=None, **kwargs) -> NameToTensorList:
@@ -404,7 +408,7 @@ class LLMSubmodule(StageSubmodule):
             from_label, to_label = snapshot_after
             cache_handle.snapshot(from_label, to_label)
         return {}
-    
+
     def _forward_prefill_vae(
         self, combined_emb: torch.Tensor,
         empty_position_ids: torch.Tensor,
@@ -510,7 +514,7 @@ class LLMSubmodule(StageSubmodule):
                 empty_combined_emb, empty_position_ids,
                 is_causal=False, mode="gen",
                 cache_handle=cache_handle,
-                write_cache=False, 
+                write_cache=False,
                 vae_token_indexes=vae_token_indexes,
                 text_indexes=text_indexes,
                 **kwargs,

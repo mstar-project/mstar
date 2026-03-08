@@ -31,13 +31,14 @@ processed causally, then each image is processed bidirectionally.
 
 import json
 from pathlib import Path
-from safetensors.torch import load_file
 
-from huggingface_hub import hf_hub_download, snapshot_download
 import torch
-import torch.nn as nn
+from huggingface_hub import hf_hub_download, snapshot_download
+from safetensors.torch import load_file
+from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.engine.base import EngineType
 from mminf.graph.base import (
     GraphPointer,
     GraphSection,
@@ -46,17 +47,15 @@ from mminf.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mminf.engine.base import EngineType
 from mminf.model.bagel.components.autoencoder import BagelAutoEncoder
-from mminf.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
 from mminf.model.bagel.components.language_model import BagelForCausalLM
+from mminf.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
 from mminf.model.bagel.components.tokenization import BagelTokenizer, add_special_tokens
 from mminf.model.bagel.components.vit_encoder import BagelVisionModel
 from mminf.model.bagel.config import load_bagel_config
 from mminf.model.bagel.submodules import LLMSubmodule, VAEDecoderSubmodule, VAEEncoderSubmodule, ViTEncoderSubmodule
 from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model, StageSubmodule
 from mminf.model.utils import load_weights
-
 
 # ---------------------------------------------------------------------------
 # System prompts (used when think_mode=True)
@@ -146,7 +145,7 @@ class BagelModel(Model):
             return
         cache_dir = snapshot_download(repo_id=self.model_path_hf)
         self.repo = Path(cache_dir)
-    
+
     def _init_language_model_components(self):
         self._download_hf()
         self.llm_initialized = True

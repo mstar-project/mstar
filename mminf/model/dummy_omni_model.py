@@ -1,5 +1,4 @@
 
-from mminf.communication.tensors import NameToTensorList
 from mminf.graph.base import GraphPointer, GraphStage, Loop, Sequential, TensorPointerInfo
 from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model
 
