@@ -9,11 +9,11 @@
 #
 # This modified file is released under the same license.
 
-from typing import Optional, Tuple
 
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
+
 from mminf.engine.flashinfer_utils import run_attention
 from mminf.model.bagel.config import BagelViTConfig
 

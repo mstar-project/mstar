@@ -218,7 +218,7 @@ class CacheHandle:
     ):
         offset = self._get_state().seq_len
         pos_ids = self.base_pos_ids[:q.shape[0]] + offset
-    
+
         import flashinfer
         return flashinfer.rope.apply_rope_pos_ids(
             q, k, pos_ids,

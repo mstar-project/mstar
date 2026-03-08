@@ -274,7 +274,7 @@ class LLMSubmodule(StageSubmodule):
         if phase in ["prefill_vit", "prefill_vae"]:
             img_emb = inputs.get("img_emb")[0]
             result["combined_emb"] = self._wrap_with_boi_eoi(img_emb)
-        
+
         if phase == "prefill_vae":
             text_len = result["combined_emb"].shape[0]
             result["text_indexes"] = torch.zeros(
@@ -321,7 +321,7 @@ class LLMSubmodule(StageSubmodule):
                 dtype=torch.long,
                 device=result["latents"].device
             )
-         
+
         return result
 
     def forward(self, phase: str, cache_handle=None, **kwargs) -> NameToTensorList:

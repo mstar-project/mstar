@@ -19,6 +19,7 @@ from transformers.activations import ACT2FN
 from mminf.engine.ar_engine import CacheHandle
 from mminf.engine.flashinfer_utils import run_rms_norm
 from mminf.model.bagel.config import BagelModelConfig
+
 torch._dynamo.config.cache_size_limit = 512
 torch._dynamo.config.accumulated_cache_size_limit = 4096
 
@@ -32,7 +33,7 @@ class BagelRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    
+
     def forward(self, hidden_states):
         pass
         # # NOTE: this is replaced by flashinfer rmsnorm
@@ -85,7 +86,7 @@ class BagelAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-    
+
         if self.config.qk_norm:
             self.q_norm = BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.k_norm = BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -283,7 +284,7 @@ class BagelAttentionMoT(nn.Module):
         query_states, key_states = cache_handle.apply_rope_default(
             query_states, key_states, rope_theta=self.rope_theta
         )
-        
+
         query_states = query_states.to(torch.bfloat16)
         key_states = key_states.to(torch.bfloat16)
         value_states = value_states.to(torch.bfloat16)
@@ -358,9 +359,9 @@ class BagelAttentionMoT(nn.Module):
 
 class BagelMoTDecoderLayer(nn.Module):
     def __init__(
-        self, 
-        config: BagelModelConfig, 
-        layer_idx: Optional[int] = None, 
+        self,
+        config: BagelModelConfig,
+        layer_idx: Optional[int] = None,
         attn_module = BagelAttentionMoT,
     ):
         super().__init__()
@@ -400,7 +401,7 @@ class BagelMoTDecoderLayer(nn.Module):
                 query_sequence[vae_token_indexes], self.input_layernorm_moe_gen.weight,
                 eps=self.input_layernorm_moe_gen.variance_epsilon
             )
-            
+
             query_sequence = query_sequence_
 
         # Self Attention
@@ -483,7 +484,7 @@ class BagelLanguageModel(nn.Module):
                     text_indexes=text_indexes,
                 )
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for _layer_idx, decoder_layer in enumerate(self.layers):
             query_sequence = decoder_layer(
                 query_sequence=query_sequence,
                 cache_handle=cache_handle,

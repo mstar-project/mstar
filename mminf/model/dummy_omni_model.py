@@ -64,7 +64,7 @@ class DummyOmniModel(Model):
                 ],
             ),
         ])
-    
+
     def get_kv_cache_config(self) -> KVCacheConfig:
         return KVCacheConfig(
             num_layers=1,

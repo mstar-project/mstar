@@ -38,8 +38,8 @@ from safetensors.torch import load_file
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.engine.base import EngineType
 from mminf.engine.ar_engine import KVCacheConfig
+from mminf.engine.base import EngineType
 from mminf.graph.base import (
     GraphPointer,
     GraphSection,
