@@ -136,28 +136,30 @@ VoxServe's existing pattern. Detokenizer runs at intervals (every 10-50 tokens) 
 │  API Server  │ ──── ZMQ ────────→  │                 Conductor                │
 │              │                     │                                          │
 │  • FastAPI   │                     │  ┌─────────────┐  ┌──────────────────┐   │
-│  • HTTP      │                     │  │   Worker    │  │   Scheduler      │   │
-│  • Streaming │                     │  │   Registry  │  │   • req mgmt     │   │
-│  • Preprocess│                     │  │   (static + │  │     (steps a-f)  │   │
-│    Worker    │                     │  │    dynamic) │  │   • stage mgmt   │   │
-│  • Tokenize  │                     │  └─────────────┘  │     (steps g-i)  │   │
+│  • HTTP      │                     │  │   Worker    │  │ Request Lifecycle│   │
+│  • Streaming │                     │  │   Registry  │  │  • req mgmt      │   │
+│  • Preprocess│                     │  │   (static + │  │    (steps a-f)   │   │
+│    Worker    │                     │  │    dynamic) │  │  • fwd pass mgmt │   │
+│  • Tokenize  │                     │  └─────────────┘  │    (steps g-i)   │   │
 └──────────────┘                     │                   └──────────────────┘   │
        ▲                             │  ┌──────────────────────────────────┐    │
-       │                             │  │ Dispatching of stages/subgraphs  │    │
-       │ stream out                  │  │ • ready/waiting queues           │    │
-       │                             │  │ • {req → {stage: worker_id}}     │    │
+       │                             │  │ Subgraph assignment              │    │
+       │ stream out                  │  │ • {req → {subgraph: worker_id}} │    │
+       │                             │  │ • Phase transitions (model ABC) │    │
        │                             │  └──────────────────────────────────┘    │
        │                             └────────────────┬───────────────────┬─────┘
        │                                              │                   │
        │                                    ┌─────────┘           ┌───────┘
        │                                    │                     │
-       │                             ┌──────▼──────┐       ┌──────▼──────┐
-       │                             │  Worker 0   │       │  Worker 1   │
-       │                             │  (GPU 0)    │  IPC  │  (GPU 1)    │
-       └──────────────────────────── │  • LLM(AR)  │◄─────►│  • ViT(E/D)│
-                                     │  • Engines  │ RDMA  │  • VAE(E/D)│
-                                     │  • Scheduler│  +ZMQ │  • Engines │
-                                     └─────────────┘       └─────────────┘
+       │                             ┌──────▼──────────┐   ┌──────▼──────────┐
+       │                             │  Worker 0       │   │  Worker 1       │
+       │                             │  (GPU 0)        │   │  (GPU 1)        │
+       └──────────────────────────── │  • LLM (AR)     │◄─►│  • ViT (E/D)   │
+                                     │  • Engines      │IPC│  • VAE (E/D)   │
+                                     │  • MicroSched   │ZMQ│  • Engines     │
+                                     │  • SubgraphsMgr │ + │  • MicroSched  │
+                                     │  • Ready/Wait Q │RDM│  • SubgraphsMgr│
+                                     └─────────────────┘ A └────────────────┘
 
                      ┌─────────────────────────────────────┐
                      │        Model (ABC)                  │
@@ -178,9 +180,9 @@ VoxServe's existing pattern. Detokenizer runs at intervals (every 10-50 tokens) 
 |-----------|---------------|---------------------|
 | **API Server** | HTTP endpoints, streaming responses, ZMQ communication with Conductor, **tokenization** via `model.process_prompt()` (in the PreprocessWorker thread), media loading (images, audio, video) | GPU computation, batching |
 | **Cluster Manager** | Deployment-time GPU allocation, autoscaling policy, config loading | Runtime request routing (deployment-time only) |
-| **Conductor** | Request lifecycle, worker selection, subgraph dispatching (contiguous graph sections to each worker), routing of inputs to the graph (e.g., text, image, embeddings from prev forward pass), determining computation phase (prefill_text → prefill_vit → decode → image_gen), passing per-request metadata (e.g., cache_labels for CFG) | GPU computation, batching, tensor operations |
+| **Conductor** | Macro-level request lifecycle: worker selection, subgraph assignment, routing inputs at the start of each forward pass, determining the next computation phase (via `model.update_for_next_forward`), EOS/completion detection, passing per-request metadata (e.g., cache_labels for CFG). Does NOT manage ready/waiting queues or batch scheduling — those are on workers. | GPU computation, batching, tensor operations, intra-forward-pass scheduling |
 | **Model** (replaces "Execution Strategy") | Defines computation graphs for each phase via `get_phase_graphs()`, engine types via `get_stage_engine_types()`, forward pass orchestration (`get_forward_pass_inputs`, `update_for_next_forward`), tokenization (`process_prompt`), and `StageSubmodule` wrappers (preprocess + forward for each stage). Lives on the `Model` ABC. | Scheduling, worker selection, communication. |
-| **Workers** | GPU computation via engines, internal batching (MicroScheduler), KV cache management (via CacheHandle in AREngine), streaming output (STREAM_OUT), inter-worker communication (Mooncake RDMA + ZMQ), subgraph queue management (SubgraphsManager). | Request lifecycle (e.g., checking for EOS tokens), cross-worker scheduling. |
+| **Workers** | GPU computation via engines, internal batch scheduling (MicroScheduler), KV cache management (via CacheHandle in AREngine), streaming output directly to API Server (STREAM_OUT), inter-worker communication (Mooncake RDMA + ZMQ), subgraph queue management and completion detection (SubgraphsManager with ready/waiting queues), per-request phase tracking (applied locally from conductor signals), buffering persist signals and new tokens before reporting to conductor. | Macro-level phase transitions (EOS detection, deciding next phase), cross-worker scheduling, worker selection. |
 
 ---
 
@@ -302,7 +304,7 @@ As we have opted for a more decentralized, IPC-heavy scheduling procedure, the c
 
 1. Assigns workers to subgraphs (contiguous computation graph sections) upon receiving a new request, and sends the workers information about what subgraph(s) they are handing for a request, and what workers are handling other subgraphs (for output routing),
 2. During a forward pass, receives information from workers about subgraph completion, and also information about tensors that will persist across forward passes (e.g., a newly-generated token will need to be added to the inputs of the next forward pass, and image embeddings may also persist for the next forward pass),
-3. At the end of each full model forward pass, updates the current input/output modalities and computation "phase" (e.g., checks for BOI or EOS tokens),
+3. At the end of each full model forward pass, calls `model.update_for_next_forward()` to advance the computation phase (e.g., prefill → decode → image_gen) and detect request completion (EOS, image generation done) via `metadata.request_done`,
 4. At the beginning of each full model forward pass, sends inputs and state information (e.g., which computation phase we are in) to the appropriate graph stages on the appropriate workers.
 
 The intra-forward-pass communication, scheduling, and batching is being handled on the worker level for now, and workers send their outputs directly to other workers (and to the API server when appropriate).
@@ -365,9 +367,9 @@ For each request, the scheduler contains multiple roles that operate at differen
 
 | Step | Action | Details |
 |------|--------|---------|
-| g | Update request lifecycle | Update lifecycle state (saw `<BOI>`, saw `<EOS>`, etc.), wrangle inputs for next forward pass. If `<EOS>`, end request (send signals to workers and API server). Also set which subgraphs are active for the next model forward pass (used to track when the fwd pass is done) |
+| g | Update request lifecycle | Call `model.update_for_next_forward(metadata, new_tokens)` to advance phase transitions (e.g., prefill → decode → image_gen) and detect completion (EOS, image done). If `metadata.request_done` is set, end request (send REMOVE_REQUEST to workers). Also set which subgraphs are active for the next model forward pass (used to track when the fwd pass is done) |
 | h | `model.get_forward_pass_inputs(...)` | Get the inputs for the current forward pass (e.g., if we are doing image generation, this will include noisy latents). This will be in the form of `GraphPointer` objects, which include tensor name, what graph stage it is routed to, and the current tensor location (IP address, memory address, size)  |
-| i | Dispatch inputs to workers | Send the input `GraphPointer`s for the current forward pass to thj appropriate workers. Also include metadata of which phase we are in (e.g. prefill, decode, image_gen), because that is required for routing |
+| i | Dispatch inputs to workers | Send the input `GraphPointer`s for the current forward pass to the appropriate workers. Also include metadata of which phase we are in (e.g. prefill, decode, image_gen) and per-request metadata (e.g., cache_labels, snapshot_after), because these are required for routing and cache orchestration |
 
 **Note**: sending the current computation phase may be replaced by a more detailed "request state", which will additionally include information about, e.g., what input token indices are text vs. image vs. video.
 
@@ -407,6 +409,7 @@ class CurrentForwardMetadata:
     output_modalities: list[str]
     phase: str
     is_prefill: bool
+    request_done: bool = False  # set by model.update_for_next_forward() on EOS/completion
     kwargs: dict  # model-specific metadata (e.g., prefill_schedule, cfg scales)
 ```
 See the [computation graph model section](#9-computation-graph-model) for information about `GraphPointer` and `TensorPointerMetadata`.
@@ -1717,11 +1720,11 @@ Thinker becomes ready on Worker 0 (internal Worker scheduling).
 
 | Component | Rationale |
 |-----------|-----------|
-| **Conductor** (all) | Unique to our architecture: graph-based scheduling, ready/waiting queues, subgraph management |
-| **Execution Strategy** (all) | Model-specific computation graphs, `run_stage()` per model family |
+| **Conductor** (all) | Unique to our architecture: request lifecycle management, subgraph assignment, phase transitions |
+| **Model ABC** (all) | Model-specific computation graphs, phase definitions, StageSubmodule wrappers |
+| **Worker internals** (SubgraphsManager, MicroScheduler) | Graph-aware ready/waiting queues, batch scheduling, subgraph completion detection |
 | **Worker Registry** | Capability-based routing unique to our design |
-| **Computation Graph Model** (GraphSection hierarchy) | Working implementation exists in `computation_graph_scratch_work.py` |
-| **RequestQueues** with graph-aware ready/waiting | Working implementation exists |
+| **Computation Graph Model** (GraphSection hierarchy) | Working implementation exists |
 | **RELAY flag handling** | Thinker-Talker streaming pattern specific to our system |
 | **Subgraph persistence** logic | Re-plan only when modalities change |
 
