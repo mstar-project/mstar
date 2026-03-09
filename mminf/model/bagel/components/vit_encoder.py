@@ -84,14 +84,17 @@ class BagelVisionEmbeddings(nn.Module):
             self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
     def convert_conv2d_to_linear(self, config: BagelViTConfig, meta=False):
-        if meta:
-            linear_patch_embedding = nn.Linear(
-                config.num_channels * self.patch_size ** 2, self.embed_dim, bias=True, device='meta'
-            )
-        else:
-            linear_patch_embedding = nn.Linear(
-                config.num_channels * self.patch_size ** 2, self.embed_dim, bias=True
-            )
+        # Keep conversion device-safe so this helper works even if called with
+        # legacy `meta=True` callers.
+        device = self.patch_embedding.weight.device
+        dtype = self.patch_embedding.weight.dtype
+        linear_patch_embedding = nn.Linear(
+            config.num_channels * self.patch_size ** 2,
+            self.embed_dim,
+            bias=True,
+            device=device,
+            dtype=dtype,
+        )
         W = self.patch_embedding.weight.permute(0, 2, 3, 1).reshape(
             self.embed_dim, config.num_channels * self.patch_size ** 2
         )

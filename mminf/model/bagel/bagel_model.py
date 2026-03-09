@@ -161,6 +161,7 @@ class BagelModel(Model):
 
         ema_path = self.repo / "ema.safetensors"
         state_dict = load_file(ema_path)
+        latent_pos_size = self._infer_position_size(state_dict, "latent_pos_embed")
 
         load_weights(
             state_dict=state_dict,
@@ -176,7 +177,7 @@ class BagelModel(Model):
         if not self.vae_initialized:
             # Need these for image gen
             self.latent_pos_embed = PositionEmbedding(
-                self.config.max_latent_size, self.config.hidden_size
+                latent_pos_size, self.config.hidden_size
             )
             self.time_embedder = TimestepEmbedder(self.config.hidden_size)
             self.vae2llm = nn.Linear(self.config.patch_latent_dim, self.config.hidden_size)
@@ -203,11 +204,6 @@ class BagelModel(Model):
         if self.vae_initialized:
             return
         self.vae_initialized = True
-        self.latent_pos_embed = PositionEmbedding(
-            self.config.max_latent_size, self.config.hidden_size
-        )
-        self.time_embedder = TimestepEmbedder(self.config.hidden_size)
-        self.vae2llm = nn.Linear(self.config.patch_latent_dim, self.config.hidden_size)
         ae_params = self.config.vae_config
         self.vae_model = BagelAutoEncoder(ae_params)
 
@@ -222,6 +218,13 @@ class BagelModel(Model):
         # Load in weights: rest
         ema_path = self.repo / "ema.safetensors"
         state_dict = load_file(ema_path)
+        latent_pos_size = self._infer_position_size(state_dict, "latent_pos_embed")
+
+        self.latent_pos_embed = PositionEmbedding(
+            latent_pos_size, self.config.hidden_size
+        )
+        self.time_embedder = TimestepEmbedder(self.config.hidden_size)
+        self.vae2llm = nn.Linear(self.config.patch_latent_dim, self.config.hidden_size)
 
         if not self.llm_initialized:
             # LLM components also need these for image gen, so these
@@ -250,16 +253,19 @@ class BagelModel(Model):
             self.config.hidden_size,
             self.config.connector_act
         )
+        ema_path = self.repo / "ema.safetensors"
+        state_dict = load_file(ema_path)
+        vit_pos_size = self._infer_position_size(
+            state_dict, "vit_pos_embed", default=self.config.vit_max_num_patch_per_side
+        )
         self.vit_pos_embed = PositionEmbedding(
-            self.config.vit_max_num_patch_per_side,
+            vit_pos_size,
             self.config.hidden_size
         )
 
         # Load in weights
-        ema_path = self.repo / "ema.safetensors"
-        state_dict = load_file(ema_path)
         self.vit_model.vision_model.embeddings.convert_conv2d_to_linear(
-            self.config.vit_config, meta=True
+            self.config.vit_config,
         )
 
         load_weights(
@@ -277,6 +283,39 @@ class BagelModel(Model):
             module=self.vit_pos_embed,
             prefix="vit_pos_embed"
         )
+
+    def _infer_position_size(
+        self,
+        state_dict: dict | None,
+        prefix: str,
+        default: int | None = None,
+    ) -> int:
+        if default is not None:
+            expected = default
+        elif prefix == "vit_pos_embed":
+            expected = self.config.vit_max_num_patch_per_side
+        else:
+            expected = self.config.max_latent_size
+
+        pos_key = f"{prefix}.pos_embed"
+        if state_dict is None or pos_key not in state_dict:
+            return expected
+
+        num_pos = state_dict[pos_key].shape[0]
+        if num_pos == 0:
+            return expected
+
+        side = int(num_pos**0.5)
+        if side * side == num_pos:
+            if side != expected:
+                logger.info(
+                    "Auto-adjusting %s size from config %s to checkpoint-derived %s",
+                    prefix,
+                    expected,
+                    side,
+                )
+            return side
+        return expected
 
 
     # -----------------------------------------------------------------------
