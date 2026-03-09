@@ -95,6 +95,7 @@ class Conductor:
         self.model = model
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
+        
         self._worker_processes: list[mp.Process] = []
 
         with open(model_config_file, "r") as f:

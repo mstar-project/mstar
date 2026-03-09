@@ -5,8 +5,11 @@ from uuid import uuid4
 
 try:
     from mooncake.engine import TransferEngine
-except ImportError:
+except Exception as _err:
+    MOONCAKE_IMPORT_ERROR = _err
     TransferEngine = None
+else:
+    MOONCAKE_IMPORT_ERROR = None
 import torch
 
 from mminf.communication.communicator import BaseCommunicator, CommProtocol
@@ -182,6 +185,18 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 ""
             )
         else:
+            if self.protocol == CommProtocol.RDMA:
+                detail = (
+                    f"{type(MOONCAKE_IMPORT_ERROR).__name__}: "
+                    f"{MOONCAKE_IMPORT_ERROR}"
+                    if MOONCAKE_IMPORT_ERROR is not None
+                    else "unknown import failure"
+                )
+                raise RuntimeError(
+                    "Mooncake TransferEngine is required when protocol=RDMA. "
+                    f"Failed to load mooncake: {detail}. "
+                    "Install mooncake-transfer-engine or set tensor protocol to IPC."
+                )
             self.engine = None
         # Per-transfer pending list (allows partial tensor readiness)
         self.pending: list[EventAndPointers] = []
@@ -216,6 +231,10 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
     def register_for_send(self, request_id, name, uuids):
         for uuid in uuids:
             if self.protocol == CommProtocol.RDMA:
+                if self.engine is None:
+                    raise RuntimeError(
+                        "Cannot register tensors for RDMA send: TransferEngine is not available."
+                    )
                 tensor = self.tensor_store.get_tensor(
                     request_id=request_id, name=name, uuid=uuid
                 )
@@ -386,7 +405,15 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 )
 
                 if self.protocol == CommProtocol.RDMA:
+                    if self.engine is None:
+                        raise RuntimeError(
+                            "Cannot start RDMA reads: TransferEngine is not available."
+                        )
                     self.engine.register_memory(buffer.data_ptr(), info.nbytes)
+                else:
+                    raise RuntimeError(
+                        "Tensor transport for IPC is not implemented yet in this build."
+                    )
 
                 with torch.cuda.stream(stream):
                     self.engine.transfer_read_on_cuda(

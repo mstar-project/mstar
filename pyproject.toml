@@ -32,6 +32,7 @@ bagel = [
     "einops",
     "flashinfer-python",
     "huggingface-hub",
+    "mooncake-transfer-engine<0.3.9",
     "Pillow",
     "regex",
     "safetensors",
