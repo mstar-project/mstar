@@ -293,6 +293,7 @@ class LLMSubmodule(StageSubmodule):
 
         For all other phases: standard unwrapping of list[Tensor] -> Tensor.
         """
+        device = next(self.parameters()).device
         result = {}
         if phase in ["prefill_text", "decode"]:
             result["text_inputs"] = inputs["text_inputs"][0]
@@ -304,13 +305,13 @@ class LLMSubmodule(StageSubmodule):
         if phase == "prefill_vae":
             text_len = result["combined_emb"].shape[0]
             result["text_indexes"] = torch.zeros(
-                text_len, dtype=torch.bool, device=result["combined_emb"].device
+                text_len, dtype=torch.bool, device=device
             )
             result["text_indexes"][0] = True
             result["text_indexes"][text_len - 1] = True
             result["vae_token_indexes"] = torch.arange(
                 1, result["combined_emb"].shape[0]-1,
-                dtype=torch.long, device=result["combined_emb"].device
+                dtype=torch.long, device=device
             )
 
         if phase == "image_gen":
@@ -322,30 +323,29 @@ class LLMSubmodule(StageSubmodule):
             )
             if "latents" not in inputs or len(inputs["latents"]) == 0:
                 result["latents"] = self._init_latents(
-                    device=next(self.parameters()).device,
+                    device=device,
                     H=H, W=W
                 )
-                result["time_index"] = 0
+                result["time_index"] = torch.tensor([0], device=device)
             else:
                result["latents"] = inputs["latents"][0]
-               result["time_index"] = inputs["time_index"][0].item()
+               result["time_index"] = inputs["time_index"][0].float()
 
             result["empty_combined_emb"] = self._wrap_with_boi_eoi_inplace(
                 torch.zeros(
                     (result["latents"].shape[0] + 2, self.config.hidden_size),
-                    device=result["latents"].device
+                    device=device
                 )
             )
             text_len = result["empty_combined_emb"].shape[0]
             result["text_indexes"] = torch.zeros(
-                text_len, dtype=torch.bool, device=result["latents"].device
+                text_len, dtype=torch.bool, device=device
             )
             result["text_indexes"][0] = True
             result["text_indexes"][text_len - 1] = True
             result["vae_token_indexes"] = torch.arange(
                 1, result["empty_combined_emb"].shape[0]-1,
-                dtype=torch.long,
-                device=result["latents"].device
+                dtype=torch.long, device=device
             )
 
         return result
@@ -475,7 +475,7 @@ class LLMSubmodule(StageSubmodule):
         vae_position_ids: torch.Tensor,
         text_indexes: torch.Tensor,
         vae_token_indexes: torch.Tensor,
-        time_index: int,
+        time_index: torch.Tensor,
         cache_handle: CacheHandle,
         cfg_text_scale: float = 4.0,
         cfg_img_scale: float = 1.5,
@@ -500,9 +500,7 @@ class LLMSubmodule(StageSubmodule):
         timestep = 1 - time_index * dt
 
         pos_embed = self.latent_pos_embed(vae_position_ids)
-        timestep_embeds = self.time_embedder(
-            torch.tensor([timestep], device=latents.device)
-        )
+        timestep_embeds = self.time_embedder(timestep, device=latents.device)
         empty_combined_emb[1:-1] = self.vae2llm(latents) + timestep_embeds \
             + pos_embed
 
@@ -540,7 +538,7 @@ class LLMSubmodule(StageSubmodule):
         latents = latents + v_final * dt
         return {
             "latents": [latents],
-            "time_index": [torch.tensor([time_index + 1])]
+            "time_index": [time_index + 1]
         }
 
     def _wrap_with_boi_eoi(self, emb: torch.Tensor) -> torch.Tensor:
