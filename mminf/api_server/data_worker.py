@@ -32,6 +32,7 @@ class PreprocessWorker:
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
+        mooncake_port: int = 13000,
     ):
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -52,6 +53,7 @@ class PreprocessWorker:
                 hostname=hostname,
                 socket_path_prefix=socket_path_prefix,
                 tensor_comm_protocol=tensor_comm_protocol,
+                mooncake_port=mooncake_port,
                 model=model,
             )
         )
@@ -96,6 +98,7 @@ class PreprocessWorkerThread:
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
+        mooncake_port: int = 13000,
         device: str = "cpu",
         model: Model | None = None,
     ):
@@ -121,6 +124,7 @@ class PreprocessWorkerThread:
             hostname=hostname,
             communicator=self.communicator,
             protocol=tensor_comm_protocol,
+            mooncake_port=mooncake_port,
         )
 
     def _process_input(
