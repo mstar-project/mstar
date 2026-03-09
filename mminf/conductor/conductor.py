@@ -184,7 +184,7 @@ class Conductor:
                     "model": self.model,
                     "device": f"cuda:{rank}",
                 },
-                daemon=True,
+                daemon=False,
             )
             p.start()
             self._worker_processes.append(p)

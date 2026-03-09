@@ -495,7 +495,6 @@ def main():
         target=_conductor_process_target,
         args=(model_name, args.config,
               args.socket_path_prefix),
-        daemon=True,
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
