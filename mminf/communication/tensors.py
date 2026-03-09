@@ -155,6 +155,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         hostname: str,
         communicator: BaseCommunicator,
         protocol: CommProtocol=CommProtocol.RDMA,
+        mooncake_port: int = 13000,
         metadata_server: str="P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
 
     ):
@@ -174,12 +175,14 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 
         self.communicator = communicator
         self.protocol = protocol
-        self.my_session_id = communicator.get_session_id()
+        # Use hostname:port as the Mooncake session ID for RDMA handshake.
+        # Each entity must use a unique port.
+        self.my_session_id = f"{hostname}:{mooncake_port}"
 
         if TransferEngine is not None:
             self.engine = TransferEngine()
             self.engine.initialize(
-                hostname,
+                self.my_session_id,
                 metadata_server,
                 protocol.value,
                 ""
