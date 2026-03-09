@@ -26,11 +26,11 @@ class StageSubmodule(torch.nn.Module):
     and CUDA graphs on the forward() path.
 
     Engine call pattern:
-        preprocessed = submodule.preprocess(**inputs)   # list → tensors
-        result = submodule(**preprocessed)              # tensor → tensor (compilable)
+        preprocessed = submodule.preprocess(phase, **inputs)  # list → tensors
+        result = submodule(**preprocessed)                     # tensor → tensor (compilable)
     """
 
-    def preprocess(self, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+    def preprocess(self, phase: str, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
         """
         Convert variable-length list[Tensor] inputs to fixed tensors.
         NOT compiled — handles Python-level variability.

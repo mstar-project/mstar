@@ -50,7 +50,7 @@ class ViTEncoderSubmodule(StageSubmodule):
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
         self.transform = ImageTransform(980, 224, 14)
 
-    def preprocess(self, image_inputs: list[torch.Tensor]) -> dict:
+    def preprocess(self, phase: str, image_inputs: list[torch.Tensor]) -> dict:
         """Convert raw images to packed ViT input format.
 
         Full implementation should include prepare_vit_images logic from BAGEL:
@@ -139,7 +139,7 @@ class VAEEncoderSubmodule(StageSubmodule):
         self.max_latent_size = max_latent_size
         self.transform = ImageTransform(1024, 512, 16)
 
-    def preprocess(self, image_inputs: list[torch.Tensor]) -> dict:
+    def preprocess(self, phase: str, image_inputs: list[torch.Tensor]) -> dict:
         """Convert raw images to VAE encoder input format.
 
         Computes patchified dimensions as Python ints for CUDA graph
@@ -298,7 +298,7 @@ class LLMSubmodule(StageSubmodule):
             result["text_inputs"] = inputs["text_inputs"][0]
 
         if phase in ["prefill_vit", "prefill_vae"]:
-            img_emb = inputs.get("img_emb")[0]
+            img_emb = inputs["img_emb"][0]
             result["combined_emb"] = self._wrap_with_boi_eoi(img_emb)
 
         if phase == "prefill_vae":
@@ -332,7 +332,7 @@ class LLMSubmodule(StageSubmodule):
 
             result["empty_combined_emb"] = self._wrap_with_boi_eoi_inplace(
                 torch.zeros(
-                    (result["latents"].shape[0], self.config.hidden_size),
+                    (result["latents"].shape[0] + 2, self.config.hidden_size),
                     device=result["latents"].device
                 )
             )
@@ -500,7 +500,9 @@ class LLMSubmodule(StageSubmodule):
         timestep = 1 - time_index * dt
 
         pos_embed = self.latent_pos_embed(vae_position_ids)
-        timestep_embeds = self.time_embedder(timestep)
+        timestep_embeds = self.time_embedder(
+            torch.tensor([timestep], device=latents.device)
+        )
         empty_combined_emb[1:-1] = self.vae2llm(latents) + timestep_embeds \
             + pos_embed
 
@@ -582,7 +584,7 @@ class VAEDecoderSubmodule(StageSubmodule):
         self.latent_channel = latent_channel
         self.latent_downsample = latent_downsample
 
-    def preprocess(self, latents: list[torch.Tensor]) -> dict:
+    def preprocess(self, phase: str, latents: list[torch.Tensor]) -> dict:
         """Prepare VAE decoder inputs.
 
         Unwraps latents from list. Image dimensions (image_h, image_w)

@@ -115,7 +115,8 @@ class BagelModel(Model):
         **kwargs
     ):
         config_path = hf_hub_download(repo_id=model_path_hf, filename="config.json", revision=None)
-        self.config = load_bagel_config(json.load(open(config_path)))
+        with open(config_path) as f:
+            self.config = load_bagel_config(json.load(f))
 
         self.model_path_hf = model_path_hf
 
@@ -386,11 +387,12 @@ class BagelModel(Model):
             img_byte_arr = io.BytesIO()
             img.save(img_byte_arr, format='PNG')
             return img_byte_arr.getvalue()
+        raise ValueError(f"Unsupported modality: {modality!r}")
 
     def get_kv_cache_config(self) -> KVCacheConfig:
         return KVCacheConfig(
             num_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_attention_heads,
+            num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.hidden_size // self.config.num_attention_heads,
             max_seq_len=self.config.max_position_embeddings,
         )
