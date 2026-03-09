@@ -39,6 +39,7 @@ def _worker_process_target(
     socket_path_prefix: str,
     model: Model | None = None,
     device: str = "cuda",
+    mooncake_port: int = 13001,
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
     import torch
@@ -58,6 +59,7 @@ def _worker_process_target(
         socket_path_prefix=socket_path_prefix,
         device=torch.device(device),
         model=model,
+        mooncake_port=mooncake_port,
     )
     worker.run()
 
@@ -90,7 +92,10 @@ class Conductor:
         model_config_file: str,
         socket_path_prefix: str = "/tmp/mminf",
         hostname: str = "localhost",
+        mooncake_base_port: int = 13000,
     ):
+        self.mooncake_base_port = mooncake_base_port
+
         self.requests: dict[str, RequestData] = {}
         self.model = model
         self.hostname = hostname
@@ -184,6 +189,7 @@ class Conductor:
                     "socket_path_prefix": self.socket_path_prefix,
                     "model": self.model,
                     "device": f"cuda:{rank}",
+                    "mooncake_port": self.mooncake_base_port + 1 + rank,
                 },
                 daemon=False,
             )
