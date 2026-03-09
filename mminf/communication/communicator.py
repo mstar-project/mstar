@@ -1,4 +1,5 @@
 import logging
+import os
 from abc import ABC, abstractmethod
 from enum import Enum
 
@@ -41,6 +42,7 @@ class ZMQCommunicator(BaseCommunicator):
         self.context = zmq.Context()
         self.protocol = protocol
         self.pull_socket = self.context.socket(zmq.PULL)
+        os.makedirs(ipc_socket_path_prefix, exist_ok=True)
 
         # TODO: maybe only open sockets as we need them, and close sockets
         # when we no longer need them
