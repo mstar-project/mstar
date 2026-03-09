@@ -1,3 +1,4 @@
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from uuid import uuid4
@@ -12,7 +13,11 @@ from mminf.communication.communicator import BaseCommunicator, CommProtocol
 from mminf.graph.base import GraphPointer, TensorPointerInfo
 from mminf.ipc_formats import NameAndUuid, TensorReceived, WorkerMessage, WorkerMessageType
 
+logger = logging.getLogger(__name__)
+
+
 NameToTensorList = dict[str, list[torch.Tensor]]
+UuidToTensor = dict[str, torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -28,7 +33,6 @@ class EventAndPointers:
     request_id: str = ""
 
 
-UuidToTensor = dict[str, torch.Tensor]
 
 class TensorStore:
     def __init__(self):
@@ -197,6 +201,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     uuid=tensor_uuid,
                     tensor=tensor
                 )
+                logger.debug("Storing tensor name %s uuid %s", name, tensor_uuid)
                 new_tensor_info = TensorPointerInfo(
                     dims=tensor.shape,
                     dtype=tensor.dtype,
@@ -244,10 +249,12 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
     def _cleanup_by_uuid(
         self, request_id: str, tensor_name: str, uuid: str
     ):
+        logger.debug("Deleting tensor name %s uuid %s", tensor_name, uuid)
         req_id_name_uuid = dict(
             request_id=request_id, name=tensor_name, uuid=uuid
         )
         if not self.tensor_store.check_uuid_presence(**req_id_name_uuid):
+            logger.warning("Trying to cleanup tensor %s:%s, but uuid not found", tensor_name, uuid)
             return
         if self.protocol == CommProtocol.RDMA and self.engine is not None:
             ret_value = self.engine.unregister_memory(
@@ -261,6 +268,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         if not self.tensor_store.check_name_presence(
             request_id=request_id, name=tensor_name
         ):
+            logger.warning("Trying to cleanup tensor %s, but tensor not found", tensor_name)
             return
 
         # By default, cleanup all tensors with the given key, unless the address
@@ -314,6 +322,10 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             if ep.event.query():
                 for ptr in ep.pointers:
                     ready.setdefault(ep.request_id, []).append(ptr)
+                    logger.debug(
+                        "Finished reading in %d tensors %s for graph node %s",
+                        len(ptr.tensor_info), ptr.name, ptr.next_stage
+                    )
 
                     for tensor_info in  ptr.tensor_info:
                         key = (tensor_info.source_entity, ep.request_id)
@@ -357,6 +369,11 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             if len(graph_ptr.tensor_info) == 0:
                 continue  # signal-only pointer, no data to transfer
 
+            logger.debug(
+                "Starting to read in %d tensors %s for graph node %s",
+                len(graph_ptr.tensor_info), graph_ptr.name, graph_ptr.next_stage
+            )
+
             for info in graph_ptr.tensor_info:
                 buffer = torch.empty(info.dims, dtype=info.dtype, device="cuda")
                 self.tensor_store.put_tensor(
@@ -375,6 +392,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         info.nbytes,
                         stream.cuda_stream,
                     )
+                logger.debug("Started transfer read for uuid %s", info.uuid)
             # For now, have one cuda event for all tensors in this graph edge
             event = torch.cuda.Event()
             event.record(stream) ##TODO @Atindra : should this be placed here or up? ##

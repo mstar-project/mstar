@@ -1,7 +1,10 @@
+import logging
 from abc import ABC, abstractmethod
 from enum import Enum
 
 import zmq
+
+logger = logging.getLogger(__name__)
 
 
 class BaseCommunicator(ABC):
@@ -43,6 +46,7 @@ class ZMQCommunicator(BaseCommunicator):
         # when we no longer need them
         self.push_sockets: dict[str, zmq.SyncSocket] = {}
         self.session_id = f"ipc://{ipc_socket_path_prefix}/{my_id}.ipc"
+        self.my_id = my_id
 
         if protocol == CommProtocol.IPC:
             self.pull_socket.bind(f"ipc://{ipc_socket_path_prefix}/{my_id}.ipc")
@@ -64,6 +68,10 @@ class ZMQCommunicator(BaseCommunicator):
 
     def send(self, entity_id: str, msg):
         # TODO: maybe serialize to JSON instead if more efficient
+        logger.debug(
+            "%s to send a message %s to entity %s",
+            self.my_id, str(msg), entity_id
+        )
         self.push_sockets[entity_id].send_pyobj(msg)
 
     def get_all_new_messages(self) -> list:
@@ -76,6 +84,10 @@ class ZMQCommunicator(BaseCommunicator):
                 messages.append(self.pull_socket.recv_pyobj(
                     flags=zmq.NOBLOCK
                 ))
+                logger.debug(
+                    "%s to received message %s",
+                    self.my_id, str(messages[-1])
+                )
             except zmq.Again:
                 # zmq.Again actually means no messages left to read
                 break

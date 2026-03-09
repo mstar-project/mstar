@@ -1,9 +1,12 @@
+import logging
 from dataclasses import dataclass
 
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphStage
 from mminf.worker.engine_manager import EngineManager
 from mminf.worker.stage_manager_utils import SubgraphsManager
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -95,6 +98,11 @@ class MicroScheduler:
 
         if not stage_objects:
             return None
+
+        logger.debug(
+            "MicroScheduler scheduling stage %s with phase %s for %d requests",
+            best_stage_name, phase, len(stage_objects)
+        )
 
         return ScheduledBatch(
             stage_name=best_stage_name,

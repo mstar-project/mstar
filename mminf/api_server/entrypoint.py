@@ -91,13 +91,13 @@ def _conductor_process_target(
     socket_path_prefix: str,
 ):
     """Runs DummyConductor.run() in a spawned process."""
-    from mminf.conductor.dummy_conductor import DummyConductor
+    from mminf.conductor.conductor import Conductor
     from mminf.model.registry import get_model_class
 
     model = get_model_class(model_name)(
         model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
     )
-    conductor = DummyConductor(
+    conductor = Conductor(
         model=model,
         model_config_file=config_path,
         socket_path_prefix=socket_path_prefix,
@@ -235,6 +235,10 @@ class APIServer:
                         self._prune_recently_completed()
                         if rid in self.pending_requests:
                             if message.message_type == "result_tensors":
+                                logger.debug(
+                                    "Got new tensors of %s modality for request %s",
+                                    message.body.modality, rid
+                                )
                                 self.preprocess_worker.new_result_tensors(
                                     message.body
                                 )
@@ -247,6 +251,10 @@ class APIServer:
                                 "Message for unknown request %s", rid
                             )
                 for result_chunk in self.preprocess_worker.get_result_chunks():
+                    logger.debug(
+                        "Got result chunk of %s modality for request %s",
+                        result_chunk.modality, result_chunk.request_id
+                    )
                     rid = result_chunk.request_id
                     self.pending_requests[rid]["chunks"].append(
                         result_chunk

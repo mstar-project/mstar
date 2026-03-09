@@ -1,9 +1,12 @@
+import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 
 from mminf.graph.base import GraphPointer, GraphStage
-from mminf.graph.request_queues import PerRequestStageQueues, ProcessedInputs
+from mminf.graph.request_queues import PerRequestStageQueues, ProcessedInputs, format_graph_edge_list
 from mminf.model.base import SPECIAL_DESTINATIONS, STREAM_OUT, Subgraph
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -189,8 +192,8 @@ class SubgraphsManager:
         subgraph_ids = self.per_request_info[request_id].phase_subgraph_ids
 
         completed_subgraphs = []
-        routed_to_this_worker = [] # list of graph edges
-        external_outputs = outputs
+        routed_to_this_worker: list[GraphPointer] = [] # list of graph edges
+        external_outputs: list[GraphPointer] = outputs
         for subgraph_id in subgraph_ids:
             queue = self.queues[subgraph_id] # ready / waiting graph node queue
             # process_new_inputs consumes outputs that are used as
@@ -231,6 +234,15 @@ class SubgraphsManager:
             if worker_id not in to_workers:
                 to_workers[worker_id] = []
             to_workers[worker_id].append(ptr)
+
+        logger.debug(
+            ("Finished processing outputs from rid %s. \n"
+             "Routed to this worker: %s; sent to others: %s; persist signals: %s"),
+            request_id, format_graph_edge_list(routed_to_this_worker),
+            format_graph_edge_list(external_outputs), format_graph_edge_list(to_conductor),
+        )
+        if completed_subgraphs:
+            logger.debug("Completed %d subgraphs", len(completed_subgraphs))
 
         return StageOutputRouting(
             routed_to_this_subgraph=routed_to_this_worker,
