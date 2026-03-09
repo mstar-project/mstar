@@ -5,7 +5,7 @@ from mminf.engine.base import BaseEngine, EngineType, StageBatch, StageOutput
 
 class AudioCodecEngine(BaseEngine):
     """
-    Wraps nn.Module submodules for audio codec forward passes.
+    Wraps submodules for audio codec forward passes.
     Stateless — identical lifecycle to EncoderDecoderEngine.
     """
 
@@ -39,7 +39,7 @@ class AudioCodecEngine(BaseEngine):
             for rid in batch.request_ids:
                 inputs = batch.per_request_input_tensors.get(rid, {})
                 if hasattr(submodule, 'preprocess'):
-                    preprocessed = submodule.preprocess(**inputs)
+                    preprocessed = submodule.preprocess(batch.phase, **inputs)
                     outputs[rid] = submodule(**preprocessed)
                 else:
                     result = submodule(**{k: v[0] for k, v in inputs.items()})

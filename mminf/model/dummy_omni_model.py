@@ -1,5 +1,5 @@
 
-from mminf.communication.tensors import NameToTensorList
+from mminf.engine.ar_engine import KVCacheConfig
 from mminf.graph.base import GraphPointer, GraphStage, Loop, Sequential, TensorPointerInfo
 from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model
 
@@ -65,6 +65,14 @@ class DummyOmniModel(Model):
             ),
         ])
 
+    def get_kv_cache_config(self) -> KVCacheConfig:
+        return KVCacheConfig(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            max_seq_len=1,
+        )
+
     def get_phase_graphs(self):
         return dict(
             prefill=self._make_full_graph(),
@@ -98,12 +106,3 @@ class DummyOmniModel(Model):
             metadata.is_prefill = False
             metadata.phase = "decode"
         return metadata
-
-    def step(
-        self, stage_name: str,
-        phase: str,
-        input_tensors: NameToTensorList,
-        state,
-        **kwargs,
-    ):
-        return  # do nothing

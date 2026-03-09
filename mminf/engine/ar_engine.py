@@ -7,6 +7,21 @@ from mminf.engine.base import BaseEngine, EngineType, StageBatch, StageOutput
 
 
 @dataclass
+class KVCacheConfig:
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
+    max_seq_len: int
+    max_num_pages: int = 2048
+    page_size: int = 128
+    num_qo_heads: int | None = None  # Optional, defaults to num_kv_heads
+
+    def __post_init__(self):
+        if self.num_qo_heads is None:
+            self.num_qo_heads = self.num_kv_heads
+
+
+@dataclass
 class KVRequestState:
     """Per-request KV cache state for the AR engine."""
     page_indices: list[int] = field(default_factory=list)
@@ -59,7 +74,8 @@ class CacheHandle:
         page_allocator: PageAllocator | None,
         request_states: dict[tuple[str, str], KVRequestState],
         workspace_buffer: torch.Tensor | None,
-        kv_cache_config: dict,
+        kv_cache_config: KVCacheConfig,
+        device,
     ):
         self.request_id = request_id
         self.kv_cache = kv_cache
@@ -67,7 +83,14 @@ class CacheHandle:
         self.request_states = request_states
         self.workspace_buffer = workspace_buffer
         self.kv_cache_config = kv_cache_config
+        self.max_seq_len = kv_cache_config.max_seq_len
         self.active_label = "main"
+
+        # for RoPE, may be moved!
+        self.base_pos_ids = torch.arange(
+            self.max_seq_len, dtype=torch.long, device=device
+        )
+        self.device = device
 
     def _get_state(self, label: str | None = None) -> KVRequestState:
         label = label or self.active_label
@@ -116,10 +139,10 @@ class CacheHandle:
 
         state = self._get_state()
         cfg = self.kv_cache_config
-        page_size = cfg["page_size"]
-        num_kv_heads = cfg["num_kv_heads"]
-        head_dim = cfg["head_dim"]
-        num_qo_heads = cfg.get("num_qo_heads", num_kv_heads)
+        page_size = cfg.page_size
+        num_kv_heads = cfg.num_kv_heads
+        head_dim = cfg.head_dim
+        num_qo_heads = cfg.num_qo_heads
         seq_len = q.shape[0]
 
         if write_cache:
@@ -183,6 +206,28 @@ class CacheHandle:
 
         return output
 
+
+    def apply_rope_default(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        rotary_dim: int | None = None,
+        interleave: bool = False,
+        rope_scale: float = 1,
+        rope_theta: float = 10000.0,
+    ):
+        offset = self._get_state().seq_len
+        pos_ids = self.base_pos_ids[:q.shape[0]] + offset
+
+        import flashinfer
+        return flashinfer.rope.apply_rope_pos_ids(
+            q, k, pos_ids,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+        )
+
     def snapshot(self, from_label: str, to_label: str) -> None:
         """Deepcopy KV cache state (all layers, all pages) from one label to another.
 
@@ -198,9 +243,7 @@ class CacheHandle:
 
             # Copy KV data page by page across all layers
             num_layers = self.kv_cache.shape[0]
-            for i, (src_page, dst_page) in enumerate(
-                zip(from_state.page_indices, new_pages)
-            ):
+            for src_page, dst_page in zip(from_state.page_indices, new_pages, strict=False):
                 self.kv_cache[:, dst_page] = self.kv_cache[:, src_page]
 
             self.request_states[to_key] = KVRequestState(
@@ -239,10 +282,12 @@ class AREngine(BaseEngine):
 
     def __init__(
         self,
-        kv_cache_config: dict | None = None,
+        kv_cache_config: KVCacheConfig | dict
     ):
+        if isinstance(kv_cache_config, dict):
+            kv_cache_config = KVCacheConfig(**kv_cache_config)
         self.submodules: dict[str, torch.nn.Module] = {}
-        self.kv_cache_config = kv_cache_config or {}
+        self.kv_cache_config = kv_cache_config
         self.device = None
         self.kv_cache = None  # [num_layers, max_pages, 2, page_size, num_kv_heads, head_dim]
         self.page_allocator: PageAllocator | None = None
@@ -267,15 +312,19 @@ class AREngine(BaseEngine):
     ) -> None:
         self.submodules = submodules
         self.device = device
-        cfg = model_config.get("kv_cache", self.kv_cache_config)
+        cfg = model_config.get(
+            "kv_cache", self.kv_cache_config
+        )
         if not cfg:
             return  # dummy mode without config
+        if isinstance(cfg, dict):
+            cfg = KVCacheConfig(**cfg)
 
-        num_layers = cfg["num_layers"]
-        max_num_pages = cfg["max_num_pages"]
-        page_size = cfg["page_size"]
-        num_kv_heads = cfg["num_kv_heads"]
-        head_dim = cfg["head_dim"]
+        num_layers = cfg.num_layers
+        max_num_pages = cfg.max_num_pages
+        page_size = cfg.page_size
+        num_kv_heads = cfg.num_kv_heads
+        head_dim = cfg.head_dim
 
         self.kv_cache = torch.zeros(
             num_layers, max_num_pages, 2,
@@ -309,6 +358,7 @@ class AREngine(BaseEngine):
             request_states=self.request_states,
             workspace_buffer=self.workspace_buffer,
             kv_cache_config=self.kv_cache_config,
+            device=self.device
         )
 
     def execute_batch(self, batch: StageBatch) -> StageOutput:
@@ -328,7 +378,7 @@ class AREngine(BaseEngine):
             inputs = batch.per_request_input_tensors.get(rid, {})
             metadata = batch.per_request_metadata.get(rid, {})
 
-            preprocessed = submodule.preprocess(**inputs)
+            preprocessed = submodule.preprocess(batch.phase, **inputs)
             with torch.no_grad():
                 output = submodule(
                     phase=batch.phase,

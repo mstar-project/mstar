@@ -9,6 +9,7 @@ import torch
 import yaml
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphPointer, GraphSection, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
 
@@ -25,11 +26,11 @@ class StageSubmodule(torch.nn.Module):
     and CUDA graphs on the forward() path.
 
     Engine call pattern:
-        preprocessed = submodule.preprocess(**inputs)   # list → tensors
-        result = submodule(**preprocessed)              # tensor → tensor (compilable)
+        preprocessed = submodule.preprocess(phase, **inputs)  # list → tensors
+        result = submodule(**preprocessed)                     # tensor → tensor (compilable)
     """
 
-    def preprocess(self, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+    def preprocess(self, phase: str, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
         """
         Convert variable-length list[Tensor] inputs to fixed tensors.
         NOT compiled — handles Python-level variability.
@@ -218,6 +219,9 @@ class Model(ABC):
                 for phase, graph in self.get_phase_graphs().items()
         ], start=[])
 
+    @abstractmethod
+    def get_kv_cache_config(self) -> KVCacheConfig:
+        pass
 
     @abstractmethod
     def get_phase_graphs(self) -> dict[str, GraphSection]:
@@ -260,6 +264,9 @@ class Model(ABC):
 
         **Important**: this sets metadata.request_done, which is used to end
         the request.
+
+        TODO: include default logic for setting request_done, and let models
+        override it
         """
         # e.g., check for BOI token, check if image was generated and should
         # be added to the input modalities and input tensors, adds new token
@@ -295,6 +302,21 @@ class Model(ABC):
         pass
 
     @abstractmethod
+    def postprocess(
+        self, output: torch.Tensor,
+        modality: str # text | image | video | audio
+    ) -> bytes:
+        """
+        Given an output of a certain modality, encode and return as bytes.
+        This will likely need to overridden with model-specific behavior.
+
+        Modality to expected encoding type:
+        - text: utf-8
+        - image: png
+        """
+        return output.cpu().numpy().tobytes()
+
+    @abstractmethod
     def get_submodule(self, stage_name: str) -> torch.nn.Module | None:
         """
         Return the nn.Module for this stage, or None for dummy mode.
@@ -304,18 +326,3 @@ class Model(ABC):
         """
         pass
 
-    def step(
-        self, stage_name: str,
-        phase: str,
-        input_tensors: NameToTensorList,
-        engine,  # BaseEngine — untyped to avoid circular import
-        **kwargs
-    ) -> NameToTensorList:
-        """
-        Thin wrapper that dispatches to the engine. The engine handles all
-        engine-specific logic (KV cache, FlashInfer, etc.).
-        Models can override this for model-specific dispatch logic.
-        """
-        return engine.execute_single_request(
-            self.get_submodule(stage_name), input_tensors, **kwargs
-        )

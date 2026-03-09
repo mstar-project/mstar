@@ -22,6 +22,7 @@ from starlette.concurrency import run_in_threadpool
 from mminf.api_server.data_worker import PreprocessInput, PreprocessWorker
 from mminf.communication.communicator import ZMQCommunicator
 from mminf.graph.base import GraphPointer
+from mminf.model.registry import HF_MODELS
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +62,6 @@ class ResultChunk:
 
 @dataclass
 class ResultTensors:
-    """
-    For now, expect the tensor to be pure bytes, and the model
-    handles the postprocessing to convert it to the appropriate
-    format (e.g. PNG encoding for images).
-    """
     request_id: str
     modality: str
     graph_edge: GraphPointer
@@ -81,7 +77,7 @@ class RequestComplete:
 @dataclass
 class APIServerMessage:
     """Envelope for messages received by the API server."""
-    message_type: str  # "result_chunk" | "request_complete"
+    message_type: str  # "result_tensors" | "request_complete"
     body: ResultTensors | RequestComplete
 
 
@@ -95,11 +91,13 @@ def _conductor_process_target(
     socket_path_prefix: str,
 ):
     """Runs DummyConductor.run() in a spawned process."""
-    from mminf.conductor.dummy_conductor import DummyConductor
+    from mminf.conductor.conductor import Conductor
     from mminf.model.registry import get_model_class
 
-    model = get_model_class(model_name)()
-    conductor = DummyConductor(
+    model = get_model_class(model_name)(
+        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
+    )
+    conductor = Conductor(
         model=model,
         model_config_file=config_path,
         socket_path_prefix=socket_path_prefix,
@@ -213,9 +211,12 @@ class APIServer:
         stale = [
             rid
             for rid, ts in self.recently_completed.items()
-            if now - ts > self._recently_completed_ttl
+            if now - ts > self._recently_completed_ttl \
+            and not self.preprocess_worker.has_pending_tensors(rid)
         ]
         for rid in stale:
+            # only set the event when there are no more pending chunks
+            self.pending_requests[rid]["event"].set()
             self.preprocess_worker.cleanup_request(rid)
             self.recently_completed.pop(rid, None)
 
@@ -233,12 +234,15 @@ class APIServer:
                     with self.request_lock:
                         self._prune_recently_completed()
                         if rid in self.pending_requests:
-                            if message.message_type == "result_chunk":
+                            if message.message_type == "result_tensors":
+                                logger.debug(
+                                    "Got new tensors of %s modality for request %s",
+                                    message.body.modality, rid
+                                )
                                 self.preprocess_worker.new_result_tensors(
                                     message.body
                                 )
                             elif message.message_type == "request_complete":
-                                self.pending_requests[rid]["event"].set()
                                 self.recently_completed[rid] = time.time()
                         elif rid in self.recently_completed:
                             logger.debug("Late message for completed %s", rid)
@@ -247,6 +251,10 @@ class APIServer:
                                 "Message for unknown request %s", rid
                             )
                 for result_chunk in self.preprocess_worker.get_result_chunks():
+                    logger.debug(
+                        "Got result chunk of %s modality for request %s",
+                        result_chunk.modality, result_chunk.request_id
+                    )
                     rid = result_chunk.request_id
                     self.pending_requests[rid]["chunks"].append(
                         result_chunk
@@ -524,7 +532,8 @@ def main():
     ctx = mp.get_context("spawn")
     conductor_proc = ctx.Process(
         target=_conductor_process_target,
-        args=(model_name, args.config, args.socket_path_prefix),
+        args=(model_name, args.config,
+              args.socket_path_prefix),
         daemon=True,
     )
     conductor_proc.start()
@@ -533,7 +542,9 @@ def main():
     # Create a lightweight model instance for prompt processing
     # (tokenization only — no GPU weights needed)
     from mminf.model.registry import get_model_class
-    model = get_model_class(model_name)()
+    model = get_model_class(model_name)(
+        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
+    )
 
     global api_server
     api_server = APIServer(

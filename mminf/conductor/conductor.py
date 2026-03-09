@@ -1,4 +1,5 @@
 import atexit
+import logging
 import multiprocessing as mp
 import os
 import time
@@ -7,7 +8,9 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
+import yaml
 
+from mminf.api_server.entrypoint import APIServerMessage, RequestComplete
 from mminf.communication.communicator import ZMQCommunicator
 from mminf.graph.base import GraphPointer, TensorPointerInfo
 from mminf.ipc_formats import (
@@ -21,6 +24,8 @@ from mminf.ipc_formats import (
     WorkerMessageType,
 )
 from mminf.model.base import CurrentForwardMetadata, Model, Subgraph
+
+logger = logging.getLogger(__name__)
 
 
 def _worker_process_target(
@@ -39,6 +44,9 @@ def _worker_process_target(
     import torch
 
     from mminf.worker.worker import Worker
+    logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
+        sum([sg.section.get_stage_names() for sg in my_subgraphs], start=[])
+    ))
     worker = Worker(
         worker_id=worker_id,
         worker_ids=worker_ids,
@@ -69,10 +77,8 @@ class RequestData:
     # make sure to check all tensors in the list are completed (BLOCKING case)
     completed_subgraph_ids: set[str] = field(default_factory=set)
 
-    # TODO: will need to add to this as we build things out
 
-
-class DummyConductor:
+class Conductor:
     """
     Initial in-progress conductor implementation. TODO: this is extremely
     un-optimized, but it provides a sense of the data movement between the
@@ -90,6 +96,11 @@ class DummyConductor:
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
         self._worker_processes: list[mp.Process] = []
+
+        with open(model_config_file, "r") as f:
+            self.model_config = yaml.safe_load(f)
+        assert "max_seq_len" in self.model_config
+        assert "stage_groups" in self.model_config
 
         self.subgraphs = {
             subgraph.subgraph_id: subgraph
@@ -123,6 +134,9 @@ class DummyConductor:
         self._per_worker_subgraphs: dict[str, list[Subgraph]] = {}
         self._per_worker_engine_configs: dict[str, list[dict]] = {}
 
+        engine_model_cfg = {
+            "kv_cache": self.model.get_kv_cache_config()
+        }
         for rank in self._sorted_ranks:
             worker_id = f"worker_{rank}"
             subgraphs = rank_to_subgraphs[rank]
@@ -137,7 +151,10 @@ class DummyConductor:
                         engine_type_to_stages[etype].append(stage_name)
 
             self._per_worker_engine_configs[worker_id] = [
-                {"engine_type": etype, "stage_names": stages, "model_config": {}}
+                {
+                    "engine_type": etype, "stage_names": stages,
+                    "model_config": engine_model_cfg
+                }
                 for etype, stages in engine_type_to_stages.items()
             ]
 
@@ -175,6 +192,7 @@ class DummyConductor:
         atexit.register(self.shutdown)
 
     def shutdown(self):
+        logger.info("Shutting down conductor...")
         """Terminate and join all worker processes."""
         for p in self._worker_processes:
             if p.is_alive():
@@ -247,6 +265,7 @@ class DummyConductor:
         and notify the workers that the request has arrived + provide the appropriate
         workers with the appropriate initial inputs for the forward pass
         """
+        logger.debug("Conductor ingesting request %s", body.request_id)
         subgraph_to_worker = self._assign_subgraphs_to_workers()
         request_data = RequestData(
             current_forward_metadata=self.model.get_initial_forward_metadata(
@@ -317,13 +336,22 @@ class DummyConductor:
         """
         Called when we see an EOS token, e.g.
         """
+        logger.debug("Request %s done", request_id)
         for worker_id in self.requests[request_id].subgraph_to_worker.values():
             msg = WorkerMessage(
                 message_type=WorkerMessageType.REMOVE_REQUEST,
                 body=RemoveRequest(request_id)
             )
             self.communicator.send(worker_id, msg)
-        # TODO: send done signal back to the API server
+        self.communicator.send(
+            "api_server",
+            APIServerMessage(
+                message_type="request_complete",
+                body=RequestComplete(
+                    request_id=request_id
+                )
+            )
+        )
         del self.requests[request_id]
 
     def _process_done_forward(
@@ -344,6 +372,14 @@ class DummyConductor:
                 metadata=request_data.current_forward_metadata,
                 new_tokens=request_data.new_tokens,
             )
+        logger.debug(
+            ("Request %s completed forward pass; moving from phase %s -> %s.\n"
+             "Received new tokens %s, has persist signals %s.\n"
+             "request_done=%s"),
+            request_id, prev_forward_meta.phase, request_data.current_forward_metadata.phase,
+            str(request_data.new_tokens), str(list(request_data.persist_signals.keys())),
+            str(request_data.current_forward_metadata.request_done)
+        )
         if request_data.current_forward_metadata.request_done:
             return True # stop the request
 

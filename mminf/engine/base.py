@@ -50,7 +50,7 @@ class BaseEngine(ABC):
         device: torch.device,
     ) -> None:
         """
-        Receive the nn.Module submodules this engine is responsible for
+        Receive the submodules this engine is responsible for
         (keyed by stage name) and perform engine-specific initialization
         (KV cache allocation, FlashInfer workspace, etc.).
         """
@@ -59,26 +59,6 @@ class BaseEngine(ABC):
     @abstractmethod
     def execute_batch(self, batch: StageBatch) -> StageOutput:
         ...
-
-    def execute_single_request(
-        self,
-        submodule: torch.nn.Module | None,
-        input_tensors: NameToTensorList,
-        **kwargs,
-    ) -> NameToTensorList:
-        """
-        Execute a single request through a submodule. Called by Model.step().
-        Default: uses preprocess/forward pattern if submodule has preprocess(),
-        otherwise falls back to direct call.
-        Override for engine-specific behavior (e.g., KV cache management).
-        """
-        if submodule is None:
-            return {}
-        with torch.no_grad():
-            if hasattr(submodule, 'preprocess'):
-                preprocessed = submodule.preprocess(**input_tensors)
-                return submodule(**preprocessed, **kwargs)
-            return submodule(input_tensors, **kwargs)
 
     @abstractmethod
     def add_request(self, request_id: str) -> None:
@@ -90,7 +70,7 @@ class BaseEngine(ABC):
 
     def warmup(self) -> None:
         """Optional CUDA graph capture. Override in subclasses."""
-        pass
+        return
 
     def shutdown(self) -> None:
-        pass
+        return

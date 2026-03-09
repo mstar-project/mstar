@@ -1,8 +1,17 @@
 
 
+import logging
 from dataclasses import dataclass, field
 
 from mminf.graph.base import DestToGraphPointers, GraphPointer, GraphSection, GraphStage, get_stage_to_inputs_mapping
+
+logger = logging.getLogger(__name__)
+
+
+def format_graph_edge_list(
+    lst: list[GraphPointer]
+):
+    return ", ".join([f"{edge.name} -> {edge.next_stage}" for edge in lst])
 
 
 @dataclass
@@ -51,6 +60,11 @@ class PerRequestStageQueues:
                 for_other_subgraphs=new_inputs,
             )
 
+        logger.debug(
+            "Processed new graph inputs: %s.",
+            format_graph_edge_list(new_inputs)
+        )
+
         new_inputs: DestToGraphPointers = get_stage_to_inputs_mapping(new_inputs)
         ingested = self.waiting.ingest_inputs(new_inputs)
         external_outputs = sum(
@@ -58,6 +72,14 @@ class PerRequestStageQueues:
         )
 
         self._update_ready_waiting()
+        logger.debug(
+            ("Finished processing new graph inputs. Ready stages: %s, waiting: %s.\n"
+             "Ingested inputs %s, didn't ingest %s"),
+            str([node.name for node in self.ready]),
+            str(list(self.waiting.get_stage_names())),
+            str([i.name for i in ingested]),
+            str([e.name for e in external_outputs])
+        )
         return ProcessedInputs(
             for_other_subgraphs=external_outputs, # inputs **not** utilized for self.waiting
             routed_to_this_subgraph=ingested, # inputs utilized for self.waiting

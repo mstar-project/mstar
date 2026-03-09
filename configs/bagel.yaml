@@ -1,4 +1,5 @@
 model: "BAGEL"
+max_seq_len: 32768
 
 stage_groups:
   - stage_names:

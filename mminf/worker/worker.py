@@ -1,3 +1,5 @@
+import logging
+
 import torch
 
 from mminf.api_server.entrypoint import APIServerMessage, ResultTensors
@@ -5,6 +7,7 @@ from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.engine.base import StageBatch, StageOutput
 from mminf.graph.base import GraphPointer
+from mminf.graph.request_queues import format_graph_edge_list
 from mminf.ipc_formats import (
     ConductorMessage,
     ConductorMessageType,
@@ -24,6 +27,8 @@ from mminf.worker.stage_manager_utils import (
     SubgraphQueues,
     SubgraphsManager,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Worker:
@@ -90,6 +95,7 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _add_new_request(self, body: NewRequest) -> None:
+        logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         self.subgraphs_manager.add_request(
             request_id=body.request_id,
             subgraph_ids=body.subgraph_ids,
@@ -99,6 +105,10 @@ class Worker:
 
         self.subgraphs_manager.update_phase(
             body.request_id, body.initial_phase
+        )
+        logger.debug(
+            "Request %s set to phase %s on worker %s",
+            body.request_id, body.initial_phase, self.worker_id
         )
 
         # Store per-request metadata from conductor
@@ -136,6 +146,15 @@ class Worker:
 
     def _process_new_inputs(self, body: InputSignals) -> None:
         self.subgraphs_manager.update_phase(body.request_id, body.phase)
+        logger.debug(
+            "Request %s set to phase %s on worker %s",
+            body.request_id, body.phase, self.worker_id
+        )
+
+        logger.debug(
+            "Received new signals %s at worker %s for request %s",
+            format_graph_edge_list(body.inputs), self.worker_id, body.request_id
+        )
 
         # Update per-request metadata from conductor
         if body.per_request_metadata:
@@ -325,7 +344,7 @@ class Worker:
         if outputs.stream_out:
             for graph_edge in outputs.stream_out:
                 message = APIServerMessage(
-                    message_type="result_chunk",
+                    message_type="result_tensors",
                     body=ResultTensors(
                         request_id=request_id,
                         modality=graph_edge.output_modality,
@@ -369,6 +388,7 @@ class Worker:
 
             # 5. Execute via engine
             engine = self.engine_manager.get_engine(batch.stage_name)
+            logger.debug("Executing batch for stage %s on engine %s", stage_batch.stage_name, str(type(engine)))
             output = engine.execute_batch(stage_batch)
 
             # 5b. Free consumed input tensors
