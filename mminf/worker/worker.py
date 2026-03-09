@@ -49,6 +49,7 @@ class Worker:
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
+        mooncake_port: int = 13001,
         device: torch.device = torch.device("cuda"),
         model: Model | None = None,
     ):
@@ -85,6 +86,7 @@ class Worker:
             hostname=hostname,
             communicator=self.communicator,
             protocol=tensor_comm_protocol,
+            mooncake_port=mooncake_port,
         )
 
         # Per-request metadata from conductor (e.g., cache_labels, snapshot_after)
