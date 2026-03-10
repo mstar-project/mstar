@@ -68,9 +68,9 @@ class PreprocessWorker:
     def new_result_tensors(self, input: ResultTensors):
         self.per_request_reading_tensors[input.request_id] += len(input.graph_edge.tensor_info)
         logger.debug(
-                "Data worker reading queue for request %s increased to length %d",
-                input.request_id,  self.per_request_reading_tensors[input.request_id]
-            )
+            "Data worker reading queue for request %s increased to length %d",
+            input.request_id,  self.per_request_reading_tensors[input.request_id]
+        )
         self.result_tensor_input_queue.put(input)
 
     def has_pending_tensors(self, request_id: str):            
@@ -231,37 +231,36 @@ class PreprocessWorkerThread:
 
     def _process_read_tensors(self):
         for request_id, graph_edges in self.tensor_manager.get_ready_tensors().items():
-            assert len(graph_edges) == 1
-            graph_edge = graph_edges[0]
-            modality = graph_edge.name.replace("_output", "")
+            for graph_edge in graph_edges:
+                modality = graph_edge.name.replace("_output", "")
 
-            uuids = []
-            for tensor_info in graph_edge.tensor_info:
-                logger.debug("Reading in OUTPUT tensor %s with uuid %s", graph_edge.name, tensor_info.uuid)
-                tensor = self.tensor_manager.get_tensor(
+                uuids = []
+                for tensor_info in graph_edge.tensor_info:
+                    logger.debug("Reading in OUTPUT tensor %s with uuid %s", graph_edge.name, tensor_info.uuid)
+                    tensor = self.tensor_manager.get_tensor(
+                        request_id=request_id,
+                        tensor_name=graph_edge.name,
+                        uuid=tensor_info.uuid
+                    )
+                    postprocessed = self.model.postprocess(
+                        tensor, modality
+                    )
+
+                    uuids.append(tensor_info.uuid)
+                    self.out_queue.put(ResultChunk(
+                        request_id=request_id,
+                        modality=modality,
+                        data=postprocessed,
+                        metadata=self.tensor_uuid_to_metadata_per_request[request_id][
+                            tensor_info.uuid]
+                    ))
+                    del self.tensor_uuid_to_metadata_per_request[request_id][
+                        tensor_info.uuid]
+                self.tensor_manager.cleanup(
                     request_id=request_id,
                     tensor_name=graph_edge.name,
-                    uuid=tensor_info.uuid
+                    uuids=uuids
                 )
-                postprocessed = self.model.postprocess(
-                    tensor, modality
-                )
-
-                uuids.append(tensor_info.uuid)
-                self.out_queue.put(ResultChunk(
-                    request_id=request_id,
-                    modality=modality,
-                    data=postprocessed,
-                    metadata=self.tensor_uuid_to_metadata_per_request[request_id][
-                        tensor_info.uuid]
-                ))
-                del self.tensor_uuid_to_metadata_per_request[request_id][
-                    tensor_info.uuid]
-            self.tensor_manager.cleanup(
-                request_id=request_id,
-                tensor_name=graph_edge.name,
-                uuids=uuids
-            )
 
     def run(self):
         while not self.stop_event.is_set():
