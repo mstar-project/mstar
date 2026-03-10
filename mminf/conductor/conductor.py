@@ -463,26 +463,29 @@ class Conductor:
 
     def run(self):
         while True:
-            done_forward_passes = []
-            for message in self.communicator.get_all_new_messages():
-                if message.message_type == ConductorMessageType.NEW_REQUEST:
-                    self._ingest_request(message.body)
-                elif message.message_type == ConductorMessageType.SUBGRAPHS_DONE:
-                    done_with_fwd = self._process_subgraphs_done(
-                        message.body
-                    )
-                    if done_with_fwd:
-                        done_forward_passes.append(message.body.request_id)
-                else:
-                    raise ValueError(f"Unknown message type: {message.message_type}")
+            try:
+                done_forward_passes = []
+                for message in self.communicator.get_all_new_messages():
+                    if message.message_type == ConductorMessageType.NEW_REQUEST:
+                        self._ingest_request(message.body)
+                    elif message.message_type == ConductorMessageType.SUBGRAPHS_DONE:
+                        done_with_fwd = self._process_subgraphs_done(
+                            message.body
+                        )
+                        if done_with_fwd:
+                            done_forward_passes.append(message.body.request_id)
+                    else:
+                        raise ValueError(f"Unknown message type: {message.message_type}")
 
-            completed_requests = []
-            for request_id in done_forward_passes:
-                saw_eos = self._process_done_forward(request_id)
-                if saw_eos:
-                    completed_requests.append(request_id)
+                completed_requests = []
+                for request_id in done_forward_passes:
+                    saw_eos = self._process_done_forward(request_id)
+                    if saw_eos:
+                        completed_requests.append(request_id)
 
-            for request_id in completed_requests:
-                self._process_request_done(request_id)
+                for request_id in completed_requests:
+                    self._process_request_done(request_id)
+            except Exception:
+                logger.exception("Conductor error in main loop")
 
             time.sleep(0.1) # just for dummy conductor!
