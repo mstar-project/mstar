@@ -39,8 +39,14 @@ def _worker_process_target(
     socket_path_prefix: str,
     model: Model | None = None,
     device: str = "cuda",
+    log_level: str = "INFO",
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format=f"%(asctime)s %(levelname)s [{worker_id}] %(name)s: %(message)s",
+        force=True,
+    )
     import torch
 
     from mminf.worker.worker import Worker
@@ -90,11 +96,13 @@ class Conductor:
         model_config_file: str,
         socket_path_prefix: str = "/tmp/mminf",
         hostname: str = "localhost",
+        log_level: str = "INFO",
     ):
         self.requests: dict[str, RequestData] = {}
         self.model = model
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
+        self.log_level = log_level
         
         self._worker_processes: list[mp.Process] = []
 
@@ -184,6 +192,7 @@ class Conductor:
                     "socket_path_prefix": self.socket_path_prefix,
                     "model": self.model,
                     "device": f"cuda:{rank}",
+                    "log_level": self.log_level,
                 },
                 daemon=False,
             )
