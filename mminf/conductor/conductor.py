@@ -241,31 +241,6 @@ class Conductor:
             ]
         return inputs_per_worker
 
-
-    def _get_schedule_step_metadata(
-        self, metadata: CurrentForwardMetadata,
-    ) -> dict:
-        """Extract per-request metadata from the current schedule step.
-
-        During prefill, the schedule step may contain cache_labels and
-        snapshot_after annotations (used by BAGEL's multi-cache CFG).
-        These are passed through to workers so the submodule can use them.
-        """
-        if not metadata.is_prefill:
-            return {}
-        schedule = metadata.kwargs.get("prefill_schedule", [])
-        step = metadata.kwargs.get("prefill_step", 0)
-        if step >= len(schedule):
-            return {}
-        _, step_kwargs = schedule[step]
-        # Extract only cache-related metadata keys
-        result = {}
-        if "cache_labels" in step_kwargs:
-            result["cache_labels"] = step_kwargs["cache_labels"]
-        if "snapshot_after" in step_kwargs:
-            result["snapshot_after"] = step_kwargs["snapshot_after"]
-        return result
-
     def _ingest_request(
         self, body: NewRequestConductor
     ):
@@ -301,7 +276,7 @@ class Conductor:
         )
 
         # Extract schedule step metadata for per-request cache orchestration
-        step_metadata = self._get_schedule_step_metadata(
+        step_metadata = self.model.get_step_metadata(
             request_data.current_forward_metadata
         )
 
@@ -405,7 +380,7 @@ class Conductor:
         )
 
         # Extract schedule step metadata for per-request cache orchestration
-        step_metadata = self._get_schedule_step_metadata(
+        step_metadata = self.model.get_step_metadata(
             request_data.current_forward_metadata
         )
 

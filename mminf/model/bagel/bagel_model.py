@@ -761,3 +761,13 @@ class BagelModel(Model):
             return metadata
 
         return metadata
+    
+    def get_step_metadata(
+        self, metadata: CurrentForwardMetadata,
+    ) -> dict:
+        return {
+            # TODO: conditional CFG skip
+            "requires_cfg": metadata.kwargs["target_output"] == "image",
+            "is_prefill": metadata.is_prefill,
+            "phase": metadata.phase
+        }

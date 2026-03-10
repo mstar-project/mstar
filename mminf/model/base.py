@@ -326,3 +326,17 @@ class Model(ABC):
         """
         pass
 
+
+    def get_step_metadata(
+        self, metadata: CurrentForwardMetadata,
+    ) -> dict:
+        """
+        Extract per-request metadata that will get passed into the model
+        forward pass at the engine level.
+
+        Can override for model-specific behavior.
+        """
+        return {
+            "is_prefill": metadata.is_prefill,
+            "phase": metadata.phase
+        }
