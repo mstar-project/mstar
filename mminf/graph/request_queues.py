@@ -76,7 +76,7 @@ class PerRequestStageQueues:
             ("Finished processing new graph inputs. Ready stages: %s, waiting: %s.\n"
              "Ingested inputs %s, didn't ingest %s"),
             str([node.name for node in self.ready]),
-            str(list(self.waiting.get_stage_names())),
+            str(list(self.waiting.get_stage_names())) if self.waiting else "[]",
             str([i.name for i in ingested]),
             str([e.name for e in external_outputs])
         )
