@@ -379,7 +379,7 @@ class LLMSubmodule(StageSubmodule):
         For generation mode, cache_labels specifies which caches to update
         (e.g., ["main", "cfg_img"] for text prefill).
         """
-        emb = self.embed_tokens(text_inputs)
+        emb = self.embed_tokens(text_inputs).to(torch.bfloat16)
         cache_labels = kwargs.pop("cache_labels", ["main"])
         snapshot_after = kwargs.pop("snapshot_after", None)
         for label in cache_labels:
@@ -455,7 +455,7 @@ class LLMSubmodule(StageSubmodule):
         # Remove metadata keys not needed for language_model
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        emb = self.embed_tokens(text_inputs)
+        emb = self.embed_tokens(text_inputs).to(torch.bfloat16)
         if cache_handle is not None:
             cache_handle.set_active_label("main")
 
@@ -548,8 +548,8 @@ class LLMSubmodule(StageSubmodule):
         device = emb.device
         boi_ids = torch.tensor([self.boi_token_id], device=device)
         eoi_ids = torch.tensor([self.eoi_token_id], device=device)
-        boi_emb = self.embed_tokens(boi_ids)
-        eoi_emb = self.embed_tokens(eoi_ids)
+        boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
+        eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
         return torch.cat([boi_emb, emb, eoi_emb], dim=0)
 
     def _wrap_with_boi_eoi_inplace(self, emb: torch.Tensor) -> torch.Tensor:
@@ -559,8 +559,8 @@ class LLMSubmodule(StageSubmodule):
         device = emb.device
         boi_ids = torch.tensor([self.boi_token_id], device=device)
         eoi_ids = torch.tensor([self.eoi_token_id], device=device)
-        boi_emb = self.embed_tokens(boi_ids)
-        eoi_emb = self.embed_tokens(eoi_ids)
+        boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
+        eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
         emb[0, :] = boi_emb
         emb[-1, :] = eoi_emb
         return emb
