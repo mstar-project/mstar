@@ -147,7 +147,7 @@ class CacheHandle:
         num_qo_heads = cfg.num_qo_heads
         seq_len = q.shape[0]
 
-        logger.warning(f"inside run_attention. page_size={page_size}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, num_qo_heads={num_qo_heads}, seq_len={seq_len}")
+        # logger.warning(f"inside run_attention. page_size={page_size}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, num_qo_heads={num_qo_heads}, seq_len={seq_len}")
 
         if write_cache:
             
@@ -167,7 +167,7 @@ class CacheHandle:
                 self.kv_cache[layer_idx, page_idx, 0, offset] = k[i]
                 self.kv_cache[layer_idx, page_idx, 1, offset] = v[i]
             
-            logger.warning(f"write_cache is True. num_pages_needed={num_pages_needed}, num_new_pages={num_new_pages}")
+            # logger.warning(f"write_cache is True. num_pages_needed={num_pages_needed}, num_new_pages={num_new_pages}")
 
         # Build FlashInfer single-request prefill args
         device = q.device
@@ -178,8 +178,8 @@ class CacheHandle:
             state.page_indices, dtype=torch.int32, device=device
         )
         
-        logger.warning(f"kv_indptr={kv_indptr}, kv_indices={kv_indices}")
-        logger.warning(f"q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}")
+        # logger.warning(f"kv_indptr={kv_indptr}, kv_indices={kv_indices}")
+        # logger.warning(f"q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}")
 
         if write_cache:
             total_len = state.seq_len + seq_len
