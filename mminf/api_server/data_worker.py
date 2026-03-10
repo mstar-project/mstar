@@ -63,7 +63,7 @@ class PreprocessWorker:
 
     def new_result_tensors(self, input: ResultTensors):
         self.per_request_reading_tensors[input.request_id] += len(input.graph_edge.tensor_info)
-        self.request_input_queue.put(input)
+        self.result_tensor_input_queue.put(input)
 
     def has_pending_tensors(self, request_id: str):
         return self.per_request_reading_tensors.get(request_id, 0) > 0
