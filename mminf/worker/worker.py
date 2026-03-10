@@ -372,39 +372,42 @@ class Worker:
 
     def run(self) -> None:
         while True:
-            # 1. Process ZMQ messages (new requests, input signals, removals)
-            self._process_messages()
+            try:
+                # 1. Process ZMQ messages (new requests, input signals, removals)
+                self._process_messages()
 
-            # 2. Check for ready RDMA tensors, feed to subgraph queues
-            self._check_ready_tensors()
+                # 2. Check for ready RDMA tensors, feed to subgraph queues
+                self._check_ready_tensors()
 
-            # 3. Pick next batch via MicroScheduler
-            batch = self.scheduler.get_next_batch(self.subgraphs_manager)
-            if batch is None:
-                continue
+                # 3. Pick next batch via MicroScheduler
+                batch = self.scheduler.get_next_batch(self.subgraphs_manager)
+                if batch is None:
+                    continue
 
-            # 4. Gather input tensors for the batch
-            stage_batch = self._build_stage_batch(batch)
+                # 4. Gather input tensors for the batch
+                stage_batch = self._build_stage_batch(batch)
 
-            # 5. Execute via engine
-            engine = self.engine_manager.get_engine(batch.stage_name)
-            logger.debug("Executing batch for stage %s on engine %s", stage_batch.stage_name, str(type(engine)))
-            output = engine.execute_batch(stage_batch)
+                # 5. Execute via engine
+                engine = self.engine_manager.get_engine(batch.stage_name)
+                logger.debug("Executing batch for stage %s on engine %s", stage_batch.stage_name, str(type(engine)))
+                output = engine.execute_batch(stage_batch)
 
-            # 5b. Free consumed input tensors
-            self._cleanup_consumed_inputs(batch)
+                # 5b. Free consumed input tensors
+                self._cleanup_consumed_inputs(batch)
 
-            # 6. Route outputs through SubgraphsManager first to determine routing
-            routing_per_request: dict[str, StageOutputRouting] = {}
-            for request_id,stage in batch.stage_objects.items():
-                routing = self.subgraphs_manager.process_stage_outputs(
-                    request_id, stage.outputs
-                )
-                routing_per_request[request_id] = routing
+                # 6. Route outputs through SubgraphsManager first to determine routing
+                routing_per_request: dict[str, StageOutputRouting] = {}
+                for request_id,stage in batch.stage_objects.items():
+                    routing = self.subgraphs_manager.process_stage_outputs(
+                        request_id, stage.outputs
+                    )
+                    routing_per_request[request_id] = routing
 
-            # 7. Store output tensors, register RDMA if needed
-            self._store_outputs(batch, output, routing_per_request)
+                # 7. Store output tensors, register RDMA if needed
+                self._store_outputs(batch, output, routing_per_request)
 
-            # 8. Send outputs to other workers / conductor
-            for request_id in batch.stage_objects.keys():
-                self._send_outputs(request_id, routing_per_request[request_id])
+                # 8. Send outputs to other workers / conductor
+                for request_id in batch.stage_objects.keys():
+                    self._send_outputs(request_id, routing_per_request[request_id])
+            except Exception:
+                logger.exception("Worker %s error in main loop", self.worker_id)
