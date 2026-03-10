@@ -302,7 +302,7 @@ class LLMSubmodule(StageSubmodule):
         elif phase == "decode":
             result["text_inputs"] = torch.tensor([self.bos_token_id], device=device)
         
-        logger.warning(f"Phase = {phase}, result[text_inputs] = {inputs["text_inputs"][0]}")
+        logger.warning(f"Phase = {phase}, result[text_inputs] = {result["text_inputs"]}")
 
         if phase in ["prefill_vit", "prefill_vae"]:
             img_emb = inputs["img_emb"][0]
