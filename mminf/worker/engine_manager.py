@@ -69,7 +69,7 @@ class EngineManager:
                 for name in stage_names:
                     submodule = model.get_submodule(name)
                     if submodule is not None:
-                        submodules[name] = submodule.to(device)
+                        submodules[name] = submodule.to(device=device, dtype=torch.bfloat16)
 
             engine.load_model(submodules, model_config, device)
             logger.info("Engine %s loaded in on device %s", cfg["engine_type"], str(device))
