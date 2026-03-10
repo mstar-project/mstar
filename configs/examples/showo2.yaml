@@ -1,0 +1,41 @@
+# This is a direct definition of subgraphs and their assignment to workers.
+# This is NOT the final design; it's just a placeholder until we have a more
+# detailed discussion about configs and subgraphs and colocation/disaggregation.
+
+model: "dummy"
+eos_token_id: 2
+
+stage_groups:
+  - stage_names:
+      - text_emb
+      - concat_text
+    ranks:
+      - 0
+  
+  - stage_names:
+      - image_emb
+      - concat_img
+    ranks:
+      - 0
+  
+  - stage_names:
+      - LLM
+    ranks:
+      - 1
+    phases:
+      - prefill
+  
+  - stage_names:
+      - LLM
+      - flow
+    ranks:
+      - 2
+      - 3
+    phases:
+      - decode
+      - image_gen
+  
+  - stage_names:
+      - VAE_dec
+    ranks:
+      - 4

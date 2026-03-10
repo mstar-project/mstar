@@ -301,6 +301,8 @@ class LLMSubmodule(StageSubmodule):
             result["text_inputs"] = inputs["text_inputs"][0]
         elif phase == "decode":
             result["text_inputs"] = torch.tensor([self.bos_token_id], device=device)
+        
+        logger.warning(f"Phase = {phase}, result[text_inputs] = {inputs["text_inputs"][0]}")
 
         if phase in ["prefill_vit", "prefill_vae"]:
             img_emb = inputs["img_emb"][0]
@@ -386,6 +388,7 @@ class LLMSubmodule(StageSubmodule):
         emb = self.embed_tokens(text_inputs)
         cache_labels = kwargs.pop("cache_labels", ["main"])
         snapshot_after = kwargs.pop("snapshot_after", None)
+        logger.warning(f"running fwd prefill text with input embeddings shape = {emb.shape}, cache label = {cache_labels}, snapshot_after={snapshot_after}")
         for label in cache_labels:
             if cache_handle is not None:
                 cache_handle.set_active_label(label)
@@ -434,13 +437,13 @@ class LLMSubmodule(StageSubmodule):
         For generation mode, cache_labels specifies which caches to update.
         snapshot_after triggers a KV cache deepcopy after processing.
         """
-        cache_labels = kwargs.pop("cache_labels", ["main"])
+        cache_labels = kwargs.pop("cache_labels", ["main"]) # TODO: need to add these? "cfg", "cfg_text" (check the logic)
         snapshot_after = kwargs.pop("snapshot_after", None)
         for label in cache_labels:
             if cache_handle is not None:
                 cache_handle.set_active_label(label)
             self.language_model(
-                combined_emb, is_causal=False, mode="und",
+                combined_emb, is_causal=False, mode="gen",
                 cache_handle=cache_handle,
                 vae_token_indexes=vae_token_indexes,
                 text_indexes=text_indexes,
@@ -463,6 +466,7 @@ class LLMSubmodule(StageSubmodule):
         if cache_handle is not None:
             cache_handle.set_active_label("main")
 
+        logger.warning(f"running fwd decode text with input embeddings shape = {emb.shape}")
 
         hidden = self.language_model(
             emb, is_causal=True, mode="und",
@@ -470,6 +474,9 @@ class LLMSubmodule(StageSubmodule):
         )
         logits = self.lm_head(hidden[-1:])
         token = torch.argmax(logits, dim=-1)
+        
+        logger.warning(f"ran fwd decode text with output logits = {logits}")
+
         return {
             "new_token": [token],
             "text_out": [token.clone()] # TODO: this is a hack, and not compatible with cuda graphs
