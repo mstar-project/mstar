@@ -58,6 +58,8 @@ class MicroScheduler:
         for subgraph_id, queue in subgraphs_manager.queues.items():
             ready_map = queue.get_ready_stage_names()
             for request_id, stage_names in ready_map.items():
+                if request_id not in subgraphs_manager.per_request_info:
+                    continue  # request was removed between scheduling cycles
                 phase = subgraphs_manager.get_phase(request_id)
                 for sname in stage_names:
                     stage_name_to_requests.setdefault(sname, []).append(
