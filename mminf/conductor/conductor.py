@@ -347,7 +347,7 @@ class Conductor:
         Called when we see an EOS token, e.g.
         """
         logger.debug("Request %s done", request_id)
-        for worker_id in self.requests[request_id].subgraph_to_worker.values():
+        for worker_id in set(self.requests[request_id].subgraph_to_worker.values()):
             msg = WorkerMessage(
                 message_type=WorkerMessageType.REMOVE_REQUEST,
                 body=RemoveRequest(request_id)
