@@ -57,8 +57,10 @@ class BagelModelConfig:
     latent_patch_size: int = 2
     max_latent_size: int = 32
     num_timesteps: int = 50
+    timestep_shift: float = 3.0
     cfg_text_scale: float = 4.0
     cfg_img_scale: float = 1.5
+    cfg_interval: tuple[float, float] = (0.0, 1.0)
     think_mode: bool = False
 
     vocab_size: int = 151936
