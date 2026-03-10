@@ -508,6 +508,7 @@ class BagelLanguageModel(nn.Module):
                     text_indexes=text_indexes,
                 )
 
+        seq_len = query_sequence.shape[0]
         for _layer_idx, decoder_layer in enumerate(self.layers):
             query_sequence = decoder_layer(
                 query_sequence=query_sequence,
@@ -516,6 +517,9 @@ class BagelLanguageModel(nn.Module):
                 is_causal=is_causal,
                 **extra_inputs,
             )
+
+        if write_cache:
+            cache_handle.advance_seq_len(seq_len)
 
         if self.use_moe:
             if mode == "und":
