@@ -688,8 +688,8 @@ class VAEDecoderSubmodule(StageSubmodule):
     def forward(
         self,
         latents: torch.Tensor,
-        image_h: int | torch.Tensor = 0,
-        image_w: int | torch.Tensor = 0,
+        image_h: int | torch.Tensor = 1024, # BAGEL's default image dim
+        image_w: int | torch.Tensor = 1024,
         **kwargs,
     ) -> NameToTensorList:
         logger.debug(

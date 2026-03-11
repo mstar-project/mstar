@@ -12,7 +12,7 @@ URL = "http://0.0.0.0:8000/generate"
 def main():
     with requests.post(
         URL,
-        data = {
+        data={
             "text": "Generate an image of a cute cat",
             "output_modalities": "image",
         },
@@ -29,12 +29,22 @@ def main():
             except json.JSONDecodeError:
                 continue
 
-            if msg.get("modality") == "text":
-                data_b64 = msg.get("data", "")
-                decoded = base64.b64decode(data_b64)
+            modality = msg.get("modality")
+            data_b64 = msg.get("data", "")
 
+            if not data_b64:
+                continue
+
+            decoded = base64.b64decode(data_b64)
+
+            if modality == "text":
                 sys.stdout.write(decoded.decode("utf-8", errors="replace"))
                 sys.stdout.flush()
+
+            elif modality == "image":
+                with open("output.png", "wb") as f:
+                    f.write(decoded)
+                print("\nSaved image to output.png")
 
 
 if __name__ == "__main__":
