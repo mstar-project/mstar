@@ -266,6 +266,5 @@ class ImageTransform:
 
     def __call__(self, img, img_num=1):
         img = self.resize_transform(img, img_num=img_num)
-        img = self.to_tensor_transform(img)
         img = self.normalize_transform(img)
         return img

@@ -67,8 +67,8 @@ class ViTEncoderSubmodule(StageSubmodule):
             image_tensor.size(1), image_tensor.size(2),
             self.vit_patch_size,
             max_num_patches_per_side=self.vit_max_num_patch_per_side
-        )
-        pixel_values = patchify(image_tensor)
+        ).to(device)
+        pixel_values = patchify(image_tensor, self.vit_patch_size)
 
         # Compute cu_seqlens for FlashAttention
         vit_token_seqlens = torch.tensor(
@@ -80,7 +80,7 @@ class ViTEncoderSubmodule(StageSubmodule):
         max_seqlen = int(num_tokens)
 
         return {
-            "packed_pixel_values": pixel_values,
+            "packed_pixel_values": pixel_values.to(torch.bfloat16),
             "packed_position_ids": position_ids,
             "cu_seqlens": cu_seqlens,
             "max_seqlen": max_seqlen,
@@ -167,7 +167,7 @@ class VAEEncoderSubmodule(StageSubmodule):
         )
 
         return {
-            "padded_images": image_tensor.unsqueeze(0),
+            "padded_images": image_tensor.unsqueeze(0).to(torch.bfloat16),
             "packed_vae_position_ids": packed_vae_position_ids,
             "packed_timesteps": torch.tensor([0], device=device),
             "h": h,

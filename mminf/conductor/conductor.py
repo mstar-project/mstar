@@ -236,7 +236,9 @@ class Conductor:
         for subgraph_id, worker_id in subgraph_to_worker.items():
             stages = set(self.subgraphs[subgraph_id].section.get_stage_names())
 
-            inputs_per_worker[worker_id] = [
+            if worker_id not in inputs_per_worker:
+                inputs_per_worker[worker_id] = []
+            inputs_per_worker[worker_id] += [
                 ptr for ptr in inputs if ptr.next_stage in stages
             ]
         return inputs_per_worker
@@ -378,6 +380,7 @@ class Conductor:
             persist_signals=request_data.persist_signals,
             prev_forward_metadata=prev_forward_meta
         )
+        logger.debug("Forward inputs: %s", str(fwd_inputs))
 
         # Extract schedule step metadata for per-request cache orchestration
         step_metadata = self.model.get_step_metadata(

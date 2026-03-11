@@ -20,7 +20,7 @@ def run_attention(
     causal: bool=True,
 ):
     import flashinfer
-    return flashinfer.ops.attention(
+    return flashinfer.single_prefill_with_kv_cache(
         q,
         k,
         v,
