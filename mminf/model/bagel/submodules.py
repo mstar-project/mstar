@@ -287,12 +287,11 @@ class LLMSubmodule(StageSubmodule):
         h, w = (H // self.config.latent_downsample,
                 W // self.config.latent_downsample)
         num_image_tokens = h * w
+        torch.random.manual_seed(42)
         return torch.randn(
             num_image_tokens,
             self.config.vae_config.z_channels * self.config.latent_patch_size ** 2,
-            dtype=torch.bfloat16,
-            device=device
-        )
+        ).to(device=device, dtype=torch.bfloat16)
 
     def preprocess(self, phase: str, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
         """Unwrap single-element tensor lists and handle latent initialization.
@@ -320,6 +319,9 @@ class LLMSubmodule(StageSubmodule):
         if phase in ["prefill_vit", "prefill_vae"]:
             img_emb = inputs["img_emb"][0]
             result["combined_emb"] = self._wrap_with_boi_eoi(img_emb)
+            result["empty_pos_ids"] = torch.zeros(
+                result["combined_emb"].shape[0], dtype=torch.int32, device=device
+            )
 
         if phase == "prefill_vae":
             text_len = result["combined_emb"].shape[0]
@@ -340,23 +342,19 @@ class LLMSubmodule(StageSubmodule):
                 self.config.latent_downsample,
                 max_num_patches_per_side=self.config.max_latent_size
             )
-            print(f"vae_position_ids = {result["vae_position_ids"]}")
             if "latents" not in inputs or len(inputs["latents"]) == 0:
                 result["latents"] = self._init_latents(
                     device=device,
                     H=H, W=W
                 )
-                result["time_index"] = torch.tensor([0], device=device, dtype=torch.bfloat16)
+                result["time_index"] = torch.zeros(result["latents"].shape[0], device=device, dtype=torch.bfloat16)
             else:
                result["latents"] = inputs["latents"][0]
                result["time_index"] = inputs["time_index"][0]
-            
-            print(f"latents = {result["latents"]}")
-            print(f"time_index = {result["time_index"]}")
 
-            result["empty_combined_emb"] = self._wrap_with_boi_eoi_inplace(
-                torch.zeros(
-                    (result["latents"].shape[0] + 2, self.config.hidden_size),
+            result["empty_combined_emb"] = self._wrap_with_boi_eoi(
+                torch.empty(
+                    (result["latents"].shape[0], self.config.hidden_size),
                     dtype=torch.bfloat16,
                     device=device
                 )
@@ -370,6 +368,9 @@ class LLMSubmodule(StageSubmodule):
             result["vae_token_indexes"] = torch.arange(
                 1, result["empty_combined_emb"].shape[0]-1,
                 dtype=torch.long, device=device
+            )
+            result["empty_pos_ids"] = torch.zeros(
+                text_len, dtype=torch.int32, device=device
             )
 
         return result
@@ -430,6 +431,7 @@ class LLMSubmodule(StageSubmodule):
 
     def _forward_prefill_vit(
         self, combined_emb: torch.Tensor,
+        empty_pos_ids: torch.Tensor,
         cache_handle: CacheHandle, **kwargs
     ) -> NameToTensorList:
         """Wrap img_emb with BOI/EOI tokens -> LLM forward (bidirectional).
@@ -444,8 +446,11 @@ class LLMSubmodule(StageSubmodule):
 
         if cache_handle is not None:
             cache_handle.set_active_label("main")
+            empty_pos_ids += cache_handle._get_state().seq_len
         self.language_model(
             combined_emb, is_causal=False, mode="und",
+            pos_ids=empty_pos_ids,
+            custom_advance_seq_len=1,
             cache_handle=cache_handle, **kwargs
         )
 
@@ -455,6 +460,7 @@ class LLMSubmodule(StageSubmodule):
 
     def _forward_prefill_vae(
         self, combined_emb: torch.Tensor,
+        empty_pos_ids: torch.Tensor,
         vae_token_indexes: torch.Tensor,
         text_indexes: torch.Tensor,
         cache_handle: CacheHandle, **kwargs
@@ -471,11 +477,13 @@ class LLMSubmodule(StageSubmodule):
 
         if cache_handle is not None:
             cache_handle.set_active_label("main")
+            empty_pos_ids += cache_handle._get_state().seq_len
         self.language_model(
             combined_emb, is_causal=False, mode="gen",
             cache_handle=cache_handle,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
+            custom_advance_seq_len=1,
             **kwargs
         )
 
@@ -537,6 +545,7 @@ class LLMSubmodule(StageSubmodule):
         text_indexes: torch.Tensor,
         vae_token_indexes: torch.Tensor,
         time_index: torch.Tensor,
+        empty_pos_ids: torch.Tensor,
         cache_handle: CacheHandle,
         requires_cfg: bool = True,
         **kwargs,
@@ -565,25 +574,28 @@ class LLMSubmodule(StageSubmodule):
         # time_index goes from 0 to N-2 (N-1 total Euler steps).
         t_uniform = 1.0 - time_index / (N - 1)
         t_uniform_next = 1.0 - (time_index + 1) / (N - 1)
-        timestep = self._apply_timestep_shift(t_uniform, shift)
-        timestep_next = self._apply_timestep_shift(t_uniform_next, shift)
-        dt = timestep - timestep_next  # positive step size
-        print("timestep, next timestep (after shifting): ", timestep, timestep_next)
+        timestep = self._apply_timestep_shift(t=t_uniform, shift=shift)
+        timestep_next = self._apply_timestep_shift(t=t_uniform_next, shift=shift)
+        dt = (timestep - timestep_next)[0].item()  # positive step size
+        logger.debug("timestep, next timestep (after shifting): ", timestep, timestep_next)
 
         pos_embed = self.latent_pos_embed(vae_position_ids) 
         timestep_embeds = self.time_embedder(timestep)
-        empty_combined_emb[1:-1] = self.vae2llm(latents) + timestep_embeds \
+        latents_ = self.vae2llm(latents) + timestep_embeds \
             + pos_embed
 
+        empty_combined_emb[1:-1] = latents_
+        logger.debug(f"packed_seq = {empty_combined_emb}")
+
         if requires_cfg:
-            print("running 3 fwd passes for cfg gen")
+            logger.debug("Running 3 fwd passes for cfg gen")
             cfg_text_scale = self.config.cfg_text_scale
             cfg_img_scale = self.config.cfg_img_scale
             renorm_type = self.config.cfg_renorm_type
 
             # CFG interval: only apply guidance when timestep is within interval
             cfg_lo, cfg_hi = self.config.cfg_interval
-            t_val = timestep.item() if isinstance(timestep, torch.Tensor) else float(timestep)
+            t_val = timestep[0].item() if isinstance(timestep, torch.Tensor) else float(timestep)
             in_cfg_interval = (t_val > cfg_lo) and (t_val <= cfg_hi)
             effective_text_scale = cfg_text_scale if in_cfg_interval else 1.0
             effective_img_scale = cfg_img_scale if in_cfg_interval else 1.0
@@ -592,10 +604,12 @@ class LLMSubmodule(StageSubmodule):
             for label in ["main", "cfg_text", "cfg_img"]:
                 if cache_handle is not None:
                     cache_handle.set_active_label(label)
+                    empty_pos_ids += cache_handle._get_state().seq_len
                 hidden = self.language_model(
                     empty_combined_emb, is_causal=False, mode="gen",
                     cache_handle=cache_handle, write_cache=False,
                     vae_token_indexes=vae_token_indexes,
+                    pos_ids=empty_pos_ids,
                     text_indexes=text_indexes, **kwargs,
                 )
                 velocities[label] = hidden
@@ -603,8 +617,6 @@ class LLMSubmodule(StageSubmodule):
             v_main = self.llm2vae(velocities["main"])[1:-1]
             v_cfg_text = self.llm2vae(velocities["cfg_text"])[1:-1]
             v_cfg_img = self.llm2vae(velocities["cfg_img"])[1:-1]
-
-            print(v_main.shape, v_cfg_text.shape, v_cfg_img.shape)
 
             # Two-stage CFG velocity combination + renormalization
             if effective_text_scale > 1.0 or effective_img_scale > 1.0:
@@ -629,10 +641,12 @@ class LLMSubmodule(StageSubmodule):
             # No CFG: single forward pass
             if cache_handle is not None:
                 cache_handle.set_active_label("main")
+                empty_pos_ids += cache_handle._get_state().seq_len
             hidden = self.language_model(
                 empty_combined_emb, is_causal=False, mode="gen",
                 cache_handle=cache_handle, write_cache=False,
                 vae_token_indexes=vae_token_indexes,
+                pos_ids=empty_pos_ids,
                 text_indexes=text_indexes, **kwargs,
             )
             v_final = self.llm2vae(hidden)[1:-1]
@@ -651,8 +665,9 @@ class LLMSubmodule(StageSubmodule):
         device = emb.device
         boi_ids = torch.tensor([self.boi_token_id], device=device)
         eoi_ids = torch.tensor([self.eoi_token_id], device=device)
-        boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
-        eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
+        with torch.no_grad():
+            boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
+            eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
         return torch.cat([boi_emb, emb, eoi_emb], dim=0)
 
     def _wrap_with_boi_eoi_inplace(self, emb: torch.Tensor) -> torch.Tensor:
@@ -661,8 +676,9 @@ class LLMSubmodule(StageSubmodule):
         device = emb.device
         boi_ids = torch.tensor([self.boi_token_id], device=device)
         eoi_ids = torch.tensor([self.eoi_token_id], device=device)
-        boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
-        eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
+        with torch.no_grad():
+            boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
+            eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
         emb[0, :] = boi_emb
         emb[-1, :] = eoi_emb
         return emb

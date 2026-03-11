@@ -13,7 +13,8 @@ def main():
     with requests.post(
         URL,
         data={
-            "text": "Generate an image of a cute cat",
+            # "text": "Generate an image of a cute cat",
+            "text": "Generate an image of a cute cat who has discovered the meaning of life",
             "output_modalities": "image",
         },
         stream=True,

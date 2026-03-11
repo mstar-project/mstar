@@ -59,8 +59,8 @@ class BagelModelConfig:
     num_timesteps: int = 50
     timestep_shift: float = 3.0
     cfg_text_scale: float = 4.0
-    cfg_img_scale: float = 1.5
-    cfg_interval: tuple[float, float] = (0.0, 1.0)
+    cfg_img_scale: float = 1.0
+    cfg_interval: tuple[float, float] = (0.4, 1.0)
     cfg_renorm_type: str = "global"
     think_mode: bool = False
 
@@ -114,6 +114,7 @@ class BagelModelConfig:
 
     def __post_init__(self) -> None:
         self.max_latent_size = 64
+        self.timestep_shift = 3.0
         self.latent_downsample = self.vae_config.downsample * self.latent_patch_size
         self.patch_latent_dim = (
             self.latent_patch_size ** 2 * self.vae_config.z_channels

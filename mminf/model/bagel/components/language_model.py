@@ -83,85 +83,85 @@ class BagelMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
-class BagelAttention(nn.Module):
-    def __init__(self,config: BagelModelConfig, layer_idx: Optional[int] = None):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
+# class BagelAttention(nn.Module):
+#     def __init__(self,config: BagelModelConfig, layer_idx: Optional[int] = None):
+#         super().__init__()
+#         self.config = config
+#         self.layer_idx = layer_idx
 
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.is_causal = config.is_causal
-        self.attention_dropout = config.attention_dropout
+#         self.hidden_size = config.hidden_size
+#         self.num_heads = config.num_attention_heads
+#         self.head_dim = self.hidden_size // self.num_heads
+#         self.num_key_value_heads = config.num_key_value_heads
+#         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+#         self.max_position_embeddings = config.max_position_embeddings
+#         self.rope_theta = config.rope_theta
+#         self.is_causal = config.is_causal
+#         self.attention_dropout = config.attention_dropout
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+#         if (self.head_dim * self.num_heads) != self.hidden_size:
+#             raise ValueError(
+#                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+#                 f" and `num_heads`: {self.num_heads})."
+#             )
+#         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+#         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+#         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+#         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        if self.config.qk_norm:
-            self.q_norm = BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.k_norm = BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        else:
-            self.q_norm = nn.Identity()
-            self.k_norm = nn.Identity()
+#         if self.config.qk_norm:
+#             self.q_norm = BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+#             self.k_norm = BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+#         else:
+#             self.q_norm = nn.Identity()
+#             self.k_norm = nn.Identity()
 
-    def forward(
-        self,
-        query_sequence: torch.Tensor,
-        cache_handle: CacheHandle,
-        write_cache=True,
-        is_causal=True,
-    ):
-        query_states = self.q_proj(query_sequence).view(
-            -1, self.num_heads, self.head_dim
-        )
-        key_states = self.k_proj(query_sequence).view(
-            -1, self.num_key_value_heads, self.head_dim
-        )
-        value_states = self.v_proj(query_sequence).view(
-            -1, self.num_key_value_heads, self.head_dim
-        )
+#     def forward(
+#         self,
+#         query_sequence: torch.Tensor,
+#         cache_handle: CacheHandle,
+#         write_cache=True,
+#         is_causal=True,
+#     ):
+#         query_states = self.q_proj(query_sequence).view(
+#             -1, self.num_heads, self.head_dim
+#         )
+#         key_states = self.k_proj(query_sequence).view(
+#             -1, self.num_key_value_heads, self.head_dim
+#         )
+#         value_states = self.v_proj(query_sequence).view(
+#             -1, self.num_key_value_heads, self.head_dim
+#         )
 
-        query_states = run_rms_norm(
-            query_states, self.q_norm.weight, eps=self.q_norm.variance_epsilon
-        )
-        key_states = run_rms_norm(
-            key_states, self.k_norm.weight, eps=self.k_norm.variance_epsilon
-        )
+#         query_states = run_rms_norm(
+#             query_states, self.q_norm.weight, eps=self.q_norm.variance_epsilon
+#         )
+#         key_states = run_rms_norm(
+#             key_states, self.k_norm.weight, eps=self.k_norm.variance_epsilon
+#         )
 
-        query_states, key_states = cache_handle.apply_rope_default(
-            query_states, key_states, rope_theta=self.rope_theta
-        )
+#         query_states, key_states = cache_handle.apply_rope_default(
+#             query_states, key_states, rope_theta=self.rope_theta
+#         )
 
-        query_states = query_states.to(torch.bfloat16)
-        key_states = key_states.to(torch.bfloat16)
-        value_states = value_states.to(torch.bfloat16)
+#         query_states = query_states.to(torch.bfloat16)
+#         key_states = key_states.to(torch.bfloat16)
+#         value_states = value_states.to(torch.bfloat16)
 
-        # Run paged attention
-        attn_output = cache_handle.run_attention(
-            q=query_states,
-            k=key_states,
-            v=value_states,
-            layer_idx=self.layer_idx,
-            is_causal=is_causal,
-            write_cache=write_cache,
-        )
+#         # Run paged attention
+#         attn_output = cache_handle.run_attention(
+#             q=query_states,
+#             k=key_states,
+#             v=value_states,
+#             layer_idx=self.layer_idx,
+#             is_causal=is_causal,
+#             write_cache=write_cache,
+#         )
 
-        attn_output = attn_output.reshape(-1, self.hidden_size)
-        attn_output = self.o_proj(attn_output)
+#         attn_output = attn_output.reshape(-1, self.hidden_size)
+#         attn_output = self.o_proj(attn_output)
 
-        return attn_output
+#         return attn_output
 
 
 class BagelAttentionMoT(nn.Module):
@@ -215,6 +215,7 @@ class BagelAttentionMoT(nn.Module):
         mode="und",
         vae_token_indexes=None,
         text_indexes=None,
+        pos_ids=None,
     ):
         if mode == "und":
             query_states = self.q_proj(query_sequence).view(
@@ -301,13 +302,14 @@ class BagelAttentionMoT(nn.Module):
             )
 
         # rotary embeddings
-        query_states, key_states = cache_handle.apply_rope_default(
-            query_states, key_states, rope_theta=self.rope_theta
-        )
-
-        # query_states = query_states.to(torch.bfloat16)
-        # key_states = key_states.to(torch.bfloat16)
-        # value_states = value_states.to(torch.bfloat16)
+        if pos_ids is None:
+            query_states, key_states = cache_handle.apply_rope_default(
+                query_states, key_states, rope_theta=self.rope_theta
+            )
+        else:
+            query_states, key_states = cache_handle.apply_rope_custom_pos_ids(
+                query_states, key_states, rope_theta=self.rope_theta, pos_ids=pos_ids
+            )
 
         # run paged attention
         attn_output = cache_handle.run_attention(
@@ -409,6 +411,7 @@ class BagelMoTDecoderLayer(nn.Module):
         mode="und",
         vae_token_indexes=None,
         text_indexes=None,
+        pos_ids=None,
     ):
         residual = query_sequence
         if mode == "und":
@@ -438,6 +441,7 @@ class BagelMoTDecoderLayer(nn.Module):
             mode=mode,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
+            pos_ids=pos_ids
         )
         query_sequence = residual + query_sequence
 
@@ -496,6 +500,8 @@ class BagelLanguageModel(nn.Module):
         mode="und",
         vae_token_indexes=None,
         text_indexes=None,
+        pos_ids=None,
+        custom_advance_seq_len=None,
     ):
         extra_inputs = {}
         if self.use_moe:
@@ -515,11 +521,15 @@ class BagelLanguageModel(nn.Module):
                 cache_handle=cache_handle,
                 write_cache=write_cache,
                 is_causal=is_causal,
+                pos_ids=pos_ids,
                 **extra_inputs,
             )
 
         if write_cache:
-            cache_handle.advance_seq_len(seq_len)
+            if custom_advance_seq_len is None:
+                cache_handle.advance_seq_len(seq_len)
+            else:
+                cache_handle.advance_seq_len(custom_advance_seq_len)
 
         if self.use_moe:
             if mode == "und":
@@ -576,6 +586,7 @@ class BagelForCausalLM(nn.Module):
         mode="und",
         vae_token_indexes=None,
         text_indexes=None,
+        pos_ids=None,
         **kwargs
     ):
         assert mode in ["und", "gen"]
@@ -587,6 +598,7 @@ class BagelForCausalLM(nn.Module):
             mode=mode,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
+            pos_ids=pos_ids
         )
 
         return outputs

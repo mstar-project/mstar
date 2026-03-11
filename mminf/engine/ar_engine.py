@@ -239,6 +239,25 @@ class CacheHandle:
             rope_scale=rope_scale,
             rope_theta=rope_theta,
         )
+    
+    def apply_rope_custom_pos_ids(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        pos_ids: torch.Tensor,
+        rotary_dim: int | None = None,
+        interleave: bool = False,
+        rope_scale: float = 1,
+        rope_theta: float = 10000.0,
+    ):
+        import flashinfer
+        return flashinfer.rope.apply_rope_pos_ids(
+            q, k, pos_ids,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+        )
 
     def snapshot(self, from_label: str, to_label: str) -> None:
         """Deepcopy KV cache state (all layers, all pages) from one label to another.
