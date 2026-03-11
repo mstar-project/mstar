@@ -226,6 +226,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 new_tensor_info = TensorPointerInfo(
                     dims=tensor.shape,
                     dtype=tensor.dtype,
+                    stride=tensor.stride(),
                     nbytes=tensor.element_size() * tensor.nelement(),
                     address=tensor.data_ptr(),
                     uuid=tensor_uuid,
@@ -421,7 +422,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             )
 
             for info in graph_ptr.tensor_info:
-                buffer = torch.empty(info.dims, dtype=info.dtype, device=device)
+                buffer = torch.empty(info.dims, dtype=info.dtype, device=device).as_strided(
+                    info.dims, stride=info.stride
+                )
                 self.tensor_store.put_tensor(
                     request_id=request_id, name=graph_ptr.name,
                     uuid=info.uuid, tensor=buffer

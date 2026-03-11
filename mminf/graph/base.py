@@ -20,6 +20,7 @@ class TensorPointerInfo:
     dtype: str
     nbytes: int
     address: int
+    stride: list[int]
     uuid: str # for all the cleanups, list[tensor] indexing
     source_session_id: str # e.g., f"{HOSTNAME}:{client_engine.get_rpc_port()}"
     source_tensor_name: str # for streaming outputs, the names of tensors are changed

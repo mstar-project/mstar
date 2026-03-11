@@ -49,6 +49,7 @@ class ViTEncoderSubmodule(StageSubmodule):
         self.vit_patch_size = vit_patch_size
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
         self.transform = ImageTransform(980, 224, 14)
+        self.vae_transform = ImageTransform(1024, 512, 16)
 
     def preprocess(self, phase: str, image_inputs: list[torch.Tensor]) -> dict:
         """Convert raw images to packed ViT input format.
@@ -59,7 +60,9 @@ class ViTEncoderSubmodule(StageSubmodule):
         - Position ID computation from image grid
         - Packing multiple images with cu_seqlens for FlashAttention
         """
-        image_tensor = self.transform(image_inputs[0])
+        image_tensor = self.vae_transform.resize_transform(image_inputs[0])
+        image_tensor = self.transform(image_tensor)
+
         num_tokens = image_tensor.shape[0]
         device = image_tensor.device
 
@@ -633,8 +636,8 @@ class LLMSubmodule(StageSubmodule):
 
     def _wrap_with_boi_eoi(self, emb: torch.Tensor) -> torch.Tensor:
         """Wrap embeddings with <|vision_start|> and <|vision_end|> tokens."""
-        if self.boi_token_id is None or self.eoi_token_id is None:
-            return emb
+        assert self.boi_token_id is not None and self.eoi_token_id is not None
+
         device = emb.device
         boi_ids = torch.tensor([self.boi_token_id], device=device)
         eoi_ids = torch.tensor([self.eoi_token_id], device=device)
@@ -644,8 +647,7 @@ class LLMSubmodule(StageSubmodule):
 
     def _wrap_with_boi_eoi_inplace(self, emb: torch.Tensor) -> torch.Tensor:
         """Wrap embeddings with <|vision_start|> and <|vision_end|> tokens."""
-        if self.boi_token_id is None or self.eoi_token_id is None:
-            return emb
+        assert self.boi_token_id is not None and self.eoi_token_id is not None
         device = emb.device
         boi_ids = torch.tensor([self.boi_token_id], device=device)
         eoi_ids = torch.tensor([self.eoi_token_id], device=device)

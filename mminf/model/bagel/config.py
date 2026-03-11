@@ -55,7 +55,7 @@ class BagelModelConfig:
     vit_config: BagelViTConfig
 
     latent_patch_size: int = 2
-    max_latent_size: int = 32
+    max_latent_size: int = 64
     num_timesteps: int = 50
     timestep_shift: float = 3.0
     cfg_text_scale: float = 4.0
@@ -113,6 +113,7 @@ class BagelModelConfig:
         )
 
     def __post_init__(self) -> None:
+        self.max_latent_size = 64
         self.latent_downsample = self.vae_config.downsample * self.latent_patch_size
         self.patch_latent_dim = (
             self.latent_patch_size ** 2 * self.vae_config.z_channels

@@ -390,9 +390,9 @@ async def generate(
         in_mods = [m.strip() for m in input_modalities.split(",") if m.strip()]
     else:
         in_mods: list[str] = []
+        in_mods.extend(file_paths.keys())
         if text:
             in_mods.append("text")
-        in_mods.extend(file_paths.keys())
 
     parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
 
