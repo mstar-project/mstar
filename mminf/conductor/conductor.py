@@ -225,7 +225,8 @@ class Conductor:
 
     def _split_inputs_to_workers(
         self, subgraph_to_worker: dict[str, str],
-        inputs: list[GraphPointer]
+        inputs: list[GraphPointer],
+        phase: str
     ) -> dict[str, list[GraphPointer]]:
         """
         Given the full ForwardPassInputs for kicking off a new forward pass,
@@ -234,7 +235,10 @@ class Conductor:
         """
         inputs_per_worker: dict[str, list[GraphPointer]] = {}
         for subgraph_id, worker_id in subgraph_to_worker.items():
-            stages = set(self.subgraphs[subgraph_id].section.get_stage_names())
+            subgraph = self.subgraphs[subgraph_id]
+            if phase not in subgraph.phases:
+                continue
+            stages = set(subgraph.section.get_stage_names())
 
             if worker_id not in inputs_per_worker:
                 inputs_per_worker[worker_id] = []
@@ -286,7 +290,8 @@ class Conductor:
         worker_to_subgraph_ids: dict[str, list[str]] = {}
         inputs_per_worker = self._split_inputs_to_workers(
             subgraph_to_worker=subgraph_to_worker,
-            inputs=first_forward_inputs
+            inputs=first_forward_inputs,
+            phase=request_data.current_forward_metadata.phase
         )
         for subgraph_id, worker_id in subgraph_to_worker.items():
             if worker_id not in worker_to_subgraph_ids:
@@ -299,7 +304,7 @@ class Conductor:
                 subgraph_ids=subgraph_ids,
                 subgraph_to_worker=subgraph_to_worker,
                 initial_phase=request_data.current_forward_metadata.phase,
-                initial_inputs=inputs_per_worker[worker],
+                initial_inputs=inputs_per_worker.get(worker, []),
                 per_request_metadata=step_metadata,
             )
             self.communicator.send(
@@ -389,7 +394,8 @@ class Conductor:
 
         inputs_per_worker = self._split_inputs_to_workers(
             subgraph_to_worker=request_data.subgraph_to_worker,
-            inputs=fwd_inputs
+            inputs=fwd_inputs,
+            phase=request_data.current_forward_metadata.phase
         )
 
         for worker, inputs in inputs_per_worker.items():
