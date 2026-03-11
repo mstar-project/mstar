@@ -14,8 +14,41 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 
-from mminf.engine.flashinfer_utils import run_attention
 from mminf.model.bagel.config import BagelViTConfig
+
+
+import torch
+import torch.nn.functional as F
+
+def run_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool = False,
+    scale: float = None,
+):
+    """
+    q,k,v: (total_tokens, num_heads, head_dim)
+    cu_seqlens: (batch + 1)
+    """
+
+    # (1, heads, seq, dim)
+    q = q.permute(1, 0, 2).unsqueeze(0)
+    k = k.permute(1, 0, 2).unsqueeze(0)
+    v = v.permute(1, 0, 2).unsqueeze(0)
+
+    out = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=causal,
+        scale=scale,
+    )
+
+    # back to (seq, heads, dim)
+    return out.squeeze(0).permute(1, 0, 2)
 
 
 class RotaryEmbedding2D(torch.nn.Module):
@@ -171,11 +204,6 @@ class BagelViTAttention(nn.Module):
             q = torch.cat([qh, qw], dim=-1)
             k = torch.cat([kh, kw], dim=-1)
 
-        # FlashInfer expects [batch, seq, heads, dim]
-        q = q.unsqueeze(0).to(torch.bfloat16)
-        k = k.unsqueeze(0).to(torch.bfloat16)
-        v = v.unsqueeze(0).to(torch.bfloat16)
-
         attn_output = run_attention(
             q,
             k,
@@ -184,8 +212,7 @@ class BagelViTAttention(nn.Module):
             scale=self.scale,
         )
 
-        # back to [tokens, hidden]
-        attn_output = attn_output.squeeze(0).reshape(total_q_len, -1)
+        attn_output = attn_output.reshape(total_q_len, -1)
 
         attn_output = self.out_proj(attn_output)
         return attn_output
