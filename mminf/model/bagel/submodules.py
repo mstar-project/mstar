@@ -238,9 +238,12 @@ class LLMSubmodule(StageSubmodule):
         )
     followed by an Euler step: x_{t+1} = x_t + v_final * dt.
 
-    Multi-cache orchestration is driven by per-request metadata:
-      - cache_labels: list of cache labels to iterate over (default ["main"])
-      - snapshot_after: (from_label, to_label) to snapshot after this step
+    Multi-cache orchestration is driven by the requires_cfg flag in
+    per-request metadata. When True, phase methods manage 3 caches:
+      - prefill_text: snapshot main->cfg_text, forward [main, cfg_img]
+      - prefill_vit/vae: forward [main], snapshot main->cfg_text
+      - decode: forward [main, cfg_img]
+      - image_gen: 3-pass CFG with conditional skip and renormalization
     The CacheHandle (provided by AREngine) manages label switching, page
     allocation, and KV data copying.
     """
@@ -388,48 +391,57 @@ class LLMSubmodule(StageSubmodule):
     ) -> NameToTensorList:
         """embed_tokens -> LLM forward (causal, mode='und') -> KV cache update.
 
-        For generation mode, cache_labels specifies which caches to update
-        (e.g., ["main", "cfg_img"] for text prefill).
+        When requires_cfg is True (image generation mode):
+        1. Snapshot main -> cfg_text BEFORE forward (cfg_text = context without this text)
+        2. Forward for main and cfg_img (both see the text tokens)
         """
         emb = self.embed_tokens(text_inputs)
-        cache_labels = kwargs.pop("cache_labels", ["main"])
-        snapshot_after = kwargs.pop("snapshot_after", None)
-        logger.debug(f"running fwd prefill text with input embeddings shape = {emb.shape}, cache label = {cache_labels}, snapshot_after={snapshot_after}")
-        for label in cache_labels:
-            if cache_handle is not None:
-                cache_handle.set_active_label(label)
+        requires_cfg = kwargs.pop("requires_cfg", False)
+        kwargs.pop("cache_labels", None)
+        kwargs.pop("snapshot_after", None)
+        kwargs.pop("is_prefill", None)
 
+        if requires_cfg and cache_handle is not None:
+            # cfg_text = main before this text (everything except subsequent text)
+            cache_handle.snapshot("main", "cfg_text")
+            for label in ["main", "cfg_img"]:
+                cache_handle.set_active_label(label)
+                self.language_model(
+                    emb, is_causal=True, mode="und",
+                    cache_handle=cache_handle, **kwargs
+                )
+        else:
+            if cache_handle is not None:
+                cache_handle.set_active_label("main")
             self.language_model(
                 emb, is_causal=True, mode="und",
                 cache_handle=cache_handle, **kwargs
             )
-        if snapshot_after and cache_handle is not None:
-            from_label, to_label = snapshot_after
-            cache_handle.snapshot(from_label, to_label)
         return {}
 
     def _forward_prefill_vit(
         self, combined_emb: torch.Tensor,
-        cache_handle: CacheHandle,**kwargs
+        cache_handle: CacheHandle, **kwargs
     ) -> NameToTensorList:
         """Wrap img_emb with BOI/EOI tokens -> LLM forward (bidirectional).
 
-        For generation mode, cache_labels specifies which caches to update.
-        snapshot_after triggers a KV cache deepcopy after processing.
+        When requires_cfg is True: forward for main only, then snapshot
+        main -> cfg_text (cfg_text = context including this image).
         """
-        cache_labels = kwargs.pop("cache_labels", ["main"])
-        snapshot_after = kwargs.pop("snapshot_after", None)
-        for label in cache_labels:
-            if cache_handle is not None:
-                cache_handle.set_active_label(label)
+        requires_cfg = kwargs.pop("requires_cfg", False)
+        kwargs.pop("cache_labels", None)
+        kwargs.pop("snapshot_after", None)
+        kwargs.pop("is_prefill", None)
 
-            self.language_model(
-                combined_emb, is_causal=False, mode="und",
-                cache_handle=cache_handle, **kwargs
-            )
-        if snapshot_after and cache_handle is not None:
-            from_label, to_label = snapshot_after
-            cache_handle.snapshot(from_label, to_label)
+        if cache_handle is not None:
+            cache_handle.set_active_label("main")
+        self.language_model(
+            combined_emb, is_causal=False, mode="und",
+            cache_handle=cache_handle, **kwargs
+        )
+
+        if requires_cfg and cache_handle is not None:
+            cache_handle.snapshot("main", "cfg_text")
         return {}
 
     def _forward_prefill_vae(
@@ -438,54 +450,65 @@ class LLMSubmodule(StageSubmodule):
         text_indexes: torch.Tensor,
         cache_handle: CacheHandle, **kwargs
     ) -> NameToTensorList:
-        """Wrap img_emb with BOI/EOI tokens -> LLM forward (bidirectional).
+        """VAE image emb -> LLM forward (bidirectional, gen mode).
 
-        For generation mode, cache_labels specifies which caches to update.
-        snapshot_after triggers a KV cache deepcopy after processing.
+        When requires_cfg is True: forward for main only, then snapshot
+        main -> cfg_text (cfg_text = context including this image).
         """
-        cache_labels = kwargs.pop("cache_labels", ["main"]) # TODO: need to add these? "cfg", "cfg_text" (check the logic)
-        snapshot_after = kwargs.pop("snapshot_after", None)
-        for label in cache_labels:
-            if cache_handle is not None:
-                cache_handle.set_active_label(label)
-            self.language_model(
-                combined_emb, is_causal=False, mode="gen",
-                cache_handle=cache_handle,
-                vae_token_indexes=vae_token_indexes,
-                text_indexes=text_indexes,
-                **kwargs
-            )
-        if snapshot_after and cache_handle is not None:
-            from_label, to_label = snapshot_after
-            cache_handle.snapshot(from_label, to_label)
+        requires_cfg = kwargs.pop("requires_cfg", False)
+        kwargs.pop("cache_labels", None)
+        kwargs.pop("snapshot_after", None)
+        kwargs.pop("is_prefill", None)
+
+        if cache_handle is not None:
+            cache_handle.set_active_label("main")
+        self.language_model(
+            combined_emb, is_causal=False, mode="gen",
+            cache_handle=cache_handle,
+            vae_token_indexes=vae_token_indexes,
+            text_indexes=text_indexes,
+            **kwargs
+        )
+
+        if requires_cfg and cache_handle is not None:
+            cache_handle.snapshot("main", "cfg_text")
         return {}
 
     def _forward_decode(
         self, text_inputs: torch.Tensor,
         cache_handle: CacheHandle, **kwargs
     ) -> NameToTensorList:
-        """embed_tokens -> LLM forward -> lm_head -> argmax."""
-        # Remove metadata keys not needed for language_model
+        """embed_tokens -> LLM forward -> lm_head -> argmax.
+
+        When requires_cfg is True: also forward for cfg_img to keep its
+        KV cache in sync (cfg_img tracks all text, no images).
+        """
+        requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
+        kwargs.pop("is_prefill", None)
         emb = self.embed_tokens(text_inputs)
+
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-
-        logger.debug(f"running fwd decode text with input embeddings shape = {emb.shape}")
-
         hidden = self.language_model(
             emb, is_causal=True, mode="und",
             cache_handle=cache_handle, **kwargs
         )
+
+        if requires_cfg and cache_handle is not None:
+            # Keep cfg_img KV cache in sync (discard output)
+            cache_handle.set_active_label("cfg_img")
+            self.language_model(
+                emb, is_causal=True, mode="und",
+                cache_handle=cache_handle, **kwargs
+            )
+
         logits = self.lm_head(hidden[-1:])
         token = torch.argmax(logits, dim=-1)
-        
-        logger.debug(f"ran fwd decode text with output logits = {logits}")
-
         return {
             "new_token": [token],
-            "text_out": [token.clone()] # TODO: this is a hack, and not compatible with cuda graphs
+            "text_out": [token.clone()]
         }
 
     @staticmethod
@@ -506,29 +529,30 @@ class LLMSubmodule(StageSubmodule):
         vae_token_indexes: torch.Tensor,
         time_index: torch.Tensor,
         cache_handle: CacheHandle,
-        cfg_text_scale: float = 4.0,
-        cfg_img_scale: float = 1.5,
-        cfg_renorm_min: float=0.0,
+        requires_cfg: bool = True,
         **kwargs,
     ) -> NameToTensorList:
-        """3-pass CFG -> llm2vae -> velocity combine -> Euler step.
+        """Flow matching Euler step with optional 3-pass CFG.
 
         Uses cache_handle to switch between the 3 frozen KV caches
         (main, cfg_text, cfg_img). write_cache=False since caches are
         frozen during flow matching.
 
-        If latents is None (first iteration), initializes random noise
-        using latent_seq_len and latent_dim from per-request metadata.
+        When requires_cfg is False, runs a single forward pass (main only)
+        without CFG, saving 2/3 of the compute.
+
+        Renormalization modes (cfg_renorm_type in config):
+          - "global": single scalar renorm over all dimensions (default)
+          - "channel": per-token renorm (independent scale per latent token)
         """
-        # Remove metadata keys not needed for language_model
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
+        kwargs.pop("is_prefill", None)
 
         N = self.config.num_timesteps
         shift = self.config.timestep_shift
 
         # Compute shifted timestep and step size for this iteration.
-        # Reference: timesteps = linspace(1,0,N) then shift-remap, dts = t[i]-t[i+1].
         # time_index goes from 0 to N-2 (N-1 total Euler steps).
         t_uniform = 1.0 - time_index.float() / (N - 1)
         t_uniform_next = 1.0 - (time_index.float() + 1) / (N - 1)
@@ -541,46 +565,64 @@ class LLMSubmodule(StageSubmodule):
         empty_combined_emb[1:-1] = self.vae2llm(latents) + timestep_embeds \
             + pos_embed
 
-        # CFG interval: only apply guidance when timestep is within interval
-        cfg_lo, cfg_hi = self.config.cfg_interval
-        t_val = timestep.item() if isinstance(timestep, torch.Tensor) else float(timestep)
-        in_cfg_interval = (t_val > cfg_lo) and (t_val <= cfg_hi)
-        effective_text_scale = cfg_text_scale if in_cfg_interval else 1.0
-        effective_img_scale = cfg_img_scale if in_cfg_interval else 1.0
+        if requires_cfg:
+            cfg_text_scale = self.config.cfg_text_scale
+            cfg_img_scale = self.config.cfg_img_scale
+            renorm_type = self.config.cfg_renorm_type
 
-        velocities = {}
-        for label in ["main", "cfg_text", "cfg_img"]:
+            # CFG interval: only apply guidance when timestep is within interval
+            cfg_lo, cfg_hi = self.config.cfg_interval
+            t_val = timestep.item() if isinstance(timestep, torch.Tensor) else float(timestep)
+            in_cfg_interval = (t_val > cfg_lo) and (t_val <= cfg_hi)
+            effective_text_scale = cfg_text_scale if in_cfg_interval else 1.0
+            effective_img_scale = cfg_img_scale if in_cfg_interval else 1.0
+
+            velocities = {}
+            for label in ["main", "cfg_text", "cfg_img"]:
+                if cache_handle is not None:
+                    cache_handle.set_active_label(label)
+                hidden = self.language_model(
+                    empty_combined_emb, is_causal=False, mode="gen",
+                    cache_handle=cache_handle, write_cache=False,
+                    vae_token_indexes=vae_token_indexes,
+                    text_indexes=text_indexes, **kwargs,
+                )
+                velocities[label] = hidden
+
+            v_main = self.llm2vae(velocities["main"])[1:-1]
+            v_cfg_text = self.llm2vae(velocities["cfg_text"])[1:-1]
+            v_cfg_img = self.llm2vae(velocities["cfg_img"])[1:-1]
+
+            # Two-stage CFG velocity combination + renormalization
+            if effective_text_scale > 1.0 or effective_img_scale > 1.0:
+                v_text_guided = v_cfg_text + effective_text_scale * (v_main - v_cfg_text)
+                v_t_ = v_cfg_img + effective_img_scale * (v_text_guided - v_cfg_img)
+
+                if renorm_type == "channel":
+                    # Per-token renormalization
+                    renorm_scale = (
+                        v_main.norm(dim=-1, keepdim=True) /
+                        (v_t_.norm(dim=-1, keepdim=True) + 1e-8)
+                    ).clamp(max=1.0)
+                else:
+                    # Global renormalization (default)
+                    renorm_scale = (
+                        v_main.norm() / (v_t_.norm() + 1e-8)
+                    ).clamp(max=1.0)
+                v_final = v_t_ * renorm_scale
+            else:
+                v_final = v_main
+        else:
+            # No CFG: single forward pass
             if cache_handle is not None:
-                cache_handle.set_active_label(label)
-
+                cache_handle.set_active_label("main")
             hidden = self.language_model(
                 empty_combined_emb, is_causal=False, mode="gen",
-                cache_handle=cache_handle,
-                write_cache=False,
+                cache_handle=cache_handle, write_cache=False,
                 vae_token_indexes=vae_token_indexes,
-                text_indexes=text_indexes,
-                **kwargs,
+                text_indexes=text_indexes, **kwargs,
             )
-            velocities[label] = hidden
-
-        # Project to VAE space
-        v_main = self.llm2vae(velocities["main"])[1:-1]
-        v_cfg_text = self.llm2vae(velocities["cfg_text"])[1:-1]
-        v_cfg_img = self.llm2vae(velocities["cfg_img"])[1:-1]
-
-        # Two-stage CFG velocity combination + global renormalization
-        if effective_text_scale > 1.0 or effective_img_scale > 1.0:
-            v_text_guided = v_cfg_text + effective_text_scale * (v_main - v_cfg_text)
-            v_t_ = v_cfg_img + effective_img_scale * (v_text_guided - v_cfg_img)
-
-            norm_v_t_ = torch.norm(v_t_)
-            norm_v_main = torch.norm(v_main)
-            scale = (norm_v_main / (norm_v_t_ + 1e-8)).clamp(
-                min=cfg_renorm_min, max=1.0
-            )
-            v_final = v_t_ * scale
-        else:
-            v_final = v_main
+            v_final = self.llm2vae(hidden)[1:-1]
 
         # Euler step: x_{t-dt} = x_t - v * dt  (velocity points data -> noise)
         latents = latents - v_final * dt

@@ -253,12 +253,17 @@ class CacheHandle:
         to_key = (self.request_id, to_label)
 
         if self.kv_cache is not None and self.page_allocator is not None:
+            # Free old pages if target already exists (prevent page leak)
+            if to_key in self.request_states:
+                old_state = self.request_states[to_key]
+                if old_state.page_indices:
+                    self.page_allocator.free(old_state.page_indices)
+
             # Allocate fresh pages for the target
             num_pages = len(from_state.page_indices)
             new_pages = self.page_allocator.allocate(num_pages) if num_pages > 0 else []
 
             # Copy KV data page by page across all layers
-            num_layers = self.kv_cache.shape[0]
             for src_page, dst_page in zip(from_state.page_indices, new_pages, strict=False):
                 self.kv_cache[:, dst_page] = self.kv_cache[:, src_page]
 

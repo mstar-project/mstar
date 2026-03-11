@@ -591,25 +591,9 @@ class BagelModel(Model):
                     schedule.append(("prefill_vae", {"input_idx": image_idx}))
                 image_idx += 1
 
-        # 3. Annotate schedule with multi-cache metadata for generation mode.
-        #    BAGEL's CFG requires 3 caches: main, cfg_img, cfg_text.
-        #    - Text prefill: write to main + cfg_img (text-only cache)
-        #    - Image prefill (vit/vae): write to main only
-        #    - After last image: snapshot main -> cfg_text (system+image cache)
-        #    Understanding mode: no annotations needed (default ["main"]).
-        if not is_understanding:
-            last_image_idx = None
-            for i, (phase, _) in enumerate(schedule):
-                if phase in ("prefill_vit", "prefill_vae"):
-                    last_image_idx = i
-
-            for i, (phase, step_kwargs) in enumerate(schedule):
-                if phase == "prefill_text":
-                    step_kwargs["cache_labels"] = ["main", "cfg_img"]
-                elif phase in ("prefill_vit", "prefill_vae"):
-                    step_kwargs["cache_labels"] = ["main"]
-                    if i == last_image_idx:
-                        step_kwargs["snapshot_after"] = ("main", "cfg_text")
+        # 3. Multi-cache orchestration for CFG is handled internally by the
+        #    LLM submodule based on the requires_cfg flag (set in get_step_metadata).
+        #    No schedule-level cache annotations needed.
 
         first_phase = schedule[0][0] if schedule else "decode"
 
@@ -766,7 +750,6 @@ class BagelModel(Model):
         self, metadata: CurrentForwardMetadata,
     ) -> dict:
         return {
-            # TODO: conditional CFG skip
             "requires_cfg": metadata.kwargs["target_output"] == "image",
             "is_prefill": metadata.is_prefill,
         }

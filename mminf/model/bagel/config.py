@@ -61,6 +61,7 @@ class BagelModelConfig:
     cfg_text_scale: float = 4.0
     cfg_img_scale: float = 1.5
     cfg_interval: tuple[float, float] = (0.0, 1.0)
+    cfg_renorm_type: str = "global"
     think_mode: bool = False
 
     vocab_size: int = 151936
