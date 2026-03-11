@@ -289,7 +289,8 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         if not self.tensor_store.check_uuid_presence(**req_id_name_uuid):
             logger.warning("Trying to cleanup tensor %s:%s, but uuid not found", tensor_name, uuid)
             return
-        if self.protocol == CommProtocol.RDMA and self.engine is not None:
+        if self.protocol == CommProtocol.RDMA and self.engine is not None \
+                and uuid in self.registered_for_send.get(request_id, set()):
             ret_value = self.engine.unregister_memory(
                 self.tensor_store.get_tensor(**req_id_name_uuid).data_ptr()
             )

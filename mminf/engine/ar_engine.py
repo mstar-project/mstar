@@ -148,26 +148,24 @@ class CacheHandle:
         seq_len = q.shape[0]
 
         # logger.warning(f"inside run_attention. page_size={page_size}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, num_qo_heads={num_qo_heads}, seq_len={seq_len}")
-
-        if write_cache:
             
-            # Allocate pages if needed for the new tokens
-            total_len = state.seq_len + seq_len
-            num_pages_needed = (total_len + page_size - 1) // page_size
-            num_new_pages = num_pages_needed - len(state.page_indices)
-            if num_new_pages > 0:
-                new_pages = self.page_allocator.allocate(num_new_pages)
-                state.page_indices.extend(new_pages)
+        # Allocate pages if needed for the new tokens
+        total_len = state.seq_len + seq_len
+        num_pages_needed = (total_len + page_size - 1) // page_size
+        num_new_pages = num_pages_needed - len(state.page_indices)
+        if num_new_pages > 0:
+            new_pages = self.page_allocator.allocate(num_new_pages)
+            state.page_indices.extend(new_pages)
 
-            # Write K,V into cache pages at this layer
-            for i in range(seq_len):
-                pos = state.seq_len + i
-                page_idx = state.page_indices[pos // page_size]
-                offset = pos % page_size
-                self.kv_cache[layer_idx, page_idx, 0, offset] = k[i]
-                self.kv_cache[layer_idx, page_idx, 1, offset] = v[i]
-            
-            # logger.warning(f"write_cache is True. num_pages_needed={num_pages_needed}, num_new_pages={num_new_pages}")
+        # Write K,V into cache pages at this layer
+        for i in range(seq_len):
+            pos = state.seq_len + i
+            page_idx = state.page_indices[pos // page_size]
+            offset = pos % page_size
+            self.kv_cache[layer_idx, page_idx, 0, offset] = k[i]
+            self.kv_cache[layer_idx, page_idx, 1, offset] = v[i]
+        
+        # logger.warning(f"write_cache is True. num_pages_needed={num_pages_needed}, num_new_pages={num_new_pages}")
 
         # Build FlashInfer single-request prefill args
         device = q.device
@@ -181,10 +179,8 @@ class CacheHandle:
         # logger.warning(f"kv_indptr={kv_indptr}, kv_indices={kv_indices}")
         # logger.warning(f"q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}")
 
-        if write_cache:
-            total_len = state.seq_len + seq_len
-        else:
-            total_len = state.seq_len
+        total_len = state.seq_len + seq_len
+
         last_page_len = total_len % page_size or page_size
         kv_last_page_len = torch.tensor(
             [last_page_len], dtype=torch.int32, device=device
