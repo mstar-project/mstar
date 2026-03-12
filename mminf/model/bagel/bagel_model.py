@@ -702,8 +702,15 @@ class BagelModel(Model):
     def get_step_metadata(
         self, metadata: CurrentForwardMetadata,
     ) -> dict:
+        requires_cfg = (
+            metadata.kwargs["target_output"] == "image" \
+                and (
+                    metadata.kwargs["cfg_img_scale"] > 1.0 \
+                    or metadata.kwargs["cfg_text_scale"] > 1.0
+                )
+        )
         return {
-            "requires_cfg": metadata.kwargs["target_output"] == "image",
+            "requires_cfg": requires_cfg,
             "is_prefill": metadata.is_prefill,
             "cfg_text_scale": metadata.kwargs["cfg_text_scale"],
             "cfg_img_scale": metadata.kwargs["cfg_img_scale"],

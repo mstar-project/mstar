@@ -122,6 +122,9 @@ class BagelModelConfig:
         )
         self.qk_norm = True
         self.tie_word_embeddings = False
+        self.cfg_text_scale = 4.0
+        self.cfg_img_scale = 1.0
+        self.cfg_interval = (0.4, 1.0)
 
 
 def load_bagel_config(config_hf: dict) -> BagelModelConfig:
