@@ -235,7 +235,8 @@ class Model(ABC):
     @abstractmethod
     def get_initial_forward_metadata(
         self, input_modalities: list[str],
-        output_modalities: list[str]
+        output_modalities: list[str],
+        model_kwargs: dict | None = None,
     ) -> CurrentForwardMetadata:
         pass
 
