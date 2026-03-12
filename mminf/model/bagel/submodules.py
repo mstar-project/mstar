@@ -623,24 +623,37 @@ class LLMSubmodule(StageSubmodule):
             v_cfg_img = self.llm2vae(velocities["cfg_img"])[1:-1]
 
             # Two-stage CFG velocity combination + renormalization
-            if effective_text_scale > 1.0 or effective_img_scale > 1.0:
+            cfg_renorm_min = self.config.cfg_renorm_min
+
+            if renorm_type == "text_channel":
+                # text_channel: renorm AFTER text CFG, THEN apply image CFG
                 v_text_guided = v_cfg_text + effective_text_scale * (v_main - v_cfg_text)
-                v_t_ = v_cfg_img + effective_img_scale * (v_text_guided - v_cfg_img)
+                norm_v = torch.norm(v_main, dim=-1, keepdim=True)
+                norm_v_text = torch.norm(v_text_guided, dim=-1, keepdim=True)
+                scale = (norm_v / (norm_v_text + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+                v_text_renormed = v_text_guided * scale
+                if effective_img_scale > 1.0:
+                    v_final = v_cfg_img + effective_img_scale * (v_text_renormed - v_cfg_img)
+                else:
+                    v_final = v_text_renormed
+            else:
+                # global / channel: apply both text+image CFG, THEN renorm
+                v_text_guided = v_cfg_text + effective_text_scale * (v_main - v_cfg_text)
+                if effective_img_scale > 1.0:
+                    v_combined = v_cfg_img + effective_img_scale * (v_text_guided - v_cfg_img)
+                else:
+                    v_combined = v_text_guided
 
                 if renorm_type == "channel":
-                    # Per-token renormalization
                     renorm_scale = (
                         v_main.norm(dim=-1, keepdim=True) /
-                        (v_t_.norm(dim=-1, keepdim=True) + 1e-8)
-                    ).clamp(max=1.0)
+                        (v_combined.norm(dim=-1, keepdim=True) + 1e-8)
+                    ).clamp(min=cfg_renorm_min, max=1.0)
                 else:
-                    # Global renormalization (default)
                     renorm_scale = (
-                        v_main.norm() / (v_t_.norm() + 1e-8)
-                    ).clamp(max=1.0)
-                v_final = v_t_ * renorm_scale
-            else:
-                v_final = v_main
+                        v_main.norm() / (v_combined.norm() + 1e-8)
+                    ).clamp(min=cfg_renorm_min, max=1.0)
+                v_final = v_combined * renorm_scale
         else:
             # No CFG: single forward pass
             if cache_handle is not None:
