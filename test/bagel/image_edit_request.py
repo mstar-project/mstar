@@ -35,10 +35,16 @@ def main():
                 except json.JSONDecodeError:
                     continue
 
+                decoded = base64.b64decode(msg.get("data", ""))
                 if msg.get("modality") == "text":
-                    decoded = base64.b64decode(msg.get("data", ""))
                     sys.stdout.write(decoded.decode("utf-8", errors="replace"))
                     sys.stdout.flush()
+                
+
+                elif msg.get("modality") == "image":
+                    with open("output_edit.png", "wb") as f:
+                        f.write(decoded)
+                    print("\nSaved image to output_edit.png")
 
 
 if __name__ == "__main__":

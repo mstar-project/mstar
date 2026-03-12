@@ -160,8 +160,8 @@ class VAEEncoderSubmodule(StageSubmodule):
         p = self.latent_patch_size
         ds = self.latent_downsample
         _, img_h, img_w = image_tensor.shape
-        h = (img_h // ds) // p
-        w = (img_w // ds) // p
+        h = (img_h // ds)
+        w = (img_w // ds) 
 
         packed_vae_position_ids = get_flattened_position_ids_extrapolate(
             img_h, img_w,
@@ -577,7 +577,6 @@ class LLMSubmodule(StageSubmodule):
         timestep = self._apply_timestep_shift(t=t_uniform, shift=shift)
         timestep_next = self._apply_timestep_shift(t=t_uniform_next, shift=shift)
         dt = (timestep - timestep_next)[0].item()  # positive step size
-        logger.debug("timestep, next timestep (after shifting): ", timestep, timestep_next)
 
         pos_embed = self.latent_pos_embed(vae_position_ids) 
         timestep_embeds = self.time_embedder(timestep)
