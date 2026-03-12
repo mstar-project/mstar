@@ -59,9 +59,9 @@ class BagelModelConfig:
     num_timesteps: int = 50
     timestep_shift: float = 3.0
     cfg_text_scale: float = 4.0
-    cfg_img_scale: float = 2.0
-    cfg_interval: tuple[float, float] = (0.0, 1.0)
-    cfg_renorm_type: str = "text_channel"
+    cfg_img_scale: float = 1.0
+    cfg_interval: tuple[float, float] = (0.4, 1.0)
+    cfg_renorm_type: str = "global"
     cfg_renorm_min: float = 0.0
     think_mode: bool = False
 
