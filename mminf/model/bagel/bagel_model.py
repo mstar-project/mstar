@@ -688,6 +688,6 @@ class BagelModel(Model):
         self, metadata: CurrentForwardMetadata,
     ) -> dict:
         return {
-            "requires_cfg": False, #metadata.kwargs["target_output"] == "image",
+            "requires_cfg": metadata.kwargs["target_output"] == "image",
             "is_prefill": metadata.is_prefill,
         }
