@@ -501,7 +501,7 @@ class BagelLanguageModel(nn.Module):
         vae_token_indexes=None,
         text_indexes=None,
         pos_ids=None,
-        custom_advance_seq_len=None,
+        custom_advance_pos_id=None,
     ):
         extra_inputs = {}
         if self.use_moe:
@@ -526,10 +526,7 @@ class BagelLanguageModel(nn.Module):
             )
 
         if write_cache:
-            if custom_advance_seq_len is None:
-                cache_handle.advance_seq_len(seq_len)
-            else:
-                cache_handle.advance_seq_len(custom_advance_seq_len)
+            cache_handle.advance_seq_len(seq_len, custom_advance_pos_id)
 
         if self.use_moe:
             if mode == "und":

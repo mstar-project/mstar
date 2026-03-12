@@ -523,12 +523,10 @@ class BagelModel(Model):
                 schedule.append(("prefill_text", {"input_idx": text_idx}))
                 text_idx += 1
             elif mod == "image":
-                if is_understanding:
-                    # Understanding: ViT only (no VAE encoding needed)
-                    schedule.append(("prefill_vit", {"input_idx": image_idx}))
-                else:
+                if not is_understanding:
                     # Generation/editing: VAE encode the image
                     schedule.append(("prefill_vae", {"input_idx": image_idx}))
+                schedule.append(("prefill_vit", {"input_idx": image_idx}))
                 image_idx += 1
 
         # 3. Multi-cache orchestration for CFG is handled internally by the
@@ -690,6 +688,6 @@ class BagelModel(Model):
         self, metadata: CurrentForwardMetadata,
     ) -> dict:
         return {
-            "requires_cfg": metadata.kwargs["target_output"] == "image",
+            "requires_cfg": False, #metadata.kwargs["target_output"] == "image",
             "is_prefill": metadata.is_prefill,
         }

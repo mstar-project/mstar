@@ -153,7 +153,7 @@ class VAEEncoderSubmodule(StageSubmodule):
         - VAE position ID computation from latent grid
         - Timestep preparation
         """
-        image_tensor: torch.Tensor = self.transform(image_inputs[0])  # [C, H, W]
+        image_tensor: torch.Tensor = self.transform(self.transform.resize_transform(image_inputs[0]))  # [C, H, W]
         device = image_tensor.device
 
         # Compute patchified dimensions as ints (CUDA graph compatible)
@@ -446,11 +446,11 @@ class LLMSubmodule(StageSubmodule):
 
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-            empty_pos_ids += cache_handle._get_state().seq_len
+            empty_pos_ids += cache_handle._get_state().position_id_start
         self.language_model(
             combined_emb, is_causal=False, mode="und",
             pos_ids=empty_pos_ids,
-            custom_advance_seq_len=1,
+            custom_advance_pos_id=1,
             cache_handle=cache_handle, **kwargs
         )
 
@@ -477,13 +477,13 @@ class LLMSubmodule(StageSubmodule):
 
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-            empty_pos_ids += cache_handle._get_state().seq_len
+            empty_pos_ids += cache_handle._get_state().position_id_start
         self.language_model(
             combined_emb, is_causal=False, mode="gen",
             cache_handle=cache_handle,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
-            custom_advance_seq_len=1,
+            custom_advance_pos_id=1,
             **kwargs
         )
 
@@ -603,7 +603,7 @@ class LLMSubmodule(StageSubmodule):
             for label in ["main", "cfg_text", "cfg_img"]:
                 if cache_handle is not None:
                     cache_handle.set_active_label(label)
-                    empty_pos_ids += cache_handle._get_state().seq_len
+                    empty_pos_ids += cache_handle._get_state().position_id_start
                 hidden = self.language_model(
                     empty_combined_emb, is_causal=False, mode="gen",
                     cache_handle=cache_handle, write_cache=False,
@@ -640,7 +640,7 @@ class LLMSubmodule(StageSubmodule):
             # No CFG: single forward pass
             if cache_handle is not None:
                 cache_handle.set_active_label("main")
-                empty_pos_ids += cache_handle._get_state().seq_len
+                empty_pos_ids += cache_handle._get_state().position_id_start
             hidden = self.language_model(
                 empty_combined_emb, is_causal=False, mode="gen",
                 cache_handle=cache_handle, write_cache=False,

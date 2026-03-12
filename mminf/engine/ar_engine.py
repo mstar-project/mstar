@@ -26,6 +26,7 @@ class KVRequestState:
     """Per-request KV cache state for the AR engine."""
     page_indices: list[int] = field(default_factory=list)
     seq_len: int = 0
+    position_id_start: int = 0
     is_paused: bool = False
 
 
@@ -228,7 +229,7 @@ class CacheHandle:
         rope_scale: float = 1,
         rope_theta: float = 10000.0,
     ):
-        offset = self._get_state().seq_len
+        offset = self._get_state().position_id_start
         pos_ids = self.base_pos_ids[:q.shape[0]] + offset
 
         import flashinfer
@@ -293,7 +294,7 @@ class CacheHandle:
                 seq_len=from_state.seq_len,
             )
 
-    def advance_seq_len(self, n: int) -> None:
+    def advance_seq_len(self, n: int, pos_id_n: int | None=None) -> None:
         """Advance the active label's seq_len by n tokens.
 
         Must be called once after a full forward pass (all layers), not
@@ -301,6 +302,10 @@ class CacheHandle:
         cache writes, RoPE offsets, and page allocation.
         """
         self._get_state().seq_len += n
+        if pos_id_n is None:
+            self._get_state().position_id_start += n
+        else:
+            self._get_state().position_id_start += pos_id_n
 
     def save_seq_position(self) -> int:
         """Return current seq_len for the active label (for flow matching rewind)."""
