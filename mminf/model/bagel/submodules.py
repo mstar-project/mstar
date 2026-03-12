@@ -446,10 +446,12 @@ class LLMSubmodule(StageSubmodule):
 
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-            empty_pos_ids += cache_handle._get_state().position_id_start
+            pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
+        else:
+            pos_ids = empty_pos_ids
         self.language_model(
             combined_emb, is_causal=False, mode="und",
-            pos_ids=empty_pos_ids,
+            pos_ids=pos_ids,
             custom_advance_pos_id=1,
             cache_handle=cache_handle, **kwargs
         )
@@ -477,12 +479,13 @@ class LLMSubmodule(StageSubmodule):
 
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-            empty_pos_ids += cache_handle._get_state().position_id_start
+            empty_pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
         self.language_model(
             combined_emb, is_causal=False, mode="gen",
             cache_handle=cache_handle,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
+            pos_ids=empty_pos_ids,
             custom_advance_pos_id=1,
             **kwargs
         )
@@ -603,12 +606,14 @@ class LLMSubmodule(StageSubmodule):
             for label in ["main", "cfg_text", "cfg_img"]:
                 if cache_handle is not None:
                     cache_handle.set_active_label(label)
-                    empty_pos_ids += cache_handle._get_state().position_id_start
+                    pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
+                else:
+                    pos_ids = empty_pos_ids
                 hidden = self.language_model(
                     empty_combined_emb, is_causal=False, mode="gen",
                     cache_handle=cache_handle, write_cache=False,
                     vae_token_indexes=vae_token_indexes,
-                    pos_ids=empty_pos_ids,
+                    pos_ids=pos_ids,
                     text_indexes=text_indexes, **kwargs,
                 )
                 velocities[label] = hidden
@@ -640,12 +645,14 @@ class LLMSubmodule(StageSubmodule):
             # No CFG: single forward pass
             if cache_handle is not None:
                 cache_handle.set_active_label("main")
-                empty_pos_ids += cache_handle._get_state().position_id_start
+                pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
+            else:
+                pos_ids = empty_pos_ids
             hidden = self.language_model(
                 empty_combined_emb, is_causal=False, mode="gen",
                 cache_handle=cache_handle, write_cache=False,
                 vae_token_indexes=vae_token_indexes,
-                pos_ids=empty_pos_ids,
+                pos_ids=pos_ids,
                 text_indexes=text_indexes, **kwargs,
             )
             v_final = self.llm2vae(hidden)[1:-1]
