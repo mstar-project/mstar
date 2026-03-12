@@ -591,12 +591,13 @@ class LLMSubmodule(StageSubmodule):
 
         if requires_cfg:
             logger.debug("Running 3 fwd passes for cfg gen")
-            cfg_text_scale = self.config.cfg_text_scale
-            cfg_img_scale = self.config.cfg_img_scale
-            renorm_type = self.config.cfg_renorm_type
+            cfg_text_scale = kwargs.pop("cfg_text_scale", self.config.cfg_text_scale)
+            cfg_img_scale = kwargs.pop("cfg_img_scale", self.config.cfg_img_scale)
+            renorm_type = kwargs.pop("cfg_renorm_type", self.config.cfg_renorm_type)
 
             # CFG interval: only apply guidance when timestep is within interval
-            cfg_lo, cfg_hi = self.config.cfg_interval
+            cfg_interval = kwargs.pop("cfg_interval", self.config.cfg_interval)
+            cfg_lo, cfg_hi = cfg_interval
             t_val = timestep[0].item() if isinstance(timestep, torch.Tensor) else float(timestep)
             in_cfg_interval = (t_val > cfg_lo) and (t_val <= cfg_hi)
             effective_text_scale = cfg_text_scale if in_cfg_interval else 1.0
@@ -623,7 +624,7 @@ class LLMSubmodule(StageSubmodule):
             v_cfg_img = self.llm2vae(velocities["cfg_img"])[1:-1]
 
             # Two-stage CFG velocity combination + renormalization
-            cfg_renorm_min = self.config.cfg_renorm_min
+            cfg_renorm_min = kwargs.pop("cfg_renorm_min", self.config.cfg_renorm_min)
 
             if renorm_type == "text_channel":
                 # text_channel: renorm AFTER text CFG, THEN apply image CFG
