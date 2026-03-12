@@ -342,7 +342,8 @@ class BagelModel(Model):
                     torch.tensor(list(byte_data), dtype=torch.uint8)
                 ]
 
-        if self.config.think_mode and self.tokenizer is not None:
+        think_mode = kwargs.get("think_mode", self.config.think_mode)
+        if think_mode and self.tokenizer is not None:
             target_output = output_modalities[0] if output_modalities else "text"
             is_understanding = (target_output == "text")
             sys_prompt = (
@@ -504,15 +505,29 @@ class BagelModel(Model):
         self,
         input_modalities: list[str],
         output_modalities: list[str],
+        model_kwargs: dict | None = None,
     ) -> CurrentForwardMetadata:
         target_output = output_modalities[0]  # "text" or "image"
         is_understanding = (target_output == "text")
+
+        # Per-request overrides with config defaults
+        overridable_keys = [
+            "cfg_text_scale", "cfg_img_scale", "cfg_interval",
+            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
+        ]
+        params = {k: getattr(self.config, k) for k in overridable_keys}
+        if model_kwargs:
+            for key in overridable_keys:
+                if key in model_kwargs:
+                    params[key] = model_kwargs[key]
+
+        think_mode = params.pop("think_mode")  # used for schedule logic, not stored in params
 
         # Build prefill schedule: sequential list of (phase_name, step_kwargs)
         schedule: list[tuple[str, dict]] = []
 
         # 1. System prompt (if think mode enabled)
-        if self.config.think_mode:
+        if think_mode:
             prompt = VLM_THINK_SYSTEM_PROMPT if is_understanding else GEN_THINK_SYSTEM_PROMPT
             schedule.append(("prefill_text", {"prompt": prompt}))
 
@@ -545,8 +560,8 @@ class BagelModel(Model):
                 "prefill_step": 0,
                 "target_output": target_output,
                 "num_timesteps": self.config.num_timesteps,
-                "cfg_text_scale": self.config.cfg_text_scale,
-                "cfg_img_scale": self.config.cfg_img_scale,
+                "think_mode": think_mode,
+                **params,  # CFG params
             },
         )
 
@@ -657,7 +672,7 @@ class BagelModel(Model):
                 if target == "text":
                     metadata.phase = "decode"
                 elif target == "image":
-                    if self.config.think_mode:
+                    if metadata.kwargs.get("think_mode", False):
                         # Think first: decode to generate reasoning, then
                         # EOS triggers transition to image_gen.
                         metadata.phase = "decode"
@@ -669,7 +684,7 @@ class BagelModel(Model):
             tokens = new_tokens.get("new_token", [])
             if self.eos_token_id is not None and self.eos_token_id in tokens:
                 target = metadata.kwargs["target_output"]
-                if self.config.think_mode and target == "image":
+                if metadata.kwargs.get("think_mode", False) and target == "image":
                     # Thinking phase complete — transition to image generation.
                     metadata.phase = "image_gen"
                 else:
@@ -690,4 +705,9 @@ class BagelModel(Model):
         return {
             "requires_cfg": metadata.kwargs["target_output"] == "image",
             "is_prefill": metadata.is_prefill,
+            "cfg_text_scale": metadata.kwargs["cfg_text_scale"],
+            "cfg_img_scale": metadata.kwargs["cfg_img_scale"],
+            "cfg_interval": metadata.kwargs["cfg_interval"],
+            "cfg_renorm_type": metadata.kwargs["cfg_renorm_type"],
+            "cfg_renorm_min": metadata.kwargs["cfg_renorm_min"],
         }
