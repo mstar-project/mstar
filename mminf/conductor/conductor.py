@@ -261,7 +261,8 @@ class Conductor:
         request_data = RequestData(
             current_forward_metadata=self.model.get_initial_forward_metadata(
                 body.initial_input_modalities,
-                body.initial_output_modalities
+                body.initial_output_modalities,
+                model_kwargs=body.model_kwargs,
             ),
             fwd_inputs=[],
             persist_signals=body.initial_signals,
