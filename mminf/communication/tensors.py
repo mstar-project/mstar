@@ -430,6 +430,22 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             )
 
             for info in graph_ptr.tensor_info:
+                if info.source_entity == self.my_entity_id:
+                    if info.source_tensor_name == graph_ptr.name:
+                        continue
+                    tensor = self.tensor_store.get_tensor(
+                        request_id=request_id, name=info.source_tensor_name,
+                        uuid=info.uuid
+                    )
+                    self.tensor_store.put_tensor(
+                        request_id=request_id, name=graph_ptr.name,
+                        uuid=info.uuid, tensor=tensor
+                    )
+                    self.tensor_store.remove_tensor(
+                        request_id=request_id, name=info.source_tensor_name,
+                        uuid=info.uuid
+                    )
+                    continue
                 buffer = torch.empty(info.dims, dtype=info.dtype, device=device).as_strided(
                     info.dims, stride=info.stride
                 )

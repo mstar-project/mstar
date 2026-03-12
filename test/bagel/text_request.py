@@ -10,9 +10,15 @@ URL = "http://0.0.0.0:8000/generate"
 
 
 def main():
+    data = {
+            "text": "What is the 7th value after the decimal point in pi?", # 6
+            # "model_kwargs": json.dumps({
+            #     "think_mode": True,
+            # }),
+        }
     with requests.post(
         URL,
-        files={"text": (None, "Hello, how are you?")},
+        data=data,
         stream=True,
     ) as resp:
         resp.raise_for_status()
