@@ -316,11 +316,7 @@ class Conductor:
         logger.debug("Conductor ingesting request %s", body.request_id)
         subgraph_to_worker = self._assign_subgraphs_to_workers()
         request_data = RequestData(
-            current_forward_metadata=self.model.get_initial_forward_pass_args(
-                body.initial_input_modalities,
-                body.initial_output_modalities,
-                model_kwargs=body.model_kwargs,
-            ),
+            current_forward_metadata=None,
             fwd_inputs=[],
             persist_signals=body.initial_signals,
             persist_signal_ref_cnt={},
