@@ -43,7 +43,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import (
-    GraphPointer,
+    GraphEdge,
     GraphSection,
     GraphStage,
     Loop,
@@ -413,7 +413,7 @@ class BagelModel(Model):
                 name="vit_encoder",
                 input_ids=["image_inputs"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="img_emb"),
+                    GraphEdge(next_stage="LLM", name="img_emb"),
                 ],
             ),
             GraphStage(
@@ -429,7 +429,7 @@ class BagelModel(Model):
                 name="vae_encoder",
                 input_ids=["image_inputs"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="img_emb"),
+                    GraphEdge(next_stage="LLM", name="img_emb"),
                 ],
             ),
             GraphStage(
@@ -444,7 +444,7 @@ class BagelModel(Model):
             name="LLM",
             input_ids=["text_inputs"],
             outputs=[
-                GraphPointer(
+                GraphEdge(
                     next_stage=STREAM_OUT,
                     name="new_token",
                     output_modality="text",
@@ -464,20 +464,20 @@ class BagelModel(Model):
                     name="LLM",
                     input_ids=["latents", "time_index"],
                     outputs=[
-                        GraphPointer(next_stage="LLM", name="latents"),
-                        GraphPointer(next_stage="LLM", name="time_index"),
+                        GraphEdge(next_stage="LLM", name="latents"),
+                        GraphEdge(next_stage="LLM", name="time_index"),
                     ],
                 ),
                 n_iters=self.config.num_timesteps - 1,
                 outputs=[
-                    GraphPointer(next_stage="vae_decoder", name="latents"),
+                    GraphEdge(next_stage="vae_decoder", name="latents"),
                 ],
             ),
             GraphStage(
                 name="vae_decoder",
                 input_ids=["latents"],
                 outputs=[
-                    GraphPointer(
+                    GraphEdge(
                         next_stage=STREAM_OUT,
                         name="image_output",
                         output_modality="image",
@@ -553,7 +553,7 @@ class BagelModel(Model):
         self,
         metadata: CurrentForwardMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphPointer]:
+    ) -> list[GraphEdge]:
         """Construct the external inputs for the current forward pass.
 
         The conductor calls this to determine what tensors to send to
@@ -576,38 +576,38 @@ class BagelModel(Model):
             input_tensor_info = [schedule[step][1]]
 
             if phase == "prefill_text":
-                ptr = GraphPointer(next_stage="LLM", name="text_inputs")
+                graph_edge = GraphEdge(next_stage="LLM", name="text_inputs")
             elif phase == "prefill_vit":
-                ptr = GraphPointer(next_stage="vit_encoder", name="image_inputs")
+                graph_edge = GraphEdge(next_stage="vit_encoder", name="image_inputs")
             elif phase == "prefill_vae":
-                ptr = GraphPointer(next_stage="vae_encoder", name="image_inputs")
+                graph_edge = GraphEdge(next_stage="vae_encoder", name="image_inputs")
             else:
                 raise ValueError(f"Unrecognized prefill phase {phase}")
-            ptr.tensor_info = input_tensor_info
-            return [ptr]
+            graph_edge.tensor_info = input_tensor_info
+            return [graph_edge]
 
         elif phase == "decode":
             # Previous token feeds back as text_inputs
-            ptr = GraphPointer(next_stage="LLM", name="text_inputs")
-            ptr.tensor_info = persist_signals.get("new_token", [])
-            return [ptr]
+            graph_edge = GraphEdge(next_stage="LLM", name="text_inputs")
+            graph_edge.tensor_info = persist_signals.get("new_token", [])
+            return [graph_edge]
 
         elif phase == "image_gen":
             # Initial noise latents feed the LLM denoising loop.
             # Note: latents are typically initialized by the submodule's
             # preprocess() (random noise), not passed through persist_signals.
             # This lookup handles the case where latents are externally provided.
-            ptr = GraphPointer(next_stage="LLM", name="latents")
-            ptr.tensor_info = persist_signals.get("latents", [])
+            graph_edge = GraphEdge(next_stage="LLM", name="latents")
+            graph_edge.tensor_info = persist_signals.get("latents", [])
             return [
-                ptr,
-                GraphPointer(next_stage="LLM", name="time_index")
+                graph_edge,
+                GraphEdge(next_stage="LLM", name="time_index")
             ]
 
         return []
 
     def _get_unpersist_tensors(
-        self, phase: str, inputs: list[GraphPointer]
+        self, phase: str, inputs: list[GraphEdge]
     ) -> list[TensorPointerInfo]:
         """
         Lists the tensors that will be used for the last time in this forward pass

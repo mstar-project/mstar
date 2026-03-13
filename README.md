@@ -57,7 +57,7 @@ These principles are derived from 13 specific problems identified in the scrappe
 | P6 | **Conductor is the inter-worker coordinator** | The conductor orchestrates lifecycle, selects workers, coordinates handoffs. It never touches GPU tensors and never manages batching. |
 | P7 | **Workers handle internal batching** | Each worker has its own micro-scheduler for continuous batching. The conductor dispatches work; the worker decides when to execute. |
 | P8 | **Start fresh, borrow primitives** | Build a clean architecture for multimodal disaggregation from day one. Copy proven primitives from VoxServe (FlashInfer, paged KV cache, CUDA graphs, ZMQ) and vLLM (scheduler interface, cache management, executor abstraction). |
-| P9 | **Stage as the fundamental unit** | Every computation is a stage with: `(inputs, outputs, pointers)`. Stages compose into graphs via `Sequential`, `Parallel`, and `Loop` primitives. Stages are run via a step function with `(inputs, state, metadata)`. |
+| P9 | **Stage as the fundamental unit** | Every computation is a stage with: `(inputs, outputs, graph_edges)`. Stages compose into graphs via `Sequential`, `Parallel`, and `Loop` primitives. Stages are run via a step function with `(inputs, state, metadata)`. |
 | P10 | **Graph-driven scheduling** | The computation graph (not hardcoded phase enums) drives all scheduling. Ready/waiting queues operate on graph stages, enabling arbitrary DAGs. |
 
 ---
@@ -214,7 +214,7 @@ The API server includes a `PreprocessWorker` (running in a separate thread) that
 1. **Tokenization** via `model.process_prompt(prompt, input_modalities, output_modalities, **model_kwargs)` — each model defines its own tokenization logic, system prompt insertion (e.g., BAGEL's think mode), and output key naming.
 2. **Media loading** — images (torchvision), audio (torchaudio), video (torchcodec) are loaded and tensor-encoded.
 3. **Tensor registration** — all input tensors are stored in the `MooncakeCommunicationManager` and registered for RDMA send.
-4. **Conductor notification** — a `NewRequestConductor` message is sent with `initial_signals` (tensor pointer info), `input_modalities`, `output_modalities`, `input_metadata`, and `model_kwargs`.
+4. **Conductor notification** — a `NewRequestConductor` message is sent with `initial_signals` (tensor edge info), `input_modalities`, `output_modalities`, `input_metadata`, and `model_kwargs`.
 
 If no model is provided (lightweight mode), the data worker falls back to UTF-8 byte encoding.
 
@@ -368,8 +368,8 @@ For each request, the scheduler contains multiple roles that operate at differen
 | Step | Action | Details |
 |------|--------|---------|
 | g | Update request lifecycle | Call `model.update_for_next_forward(metadata, new_tokens)` to advance phase transitions (e.g., prefill → decode → image_gen) and detect completion (EOS, image done). If `metadata.request_done` is set, end request (send REMOVE_REQUEST to workers). Also set which subgraphs are active for the next model forward pass (used to track when the fwd pass is done) |
-| h | `model.get_forward_pass_inputs(...)` | Get the inputs for the current forward pass (e.g., if we are doing image generation, this will include noisy latents). This will be in the form of `GraphPointer` objects, which include tensor name, what graph stage it is routed to, and the current tensor location (IP address, memory address, size)  |
-| i | Dispatch inputs to workers | Send the input `GraphPointer`s for the current forward pass to the appropriate workers. Also include metadata of which phase we are in (e.g. prefill, decode, image_gen) and per-request metadata (e.g., cache_labels, snapshot_after), because these are required for routing and cache orchestration |
+| h | `model.get_forward_pass_inputs(...)` | Get the inputs for the current forward pass (e.g., if we are doing image generation, this will include noisy latents). This will be in the form of `GraphEdge` objects, which include tensor name, what graph stage it is routed to, and the current tensor location (IP address, memory address, size)  |
+| i | Dispatch inputs to workers | Send the input `GraphEdge`s for the current forward pass to the appropriate workers. Also include metadata of which phase we are in (e.g. prefill, decode, image_gen) and per-request metadata (e.g., cache_labels, snapshot_after), because these are required for routing and cache orchestration |
 
 **Note**: sending the current computation phase may be replaced by a more detailed "request state", which will additionally include information about, e.g., what input token indices are text vs. image vs. video.
 
@@ -391,7 +391,7 @@ class Subgraph:
 @dataclass
 class RequestData:
     current_forward_metadata: CurrentForwardMetadata
-    fwd_inputs: list[GraphPointer] # inputs that the conductor has sent to the current fwd pass
+    fwd_inputs: list[GraphEdge] # inputs that the conductor has sent to the current fwd pass
     persist_signals: dict[str, list[TensorPointerInfo]] # signals passed back to conductor
     subgraph_to_worker: dict[str, str] # subgraph id to worker id
     new_tokens: dict[str, list[int]] # name -> tokens, for this fwd pass (e.g., {"new_token": [42, 17]})
@@ -412,7 +412,7 @@ class CurrentForwardMetadata:
     request_done: bool = False  # set by model.update_for_next_forward() on EOS/completion
     kwargs: dict  # model-specific metadata (e.g., prefill_schedule, cfg scales)
 ```
-See the [computation graph model section](#9-computation-graph-model) for information about `GraphPointer` and `TensorPointerMetadata`.
+See the [computation graph model section](#9-computation-graph-model) for information about `GraphEdge` and `TensorPointerMetadata`.
 
 
 ### 6.4 Subgraph Persistence (Note 7)
@@ -461,7 +461,7 @@ In addition to the computation graph, each model implements the following abstra
 
 - `get_initial_forward_metadata(input_modalities, output_modalities) → CurrentForwardMetadata` — Determines the starting phase and constructs model-specific metadata (e.g., BAGEL's prefill schedule with multi-cache annotations for CFG).
 
-- `get_forward_pass_inputs(metadata, persist_signals, prev_forward_metadata) → list[GraphPointer]` — Returns the external inputs to send to workers at the start of each forward pass. Uses `persist_signals` (tensors that persisted from previous forward passes) and the current phase to construct `GraphPointer`s with `next_stage`, `name`, and `tensor_info` fields.
+- `get_forward_pass_inputs(metadata, persist_signals, prev_forward_metadata) → list[GraphEdge]` — Returns the external inputs to send to workers at the start of each forward pass. Uses `persist_signals` (tensors that persisted from previous forward passes) and the current phase to construct `GraphEdge`s with `next_stage`, `name`, and `tensor_info` fields.
 
 - `update_for_next_forward(metadata, new_tokens) → CurrentForwardMetadata` — Called after each full model forward pass to advance phase transitions (e.g., prefill_text → prefill_vit → decode → image_gen). Phase transitions are schedule-driven for models like BAGEL; `new_tokens` is checked for EOS.
 
@@ -497,7 +497,7 @@ def get_phase_graphs(self) -> dict[str, GraphSection]:
         GraphStage(
             name="vit_encoder",
             input_ids=["image_inputs"],
-            outputs=[GraphPointer(next_stage="LLM", name="vit_emb")],
+            outputs=[GraphEdge(next_stage="LLM", name="vit_emb")],
         ),
         GraphStage(name="LLM", input_ids=["vit_emb"], outputs=[]),
     ])
@@ -507,7 +507,7 @@ def get_phase_graphs(self) -> dict[str, GraphSection]:
         GraphStage(
             name="vae_encoder",
             input_ids=["image_inputs"],
-            outputs=[GraphPointer(next_stage="LLM", name="vae_emb")],
+            outputs=[GraphEdge(next_stage="LLM", name="vae_emb")],
         ),
         GraphStage(name="LLM", input_ids=["vae_emb"], outputs=[]),
     ])
@@ -517,7 +517,7 @@ def get_phase_graphs(self) -> dict[str, GraphSection]:
         name="LLM",
         input_ids=["text_inputs"],
         outputs=[
-            GraphPointer(
+            GraphEdge(
                 next_stage=STREAM_OUT, name="new_token",
                 output_modality="text", is_new_token=True,
                 back_to_conductor=True,
@@ -531,16 +531,16 @@ def get_phase_graphs(self) -> dict[str, GraphSection]:
             section=GraphStage(
                 name="LLM",
                 input_ids=["latents"],
-                outputs=[GraphPointer(next_stage="LLM", name="latents")],
+                outputs=[GraphEdge(next_stage="LLM", name="latents")],
             ),
             n_iters=self.num_timesteps - 1,  # N-1 Euler steps for N timesteps
-            outputs=[GraphPointer(next_stage="vae_decoder", name="latents")],
+            outputs=[GraphEdge(next_stage="vae_decoder", name="latents")],
         ),
         GraphStage(
             name="vae_decoder",
             input_ids=["latents"],
             outputs=[
-                GraphPointer(
+                GraphEdge(
                     next_stage=STREAM_OUT, name="image_output",
                     output_modality="image", back_to_conductor=True,
                 ),
@@ -584,7 +584,7 @@ Sequential([
             name="vit_encoder",
             input_ids=["image"],
             outputs=[
-                GraphPointer(
+                GraphEdge(
                     next_stage="LLM",
                     name="img_emb"
                 )
@@ -594,7 +594,7 @@ Sequential([
             name="text_emb",
             input_ids=["text"],
             outputs=[
-                GraphPointer(
+                GraphEdge(
                     next_stage="LLM",
                     name="text_emb"
                 )
@@ -605,7 +605,7 @@ Sequential([
         name="LLM_text_gen",  # AR text generation phase
         input_ids=["text_emb", "img_emb"],
         outputs=[
-            GraphPointer(next_stage="STREAM_OUT", name="text_tokens"),
+            GraphEdge(next_stage="STREAM_OUT", name="text_tokens"),
         ]
     )
 ])
@@ -619,7 +619,7 @@ Sequential([
             name="vit_encoder",
             input_ids=["image"],
             outputs=[
-                GraphPointer(
+                GraphEdge(
                     next_stage="LLM",
                     name="img_emb"
                 )
@@ -629,7 +629,7 @@ Sequential([
             name="text_emb",
             input_ids=["text"],
             outputs=[
-                GraphPointer(
+                GraphEdge(
                     next_stage="LLM",
                     name="text_emb"
                 )
@@ -642,7 +642,7 @@ Sequential([
                 name="LLM",  # Full LLM forward pass at each flow step
                 input_ids=["text_emb", "img_emb", "latents"],
                 outputs=[
-                    GraphPointer(
+                    GraphEdge(
                         next_stage="diffusion_head",
                         name="hidden_states"
                     )
@@ -652,7 +652,7 @@ Sequential([
                 name="diffusion_head",
                 input_ids=["hidden_states"],
                 outputs=[
-                    GraphPointer(
+                    GraphEdge(
                         next_stage="euler_step",
                         name="velocity"
                     )
@@ -662,7 +662,7 @@ Sequential([
                 name="euler_step",
                 input_ids=["velocity", "latents"],
                 outputs=[
-                    GraphPointer(
+                    GraphEdge(
                         next_stage="LLM",
                         name="latents"
                     )  # loop-back
@@ -671,7 +671,7 @@ Sequential([
         ]),
         n_iters=50,
         outputs=[
-            GraphPointer(
+            GraphEdge(
                 next_stage="vae_decoder",
                 name="latents"
             )
@@ -681,7 +681,7 @@ Sequential([
         name="vae_decoder",
         input_ids=["latents"],
         outputs=[
-            GraphPointer(
+            GraphEdge(
                 next_stage="STREAM_OUT",
                 name="image"
             )
@@ -701,7 +701,7 @@ full_graph = Sequential([
             name="text_emb",
             input_ids=["text"],
             outputs=[
-                GraphPointer(
+                GraphEdge(
                     next_stage="thinker",
                     name="text_emb"
                 )
@@ -711,7 +711,7 @@ full_graph = Sequential([
             name="vit_encoder",
             input_ids=["image"],
             outputs=[
-                GraphPointer(
+                GraphEdge(
                     next_stage="thinker",
                     name="img_emb"
                 )
@@ -721,7 +721,7 @@ full_graph = Sequential([
             name="audio_encoder",
             input_ids=["audio"],
             outputs=[
-                GraphPointer(
+                GraphEdge(
                     next_stage="thinker",
                     name="audio_emb"
                 )
@@ -734,11 +734,11 @@ full_graph = Sequential([
             name="thinker",
             input_ids=["text_emb", "img_emb", "audio_emb"],
             outputs=[
-                GraphPointer(
+                GraphEdge(
                     next_stage="STREAM_OUT",
                     name="text_tokens"
                 ),
-                GraphPointer(
+                GraphEdge(
                     next_stage="talker",
                     name="hidden_states",
                     back_to_conductor=False
@@ -759,7 +759,7 @@ full_graph = Sequential([
                 consumes_stream=True,
                 input_ids=["hidden_states"],  # from thinker via RELAY
                 outputs=[
-                    GraphPointer(
+                    GraphEdge(
                         next_stage="mtp_module",
                         name="codec_tokens"
                     )
@@ -769,7 +769,7 @@ full_graph = Sequential([
                 name="mtp_module",
                 input_ids=["codec_tokens"],
                 outputs=[
-                    GraphPointer(
+                    GraphEdge(
                         next_stage="code2wav",
                         name="full_codebook"
                     )
@@ -779,7 +779,7 @@ full_graph = Sequential([
                 name="code2wav",
                 input_ids=["full_codebook"],
                 outputs=[
-                    GraphPointer(
+                    GraphEdge(
                         next_stage="STREAM_OUT",
                         name="audio_chunk"
                     )
@@ -791,9 +791,9 @@ full_graph = Sequential([
 ```
 
 
-### 7.6 Note: GraphPointers in Full Graph Construction
+### 7.6 Note: GraphEdges in Full Graph Construction
 
-The graph pointer info associated with each tensor triggers the onset of the `next_stage` as well as inter-worker or worker-to-conductor communication (tensor sharing).
+The graph edge info associated with each tensor triggers the onset of the `next_stage` as well as inter-worker or worker-to-conductor communication (tensor sharing).
 
 ```python
 @dataclass
@@ -807,7 +807,7 @@ class TensorPointerInfo:
     source_entity: str # which {worker, api_server} the tensor is on
 
 @dataclass
-class GraphPointer:
+class GraphEdge:
     next_stage: str
     name: str
     tensor_info: list[TensorPointerInfo] = field(default_factory=list)
@@ -949,7 +949,7 @@ State is mainly managed within workers (or between workers, via IPC), with some 
 
 - **Within-worker state** (worker manages): KV cache (via CacheHandle), per-request graph queues, engine state.
 - **Between-worker synchronization** (handled by IPC between workers): tensor transfers, stage output routing.
-- **Conductor-to-worker synchronization**: At the beginning of each forward pass, the conductor sends `InputSignals` with: inputs (`list[GraphPointer]`), phase, and `per_request_metadata` (e.g., `cache_labels`, `snapshot_after` for CFG). After the forward pass starts, subsequent signals pass between workers directly via IPC.
+- **Conductor-to-worker synchronization**: At the beginning of each forward pass, the conductor sends `InputSignals` with: inputs (`list[GraphEdge]`), phase, and `per_request_metadata` (e.g., `cache_labels`, `snapshot_after` for CFG). After the forward pass starts, subsequent signals pass between workers directly via IPC.
 
 ### 8.6 Streaming Output
 
@@ -989,20 +989,20 @@ This abstraction is necessary for `Sequential`, `Parallel`, and `Loop` blocks to
 
 **Abstract methods on GraphSection** (all subclasses must implement):
 ```python
-DestToInputs = dict[str, list[GraphPointer]]
+DestToInputs = dict[str, list[GraphEdge]]
 
 class GraphSection(ABC):
     def get_stage_names(self) -> list[str]: ...             # Names of all stages in this section
-    def get_inputs(self) -> list[GraphPointer]: ...         # External/loop-back inputs
-    def get_outputs(self) -> list[GraphPointer]: ...        # External/loop-back outputs
+    def get_inputs(self) -> list[GraphEdge]: ...         # External/loop-back inputs
+    def get_outputs(self) -> list[GraphEdge]: ...        # External/loop-back outputs
     def ingest_inputs(self, stage_to_inputs: DestToInputs): ...  # Mark inputs as received; MUTATES stage_to_inputs
     def split_off_ready(self) -> tuple[list[GraphStage], GraphSection | None]: ...  # Split ready stages from waiting
 ```
 
-As a reminder, the `GraphPointer` is the following dataclass:
+As a reminder, the `GraphEdge` is the following dataclass:
 ```python
 @dataclass
-class GraphPointer:
+class GraphEdge:
     next_stage: str
     name: str
     tensor_info: TensorPointerInfo | None = field(default=None)
@@ -1022,21 +1022,21 @@ The fundamental computation unit (leaf node).
 class GraphStage(GraphSection):
     name: str
     input_ids: set[str]              # Named inputs this stage needs (coerced from list in __post_init__)
-    outputs: list[GraphPointer]
+    outputs: list[GraphEdge]
     consumes_stream: bool = False     # For RELAY consumer stages (e.g., Talker)
 
-    # Populated as predecessors complete — maps input name to the GraphPointer
+    # Populated as predecessors complete — maps input name to the GraphEdge
     # carrying the tensor info (address, uuid, etc.)
-    ready_inputs: dict[str, GraphPointer] = field(default_factory=dict)
+    ready_inputs: dict[str, GraphEdge] = field(default_factory=dict)
 
     def is_ready(self) -> bool:
         return self.input_ids.issubset(set(self.ready_inputs.keys()))
 ```
 
 **Key methods**:
-- `ingest_inputs(stage_to_inputs)`: If this stage's name is in `stage_to_inputs`, ingest any input IDs that this stage needs and hasn't already received. Remove consumed entries from `stage_to_inputs` (mutation). Returns the list of ingested `GraphPointer`s.
+- `ingest_inputs(stage_to_inputs)`: If this stage's name is in `stage_to_inputs`, ingest any input IDs that this stage needs and hasn't already received. Remove consumed entries from `stage_to_inputs` (mutation). Returns the list of ingested `GraphEdge`s.
 - `split_off_ready()`: Returns `([self], None)` if ready, or `([], self)` if still waiting.
-- `get_inputs()`: Returns `[GraphPointer(next_stage=self.name, name=id) for id in self.input_ids]`.
+- `get_inputs()`: Returns `[GraphEdge(next_stage=self.name, name=id) for id in self.input_ids]`.
 - `get_outputs()`: Returns `self.outputs`.
 
 Visual:
@@ -1095,10 +1095,10 @@ A stage or subgraph repeated N times. Handles loop-back signals (outputs that fe
 class Loop(GraphSection):
     section: GraphSection           # Template ("clean" copy, never mutated)
     n_iters: int
-    outputs: list[GraphPointer]   # Final iteration outputs (replace loop-backs)
+    outputs: list[GraphEdge]   # Final iteration outputs (replace loop-backs)
     curr_iter: int = field(default=0)
-    external_inputs: list[GraphPointer] = field(default=None)     # Inputs from OUTSIDE the loop (not loop-back)
-    loop_back_signals: list[GraphPointer] = field(default=None)
+    external_inputs: list[GraphEdge] = field(default=None)     # Inputs from OUTSIDE the loop (not loop-back)
+    loop_back_signals: list[GraphEdge] = field(default=None)
     curr_iter_section: GraphSection = field(default=None)    # Mutable copy for current iteration
     nxt_iter_section: GraphSection = field(default=None)     # Pre-populated copy for next iteration
 ```
@@ -1110,7 +1110,7 @@ These outputs must be removed in the final loop iteration.
 
 **Key internal methods**:
 - `_get_loop_back_signals()`: Identifies signals that appear in both the section's inputs AND outputs -- these are the loop-back edges.
-- `_replace_outputs_for_final_iter(section)`: On the last iteration, removes loop-back pointers from stage outputs and replaces them with `self.outputs` (the final output destinations). Applied recursively through nested sections.
+- `_replace_outputs_for_final_iter(section)`: On the last iteration, removes loop-back edges from stage outputs and replaces them with `self.outputs` (the final output destinations). Applied recursively through nested sections.
 - `_advance_one_iter()`: Promotes `nxt_iter_section` to `curr_iter_section`, creates a fresh `deepcopy` for the new `nxt_iter_section`, increments `curr_iter`, and re-ingests `external_inputs`.
 - `split_off_ready()`: If `curr_iter_section` is None (iteration consumed), calls `_advance_one_iter()`. Then splits off ready stages from the current iteration. On last iteration, returns the waiting section directly (no Loop wrapper). Otherwise, returns the Loop itself as the waiting section.
 - `ingest_inputs(stage_to_inputs)`: First ingests into `curr_iter_section`. Then separates external inputs from loop-back inputs, and only passes loop-back inputs to `nxt_iter_section` (to prevent external inputs from prematurely populating the next iteration). This logic is required for nested loops.
@@ -1129,24 +1129,24 @@ Three equivalent representations of graph edges:
 
 ```python
 SignalToDests = dict[str, list[str]]              # {signal: [dest_stage_names]}
-SignalToDestsAndFlags = dict[str, list[GraphPointer]]  # {signal: [GraphPointer(dest, flags)]}
+SignalToDestsAndFlags = dict[str, list[GraphEdge]]  # {signal: [GraphEdge(dest, flags)]}
 DestToInputs = dict[str, list[str]]              # {dest_stage: [required_signals]}
 ```
 
 These can be converted between each other:
-- `remove_flags()`: SignalToDestsAndFlags → SignalToDests (strips GraphPointer, keeps dest names)
+- `remove_flags()`: SignalToDestsAndFlags → SignalToDests (strips GraphEdge, keeps dest names)
 - `get_stage_to_inputs_mapping()`: SignalToDests → DestToInputs (inverts the mapping)
 - `get_signal_to_dest_mapping()`: DestToInputs → SignalToDests (inverts back)
 
 Helper: `update_list_dicts(signals, new_signals)` merges two `dict[str, list]` by extending existing keys and adding new ones. Used by `Parallel` when combining inputs/outputs across branches.
 
-**Mapping direction note**: The whiteboard (IMG_0728) uses `destination → [output_names]` notation (e.g., `DONE_W_FWD: [tokens]`). The code uses the **inverse**: `output_name → [destinations]` (e.g., `"tokens": [GraphPointer("DONE_WITH_FWD")]`). Both representations are equivalent; the code's direction was chosen because it maps naturally to a stage's `outputs` dict where each named output lists where it goes. -->
+**Mapping direction note**: The whiteboard (IMG_0728) uses `destination → [output_names]` notation (e.g., `DONE_W_FWD: [tokens]`). The code uses the **inverse**: `output_name → [destinations]` (e.g., `"tokens": [GraphEdge("DONE_WITH_FWD")]`). Both representations are equivalent; the code's direction was chosen because it maps naturally to a stage's `outputs` dict where each named output lists where it goes. -->
 
-### 9.6 GraphPointer
+### 9.6 GraphEdge
 
 ```python
 @dataclass
-class GraphPointer:
+class GraphEdge:
     next_stage: str
     name: str # name of the signal that is being passed (e.g., text_emb, latents, etc.)
     tensor_info: list[TensorPointerInfo] = field(default_factory=list)
@@ -1243,11 +1243,11 @@ class RequestQueues:
 
     def process_new_inputs(
         self,
-        new_inputs: list[GraphPointer]
+        new_inputs: list[GraphEdge]
     ) -> ProcessedInputs:
         """
         Processes all outputs that feed into the waiting graph section, and
-        return a dictionary of external output pointers (ones that are feeding
+        return a dictionary of external output edges (ones that are feeding
         to different subgraphs)
         """
         if self.waiting is None:
@@ -1256,7 +1256,7 @@ class RequestQueues:
                 for_other_subgraphs=new_inputs,
             )
 
-        new_inputs: DestToGraphPointers = get_stage_to_inputs_mapping(new_inputs)
+        new_inputs: DestToGraphEdges = get_stage_to_inputs_mapping(new_inputs)
         ingested = self.waiting.ingest_inputs(new_inputs)
         external_outputs = sum( new_inputs.values(), start=[])
         
@@ -1290,9 +1290,9 @@ Here, we detail the messages that can be sent to the conductor, worker, and API 
 
 | Flow | Direction | Purpose | Message Content |
 |------|-----------|---------|-----------------|
-**New Request** | Conductor → Worker | Notify worker will be handling subgraphs this request | `req_id`, `subgraph_ids`, `subgraph_to_worker: dict[str, str]`, `initial_phase`, `initial_inputs: list[GraphPointer]`, `per_request_metadata: dict` |
+**New Request** | Conductor → Worker | Notify worker will be handling subgraphs this request | `req_id`, `subgraph_ids`, `subgraph_to_worker: dict[str, str]`, `initial_phase`, `initial_inputs: list[GraphEdge]`, `per_request_metadata: dict` |
 **Remove Request** | Conductor → Worker | Remove request upon `<EOS>` or rescheduling | `req_id` |
-**Input Signals** | Conductor → Worker or Worker → Worker | Send inputs to graph stages | `req_id`, `phase`, `inputs: list[GraphPointer]`, `per_request_metadata: dict` |
+**Input Signals** | Conductor → Worker or Worker → Worker | Send inputs to graph stages | `req_id`, `phase`, `inputs: list[GraphEdge]`, `per_request_metadata: dict` |
 **Tensor Received** | Worker → Worker or Worker → API server | ACK that RDMA tensor read has finished | `req_id`, `successful_tensors: list[NameAndUuid]`, `failed_tensor_ids: list[NameAndUuid]` |
 
 The `per_request_metadata` field on `NewRequest` and `InputSignals` carries model-specific metadata from the conductor to workers (e.g., `cache_labels`, `snapshot_after` for BAGEL's multi-cache CFG orchestration).
@@ -1301,7 +1301,7 @@ The `per_request_metadata` field on `NewRequest` and `InputSignals` carries mode
 
 | Flow | Direction | Purpose | Message Content |
 |------|-----------|---------|-----------------|
-**Result Chunk** | Worker → API server | Stream output | `req_id`, `modality`, `graph_edge: GraphPointer`, `metadata` dict |
+**Result Chunk** | Worker → API server | Stream output | `req_id`, `modality`, `graph_edge: GraphEdge`, `metadata` dict |
 **Request Complete** | Conductor → API server | Request has finished processing | `req_id`
 
 
@@ -1366,7 +1366,7 @@ def run(self) -> None:
         # 1. Process ZMQ messages (new requests, input signals, removals)
         self._process_messages()
 
-        # 2. Check for completed RDMA transfers, feed ready pointers to subgraph queues
+        # 2. Check for completed RDMA transfers, feed ready edges to subgraph queues
         self._check_ready_tensors()
 
         # 3. Pick next batch via MicroScheduler (selects stage + requests)
@@ -1913,7 +1913,7 @@ These notes were captured during whiteboard sessions and design discussions. The
 
 *(Note 8 does not exist -- numbering skips from 7 to 9)*
 
-**Note 9:** modification of needs/produces/pointer design: every subgraph has a list of inputs that it needs. We merge the produces/pointer concepts: every subgraph can have multiple outputs that feed into different subgraphs, some of which will be ready in the middle of the subgraph execution. This is handled by multiple pointers to next subgraphs, each of which is associated with the corresponding produced tensors.
+**Note 9:** modification of needs/produces/edge design: every subgraph has a list of inputs that it needs. We merge the produces/edge concepts: every subgraph can have multiple outputs that feed into different subgraphs, some of which will be ready in the middle of the subgraph execution. This is handled by multiple edges to next subgraphs, each of which is associated with the corresponding produced tensors.
 
 **Note 10:** Whenever we change subgraphs, the conductor should send the corresponding workers information to the extent of "when you get tensors X and Y, run subgraph Z"
 

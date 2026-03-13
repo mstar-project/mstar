@@ -6,7 +6,7 @@ from mminf.graph.request_queues import PerRequestStageQueues
 sys.path.insert(0, ".")
 import numpy as np
 
-from mminf.graph.base import GraphPointer, GraphStage, Loop, Parallel, Sequential
+from mminf.graph.base import GraphEdge, GraphStage, Loop, Parallel, Sequential
 
 if __name__ == "__main__":
     # show-o2-style graph with weird stuff added to stress-test
@@ -18,8 +18,8 @@ if __name__ == "__main__":
                     name="LLM",
                     input_ids=["text_emb", "img_emb", "latents"],
                     outputs=[
-                        GraphPointer(name="hidden_states", next_stage="flow"),
-                        GraphPointer(name="some_random_external_output", next_stage="f")
+                        GraphEdge(name="hidden_states", next_stage="flow"),
+                        GraphEdge(name="some_random_external_output", next_stage="f")
                     ]
                 ),
                 Loop(
@@ -28,21 +28,21 @@ if __name__ == "__main__":
                             name="flow",
                             input_ids=["hidden_states", "mystery", "mystery2"],
                             outputs=[
-                                GraphPointer(name="partial_mystery2", next_stage="flow2"),
-                                GraphPointer(name="partial_latents", next_stage="flow2")
+                                GraphEdge(name="partial_mystery2", next_stage="flow2"),
+                                GraphEdge(name="partial_latents", next_stage="flow2")
                             ]
                         ),
                         GraphStage(
                             name="flow2",
                             input_ids=["partial_latents"],
                             outputs=[
-                                GraphPointer(name="latents", next_stage="")
+                                GraphEdge(name="latents", next_stage="")
                             ]
                         ),
                     ]),
                     n_iters=2,
                     outputs=[
-                        GraphPointer(name="latents", next_stage="LLM")
+                        GraphEdge(name="latents", next_stage="LLM")
                     ]
                 )
             ]),
@@ -51,23 +51,23 @@ if __name__ == "__main__":
                     name="f",
                     input_ids=["mystery", "some_random_external_output"],
                     outputs=[
-                        GraphPointer(name="xyz", next_stage="g")
+                        GraphEdge(name="xyz", next_stage="g")
                     ]
                 ),
                 GraphStage(
                     name="g",
                     input_ids=["xyz"],
                     outputs=[
-                        GraphPointer(name="mystery", next_stage="f"),
-                        GraphPointer(name="mystery", next_stage="flow")
+                        GraphEdge(name="mystery", next_stage="f"),
+                        GraphEdge(name="mystery", next_stage="flow")
                     ]
                 )
             ])
         ]),
         n_iters=3,
         outputs=[
-            GraphPointer(name="latents", next_stage="VAE_decoder"),
-            GraphPointer(name="some_random_external_output", next_stage="STREAM_OUT")
+            GraphEdge(name="latents", next_stage="VAE_decoder"),
+            GraphEdge(name="some_random_external_output", next_stage="STREAM_OUT")
         ]
     )
 
@@ -107,17 +107,17 @@ if __name__ == "__main__":
                 name="text_emb",
                 input_ids=["text"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="text_emb"),
-                    GraphPointer(next_stage="f", name="mystery"),
-                    GraphPointer(next_stage="flow", name="mystery")
+                    GraphEdge(next_stage="LLM", name="text_emb"),
+                    GraphEdge(next_stage="f", name="mystery"),
+                    GraphEdge(next_stage="flow", name="mystery")
                 ]
             ),
             GraphStage(
                 name="vit_encoder",
                 input_ids=["image"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="img_emb"),
-                    GraphPointer(next_stage="f", name="some_random_external_output"),
+                    GraphEdge(next_stage="LLM", name="img_emb"),
+                    GraphEdge(next_stage="f", name="some_random_external_output"),
                 ]
             )
         ]),
@@ -128,8 +128,8 @@ if __name__ == "__main__":
                         name="LLM",
                         input_ids=["text_emb", "img_emb", "latents"],
                         outputs=[
-                            GraphPointer(next_stage="flow", name="hidden_states"),
-                            GraphPointer(next_stage="f", name="some_random_external_output")
+                            GraphEdge(next_stage="flow", name="hidden_states"),
+                            GraphEdge(next_stage="f", name="some_random_external_output")
                         ]
                     ),
                     Loop(
@@ -138,22 +138,22 @@ if __name__ == "__main__":
                                 name="flow",
                                 input_ids=["hidden_states", "mystery", "mystery2"],
                                 outputs=[
-                                    GraphPointer(next_stage="flow2", name="partial_mystery2"),
-                                    GraphPointer(next_stage="flow2", name="partial_latents")
+                                    GraphEdge(next_stage="flow2", name="partial_mystery2"),
+                                    GraphEdge(next_stage="flow2", name="partial_latents")
                                 ]
                             ),
                             GraphStage(
                                 name="flow2",
                                 input_ids=["partial_latents", "partial_mystery2"],
                                 outputs=[
-                                    GraphPointer(next_stage="", name="latents"),
-                                    GraphPointer(next_stage="flow", name="mystery2")
+                                    GraphEdge(next_stage="", name="latents"),
+                                    GraphEdge(next_stage="flow", name="mystery2")
                                 ]
                             ),
                         ]),
                         n_iters=2,
                         outputs=[
-                            GraphPointer(next_stage="LLM", name="latents")
+                            GraphEdge(next_stage="LLM", name="latents")
                         ]
                     )
                 ]),
@@ -162,39 +162,39 @@ if __name__ == "__main__":
                         name="f",
                         input_ids=["mystery", "some_random_external_output"],
                         outputs=[
-                            GraphPointer(next_stage="g", name="xyz")
+                            GraphEdge(next_stage="g", name="xyz")
                         ]
                     ),
                     GraphStage(
                         name="g",
                         input_ids=["xyz"],
                         outputs=[
-                            GraphPointer(next_stage="f", name="mystery"),
-                            GraphPointer(next_stage="flow", name="mystery")
+                            GraphEdge(next_stage="f", name="mystery"),
+                            GraphEdge(next_stage="flow", name="mystery")
                         ]
                     )
                 ])
             ]),
             n_iters=3,
             outputs=[
-                GraphPointer(next_stage="VAE_decoder", name="latents"),
-                GraphPointer(next_stage="STREAM_OUT", name="some_random_external_output")
+                GraphEdge(next_stage="VAE_decoder", name="latents"),
+                GraphEdge(next_stage="STREAM_OUT", name="some_random_external_output")
             ]
         ),
         GraphStage(
             name="VAE_decoder",
             input_ids=["latents"],
             outputs=[
-                GraphPointer(next_stage="STREAM_OUT", name="generated_image")
+                GraphEdge(next_stage="STREAM_OUT", name="generated_image")
             ]
         )
     ])
 
     provided_inputs = [
-        GraphPointer(name="text", next_stage="text_emb"),
-        GraphPointer(name="image", next_stage="vit_encoder"),
-        GraphPointer(name="latents", next_stage="LLM"),
-        GraphPointer(name="mystery2", next_stage="flow")
+        GraphEdge(name="text", next_stage="text_emb"),
+        GraphEdge(name="image", next_stage="vit_encoder"),
+        GraphEdge(name="latents", next_stage="LLM"),
+        GraphEdge(name="mystery2", next_stage="flow")
     ]
 
     queues = PerRequestStageQueues(
@@ -219,9 +219,8 @@ if __name__ == "__main__":
         stage = queues.ready.pop(np.random.randint(0, len(queues.ready)))
         print(f"Processing stage {stage.name} with inputs {stage.input_ids}")
         new_inputs = stage.outputs
-        print(f"New inputs: {[f'{ptr.name} -> {ptr.next_stage}' for ptr in new_inputs]}")
+        print(f"New inputs: {[f'{edge.name} -> {edge.next_stage}' for edge in new_inputs]}")
         external_outputs = queues.process_new_inputs(new_inputs)
         print(f"Outputs: {external_outputs}")
     toc = time.perf_counter()
     print(toc - tic)
-

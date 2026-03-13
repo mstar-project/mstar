@@ -11,7 +11,7 @@ import yaml
 
 from mminf.api_server.types import APIServerMessage, RequestComplete
 from mminf.communication.communicator import ZMQCommunicator
-from mminf.graph.base import GraphPointer, TensorPointerInfo
+from mminf.graph.base import GraphEdge, TensorPointerInfo
 from mminf.ipc_formats import (
     ConductorMessageType,
     InputSignals,
@@ -71,7 +71,7 @@ def _worker_process_target(
 @dataclass
 class RequestData:
     current_forward_metadata: CurrentForwardMetadata
-    fwd_inputs: list[GraphPointer]
+    fwd_inputs: list[GraphEdge]
     # name -> list[TensorPointerInfo]
     persist_signals: dict[str, list[TensorPointerInfo]] # signals passed back to conductor
     persist_signal_ref_cnt: dict[str, int] # uuid -> number of times it was passed to workers
@@ -237,15 +237,15 @@ class Conductor:
 
     def _split_inputs_to_workers(
         self, subgraph_to_worker: dict[str, str],
-        inputs: list[GraphPointer],
+        inputs: list[GraphEdge],
         phase: str
-    ) -> dict[str, list[GraphPointer]]:
+    ) -> dict[str, list[GraphEdge]]:
         """
         Given the full ForwardPassInputs for kicking off a new forward pass,
         return a mapping of worker_id to the ForwardPassInputs that are routed
-        to that worker. ForwardPassInputs consists of graph pointers and tensors.
+        to that worker. ForwardPassInputs consists of graph edges and tensors.
         """
-        inputs_per_worker: dict[str, list[GraphPointer]] = {}
+        inputs_per_worker: dict[str, list[GraphEdge]] = {}
         for subgraph_id, worker_id in subgraph_to_worker.items():
             subgraph = self.subgraphs[subgraph_id]
             if phase not in subgraph.phases:
@@ -255,7 +255,7 @@ class Conductor:
             if worker_id not in inputs_per_worker:
                 inputs_per_worker[worker_id] = []
             inputs_per_worker[worker_id] += [
-                ptr for ptr in inputs if ptr.next_stage in stages
+                edge for edge in inputs if edge.next_stage in stages
             ]
         return inputs_per_worker
 

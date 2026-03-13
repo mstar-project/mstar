@@ -1,6 +1,6 @@
 
 from mminf.engine.ar_engine import KVCacheConfig
-from mminf.graph.base import GraphPointer, GraphStage, Loop, Sequential, TensorPointerInfo
+from mminf.graph.base import GraphEdge, GraphStage, Loop, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import STREAM_OUT
 from mminf.model.base import CurrentForwardMetadata, Model
 
@@ -23,8 +23,8 @@ class DummyOmniModel(Model):
                 name="ThinkerLLM",
                 input_ids=["input_ids"],
                 outputs=[
-                    GraphPointer(next_stage="TalkerLLM", name="thinker_hidden"),
-                    GraphPointer(
+                    GraphEdge(next_stage="TalkerLLM", name="thinker_hidden"),
+                    GraphEdge(
                         next_stage=STREAM_OUT, name="thinker_token", is_new_token=True,
                         output_modality="text"
                     ),
@@ -34,8 +34,8 @@ class DummyOmniModel(Model):
                 name="TalkerLLM",
                 input_ids=["thinker_hidden"],
                 outputs=[
-                    GraphPointer(next_stage="MTP", name="codec_hidden"),
-                    GraphPointer(next_stage=STREAM_OUT, name="talker_token", is_new_token=True),
+                    GraphEdge(next_stage="MTP", name="codec_hidden"),
+                    GraphEdge(next_stage=STREAM_OUT, name="talker_token", is_new_token=True),
                 ],
             ),
             Loop(
@@ -43,20 +43,20 @@ class DummyOmniModel(Model):
                     name="MTP",
                     input_ids=["codec_hidden"],
                     outputs=[
-                        GraphPointer(next_stage="MTP", name="codec_hidden"),
-                        GraphPointer(next_stage=STREAM_OUT, name="mtp_token", is_new_token=True),
+                        GraphEdge(next_stage="MTP", name="codec_hidden"),
+                        GraphEdge(next_stage=STREAM_OUT, name="mtp_token", is_new_token=True),
                     ],
                 ),
                 n_iters=16,
                 outputs=[
-                    GraphPointer(next_stage="AudioCodec", name="codec_hidden"),
+                    GraphEdge(next_stage="AudioCodec", name="codec_hidden"),
                 ],
             ),
             GraphStage(
                 name="AudioCodec",
                 input_ids=["codec_hidden"],
                 outputs=[
-                    GraphPointer(
+                    GraphEdge(
                         next_stage=STREAM_OUT,
                         name="audio_output",
                         output_modality="audio",
@@ -94,10 +94,10 @@ class DummyOmniModel(Model):
         self, metadata: CurrentForwardMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         prev_forward_metadata: CurrentForwardMetadata = None,
-    ) -> list[GraphPointer]:
-        ptr = GraphPointer(next_stage="ThinkerLLM", name="input_ids")
-        ptr.tensor_info = persist_signals.get("input_ids", [])
-        return [ptr]
+    ) -> list[GraphEdge]:
+        graph_edge = GraphEdge(next_stage="ThinkerLLM", name="input_ids")
+        graph_edge.tensor_info = persist_signals.get("input_ids", [])
+        return [graph_edge]
 
     def update_for_next_forward(
         self, metadata: CurrentForwardMetadata,

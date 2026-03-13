@@ -32,7 +32,7 @@ class TensorPointerInfo:
 # assume blocking case for all stages for now.
 
 @dataclass
-class GraphPointer:
+class GraphEdge:
     next_stage: str
     # connection_type: ConnectionType
     # wait_for_next_tensor : bool = True
@@ -47,16 +47,16 @@ class GraphPointer:
     _persist_for_loop: bool = field(default=False)
 
 # Two different ways of defining graph edges
-DestToGraphPointers = dict[str, list[GraphPointer]]
+DestToGraphEdges = dict[str, list[GraphEdge]]
 
 def get_stage_to_inputs_mapping(
-    new_inputs: list[GraphPointer]
-)-> DestToGraphPointers:
-    result: DestToGraphPointers = {}
-    for ptr in new_inputs:
-        if ptr.next_stage not in result:
-            result[ptr.next_stage] = []
-        result[ptr.next_stage].append(ptr)
+    new_inputs: list[GraphEdge]
+)-> DestToGraphEdges:
+    result: DestToGraphEdges = {}
+    for edge in new_inputs:
+        if edge.next_stage not in result:
+            result[edge.next_stage] = []
+        result[edge.next_stage].append(edge)
     return result
 
 
@@ -67,21 +67,21 @@ class GraphSection(ABC):
         pass
 
     @abstractmethod
-    def get_inputs(self) -> list[GraphPointer]:
+    def get_inputs(self) -> list[GraphEdge]:
         """
         All external or "loop-back" inputs into a subgraph
         """
         pass
 
     @abstractmethod
-    def get_outputs(self) -> list[GraphPointer]:
+    def get_outputs(self) -> list[GraphEdge]:
         """
         All external or "loop-back" outputs from a subgraph
         """
         pass
 
     @abstractmethod
-    def ingest_inputs(self, stage_to_inputs: DestToGraphPointers) -> list[GraphPointer]:
+    def ingest_inputs(self, stage_to_inputs: DestToGraphEdges) -> list[GraphEdge]:
         """
         Adds inputs to the appropriate "ready_input_ids", and **mutates
         stage_to_inputs** to remove the inputs that were able to be added
@@ -102,12 +102,12 @@ class GraphSection(ABC):
 class GraphStage(GraphSection):
     name: str
     input_ids: set[str]
-    outputs: list[GraphPointer]
+    outputs: list[GraphEdge]
     consumes_stream: bool = field(default=False)
 
     # Populated as previous stages complete
     # This will also include, e.g., tensor UUIDs associated with these inputs
-    ready_inputs: dict[str, GraphPointer] = field(default_factory=dict) # name -> graph edge
+    ready_inputs: dict[str, GraphEdge] = field(default_factory=dict) # name -> graph edge
 
     def __post_init__(self):
         # if the user inputs, e.g., a list, turn it into a set
@@ -119,28 +119,28 @@ class GraphStage(GraphSection):
     def get_stage_names(self) -> list[str]:
         return [self.name]
 
-    def get_inputs(self) -> list[GraphPointer]:
+    def get_inputs(self) -> list[GraphEdge]:
         return [
-            GraphPointer(next_stage=self.name, name=id) for id in self.input_ids
+            GraphEdge(next_stage=self.name, name=id) for id in self.input_ids
         ]
 
-    def get_outputs(self) -> list[GraphPointer]:
+    def get_outputs(self) -> list[GraphEdge]:
         return self.outputs
 
-    def ingest_inputs(self, stage_to_inputs: DestToGraphPointers):
+    def ingest_inputs(self, stage_to_inputs: DestToGraphEdges):
         if self.name not in stage_to_inputs:
             return []
 
         ingested = {
-            ptr.name: ptr for ptr in stage_to_inputs[self.name] \
-                if ptr.name in self.input_ids and ptr.name not in self.ready_inputs
+            edge.name: edge for edge in stage_to_inputs[self.name] \
+                if edge.name in self.input_ids and edge.name not in self.ready_inputs
         } # ingest ids that this stage takes in, and are not already ready
         self.ready_inputs.update(ingested)
 
         # remove the ingested ids from the stage_to_inputs
         stage_to_inputs[self.name] = [
-            ptr for ptr in stage_to_inputs[self.name] \
-                if ptr.name not in ingested
+            edge for edge in stage_to_inputs[self.name] \
+                if edge.name not in ingested
         ]
         if len(stage_to_inputs[self.name]) == 0:
             del stage_to_inputs[self.name]
@@ -167,8 +167,8 @@ class Sequential(GraphSection):
     def _get_inputs_outputs(self):
         # In the case that this section is part of a loop, "loop-back"
         # variables are included in the list of inputs and outputs
-        inputs: list[GraphPointer] = []
-        outputs: list[GraphPointer] = []
+        inputs: list[GraphEdge] = []
+        outputs: list[GraphEdge] = []
         output_names = set()
         for s in self.sections:
             stage_names = s.get_stage_names()
@@ -177,23 +177,23 @@ class Sequential(GraphSection):
             # filter out internal signals from the new inputs
             inputs += ([inp for inp in inputs_of_s if inp.name not in output_names])
             # filter internal output signals from the output list
-            outputs = [ptr for ptr in outputs if not (
-                ptr.name not in inputs_of_s and ptr.next_stage in stage_names
+            outputs = [edge for edge in outputs if not (
+                edge.name not in inputs_of_s and edge.next_stage in stage_names
             )]
 
             # add new outputs to the output list
             outputs_of_s = s.get_outputs()
             outputs += outputs_of_s
-            output_names.update([ptr.name for ptr in outputs_of_s])
+            output_names.update([edge.name for edge in outputs_of_s])
         return inputs, outputs
 
-    def get_inputs(self) -> list[GraphPointer]:
+    def get_inputs(self) -> list[GraphEdge]:
         return self._get_inputs_outputs()[0]
 
-    def get_outputs(self) -> list[GraphPointer]:
+    def get_outputs(self) -> list[GraphEdge]:
         return self._get_inputs_outputs()[1]
 
-    def ingest_inputs(self, stage_to_inputs: DestToGraphPointers):
+    def ingest_inputs(self, stage_to_inputs: DestToGraphEdges):
         ingested = []
         for s in self.sections:
             ingested += s.ingest_inputs(stage_to_inputs)
@@ -231,7 +231,7 @@ class Parallel(GraphSection):
             [s.get_outputs() for s in self.sections], start=[]
         )
 
-    def ingest_inputs(self, stage_to_inputs: DestToGraphPointers):
+    def ingest_inputs(self, stage_to_inputs: DestToGraphEdges):
         ingested = []
         for s in self.sections:
             ingested += s.ingest_inputs(stage_to_inputs)
@@ -256,10 +256,10 @@ class Loop(GraphSection):
     section: GraphSection # this is used to populate next_section and
                           # in-progress section; it remains "clean"
     n_iters: int
-    outputs: list[GraphPointer]
+    outputs: list[GraphEdge]
     curr_iter: int = field(default=0)
-    external_inputs: list[GraphPointer] = field(default=None)
-    loop_back_signals: list[GraphPointer] = field(default=None)
+    external_inputs: list[GraphEdge] = field(default=None)
+    loop_back_signals: list[GraphEdge] = field(default=None)
     curr_iter_section: GraphSection = field(default=None)
     nxt_iter_section: GraphSection = field(default=None)
 
@@ -272,11 +272,11 @@ class Loop(GraphSection):
     def get_stage_names(self):
         return self.section.get_stage_names()
 
-    def ingest_inputs(self, stage_to_inputs: DestToGraphPointers):
+    def ingest_inputs(self, stage_to_inputs: DestToGraphEdges):
         # Populate the current iteration first, then populate the next iteration
         # if there are any leftover inputs (which would signal either inputs that
         # are not for this section, or loop-back inputs)
-        ingested: list[GraphPointer] = []
+        ingested: list[GraphEdge] = []
         if self.curr_iter_section is not None:
             ingested += self.curr_iter_section.ingest_inputs(stage_to_inputs)
 
@@ -284,11 +284,11 @@ class Loop(GraphSection):
         # so exclude external inputs from populating nxt_iter_section. This logic
         # is required to make nested loops work.
         my_external_inputs = {
-            (ptr.name, ptr.next_stage): ptr for ptr in self.external_inputs
+            (edge.name, edge.next_stage): edge for edge in self.external_inputs
         }
         external_inputs = {
             dest: [
-                ptr for ptr in inputs if (ptr.name, dest) in my_external_inputs
+                edge for edge in inputs if (edge.name, dest) in my_external_inputs
             ] for dest, inputs in stage_to_inputs.items()
         }
         for dest in stage_to_inputs:
@@ -301,18 +301,18 @@ class Loop(GraphSection):
         update_list_dicts(stage_to_inputs, external_inputs)
 
         if self.curr_iter != self.n_iters - 1:
-            for input in ingested:
-                if (input.name, input.next_stage) in my_external_inputs:
+            for graph_edge in ingested:
+                if (graph_edge.name, graph_edge.next_stage) in my_external_inputs:
                     my_external_inputs[(
-                        input.name, input.next_stage
-                    )].tensor_info = input.tensor_info
-                    input._persist_for_loop = True
+                        graph_edge.name, graph_edge.next_stage
+                    )].tensor_info = graph_edge.tensor_info
+                    graph_edge._persist_for_loop = True
         return ingested
 
     def _get_external_inputs(self):
         inputs = self.section.get_inputs()
         internal_outputs = self.section.get_outputs()
-        output_names_dests = set([(ptr.name, ptr.next_stage) for ptr in internal_outputs])
+        output_names_dests = set([(edge.name, edge.next_stage) for edge in internal_outputs])
 
         # compute "external inputs", i.e., ones that don't come from looping
         # back, and make sure those are populated for the next loop iter
@@ -320,17 +320,17 @@ class Loop(GraphSection):
             inp for inp in inputs if (inp.name, inp.next_stage) not in output_names_dests
         ]
 
-    def _get_loop_back_signals(self) -> list[GraphPointer]:
+    def _get_loop_back_signals(self) -> list[GraphEdge]:
         # these inputs and outputs only include external and loop-back signals;
         # they do not include signals that are purely internal to the section
         inputs = self.section.get_inputs()
         input_names_dests = [
-            (ptr.name, ptr.next_stage) for ptr in inputs
+            (edge.name, edge.next_stage) for edge in inputs
         ]
         outputs = self.section.get_outputs()
 
         return [
-            ptr for ptr in outputs if (ptr.name, ptr.next_stage) in input_names_dests
+            edge for edge in outputs if (edge.name, edge.next_stage) in input_names_dests
         ]
 
     def _replace_outputs_for_final_iter(
@@ -342,21 +342,21 @@ class Loop(GraphSection):
         """
         loop_back_signals = self.loop_back_signals
         loop_back_name_dests = set([
-            (ptr.name, ptr.next_stage) for ptr in loop_back_signals
+            (edge.name, edge.next_stage) for edge in loop_back_signals
         ])
         full_outputs = self.outputs
 
-        def replace_outputs(stage_outputs: list[GraphPointer]):
+        def replace_outputs(stage_outputs: list[GraphEdge]):
             stage_output_names = set([
-                ptr.name for ptr in stage_outputs
+                edge.name for edge in stage_outputs
             ])
             outputs_to_add = [
-                ptr for ptr in full_outputs if ptr.name in stage_output_names
+                edge for edge in full_outputs if edge.name in stage_output_names
             ]
 
             return outputs_to_add + [
-                ptr for ptr in stage_outputs \
-                    if (ptr.name, ptr.next_stage) not in loop_back_name_dests
+                edge for edge in stage_outputs \
+                    if (edge.name, edge.next_stage) not in loop_back_name_dests
             ]
         if isinstance(section, GraphStage) or isinstance(section, Loop):
             section.outputs = replace_outputs(section.outputs)

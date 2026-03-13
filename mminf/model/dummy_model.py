@@ -6,7 +6,7 @@ import torch
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
-from mminf.graph.base import GraphPointer, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
+from mminf.graph.base import GraphEdge, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import STREAM_OUT
 from mminf.model.base import CurrentForwardMetadata, Model
 
@@ -21,14 +21,14 @@ class DummyModel(Model):
                 name="text_emb",
                 input_ids=["text_inputs"],
                 outputs=[
-                    GraphPointer(next_stage="concat_text", name="new_text_emb")
+                    GraphEdge(next_stage="concat_text", name="new_text_emb")
                 ]
             ),
             GraphStage(
                 name="concat_text",
                 input_ids=["new_text_emb", "existing_text_emb"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="text_emb", persist=True)
+                    GraphEdge(next_stage="LLM", name="text_emb", persist=True)
                 ]
             )
         ])
@@ -39,14 +39,14 @@ class DummyModel(Model):
                 name="image_emb",
                 input_ids=["image_inputs"],
                 outputs=[
-                    GraphPointer(next_stage="concat_img", name="new_image_emb")
+                    GraphEdge(next_stage="concat_img", name="new_image_emb")
                 ]
             ),
             GraphStage(
                 name="concat_img",
                 input_ids=["new_image_emb", "existing_image_emb"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="img_emb", persist=True)
+                    GraphEdge(next_stage="LLM", name="img_emb", persist=True)
                 ]
              )
         ])
@@ -69,7 +69,7 @@ class DummyModel(Model):
                 name="LLM",
                 input_ids=["text_emb", "img_emb"],
                 outputs=[
-                    GraphPointer(
+                    GraphEdge(
                         next_stage=STREAM_OUT,
                         output_modality="text",
                         name="new_token",
@@ -87,27 +87,27 @@ class DummyModel(Model):
                         name="LLM",
                         input_ids=["text_emb", "img_emb", "latents"],
                         outputs=[
-                            GraphPointer(next_stage="flow", name="hidden_states")
+                            GraphEdge(next_stage="flow", name="hidden_states")
                         ]
                     ),
                     GraphStage(
                         "flow",
                         input_ids=["hidden_states"],
                         outputs=[
-                            GraphPointer(next_stage="LLM", name="latents")
+                            GraphEdge(next_stage="LLM", name="latents")
                         ]
                     )
                 ]),
                 n_iters=10,
                 outputs=[
-                    GraphPointer(next_stage="VAE_dec", name="latents")
+                    GraphEdge(next_stage="VAE_dec", name="latents")
                 ]
             ),
             GraphStage(
                 name="VAE_dec",
                 input_ids=["latents"],
                 outputs=[
-                    GraphPointer(
+                    GraphEdge(
                         next_stage=STREAM_OUT,
                         output_modality="image",
                         name="image_output",
@@ -145,25 +145,25 @@ class DummyModel(Model):
         self, metadata: CurrentForwardMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         prev_forward_metadata: CurrentForwardMetadata=None,
-    ) -> list[GraphPointer]:
-        text_inp = GraphPointer(
+    ) -> list[GraphEdge]:
+        text_inp = GraphEdge(
             next_stage="text_emb",
             name="text_inputs",
         )
-        img_inp = GraphPointer(
+        img_inp = GraphEdge(
             next_stage="image_emb",
             name="image_inputs",
         )
-        existing_text = GraphPointer(
+        existing_text = GraphEdge(
             next_stage="concat_text",
             name="existing_text_emb",
         )
-        existing_img = GraphPointer(
+        existing_img = GraphEdge(
             next_stage="concat_img",
             name="existing_image_emb",
         )
 
-        pointers = [
+        graph_edges = [
             text_inp, img_inp, existing_text, existing_img
         ]
 
@@ -178,14 +178,14 @@ class DummyModel(Model):
                 text_inp.tensor_info = persist_signals.get("new_token", [])
 
             if metadata.phase == "image_gen":
-                pointers.append(
-                    GraphPointer(
+                graph_edges.append(
+                    GraphEdge(
                         next_stage="LLM",
                         name="latents",
                         tensor_info=persist_signals.get("latents", [])
                     )
                 )
-        return pointers
+        return graph_edges
 
     def update_for_next_forward(
         self, metadata: CurrentForwardMetadata,

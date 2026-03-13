@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 
-from mminf.graph.base import GraphPointer
+from mminf.graph.base import GraphEdge
 
 
 @dataclass
@@ -16,7 +16,7 @@ class ResultChunk:
 class ResultTensors:
     request_id: str
     modality: str
-    graph_edge: GraphPointer
+    graph_edge: GraphEdge
     metadata: dict = field(default_factory=dict)
 
 

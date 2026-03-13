@@ -3,21 +3,21 @@
 import logging
 from dataclasses import dataclass, field
 
-from mminf.graph.base import DestToGraphPointers, GraphPointer, GraphSection, GraphStage, get_stage_to_inputs_mapping
+from mminf.graph.base import DestToGraphEdges, GraphEdge, GraphSection, GraphStage, get_stage_to_inputs_mapping
 
 logger = logging.getLogger(__name__)
 
 
 def format_graph_edge_list(
-    lst: list[GraphPointer]
+    lst: list[GraphEdge]
 ):
     return ", ".join([f"{edge.name} -> {edge.next_stage}" for edge in lst])
 
 
 @dataclass
 class ProcessedInputs:
-    routed_to_this_subgraph: list[GraphPointer]
-    for_other_subgraphs: list[GraphPointer]
+    routed_to_this_subgraph: list[GraphEdge]
+    for_other_subgraphs: list[GraphEdge]
 
 
 @dataclass
@@ -44,11 +44,11 @@ class PerRequestStageQueues:
 
     def process_new_inputs(
         self,
-        new_inputs: list[GraphPointer]
+        new_inputs: list[GraphEdge]
     ) -> ProcessedInputs:
         """
         Processes all outputs that feed into the waiting graph section, and
-        return a dictionary of external output pointers (ones that are feeding
+        return a dictionary of external output graph edges (ones that are feeding
         to different subgraphs)
         """
         # for input in new_inputs:
@@ -65,7 +65,7 @@ class PerRequestStageQueues:
             format_graph_edge_list(new_inputs)
         )
 
-        new_inputs: DestToGraphPointers = get_stage_to_inputs_mapping(new_inputs)
+        new_inputs: DestToGraphEdges = get_stage_to_inputs_mapping(new_inputs)
         ingested = self.waiting.ingest_inputs(new_inputs)
         external_outputs = sum(
             new_inputs.values(), start=[]
@@ -84,4 +84,3 @@ class PerRequestStageQueues:
             for_other_subgraphs=external_outputs, # inputs **not** utilized for self.waiting
             routed_to_this_subgraph=ingested, # inputs utilized for self.waiting
         )
-

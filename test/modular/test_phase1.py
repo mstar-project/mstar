@@ -14,7 +14,7 @@ from mminf.engine.ar_engine import AREngine, PageAllocator
 from mminf.engine.base import EngineType, StageBatch, StageOutput
 from mminf.engine.enc_dec_engine import EncoderDecoderEngine
 from mminf.engine.flow_engine import FlowEngine
-from mminf.graph.base import GraphPointer
+from mminf.graph.base import GraphEdge
 from mminf.graph.request_queues import PerRequestStageQueues
 from mminf.model.base import Subgraph
 from mminf.model.dummy_model import DummyModel
@@ -220,11 +220,11 @@ class TestImageGenLoop:
 
         # Provide all initial external inputs
         initial_inputs = [
-            GraphPointer(name="text", next_stage="text_emb"),
-            GraphPointer(name="images", next_stage="image_emb"),
-            GraphPointer(name="existing_text_emb", next_stage="concat_text"),
-            GraphPointer(name="existing_image_emb", next_stage="concat_img"),
-            GraphPointer(name="latents", next_stage="LLM"),
+            GraphEdge(name="text", next_stage="text_emb"),
+            GraphEdge(name="images", next_stage="image_emb"),
+            GraphEdge(name="existing_text_emb", next_stage="concat_text"),
+            GraphEdge(name="existing_image_emb", next_stage="concat_img"),
+            GraphEdge(name="latents", next_stage="LLM"),
         ]
         queues.process_new_inputs(initial_inputs)
 
@@ -306,11 +306,11 @@ class TestImageGenLoop:
 
         # Provide initial inputs
         initial_inputs = [
-            GraphPointer(name="text", next_stage="text_emb"),
-            GraphPointer(name="images", next_stage="image_emb"),
-            GraphPointer(name="existing_text_emb", next_stage="concat_text"),
-            GraphPointer(name="existing_image_emb", next_stage="concat_img"),
-            GraphPointer(name="latents", next_stage="LLM"),
+            GraphEdge(name="text", next_stage="text_emb"),
+            GraphEdge(name="images", next_stage="image_emb"),
+            GraphEdge(name="existing_text_emb", next_stage="concat_text"),
+            GraphEdge(name="existing_image_emb", next_stage="concat_img"),
+            GraphEdge(name="latents", next_stage="LLM"),
         ]
         manager.process_new_inputs(request_id, initial_inputs)
 
@@ -399,11 +399,11 @@ class TestImageGenLoop:
 
         # Feed inputs
         initial_inputs = [
-            GraphPointer(name="text", next_stage="text_emb"),
-            GraphPointer(name="images", next_stage="image_emb"),
-            GraphPointer(name="existing_text_emb", next_stage="concat_text"),
-            GraphPointer(name="existing_image_emb", next_stage="concat_img"),
-            GraphPointer(name="latents", next_stage="LLM"),
+            GraphEdge(name="text", next_stage="text_emb"),
+            GraphEdge(name="images", next_stage="image_emb"),
+            GraphEdge(name="existing_text_emb", next_stage="concat_text"),
+            GraphEdge(name="existing_image_emb", next_stage="concat_img"),
+            GraphEdge(name="latents", next_stage="LLM"),
         ]
         manager.process_new_inputs(request_id, initial_inputs)
 
@@ -428,10 +428,10 @@ class TestPrefillDecodeGraph:
 
         queues = PerRequestStageQueues(waiting=prefill)
         inputs = [
-            GraphPointer(name="text", next_stage="text_emb"),
-            GraphPointer(name="images", next_stage="image_emb"),
-            GraphPointer(name="existing_text_emb", next_stage="concat_text"),
-            GraphPointer(name="existing_image_emb", next_stage="concat_img"),
+            GraphEdge(name="text", next_stage="text_emb"),
+            GraphEdge(name="images", next_stage="image_emb"),
+            GraphEdge(name="existing_text_emb", next_stage="concat_text"),
+            GraphEdge(name="existing_image_emb", next_stage="concat_img"),
         ]
         queues.process_new_inputs(inputs)
 

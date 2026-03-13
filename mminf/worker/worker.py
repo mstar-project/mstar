@@ -6,7 +6,7 @@ from mminf.api_server.types import APIServerMessage, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.engine.base import StageBatch, StageOutput
-from mminf.graph.base import GraphPointer
+from mminf.graph.base import GraphEdge
 from mminf.graph.request_queues import format_graph_edge_list
 from mminf.ipc_formats import (
     ConductorMessage,
@@ -123,9 +123,9 @@ class Worker:
             device=self.device
         )
 
-        # Signal-only pointers (tensor_info is None) can be processed immediately
+        # Signal-only edges (tensor_info is None) can be processed immediately
         signal_only = [
-            ptr for ptr in body.initial_inputs if len(ptr.tensor_info) == 0
+            edge for edge in body.initial_inputs if len(edge.tensor_info) == 0
         ]
         if signal_only:
             self.subgraphs_manager.process_new_inputs(
@@ -172,8 +172,8 @@ class Worker:
             device=self.device
         )
 
-        # Signal-only pointers can be processed immediately
-        signal_only = [ptr for ptr in body.inputs if len(ptr.tensor_info) == 0]
+        # Signal-only edges can be processed immediately
+        signal_only = [edge for edge in body.inputs if len(edge.tensor_info) == 0]
         if signal_only:
             self.subgraphs_manager.process_new_inputs(
                 request_id=body.request_id, inputs=signal_only
@@ -222,11 +222,11 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _check_ready_tensors(self) -> None:
-        """Poll for completed RDMA transfers, feed ready pointers to subgraph queues."""
+        """Poll for completed RDMA transfers, feed ready graph edges to subgraph queues."""
         ready = self.tensor_manager.get_ready_tensors()
-        for request_id, pointers in ready.items():
+        for request_id, edges in ready.items():
             self.subgraphs_manager.process_new_inputs(
-                request_id=request_id, inputs=pointers
+                request_id=request_id, inputs=edges
             )
 
     # ------------------------------------------------------------------
@@ -284,21 +284,21 @@ class Worker:
         batch: ScheduledBatch,
         output: "StageOutput",
         routing_per_request: dict[str, StageOutputRouting],
-    ) -> dict[str, list[GraphPointer]]:
+    ) -> dict[str, list[GraphEdge]]:
         """
         For outputs going to other workers: register tensors for RDMA send
-        and populate tensor_info on the GraphPointers.
+        and populate tensor_info on the GraphEdges.
         For outputs staying local: store tensors in tensor_manager.
-        Returns the output pointers per request (with tensor_info filled in).
+        Returns the output edges per request (with tensor_info filled in).
         """
-        output_pointers: dict[str, list[GraphPointer]] = {}
+        output_edges: dict[str, list[GraphEdge]] = {}
 
         for request_id, stage in batch.stage_objects.items():
             # output name to list of tensors
             request_output_tensors = output.per_request_output_tensors.get(
                 request_id, {}
             ) # name -> list of tensors
-            output_pointers[request_id] = stage.outputs
+            output_edges[request_id] = stage.outputs
 
             if not request_output_tensors:
                 # TODO (error handling?): this should not happen
@@ -307,30 +307,30 @@ class Worker:
             self.tensor_manager.store_and_populate_graph_edges(
                 request_id=request_id,
                 tensors=request_output_tensors,
-                graph_pointers=stage.outputs
+                graph_edges=stage.outputs
             )
 
             routing = routing_per_request[request_id]
             uuids = set()
-            for ptr in (
+            for edge in (
                 routing.persist + \
                 sum(routing.to_workers.values(), start=[]) + \
                 routing.stream_out
             ):
                 uuids.update([
-                    info.uuid for info in ptr.tensor_info \
+                    info.uuid for info in edge.tensor_info \
                 ])
             self.tensor_manager.register_for_send(
                 request_id=request_id, uuids=uuids
             )
 
-            for ptr in routing.persist:
-                for info in ptr.tensor_info:
+            for edge in routing.persist:
+                for info in edge.tensor_info:
                     self.tensor_manager.set_persist(
                         request_id=request_id, uuid=info.uuid, persist=True
                     )
 
-        return output_pointers
+        return output_edges
 
     def _send_outputs(
         self, request_id: str, outputs: StageOutputRouting
@@ -340,13 +340,13 @@ class Worker:
         Persist signals are buffered and sent together with the
         SUBGRAPHS_DONE message to avoid race conditions.
         """
-        for worker_id, pointers in outputs.to_workers.items():
+        for worker_id, edges in outputs.to_workers.items():
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
                     request_id=request_id,
                     phase=self.subgraphs_manager.get_phase(request_id),
-                    inputs=pointers,
+                    inputs=edges,
                 ),
             )
             self.communicator.send(worker_id, message)

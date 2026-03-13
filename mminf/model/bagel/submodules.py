@@ -30,7 +30,7 @@ class ViTEncoderSubmodule(StageSubmodule):
     Receives preprocessed inputs containing packed pixel values, position IDs,
     cumulative sequence lengths, and max sequence length. Both vit_encoder and
     vae_encoder receive "image_inputs" as their graph input name; routing is
-    handled by the graph pointer's next_stage field.
+    handled by the graph edge's next_stage field.
     """
 
     def __init__(

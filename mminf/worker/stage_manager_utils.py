@@ -2,7 +2,7 @@ import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 
-from mminf.graph.base import GraphPointer, GraphStage, TensorPointerInfo
+from mminf.graph.base import GraphEdge, GraphStage, TensorPointerInfo
 from mminf.graph.request_queues import PerRequestStageQueues, ProcessedInputs, format_graph_edge_list
 from mminf.graph.special_destinations import SPECIAL_DESTINATIONS, STREAM_OUT
 from mminf.model.base import Subgraph
@@ -21,11 +21,11 @@ class StageAndPhase:
 
 @dataclass
 class StageOutputRouting:
-    routed_to_this_subgraph:list[GraphPointer]
-    persist: list[GraphPointer] # outputs that are going back to the conductor
-    to_workers: dict[str, list[GraphPointer]] # worker id to signals
-    stream_out: list[GraphPointer] = field(default_factory=list)
-    new_token_outputs: list[GraphPointer] = field(default_factory=list)
+    routed_to_this_subgraph:list[GraphEdge]
+    persist: list[GraphEdge] # outputs that are going back to the conductor
+    to_workers: dict[str, list[GraphEdge]] # worker id to signals
+    stream_out: list[GraphEdge] = field(default_factory=list)
+    new_token_outputs: list[GraphEdge] = field(default_factory=list)
     completed_subgraphs: list[str] = field(default_factory=list)
 
 
@@ -41,7 +41,7 @@ class SubgraphQueues:
     subgraph: Subgraph
     per_request_queues: dict[str, PerRequestStageQueues] # request_id -> queue
 
-    def process_new_inputs(self, request_id: str, inputs: list[GraphPointer]) -> ProcessedInputs:
+    def process_new_inputs(self, request_id: str, inputs: list[GraphEdge]) -> ProcessedInputs:
         """
         Add new inputs for a request, and update waiting/ready stages accordingly.
         Returns any signals that should be sent to other subgraphs.
@@ -128,7 +128,7 @@ class PerRequestInfo:
     # phase_subgraph_ids = subgraphs for the current phase
     phase_subgraph_ids: list[str] = field(default_factory=list) # for this worker
 
-    pending_persist_signals: list[GraphPointer] = field(default_factory=list)
+    pending_persist_signals: list[GraphEdge] = field(default_factory=list)
     pending_new_tokens: dict[str, list[int]] = field(default_factory=dict)
 
 
@@ -161,7 +161,7 @@ class SubgraphsManager:
     def process_new_inputs(
         self,
         request_id: str,
-        inputs: list[GraphPointer]
+        inputs: list[GraphEdge]
     ):
         """
         Updates queues with new inputs for a request
@@ -171,9 +171,9 @@ class SubgraphsManager:
             self.queues[subgraph_id].process_new_inputs(request_id, inputs)
 
 
-    def process_stage_outputs(
+def process_stage_outputs(
         self, request_id: str,
-        outputs: list[GraphPointer]
+        outputs: list[GraphEdge]
     ) -> StageOutputRouting:
         """
         After a stage has finished processing, use its outputs to update
@@ -185,15 +185,15 @@ class SubgraphsManager:
         (different) worker.
         """
         # (1) find back_to_conductor flags
-        to_conductor = [ptr for ptr in outputs if ptr.persist]
-        new_token_outputs = [ptr for ptr in outputs if ptr.is_new_token]
+        to_conductor = [edge for edge in outputs if edge.persist]
+        new_token_outputs = [edge for edge in outputs if edge.is_new_token]
 
         # (2) process all internal-facing outputs
         subgraph_ids = self.per_request_info[request_id].phase_subgraph_ids
 
         completed_subgraphs = []
-        routed_to_this_worker: list[GraphPointer] = [] # list of graph edges
-        external_outputs: list[GraphPointer] = outputs
+        routed_to_this_worker: list[GraphEdge] = [] # list of graph edges
+        external_outputs: list[GraphEdge] = outputs
         for subgraph_id in subgraph_ids:
             queue = self.queues[subgraph_id] # ready / waiting graph node queue
             # process_new_inputs consumes outputs that are used as
@@ -210,30 +210,30 @@ class SubgraphsManager:
         # in different workers)
 
         # (3) get mapping of worker to external outputs
-        # Skip pointers whose next_stage is a special destination (e.g.,
+        # Skip edges whose next_stage is a special destination (e.g.,
         # stream_out is a virtual destination, not a real stage on any worker).
-        # Note: back_to_conductor pointers may ALSO route to a worker
+        # Note: back_to_conductor edges may ALSO route to a worker
         # (e.g., concat_text outputs text_emb -> LLM with back_to_conductor=True),
         # so we do NOT filter on back_to_conductor here.
-        to_workers: dict[str, list[GraphPointer]] = {}
-        stream_out: list[GraphPointer] = []
-        for ptr in external_outputs:
+        to_workers: dict[str, list[GraphEdge]] = {}
+        stream_out: list[GraphEdge] = []
+        for edge in external_outputs:
             stage_phase = StageAndPhase(
-                stage=ptr.next_stage, phase=self.get_phase(request_id)
+                stage=edge.next_stage, phase=self.get_phase(request_id)
             )
             if stage_phase not in self.per_request_info[request_id].stage_to_worker:
-                if ptr.next_stage in SPECIAL_DESTINATIONS or ptr.persist:
-                    if ptr.next_stage == STREAM_OUT:
-                        stream_out.append(ptr)
+                if edge.next_stage in SPECIAL_DESTINATIONS or edge.persist:
+                    if edge.next_stage == STREAM_OUT:
+                        stream_out.append(edge)
                     continue  # e.g., stream_out — already captured in to_conductor
                 raise ValueError(
-                    f"Output pointer targets unknown stage/phase: {stage_phase}. "
+                    f"Output edge targets unknown stage/phase: {stage_phase}. "
                     f"Check graph construction."
                 )
             worker_id = self.per_request_info[request_id].stage_to_worker[stage_phase]
             if worker_id not in to_workers:
                 to_workers[worker_id] = []
-            to_workers[worker_id].append(ptr)
+            to_workers[worker_id].append(edge)
 
         logger.debug(
             ("Finished processing outputs from rid %s. \n"
@@ -288,7 +288,7 @@ class SubgraphsManager:
 
     def buffer_persist_signals(
             self, request_id: str,
-            signals: list[GraphPointer]
+            signals: list[GraphEdge]
         ):
         """Extend the pending persist signals for a request."""
         self.per_request_info[request_id].pending_persist_signals.extend(signals)
@@ -306,15 +306,15 @@ class SubgraphsManager:
     def flush_persist_signals(self, request_id: str) -> dict[str, list[TensorPointerInfo]]:
         """Pop and return all buffered persist signals for a request.
 
-        Converts from internal list[GraphPointer] to the dict format
+        Converts from internal list[GraphEdge] to the dict format
         expected by the conductor (name -> list[TensorPointerInfo]).
         """
         info = self.per_request_info[request_id]
         signals = info.pending_persist_signals
         info.pending_persist_signals = []
         result: dict[str, list[TensorPointerInfo]] = {}
-        for gp in signals:
-            result[gp.name] = gp.tensor_info
+        for edge in signals:
+            result[edge.name] = edge.tensor_info
         return result
 
     def flush_new_tokens(self, request_id: str) -> dict[str, list[int]]:

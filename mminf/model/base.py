@@ -11,7 +11,7 @@ import yaml
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
-from mminf.graph.base import GraphPointer, GraphSection, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
+from mminf.graph.base import GraphEdge, GraphSection, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
 
 
 class StageSubmodule(torch.nn.Module):
@@ -186,7 +186,7 @@ class CurrentForwardMetadata:
 class ForwardPassArgs:
     # full_metadata is at the conductor level
     full_metadata: CurrentForwardMetadata
-    inputs: list[GraphPointer]
+    inputs: list[GraphEdge]
 
     # de_persist_tensors are tensors that will be used for the final time and
     # not go into future graph stages

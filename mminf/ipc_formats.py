@@ -1,7 +1,7 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 
-from mminf.graph.base import GraphPointer, TensorPointerInfo
+from mminf.graph.base import GraphEdge, TensorPointerInfo
 
 
 class Status(Enum):
@@ -38,7 +38,7 @@ class NewRequest(MessageBody):
     subgraph_ids: list[str]
     subgraph_to_worker: dict[str, str]
     initial_phase: str
-    initial_inputs: list[GraphPointer]
+    initial_inputs: list[GraphEdge]
     per_request_metadata: dict = field(default_factory=dict)
 
 
@@ -51,14 +51,14 @@ class RemoveRequest(MessageBody):
 class InputSignals(MessageBody):
     request_id: str
     phase: str
-    inputs: list[GraphPointer]
+    inputs: list[GraphEdge]
     per_request_metadata: dict = field(default_factory=dict)
 
 
 @dataclass
 class TensorReceived(MessageBody):
     request_id: str
-    successful_tensors: dict[str, int] # uuid -> graph pointer count
+    successful_tensors: dict[str, int] # uuid -> graph edge count
     failed_tensor_ids: list[str] # uuids
 
 
