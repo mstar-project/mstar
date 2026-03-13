@@ -228,9 +228,10 @@ class APIServer:
                         result_chunk.modality, result_chunk.request_id
                     )
                     rid = result_chunk.request_id
-                    self.pending_requests[rid]["chunks"].append(
-                        result_chunk
-                    )
+                    with self.request_lock:
+                        self.pending_requests[rid]["chunks"].append(
+                            result_chunk
+                        )
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")

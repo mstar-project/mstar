@@ -239,7 +239,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     dims=tensor.shape,
                     dtype=tensor.dtype,
                     stride=tensor.stride(),
-                    nbytes=tensor.element_size() * tensor.nelement(),
+                    nbytes=tensor.nbytes,
                     address=tensor.data_ptr(),
                     uuid=tensor_uuid,
                     source_session_id=self.my_session_id,
@@ -256,12 +256,15 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         "Cannot register tensors for RDMA send: TransferEngine is not available."
                     )
                 if self.tensor_store.is_registered(request_id, uuid):
-                    continue # don't double-register
+                    continue
+                logger.debug("Registering %s for send", uuid)
                 tensor = self.tensor_store.get_tensor(
                     request_id=request_id, uuid=uuid
                 )
+
+                torch.cuda.default_stream().synchronize()
                 ret_value = self.engine.register_memory(
-                    tensor.data_ptr(), tensor.element_size() * tensor.nelement()
+                    tensor.data_ptr(), tensor.nbytes
                 )
                 if ret_value != 0:
                     # TODO: error handling
@@ -483,7 +486,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 logger.debug("Started transfer read for uuid %s", info.uuid)
             # For now, have one cuda event for all tensors in this graph edge
             event = torch.cuda.Event()
-            event.record(stream) ##TODO @Atindra : should this be placed here or up? ##
+            event.record(stream)
             self.pending.append(
                 EventAndPointers(
                     event=event, pointers=[graph_ptr], request_id=request_id
