@@ -21,9 +21,8 @@ class TensorPointerInfo:
     nbytes: int
     address: int
     stride: list[int]
-    uuid: str # for all the cleanups, list[tensor] indexing
-    source_session_id: str # e.g., f"{HOSTNAME}:{client_engine.get_rpc_port()}"
-    source_tensor_name: str # for streaming outputs, the names of tensors are changed
+    uuid: str # for indexing storage
+    source_session_id: str # "{HOSTNAME}:{client_engine.get_rpc_port()}"
     source_entity: str # which {worker, api_server} the tensor is on
 
 # class ConnectionType(Enum):
@@ -41,7 +40,7 @@ class GraphPointer:
     tensor_info: list[TensorPointerInfo] = field(default_factory=list)
 
     # Flags
-    back_to_conductor: bool = field(default=False)
+    persist: bool = field(default=False) # previously back_to_conductor
     is_new_token: bool = field(default=False)
     # only for STREAM_OUT
     output_modality: str = field(default="") # text | image | video | audio

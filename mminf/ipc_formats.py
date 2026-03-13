@@ -28,6 +28,7 @@ class WorkerMessageType(Enum):
     NEW_REQUEST = "new_request"
     REMOVE_REQUEST = "remove_request"
     INPUT_SIGNALS = "input_signals"
+    UNPERSIST_TENSORS = "unpersist"
     TENSOR_RECEIVED = "tensor_received"
 
 
@@ -55,17 +56,16 @@ class InputSignals(MessageBody):
 
 
 @dataclass
-class NameAndUuid:
-    tensor_id: str
-    uuid: str
+class TensorReceived(MessageBody):
+    request_id: str
+    successful_tensors: dict[str, int] # uuid -> graph pointer count
+    failed_tensor_ids: list[str] # uuids
 
 
 @dataclass
-class TensorReceived(MessageBody):
+class UnpersistTensors(MessageBody):
     request_id: str
-    successful_tensors: list[NameAndUuid]
-    failed_tensor_ids: list[NameAndUuid]
-
+    uuid_to_ref_count: dict[str, int]
 
 @dataclass
 class WorkerMessage:

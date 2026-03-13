@@ -13,9 +13,6 @@ from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphPointer, GraphSection, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
 
-STREAM_OUT = "stream_out"
-SPECIAL_DESTINATIONS = {STREAM_OUT}  # add RELAY etc. later
-
 
 class StageSubmodule(torch.nn.Module):
     """
@@ -182,8 +179,25 @@ class CurrentForwardMetadata:
     output_modalities: list[str]
     phase: str
     is_prefill: bool
-    request_done: bool = field(default=False)
     kwargs: dict = field(default_factory=dict)
+
+
+@dataclass
+class ForwardPassArgs:
+    # full_metadata is at the conductor level
+    full_metadata: CurrentForwardMetadata
+    inputs: list[GraphPointer]
+
+    # de_persist_tensors are tensors that will be used for the final time and
+    # not go into future graph stages
+    unpersist_tensors: list[TensorPointerInfo]
+
+    # e.g., saw EOS or max tokens. Is used to end the request
+    request_done: bool =  False
+
+    # step_metadata is at the engine / worker level; and
+    # is passed into the fwd pass
+    step_metadata: dict = field(default_factory=dict)
 
 
 class Model(ABC):
@@ -233,46 +247,31 @@ class Model(ABC):
         pass
 
     @abstractmethod
-    def get_initial_forward_metadata(
+    def get_initial_forward_pass_args(
         self, input_modalities: list[str],
         output_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
-    ) -> CurrentForwardMetadata:
+    ) -> ForwardPassArgs:
         pass
 
     @abstractmethod
-    def get_forward_pass_inputs(
+    def get_forward_pass_args(
         self, metadata: CurrentForwardMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        prev_forward_metadata: CurrentForwardMetadata=None,
-    ) -> list[GraphPointer]:
+        new_tokens: dict[str, list[int]],
+    ) -> ForwardPassArgs:
         """
         Called by the conductor.
 
-        These are the external inputs that go from the conductor to the
-        workers at the beginning of the current forward pass; all other signals
-        are handled internally via IPC.
-        """
-        pass
+        **Important**: this sets ForwardPassArgs.request_done, which is used to
+        end the request.
 
-    @abstractmethod
-    def update_for_next_forward(
-        self, metadata: CurrentForwardMetadata,
-        new_tokens: dict[str, list[int]],
-    ) -> CurrentForwardMetadata:
-        """
-        Called by the conductor at the end of a full model fwd pass.
+        Also extracts per-request metadata that will get passed into the model
+        forward pass at the engine level.
 
-        **Important**: this sets metadata.request_done, which is used to end
-        the request.
-
-        TODO: include default logic for setting request_done, and let models
-        override it
+        TODO: description
         """
-        # e.g., check for BOI token, check if image was generated and should
-        # be added to the input modalities and input tensors, adds new token
-        # to the input text, etc...
-        # Returns the metadata for the new forward pass
         pass
 
     @abstractmethod
@@ -326,17 +325,3 @@ class Model(ABC):
         FlashInfer, etc.).
         """
         pass
-
-
-    def get_step_metadata(
-        self, metadata: CurrentForwardMetadata,
-    ) -> dict:
-        """
-        Extract per-request metadata that will get passed into the model
-        forward pass at the engine level.
-
-        Can override for model-specific behavior.
-        """
-        return {
-            "is_prefill": metadata.is_prefill,
-        }

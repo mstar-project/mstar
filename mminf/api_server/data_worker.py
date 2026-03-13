@@ -17,7 +17,7 @@ except (ImportError, RuntimeError):
 from mminf.api_server.types import PreprocessInput, ResultChunk, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
-from mminf.ipc_formats import ConductorMessage, ConductorMessageType, NewRequestConductor
+from mminf.ipc_formats import ConductorMessage, ConductorMessageType, NewRequestConductor, TensorReceived, UnpersistTensors, WorkerMessageType
 from mminf.model.base import Model
 
 
@@ -196,10 +196,17 @@ class PreprocessWorkerThread:
             request_id=input.request_id,
             tensors=tensors # dict(modality_input: list[tensors])
         )
-        for name, tensor_infos in initial_signals.items():
-            self.tensor_manager.register_for_send(
-                request_id=input.request_id, name=name,
-                uuids=[info.uuid for info in tensor_infos]
+        all_uuids = sum([
+            [info.uuid for info in infos] for infos in initial_signals.values()
+        ], start=[])
+        self.tensor_manager.register_for_send(
+            request_id=input.request_id,
+            uuids=all_uuids
+        )
+        # also persist all of the input signals
+        for uuid in all_uuids:
+            self.tensor_manager.set_persist(
+                input.request_id, uuid, persist=True
             )
 
         msg = ConductorMessage(
@@ -256,15 +263,33 @@ class PreprocessWorkerThread:
                     ))
                     del self.tensor_uuid_to_metadata_per_request[request_id][
                         tensor_info.uuid]
-                self.tensor_manager.cleanup(
+                self.tensor_manager.dereference(
                     request_id=request_id,
-                    tensor_name=graph_edge.name,
                     uuids=uuids
                 )
+
+    def _process_messages(self):
+        for message in self.communicator.get_all_new_messages():
+            if message.message_type == WorkerMessageType.TENSOR_RECEIVED:
+                body: TensorReceived = message.body
+                for (uuid, ref_cnt) in body.successful_tensors.items():
+                    self.tensor_manager.dereference(
+                        body.request_id, uuid, n=ref_cnt
+                    )
+            elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
+                body: UnpersistTensors = message.body
+                for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
+                    self.tensor_manager.increment_ref(
+                        body.request_id, uuid, n=ref_cnt
+                    )
+                    self.tensor_manager.set_persist(
+                        body.request_id, uuid, persist=False
+                    )
 
     def run(self):
         while not self.stop_event.is_set():
             try:
+                self._process_messages()
                 if not self.in_queue.empty():
                     self._process_input(self.in_queue.get())
                 if not self.result_tensor_queue.empty():

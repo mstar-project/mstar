@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 
 from mminf.graph.base import GraphPointer, GraphStage, TensorPointerInfo
 from mminf.graph.request_queues import PerRequestStageQueues, ProcessedInputs, format_graph_edge_list
-from mminf.model.base import SPECIAL_DESTINATIONS, STREAM_OUT, Subgraph
+from mminf.graph.special_destinations import SPECIAL_DESTINATIONS, STREAM_OUT
+from mminf.model.base import Subgraph
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,7 @@ class StageAndPhase:
 @dataclass
 class StageOutputRouting:
     routed_to_this_subgraph:list[GraphPointer]
-    to_conductor: list[GraphPointer] # outputs that are going back to the conductor
+    persist: list[GraphPointer] # outputs that are going back to the conductor
     to_workers: dict[str, list[GraphPointer]] # worker id to signals
     stream_out: list[GraphPointer] = field(default_factory=list)
     new_token_outputs: list[GraphPointer] = field(default_factory=list)
@@ -184,7 +185,7 @@ class SubgraphsManager:
         (different) worker.
         """
         # (1) find back_to_conductor flags
-        to_conductor = [ptr for ptr in outputs if ptr.back_to_conductor]
+        to_conductor = [ptr for ptr in outputs if ptr.persist]
         new_token_outputs = [ptr for ptr in outputs if ptr.is_new_token]
 
         # (2) process all internal-facing outputs
@@ -221,7 +222,7 @@ class SubgraphsManager:
                 stage=ptr.next_stage, phase=self.get_phase(request_id)
             )
             if stage_phase not in self.per_request_info[request_id].stage_to_worker:
-                if ptr.next_stage in SPECIAL_DESTINATIONS or ptr.back_to_conductor:
+                if ptr.next_stage in SPECIAL_DESTINATIONS or ptr.persist:
                     if ptr.next_stage == STREAM_OUT:
                         stream_out.append(ptr)
                     continue  # e.g., stream_out — already captured in to_conductor
@@ -245,7 +246,7 @@ class SubgraphsManager:
 
         return StageOutputRouting(
             routed_to_this_subgraph=routed_to_this_worker,
-            to_conductor=to_conductor,
+            persist=to_conductor,
             to_workers=to_workers,
             stream_out=stream_out,
             new_token_outputs=new_token_outputs,
