@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
-import requests
 import base64
 import json
 import sys
 from pathlib import Path
+
+import requests
 
 URL = "http://0.0.0.0:8000/generate"
 IMAGE_PATH = "test/bagel/bagel.png"
@@ -19,12 +20,13 @@ def main():
         ]
 
         data = {
-            "text": "Generate a cat eating the item in this image.",
+            "text": "Make a cat eating this item",
             "output_modalities": "image",
             "model_kwargs": json.dumps({
                 "cfg_img_scale": 2.0,
                 "cfg_interval": [0.0, 1.0],
                 "cfg_renorm_type": "text_channel",
+                "think_mode": True
             }),
         }
 
@@ -44,7 +46,7 @@ def main():
                 if msg.get("modality") == "text":
                     sys.stdout.write(decoded.decode("utf-8", errors="replace"))
                     sys.stdout.flush()
-                
+
 
                 elif msg.get("modality") == "image":
                     with open("output_edit.png", "wb") as f:

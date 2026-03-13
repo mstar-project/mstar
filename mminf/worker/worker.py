@@ -16,6 +16,7 @@ from mminf.ipc_formats import (
     RemoveRequest,
     SubgraphsDone,
     TensorReceived,
+    UnpersistTensors,
     WorkerMessage,
     WorkerMessageType,
 )
@@ -89,6 +90,7 @@ class Worker:
 
         # Per-request metadata from conductor (e.g., cache_labels, snapshot_after)
         self._per_request_metadata: dict[str, dict] = {}
+        self._unprocessed_messages = {} # req_id -> messages for requests that are not in the queue
 
     # ------------------------------------------------------------------
     # Message handling
@@ -129,6 +131,11 @@ class Worker:
             self.subgraphs_manager.process_new_inputs(
                 request_id=body.request_id, inputs=signal_only
             )
+        # process messages that may have came in out-of-order
+        if body.request_id in self._unprocessed_messages:
+            self._process_message_list(self._unprocessed_messages[body.request_id])
+            del self._unprocessed_messages[body.request_id]
+
 
     def _remove_request(self, body: RemoveRequest) -> None:
         self.engine_manager.remove_request(body.request_id)
@@ -138,10 +145,9 @@ class Worker:
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
-        for name_uuid in body.successful_tensors:
-            self.tensor_manager.cleanup(
-                body.request_id, name_uuid.tensor_id,
-                [name_uuid.uuid]
+        for (uuid, ref_cnt) in body.successful_tensors.items():
+            self.tensor_manager.dereference(
+                body.request_id, uuid, n=ref_cnt
             )
 
     def _process_new_inputs(self, body: InputSignals) -> None:
@@ -173,8 +179,30 @@ class Worker:
                 request_id=body.request_id, inputs=signal_only
             )
 
-    def _process_messages(self) -> None:
-        for message in self.communicator.get_all_new_messages():
+    def _unpersist_tensors(self, body: UnpersistTensors):
+        for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
+            self.tensor_manager.increment_ref(
+                body.request_id, uuid, n=ref_cnt
+            )
+            self.tensor_manager.set_persist(
+                body.request_id, uuid, persist=False
+            )
+
+    def _process_message_list(self, messages: list[WorkerMessage]):
+        msg_types_needing_active_request = [
+            WorkerMessageType.REMOVE_REQUEST,
+            WorkerMessageType.INPUT_SIGNALS,
+        ]
+        for message in messages:
+            if (
+                message.message_type in msg_types_needing_active_request and \
+                message.body.request_id not in self._per_request_metadata
+            ):
+                # got an out-of-order request
+                self._unprocessed_messages.setdefault(
+                    message.body.request_id, []
+                ).append(message)
+                continue
             if message.message_type == WorkerMessageType.NEW_REQUEST:
                 self._add_new_request(message.body)
             elif message.message_type == WorkerMessageType.REMOVE_REQUEST:
@@ -183,6 +211,11 @@ class Worker:
                 self._process_new_inputs(message.body)
             elif message.message_type == WorkerMessageType.TENSOR_RECEIVED:
                 self._handle_tensor_received(message.body)
+            elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
+                self._unpersist_tensors(message.body)
+
+    def _process_messages(self) -> None:
+        self._process_message_list(self.communicator.get_all_new_messages())
 
     # ------------------------------------------------------------------
     # Tensor readiness
@@ -210,8 +243,7 @@ class Worker:
             for input_name in stage.ready_inputs:
                 tensors[input_name] = [
                     self.tensor_manager.get_tensor(
-                        request_id=request_id, tensor_name=input_name,
-                        uuid=info.uuid
+                        request_id=request_id, uuid=info.uuid
                     ) for info in stage.ready_inputs[input_name].tensor_info
                 ]
             per_request_inputs[request_id] = tensors
@@ -236,10 +268,11 @@ class Worker:
         """Free input tensors that were consumed by the just-executed stage."""
         for request_id, stage in batch.stage_objects.items():
             for input in stage.ready_inputs.values():
-                if not (input._persist_for_loop or input.back_to_conductor):
-                    self.tensor_manager.cleanup(
-                        request_id, input.name,
-                        [info.uuid for info in input.tensor_info]
+                if input._persist_for_loop:
+                    continue
+                for info in input.tensor_info:
+                    self.tensor_manager.dereference(
+                        request_id, info.uuid
                     )
 
     # ------------------------------------------------------------------
@@ -278,22 +311,24 @@ class Worker:
             )
 
             routing = routing_per_request[request_id]
-            seen_uuids = set()
+            uuids = set()
             for ptr in (
-                routing.to_conductor + \
+                routing.persist + \
                 sum(routing.to_workers.values(), start=[]) + \
                 routing.stream_out
             ):
-                uuids = [
+                uuids.update([
                     info.uuid for info in ptr.tensor_info \
-                        if info.uuid not in seen_uuids
-                ] # all uuids that have not been seen yet
-                if not uuids:
-                    continue
-                seen_uuids.update(uuids)
-                self.tensor_manager.register_for_send(
-                    request_id=request_id, name=ptr.name, uuids=uuids
-                )
+                ])
+            self.tensor_manager.register_for_send(
+                request_id=request_id, uuids=uuids
+            )
+
+            for ptr in routing.persist:
+                for info in ptr.tensor_info:
+                    self.tensor_manager.set_persist(
+                        request_id=request_id, uuid=info.uuid, persist=True
+                    )
 
         return output_pointers
 
@@ -317,9 +352,9 @@ class Worker:
             self.communicator.send(worker_id, message)
 
         # Buffer persist signals for this request
-        if outputs.to_conductor:
+        if outputs.persist:
             self.subgraphs_manager.buffer_persist_signals(
-                request_id, outputs.to_conductor
+                request_id, outputs.persist
             )
 
         if outputs.new_token_outputs:
@@ -331,7 +366,6 @@ class Worker:
                 for tensor_info in signal.tensor_info:
                     tensor = self.tensor_manager.get_tensor(
                         request_id=request_id,
-                        tensor_name=signal.name,
                         uuid=tensor_info.uuid
                     )
                     new_tokens.extend(tensor.cpu().numpy().tolist())

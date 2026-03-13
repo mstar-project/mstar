@@ -4,7 +4,6 @@ import multiprocessing as mp
 import os
 import time
 from collections import defaultdict
-from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -20,10 +19,11 @@ from mminf.ipc_formats import (
     NewRequestConductor,
     RemoveRequest,
     SubgraphsDone,
+    UnpersistTensors,
     WorkerMessage,
     WorkerMessageType,
 )
-from mminf.model.base import CurrentForwardMetadata, Model, Subgraph
+from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, Subgraph
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,8 @@ class RequestData:
     fwd_inputs: list[GraphPointer]
     # name -> list[TensorPointerInfo]
     persist_signals: dict[str, list[TensorPointerInfo]] # signals passed back to conductor
+    persist_signal_ref_cnt: dict[str, int] # uuid -> number of times it was passed to workers
+
     subgraph_to_worker: dict[str, str]
     new_tokens: dict[str, list[int]]
 
@@ -82,6 +84,16 @@ class RequestData:
     current_subgraph_ids: set[str]
     # make sure to check all tensors in the list are completed (BLOCKING case)
     completed_subgraph_ids: set[str] = field(default_factory=set)
+
+    def remove_persist_signal_uuids(self, uuids: list[str]):
+        uuids = set(uuids)
+        for name in self.persist_signals:
+            self.persist_signals[name] = [
+                info for info in self.persist_signals[name] if info.uuid not in uuids
+            ]
+
+        for uuid in uuids:
+            del self.persist_signal_ref_cnt[uuid]
 
 
 class Conductor:
@@ -103,7 +115,7 @@ class Conductor:
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
-        
+
         self._worker_processes: list[mp.Process] = []
 
         with open(model_config_file, "r") as f:
@@ -247,6 +259,52 @@ class Conductor:
             ]
         return inputs_per_worker
 
+    def _update_request_info(
+        self, request_id, args: ForwardPassArgs
+    ):
+        self._set_current_subgraph_ids(
+            request_id,
+            args.full_metadata.phase
+        )
+        self.requests[request_id].current_forward_metadata = args.full_metadata
+        self.requests[request_id].fwd_inputs = args.inputs
+
+        # update reference counts for persist signals
+        ref_cnts = self.requests[request_id].persist_signal_ref_cnt
+        for edge in args.inputs:
+            for info in edge.tensor_info:
+                if info.uuid not in ref_cnts:
+                    ref_cnts[info.uuid] = 0
+                ref_cnts[info.uuid] += 1
+
+    def _un_persist_tensors(
+        self, request_id: str, tensor_info: list[TensorPointerInfo]
+    ):
+        entity_id_to_msg = {}
+        uuids = []
+        for info in tensor_info:
+            uuid_to_ref_count = entity_id_to_msg.setdefault(
+                info.source_entity, UnpersistTensors(
+                    request_id=request_id, uuid_to_ref_count={}
+                )
+            ).uuid_to_ref_count
+
+            if info.uuid in uuid_to_ref_count:
+                # duplicate; skip
+                continue
+            uuid_to_ref_count[info.uuid] = self.requests[
+                request_id].persist_signal_ref_cnt[info.uuid]
+            uuids.append(info.uuid)
+        self.requests[request_id].remove_persist_signal_uuids(uuids)
+
+        for (entity, body) in entity_id_to_msg.items():
+            self.communicator.send(
+                entity, WorkerMessage(
+                    message_type=WorkerMessageType.UNPERSIST_TENSORS,
+                    body=body
+                )
+            )
+
     def _ingest_request(
         self, body: NewRequestConductor
     ):
@@ -259,13 +317,10 @@ class Conductor:
         logger.debug("Conductor ingesting request %s", body.request_id)
         subgraph_to_worker = self._assign_subgraphs_to_workers()
         request_data = RequestData(
-            current_forward_metadata=self.model.get_initial_forward_metadata(
-                body.initial_input_modalities,
-                body.initial_output_modalities,
-                model_kwargs=body.model_kwargs,
-            ),
+            current_forward_metadata=None,
             fwd_inputs=[],
             persist_signals=body.initial_signals,
+            persist_signal_ref_cnt={},
             subgraph_to_worker=subgraph_to_worker,
             all_subgraph_ids=set(subgraph_to_worker.keys()),
             current_subgraph_ids=set(),
@@ -273,27 +328,22 @@ class Conductor:
         )
         self.requests[body.request_id] = request_data
 
-        first_forward_inputs = self.model.get_forward_pass_inputs(
-            request_data.current_forward_metadata,
-            persist_signals=body.initial_signals
+        fwd_args = self.model.get_initial_forward_pass_args(
+            input_modalities=body.initial_input_modalities,
+            output_modalities=body.initial_output_modalities,
+            input_signals=body.initial_signals,
+            model_kwargs=body.model_kwargs
         )
-        self._set_current_subgraph_ids(
-            body.request_id,
-            request_data.current_forward_metadata.phase
-        )
-
-        # Extract schedule step metadata for per-request cache orchestration
-        step_metadata = self.model.get_step_metadata(
-            request_data.current_forward_metadata
-        )
+        self._update_request_info(body.request_id, fwd_args)
 
         # send data to appropriate workers
         worker_to_subgraph_ids: dict[str, list[str]] = {}
         inputs_per_worker = self._split_inputs_to_workers(
             subgraph_to_worker=subgraph_to_worker,
-            inputs=first_forward_inputs,
-            phase=request_data.current_forward_metadata.phase
+            inputs=fwd_args.inputs,
+            phase=fwd_args.full_metadata.phase
         )
+
         for subgraph_id, worker_id in subgraph_to_worker.items():
             if worker_id not in worker_to_subgraph_ids:
                 worker_to_subgraph_ids[worker_id] = []
@@ -306,7 +356,7 @@ class Conductor:
                 subgraph_to_worker=subgraph_to_worker,
                 initial_phase=request_data.current_forward_metadata.phase,
                 initial_inputs=inputs_per_worker.get(worker, []),
-                per_request_metadata=step_metadata,
+                per_request_metadata=fwd_args.step_metadata,
             )
             self.communicator.send(
                 worker, WorkerMessage(
@@ -359,44 +409,32 @@ class Conductor:
         """
         request_data = self.requests[request_id]
 
-        prev_forward_meta = deepcopy(request_data.current_forward_metadata)
-        request_data.current_forward_metadata = \
-            self.model.update_for_next_forward(
-                metadata=request_data.current_forward_metadata,
-                new_tokens=request_data.new_tokens,
-            )
+        prev_phase = request_data.current_forward_metadata.phase
+        fwd_args = self.model.get_forward_pass_args(
+            request_data.current_forward_metadata,
+            persist_signals=request_data.persist_signals,
+            new_tokens=request_data.new_tokens
+        )
+        self._update_request_info(request_id, fwd_args)
+
         logger.debug(
             ("Request %s completed forward pass; moving from phase %s -> %s.\n"
              "Received new tokens %s, has persist signals %s.\n"
              "request_done=%s"),
-            request_id, prev_forward_meta.phase, request_data.current_forward_metadata.phase,
+            request_id, prev_phase, fwd_args.full_metadata.phase,
             str(request_data.new_tokens), str(list(request_data.persist_signals.keys())),
-            str(request_data.current_forward_metadata.request_done)
+            str(fwd_args.request_done)
         )
-        if request_data.current_forward_metadata.request_done:
+        self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
+        if fwd_args.request_done:
             return True # stop the request
 
-        self._set_current_subgraph_ids(
-            request_id,
-            request_data.current_forward_metadata.phase
-        )
-
-        fwd_inputs = self.model.get_forward_pass_inputs(
-            metadata=request_data.current_forward_metadata,
-            persist_signals=request_data.persist_signals,
-            prev_forward_metadata=prev_forward_meta
-        )
-        logger.debug("Forward inputs: %s", str(fwd_inputs))
-
-        # Extract schedule step metadata for per-request cache orchestration
-        step_metadata = self.model.get_step_metadata(
-            request_data.current_forward_metadata
-        )
+        logger.debug("Forward inputs: %s", str(fwd_args.inputs))
 
         inputs_per_worker = self._split_inputs_to_workers(
             subgraph_to_worker=request_data.subgraph_to_worker,
-            inputs=fwd_inputs,
-            phase=request_data.current_forward_metadata.phase
+            inputs=fwd_args.inputs,
+            phase=fwd_args.full_metadata.phase
         )
 
         for worker, inputs in inputs_per_worker.items():
@@ -406,12 +444,11 @@ class Conductor:
                     request_id=request_id,
                     phase=request_data.current_forward_metadata.phase,
                     inputs=inputs,
-                    per_request_metadata=step_metadata,
+                    per_request_metadata=fwd_args.step_metadata,
                 )
             )
             self.communicator.send(worker, message)
 
-        request_data.fwd_inputs = fwd_inputs
         request_data.new_tokens = {}
         request_data.completed_subgraph_ids = set()
         return False
@@ -473,4 +510,4 @@ class Conductor:
             except Exception:
                 logger.exception("Conductor error in main loop")
 
-            time.sleep(0.1) # just for dummy conductor!
+            time.sleep(0.001)

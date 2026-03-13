@@ -156,9 +156,9 @@ class DummyWorker:
             self.communicator.send(worker, message)
 
         # Buffer persist signals for this request
-        if outputs.to_conductor:
+        if outputs.persist:
             self.subgraphs_manager.buffer_persist_signals(
-                request_id, outputs.to_conductor
+                request_id, outputs.persist
             )
 
         if outputs.completed_subgraphs:

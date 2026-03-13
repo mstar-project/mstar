@@ -161,7 +161,7 @@ class VAEEncoderSubmodule(StageSubmodule):
         ds = self.latent_downsample
         _, img_h, img_w = image_tensor.shape
         h = (img_h // ds)
-        w = (img_w // ds) 
+        w = (img_w // ds)
 
         packed_vae_position_ids = get_flattened_position_ids_extrapolate(
             img_h, img_w,
@@ -287,7 +287,7 @@ class LLMSubmodule(StageSubmodule):
         h, w = (H // self.config.latent_downsample,
                 W // self.config.latent_downsample)
         num_image_tokens = h * w
-        torch.random.manual_seed(42)
+        # torch.random.manual_seed(42)
         return torch.randn(
             num_image_tokens,
             self.config.vae_config.z_channels * self.config.latent_patch_size ** 2,
@@ -315,7 +315,7 @@ class LLMSubmodule(StageSubmodule):
             result["text_inputs"] = inputs["text_inputs"][0]
         elif phase == "decode":
             result["text_inputs"] = torch.tensor([self.bos_token_id], device=device)
-    
+
         if phase in ["prefill_vit", "prefill_vae"]:
             img_emb = inputs["img_emb"][0]
             result["combined_emb"] = self._wrap_with_boi_eoi(img_emb)
@@ -528,7 +528,6 @@ class LLMSubmodule(StageSubmodule):
         token = torch.argmax(logits, dim=-1)
         return {
             "new_token": [token],
-            "text_out": [token.clone()]
         }
 
     @staticmethod
@@ -581,7 +580,7 @@ class LLMSubmodule(StageSubmodule):
         timestep_next = self._apply_timestep_shift(t=t_uniform_next, shift=shift)
         dt = (timestep - timestep_next)[0].item()  # positive step size
 
-        pos_embed = self.latent_pos_embed(vae_position_ids) 
+        pos_embed = self.latent_pos_embed(vae_position_ids)
         timestep_embeds = self.time_embedder(timestep)
         latents_ = self.vae2llm(latents) + timestep_embeds \
             + pos_embed

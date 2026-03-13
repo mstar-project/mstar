@@ -1,7 +1,8 @@
 
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.graph.base import GraphPointer, GraphStage, Loop, Sequential, TensorPointerInfo
-from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model
+from mminf.graph.special_destinations import STREAM_OUT
+from mminf.model.base import CurrentForwardMetadata, Model
 
 
 class DummyOmniModel(Model):
@@ -59,7 +60,7 @@ class DummyOmniModel(Model):
                         next_stage=STREAM_OUT,
                         name="audio_output",
                         output_modality="audio",
-                        back_to_conductor=True,
+                        persist=True,
                     ),
                 ],
             ),
@@ -79,7 +80,7 @@ class DummyOmniModel(Model):
             decode=self._make_full_graph(),
         )
 
-    def get_initial_forward_metadata(
+    def get_initial_forward_pass_args(
         self, input_modalities, output_modalities,
     ):
         return CurrentForwardMetadata(
@@ -89,7 +90,7 @@ class DummyOmniModel(Model):
             is_prefill=True,
         )
 
-    def get_forward_pass_inputs(
+    def get_forward_pass_args(
         self, metadata: CurrentForwardMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         prev_forward_metadata: CurrentForwardMetadata = None,

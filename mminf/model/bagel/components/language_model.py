@@ -584,6 +584,7 @@ class BagelForCausalLM(nn.Module):
         vae_token_indexes=None,
         text_indexes=None,
         pos_ids=None,
+        custom_advance_pos_id=None,
         **kwargs
     ):
         assert mode in ["und", "gen"]
@@ -595,7 +596,8 @@ class BagelForCausalLM(nn.Module):
             mode=mode,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
-            pos_ids=pos_ids
+            pos_ids=pos_ids,
+            custom_advance_pos_id=custom_advance_pos_id
         )
 
         return outputs

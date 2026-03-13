@@ -37,7 +37,6 @@ from pathlib import Path
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
 from PIL import Image
-from safetensors.torch import load_file
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
@@ -51,6 +50,7 @@ from mminf.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
+from mminf.graph.special_destinations import STREAM_OUT
 from mminf.model.bagel.components.autoencoder import BagelAutoEncoder
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
@@ -58,8 +58,8 @@ from mminf.model.bagel.components.tokenization import BagelTokenizer, add_specia
 from mminf.model.bagel.components.vit_encoder import BagelVisionModel
 from mminf.model.bagel.config import load_bagel_config
 from mminf.model.bagel.submodules import LLMSubmodule, VAEDecoderSubmodule, VAEEncoderSubmodule, ViTEncoderSubmodule
-from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model, StageSubmodule
-from mminf.model.utils import ModuleAndPrefix, load_weights, load_weights_from_file
+from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, StageSubmodule
+from mminf.model.utils import ModuleAndPrefix, load_weights_from_file
 
 logger = logging.getLogger(__name__)
 
@@ -445,17 +445,11 @@ class BagelModel(Model):
             input_ids=["text_inputs"],
             outputs=[
                 GraphPointer(
-                    next_stage="",
+                    next_stage=STREAM_OUT,
                     name="new_token",
                     output_modality="text",
                     is_new_token=True,
-                    back_to_conductor=True,
-                ),
-                # TODO: the following is a hack to avoid a tensor cleanup race condition
-                GraphPointer(
-                    next_stage=STREAM_OUT,
-                    name="text_out",
-                    output_modality="text",
+                    persist=True,
                 ),
             ],
         )
@@ -487,7 +481,7 @@ class BagelModel(Model):
                         next_stage=STREAM_OUT,
                         name="image_output",
                         output_modality="image",
-                        back_to_conductor=True,
+                        persist=True,
                     ),
                 ],
             ),
@@ -501,75 +495,64 @@ class BagelModel(Model):
             image_gen=image_gen,
         )
 
-    def get_initial_forward_metadata(
-        self,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        model_kwargs: dict | None = None,
-    ) -> CurrentForwardMetadata:
-        target_output = output_modalities[0]  # "text" or "image"
-        is_understanding = (target_output == "text")
-
-        # Per-request overrides with config defaults
-        overridable_keys = [
-            "cfg_text_scale", "cfg_img_scale", "cfg_interval",
-            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
-        ]
-        params = {k: getattr(self.config, k) for k in overridable_keys}
-        if model_kwargs:
-            for key in overridable_keys:
-                if key in model_kwargs:
-                    params[key] = model_kwargs[key]
-
-        think_mode = params.pop("think_mode")  # used for schedule logic, not stored in params
-
-        # Build prefill schedule: sequential list of (phase_name, step_kwargs)
-        schedule: list[tuple[str, dict]] = []
+    def _build_prefill_schedule(
+        self, input_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+        is_understanding: bool,
+        think_mode: bool
+    ):
+        # Build prefill schedule: sequential list of (phase_name, input tensor info)
+        schedule: list[tuple[str, TensorPointerInfo]] = []
 
         # 1. System prompt (if think mode enabled)
-        if think_mode:
-            prompt = VLM_THINK_SYSTEM_PROMPT if is_understanding else GEN_THINK_SYSTEM_PROMPT
-            schedule.append(("prefill_text", {"prompt": prompt}))
+        if think_mode and "system_prompt" in input_signals:
+            schedule.append(("prefill_text", input_signals["system_prompt"][0]))
 
         # 2. Walk through interleaved inputs, building sequential steps
+        images = input_signals.get("image_inputs", [])
+        texts = input_signals.get("text_inputs", [])
+
         text_idx, image_idx = 0, 0
         for mod in input_modalities:
             if mod == "text":
-                schedule.append(("prefill_text", {"input_idx": text_idx}))
+                if text_idx >= len(texts):
+                    continue
+                schedule.append(("prefill_text", texts[text_idx]))
                 text_idx += 1
             elif mod == "image":
+                if image_idx >= len(images):
+                    continue
                 if not is_understanding:
                     # Generation/editing: VAE encode the image
-                    schedule.append(("prefill_vae", {"input_idx": image_idx}))
-                schedule.append(("prefill_vit", {"input_idx": image_idx}))
+                    schedule.append(("prefill_vae", images[image_idx]))
+                schedule.append(("prefill_vit", images[image_idx]))
                 image_idx += 1
+        return schedule
 
-        # 3. Multi-cache orchestration for CFG is handled internally by the
-        #    LLM submodule based on the requires_cfg flag (set in get_step_metadata).
-        #    No schedule-level cache annotations needed.
-
-        first_phase = schedule[0][0] if schedule else "decode"
-
-        return CurrentForwardMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            phase=first_phase,
-            is_prefill=bool(schedule),
-            kwargs={
-                "prefill_schedule": schedule,
-                "prefill_step": 0,
-                "target_output": target_output,
-                "num_timesteps": self.config.num_timesteps,
-                "think_mode": think_mode,
-                **params,  # CFG params
-            },
+    def _get_step_metadata(
+        self, full_metadata: CurrentForwardMetadata,
+    ) -> dict:
+        requires_cfg = (
+            full_metadata.kwargs["target_output"] == "image" \
+                and (
+                    full_metadata.kwargs["cfg_img_scale"] > 1.0 \
+                    or full_metadata.kwargs["cfg_text_scale"] > 1.0
+                )
         )
+        return {
+            "requires_cfg": requires_cfg,
+            "is_prefill": full_metadata.is_prefill,
+            "cfg_text_scale": full_metadata.kwargs["cfg_text_scale"],
+            "cfg_img_scale": full_metadata.kwargs["cfg_img_scale"],
+            "cfg_interval": full_metadata.kwargs["cfg_interval"],
+            "cfg_renorm_type": full_metadata.kwargs["cfg_renorm_type"],
+            "cfg_renorm_min": full_metadata.kwargs["cfg_renorm_min"],
+        }
 
-    def get_forward_pass_inputs(
+    def _get_fwd_pass_inputs(
         self,
         metadata: CurrentForwardMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        prev_forward_metadata: CurrentForwardMetadata = None,
     ) -> list[GraphPointer]:
         """Construct the external inputs for the current forward pass.
 
@@ -590,32 +573,18 @@ class BagelModel(Model):
         if metadata.is_prefill:
             schedule = metadata.kwargs["prefill_schedule"]
             step = metadata.kwargs["prefill_step"]
-            _, step_kwargs = schedule[step]
+            input_tensor_info = [schedule[step][1]]
 
             if phase == "prefill_text":
                 ptr = GraphPointer(next_stage="LLM", name="text_inputs")
-                if "prompt" in step_kwargs:
-                    # System prompt -- tokenized by process_prompt() in data worker
-                    ptr.tensor_info = persist_signals.get("system_prompt", [])
-                else:
-                    idx = step_kwargs["input_idx"]
-                    all_text = persist_signals.get("text_inputs", [])
-                    ptr.tensor_info = [all_text[idx]] if idx < len(all_text) else []
-                return [ptr]
-
             elif phase == "prefill_vit":
-                idx = step_kwargs["input_idx"]
                 ptr = GraphPointer(next_stage="vit_encoder", name="image_inputs")
-                all_images = persist_signals.get("image_inputs", [])
-                ptr.tensor_info = [all_images[idx]] if idx < len(all_images) else []
-                return [ptr]
-
             elif phase == "prefill_vae":
-                idx = step_kwargs["input_idx"]
                 ptr = GraphPointer(next_stage="vae_encoder", name="image_inputs")
-                all_images = persist_signals.get("image_inputs", [])
-                ptr.tensor_info = [all_images[idx]] if idx < len(all_images) else []
-                return [ptr]
+            else:
+                raise ValueError(f"Unrecognized prefill phase {phase}")
+            ptr.tensor_info = input_tensor_info
+            return [ptr]
 
         elif phase == "decode":
             # Previous token feeds back as text_inputs
@@ -637,11 +606,81 @@ class BagelModel(Model):
 
         return []
 
-    def update_for_next_forward(
-        self,
-        metadata: CurrentForwardMetadata,
+    def _get_unpersist_tensors(
+        self, phase: str, inputs: list[GraphPointer]
+    ) -> list[TensorPointerInfo]:
+        """
+        Lists the tensors that will be used for the last time in this forward pass
+        """
+        if phase == "prefill_vae":
+            # If we have prefill_vae, we know that the image input will be
+            # passed into the ViT encoder for the next forward pass, so it
+            # has to stick around
+            return []
+        # otherwise, we can un-persist all tensors
+        return sum(
+            [inp.tensor_info for inp in inputs], start=[]
+        )
+
+    def get_initial_forward_pass_args(
+        self, input_modalities: list[str],
+        output_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict | None = None,
+    ) -> ForwardPassArgs:
+        target_output = output_modalities[0]  # "text" or "image"
+
+        # Per-request overrides with config defaults
+        overridable_keys = [
+            "cfg_text_scale", "cfg_img_scale", "cfg_interval",
+            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
+        ]
+        params = {k: getattr(self.config, k) for k in overridable_keys}
+        if model_kwargs:
+            for key in overridable_keys:
+                if key in model_kwargs:
+                    params[key] = model_kwargs[key]
+
+        think_mode = params.pop("think_mode") # used for schedule logic, not stored in params
+        schedule = self._build_prefill_schedule(
+            input_modalities=input_modalities,
+            input_signals=input_signals,
+            is_understanding=(target_output == "text"),
+            think_mode=think_mode
+        )
+
+        first_phase = schedule[0][0] if schedule else "decode"
+        full_metadata = CurrentForwardMetadata(
+            input_modalities=input_modalities,
+            output_modalities=output_modalities,
+            phase=first_phase,
+            is_prefill=bool(schedule),
+            kwargs={
+                "prefill_schedule": schedule,
+                "prefill_step": 0,
+                "target_output": target_output,
+                "num_timesteps": self.config.num_timesteps,
+                "think_mode": think_mode,
+                **params,  # CFG params
+            },
+        )
+        step_metadata =  self._get_step_metadata(full_metadata)
+        inputs = self._get_fwd_pass_inputs(
+            full_metadata, input_signals
+        )
+        unpersist_tensors = self._get_unpersist_tensors(first_phase, inputs)
+        return ForwardPassArgs(
+            full_metadata=full_metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata=step_metadata
+        )
+
+    def get_forward_pass_args(
+        self, metadata: CurrentForwardMetadata,
+        persist_signals: dict[str, list[TensorPointerInfo]],
         new_tokens: dict[str, list[int]],
-    ) -> CurrentForwardMetadata:
+    ) -> ForwardPassArgs:
         """Advance phase transitions. Schedule-driven, no BOI detection.
 
         During prefill, steps through the schedule one entry at a time.
@@ -657,6 +696,7 @@ class BagelModel(Model):
 
         After image_gen, marks request complete (one image per request).
         """
+        request_done = False
         if metadata.is_prefill:
             step = metadata.kwargs["prefill_step"] + 1
             schedule = metadata.kwargs["prefill_schedule"]
@@ -678,9 +718,7 @@ class BagelModel(Model):
                         metadata.phase = "decode"
                     else:
                         metadata.phase = "image_gen"
-            return metadata
-
-        if metadata.phase == "decode":
+        elif metadata.phase == "decode":
             tokens = new_tokens.get("new_token", [])
             if self.eos_token_id is not None and self.eos_token_id in tokens:
                 target = metadata.kwargs["target_output"]
@@ -688,33 +726,23 @@ class BagelModel(Model):
                     # Thinking phase complete — transition to image generation.
                     metadata.phase = "image_gen"
                 else:
-                    metadata.request_done = True
-            # Otherwise stay in decode phase
-            return metadata
+                    request_done = True
 
-        if metadata.phase == "image_gen":
+        elif metadata.phase == "image_gen":
             # Image generation complete (one image per request)
-            metadata.request_done = True
-            return metadata
+            request_done = True
 
-        return metadata
-    
-    def get_step_metadata(
-        self, metadata: CurrentForwardMetadata,
-    ) -> dict:
-        requires_cfg = (
-            metadata.kwargs["target_output"] == "image" \
-                and (
-                    metadata.kwargs["cfg_img_scale"] > 1.0 \
-                    or metadata.kwargs["cfg_text_scale"] > 1.0
-                )
+        step_metadata =  self._get_step_metadata(metadata)
+        inputs = self._get_fwd_pass_inputs(
+            metadata, persist_signals
         )
-        return {
-            "requires_cfg": requires_cfg,
-            "is_prefill": metadata.is_prefill,
-            "cfg_text_scale": metadata.kwargs["cfg_text_scale"],
-            "cfg_img_scale": metadata.kwargs["cfg_img_scale"],
-            "cfg_interval": metadata.kwargs["cfg_interval"],
-            "cfg_renorm_type": metadata.kwargs["cfg_renorm_type"],
-            "cfg_renorm_min": metadata.kwargs["cfg_renorm_min"],
-        }
+        unpersist_tensors = self._get_unpersist_tensors(
+            metadata.phase, inputs
+        )
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata=step_metadata,
+            request_done=request_done
+        )

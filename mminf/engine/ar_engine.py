@@ -1,9 +1,11 @@
+import logging
 import queue
 from dataclasses import dataclass, field
 
 import torch
-import logging
+
 from mminf.engine.base import BaseEngine, EngineType, StageBatch, StageOutput
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -137,7 +139,7 @@ class CacheHandle:
         # if self.kv_cache is None:
         #     # Dummy mode: return zeros shaped like q
         #     return torch.zeros_like(q)
-        
+
         assert self.kv_cache is not None
 
         state = self._get_state()
@@ -148,8 +150,6 @@ class CacheHandle:
         num_qo_heads = cfg.num_qo_heads
         seq_len = q.shape[0]
 
-        # logger.warning(f"inside run_attention. page_size={page_size}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, num_qo_heads={num_qo_heads}, seq_len={seq_len}")
-            
         # Allocate pages if needed for the new tokens
         total_len = state.seq_len + seq_len
         num_pages_needed = (total_len + page_size - 1) // page_size
@@ -165,7 +165,7 @@ class CacheHandle:
             offset = pos % page_size
             self.kv_cache[layer_idx, page_idx, 0, offset] = k[i]
             self.kv_cache[layer_idx, page_idx, 1, offset] = v[i]
-        
+
         # logger.warning(f"write_cache is True. num_pages_needed={num_pages_needed}, num_new_pages={num_new_pages}")
 
         # Build FlashInfer single-request prefill args
@@ -176,7 +176,7 @@ class CacheHandle:
         kv_indices = torch.tensor(
             state.page_indices, dtype=torch.int32, device=device
         )
-        
+
         # logger.warning(f"kv_indptr={kv_indptr}, kv_indices={kv_indices}")
         # logger.warning(f"q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}")
 
@@ -214,8 +214,7 @@ class CacheHandle:
         except ImportError as e:
             # No FlashInfer: naive attention fallback (for testing)
             logger.error("Could not run flashinfer. Outputting zeros from run_attention()")
-            raise e 
-            output = torch.zeros_like(q)
+            raise e
 
         return output
 
@@ -240,7 +239,7 @@ class CacheHandle:
             rope_scale=rope_scale,
             rope_theta=rope_theta,
         )
-    
+
     def apply_rope_custom_pos_ids(
         self,
         q: torch.Tensor,

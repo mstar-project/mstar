@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
-import requests
 import base64
 import json
 import sys
 
+import requests
 
 URL = "http://0.0.0.0:8000/generate"
 
@@ -13,9 +13,11 @@ def main():
     with requests.post(
         URL,
         data={
-            "text": "a car made out of small cars",
-            # "text": "A female cosplayer portraying an ethereal fairy or elf, wearing a flowing dress made of delicate fabrics in soft, mystical colors like emerald green and silver. She has pointed ears, a gentle, enchanting expression, and her outfit is adorned with sparkling jewels and intricate patterns. The background is a magical forest with glowing plants, mystical creatures, and a serene atmosphere.",
+            "text": "A cat in a suit and tie",
             "output_modalities": "image",
+            "model_kwargs": json.dumps({
+                "think_mode": True,
+            }),
         },
         stream=True,
     ) as resp:

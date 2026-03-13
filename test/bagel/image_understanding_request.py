@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
-import requests
 import base64
 import json
 import sys
 from pathlib import Path
+
+import requests
 
 URL = "http://0.0.0.0:8000/generate"
 IMAGE_PATH = "test/bagel/bagel.png"
@@ -19,7 +20,10 @@ def main():
         ]
 
         data = {
-            "text": "Describe this image",
+            "text": "Please describe how this food is made",
+            # "model_kwargs": json.dumps({
+            #     "think_mode": True,
+            # })
         }
 
         with requests.post(URL, data=data, files=files, stream=True) as resp:

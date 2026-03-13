@@ -1,9 +1,9 @@
 
 from dataclasses import dataclass
 from typing import Any
-from safetensors.torch import safe_open
 
 import torch
+from safetensors.torch import safe_open
 
 
 def load_weights(
@@ -58,7 +58,7 @@ def load_weights_from_file(
 
     with safe_open(safetensors_file, framework="pt", device=st_device) as f:
         for k in f.keys():
-            for i, (mod, prefix, key_map) in enumerate(module_key_maps):
+            for i, (_mod, _prefix, key_map) in enumerate(module_key_maps):
                 if k in key_map:
                     tensor = f.get_tensor(k)
                     if device != st_device:

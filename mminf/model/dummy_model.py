@@ -7,7 +7,8 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphPointer, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
-from mminf.model.base import STREAM_OUT, CurrentForwardMetadata, Model
+from mminf.graph.special_destinations import STREAM_OUT
+from mminf.model.base import CurrentForwardMetadata, Model
 
 
 class DummyModel(Model):
@@ -27,7 +28,7 @@ class DummyModel(Model):
                 name="concat_text",
                 input_ids=["new_text_emb", "existing_text_emb"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="text_emb", back_to_conductor=True)
+                    GraphPointer(next_stage="LLM", name="text_emb", persist=True)
                 ]
             )
         ])
@@ -45,7 +46,7 @@ class DummyModel(Model):
                 name="concat_img",
                 input_ids=["new_image_emb", "existing_image_emb"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="img_emb", back_to_conductor=True)
+                    GraphPointer(next_stage="LLM", name="img_emb", persist=True)
                 ]
              )
         ])
@@ -110,7 +111,7 @@ class DummyModel(Model):
                         next_stage=STREAM_OUT,
                         output_modality="image",
                         name="image_output",
-                        back_to_conductor=True
+                        persist=True
                     )
                 ]
             )
@@ -130,7 +131,7 @@ class DummyModel(Model):
             max_seq_len=1,
         )
 
-    def get_initial_forward_metadata(
+    def get_initial_forward_pass_args(
         self, input_modalities, output_modalities
     ):
         return CurrentForwardMetadata(
@@ -140,7 +141,7 @@ class DummyModel(Model):
             is_prefill=True
         )
 
-    def get_forward_pass_inputs(
+    def get_forward_pass_args(
         self, metadata: CurrentForwardMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         prev_forward_metadata: CurrentForwardMetadata=None,

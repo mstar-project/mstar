@@ -11,14 +11,12 @@
 
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 
 from mminf.model.bagel.config import BagelViTConfig
 
-
-import torch
-import torch.nn.functional as F
 
 def run_attention(
     q: torch.Tensor,
