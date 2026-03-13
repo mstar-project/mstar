@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from mminf.graph.base import GraphEdge, GraphStage, TensorPointerInfo
 from mminf.graph.request_queues import PerRequestStageQueues, ProcessedInputs, format_graph_edge_list
 from mminf.graph.special_destinations import SPECIAL_DESTINATIONS, STREAM_OUT
-from mminf.model.base import Subgraph
+from mminf.model.base import WorkerGraph
 
 logger = logging.getLogger(__name__)
 
@@ -21,30 +21,30 @@ class StageAndPhase:
 
 @dataclass
 class StageOutputRouting:
-    routed_to_this_subgraph:list[GraphEdge]
+    routed_to_this_worker_graph:list[GraphEdge]
     persist: list[GraphEdge] # outputs that are going back to the conductor
     to_workers: dict[str, list[GraphEdge]] # worker id to signals
     stream_out: list[GraphEdge] = field(default_factory=list)
     new_token_outputs: list[GraphEdge] = field(default_factory=list)
-    completed_subgraphs: list[str] = field(default_factory=list)
+    completed_worker_graph_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
-class SubgraphQueues:
+class WorkerGraphQueues:
     """
-    For a single subgraph, keeps track of which stages are waiting on which
+    For a single worker graph, keeps track of which stages are waiting on which
     inputs for each request, and which stages are ready to run per request.
     """
-    subgraph_id: str
-    phases: set[str] # e.g., this subgraph is active during decode and image_gen
+    worker_graph_id: str
+    phases: set[str] # e.g., this worker graph is active during decode and image_gen
                      # but not the prefill phase
-    subgraph: Subgraph
+    worker_graph: WorkerGraph
     per_request_queues: dict[str, PerRequestStageQueues] # request_id -> queue
 
     def process_new_inputs(self, request_id: str, inputs: list[GraphEdge]) -> ProcessedInputs:
         """
         Add new inputs for a request, and update waiting/ready stages accordingly.
-        Returns any signals that should be sent to other subgraphs.
+        Returns any signals that should be sent to other worker graphs.
         """
         return self.per_request_queues[request_id].process_new_inputs(inputs)
 
@@ -57,8 +57,8 @@ class SubgraphQueues:
         Initialize queues for a new request
         """
         self.per_request_queues[request_id] = PerRequestStageQueues(
-            waiting=deepcopy(self.subgraph.section),
-            subgraph_id=self.subgraph_id
+            waiting=deepcopy(self.worker_graph.section),
+            worker_graph_id=self.worker_graph_id
         )
 
     def remove_request(self, request_id: str):
@@ -81,8 +81,8 @@ class SubgraphQueues:
         self, request_id: str, stage_names: list[str]
     ) -> list[GraphStage]:
         """
-        Remove the given stage names from the ready queue for the request an
-        return the corresponding GraphStage objects
+        Remove the given stage names from the ready queue for the request and
+        return the corresponding GraphStage objects.
         """
         stages = []
         if request_id in self.per_request_queues:
@@ -96,10 +96,10 @@ class SubgraphQueues:
 
     def reset(self, request_id):
         """
-        At the end of a subgraph, reset the queues for that request so that it
-        can be used for the next full model forward pass
+        At the end of a worker graph, reset the queues for a request so it can
+        be used for the next full model forward pass.
         """
-        self.per_request_queues[request_id].waiting = deepcopy(self.subgraph.section)
+        self.per_request_queues[request_id].waiting = deepcopy(self.worker_graph.section)
         self.per_request_queues[request_id].ready = []
 
 
@@ -109,50 +109,50 @@ class PerRequestInfo:
     Information about a request that the worker needs to keep track of:
     - stage_to_worker: for all stages. This is, e.g., how we say that if
         an output goes to (LLM, decode phase), what worker that points to.
-    - subgraph_ids: mainly redundant information / syntactic sugar. This is
-        the list of subgraph IDs that are on this worker and used by this request
+    - worker_graph_ids: mainly redundant information / syntactic sugar. This is
+        the list of worker graph IDs that are on this worker and used by this request
         (across all possible phases)
-    - current_phase: which computation path we are currently on, e.g., prefill,
+    - current_phase: which computation path we’re currently on, e.g., prefill,
         decode, image_gen, etc.
-    - phase_subgraph_ids: subgraph IDs used in the current phase (e.g., if there
-        is a prefill LLM subgraph and decode LLM subgraph and we are in decode,
-        this list only includes the decode subgraph)
+    - phase_worker_graph_ids: worker graph IDs used in the current phase (e.g., if there
+        is a prefill LLM worker graph and decode LLM worker graph and we are in decode,
+        this list only includes the decode worker graph)
     - pending_persist_signals: buffered persist signals awaiting flush on
-        SUBGRAPHS_DONE
+        WORKER_GRAPHS_DONE
     - tensors: TBD
     """
     stage_to_worker: dict[StageAndPhase, str]  # for all stages
-    subgraph_ids: list[str] # for this worker
+    worker_graph_ids: list[str] # for this worker
     current_phase: str = field(default=None)
 
-    # phase_subgraph_ids = subgraphs for the current phase
-    phase_subgraph_ids: list[str] = field(default_factory=list) # for this worker
+    # phase_worker_graph_ids = worker graphs for current phase
+    phase_worker_graph_ids: list[str] = field(default_factory=list) # for this worker
 
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
     pending_new_tokens: dict[str, list[int]] = field(default_factory=dict)
 
 
 @dataclass
-class SubgraphsManager:
+class WorkerGraphsManager:
     """
-    Manages the subgraphs that this worker is responsible for, and the queues
-    for each subgraph and request. Also keeps track of which stages belong
-    to which subgraphs, and which subgraphs belong to which phases, for
+    Manages the worker graphs that this worker is responsible for, and the queues
+    for each graph and request. Also keeps track of which stages belong
+    to which worker graphs, and which worker graphs belong to which phases, for
     routing external outputs to the correct worker.
     """
-    queues: dict[str, SubgraphQueues] # subgraph_id to queues
+    queues: dict[str, WorkerGraphQueues] # worker graph id to queues
     per_request_info: dict[str, PerRequestInfo] # request id to info
 
     # The following two are for routing purposes:
-    all_subgraph_ids_to_phases: dict[str, set[str]] # for subgraphs on different workers too
-    all_subgraph_ids_to_stages: dict[str, str] # for subgraphs on different workers too
+    all_worker_graph_ids_to_phases: dict[str, set[str]] # for worker graphs on different workers too
+    all_worker_graph_ids_to_stages: dict[str, str] # for worker graphs on different workers too
 
     def update_phase(self, request_id: str, phase: str):
         if self.per_request_info[request_id].current_phase != phase:
             self.per_request_info[request_id].current_phase = phase
-            self.per_request_info[request_id].phase_subgraph_ids = [
-                id for id in self.per_request_info[request_id].subgraph_ids \
-                    if phase in self.all_subgraph_ids_to_phases[id]
+            self.per_request_info[request_id].phase_worker_graph_ids = [
+                graph_id for graph_id in self.per_request_info[request_id].worker_graph_ids \
+                    if phase in self.all_worker_graph_ids_to_phases[graph_id]
             ]
 
     def get_phase(self, request_id: str):
@@ -164,24 +164,24 @@ class SubgraphsManager:
         inputs: list[GraphEdge]
     ):
         """
-        Updates queues with new inputs for a request
+        Updates queues with new inputs for a request.
         """
-        subgraph_ids = self.per_request_info[request_id].phase_subgraph_ids
-        for subgraph_id in subgraph_ids:
-            self.queues[subgraph_id].process_new_inputs(request_id, inputs)
+        worker_graph_ids = self.per_request_info[request_id].phase_worker_graph_ids
+        for worker_graph_id in worker_graph_ids:
+            self.queues[worker_graph_id].process_new_inputs(request_id, inputs)
 
 
-def process_stage_outputs(
+    def process_stage_outputs(
         self, request_id: str,
         outputs: list[GraphEdge]
     ) -> StageOutputRouting:
         """
         After a stage has finished processing, use its outputs to update
-        subgraph queues, and return any outputs that should be sent to other
-        subgraphs or the conductor.
+        worker graph queues, and return any outputs that should be sent to other
+        worker graphs or the conductor.
 
-        I.e., it updates ready/waiting queues for subgraphs on this current
-        worker, and directs external outputs to subgraphs on the appropriate
+        I.e., it updates ready/waiting queues for worker graphs on this current
+        worker, and directs external outputs to worker graphs on the appropriate
         (different) worker.
         """
         # (1) find back_to_conductor flags
@@ -189,22 +189,22 @@ def process_stage_outputs(
         new_token_outputs = [edge for edge in outputs if edge.is_new_token]
 
         # (2) process all internal-facing outputs
-        subgraph_ids = self.per_request_info[request_id].phase_subgraph_ids
+        worker_graph_ids = self.per_request_info[request_id].phase_worker_graph_ids
 
-        completed_subgraphs = []
+        completed_worker_graph_ids = []
         routed_to_this_worker: list[GraphEdge] = [] # list of graph edges
         external_outputs: list[GraphEdge] = outputs
-        for subgraph_id in subgraph_ids:
-            queue = self.queues[subgraph_id] # ready / waiting graph node queue
+        for worker_graph_id in worker_graph_ids:
+            queue = self.queues[worker_graph_id] # ready / waiting graph node queue
             # process_new_inputs consumes outputs that are used as
             # stage inputs within `queue`
             processed_inputs = queue.process_new_inputs(request_id, external_outputs)
 
             # keep updating outputs to be the edges that have not yet been utilized
-            external_outputs = processed_inputs.for_other_subgraphs
-            routed_to_this_worker += processed_inputs.routed_to_this_subgraph
+            external_outputs = processed_inputs.for_other_worker_graphs
+            routed_to_this_worker += processed_inputs.routed_to_this_worker_graph
             if queue.is_done(request_id):
-                completed_subgraphs.append(subgraph_id)
+                completed_worker_graph_ids.append(worker_graph_id)
                 queue.reset(request_id)
         # all outputs left over at this point are external outputs (to stages
         # in different workers)
@@ -241,48 +241,48 @@ def process_stage_outputs(
             request_id, format_graph_edge_list(routed_to_this_worker),
             format_graph_edge_list(external_outputs), format_graph_edge_list(to_conductor),
         )
-        if completed_subgraphs:
-            logger.debug("Completed %d subgraphs", len(completed_subgraphs))
+        if completed_worker_graph_ids:
+            logger.debug("Completed %d worker graphs", len(completed_worker_graph_ids))
 
         return StageOutputRouting(
-            routed_to_this_subgraph=routed_to_this_worker,
+            routed_to_this_worker_graph=routed_to_this_worker,
             persist=to_conductor,
             to_workers=to_workers,
             stream_out=stream_out,
             new_token_outputs=new_token_outputs,
-            completed_subgraphs=completed_subgraphs,
+            completed_worker_graph_ids=completed_worker_graph_ids,
         )
 
     def add_request(
         self, request_id: str,
-        subgraph_ids: list[str], # for this worker's subgraphs
-        subgraph_to_worker: dict[str, str] # for other / all subgraphs
+        worker_graph_ids: list[str], # for this worker's worker graphs
+        worker_graph_to_worker: dict[str, str] # for other / all worker graphs
     ):
         """
         Set up queues and info for a new request. This includes adding the request
-        to the relevant subgraph queues, and updating the mapping of which worker
+        to the relevant worker graph queues, and updating the mapping of which worker
         is responsible for which stages for this request (for output routing).
         """
         stage_to_worker = {}
-        for id in subgraph_ids:
-            self.queues[id].add_request(request_id)
+        for graph_id in worker_graph_ids:
+            self.queues[graph_id].add_request(request_id)
 
-        for subgraph_id, worker_id in subgraph_to_worker.items():
-            for phase in self.all_subgraph_ids_to_phases[subgraph_id]:
+        for worker_graph_id, worker_id in worker_graph_to_worker.items():
+            for phase in self.all_worker_graph_ids_to_phases[worker_graph_id]:
                 stage_to_worker.update({
                     StageAndPhase(
                         stage=name,
                         phase=phase
-                    ): worker_id for name in self.all_subgraph_ids_to_stages[subgraph_id]
+                    ): worker_id for name in self.all_worker_graph_ids_to_stages[worker_graph_id]
                 })
         self.per_request_info[request_id] = PerRequestInfo(
             stage_to_worker=stage_to_worker,
-            subgraph_ids=subgraph_ids
+            worker_graph_ids=worker_graph_ids
         )
 
     def remove_request(self, request_id: str):
         if request_id in self.per_request_info:
-            for queue_id in self.per_request_info[request_id].subgraph_ids:
+            for queue_id in self.per_request_info[request_id].worker_graph_ids:
                 self.queues[queue_id].remove_request(request_id)
             del self.per_request_info[request_id]
 

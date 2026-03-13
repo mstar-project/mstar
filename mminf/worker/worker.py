@@ -14,19 +14,19 @@ from mminf.ipc_formats import (
     InputSignals,
     NewRequest,
     RemoveRequest,
-    SubgraphsDone,
+    WorkerGraphsDone,
     TensorReceived,
     UnpersistTensors,
     WorkerMessage,
     WorkerMessageType,
 )
-from mminf.model.base import Model, Subgraph
+from mminf.model.base import Model, WorkerGraph
 from mminf.worker.engine_manager import EngineManager
 from mminf.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mminf.worker.stage_manager_utils import (
     StageOutputRouting,
-    SubgraphQueues,
-    SubgraphsManager,
+    WorkerGraphQueues,
+    WorkerGraphsManager,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 class Worker:
     """
-    Real worker that integrates SubgraphsManager, EngineManager,
+    Real worker that integrates WorkerGraphsManager, EngineManager,
     MicroScheduler, and MooncakeCommunicationManager to execute
     computation via engines.
     """
@@ -43,10 +43,10 @@ class Worker:
         self,
         worker_id: str,
         worker_ids: list[str],
-        my_subgraphs: list[Subgraph],
+        my_worker_graphs: list[WorkerGraph],
         engine_configs: list[dict],
-        all_subgraph_ids_to_phases: dict[str, set[str]],
-        all_subgraph_ids_to_stages: dict[str, list[str]],
+        all_worker_graph_ids_to_phases: dict[str, set[str]],
+        all_worker_graph_ids_to_stages: dict[str, list[str]],
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
@@ -56,19 +56,19 @@ class Worker:
         self.worker_id = worker_id
         self.device = device
 
-        self.subgraphs_manager = SubgraphsManager(
+        self.worker_graphs_manager = WorkerGraphsManager(
             queues={
-                subgraph.subgraph_id: SubgraphQueues(
-                    subgraph_id=subgraph.subgraph_id,
-                    phases=subgraph.phases,
-                    subgraph=subgraph,
+                worker_graph.worker_graph_id: WorkerGraphQueues(
+                    worker_graph_id=worker_graph.worker_graph_id,
+                    phases=worker_graph.phases,
+                    worker_graph=worker_graph,
                     per_request_queues={},
                 )
-                for subgraph in my_subgraphs
+                for worker_graph in my_worker_graphs
             },
             per_request_info={},
-            all_subgraph_ids_to_phases=all_subgraph_ids_to_phases,
-            all_subgraph_ids_to_stages=all_subgraph_ids_to_stages,
+            all_worker_graph_ids_to_phases=all_worker_graph_ids_to_phases,
+            all_worker_graph_ids_to_stages=all_worker_graph_ids_to_stages,
         )
 
         self.engine_manager = EngineManager.from_config(
@@ -98,14 +98,14 @@ class Worker:
 
     def _add_new_request(self, body: NewRequest) -> None:
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
-        self.subgraphs_manager.add_request(
+        self.worker_graphs_manager.add_request(
             request_id=body.request_id,
-            subgraph_ids=body.subgraph_ids,
-            subgraph_to_worker=body.subgraph_to_worker,
+            worker_graph_ids=body.worker_graph_ids,
+            worker_graph_to_worker=body.worker_graph_to_worker,
         )
         self.engine_manager.add_request(body.request_id)
 
-        self.subgraphs_manager.update_phase(
+        self.worker_graphs_manager.update_phase(
             body.request_id, body.initial_phase
         )
         logger.debug(
@@ -128,7 +128,7 @@ class Worker:
             edge for edge in body.initial_inputs if len(edge.tensor_info) == 0
         ]
         if signal_only:
-            self.subgraphs_manager.process_new_inputs(
+            self.worker_graphs_manager.process_new_inputs(
                 request_id=body.request_id, inputs=signal_only
             )
         # process messages that may have came in out-of-order
@@ -139,7 +139,7 @@ class Worker:
 
     def _remove_request(self, body: RemoveRequest) -> None:
         self.engine_manager.remove_request(body.request_id)
-        self.subgraphs_manager.remove_request(body.request_id)
+        self.worker_graphs_manager.remove_request(body.request_id)
         self.tensor_manager.cleanup_request(body.request_id)
         self._per_request_metadata.pop(body.request_id, None)
 
@@ -151,7 +151,7 @@ class Worker:
             )
 
     def _process_new_inputs(self, body: InputSignals) -> None:
-        self.subgraphs_manager.update_phase(body.request_id, body.phase)
+        self.worker_graphs_manager.update_phase(body.request_id, body.phase)
         logger.debug(
             "Request %s set to phase %s on worker %s",
             body.request_id, body.phase, self.worker_id
@@ -175,7 +175,7 @@ class Worker:
         # Signal-only edges can be processed immediately
         signal_only = [edge for edge in body.inputs if len(edge.tensor_info) == 0]
         if signal_only:
-            self.subgraphs_manager.process_new_inputs(
+            self.worker_graphs_manager.process_new_inputs(
                 request_id=body.request_id, inputs=signal_only
             )
 
@@ -222,10 +222,10 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _check_ready_tensors(self) -> None:
-        """Poll for completed RDMA transfers, feed ready graph edges to subgraph queues."""
+        """Poll for completed RDMA transfers, feed ready graph edges to worker graph queues."""
         ready = self.tensor_manager.get_ready_tensors()
         for request_id, edges in ready.items():
-            self.subgraphs_manager.process_new_inputs(
+            self.worker_graphs_manager.process_new_inputs(
                 request_id=request_id, inputs=edges
             )
 
@@ -338,14 +338,14 @@ class Worker:
         """
         Send outputs to other workers and to the conductor.
         Persist signals are buffered and sent together with the
-        SUBGRAPHS_DONE message to avoid race conditions.
+        WORKER_GRAPHS_DONE message to avoid race conditions.
         """
         for worker_id, edges in outputs.to_workers.items():
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
                     request_id=request_id,
-                    phase=self.subgraphs_manager.get_phase(request_id),
+                    phase=self.worker_graphs_manager.get_phase(request_id),
                     inputs=edges,
                 ),
             )
@@ -353,7 +353,7 @@ class Worker:
 
         # Buffer persist signals for this request
         if outputs.persist:
-            self.subgraphs_manager.buffer_persist_signals(
+            self.worker_graphs_manager.buffer_persist_signals(
                 request_id, outputs.persist
             )
 
@@ -371,9 +371,9 @@ class Worker:
                     new_tokens.extend(tensor.cpu().numpy().tolist())
                 name_to_new_token[signal.name] = new_tokens
 
-            self.subgraphs_manager.buffer_new_tokens(
-                request_id, name_to_new_token
-            )
+                self.worker_graphs_manager.buffer_new_tokens(
+                    request_id, name_to_new_token
+                )
 
         if outputs.stream_out:
             for graph_edge in outputs.stream_out:
@@ -388,14 +388,14 @@ class Worker:
                 )
                 self.communicator.send("api_server", message)
 
-        if outputs.completed_subgraphs:
+        if outputs.completed_worker_graph_ids:
             message = ConductorMessage(
-                message_type=ConductorMessageType.SUBGRAPHS_DONE,
-                body=SubgraphsDone(
+                message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
+                body=WorkerGraphsDone(
                     request_id=request_id,
-                    subgraph_ids=outputs.completed_subgraphs,
-                    persist_signals=self.subgraphs_manager.flush_persist_signals(request_id),
-                    new_tokens=self.subgraphs_manager.flush_new_tokens(request_id),
+                    worker_graph_ids=outputs.completed_worker_graph_ids,
+                    persist_signals=self.worker_graphs_manager.flush_persist_signals(request_id),
+                    new_tokens=self.worker_graphs_manager.flush_new_tokens(request_id),
                 ),
             )
             self.communicator.send("conductor", message)
@@ -410,11 +410,11 @@ class Worker:
                 # 1. Process ZMQ messages (new requests, input signals, removals)
                 self._process_messages()
 
-                # 2. Check for ready RDMA tensors, feed to subgraph queues
+                # 2. Check for ready RDMA tensors, feed to worker graph queues
                 self._check_ready_tensors()
 
                 # 3. Pick next batch via MicroScheduler
-                batch = self.scheduler.get_next_batch(self.subgraphs_manager)
+                batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
                 if batch is None:
                     continue
 
@@ -429,10 +429,10 @@ class Worker:
                 # 5b. Free consumed input tensors
                 self._cleanup_consumed_inputs(batch)
 
-                # 6. Route outputs through SubgraphsManager first to determine routing
+                # 6. Route outputs through WorkerGraphsManager first to determine routing
                 routing_per_request: dict[str, StageOutputRouting] = {}
                 for request_id,stage in batch.stage_objects.items():
-                    routing = self.subgraphs_manager.process_stage_outputs(
+                    routing = self.worker_graphs_manager.process_stage_outputs(
                         request_id, stage.outputs
                     )
                     routing_per_request[request_id] = routing

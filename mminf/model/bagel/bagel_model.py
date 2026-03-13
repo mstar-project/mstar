@@ -400,7 +400,7 @@ class BagelModel(Model):
 
     def get_phase_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM stage (text embedding is internal) --
-        # No output needed — conductor is notified when the subgraph completes.
+        # No output needed — conductor is notified when the worker graph completes.
         prefill_text = GraphStage(
             name="LLM",
             input_ids=["text_inputs"],

@@ -35,8 +35,8 @@ class WorkerMessageType(Enum):
 @dataclass
 class NewRequest(MessageBody):
     request_id: str
-    subgraph_ids: list[str]
-    subgraph_to_worker: dict[str, str]
+    worker_graph_ids: list[str]
+    worker_graph_to_worker: dict[str, str]
     initial_phase: str
     initial_inputs: list[GraphEdge]
     per_request_metadata: dict = field(default_factory=dict)
@@ -79,7 +79,7 @@ class WorkerMessage:
 
 class ConductorMessageType(Enum):
     NEW_REQUEST = "new_request"
-    SUBGRAPHS_DONE = "subgraphs_done"
+    WORKER_GRAPHS_DONE = "worker_graphs_done"
 
 
 @dataclass
@@ -93,9 +93,9 @@ class NewRequestConductor(MessageBody):
 
 
 @dataclass
-class SubgraphsDone(MessageBody):
+class WorkerGraphsDone(MessageBody):
     request_id: str
-    subgraph_ids: list[str]
+    worker_graph_ids: list[str]
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
 

@@ -47,13 +47,13 @@ class StageSubmodule(torch.nn.Module):
 
 
 @dataclass
-class Subgraph:
+class WorkerGraph:
     section: GraphSection
     phases: set[str] # e.g., prefill, decode, image_gen
     consumes_stream: bool = field(default=False)
     ranks: list[int] = field(default_factory=list)
-    _group_id: int = field(default=-1) # used in going from config yaml to subgraphs
-    subgraph_id: str = field(default_factory=lambda: str(uuid4()))
+    _group_id: int = field(default=-1) # used in going from config yaml to worker graphs
+    worker_graph_id: str = field(default_factory=lambda: str(uuid4()))
 
 
 def _combine_sections_sequential_or_parallel(
@@ -72,17 +72,17 @@ def _combine_sections_sequential_or_parallel(
     return comb_type([section, other])
 
 
-def _divide_into_subgraphs(
+def _divide_into_worker_graphs(
     graph: GraphSection,
     phase: str,
     stage_to_group_idx: dict[str, int],
     stage_groups: list[dict]
-) -> list[Subgraph]:
+) -> list[WorkerGraph]:
     """
-    Given a graph, break it into subgraphs
+    Given a graph, break it into worker graphs
     """
     if isinstance(graph, GraphStage):
-        return [Subgraph(
+        return [WorkerGraph(
             section=graph,
             phases=set([phase]),
             consumes_stream=graph.consumes_stream,
@@ -91,7 +91,7 @@ def _divide_into_subgraphs(
         )]
 
     if isinstance(graph, Sequential):
-        subgraphs = _divide_into_subgraphs(
+        worker_graphs = _divide_into_worker_graphs(
             graph.sections[0],
             phase=phase,
             stage_to_group_idx=stage_to_group_idx,
@@ -101,63 +101,63 @@ def _divide_into_subgraphs(
         for i in range(1, len(graph.sections)):
             # Go through it sequentially and merge adjacent sections
             # that are on the same device
-            new_subgraphs = _divide_into_subgraphs(
+            new_worker_graphs = _divide_into_worker_graphs(
                 graph.sections[i],
                 phase=phase,
                 stage_to_group_idx=stage_to_group_idx,
                 stage_groups=stage_groups
             )
-            if new_subgraphs[0]._group_id == subgraphs[-1]._group_id and \
-                    not new_subgraphs[0].consumes_stream:
-                subgraphs[-1].section = _combine_sections_sequential_or_parallel(
-                    subgraphs[-1].section, new_subgraphs.pop(0).section,
+            if new_worker_graphs[0]._group_id == worker_graphs[-1]._group_id and \
+                    not new_worker_graphs[0].consumes_stream:
+                worker_graphs[-1].section = _combine_sections_sequential_or_parallel(
+                    worker_graphs[-1].section, new_worker_graphs.pop(0).section,
                     comb_type=Sequential
                 )
-            subgraphs.extend(new_subgraphs)
-        return subgraphs
+            worker_graphs.extend(new_worker_graphs)
+        return worker_graphs
 
     if isinstance(graph, Parallel):
-        all_subgraphs = [
-            _divide_into_subgraphs(
+        all_worker_graphs = [
+            _divide_into_worker_graphs(
                 s, phase=phase,
                 stage_to_group_idx=stage_to_group_idx,
                 stage_groups=stage_groups
             ) for s in graph.sections
         ]
         # parallel sections that are all on the same worker can be merged
-        singleton_subgraphs = [
-            s[0] for s in all_subgraphs if len(s) == 1 and not s[0].consumes_stream
+        singleton_worker_graphs = [
+            s[0] for s in all_worker_graphs if len(s) == 1 and not s[0].consumes_stream
         ]
-        group_id_to_subgraph = {}
-        for s in singleton_subgraphs:
-            if s._group_id in group_id_to_subgraph:
-                existing = group_id_to_subgraph[s._group_id]
+        group_id_to_worker_graph = {}
+        for s in singleton_worker_graphs:
+            if s._group_id in group_id_to_worker_graph:
+                existing = group_id_to_worker_graph[s._group_id]
                 existing.section = _combine_sections_sequential_or_parallel(
                     existing.section, s.section,
                     comb_type=Parallel
                 )
             else:
-                group_id_to_subgraph[s._group_id] = s
+                group_id_to_worker_graph[s._group_id] = s
 
-        return list(group_id_to_subgraph.values()) + sum([
-            s for s in all_subgraphs if len(s) > 1 or s[0].consumes_stream
-        ], start=[]) # remaining subgraphs
+        return list(group_id_to_worker_graph.values()) + sum([
+            s for s in all_worker_graphs if len(s) > 1 or s[0].consumes_stream
+        ], start=[]) # remaining worker graphs
 
     if isinstance(graph, Loop):
-        loop_section_subgraphs = _divide_into_subgraphs(
+        loop_section_worker_graphs = _divide_into_worker_graphs(
             graph.section,
             phase=phase,
             stage_to_group_idx=stage_to_group_idx,
             stage_groups=stage_groups
         )
-        if len(loop_section_subgraphs) == 1:
+        if len(loop_section_worker_graphs) == 1:
             # fully colocated case
-            loop_section_subgraphs[0].section = graph
-            return loop_section_subgraphs
+            loop_section_worker_graphs[0].section = graph
+            return loop_section_worker_graphs
 
-        # in the disaggregated case, we need to wrap all subgraphs in a loop
+        # in the disaggregated case, we need to wrap all worker graphs in a loop
         # with the external signals and loop-back signals pre-computed
-        for s in loop_section_subgraphs:
+        for s in loop_section_worker_graphs:
             s.section = Loop(
                 section=s.section,
                 n_iters=graph.n_iters,
@@ -166,7 +166,7 @@ def _divide_into_subgraphs(
                 loop_back_signals=graph.loop_back_signals,
                 outputs=graph.outputs
             )
-        return loop_section_subgraphs
+        return loop_section_worker_graphs
 
 
 @dataclass
@@ -201,7 +201,7 @@ class ForwardPassArgs:
 
 
 class Model(ABC):
-    def _get_subgraphs_for_phase(
+    def _get_worker_graphs_for_phase(
         self, phase_name: str, graph: GraphSection,
         stage_groups: list[dict],
     ):
@@ -216,20 +216,20 @@ class Model(ABC):
                 name: i for name in group["stage_names"]
             })
 
-        return _divide_into_subgraphs(
+        return _divide_into_worker_graphs(
             graph,
             phase=phase_name,
             stage_to_group_idx=stage_to_group_idx,
             stage_groups=stage_groups
         )
 
-    def get_subgraphs(self, config_path: str) -> list[Subgraph]:
+    def get_worker_graphs(self, config_path: str) -> list[WorkerGraph]:
         with open(config_path, "r") as f:
             stage_groups = yaml.safe_load(f)["stage_groups"]
 
-        # TODO: merge identical subgraphs from different phases
+        # TODO: merge identical worker graphs from different phases
         return sum([
-            self._get_subgraphs_for_phase(phase, graph, stage_groups) \
+            self._get_worker_graphs_for_phase(phase, graph, stage_groups) \
                 for phase, graph in self.get_phase_graphs().items()
         ], start=[])
 

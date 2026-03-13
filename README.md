@@ -143,8 +143,8 @@ VoxServe's existing pattern. Detokenizer runs at intervals (every 10-50 tokens) 
 │  • Tokenize  │                     │  └─────────────┘  │    (steps g-i)   │   │
 └──────────────┘                     │                   └──────────────────┘   │
        ▲                             │  ┌──────────────────────────────────┐    │
-       │                             │  │ Subgraph assignment              │    │
-       │ stream out                  │  │ • {req → {subgraph: worker_id}} │    │
+       │                             │  │ WorkerGraph assignment           │    │
+       │ stream out                  │  │ • {req → {worker_graph_id: worker_id}} │    │
        │                             │  │ • Phase transitions (model ABC) │    │
        │                             │  └──────────────────────────────────┘    │
        │                             └────────────────┬───────────────────┬─────┘
@@ -157,8 +157,8 @@ VoxServe's existing pattern. Detokenizer runs at intervals (every 10-50 tokens) 
        └──────────────────────────── │  • LLM (AR)     │◄─►│  • ViT (E/D)   │
                                      │  • Engines      │IPC│  • VAE (E/D)   │
                                      │  • MicroSched   │ZMQ│  • Engines     │
-                                     │  • SubgraphsMgr │ + │  • MicroSched  │
-                                     │  • Ready/Wait Q │RDM│  • SubgraphsMgr│
+                                     │  • WorkerGraphsMgr │ + │  • MicroSched  │
+                                     │  • Ready/Wait Q │RDM│  • WorkerGraphsMgr│
                                      └─────────────────┘ A └────────────────┘
 
                      ┌─────────────────────────────────────┐
@@ -180,9 +180,9 @@ VoxServe's existing pattern. Detokenizer runs at intervals (every 10-50 tokens) 
 |-----------|---------------|---------------------|
 | **API Server** | HTTP endpoints, streaming responses, ZMQ communication with Conductor, **tokenization** via `model.process_prompt()` (in the PreprocessWorker thread), media loading (images, audio, video) | GPU computation, batching |
 | **Cluster Manager** | Deployment-time GPU allocation, autoscaling policy, config loading | Runtime request routing (deployment-time only) |
-| **Conductor** | Macro-level request lifecycle: worker selection, subgraph assignment, routing inputs at the start of each forward pass, determining the next computation phase (via `model.update_for_next_forward`), EOS/completion detection, passing per-request metadata (e.g., cache_labels for CFG). Does NOT manage ready/waiting queues or batch scheduling — those are on workers. | GPU computation, batching, tensor operations, intra-forward-pass scheduling |
+| **Conductor** | Macro-level request lifecycle: worker selection, worker graph assignment, routing inputs at the start of each forward pass, determining the next computation phase (via `model.update_for_next_forward`), EOS/completion detection, passing per-request metadata (e.g., cache_labels for CFG). Does NOT manage ready/waiting queues or batch scheduling — those are on workers. | GPU computation, batching, tensor operations, intra-forward-pass scheduling |
 | **Model** (replaces "Execution Strategy") | Defines computation graphs for each phase via `get_phase_graphs()`, engine types via `get_stage_engine_types()`, forward pass orchestration (`get_forward_pass_inputs`, `update_for_next_forward`), tokenization (`process_prompt`), and `StageSubmodule` wrappers (preprocess + forward for each stage). Lives on the `Model` ABC. | Scheduling, worker selection, communication. |
-| **Workers** | GPU computation via engines, internal batch scheduling (MicroScheduler), KV cache management (via CacheHandle in AREngine), streaming output directly to API Server (STREAM_OUT), inter-worker communication (Mooncake RDMA + ZMQ), subgraph queue management and completion detection (SubgraphsManager with ready/waiting queues), per-request phase tracking (applied locally from conductor signals), buffering persist signals and new tokens before reporting to conductor. | Macro-level phase transitions (EOS detection, deciding next phase), cross-worker scheduling, worker selection. |
+| **Workers** | GPU computation via engines, internal batch scheduling (MicroScheduler), KV cache management (via CacheHandle in AREngine), streaming output directly to API Server (STREAM_OUT), inter-worker communication (Mooncake RDMA + ZMQ), worker graph queue management and completion detection (WorkerGraphsManager with ready/waiting queues), per-request phase tracking (applied locally from conductor signals), buffering persist signals and new tokens before reporting to conductor. | Macro-level phase transitions (EOS detection, deciding next phase), cross-worker scheduling, worker selection. |
 
 ---
 
@@ -247,7 +247,7 @@ A small, deployment-time-only component that reads `cluster_config.yaml` and ini
 
 ### 5.2 Config YAML Structure
 
-The config uses `stage_groups` — each group lists the graph stage names it handles and which GPU ranks can execute it. The conductor uses this to break phase graphs into subgraphs and assign them to workers.
+The config uses `stage_groups` — each group lists the graph stage names it handles and which GPU ranks can execute it. The conductor uses this to break phase graphs into worker graphs and assign them to workers.
 
 ```yaml
 # BAGEL example: LLM on GPU 0, encoders/decoders on GPU 1
@@ -276,7 +276,7 @@ stage_groups:
 ```
 
 Stage names in the YAML must match the `name` fields in the model's `get_phase_graphs()` output.
-When `ranks` has multiple entries, the subgraph is replicated for data parallelism and the conductor randomly assigns requests to one rank per subgraph.
+When `ranks` has multiple entries, the worker graph is replicated for data parallelism and the conductor randomly assigns requests to one rank per worker graph.
 The optional `phases` field restricts a stage group to specific computation phases (e.g., `phases: ["image_gen"]`); if omitted, the group is active for all phases.
 
 ### 5.3 Responsibilities
@@ -302,8 +302,8 @@ This was explicitly corrected from an earlier design that incorrectly placed the
 The Conductor is the central runtime coordinator.
 As we have opted for a more decentralized, IPC-heavy scheduling procedure, the coordinator:
 
-1. Assigns workers to subgraphs (contiguous computation graph sections) upon receiving a new request, and sends the workers information about what subgraph(s) they are handing for a request, and what workers are handling other subgraphs (for output routing),
-2. During a forward pass, receives information from workers about subgraph completion, and also information about tensors that will persist across forward passes (e.g., a newly-generated token will need to be added to the inputs of the next forward pass, and image embeddings may also persist for the next forward pass),
+1. Assigns workers to worker graphs (contiguous computation graph sections) upon receiving a new request, and sends the workers information about what worker graph(s) they are handling for a request, and what workers are handling other worker graphs (for output routing),
+2. During a forward pass, receives information from workers about worker graph completion, and also information about tensors that will persist across forward passes (e.g., a newly-generated token will need to be added to the inputs of the next forward pass, and image embeddings may also persist for the next forward pass),
 3. At the end of each full model forward pass, calls `model.update_for_next_forward()` to advance the computation phase (e.g., prefill → decode → image_gen) and detect request completion (EOS, image generation done) via `metadata.request_done`,
 4. At the beginning of each full model forward pass, sends inputs and state information (e.g., which computation phase we are in) to the appropriate graph stages on the appropriate workers.
 
@@ -335,15 +335,15 @@ Indexes all workers by capability and tracks their state.
 
 #### 6.2.2 Scheduling
 
-At **initialization** time, the conductor assigns subgraphs to workers.
-In the data-parallel case, a subgraph may be assigned to multiple workers, and requests will be routed to one of the data-parallel ranks per subgraph.
-If there are multiple "phases" of computation (e.g., prefill, decode, image generation), components of those will have separate subgraphs where appropriate.
-Subgraphs for all phases will be assigned to workers at the beginning of a request, though only the subgraphs for one phase will be run by workers during each forward pass.
+At **initialization** time, the conductor assigns worker graphs to workers.
+In the data-parallel case, a worker graph may be assigned to multiple workers, and requests will be routed to one of the data-parallel ranks per worker graph.
+If there are multiple "phases" of computation (e.g., prefill, decode, image generation), components of those will have separate worker graphs where appropriate.
+Worker graphs for all phases will be assigned to workers at the beginning of a request, though only the worker graphs for one phase will be run by workers during each forward pass.
 
-Specifically, upon instatiation, the conductor calls `model.get_subgraphs(model_config_file)` and creates a mapping of subgraph id to subgraph.
-A **subgraph** is a contiguous section of a model computation graph that will be assigned to a worker. `model.get_subgraphs` populates the subgraphs with a list of what workers can execute that subgraph (i.e., have the right sub-models loaded) and what computation phase the subgraph is active for.
+Specifically, upon instatiation, the conductor calls `model.get_worker_graphs(model_config_file)` and creates a mapping of worker graph id to worker graph.
+A **WorkerGraph** is a contiguous section of a model computation graph that will be assigned to a worker. `model.get_worker_graphs` populates the worker graphs with a list of what workers can execute each worker graph (i.e., have the right sub-models loaded) and what computation phase the worker graph is active for.
 
-Then, it communicates to each worker what subgraphs they will be processing, as well as what graph stages are in other subgraphs (required for output routing).
+Then, it communicates to each worker what worker graphs they will be processing, as well as what graph stages are in other worker graphs (required for output routing).
 
 For each request, the scheduler contains multiple roles that operate at different timescales:
 
@@ -352,22 +352,22 @@ For each request, the scheduler contains multiple roles that operate at differen
 | Step | Action | Inputs |
 |------|--------|--------|
 | a | Get request from queue, extract metadata | `model_name`, initial input/output modalities |
-| b | Determine worker plan for request (e.g., random routing for DP, though we should use a more sophisticated system in the future) to get a subgraph to worker mapping for this request | server config (worker->gpu mappings) |
+| b | Determine worker plan for request (e.g., random routing for DP, though we should use a more sophisticated system in the future) to get a worker_graph to worker mapping for this request | server config (worker->gpu mappings) |
 | c | Initialize a `RequestData` object for this request to track the progress of the current request, as well as signals that persist between forward passes |  Worker plan from (b), initial input/output modalities |
-| d | Communicate to the relevant workers the subgraph IDs for this request, as well as the subgraph to worker mapping (so that the workers can route their outputs properly to other workers) | outputs from (b) and (c) | 
+| d | Communicate to the relevant workers the worker graph IDs for this request, as well as the worker graph to worker mapping (so that the workers can route their outputs properly to other workers) | outputs from (b) and (c) | 
 
-**Intra-forward Pass Management** -- Runs every conductor full model forward pass (i.e., when all subgraphs have been completed).
+**Intra-forward Pass Management** -- Runs every conductor full model forward pass (i.e., when all worker graphs have been completed).
 
 | Step | Action | Details |
 |------|--------|---------|
 | e | Check for "persistent signals" from workers | The workers may push information about tensors that will be used in future forward passes, which will be used as inputs in future forward passes |
-| f | Check for "subgraph done" signals from workers | Update what subgraphs have been completed for the current request forward pass. If all subgraphs for the current computation phase have been completed, we have completed a forward pass. |
+| f | Check for "worker graph done" signals from workers | Update what worker graphs have been completed for the current request forward pass. If all worker graphs for the current computation phase have been completed, we have completed a forward pass. |
 
 **At the end of each forward pass and beginning of the next**:
 
 | Step | Action | Details |
 |------|--------|---------|
-| g | Update request lifecycle | Call `model.update_for_next_forward(metadata, new_tokens)` to advance phase transitions (e.g., prefill → decode → image_gen) and detect completion (EOS, image done). If `metadata.request_done` is set, end request (send REMOVE_REQUEST to workers). Also set which subgraphs are active for the next model forward pass (used to track when the fwd pass is done) |
+| g | Update request lifecycle | Call `model.update_for_next_forward(metadata, new_tokens)` to advance phase transitions (e.g., prefill → decode → image_gen) and detect completion (EOS, image done). If `metadata.request_done` is set, end request (send REMOVE_REQUEST to workers). Also set which worker graphs are active for the next model forward pass (used to track when the fwd pass is done) |
 | h | `model.get_forward_pass_inputs(...)` | Get the inputs for the current forward pass (e.g., if we are doing image generation, this will include noisy latents). This will be in the form of `GraphEdge` objects, which include tensor name, what graph stage it is routed to, and the current tensor location (IP address, memory address, size)  |
 | i | Dispatch inputs to workers | Send the input `GraphEdge`s for the current forward pass to the appropriate workers. Also include metadata of which phase we are in (e.g. prefill, decode, image_gen) and per-request metadata (e.g., cache_labels, snapshot_after), because these are required for routing and cache orchestration |
 
@@ -376,15 +376,15 @@ For each request, the scheduler contains multiple roles that operate at differen
 
 **Key data structures**:
 
-- `{subgraph_id: subgraph}`:
+- `{worker_graph_id: worker_graph}`:
 ```python
 @dataclass
-class Subgraph:
+class WorkerGraph:
     section: GraphSection
     phases: set[str] # e.g., prefill, decode, image_gen 
     consumes_stream: bool # for thinker-talker
     ranks: list[int] # one-to-one mapping of worker to rank
-    subgraph_id: str
+    worker_graph_id: str
 ```
 - `{req_id: request_data}`:
 ```python
@@ -393,13 +393,13 @@ class RequestData:
     current_forward_metadata: CurrentForwardMetadata
     fwd_inputs: list[GraphEdge] # inputs that the conductor has sent to the current fwd pass
     persist_signals: dict[str, list[TensorPointerInfo]] # signals passed back to conductor
-    subgraph_to_worker: dict[str, str] # subgraph id to worker id
+    worker_graph_to_worker: dict[str, str] # worker graph id to worker id
     new_tokens: dict[str, list[int]] # name -> tokens, for this fwd pass (e.g., {"new_token": [42, 17]})
 
     # for tracking progress
-    all_subgraph_ids: set[str] # across all phases
-    current_subgraph_ids: set[str] # for the current fwd pass computation phase
-    completed_subgraph_ids: set[str] # for the current full model fwd pass
+    all_worker_graph_ids: set[str] # across all phases
+    current_worker_graph_ids: set[str] # for the current fwd pass computation phase
+    completed_worker_graph_ids: set[str] # for the current full model fwd pass
 ```
 where `CurrentForwardMetadata` is:
 ```python
@@ -415,14 +415,14 @@ class CurrentForwardMetadata:
 See the [computation graph model section](#9-computation-graph-model) for information about `GraphEdge` and `TensorPointerMetadata`.
 
 
-### 6.4 Subgraph Persistence (Note 7)
+### 6.4 WorkerGraph Persistence (Note 7)
 
 The conductor does NOT recompute the execution plan every forward pass. Instead:
 
-1. On server initialization phase: determine stage->worker and worker->gpu mappings from yaml file. This results in a static list of subgraphs that are being handled by each worker.
-2. On a new request arriving: compute the execution plan based on input/output modalities, stored in the request state. Only recompute IF input/output modalities change (e.g., `<BOI>` triggers adding flow subgraph). The conductor only sends the inputs to the proper workers for this forward pass, as well as what phase of computation we are in (it does **not** need to send new subgraph information to workers); the execution of the proper subgraphs for each forward pass can be handled via tensor routing between workers.
+1. On server initialization phase: determine stage->worker and worker->gpu mappings from yaml file. This results in a static list of worker graphs that are being handled by each worker.
+2. On a new request arriving: compute the execution plan based on input/output modalities, stored in the request state. Only recompute IF input/output modalities change (e.g., `<BOI>` triggers adding flow worker graph). The conductor only sends the inputs to the proper workers for this forward pass, as well as what phase of computation we are in (it does **not** need to send new worker graph information to workers); the execution of the proper worker graphs for each forward pass can be handled via tensor routing between workers.
 
-The worker needs to know only (1) what the computation subgraphs are to compute, (2) what's in the incoming request queue, and (3) where to send the output, which is decided by the conductor as metadata for each request. This is assuming subgraph-to-worker mapping is static (i.e., there never exists LLM-only worker and LLM+flow worker at the same time)
+The worker needs to know only (1) what the computation worker graphs are to compute, (2) what's in the incoming request queue, and (3) where to send the output, which is decided by the conductor as metadata for each request. This is assuming worker graph-to-worker mapping is static (i.e., there never exists LLM-only worker and LLM+flow worker at the same time)
 
 This enables:
 - Reduced recomputation overhead
@@ -438,15 +438,15 @@ When defining a model, the user must define a computation graph for each phase o
 
 **Note**: This is currently in the `Model` class, but it might make more sense to pull this logic out into an `ExecutionStrategy` class, which can be retrieved via `model.get_execution_strategy`.
 
-### 7.1 Computation Graph and Subgraphs
+### 7.1 Computation Graph and WorkerGraphs
 For each phase of computation, the user must define a **computation** graph, which specifies the discrete computation stages, their execution order, and how their outputs are routed.
 
 To make graph definition more intuitive than, e.g., a generic DAG, stages can be organized in `Sequential`, `Parallel`, and `Loop` configurations.
 
 The user must define `self.get_phase_graphs()`, which returns a mapping of computation phase name (e.g., `prefill`, `decode`, `image_gen`) to computation graph.
 
-Once the graphs are defined, the `Model` class automatically parses it, along with the cluster config, to produce a list of **Subgraphs**, or groups of stages that will be assigned to a worker together.
-This is produced by `model.get_subgraphs(config_path)`, which calls `self.get_phase_graphs()` and performs the logic to break the graphs from each phase into subgraphs.
+Once the graphs are defined, the `Model` class automatically parses it, along with the cluster config, to produce a list of **WorkerGraphs**, or groups of stages that will be assigned to a worker together.
+This is produced by `model.get_worker_graphs(config_path)`, which calls `self.get_phase_graphs()` and performs the logic to break the graphs from each phase into worker graphs.
 See the [computation graph model section](#9-computation-graph-model) for information.
 
 ### 7.2 Model ABC Methods
@@ -489,7 +489,7 @@ def get_phase_graphs(self) -> dict[str, GraphSection]:
     prefill_text = GraphStage(
         name="LLM",
         input_ids=["text_inputs"],
-        outputs=[],   # No output — conductor notified via SUBGRAPHS_DONE
+            outputs=[],   # No output — conductor notified via WORKER_GRAPHS_DONE
     )
 
     # -- prefill_vit: ViT encoder -> LLM (bidirectional attention) --
@@ -919,7 +919,7 @@ Passes `per_request_metadata` to `submodule.forward()` alongside preprocessed in
 
 #### 8.3 Scheduler
 
-Each worker handles its own batch scheduling via a `MicroScheduler` class; at every worker loop, the worker calls `scheduler.get_next_batch(subgraphs_manager)` to get the next stage name and batch of inputs that should be run.
+Each worker handles its own batch scheduling via a `MicroScheduler` class; at every worker loop, the worker calls `scheduler.get_next_batch(worker_graphs_manager)` to get the next stage name and batch of inputs that should be run.
 The conductor and other workers dispatch work items; the worker accumulates and batches them.
 
 **For AR decode stages**:
@@ -938,7 +938,7 @@ The conductor and other workers dispatch work items; the worker accumulates and 
 ### 8.4 Worker Internal Architecture
 
 The worker (`worker/worker.py`) integrates four components:
-1. **SubgraphsManager** — Tracks per-request graph state: which subgraphs are assigned, ready/waiting queues, phase tracking, output routing.
+1. **WorkerGraphsManager** — Tracks per-request graph state: which worker graphs are assigned, ready/waiting queues, phase tracking, output routing.
 2. **EngineManager** — Maps stage names to engine instances, handles `load_model()`, `add_request()`, `remove_request()`.
 3. **MicroScheduler** — Selects the next batch to run based on ready stages across all requests.
 4. **MooncakeCommunicationManager** — Handles RDMA tensor transfers (start_read, get_ready, register_for_send).
@@ -979,7 +979,7 @@ GraphSection (ABC)
 ├── GraphStage          # Node: a single computation unit
 ├── Sequential          # Stages execute in order
 ├── Parallel            # Stages execute concurrently
-└── Loop                # Stage/subgraph repeated N times
+└── Loop                # Stage/worker graph repeated N times
 ```
 
 A `GraphSection` is an abstract class that represents any arbitrary (contiguous) part of a graph: a single node (`GraphStage`), or different compositions of nodes.
@@ -1088,7 +1088,7 @@ Visual:
 
 ### 9.5 Loop
 
-A stage or subgraph repeated N times. Handles loop-back signals (outputs that feed back as inputs to the next iteration) and external inputs.
+    A stage or worker graph repeated N times. Handles loop-back signals (outputs that feed back as inputs to the next iteration) and external inputs.
 
 ```python
 @dataclass
@@ -1186,7 +1186,7 @@ A flag for **producer-consumer streaming between workers**. Distinct from STREAM
 **Flow**:
 ```
 Thinker Worker ──RELAY (hidden states + token IDs)──→ Talker Worker
-Thinker Worker ──SUBGRAPH_DONE──→ Conductor
+Thinker Worker ──WORKER_GRAPHS_DONE──→ Conductor
 Conductor starts next forward pass
 ...
 Conductor ──(at <EOS>)──→ Talker Worker: STOP signal (ZMQ msg: req_id, STOP)
@@ -1248,12 +1248,12 @@ class RequestQueues:
         """
         Processes all outputs that feed into the waiting graph section, and
         return a dictionary of external output edges (ones that are feeding
-        to different subgraphs)
+        to different worker graphs)
         """
         if self.waiting is None:
             return ProcessedInputs(
-                routed_to_this_subgraph=set(),
-                for_other_subgraphs=new_inputs,
+                routed_to_this_worker_graph=set(),
+                for_other_worker_graphs=new_inputs,
             )
 
         new_inputs: DestToGraphEdges = get_stage_to_inputs_mapping(new_inputs)
@@ -1262,8 +1262,8 @@ class RequestQueues:
         
         self._update_ready_waiting()
         return ProcessedInputs(
-            for_other_subgraphs=external_outputs,
-            routed_to_this_subgraph=ingested
+            for_other_worker_graphs=external_outputs,
+            routed_to_this_worker_graph=ingested
         )
 ```
 
@@ -1284,13 +1284,13 @@ Here, we detail the messages that can be sent to the conductor, worker, and API 
 | Flow | Direction | Purpose | Message Content |
 |------|-----------|---------|-----------------|
 **New Request** | API server → Conductor | Notify conductor of new work | `req_id`, `initial_signals: dict[str, list[TensorPointerInfo]]`, `initial_input_modalities`, `initial_output_modalities`, `input_metadata`, `model_kwargs` |
-**Subgraphs Done** | Worker → Conductor | Notify subgraph completion | `req_id`, `subgraph_ids`, `persist_signals: dict[str, list[TensorPointerInfo]]`, `new_tokens: dict[str, list[int]]` |
+**Worker Graphs Done** | Worker → Conductor | Notify worker graph completion | `req_id`, `worker_graph_ids`, `persist_signals: dict[str, list[TensorPointerInfo]]`, `new_tokens: dict[str, list[int]]` |
 
 **Communication to workers** (`WorkerMessageType`):
 
 | Flow | Direction | Purpose | Message Content |
 |------|-----------|---------|-----------------|
-**New Request** | Conductor → Worker | Notify worker will be handling subgraphs this request | `req_id`, `subgraph_ids`, `subgraph_to_worker: dict[str, str]`, `initial_phase`, `initial_inputs: list[GraphEdge]`, `per_request_metadata: dict` |
+**New Request** | Conductor → Worker | Notify worker will be handling worker graphs this request | `req_id`, `worker_graph_ids`, `worker_graph_to_worker: dict[str, str]`, `initial_phase`, `initial_inputs: list[GraphEdge]`, `per_request_metadata: dict` |
 **Remove Request** | Conductor → Worker | Remove request upon `<EOS>` or rescheduling | `req_id` |
 **Input Signals** | Conductor → Worker or Worker → Worker | Send inputs to graph stages | `req_id`, `phase`, `inputs: list[GraphEdge]`, `per_request_metadata: dict` |
 **Tensor Received** | Worker → Worker or Worker → API server | ACK that RDMA tensor read has finished | `req_id`, `successful_tensors: list[NameAndUuid]`, `failed_tensor_ids: list[NameAndUuid]` |
@@ -1326,15 +1326,15 @@ From the Mooncake research, the inter-worker communication layer should:
 Mooncake includes a `mooncake-transfer-engine` package that we can use out-of-the box, along with ZMQ for passing of metadata.
 
 Specifically, there are two layers of inter-worker communication:
-- **(1) ZMQ**: For control messages, metadata, and notifications (e.g., "you can now read the latents from IP X at memory address Y", "I have completed this subgraph", "stop talking")
-- **(2) Mooncake Transfer Engine**: For the actual heavy lifting of tensor data transfer (e.g., KV cache blocks and tensors transferred between subgraphs/workers and from workers to the API server).
+- **(1) ZMQ**: For control messages, metadata, and notifications (e.g., "you can now read the latents from IP X at memory address Y", "I have completed this worker graph", "stop talking")
+- **(2) Mooncake Transfer Engine**: For the actual heavy lifting of tensor data transfer (e.g., KV cache blocks and tensors transferred between worker graphs/workers and from workers to the API server).
 
 **(1) Message-Passing Communication**:
 The `BaseCommunicator` abstract class handles message-level worker communication, with interfaces for `send` and `get_all_new_messages`, and is implemented by `ZMQCommunicator`.
 Each entity (worker, conductor, api server) has one `ZMQCommunicator` instance, and calls the `send` and `get_all_new_messages` methods when appropriate.
 
 **(2) Tensor Communicator**:
-The `TensorCommunicationManager` abstract class (a) holds all tensors used by a worker, and (b) handles tensor-level worker-worker (e.g., when `next_stage` is a part of a subgraph that's in a different worker) and worker-api_server (streaming out) communication.
+The `TensorCommunicationManager` abstract class (a) holds all tensors used by a worker, and (b) handles tensor-level worker-worker (e.g., when `next_stage` is a part of a worker graph that's in a different worker) and worker-api_server (streaming out) communication.
 It is implemented by `MooncakeCommunicationManager`.
 
 To read in tensors, the receiver first calls `communication_manager.start_read_tensors(...)`, which allocates an appropriately-sized buffer and calls
@@ -1355,7 +1355,7 @@ This also sends ACK messages back to the senders of those tensors, so that they 
 
 
 **Tensor transfer high-level example**:
-`Worker_0` has latents that are needed on the `Worker_1` subgraph. `Worker_0` sends `address` and `n_bytes` information (via ZMQ). `Worker_1` allocates the required memory for latents, uses `transfer_read_on_cuda` to pull the tensors from `Worker_0`.
+`Worker_0` has latents that are needed on the `Worker_1` (via its worker graph). `Worker_0` sends `address` and `n_bytes` information (via ZMQ). `Worker_1` allocates the required memory for latents, uses `transfer_read_on_cuda` to pull the tensors from `Worker_0`.
 While the tensors are being transferred, `Worker_1` performs computation if applicable.
 When the tensors are fully read in, `Worker_1` and sends a feedback message to `Worker_0` for confirmation.
 
@@ -1366,11 +1366,11 @@ def run(self) -> None:
         # 1. Process ZMQ messages (new requests, input signals, removals)
         self._process_messages()
 
-        # 2. Check for completed RDMA transfers, feed ready edges to subgraph queues
+        # 2. Check for completed RDMA transfers, feed ready edges to worker graph queues
         self._check_ready_tensors()
 
         # 3. Pick next batch via MicroScheduler (selects stage + requests)
-        batch = self.scheduler.get_next_batch(self.subgraphs_manager)
+        batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
         if batch is None:
             continue
 
@@ -1384,9 +1384,9 @@ def run(self) -> None:
         # 5b. Free consumed input tensors
         self._cleanup_consumed_inputs(batch)
 
-        # 6. Route outputs through SubgraphsManager (determines destinations)
+        # 6. Route outputs through WorkerGraphsManager (determines destinations)
         routing_per_request = {
-            rid: self.subgraphs_manager.process_stage_outputs(rid, stage.outputs)
+            rid: self.worker_graphs_manager.process_stage_outputs(rid, stage.outputs)
             for rid, stage in batch.stage_objects.items()
         }
 
@@ -1514,18 +1514,18 @@ This supports:
 3. Conductor:
    a. Calls model.get_initial_forward_metadata(["text", "image"], ["text"])
       → Builds prefill schedule (e.g., for BAGEL: prefill_text, prefill_vit)
-   b. Assigns subgraphs to workers (e.g., LLM → Worker 0, vit_encoder → Worker 1)
-   c. Sends NewRequest to each worker with subgraph assignments
+   b. Assigns worker graphs to workers (e.g., LLM → Worker 0, vit_encoder → Worker 1)
+   c. Sends NewRequest to each worker with worker graph assignments
 4. Prefill phase (schedule-driven):
    Step 0: prefill_text — Conductor sends text_inputs to Worker 0 (LLM)
    Step 1: prefill_vit — Conductor sends image_inputs to Worker 1 (vit_encoder)
      → Worker 1 runs ViT, sends vit_emb to Worker 0 via IPC
      → Worker 0 runs LLM forward (bidirectional for image tokens)
-   Each step ends with SUBGRAPHS_DONE → Conductor
+   Each step ends with WORKER_GRAPHS_DONE → Conductor
 5. Conductor transitions to decode phase
 6. Decode loop: For every forward pass, conductor sends previous token to Worker 0
    - Worker 0 runs LLM decode, streams new_token → API Server (STREAM_OUT)
-   - Worker 0 sends SUBGRAPHS_DONE with new_token to Conductor
+   - Worker 0 sends WORKER_GRAPHS_DONE with new_token to Conductor
 7. At <EOS>, conductor sends REMOVE_REQUEST to all workers
 8. Conductor finishes request
 ```
@@ -1549,23 +1549,23 @@ Output mode is known **upfront** from the API request's `output_modalities` (no 
       → Builds prefill schedule with CFG annotations:
         [("prefill_text", {cache_labels: ["main", "cfg_img"]}),
          ("prefill_vae",  {cache_labels: ["main"], snapshot_after: ("main", "cfg_text")})]
-   b. Assigns subgraphs to workers:
+   b. Assigns worker graphs to workers:
       LLM → Worker 0, vit_encoder + vae_encoder + vae_decoder → Worker 1
-   c. Sends NewRequest to workers with subgraph assignments
+   c. Sends NewRequest to workers with worker graph assignments
 
 4. Prefill phase (multiple forward passes, schedule-driven):
    Step 0: prefill_text
      - Conductor sends text_inputs to Worker 0 (LLM stage)
      - Worker 0: LLMSubmodule._forward_prefill_text()
        → embed_tokens → LLM forward (causal) writing to "main" and "cfg_img" caches
-     - Worker 0 sends SUBGRAPHS_DONE → Conductor
+     - Worker 0 sends WORKER_GRAPHS_DONE → Conductor
    Step 1: prefill_vae
      - Conductor sends image_inputs to Worker 1 (vae_encoder stage)
      - Worker 1: VAE encode → sends vae_emb to Worker 0 (via IPC)
      - Worker 0: LLMSubmodule._forward_prefill_vae()
        → BOI + vae_emb + EOI → LLM forward (bidirectional) writing to "main" only
        → snapshot("main", "cfg_text") — creates text-only CFG cache
-     - Worker 0 sends SUBGRAPHS_DONE → Conductor
+     - Worker 0 sends WORKER_GRAPHS_DONE → Conductor
 
 5. Conductor: all prefill steps done → transitions to image_gen phase
    (no BOI token, direct transition from schedule)
@@ -1602,7 +1602,7 @@ Output mode is known **upfront** from the API request's `output_modalities` (no 
    c. vae_decoder → Worker 1
    d. Ready: text_emb (has text input)
 4. Dispatch text_emb → Worker 0
-... Worker 0 runs decode (sending appropriate SUBGRAPH_DONE signals to coductor), produces <BOI>, which conductor sees and starts image generation phase ...
+... Worker 0 runs decode (sending appropriate WORKER_GRAPHS_DONE signals to coductor), produces <BOI>, which conductor sees and starts image generation phase ...
 5. Worker 0 starts Loop(50):
    For each of 50 iterations:
      a. LLM full forward pass (text_emb + img_emb + current latents)
@@ -1629,12 +1629,12 @@ Output mode is known **upfront** from the API request's `output_modalities` (no 
    b. Assign: vit + audio_encoder + thinker → Worker 0 (30B MoE)
               talker + mtp + code2wav → Worker 1 (3B MoE)
    c. Ready: vit_encoder (has image), audio_encoder (has audio)
-4. Dispatch encoder inputs → Worker 0 (parallel). Send SUBGRAPH_DONE signal.
+4. Dispatch encoder inputs → Worker 0 (parallel). Send WORKER_GRAPHS_DONE signal.
 Thinker becomes ready on Worker 0 (internal Worker scheduling).
 5. Worker 0 runs thinker decode loop:
    - Streams text tokens → API Server (STREAM_OUT)
    - Streams layer-0 embeddings + layer-24 hidden states (accept_hidden_layer) + token IDs → Worker 1 (RELAY)
-6. Once SUBGRAPH_DONE for the thinker is sent to the conductor, the conductor immediately starts a new forward pass. 
+6. Once WORKER_GRAPHS_DONE for the thinker is sent to the conductor, the conductor immediately starts a new forward pass. 
 7. Worker 1 (talker loop, running concurrently):
    - Buffers incoming hidden states + token IDs from RELAY
    - When sufficient data: runs talker AR decode
@@ -1658,7 +1658,7 @@ Thinker becomes ready on Worker 0 (internal Worker scheduling).
 3. Conductor:
    a. Instantiates a new `RequestData` object
    b. Assign: preprocess + LLM + detokenizer → Worker 0
-4. Worker 0 runs VoxServe-style loop (with inputs passing in from the conductor at every forward pass, and SUBGRAPH_DONE messages passing from the worker to the condutor):
+4. Worker 0 runs VoxServe-style loop (with inputs passing in from the conductor at every forward pass, and WORKER_GRAPHS_DONE messages passing from the worker to the condutor):
    a. Preprocess: tokenize text, allocate KV cache, init decoder cache
    b. LLM prefill
    c. LLM decode loop (continuous batching):
@@ -1720,13 +1720,13 @@ Thinker becomes ready on Worker 0 (internal Worker scheduling).
 
 | Component | Rationale |
 |-----------|-----------|
-| **Conductor** (all) | Unique to our architecture: request lifecycle management, subgraph assignment, phase transitions |
+| **Conductor** (all) | Unique to our architecture: request lifecycle management, worker graph assignment, phase transitions |
 | **Model ABC** (all) | Model-specific computation graphs, phase definitions, StageSubmodule wrappers |
-| **Worker internals** (SubgraphsManager, MicroScheduler) | Graph-aware ready/waiting queues, batch scheduling, subgraph completion detection |
+| **Worker internals** (WorkerGraphsManager, MicroScheduler) | Graph-aware ready/waiting queues, batch scheduling, worker graph completion detection |
 | **Worker Registry** | Capability-based routing unique to our design |
 | **Computation Graph Model** (GraphSection hierarchy) | Working implementation exists |
 | **RELAY flag handling** | Thinker-Talker streaming pattern specific to our system |
-| **Subgraph persistence** logic | Re-plan only when modalities change |
+| **WorkerGraph persistence** logic | Re-plan only when modalities change |
 
 ### 13.6 Insert Later (Not Initial Implementation)
 
@@ -1875,12 +1875,12 @@ This must work across LLM forward passes. When any worker completes:
 
 ## Appendix C: Stage Completion Signaling (Note 11)
 
-When a stage within a subgraph completes, the worker sends a "stage completed" message to the conductor. This doesn't necessarily trigger any action but is important for:
+When a stage within a worker graph completes, the worker sends a "stage completed" message to the conductor. This doesn't necessarily trigger any action but is important for:
 - SLO-aware scheduling (estimating remaining time)
 - Progress monitoring
 - Debugging
 
-The message can include a flag saying "this also means subgraph completed" to distinguish intra-subgraph progress from subgraph completion.
+The message can include a flag saying "this also means worker graph completed" to distinguish intra-worker graph progress from worker graph completion.
 
 ## Appendix D: Design Notes from Atindra & Naomi
 
@@ -1901,9 +1901,9 @@ These notes were captured during whiteboard sessions and design discussions. The
 - Qwen2.5-Omni which sends hidden states from thinker to talker (so before DONE_WITH_FWD flag is on). The Qwen3-Omni architecture works only with DONE_WITH_FWD flag without RELAY if we are willing to take the conductor communication hit.
   - **[Correction]**: The original note said "layer 18." Verified findings: Qwen2.5-Omni sends **last-layer** hidden states + input embeddings (element-wise sum, 3584-dim/token), NOT from a specific intermediate layer. Qwen3-Omni sends from layer 24 (`accept_hidden_layer=24` in the released model config).
 
-**Note 6:** For every forward pass, we are making a computation graph and dispatching it. Have subgraphs all ready per request. The scheduling part of conductor launches them when they are done (for example flow part of subgraph is launched at \<BOI\> and killed at \<EOI\>). We keep the talker subgraph alive throughout.
+**Note 6:** For every forward pass, we are making a computation graph and dispatching it. Have worker graphs all ready per request. The scheduling part of conductor launches them when they are done (for example flow part of worker graph is launched at \<BOI\> and killed at \<EOI\>). We keep the talker worker graph alive throughout.
 
-**Note 7:** idea on persistence of subgraphs: For every request, the conductor holds the current computation graph / execution plan. When the next forward pass starts, it retrieves a new execution plan from the model IF the input or output modalities change. If we have a new execution plan, the conductor formulates the new plan as a series of additions / subtractions from the current computation graph.
+**Note 7:** idea on persistence of worker graphs: For every request, the conductor holds the current computation graph / execution plan. When the next forward pass starts, it retrieves a new execution plan from the model IF the input or output modalities change. If we have a new execution plan, the conductor formulates the new plan as a series of additions / subtractions from the current computation graph.
 - The addition/subtraction mechanism can be trivial: the model can produce the "full possible computation" graph, and the get\_execution\_plan function can return whether each stage is active or not.
 - `showo2_model.execution_plan(input_modalities, output_modalities, metadata)` -- per-request, per-forward pass
 - This solves a few issues:
@@ -1913,11 +1913,11 @@ These notes were captured during whiteboard sessions and design discussions. The
 
 *(Note 8 does not exist -- numbering skips from 7 to 9)*
 
-**Note 9:** modification of needs/produces/edge design: every subgraph has a list of inputs that it needs. We merge the produces/edge concepts: every subgraph can have multiple outputs that feed into different subgraphs, some of which will be ready in the middle of the subgraph execution. This is handled by multiple edges to next subgraphs, each of which is associated with the corresponding produced tensors.
+**Note 9:** modification of needs/produces/edge design: every worker graph has a list of inputs that it needs. We merge the produces/edge concepts: every worker graph can have multiple outputs that feed into different worker graphs, some of which will be ready in the middle of the worker graph execution. This is handled by multiple edges to next worker graphs, each of which is associated with the corresponding produced tensors.
 
-**Note 10:** Whenever we change subgraphs, the conductor should send the corresponding workers information to the extent of "when you get tensors X and Y, run subgraph Z"
+**Note 10:** Whenever we change worker graphs, the conductor should send the corresponding workers information to the extent of "when you get tensors X and Y, run worker graph Z"
 
-**Note 11:** When a stage within a subgraph completes, send a "stage completed" message back to the conductor. This doesn't really trigger anything but is important for SLO-aware scheduling. We can also have a flag in the message saying "this also means the subgraph has completed"
+**Note 11:** When a stage within a worker graph completes, send a "stage completed" message back to the conductor. This doesn't really trigger anything but is important for SLO-aware scheduling. We can also have a flag in the message saying "this also means the worker graph has completed"
 
 **Note 12:** KV cache management: take the IPC logic from mooncake
 

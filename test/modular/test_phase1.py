@@ -16,13 +16,13 @@ from mminf.engine.enc_dec_engine import EncoderDecoderEngine
 from mminf.engine.flow_engine import FlowEngine
 from mminf.graph.base import GraphEdge
 from mminf.graph.request_queues import PerRequestStageQueues
-from mminf.model.base import Subgraph
+from mminf.model.base import WorkerGraph
 from mminf.model.dummy_model import DummyModel
 from mminf.worker.engine_manager import EngineManager
 from mminf.worker.micro_scheduler import MicroScheduler
 from mminf.worker.stage_manager_utils import (
-    SubgraphQueues,
-    SubgraphsManager,
+    WorkerGraphQueues,
+    WorkerGraphsManager,
 )
 
 # ======================================================================
@@ -265,33 +265,33 @@ class TestImageGenLoop:
         # Verify VAE_dec fires only once
         assert fired_stages.count("VAE_dec") == 1
 
-    def test_loop_with_subgraph_manager(self):
+    def test_loop_with_worker_graph_manager(self):
         """
-        Test the full loop using SubgraphsManager (single-worker scenario).
+        Test the full loop using WorkerGraphsManager (single-worker scenario).
         All stages on one worker, verifying queue management works end-to-end.
         """
         graph = self._build_image_gen_graph()
 
-        subgraph_id = "sg_image_gen"
-        subgraph = Subgraph(
+        worker_graph_id = "sg_image_gen"
+        worker_graph = WorkerGraph(
             section=graph,
             phases={"image_gen"},
-            subgraph_id=subgraph_id,
+            worker_graph_id=worker_graph_id,
         )
 
-        manager = SubgraphsManager(
+        manager = WorkerGraphsManager(
             queues={
-                subgraph_id: SubgraphQueues(
-                    subgraph_id=subgraph_id,
+                worker_graph_id: WorkerGraphQueues(
+                    worker_graph_id=worker_graph_id,
                     phases={"image_gen"},
-                    subgraph=subgraph,
+                    worker_graph=worker_graph,
                     per_request_queues={},
                 )
             },
             per_request_info={},
-            all_subgraph_ids_to_phases={subgraph_id: {"image_gen"}},
-            all_subgraph_ids_to_stages={
-                subgraph_id: graph.get_stage_names()
+            all_worker_graph_ids_to_phases={worker_graph_id: {"image_gen"}},
+            all_worker_graph_ids_to_stages={
+                worker_graph_id: graph.get_stage_names()
             },
         )
 
@@ -299,8 +299,8 @@ class TestImageGenLoop:
         request_id = "test_req_1"
         manager.add_request(
             request_id=request_id,
-            subgraph_ids=[subgraph_id],
-            subgraph_to_worker={subgraph_id: "worker_0"},
+            worker_graph_ids=[worker_graph_id],
+            worker_graph_to_worker={worker_graph_id: "worker_0"},
         )
         manager.update_phase(request_id, "image_gen")
 
@@ -318,7 +318,7 @@ class TestImageGenLoop:
         max_iterations = 100
 
         for _ in range(max_iterations):
-            queue = manager.queues[subgraph_id]
+            queue = manager.queues[worker_graph_id]
             ready_map = queue.get_ready_stage_names()
 
             if request_id not in ready_map or not ready_map[request_id]:
@@ -348,11 +348,11 @@ class TestImageGenLoop:
     def test_micro_scheduler_picks_stages(self):
         """Test that MicroScheduler correctly selects and batches ready stages."""
         graph = self._build_image_gen_graph()
-        subgraph_id = "sg_test"
-        subgraph = Subgraph(
+        worker_graph_id = "sg_test"
+        worker_graph = WorkerGraph(
             section=graph,
             phases={"image_gen"},
-            subgraph_id=subgraph_id,
+            worker_graph_id=worker_graph_id,
         )
 
         engine_configs = [
@@ -369,27 +369,27 @@ class TestImageGenLoop:
         engine_mgr = EngineManager.from_config(engine_configs, device="cpu")
         scheduler = MicroScheduler(engine_mgr)
 
-        manager = SubgraphsManager(
+        manager = WorkerGraphsManager(
             queues={
-                subgraph_id: SubgraphQueues(
-                    subgraph_id=subgraph_id,
+                worker_graph_id: WorkerGraphQueues(
+                    worker_graph_id=worker_graph_id,
                     phases={"image_gen"},
-                    subgraph=subgraph,
+                    worker_graph=worker_graph,
                     per_request_queues={},
                 )
             },
             per_request_info={},
-            all_subgraph_ids_to_phases={subgraph_id: {"image_gen"}},
-            all_subgraph_ids_to_stages={
-                subgraph_id: graph.get_stage_names()
+            all_worker_graph_ids_to_phases={worker_graph_id: {"image_gen"}},
+            all_worker_graph_ids_to_stages={
+                worker_graph_id: graph.get_stage_names()
             },
         )
 
         request_id = "req_sched"
         manager.add_request(
             request_id=request_id,
-            subgraph_ids=[subgraph_id],
-            subgraph_to_worker={subgraph_id: "w0"},
+            worker_graph_ids=[worker_graph_id],
+            worker_graph_to_worker={worker_graph_id: "w0"},
         )
         manager.update_phase(request_id, "image_gen")
 

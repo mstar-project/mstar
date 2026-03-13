@@ -18,12 +18,12 @@ from mminf.ipc_formats import (
     NewRequest,
     NewRequestConductor,
     RemoveRequest,
-    SubgraphsDone,
+    WorkerGraphsDone,
     UnpersistTensors,
     WorkerMessage,
     WorkerMessageType,
 )
-from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, Subgraph
+from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, WorkerGraph
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +31,10 @@ logger = logging.getLogger(__name__)
 def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
-    my_subgraphs: list[Subgraph],
+    worker_graphs: list[WorkerGraph],
     engine_configs: list[dict],
-    all_subgraph_ids_to_phases: dict[str, set[str]],
-    all_subgraph_ids_to_stages: dict[str, list[str]],
+    all_worker_graph_ids_to_phases: dict[str, set[str]],
+    all_worker_graph_ids_to_stages: dict[str, list[str]],
     hostname: str,
     socket_path_prefix: str,
     model: Model | None = None,
@@ -51,15 +51,15 @@ def _worker_process_target(
 
     from mminf.worker.worker import Worker
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
-        sum([sg.section.get_stage_names() for sg in my_subgraphs], start=[])
+        sum([wg.section.get_stage_names() for wg in worker_graphs], start=[])
     ))
     worker = Worker(
         worker_id=worker_id,
         worker_ids=worker_ids,
-        my_subgraphs=my_subgraphs,
+        my_worker_graphs=worker_graphs,
         engine_configs=engine_configs,
-        all_subgraph_ids_to_phases=all_subgraph_ids_to_phases,
-        all_subgraph_ids_to_stages=all_subgraph_ids_to_stages,
+        all_worker_graph_ids_to_phases=all_worker_graph_ids_to_phases,
+        all_worker_graph_ids_to_stages=all_worker_graph_ids_to_stages,
         hostname=hostname,
         socket_path_prefix=socket_path_prefix,
         device=torch.device(device),
@@ -76,14 +76,14 @@ class RequestData:
     persist_signals: dict[str, list[TensorPointerInfo]] # signals passed back to conductor
     persist_signal_ref_cnt: dict[str, int] # uuid -> number of times it was passed to workers
 
-    subgraph_to_worker: dict[str, str]
+    worker_graph_to_worker: dict[str, str]
     new_tokens: dict[str, list[int]]
 
     # for tracking progress
-    all_subgraph_ids: set[str]
-    current_subgraph_ids: set[str]
+    all_worker_graph_ids: set[str]
+    current_worker_graph_ids: set[str]
     # make sure to check all tensors in the list are completed (BLOCKING case)
-    completed_subgraph_ids: set[str] = field(default_factory=set)
+    completed_worker_graph_ids: set[str] = field(default_factory=set)
 
     def remove_persist_signal_uuids(self, uuids: list[str]):
         uuids = set(uuids)
@@ -123,9 +123,9 @@ class Conductor:
         assert "max_seq_len" in self.model_config
         assert "stage_groups" in self.model_config
 
-        self.subgraphs = {
-            subgraph.subgraph_id: subgraph
-            for subgraph in model.get_subgraphs(model_config_file)
+        self.worker_graphs = {
+            worker_graph.worker_graph_id: worker_graph
+            for worker_graph in model.get_worker_graphs(model_config_file)
         }
 
         os.makedirs(socket_path_prefix, exist_ok=True)
@@ -139,20 +139,20 @@ class Conductor:
         )
 
     def _derive_worker_info(self):
-        """Derive per-rank worker info from subgraphs and model engine types."""
+        """Derive per-rank worker info from worker graphs and model engine types."""
         stage_engine_types = self.model.get_stage_engine_types()
 
-        # Collect unique ranks and per-rank subgraphs
-        rank_to_subgraphs: dict[int, list[Subgraph]] = defaultdict(list)
-        for subgraph in self.subgraphs.values():
-            for rank in subgraph.ranks:
-                rank_to_subgraphs[rank].append(subgraph)
+        # Collect unique ranks and per-rank worker graphs
+        rank_to_worker_graphs: dict[int, list[WorkerGraph]] = defaultdict(list)
+        for worker_graph in self.worker_graphs.values():
+            for rank in worker_graph.ranks:
+                rank_to_worker_graphs[rank].append(worker_graph)
 
-        self._sorted_ranks = sorted(rank_to_subgraphs.keys())
+        self._sorted_ranks = sorted(rank_to_worker_graphs.keys())
         self.worker_ids = [f"worker_{rank}" for rank in self._sorted_ranks]
 
-        # Per-worker subgraphs, engine configs
-        self._per_worker_subgraphs: dict[str, list[Subgraph]] = {}
+        # Per-worker graph units, engine configs
+        self._per_worker_graphs: dict[str, list[WorkerGraph]] = {}
         self._per_worker_engine_configs: dict[str, list[dict]] = {}
 
         engine_model_cfg = {
@@ -160,13 +160,13 @@ class Conductor:
         }
         for rank in self._sorted_ranks:
             worker_id = f"worker_{rank}"
-            subgraphs = rank_to_subgraphs[rank]
-            self._per_worker_subgraphs[worker_id] = subgraphs
+            worker_graphs = rank_to_worker_graphs[rank]
+            self._per_worker_graphs[worker_id] = worker_graphs
 
             # Collect engine configs: group stages by engine type
             engine_type_to_stages: dict[str, list[str]] = defaultdict(list)
-            for sg in subgraphs:
-                for stage_name in sg.section.get_stage_names():
+            for wg in worker_graphs:
+                for stage_name in wg.section.get_stage_names():
                     etype = stage_engine_types[stage_name].value
                     if stage_name not in engine_type_to_stages[etype]:
                         engine_type_to_stages[etype].append(stage_name)
@@ -180,11 +180,11 @@ class Conductor:
             ]
 
         # Global maps needed by all workers
-        self._all_subgraph_ids_to_phases: dict[str, set[str]] = {
-            sg_id: sg.phases for sg_id, sg in self.subgraphs.items()
+        self._all_worker_graph_ids_to_phases: dict[str, set[str]] = {
+            worker_graph_id: worker_graph.phases for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        self._all_subgraph_ids_to_stages: dict[str, list[str]] = {
-            sg_id: sg.section.get_stage_names() for sg_id, sg in self.subgraphs.items()
+        self._all_worker_graph_ids_to_stages: dict[str, list[str]] = {
+            worker_graph_id: worker_graph.section.get_stage_names() for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
 
     def _launch_workers(self):
@@ -196,10 +196,10 @@ class Conductor:
                 kwargs={
                     "worker_id": worker_id,
                     "worker_ids": self.worker_ids,
-                    "my_subgraphs": self._per_worker_subgraphs[worker_id],
+                    "my_worker_graphs": self._per_worker_graphs[worker_id],
                     "engine_configs": self._per_worker_engine_configs[worker_id],
-                    "all_subgraph_ids_to_phases": self._all_subgraph_ids_to_phases,
-                    "all_subgraph_ids_to_stages": self._all_subgraph_ids_to_stages,
+                    "all_worker_graph_ids_to_phases": self._all_worker_graph_ids_to_phases,
+                    "all_worker_graph_ids_to_stages": self._all_worker_graph_ids_to_stages,
                     "hostname": self.hostname,
                     "socket_path_prefix": self.socket_path_prefix,
                     "model": self.model,
@@ -223,20 +223,20 @@ class Conductor:
             p.join(timeout=5)
         self._worker_processes.clear()
 
-    def _assign_subgraphs_to_workers(self) -> dict[str, str]:
+    def _assign_worker_graphs_to_workers(self) -> dict[str, str]:
         """
-        For a request, assign subgraphs to workers. This is relevant in the
-        data parallel case, where there may be a subgraph that is replicated
+        For a request, assign worker graphs to workers. This is relevant in the
+        data parallel case, where there may be a worker graph that is replicated
         across many workers.
         """
         # Do a random policy for now. TODO: refine this
         return {
-            subgraph_id: f"worker_{np.random.choice(subgraph.ranks)}"
-            for subgraph_id, subgraph in self.subgraphs.items()
+            worker_graph_id: f"worker_{np.random.choice(worker_graph.ranks)}"
+            for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
 
     def _split_inputs_to_workers(
-        self, subgraph_to_worker: dict[str, str],
+        self, worker_graph_to_worker: dict[str, str],
         inputs: list[GraphEdge],
         phase: str
     ) -> dict[str, list[GraphEdge]]:
@@ -246,11 +246,11 @@ class Conductor:
         to that worker. ForwardPassInputs consists of graph edges and tensors.
         """
         inputs_per_worker: dict[str, list[GraphEdge]] = {}
-        for subgraph_id, worker_id in subgraph_to_worker.items():
-            subgraph = self.subgraphs[subgraph_id]
-            if phase not in subgraph.phases:
+        for worker_graph_id, worker_id in worker_graph_to_worker.items():
+            worker_graph = self.worker_graphs[worker_graph_id]
+            if phase not in worker_graph.phases:
                 continue
-            stages = set(subgraph.section.get_stage_names())
+            stages = set(worker_graph.section.get_stage_names())
 
             if worker_id not in inputs_per_worker:
                 inputs_per_worker[worker_id] = []
@@ -262,7 +262,7 @@ class Conductor:
     def _update_request_info(
         self, request_id, args: ForwardPassArgs
     ):
-        self._set_current_subgraph_ids(
+        self._set_current_worker_graph_ids(
             request_id,
             args.full_metadata.phase
         )
@@ -310,20 +310,20 @@ class Conductor:
     ):
         """
         When a new request comes in from the API server, assign workers for each
-        subgraph (for all possible execution phases, e.g., prefill, decode, image_gen),
+        worker graph (for all possible execution phases, e.g., prefill, decode, image_gen),
         and notify the workers that the request has arrived + provide the appropriate
         workers with the appropriate initial inputs for the forward pass
         """
         logger.debug("Conductor ingesting request %s", body.request_id)
-        subgraph_to_worker = self._assign_subgraphs_to_workers()
+        worker_graph_to_worker = self._assign_worker_graphs_to_workers()
         request_data = RequestData(
             current_forward_metadata=None,
             fwd_inputs=[],
             persist_signals=body.initial_signals,
             persist_signal_ref_cnt={},
-            subgraph_to_worker=subgraph_to_worker,
-            all_subgraph_ids=set(subgraph_to_worker.keys()),
-            current_subgraph_ids=set(),
+            worker_graph_to_worker=worker_graph_to_worker,
+            all_worker_graph_ids=set(worker_graph_to_worker.keys()),
+            current_worker_graph_ids=set(),
             new_tokens={},
         )
         self.requests[body.request_id] = request_data
@@ -337,23 +337,23 @@ class Conductor:
         self._update_request_info(body.request_id, fwd_args)
 
         # send data to appropriate workers
-        worker_to_subgraph_ids: dict[str, list[str]] = {}
+        worker_to_worker_graph_ids: dict[str, list[str]] = {}
         inputs_per_worker = self._split_inputs_to_workers(
-            subgraph_to_worker=subgraph_to_worker,
+            worker_graph_to_worker=worker_graph_to_worker,
             inputs=fwd_args.inputs,
             phase=fwd_args.full_metadata.phase
         )
 
-        for subgraph_id, worker_id in subgraph_to_worker.items():
-            if worker_id not in worker_to_subgraph_ids:
-                worker_to_subgraph_ids[worker_id] = []
-            worker_to_subgraph_ids[worker_id].append(subgraph_id)
+        for worker_graph_id, worker_id in worker_graph_to_worker.items():
+            if worker_id not in worker_to_worker_graph_ids:
+                worker_to_worker_graph_ids[worker_id] = []
+            worker_to_worker_graph_ids[worker_id].append(worker_graph_id)
 
-        for worker, subgraph_ids in worker_to_subgraph_ids.items():
+        for worker, worker_graph_ids in worker_to_worker_graph_ids.items():
             message = NewRequest(
                 request_id=body.request_id,
-                subgraph_ids=subgraph_ids,
-                subgraph_to_worker=subgraph_to_worker,
+                worker_graph_ids=worker_graph_ids,
+                worker_graph_to_worker=worker_graph_to_worker,
                 initial_phase=request_data.current_forward_metadata.phase,
                 initial_inputs=inputs_per_worker.get(worker, []),
                 per_request_metadata=fwd_args.step_metadata,
@@ -365,12 +365,12 @@ class Conductor:
                 )
             )
 
-    def _set_current_subgraph_ids(
+    def _set_current_worker_graph_ids(
         self, request_id: str, phase: str
     ):
-        self.requests[request_id].current_subgraph_ids = set([
-            sg for sg in self.requests[request_id].all_subgraph_ids \
-                if phase in self.subgraphs[sg].phases
+        self.requests[request_id].current_worker_graph_ids = set([
+            worker_graph_id for worker_graph_id in self.requests[request_id].all_worker_graph_ids \
+                if phase in self.worker_graphs[worker_graph_id].phases
         ])
 
     def _process_request_done(
@@ -380,7 +380,7 @@ class Conductor:
         Called when we see an EOS token, e.g.
         """
         logger.info("Request %s done", request_id)
-        for worker_id in set(self.requests[request_id].subgraph_to_worker.values()):
+        for worker_id in set(self.requests[request_id].worker_graph_to_worker.values()):
             msg = WorkerMessage(
                 message_type=WorkerMessageType.REMOVE_REQUEST,
                 body=RemoveRequest(request_id)
@@ -432,7 +432,7 @@ class Conductor:
         logger.debug("Forward inputs: %s", str(fwd_args.inputs))
 
         inputs_per_worker = self._split_inputs_to_workers(
-            subgraph_to_worker=request_data.subgraph_to_worker,
+            worker_graph_to_worker=request_data.worker_graph_to_worker,
             inputs=fwd_args.inputs,
             phase=fwd_args.full_metadata.phase
         )
@@ -450,18 +450,19 @@ class Conductor:
             self.communicator.send(worker, message)
 
         request_data.new_tokens = {}
-        request_data.completed_subgraph_ids = set()
+        request_data.completed_worker_graph_ids = set()
         return False
 
-    def _process_subgraphs_done(
-        self, body: SubgraphsDone
+    def _process_worker_graphs_done(
+        self, body: WorkerGraphsDone
     ):
         """
-        When some subgraphs have completed (the worker notifies the conductor that
-        the subgraphs have completed), update the metadata for this request.
+        When some worker graphs have completed (the worker notifies the conductor
+        that the worker graphs have completed), update the metadata for this
+        request.
 
         Return whether the full model forward pass has been completed (i.e., all
-        subgraphs for the current computation phase have been completed)
+        worker graphs for the current computation phase have been completed)
         """
         request_data = self.requests[body.request_id]
 
@@ -474,12 +475,12 @@ class Conductor:
                     request_data.new_tokens[name] = []
                 request_data.new_tokens[name] += body.new_tokens[name]
 
-        request_data.completed_subgraph_ids.update(
-            body.subgraph_ids
+        request_data.completed_worker_graph_ids.update(
+            body.worker_graph_ids
         )
 
-        done_with_forward = request_data.current_subgraph_ids.issubset(
-            request_data.completed_subgraph_ids
+        done_with_forward = request_data.current_worker_graph_ids.issubset(
+            request_data.completed_worker_graph_ids
         )
         return done_with_forward
 
@@ -490,8 +491,8 @@ class Conductor:
                 for message in self.communicator.get_all_new_messages():
                     if message.message_type == ConductorMessageType.NEW_REQUEST:
                         self._ingest_request(message.body)
-                    elif message.message_type == ConductorMessageType.SUBGRAPHS_DONE:
-                        done_with_fwd = self._process_subgraphs_done(
+                    elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
+                        done_with_fwd = self._process_worker_graphs_done(
                             message.body
                         )
                         if done_with_fwd:

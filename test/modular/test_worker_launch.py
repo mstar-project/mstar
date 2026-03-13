@@ -57,8 +57,8 @@ class TestDeriveWorkerInfo:
             ]
             conductor.shutdown()
 
-    def test_per_worker_subgraphs(self):
-        """Verify each worker gets the correct subgraphs assigned to it."""
+    def test_per_worker_worker_graphs(self):
+        """Verify each worker gets the correct worker graphs assigned to it."""
         from mminf.conductor.conductor import Conductor
 
         model = DummyModel()
@@ -66,12 +66,12 @@ class TestDeriveWorkerInfo:
             conductor = Conductor(
                 model=model,
                 model_config_file=CONFIG_PATH,
-                socket_path_prefix=os.path.join(tmpdir, "ipc_subgraphs"),
+                socket_path_prefix=os.path.join(tmpdir, "ipc_worker_graphs"),
             )
-            # Every worker should have at least one subgraph
+            # Every worker should have at least one worker graph
             for worker_id in conductor.worker_ids:
-                assert len(conductor._per_worker_subgraphs[worker_id]) > 0, (
-                    f"{worker_id} has no subgraphs"
+                assert len(conductor._per_worker_graphs[worker_id]) > 0, (
+                    f"{worker_id} has no worker graphs"
                 )
             conductor.shutdown()
 
@@ -95,8 +95,8 @@ class TestDeriveWorkerInfo:
                     assert cfg["engine_type"] in {"ar", "flow", "enc_dec"}
             conductor.shutdown()
 
-    def test_global_subgraph_maps(self):
-        """Verify all_subgraph_ids_to_phases and all_subgraph_ids_to_stages are populated."""
+    def test_global_worker_graph_maps(self):
+        """Verify all_worker_graph_ids_to_phases and all_worker_graph_ids_to_stages are populated."""
         from mminf.conductor.conductor import Conductor
 
         model = DummyModel()
@@ -104,16 +104,16 @@ class TestDeriveWorkerInfo:
             conductor = Conductor(
                 model=model,
                 model_config_file=CONFIG_PATH,
-                socket_path_prefix=os.path.join(tmpdir, "ipc_global"),
+                socket_path_prefix=os.path.join(tmpdir, "ipc_worker_graphs_global"),
             )
-            assert len(conductor._all_subgraph_ids_to_phases) == len(conductor.subgraphs)
-            assert len(conductor._all_subgraph_ids_to_stages) == len(conductor.subgraphs)
+            assert len(conductor._all_worker_graph_ids_to_phases) == len(conductor.worker_graphs)
+            assert len(conductor._all_worker_graph_ids_to_stages) == len(conductor.worker_graphs)
 
-            for sg_id in conductor.subgraphs:
-                assert sg_id in conductor._all_subgraph_ids_to_phases
-                assert sg_id in conductor._all_subgraph_ids_to_stages
-                assert len(conductor._all_subgraph_ids_to_phases[sg_id]) > 0
-                assert len(conductor._all_subgraph_ids_to_stages[sg_id]) > 0
+            for worker_graph_id in conductor.worker_graphs:
+                assert worker_graph_id in conductor._all_worker_graph_ids_to_phases
+                assert worker_graph_id in conductor._all_worker_graph_ids_to_stages
+                assert len(conductor._all_worker_graph_ids_to_phases[worker_graph_id]) > 0
+                assert len(conductor._all_worker_graph_ids_to_stages[worker_graph_id]) > 0
             conductor.shutdown()
 
 

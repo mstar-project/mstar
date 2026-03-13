@@ -16,20 +16,20 @@ def format_graph_edge_list(
 
 @dataclass
 class ProcessedInputs:
-    routed_to_this_subgraph: list[GraphEdge]
-    for_other_subgraphs: list[GraphEdge]
+    routed_to_this_worker_graph: list[GraphEdge]
+    for_other_worker_graphs: list[GraphEdge]
 
 
 @dataclass
 class PerRequestStageQueues:
     """
-    The worker has a list of subgraphs; each subgraph has a list of requests
-    using that subgraph. For every (subgraph, request) pair, we instantiate
+    The worker has a list of worker graphs; each worker graph has a list of requests
+    using that graph. For every (worker graph, request) pair, we instantiate
     one of these queues.
     """
     waiting: GraphSection | None
     ready: list[GraphStage] = field(default_factory=list)
-    subgraph_id: str = field(default="")
+    worker_graph_id: str = field(default="")
 
     def _update_ready_waiting(self):
         """
@@ -49,15 +49,15 @@ class PerRequestStageQueues:
         """
         Processes all outputs that feed into the waiting graph section, and
         return a dictionary of external output graph edges (ones that are feeding
-        to different subgraphs)
+        to different worker graphs)
         """
         # for input in new_inputs:
         #     input._persist_for_loop = False
 
         if self.waiting is None:
             return ProcessedInputs(
-                routed_to_this_subgraph=[],
-                for_other_subgraphs=new_inputs,
+                routed_to_this_worker_graph=[],
+                for_other_worker_graphs=new_inputs,
             )
 
         logger.debug(
@@ -81,6 +81,6 @@ class PerRequestStageQueues:
             str([e.name for e in external_outputs])
         )
         return ProcessedInputs(
-            for_other_subgraphs=external_outputs, # inputs **not** utilized for self.waiting
-            routed_to_this_subgraph=ingested, # inputs utilized for self.waiting
+            for_other_worker_graphs=external_outputs, # inputs **not** utilized for self.waiting
+            routed_to_this_worker_graph=ingested, # inputs utilized for self.waiting
         )

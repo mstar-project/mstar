@@ -69,14 +69,14 @@ class GraphSection(ABC):
     @abstractmethod
     def get_inputs(self) -> list[GraphEdge]:
         """
-        All external or "loop-back" inputs into a subgraph
+        All external or "loop-back" inputs into a worker graph
         """
         pass
 
     @abstractmethod
     def get_outputs(self) -> list[GraphEdge]:
         """
-        All external or "loop-back" outputs from a subgraph
+        All external or "loop-back" outputs from a worker graph
         """
         pass
 

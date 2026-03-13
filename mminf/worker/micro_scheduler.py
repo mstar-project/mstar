@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphStage
 from mminf.worker.engine_manager import EngineManager
-from mminf.worker.stage_manager_utils import SubgraphsManager
+from mminf.worker.stage_manager_utils import WorkerGraphsManager
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class ReadyStageEntry:
     """A ready stage entry for a single request."""
     request_id: str
-    subgraph_id: str
+    worker_graph_id: str
     phase: str
 
 
@@ -37,7 +37,7 @@ PRIORITY = {
 
 class MicroScheduler:
     """
-    Simple MVP scheduler: scans all subgraph queues for ready stages,
+    Simple MVP scheduler: scans all worker graph queues for ready stages,
     groups by stage name, returns the highest-priority group.
     """
 
@@ -45,25 +45,25 @@ class MicroScheduler:
         self.engine_manager = engine_manager
 
     def get_next_batch(
-        self, subgraphs_manager: SubgraphsManager
+        self, worker_graphs_manager: WorkerGraphsManager
     ) -> ScheduledBatch | None:
         """
-        Scans all subgraph queues for ready stages.
+        Scans all worker graph queues for ready stages.
         Groups by stage name. Returns highest-priority group.
         """
         # Collect all ready (stage_name, request_id, phase) tuples
         # grouped by stage name
         stage_name_to_requests: dict[str, list[ReadyStageEntry]] = {}
 
-        for subgraph_id, queue in subgraphs_manager.queues.items():
+        for worker_graph_id, queue in worker_graphs_manager.queues.items():
             ready_map = queue.get_ready_stage_names()
             for request_id, stage_names in ready_map.items():
-                if request_id not in subgraphs_manager.per_request_info:
+                if request_id not in worker_graphs_manager.per_request_info:
                     continue  # request was removed between scheduling cycles
-                phase = subgraphs_manager.get_phase(request_id)
+                phase = worker_graphs_manager.get_phase(request_id)
                 for sname in stage_names:
                     stage_name_to_requests.setdefault(sname, []).append(
-                        ReadyStageEntry(request_id, subgraph_id, phase)
+                        ReadyStageEntry(request_id, worker_graph_id, phase)
                     )
 
         if not stage_name_to_requests:
@@ -91,7 +91,7 @@ class MicroScheduler:
         phase = entries[0].phase
 
         for entry in entries:
-            queue = subgraphs_manager.queues[entry.subgraph_id]
+            queue = worker_graphs_manager.queues[entry.worker_graph_id]
             popped = queue.pop_ready_stages(entry.request_id, [best_stage_name])
             if popped:
                 assert len(popped) == 1
