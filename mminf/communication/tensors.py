@@ -436,7 +436,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             )
 
             for info in graph_ptr.tensor_info:
-                if info.source_entity == self.my_entity_id:
+                if info.source_entity == self.my_entity_id or self.tensor_store.check_uuid_presence(
+                    request_id, info.uuid
+                ): # we already have this tensor!
                     continue
                 buffer = torch.empty(info.dims, dtype=info.dtype, device=device).as_strided(
                     info.dims, stride=info.stride
