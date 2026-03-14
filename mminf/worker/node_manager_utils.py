@@ -8,7 +8,7 @@ from mminf.graph.request_queues import (
     ProcessedInputs,
     format_graph_edge_list,
 )
-from mminf.graph.special_destinations import SPECIAL_DESTINATIONS, EMIT_TO_CLIENT
+from mminf.graph.special_destinations import EMIT_TO_CLIENT, SPECIAL_DESTINATIONS
 from mminf.model.base import WorkerGraph
 
 logger = logging.getLogger(__name__)

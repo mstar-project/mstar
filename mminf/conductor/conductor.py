@@ -18,8 +18,8 @@ from mminf.ipc_formats import (
     NewRequest,
     NewRequestConductor,
     RemoveRequest,
-    WorkerGraphsDone,
     UnpersistTensors,
+    WorkerGraphsDone,
     WorkerMessage,
     WorkerMessageType,
 )
@@ -184,7 +184,8 @@ class Conductor:
             worker_graph_id: worker_graph.graph_walks for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
         self._all_worker_graph_ids_to_nodes: dict[str, list[str]] = {
-            worker_graph_id: worker_graph.section.get_node_names() for worker_graph_id, worker_graph in self.worker_graphs.items()
+            worker_graph_id: worker_graph.section.get_node_names()
+            for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
 
     def _launch_workers(self):

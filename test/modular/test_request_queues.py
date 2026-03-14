@@ -8,7 +8,6 @@ import numpy as np
 
 from mminf.graph.base import GraphEdge, GraphNode, Loop, Parallel, Sequential
 
-
 if __name__ == "__main__":
     # show-o2-style graph with weird stuff added to stress-test
 

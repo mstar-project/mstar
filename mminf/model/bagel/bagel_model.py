@@ -44,8 +44,8 @@ from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import (
     GraphEdge,
-    GraphSection,
     GraphNode,
+    GraphSection,
     Loop,
     Sequential,
     TensorPointerInfo,

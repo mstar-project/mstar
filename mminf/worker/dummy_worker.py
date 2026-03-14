@@ -8,8 +8,8 @@ from mminf.ipc_formats import (
     InputSignals,
     NewRequest,
     RemoveRequest,
-    WorkerGraphsDone,
     TensorReceived,
+    WorkerGraphsDone,
     WorkerMessage,
     WorkerMessageType,
 )

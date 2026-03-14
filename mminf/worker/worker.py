@@ -14,9 +14,9 @@ from mminf.ipc_formats import (
     InputSignals,
     NewRequest,
     RemoveRequest,
-    WorkerGraphsDone,
     TensorReceived,
     UnpersistTensors,
+    WorkerGraphsDone,
     WorkerMessage,
     WorkerMessageType,
 )
