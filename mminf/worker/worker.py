@@ -75,7 +75,7 @@ class Worker:
 
         self.engine_manager = EngineManager.from_config(
             engine_configs=engine_configs, device=device, model=model,
-            nvtx_enabled=self.enable_nvtx
+            enable_nvtx=self.enable_nvtx
         )
         self.scheduler = MicroScheduler(self.engine_manager)
 

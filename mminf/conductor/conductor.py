@@ -31,13 +31,13 @@ logger = logging.getLogger(__name__)
 def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
-    worker_graphs: list[WorkerGraph],
+    my_worker_graphs: list[WorkerGraph],
     engine_configs: list[dict],
     all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
     all_worker_graph_ids_to_nodes: dict[str, list[str]],
     hostname: str,
     socket_path_prefix: str,
-    nvtx_enabled: bool = False,
+    enable_nvtx: bool = False,
     model: Model | None = None,
     device: str = "cuda",
     log_level: str = "INFO",
@@ -52,18 +52,18 @@ def _worker_process_target(
 
     from mminf.worker.worker import Worker
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
-        sum([wg.section.get_node_names() for wg in worker_graphs], start=[])
+        sum([wg.section.get_node_names() for wg in my_worker_graphs], start=[])
     ))
     worker = Worker(
         worker_id=worker_id,
         worker_ids=worker_ids,
-        my_worker_graphs=worker_graphs,
+        my_worker_graphs=my_worker_graphs,
         engine_configs=engine_configs,
         all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
         all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
         hostname=hostname,
         socket_path_prefix=socket_path_prefix,
-        nvtx_enabled=nvtx_enabled,
+        enable_nvtx=enable_nvtx,
         device=torch.device(device),
         model=model,
     )
@@ -110,7 +110,7 @@ class Conductor:
         model_config_file: str,
         socket_path_prefix: str = "/tmp/mminf",
         hostname: str = "localhost",
-        nvtx_enabled: bool = False,
+        enable_nvtx: bool = False,
         log_level: str = "INFO",
     ):
         self.requests: dict[str, RequestData] = {}
@@ -118,7 +118,7 @@ class Conductor:
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
-        self.nvtx_enabled = nvtx_enabled
+        self.enable_nvtx = enable_nvtx
 
         self._worker_processes: list[mp.Process] = []
 
@@ -208,7 +208,7 @@ class Conductor:
                     "hostname": self.hostname,
                     "socket_path_prefix": self.socket_path_prefix,
                     "model": self.model,
-                    "nvtx_enabled": self.nvtx_enabled,
+                    "enable_nvtx": self.enable_nvtx,
                     "device": f"cuda:{rank}",
                     "log_level": self.log_level,
                 },
@@ -494,7 +494,7 @@ class Conductor:
         from mminf.utils.profiler import range_pop, range_push
 
         while True:
-            if self.nvtx_enabled:
+            if self.enable_nvtx:
                 range_push("conductor.run_loop")
 
             try:
@@ -522,7 +522,7 @@ class Conductor:
             except Exception:
                 logger.exception("Conductor error in main loop")
             finally:
-                if self.nvtx_enabled:
+                if self.enable_nvtx:
                     range_pop()
 
             time.sleep(0.001)

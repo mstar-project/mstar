@@ -38,8 +38,8 @@ class NodeOutput:
 
 
 class BaseEngine(ABC):
-    def __init__(self, nvtx_enabled: bool = False):
-        self.nvtx_enabled = nvtx_enabled
+    def __init__(self, enable_nvtx: bool = False):
+        self.enable_nvtx = enable_nvtx
 
     @abstractmethod
     def engine_type(self) -> EngineType:

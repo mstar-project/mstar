@@ -10,8 +10,8 @@ class EncoderDecoderEngine(BaseEngine):
     (ViT encoder, text embedding, VAE decoder).
     """
 
-    def __init__(self, nvtx_enabled: bool = False):
-        super().__init__(nvtx_enabled=nvtx_enabled)
+    def __init__(self, enable_nvtx: bool = False):
+        super().__init__(enable_nvtx=enable_nvtx)
         self.submodules: dict[str, torch.nn.Module] = {}
         self.device = None
 
@@ -28,7 +28,7 @@ class EncoderDecoderEngine(BaseEngine):
         self.device = device
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
-        if self.nvtx_enabled:
+        if self.enable_nvtx:
             range_push(f"engine.enc_dec.{batch.node_name}.{batch.graph_walk}")
 
         submodule = self.submodules.get(batch.node_name)
@@ -37,7 +37,7 @@ class EncoderDecoderEngine(BaseEngine):
             output = NodeOutput(
                 per_request_output_tensors={rid: {} for rid in batch.request_ids}
             )
-            if self.nvtx_enabled:
+            if self.enable_nvtx:
                 range_pop()
             return output
 
@@ -62,7 +62,7 @@ class EncoderDecoderEngine(BaseEngine):
                             outputs[rid] = {}
                 return NodeOutput(per_request_output_tensors=outputs)
         finally:
-            if self.nvtx_enabled:
+            if self.enable_nvtx:
                 range_pop()
 
     def add_request(self, request_id: str) -> None:

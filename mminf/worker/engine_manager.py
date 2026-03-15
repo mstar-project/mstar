@@ -30,7 +30,7 @@ class EngineManager:
         cls,
         engine_configs: list[dict],
         device: torch.device,
-        nvtx_enabled: bool = False,
+        enable_nvtx: bool = False,
         model: Model | None = None,
     ) -> "EngineManager":
         """
@@ -64,10 +64,10 @@ class EngineManager:
             if engine_type_str == "ar":
                 engine = engine_cls(
                     kv_cache_config=model_config.get("kv_cache", {}),
-                    nvtx_enabled=nvtx_enabled,
+                    enable_nvtx=enable_nvtx,
                 )
             else:
-                engine = engine_cls(nvtx_enabled=nvtx_enabled)
+                engine = engine_cls(enable_nvtx=enable_nvtx)
 
             # Extract submodules from the Model for this engine's nodes
             submodules: dict[str, torch.nn.Module] = {}

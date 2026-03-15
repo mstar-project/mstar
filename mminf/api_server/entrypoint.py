@@ -69,7 +69,7 @@ def _conductor_process_target(
         model=model,
         model_config_file=config_path,
         socket_path_prefix=socket_path_prefix,
-        nvtx_enabled=enable_nvtx,
+        enable_nvtx=enable_nvtx,
         log_level=log_level,
     )
     conductor.run()

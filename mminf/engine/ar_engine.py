@@ -335,9 +335,9 @@ class AREngine(BaseEngine):
     def __init__(
         self,
         kv_cache_config: KVCacheConfig | dict,
-        nvtx_enabled: bool = False,
+        enable_nvtx: bool = False,
     ):
-        super().__init__(nvtx_enabled=nvtx_enabled)
+        super().__init__(enable_nvtx=enable_nvtx)
         if isinstance(kv_cache_config, dict):
             kv_cache_config = KVCacheConfig(**kv_cache_config)
         self.submodules: dict[str, torch.nn.Module] = {}
@@ -416,7 +416,7 @@ class AREngine(BaseEngine):
         )
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
-        if self.nvtx_enabled:
+        if self.enable_nvtx:
             range_push(f"engine.ar.{batch.node_name}.{batch.graph_walk}")
 
         submodule = self.submodules.get(batch.node_name)
@@ -424,7 +424,7 @@ class AREngine(BaseEngine):
             output = NodeOutput(
                 per_request_output_tensors={rid: {} for rid in batch.request_ids}
             )
-            if self.nvtx_enabled:
+            if self.enable_nvtx:
                 range_pop()
             return output
 
@@ -448,7 +448,7 @@ class AREngine(BaseEngine):
 
             return NodeOutput(per_request_output_tensors=per_request_outputs)
         finally:
-            if self.nvtx_enabled:
+            if self.enable_nvtx:
                 range_pop()
 
     def add_request(
