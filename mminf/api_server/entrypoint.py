@@ -6,6 +6,8 @@ import collections
 import json
 import logging
 import multiprocessing as mp
+import os
+import signal
 import threading
 import time
 import uuid
@@ -72,7 +74,33 @@ def _conductor_process_target(
         enable_nvtx=enable_nvtx,
         log_level=log_level,
     )
-    conductor.run()
+    try:
+        conductor.run()
+    finally:
+        conductor.shutdown()
+
+
+def _shutdown_conductor_process(
+    conductor_proc: mp.Process,
+    timeout: float = 5.0,
+) -> None:
+    if not conductor_proc.is_alive():
+        return
+
+    try:
+        conductor_proc.send_signal(signal.SIGINT)
+        conductor_proc.join(timeout=timeout)
+    except Exception:
+        logger.exception("Failed graceful conductor shutdown")
+
+    if conductor_proc.is_alive():
+        conductor_proc.terminate()
+        conductor_proc.join(timeout=timeout)
+
+    if conductor_proc.is_alive():
+        if os.name != "nt":
+            conductor_proc.kill()
+            conductor_proc.join(timeout=timeout)
 
 
 # ------------------------------------------------------------------
@@ -547,8 +575,7 @@ def main():
     finally:
         if api_server is not None:
             api_server.cleanup()
-        conductor_proc.terminate()
-        conductor_proc.join(timeout=5)
+        _shutdown_conductor_process(conductor_proc)
 
 
 if __name__ == "__main__":
