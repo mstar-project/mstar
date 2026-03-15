@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import yaml
 
-from mminf.api_server.types import APIServerMessage, RequestComplete
+from mminf.api_server.request_types import APIServerMessage, RequestComplete
 from mminf.communication.communicator import ZMQCommunicator
 from mminf.graph.base import GraphEdge, TensorPointerInfo
 from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, WorkerGraph

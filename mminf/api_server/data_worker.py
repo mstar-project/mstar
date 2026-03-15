@@ -15,7 +15,7 @@ try:
 except (ImportError, RuntimeError):
     VideoDecoder = None
 
-from mminf.api_server.types import PreprocessInput, ResultChunk, ResultTensors
+from mminf.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.model.base import Model

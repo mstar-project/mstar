@@ -2,7 +2,7 @@ import logging
 
 import torch
 
-from mminf.api_server.types import APIServerMessage, ResultTensors
+from mminf.api_server.request_types import APIServerMessage, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.engine.base import NodeBatch, NodeOutput

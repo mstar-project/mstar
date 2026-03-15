@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from mminf.api_server.data_worker import PreprocessWorker
-from mminf.api_server.types import APIServerMessage, PreprocessInput, ResultChunk
+from mminf.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mminf.communication.communicator import ZMQCommunicator
 from mminf.model.registry import HF_MODELS
 
