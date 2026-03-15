@@ -1,25 +1,25 @@
-stage_groups:
-  - stage_names:
+node_groups:
+  - node_names:
       - ThinkerLLM
     ranks:
       - 0
-    phases:
+    graph_walks:
       - prefill
 
-  - stage_names:
+  - node_names:
       - ThinkerLLM
     ranks:
       - 1
-    phases:
+    graph_walks:
       - decode
 
-  - stage_names:
+  - node_names:
       - TalkerLLM
       - MTP
     ranks:
       - 2
 
-  - stage_names:
+  - node_names:
       - AudioCodec
     ranks:
       - 3

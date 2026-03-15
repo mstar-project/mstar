@@ -1,19 +1,19 @@
 model: "bagel"
 max_seq_len: 32768
 
-stage_groups:
-  - stage_names:
+node_groups:
+  - node_names:
       - vit_encoder
     ranks:
       - 0
   
-  - stage_names:
+  - node_names:
       - vae_encoder
       - vae_decoder
     ranks:
       - 0
   
-  - stage_names:
+  - node_names:
       - LLM
     ranks:
       - 1

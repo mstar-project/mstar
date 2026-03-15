@@ -15,7 +15,7 @@ else:
 import torch
 
 from mminf.communication.communicator import BaseCommunicator, CommProtocol
-from mminf.graph.base import GraphPointer, TensorPointerInfo
+from mminf.graph.base import GraphEdge, TensorPointerInfo
 from mminf.ipc_formats import TensorReceived, WorkerMessage, WorkerMessageType
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EventAndPointers:
     event: torch.cuda.Event
-    pointers: list[GraphPointer]
+    graph_edges: list[GraphEdge]
     request_id: str = ""
 
 
@@ -115,10 +115,10 @@ class TensorCommunicationManager(ABC):
     @abstractmethod
     def store_and_populate_graph_edges(
         self, request_id: str, tensors: NameToTensorList,
-        graph_pointers: list[GraphPointer]
+        graph_edges: list[GraphEdge]
     ):
         """
-        Updates graph_pointers with required tensor info (addresses, datatypes,
+        Updates graph_edges with required tensor info (addresses, datatypes,
         num bytes, etc.) and UUID.
         """
         pass
@@ -157,7 +157,7 @@ class TensorCommunicationManager(ABC):
 
     @abstractmethod
     def start_read_tensors(
-        self, request_id: str, graph_pointers: list[GraphPointer]
+        self, request_id: str, graph_edges: list[GraphEdge]
     ) -> list[int]:
         """
         Initializes empty buffer, initializes a read. May return immediately.
@@ -165,9 +165,9 @@ class TensorCommunicationManager(ABC):
         pass
 
     @abstractmethod
-    def get_ready_tensors(self) -> dict[str, list[GraphPointer]]: # uuid based
+    def get_ready_tensors(self) -> dict[str, list[GraphEdge]]: # uuid based
         """
-        Returns request_id: list of the GraphPointers that are currently
+        Returns request_id: list of the GraphEdges that are currently
         ready for that request
 
         Returns a list of local addresses for the tensors being read.
@@ -276,34 +276,34 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
     def store_and_populate_graph_edges(
         self, request_id: str,
         tensors: NameToTensorList,
-        graph_pointers: list[GraphPointer]
+        graph_edges: list[GraphEdge]
     ):
-        # get tensor name to graph pointers
-        name_to_pointers: dict[str, list[GraphPointer]] = {}
-        for pointer in graph_pointers:
-            if pointer.name not in name_to_pointers:
-                name_to_pointers[pointer.name] = []
-            name_to_pointers[pointer.name].append(pointer)
+        # get tensor name to graph edges
+        name_to_graph_edges: dict[str, list[GraphEdge]] = {}
+        for edge in graph_edges:
+            if edge.name not in name_to_graph_edges:
+                name_to_graph_edges[edge.name] = []
+            name_to_graph_edges[edge.name].append(edge)
 
-        pointer_info = self.store_and_return_tensor_info(
+        graph_node_info = self.store_and_return_tensor_info(
             request_id=request_id, tensors=tensors
         )
 
         for name in tensors:
             logger.debug(
-                "Storing tensor %s (uuids %s) for stages %s",
-                name, str([info.uuid for info in pointer_info[name]]),
-                str([edge.name for edge in name_to_pointers.get(name, [])])
+                "Storing tensor %s (uuids %s) for nodes %s",
+                name, str([info.uuid for info in graph_node_info[name]]),
+                str([edge.name for edge in name_to_graph_edges.get(name, [])])
             )
-            edges = name_to_pointers.get(name, [])
-            for info in pointer_info[name]:
+            edges = name_to_graph_edges.get(name, [])
+            for info in graph_node_info[name]:
                 self.tensor_store.increment_ref(
                     request_id, info.uuid, n=len([
-                        e for e in edges if e.next_stage != EMPTY_DESTINATION
+                        graph_edge for graph_edge in edges if graph_edge.next_node != EMPTY_DESTINATION
                     ]) # number of nodes it will be sent to
                 )
-            for pointer in edges:
-                pointer.tensor_info = pointer_info[name]
+            for edge in edges:
+                edge.tensor_info = graph_node_info[name]
 
     def _cleanup_by_uuid(
         self, request_id: str, uuid: str
@@ -338,13 +338,13 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         self.tensor_store.increment_ref(request_id, uuid, n=n)
 
     def _collect_and_send_acks(
-        self, request_id: str, graph_pointers: list[GraphPointer]
+        self, request_id: str, graph_edges: list[GraphEdge]
     ):
         # Collect ACKs to send: entity_id -> {UUID -> count}
         acks:  dict[str, dict[str, int]] = {}
 
-        for ptr in graph_pointers:
-            for info in ptr.tensor_info:
+        for edge in graph_edges:
+            for info in edge.tensor_info:
                 if info.source_entity not in acks:
                     acks[info.source_entity] = {}
                 acks[info.source_entity][info.uuid] = acks[info.source_entity].get(
@@ -380,7 +380,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         # remove pending transfers but send ACKs
         self._collect_and_send_acks(
             request_id, sum([
-                ep.pointers for ep in self.pending if ep.request_id == request_id
+                ep.graph_edges for ep in self.pending if ep.request_id == request_id
             ], start=[])
         )
         self.pending = [
@@ -392,31 +392,31 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             request_id=request_id, uuid=uuid
         )
 
-    def get_ready_tensors(self) -> dict[str, list[GraphPointer]]:
+    def get_ready_tensors(self) -> dict[str, list[GraphEdge]]:
         """
-        Poll CUDA events. Return {request_id: [ready GraphPointers]}.
+        Poll CUDA events. Return {request_id: [ready GraphEdges]}.
         Remove completed entries from self.pending.
         Sends TENSOR_RECEIVED ACKs back to senders so they can free buffers.
         """
 
-        # request_id -> ready graph pointers
-        ready: dict[str, list[GraphPointer]] = {}
+        # request_id -> ready graph edges
+        ready: dict[str, list[GraphEdge]] = {}
         still_pending = []
 
         for ep in self.pending:
             if ep.event.query():
-                for ptr in ep.pointers:
-                    ready.setdefault(ep.request_id, []).append(ptr)
+                for edge in ep.graph_edges:
+                    ready.setdefault(ep.request_id, []).append(edge)
                     logger.debug(
                         "Finished reading in %d tensors %s for graph node %s",
-                        len(ptr.tensor_info), ptr.name, ptr.next_stage
+                        len(edge.tensor_info), edge.name, edge.next_node
                     )
             else:
                 still_pending.append(ep)
         self.pending = still_pending
-        for req_id, ptrs in ready.items():
-            self._collect_and_send_acks(req_id, ptrs)
-            for edge in ptrs:
+        for req_id, edges in ready.items():
+            self._collect_and_send_acks(req_id, edges)
+            for edge in edges:
                 for info in edge.tensor_info:
                     self.tensor_store.dereference(
                         req_id, info.uuid, 1
@@ -425,25 +425,25 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         return ready
 
     def start_read_tensors(
-        self, request_id: str, graph_pointers: list[GraphPointer],
+        self, request_id: str, graph_edges: list[GraphEdge],
         device: str="cuda"
     ):
         """
-        For each pointer with tensor_info (RDMA source): allocate dst tensor,
+        For each edge with tensor_info (RDMA source): allocate dst tensor,
         register memory, call engine.transfer_read_on_cuda(), record CUDA event.
-        For each pointer WITHOUT tensor_info (signal-only): no data to transfer.
+        For each edge WITHOUT tensor_info (signal-only): no data to transfer.
         """
         stream = torch.cuda.Stream()
-        for graph_ptr in graph_pointers:
-            if len(graph_ptr.tensor_info) == 0:
-                continue  # signal-only pointer, no data to transfer
+        for graph_edge in graph_edges:
+            if len(graph_edge.tensor_info) == 0:
+                continue  # signal-only edge, no data to transfer
 
             logger.debug(
                 "Starting to read in %d tensors %s for graph node %s",
-                len(graph_ptr.tensor_info), graph_ptr.name, graph_ptr.next_stage
+                len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node
             )
 
-            for info in graph_ptr.tensor_info:
+            for info in graph_edge.tensor_info:
                 if info.source_entity == self.my_entity_id or self.tensor_store.check_uuid_presence(
                     request_id, info.uuid
                 ): # we already have this tensor!
@@ -489,6 +489,6 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             event.record(stream)
             self.pending.append(
                 EventAndPointers(
-                    event=event, pointers=[graph_ptr], request_id=request_id
+                    event=event, graph_edges=[graph_edge], request_id=request_id
                 )
             )

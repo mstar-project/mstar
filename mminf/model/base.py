@@ -11,29 +11,29 @@ import yaml
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
-from mminf.graph.base import GraphPointer, GraphSection, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
+from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 
 
-class StageSubmodule(torch.nn.Module):
+class NodeSubmodule(torch.nn.Module):
     """
-    Base class for stage wrapper submodules.
+    Base class for node wrapper submodules.
 
     Separates preprocessing (variable-length list[Tensor] → fixed Tensor)
     from computation (Tensor → NameToTensorList), enabling torch.compile
     and CUDA graphs on the forward() path.
 
     Engine call pattern:
-        preprocessed = submodule.preprocess(phase, **inputs)  # list → tensors
+        preprocessed = submodule.preprocess(graph_walk, **inputs)  # list → tensors
         result = submodule(**preprocessed)                     # tensor → tensor (compilable)
     """
 
-    def preprocess(self, phase: str, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+    def preprocess(self, graph_walk: str, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
         """
         Convert variable-length list[Tensor] inputs to fixed tensors.
         NOT compiled — handles Python-level variability.
 
         Default: assert each input has exactly 1 tensor and unwrap it.
-        Override for stages that handle multiple tensors (e.g., stacking images).
+        Override for nodes that handle multiple tensors (e.g., stacking images).
         """
         return {k: v[0] for k, v in inputs.items()}
 
@@ -47,13 +47,13 @@ class StageSubmodule(torch.nn.Module):
 
 
 @dataclass
-class Subgraph:
+class WorkerGraph:
     section: GraphSection
-    phases: set[str] # e.g., prefill, decode, image_gen
+    graph_walks: set[str] # e.g., prefill, decode, image_gen
     consumes_stream: bool = field(default=False)
     ranks: list[int] = field(default_factory=list)
-    _group_id: int = field(default=-1) # used in going from config yaml to subgraphs
-    subgraph_id: str = field(default_factory=lambda: str(uuid4()))
+    _group_id: int = field(default=-1) # used in going from config yaml to worker graphs
+    worker_graph_id: str = field(default_factory=lambda: str(uuid4()))
 
 
 def _combine_sections_sequential_or_parallel(
@@ -72,92 +72,92 @@ def _combine_sections_sequential_or_parallel(
     return comb_type([section, other])
 
 
-def _divide_into_subgraphs(
+def _divide_into_worker_graphs(
     graph: GraphSection,
-    phase: str,
-    stage_to_group_idx: dict[str, int],
-    stage_groups: list[dict]
-) -> list[Subgraph]:
+    graph_walk: str,
+    node_to_group_idx: dict[str, int],
+    node_groups: list[dict]
+) -> list[WorkerGraph]:
     """
-    Given a graph, break it into subgraphs
+    Given a graph, break it into worker graphs
     """
-    if isinstance(graph, GraphStage):
-        return [Subgraph(
+    if isinstance(graph, GraphNode):
+        return [WorkerGraph(
             section=graph,
-            phases=set([phase]),
+            graph_walks=set([graph_walk]),
             consumes_stream=graph.consumes_stream,
-            _group_id=stage_to_group_idx[graph.name],
-            ranks=stage_groups[stage_to_group_idx[graph.name]]["ranks"]
+            _group_id=node_to_group_idx[graph.name],
+            ranks=node_groups[node_to_group_idx[graph.name]]["ranks"]
         )]
 
     if isinstance(graph, Sequential):
-        subgraphs = _divide_into_subgraphs(
+        worker_graphs = _divide_into_worker_graphs(
             graph.sections[0],
-            phase=phase,
-            stage_to_group_idx=stage_to_group_idx,
-            stage_groups=stage_groups
+            graph_walk=graph_walk,
+            node_to_group_idx=node_to_group_idx,
+            node_groups=node_groups
         )
 
         for i in range(1, len(graph.sections)):
             # Go through it sequentially and merge adjacent sections
             # that are on the same device
-            new_subgraphs = _divide_into_subgraphs(
+            new_worker_graphs = _divide_into_worker_graphs(
                 graph.sections[i],
-                phase=phase,
-                stage_to_group_idx=stage_to_group_idx,
-                stage_groups=stage_groups
+                graph_walk=graph_walk,
+                node_to_group_idx=node_to_group_idx,
+                node_groups=node_groups
             )
-            if new_subgraphs[0]._group_id == subgraphs[-1]._group_id and \
-                    not new_subgraphs[0].consumes_stream:
-                subgraphs[-1].section = _combine_sections_sequential_or_parallel(
-                    subgraphs[-1].section, new_subgraphs.pop(0).section,
+            if new_worker_graphs[0]._group_id == worker_graphs[-1]._group_id and \
+                    not new_worker_graphs[0].consumes_stream:
+                worker_graphs[-1].section = _combine_sections_sequential_or_parallel(
+                    worker_graphs[-1].section, new_worker_graphs.pop(0).section,
                     comb_type=Sequential
                 )
-            subgraphs.extend(new_subgraphs)
-        return subgraphs
+            worker_graphs.extend(new_worker_graphs)
+        return worker_graphs
 
     if isinstance(graph, Parallel):
-        all_subgraphs = [
-            _divide_into_subgraphs(
-                s, phase=phase,
-                stage_to_group_idx=stage_to_group_idx,
-                stage_groups=stage_groups
+        all_worker_graphs = [
+            _divide_into_worker_graphs(
+                s, graph_walk=graph_walk,
+                node_to_group_idx=node_to_group_idx,
+                node_groups=node_groups
             ) for s in graph.sections
         ]
         # parallel sections that are all on the same worker can be merged
-        singleton_subgraphs = [
-            s[0] for s in all_subgraphs if len(s) == 1 and not s[0].consumes_stream
+        singleton_worker_graphs = [
+            s[0] for s in all_worker_graphs if len(s) == 1 and not s[0].consumes_stream
         ]
-        group_id_to_subgraph = {}
-        for s in singleton_subgraphs:
-            if s._group_id in group_id_to_subgraph:
-                existing = group_id_to_subgraph[s._group_id]
+        group_id_to_worker_graph = {}
+        for s in singleton_worker_graphs:
+            if s._group_id in group_id_to_worker_graph:
+                existing = group_id_to_worker_graph[s._group_id]
                 existing.section = _combine_sections_sequential_or_parallel(
                     existing.section, s.section,
                     comb_type=Parallel
                 )
             else:
-                group_id_to_subgraph[s._group_id] = s
+                group_id_to_worker_graph[s._group_id] = s
 
-        return list(group_id_to_subgraph.values()) + sum([
-            s for s in all_subgraphs if len(s) > 1 or s[0].consumes_stream
-        ], start=[]) # remaining subgraphs
+        return list(group_id_to_worker_graph.values()) + sum([
+            s for s in all_worker_graphs if len(s) > 1 or s[0].consumes_stream
+        ], start=[]) # remaining worker graphs
 
     if isinstance(graph, Loop):
-        loop_section_subgraphs = _divide_into_subgraphs(
+        loop_section_worker_graphs = _divide_into_worker_graphs(
             graph.section,
-            phase=phase,
-            stage_to_group_idx=stage_to_group_idx,
-            stage_groups=stage_groups
+            graph_walk=graph_walk,
+            node_to_group_idx=node_to_group_idx,
+            node_groups=node_groups
         )
-        if len(loop_section_subgraphs) == 1:
+        if len(loop_section_worker_graphs) == 1:
             # fully colocated case
-            loop_section_subgraphs[0].section = graph
-            return loop_section_subgraphs
+            loop_section_worker_graphs[0].section = graph
+            return loop_section_worker_graphs
 
-        # in the disaggregated case, we need to wrap all subgraphs in a loop
+        # in the disaggregated case, we need to wrap all worker graphs in a loop
         # with the external signals and loop-back signals pre-computed
-        for s in loop_section_subgraphs:
+        for s in loop_section_worker_graphs:
             s.section = Loop(
                 section=s.section,
                 n_iters=graph.n_iters,
@@ -166,7 +166,7 @@ def _divide_into_subgraphs(
                 loop_back_signals=graph.loop_back_signals,
                 outputs=graph.outputs
             )
-        return loop_section_subgraphs
+        return loop_section_worker_graphs
 
 
 @dataclass
@@ -177,7 +177,7 @@ class CurrentForwardMetadata:
     """
     input_modalities: list[str]
     output_modalities: list[str]
-    phase: str
+    graph_walk: str
     is_prefill: bool
     kwargs: dict = field(default_factory=dict)
 
@@ -186,10 +186,10 @@ class CurrentForwardMetadata:
 class ForwardPassArgs:
     # full_metadata is at the conductor level
     full_metadata: CurrentForwardMetadata
-    inputs: list[GraphPointer]
+    inputs: list[GraphEdge]
 
     # de_persist_tensors are tensors that will be used for the final time and
-    # not go into future graph stages
+    # not go into future graph nodes
     unpersist_tensors: list[TensorPointerInfo]
 
     # e.g., saw EOS or max tokens. Is used to end the request
@@ -201,36 +201,39 @@ class ForwardPassArgs:
 
 
 class Model(ABC):
-    def _get_subgraphs_for_phase(
-        self, phase_name: str, graph: GraphSection,
-        stage_groups: list[dict],
+    def _get_worker_graphs_for_graph_walk(
+        self, graph_walk: str, graph: GraphSection,
+        node_groups: list[dict],
     ):
-        stage_groups = [
-            g for g in stage_groups if (
-                "phases" not in g or phase_name in g["phases"]
+        node_groups = [
+            g for g in node_groups if (
+                "graph_walks" not in g or graph_walk in g["graph_walks"]
             )
         ]
-        stage_to_group_idx: dict[str, int] = {}
-        for i, group in enumerate(stage_groups):
-            stage_to_group_idx.update({
-                name: i for name in group["stage_names"]
+        node_to_group_idx: dict[str, int] = {}
+        for i, group in enumerate(node_groups):
+            node_to_group_idx.update({
+                name: i for name in group["node_names"]
             })
 
-        return _divide_into_subgraphs(
+        return _divide_into_worker_graphs(
             graph,
-            phase=phase_name,
-            stage_to_group_idx=stage_to_group_idx,
-            stage_groups=stage_groups
+            graph_walk=graph_walk,
+            node_to_group_idx=node_to_group_idx,
+            node_groups=node_groups
         )
 
-    def get_subgraphs(self, config_path: str) -> list[Subgraph]:
+    def get_worker_graphs(self, config_path: str) -> list[WorkerGraph]:
         with open(config_path, "r") as f:
-            stage_groups = yaml.safe_load(f)["stage_groups"]
+            config = yaml.safe_load(f)
+        node_groups = config.get("node_groups")
+        if node_groups is None:
+            raise KeyError("Config must define `node_groups`.")
 
-        # TODO: merge identical subgraphs from different phases
+        # TODO: merge identical worker graphs from different graph walks
         return sum([
-            self._get_subgraphs_for_phase(phase, graph, stage_groups) \
-                for phase, graph in self.get_phase_graphs().items()
+            self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups) \
+                for graph_walk, graph in self.get_graph_walk_graphs().items()
         ], start=[])
 
     @abstractmethod
@@ -238,12 +241,12 @@ class Model(ABC):
         pass
 
     @abstractmethod
-    def get_phase_graphs(self) -> dict[str, GraphSection]:
+    def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         pass
 
     @abstractmethod
-    def get_stage_engine_types(self) -> dict[str, EngineType]:
-        """Returns stage_name -> EngineType enum."""
+    def get_node_engine_types(self) -> dict[str, EngineType]:
+        """Returns node_name -> EngineType enum."""
         pass
 
     @abstractmethod
@@ -317,9 +320,9 @@ class Model(ABC):
         return output.cpu().numpy().tobytes()
 
     @abstractmethod
-    def get_submodule(self, stage_name: str, device="cpu") -> torch.nn.Module | None:
+    def get_submodule(self, node_name: str, device="cpu") -> torch.nn.Module | None:
         """
-        Return the nn.Module for this stage, or None for dummy mode.
+        Return the nn.Module for this node, or None for dummy mode.
         The engine calls this (via EngineManager) to get the submodule it
         will execute directly with engine-specific wrapping (KV cache,
         FlashInfer, etc.).

@@ -1,7 +1,7 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 
-from mminf.graph.base import GraphPointer, TensorPointerInfo
+from mminf.graph.base import GraphEdge, TensorPointerInfo
 
 
 class Status(Enum):
@@ -35,10 +35,10 @@ class WorkerMessageType(Enum):
 @dataclass
 class NewRequest(MessageBody):
     request_id: str
-    subgraph_ids: list[str]
-    subgraph_to_worker: dict[str, str]
-    initial_phase: str
-    initial_inputs: list[GraphPointer]
+    worker_graph_ids: list[str]
+    worker_graph_to_worker: dict[str, str]
+    initial_graph_walk: str
+    initial_inputs: list[GraphEdge]
     per_request_metadata: dict = field(default_factory=dict)
 
 
@@ -50,15 +50,15 @@ class RemoveRequest(MessageBody):
 @dataclass
 class InputSignals(MessageBody):
     request_id: str
-    phase: str
-    inputs: list[GraphPointer]
+    graph_walk: str
+    inputs: list[GraphEdge]
     per_request_metadata: dict = field(default_factory=dict)
 
 
 @dataclass
 class TensorReceived(MessageBody):
     request_id: str
-    successful_tensors: dict[str, int] # uuid -> graph pointer count
+    successful_tensors: dict[str, int] # uuid -> graph edge count
     failed_tensor_ids: list[str] # uuids
 
 
@@ -79,7 +79,7 @@ class WorkerMessage:
 
 class ConductorMessageType(Enum):
     NEW_REQUEST = "new_request"
-    SUBGRAPHS_DONE = "subgraphs_done"
+    WORKER_GRAPHS_DONE = "worker_graphs_done"
 
 
 @dataclass
@@ -93,9 +93,9 @@ class NewRequestConductor(MessageBody):
 
 
 @dataclass
-class SubgraphsDone(MessageBody):
+class WorkerGraphsDone(MessageBody):
     request_id: str
-    subgraph_ids: list[str]
+    worker_graph_ids: list[str]
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
 

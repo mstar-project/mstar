@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class EngineManager:
-    """Maps stage names to engine instances."""
-    stage_to_engine: dict[str, BaseEngine] = field(default_factory=dict)
+    """Maps node names to engine instances."""
+    node_to_engine: dict[str, BaseEngine] = field(default_factory=dict)
 
     @classmethod
     def from_config(
@@ -36,22 +36,26 @@ class EngineManager:
         Build an EngineManager from a list of engine configs.
 
         The Model object (if provided) supplies nn.Module submodules for
-        each stage via model.get_submodule(stage_name). In dummy mode
+        each node via model.get_submodule(node_name). In dummy mode
         (model=None or get_submodule returns None), engines run without
         real computation.
 
         engine_configs example:
         [
-            {"engine_type": "ar", "stage_names": ["LLM"], "model_config": {...}},
-            {"engine_type": "flow", "stage_names": ["flow"], "model_config": {...}},
-            {"engine_type": "enc_dec", "stage_names": ["text_emb", "image_emb", "VAE_dec"], ...}
+            {"engine_type": "ar", "node_names": ["LLM"], "model_config": {...}},
+            {"engine_type": "flow", "node_names": ["flow"], "model_config": {...}},
+            {"engine_type": "enc_dec", "node_names": ["text_emb", "image_emb", "VAE_dec"], ...}
         ]
         """
-        stage_to_engine: dict[str, BaseEngine] = {}
+        node_to_engine: dict[str, BaseEngine] = {}
 
         for cfg in engine_configs:
             engine_type_str = cfg["engine_type"]
-            stage_names = cfg["stage_names"]
+            if "node_names" not in cfg:
+                raise KeyError(
+                    f"Engine config missing `node_names`: {cfg}"
+                )
+            node_names = cfg["node_names"]
             model_config = cfg.get("model_config", {})
 
             engine_cls = ENGINE_TYPE_TO_CLASS[engine_type_str]
@@ -63,10 +67,10 @@ class EngineManager:
             else:
                 engine = engine_cls()
 
-            # Extract submodules from the Model for this engine's stages
+            # Extract submodules from the Model for this engine's nodes
             submodules: dict[str, torch.nn.Module] = {}
             if model is not None:
-                for name in stage_names:
+                for name in node_names:
                     submodule = model.get_submodule(name, device)
                     if submodule is not None:
                         submodules[name] = submodule.to(device=device, dtype=torch.bfloat16)
@@ -74,19 +78,19 @@ class EngineManager:
             engine.load_model(submodules, model_config, device)
             logger.info("Engine %s loaded in on device %s", cfg["engine_type"], str(device))
 
-            for name in stage_names:
-                stage_to_engine[name] = engine
+            for name in node_names:
+                node_to_engine[name] = engine
         logger.info("All engines loaded on device %s", str(device))
 
-        return cls(stage_to_engine=stage_to_engine)
+        return cls(node_to_engine=node_to_engine)
 
-    def get_engine(self, stage_name: str) -> BaseEngine:
-        return self.stage_to_engine[stage_name]
+    def get_engine(self, node_name: str) -> BaseEngine:
+        return self.node_to_engine[node_name]
 
     def add_request(self, request_id: str) -> None:
         """Propagate add_request to all unique engines."""
         seen = set()
-        for engine in self.stage_to_engine.values():
+        for engine in self.node_to_engine.values():
             eid = id(engine)
             if eid not in seen:
                 seen.add(eid)
@@ -95,7 +99,7 @@ class EngineManager:
     def remove_request(self, request_id: str) -> None:
         """Propagate remove_request to all unique engines."""
         seen = set()
-        for engine in self.stage_to_engine.values():
+        for engine in self.node_to_engine.values():
             eid = id(engine)
             if eid not in seen:
                 seen.add(eid)
@@ -103,7 +107,7 @@ class EngineManager:
 
     def shutdown(self) -> None:
         seen = set()
-        for engine in self.stage_to_engine.values():
+        for engine in self.node_to_engine.values():
             eid = id(engine)
             if eid not in seen:
                 seen.add(eid)

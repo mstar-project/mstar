@@ -6,21 +6,21 @@ SigLIP2 ViT for image understanding, and FLUX VAE for image generation.
 The LLM itself serves as the denoiser for rectified flow image generation
 (no separate diffusion model).
 
-Architecture (4 stages):
+Architecture (4 nodes):
     vit_encoder   (enc_dec) - SigLIP2 ViT + connector + pos embed
     vae_encoder   (enc_dec) - VAE encode + patchify + projection
-    LLM           (ar)      - Fat stage: embed + Qwen2 + lm_head + CFG + Euler
+    LLM           (ar)      - Fat node: embed + Qwen2 + lm_head + CFG + Euler
     vae_decoder   (enc_dec) - VAE decode to pixels
 
-Phases (5):
+Graph walks (5):
     prefill_text  - Text token embedding + LLM prefill (causal)
     prefill_vit   - ViT encoding + LLM prefill (bidirectional for images)
     prefill_vae   - VAE encoding + LLM prefill (bidirectional for images)
     decode        - Autoregressive text generation
     image_gen     - Flow matching loop (3-pass CFG + Euler) + VAE decode
 
-The LLM stage absorbs text_emb, lm_head, and flow_proj because they are
-always colocated on the same GPU. Keeping them as separate graph stages
+The LLM node absorbs text_emb, lm_head, and flow_proj because they are
+always colocated on the same GPU. Keeping them as separate graph nodes
 would add unnecessary IPC overhead. CFG requires 3 LLM forward passes +
 velocity combination, which is easier as one atomic operation.
 
@@ -43,14 +43,14 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import (
-    GraphPointer,
+    GraphEdge,
+    GraphNode,
     GraphSection,
-    GraphStage,
     Loop,
     Sequential,
     TensorPointerInfo,
 )
-from mminf.graph.special_destinations import STREAM_OUT
+from mminf.graph.special_destinations import EMIT_TO_CLIENT
 from mminf.model.bagel.components.autoencoder import BagelAutoEncoder
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
@@ -58,7 +58,7 @@ from mminf.model.bagel.components.tokenization import BagelTokenizer, add_specia
 from mminf.model.bagel.components.vit_encoder import BagelVisionModel
 from mminf.model.bagel.config import load_bagel_config
 from mminf.model.bagel.submodules import LLMSubmodule, VAEDecoderSubmodule, VAEEncoderSubmodule, ViTEncoderSubmodule
-from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, StageSubmodule
+from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.utils import ModuleAndPrefix, load_weights_from_file
 
 logger = logging.getLogger(__name__)
@@ -90,20 +90,20 @@ class BagelModel(Model):
     The LLM serves as both the autoregressive text model and the denoiser
     for rectified flow image generation (no separate diffusion model).
 
-    Stages (4):
+    Nodes (4):
         vit_encoder   (enc_dec) - SigLIP2 ViT + connector + pos embed
         vae_encoder   (enc_dec) - VAE encode + patchify + projection
-        LLM           (ar)      - Fat stage: embed + Qwen2 + lm_head + CFG
+        LLM           (ar)      - Fat node: embed + Qwen2 + lm_head + CFG
         vae_decoder   (enc_dec) - VAE decode to pixels
 
-    Phases (5):
+    Graph walks (5):
         prefill_text  - Text token embedding + LLM prefill (causal)
         prefill_vit   - ViT encoding + LLM prefill (bidirectional)
         prefill_vae   - VAE encoding + LLM prefill (bidirectional)
         decode        - Autoregressive text generation
         image_gen     - Flow matching loop (3-pass CFG + Euler) + VAE decode
 
-    Phase transitions are schedule-driven (no BOI token detection). The
+    Graph walk transitions are schedule-driven (no BOI token detection). The
     output mode is known upfront from the API request's output_modalities.
     Prefill steps are constructed as a sequential schedule that walks
     through interleaved text and image inputs.
@@ -133,7 +133,7 @@ class BagelModel(Model):
         # get_submodule(). A worker only instantiates the submodules it
         # actually needs (e.g., a worker running only vit_encoder never
         # creates the LLMSubmodule).
-        self._submodule_cache: dict[str, StageSubmodule | None] = {}
+        self._submodule_cache: dict[str, NodeSubmodule | None] = {}
         self.language_model = None
         self.llm2vae = None
         self.vae_model = None
@@ -262,10 +262,10 @@ class BagelModel(Model):
     # Lazy submodule initialization
     # -----------------------------------------------------------------------
 
-    def _create_submodule(self, stage_name: str, device: str) -> StageSubmodule | None:
+    def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
         """Create a submodule wrapper on first access."""
-        logger.debug("Creating submodule for BAGEL model stage %s", stage_name)
-        if stage_name == "LLM":
+        logger.debug("Creating submodule for BAGEL model node %s", node_name)
+        if node_name == "LLM":
             self._init_language_model_components(device)
             return LLMSubmodule(
                 language_model=self.language_model,
@@ -279,7 +279,7 @@ class BagelModel(Model):
                 bos_token_id=self.bos_token_id,
                 eos_token_id=self.eos_token_id
             )
-        elif stage_name == "vit_encoder":
+        elif node_name == "vit_encoder":
             self._init_vit_components(device)
             return ViTEncoderSubmodule(
                 vit_model=self.vit_model,
@@ -288,7 +288,7 @@ class BagelModel(Model):
                 vit_patch_size=self.config.vit_config.patch_size,
                 vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side
             )
-        elif stage_name == "vae_encoder":
+        elif node_name == "vae_encoder":
             self._init_vae_components(device)
             return VAEEncoderSubmodule(
                 vae_model=self.vae_model,
@@ -300,7 +300,7 @@ class BagelModel(Model):
                 latent_downsample=self.config.latent_downsample,
                 max_latent_size=self.config.max_latent_size,
             )
-        elif stage_name == "vae_decoder":
+        elif node_name == "vae_decoder":
             self._init_vae_components(device)
             return VAEDecoderSubmodule(
                 vae_model=self.vae_model,
@@ -382,15 +382,15 @@ class BagelModel(Model):
             num_qo_heads=self.config.num_attention_heads,
         )
 
-    def get_submodule(self, stage_name: str, device: str="cpu") -> torch.nn.Module | None:
-        if stage_name in self._submodule_cache:
-            return self._submodule_cache[stage_name]
-        submodule = self._create_submodule(stage_name, device)
-        logger.info(f"Successfully loaded in BAGEL submodule for {stage_name}")
-        self._submodule_cache[stage_name] = submodule
+    def get_submodule(self, node_name: str, device: str="cpu") -> torch.nn.Module | None:
+        if node_name in self._submodule_cache:
+            return self._submodule_cache[node_name]
+        submodule = self._create_submodule(node_name, device)
+        logger.info(f"Successfully loaded in BAGEL submodule for {node_name}")
+        self._submodule_cache[node_name] = submodule
         return submodule
 
-    def get_stage_engine_types(self) -> dict[str, EngineType]:
+    def get_node_engine_types(self) -> dict[str, EngineType]:
         return {
             "vit_encoder": EngineType.ENC_DEC,
             "vae_encoder": EngineType.ENC_DEC,
@@ -398,10 +398,10 @@ class BagelModel(Model):
             "vae_decoder": EngineType.ENC_DEC,
         }
 
-    def get_phase_graphs(self) -> dict[str, GraphSection]:
-        # -- prefill_text: just the LLM stage (text embedding is internal) --
-        # No output needed — conductor is notified when the subgraph completes.
-        prefill_text = GraphStage(
+    def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
+        # -- prefill_text: just the LLM node (text embedding is internal) --
+        # No output needed — conductor is notified when the worker graph completes.
+        prefill_text = GraphNode(
             name="LLM",
             input_ids=["text_inputs"],
             outputs=[],
@@ -409,14 +409,14 @@ class BagelModel(Model):
 
         # -- prefill_vit: ViT encoder -> LLM --
         prefill_vit = Sequential([
-            GraphStage(
+            GraphNode(
                 name="vit_encoder",
                 input_ids=["image_inputs"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="img_emb"),
+                    GraphEdge(next_node="LLM", name="img_emb"),
                 ],
             ),
-            GraphStage(
+            GraphNode(
                 name="LLM",
                 input_ids=["img_emb"],
                 outputs=[],
@@ -425,27 +425,27 @@ class BagelModel(Model):
 
         # -- prefill_vae: VAE encoder -> LLM --
         prefill_vae = Sequential([
-            GraphStage(
+            GraphNode(
                 name="vae_encoder",
                 input_ids=["image_inputs"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="img_emb"),
+                    GraphEdge(next_node="LLM", name="img_emb"),
                 ],
             ),
-            GraphStage(
+            GraphNode(
                 name="LLM",
                 input_ids=["img_emb"],
                 outputs=[],
             ),
         ])
 
-        # -- decode: single LLM stage (embed + transformer + lm_head) --
-        decode = GraphStage(
+        # -- decode: single LLM node (embed + transformer + lm_head) --
+        decode = GraphNode(
             name="LLM",
             input_ids=["text_inputs"],
             outputs=[
-                GraphPointer(
-                    next_stage=STREAM_OUT,
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
                     name="new_token",
                     output_modality="text",
                     is_new_token=True,
@@ -460,25 +460,25 @@ class BagelModel(Model):
         # there are N-1 intervals, so N-1 Euler steps are needed.
         image_gen = Sequential([
             Loop(
-                section=GraphStage(
+                section=GraphNode(
                     name="LLM",
                     input_ids=["latents", "time_index"],
                     outputs=[
-                        GraphPointer(next_stage="LLM", name="latents"),
-                        GraphPointer(next_stage="LLM", name="time_index"),
+                        GraphEdge(next_node="LLM", name="latents"),
+                        GraphEdge(next_node="LLM", name="time_index"),
                     ],
                 ),
                 n_iters=self.config.num_timesteps - 1,
                 outputs=[
-                    GraphPointer(next_stage="vae_decoder", name="latents"),
+                    GraphEdge(next_node="vae_decoder", name="latents"),
                 ],
             ),
-            GraphStage(
+            GraphNode(
                 name="vae_decoder",
                 input_ids=["latents"],
                 outputs=[
-                    GraphPointer(
-                        next_stage=STREAM_OUT,
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
                         name="image_output",
                         output_modality="image",
                         persist=True,
@@ -501,7 +501,7 @@ class BagelModel(Model):
         is_understanding: bool,
         think_mode: bool
     ):
-        # Build prefill schedule: sequential list of (phase_name, input tensor info)
+        # Build prefill schedule: sequential list of (graph_walk_name, input tensor info)
         schedule: list[tuple[str, TensorPointerInfo]] = []
 
         # 1. System prompt (if think mode enabled)
@@ -553,11 +553,11 @@ class BagelModel(Model):
         self,
         metadata: CurrentForwardMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphPointer]:
+    ) -> list[GraphEdge]:
         """Construct the external inputs for the current forward pass.
 
         The conductor calls this to determine what tensors to send to
-        workers at the start of each forward pass. For prefill phases,
+        workers at the start of each forward pass. For prefill graph walks,
         the schedule entry determines which input to route; for decode
         and image_gen, the previous output feeds back in.
 
@@ -568,51 +568,51 @@ class BagelModel(Model):
             "new_token"      - last generated token (during decode)
             "latents"        - noise latents (for image_gen entry)
         """
-        phase = metadata.phase
+        graph_walk = metadata.graph_walk
 
         if metadata.is_prefill:
             schedule = metadata.kwargs["prefill_schedule"]
             step = metadata.kwargs["prefill_step"]
             input_tensor_info = [schedule[step][1]]
 
-            if phase == "prefill_text":
-                ptr = GraphPointer(next_stage="LLM", name="text_inputs")
-            elif phase == "prefill_vit":
-                ptr = GraphPointer(next_stage="vit_encoder", name="image_inputs")
-            elif phase == "prefill_vae":
-                ptr = GraphPointer(next_stage="vae_encoder", name="image_inputs")
+            if graph_walk == "prefill_text":
+                graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
+            elif graph_walk == "prefill_vit":
+                graph_edge = GraphEdge(next_node="vit_encoder", name="image_inputs")
+            elif graph_walk == "prefill_vae":
+                graph_edge = GraphEdge(next_node="vae_encoder", name="image_inputs")
             else:
-                raise ValueError(f"Unrecognized prefill phase {phase}")
-            ptr.tensor_info = input_tensor_info
-            return [ptr]
+                raise ValueError(f"Unrecognized prefill graph_walk {graph_walk}")
+            graph_edge.tensor_info = input_tensor_info
+            return [graph_edge]
 
-        elif phase == "decode":
+        elif graph_walk == "decode":
             # Previous token feeds back as text_inputs
-            ptr = GraphPointer(next_stage="LLM", name="text_inputs")
-            ptr.tensor_info = persist_signals.get("new_token", [])
-            return [ptr]
+            graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
+            graph_edge.tensor_info = persist_signals.get("new_token", [])
+            return [graph_edge]
 
-        elif phase == "image_gen":
+        elif graph_walk == "image_gen":
             # Initial noise latents feed the LLM denoising loop.
             # Note: latents are typically initialized by the submodule's
             # preprocess() (random noise), not passed through persist_signals.
             # This lookup handles the case where latents are externally provided.
-            ptr = GraphPointer(next_stage="LLM", name="latents")
-            ptr.tensor_info = persist_signals.get("latents", [])
+            graph_edge = GraphEdge(next_node="LLM", name="latents")
+            graph_edge.tensor_info = persist_signals.get("latents", [])
             return [
-                ptr,
-                GraphPointer(next_stage="LLM", name="time_index")
+                graph_edge,
+                GraphEdge(next_node="LLM", name="time_index")
             ]
 
         return []
 
     def _get_unpersist_tensors(
-        self, phase: str, inputs: list[GraphPointer]
+        self, graph_walk: str, inputs: list[GraphEdge]
     ) -> list[TensorPointerInfo]:
         """
         Lists the tensors that will be used for the last time in this forward pass
         """
-        if phase == "prefill_vae":
+        if graph_walk == "prefill_vae":
             # If we have prefill_vae, we know that the image input will be
             # passed into the ViT encoder for the next forward pass, so it
             # has to stick around
@@ -649,11 +649,11 @@ class BagelModel(Model):
             think_mode=think_mode
         )
 
-        first_phase = schedule[0][0] if schedule else "decode"
+        first_graph_walk = schedule[0][0] if schedule else "decode"
         full_metadata = CurrentForwardMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            phase=first_phase,
+            graph_walk=first_graph_walk,
             is_prefill=bool(schedule),
             kwargs={
                 "prefill_schedule": schedule,
@@ -668,7 +668,7 @@ class BagelModel(Model):
         inputs = self._get_fwd_pass_inputs(
             full_metadata, input_signals
         )
-        unpersist_tensors = self._get_unpersist_tensors(first_phase, inputs)
+        unpersist_tensors = self._get_unpersist_tensors(first_graph_walk, inputs)
         return ForwardPassArgs(
             full_metadata=full_metadata,
             inputs=inputs,
@@ -681,7 +681,7 @@ class BagelModel(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         new_tokens: dict[str, list[int]],
     ) -> ForwardPassArgs:
-        """Advance phase transitions. Schedule-driven, no BOI detection.
+        """Advance graph walk transitions. Schedule-driven, no BOI detection.
 
         During prefill, steps through the schedule one entry at a time.
         After all prefill steps, transitions to:
@@ -704,31 +704,31 @@ class BagelModel(Model):
             if step < len(schedule):
                 # More prefill steps remaining
                 metadata.kwargs["prefill_step"] = step
-                metadata.phase = schedule[step][0]
+                metadata.graph_walk = schedule[step][0]
             else:
                 # All prefill done -- transition based on target_output
                 metadata.is_prefill = False
                 target = metadata.kwargs["target_output"]
                 if target == "text":
-                    metadata.phase = "decode"
+                    metadata.graph_walk = "decode"
                 elif target == "image":
                     if metadata.kwargs.get("think_mode", False):
                         # Think first: decode to generate reasoning, then
                         # EOS triggers transition to image_gen.
-                        metadata.phase = "decode"
+                        metadata.graph_walk = "decode"
                     else:
-                        metadata.phase = "image_gen"
-        elif metadata.phase == "decode":
+                        metadata.graph_walk = "image_gen"
+        elif metadata.graph_walk == "decode":
             tokens = new_tokens.get("new_token", [])
             if self.eos_token_id is not None and self.eos_token_id in tokens:
                 target = metadata.kwargs["target_output"]
                 if metadata.kwargs.get("think_mode", False) and target == "image":
-                    # Thinking phase complete — transition to image generation.
-                    metadata.phase = "image_gen"
+                    # Thinking graph walk complete — transition to image generation.
+                    metadata.graph_walk = "image_gen"
                 else:
                     request_done = True
 
-        elif metadata.phase == "image_gen":
+        elif metadata.graph_walk == "image_gen":
             # Image generation complete (one image per request)
             request_done = True
 
@@ -737,7 +737,7 @@ class BagelModel(Model):
             metadata, persist_signals
         )
         unpersist_tensors = self._get_unpersist_tensors(
-            metadata.phase, inputs
+            metadata.graph_walk, inputs
         )
         return ForwardPassArgs(
             full_metadata=metadata,

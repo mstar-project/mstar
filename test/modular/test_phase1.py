@@ -1,7 +1,7 @@
 """
-Phase 1 tests: Engine execution + Mooncake integration.
+GraphWalk 1 tests: Engine execution + Mooncake integration.
 Tests engines in dummy mode (model=None, no GPU required) and verifies
-the interleaved LLM<->flow loop fires stages in the correct order.
+the interleaved LLM<->flow loop fires nodes in the correct order.
 """
 import sys
 
@@ -11,18 +11,18 @@ sys.path.insert(0, ".")
 import pytest
 
 from mminf.engine.ar_engine import AREngine, PageAllocator
-from mminf.engine.base import EngineType, StageBatch, StageOutput
+from mminf.engine.base import EngineType, NodeBatch, NodeOutput
 from mminf.engine.enc_dec_engine import EncoderDecoderEngine
 from mminf.engine.flow_engine import FlowEngine
-from mminf.graph.base import GraphPointer
-from mminf.graph.request_queues import PerRequestStageQueues
-from mminf.model.base import Subgraph
+from mminf.graph.base import GraphEdge
+from mminf.graph.request_queues import PerRequestNodeQueues
+from mminf.model.base import WorkerGraph
 from mminf.model.dummy_model import DummyModel
 from mminf.worker.engine_manager import EngineManager
 from mminf.worker.micro_scheduler import MicroScheduler
-from mminf.worker.stage_manager_utils import (
-    SubgraphQueues,
-    SubgraphsManager,
+from mminf.worker.node_manager_utils import (
+    WorkerGraphQueues,
+    WorkerGraphsManager,
 )
 
 # ======================================================================
@@ -78,10 +78,10 @@ class TestPageAllocator:
 
 
 class TestEngines:
-    def _make_batch(self, stage_name: str, request_ids: list[str]) -> StageBatch:
-        return StageBatch(
-            stage_name=stage_name,
-            phase="test",
+    def _make_batch(self, node_name: str, request_ids: list[str]) -> NodeBatch:
+        return NodeBatch(
+            node_name=node_name,
+            graph_walk="test",
             request_ids=request_ids,
             per_request_input_tensors={rid: {} for rid in request_ids},
         )
@@ -94,7 +94,7 @@ class TestEngines:
         engine = AREngine()
         batch = self._make_batch("LLM", ["req1", "req2"])
         output = engine.execute_batch(batch)
-        assert isinstance(output, StageOutput)
+        assert isinstance(output, NodeOutput)
         assert "req1" in output.per_request_output_tensors
         assert "req2" in output.per_request_output_tensors
 
@@ -132,7 +132,7 @@ class TestEngines:
         engine = FlowEngine()
         batch = self._make_batch("flow", ["req1"])
         output = engine.execute_batch(batch)
-        assert isinstance(output, StageOutput)
+        assert isinstance(output, NodeOutput)
         assert "req1" in output.per_request_output_tensors
 
     def test_enc_dec_engine_type(self):
@@ -143,7 +143,7 @@ class TestEngines:
         engine = EncoderDecoderEngine()
         batch = self._make_batch("text_emb", ["req1", "req2", "req3"])
         output = engine.execute_batch(batch)
-        assert isinstance(output, StageOutput)
+        assert isinstance(output, NodeOutput)
         assert len(output.per_request_output_tensors) == 3
 
 
@@ -155,11 +155,11 @@ class TestEngines:
 class TestEngineManager:
     def test_from_config_dummy(self):
         configs = [
-            {"engine_type": "ar", "stage_names": ["LLM"], "model_config": {}},
-            {"engine_type": "flow", "stage_names": ["flow"], "model_config": {}},
+            {"engine_type": "ar", "node_names": ["LLM"], "model_config": {}},
+            {"engine_type": "flow", "node_names": ["flow"], "model_config": {}},
             {
                 "engine_type": "enc_dec",
-                "stage_names": ["text_emb", "image_emb", "VAE_dec"],
+                "node_names": ["text_emb", "image_emb", "VAE_dec"],
                 "model_config": {},
             },
         ]
@@ -173,8 +173,8 @@ class TestEngineManager:
 
     def test_add_remove_request_propagation(self):
         configs = [
-            {"engine_type": "ar", "stage_names": ["LLM"], "model_config": {}},
-            {"engine_type": "flow", "stage_names": ["flow"], "model_config": {}},
+            {"engine_type": "ar", "node_names": ["LLM"], "model_config": {}},
+            {"engine_type": "flow", "node_names": ["flow"], "model_config": {}},
         ]
         mgr = EngineManager.from_config(configs, device="cpu")
         mgr.add_request("req1")
@@ -193,8 +193,8 @@ class TestEngineManager:
 
 class TestImageGenLoop:
     """
-    Uses DummyModel's image_gen phase graph to verify the interleaved
-    LLM<->flow loop fires stages in the correct order.
+    Uses DummyModel's image_gen graph walk to verify the interleaved
+    LLM<->flow loop fires nodes in the correct order.
 
     The image_gen graph structure:
     Sequential([
@@ -210,88 +210,88 @@ class TestImageGenLoop:
 
     def _build_image_gen_graph(self):
         model = DummyModel()
-        graphs = model.get_phase_graphs()
+        graphs = model.get_graph_walk_graphs()
         return graphs["image_gen"]
 
-    def test_loop_stage_order(self):
-        """Verify stages fire in the correct order through the loop."""
+    def test_loop_node_order(self):
+        """Verify nodes fire in the correct order through the loop."""
         graph = self._build_image_gen_graph()
-        queues = PerRequestStageQueues(waiting=graph)
+        queues = PerRequestNodeQueues(waiting=graph)
 
         # Provide all initial external inputs
         initial_inputs = [
-            GraphPointer(name="text", next_stage="text_emb"),
-            GraphPointer(name="images", next_stage="image_emb"),
-            GraphPointer(name="existing_text_emb", next_stage="concat_text"),
-            GraphPointer(name="existing_image_emb", next_stage="concat_img"),
-            GraphPointer(name="latents", next_stage="LLM"),
+            GraphEdge(name="text", next_node="text_emb"),
+            GraphEdge(name="images", next_node="image_emb"),
+            GraphEdge(name="existing_text_emb", next_node="concat_text"),
+            GraphEdge(name="existing_image_emb", next_node="concat_img"),
+            GraphEdge(name="latents", next_node="LLM"),
         ]
         queues.process_new_inputs(initial_inputs)
 
-        fired_stages = []
+        fired_nodes = []
         max_iterations = 100  # safety bound
 
         for _ in range(max_iterations):
             if not queues.ready and queues.waiting is None:
                 break
-            assert queues.ready, "Deadlock: no ready stages but waiting stages remain"
+            assert queues.ready, "Deadlock: no ready nodes but waiting nodes remain"
 
-            # Pop and process one stage at a time
-            stage = queues.ready.pop(0)
-            fired_stages.append(stage.name)
-            queues.process_new_inputs(stage.outputs)
+            # Pop and process one node at a time
+            node = queues.ready.pop(0)
+            fired_nodes.append(node.name)
+            queues.process_new_inputs(node.outputs)
 
         # Expected order:
         # 1. text_emb and image_emb fire (parallel, order may vary)
         # 2. concat_text and concat_img fire (parallel, order may vary)
         # 3. 10 iterations of LLM then flow
         # 4. VAE_dec fires last
-        assert fired_stages[-1] == "VAE_dec"
+        assert fired_nodes[-1] == "VAE_dec"
 
         # Count LLM and flow occurrences — should be 10 each
-        llm_count = fired_stages.count("LLM")
-        flow_count = fired_stages.count("flow")
-        assert llm_count == 10, f"Expected 10 LLM stages, got {llm_count}"
-        assert flow_count == 10, f"Expected 10 flow stages, got {flow_count}"
+        llm_count = fired_nodes.count("LLM")
+        flow_count = fired_nodes.count("flow")
+        assert llm_count == 10, f"Expected 10 LLM nodes, got {llm_count}"
+        assert flow_count == 10, f"Expected 10 flow nodes, got {flow_count}"
 
         # Verify LLM always fires before flow within each iteration
-        llm_indices = [i for i, s in enumerate(fired_stages) if s == "LLM"]
-        flow_indices = [i for i, s in enumerate(fired_stages) if s == "flow"]
+        llm_indices = [i for i, s in enumerate(fired_nodes) if s == "LLM"]
+        flow_indices = [i for i, s in enumerate(fired_nodes) if s == "flow"]
         for llm_idx, flow_idx in zip(llm_indices, flow_indices, strict=True):
             assert llm_idx < flow_idx, (
                 f"LLM (index {llm_idx}) should fire before flow (index {flow_idx})"
             )
 
         # Verify VAE_dec fires only once
-        assert fired_stages.count("VAE_dec") == 1
+        assert fired_nodes.count("VAE_dec") == 1
 
-    def test_loop_with_subgraph_manager(self):
+    def test_loop_with_worker_graph_manager(self):
         """
-        Test the full loop using SubgraphsManager (single-worker scenario).
-        All stages on one worker, verifying queue management works end-to-end.
+        Test the full loop using WorkerGraphsManager (single-worker scenario).
+        All nodes on one worker, verifying queue management works end-to-end.
         """
         graph = self._build_image_gen_graph()
 
-        subgraph_id = "sg_image_gen"
-        subgraph = Subgraph(
+        worker_graph_id = "sg_image_gen"
+        worker_graph = WorkerGraph(
             section=graph,
-            phases={"image_gen"},
-            subgraph_id=subgraph_id,
+            graph_walks={"image_gen"},
+            worker_graph_id=worker_graph_id,
         )
 
-        manager = SubgraphsManager(
+        manager = WorkerGraphsManager(
             queues={
-                subgraph_id: SubgraphQueues(
-                    subgraph_id=subgraph_id,
-                    phases={"image_gen"},
-                    subgraph=subgraph,
+                worker_graph_id: WorkerGraphQueues(
+                    worker_graph_id=worker_graph_id,
+                    graph_walks={"image_gen"},
+                    worker_graph=worker_graph,
                     per_request_queues={},
                 )
             },
             per_request_info={},
-            all_subgraph_ids_to_phases={subgraph_id: {"image_gen"}},
-            all_subgraph_ids_to_stages={
-                subgraph_id: graph.get_stage_names()
+            all_worker_graph_ids_to_graph_walks={worker_graph_id: {"image_gen"}},
+            all_worker_graph_ids_to_nodes={
+                worker_graph_id: graph.get_node_names()
             },
         )
 
@@ -299,68 +299,68 @@ class TestImageGenLoop:
         request_id = "test_req_1"
         manager.add_request(
             request_id=request_id,
-            subgraph_ids=[subgraph_id],
-            subgraph_to_worker={subgraph_id: "worker_0"},
+            worker_graph_ids=[worker_graph_id],
+            worker_graph_to_worker={worker_graph_id: "worker_0"},
         )
-        manager.update_phase(request_id, "image_gen")
+        manager.update_graph_walk(request_id, "image_gen")
 
         # Provide initial inputs
         initial_inputs = [
-            GraphPointer(name="text", next_stage="text_emb"),
-            GraphPointer(name="images", next_stage="image_emb"),
-            GraphPointer(name="existing_text_emb", next_stage="concat_text"),
-            GraphPointer(name="existing_image_emb", next_stage="concat_img"),
-            GraphPointer(name="latents", next_stage="LLM"),
+            GraphEdge(name="text", next_node="text_emb"),
+            GraphEdge(name="images", next_node="image_emb"),
+            GraphEdge(name="existing_text_emb", next_node="concat_text"),
+            GraphEdge(name="existing_image_emb", next_node="concat_img"),
+            GraphEdge(name="latents", next_node="LLM"),
         ]
         manager.process_new_inputs(request_id, initial_inputs)
 
-        fired_stages = []
+        fired_nodes = []
         max_iterations = 100
 
         for _ in range(max_iterations):
-            queue = manager.queues[subgraph_id]
-            ready_map = queue.get_ready_stage_names()
+            queue = manager.queues[worker_graph_id]
+            ready_map = queue.get_ready_node_names()
 
             if request_id not in ready_map or not ready_map[request_id]:
                 # Check if done
                 if queue.is_done(request_id):
                     break
-                break  # no more ready stages
+                break  # no more ready nodes
 
-            # Pop one stage at a time
-            stage_name = ready_map[request_id][0]
-            stages = queue.pop_ready_stages(request_id, [stage_name])
-            assert stages, f"Expected to pop stage {stage_name}"
+            # Pop one node at a time
+            node_name = ready_map[request_id][0]
+            nodes = queue.pop_ready_nodes(request_id, [node_name])
+            assert nodes, f"Expected to pop node {node_name}"
 
-            stage = stages[0]
-            fired_stages.append(stage.name)
+            node = nodes[0]
+            fired_nodes.append(node.name)
 
             # Process outputs through the manager
-            routing = manager.process_stage_outputs(request_id, stage.outputs)
+            routing = manager.process_node_outputs(request_id, node.outputs)
 
             # In single-worker scenario, all routing should be internal
-            # (to_workers should be empty since all stages are on this worker)
+            # (to_workers should be empty since all nodes are on this worker)
 
-        assert "VAE_dec" in fired_stages
-        assert fired_stages.count("LLM") == 10
-        assert fired_stages.count("flow") == 10
+        assert "VAE_dec" in fired_nodes
+        assert fired_nodes.count("LLM") == 10
+        assert fired_nodes.count("flow") == 10
 
-    def test_micro_scheduler_picks_stages(self):
-        """Test that MicroScheduler correctly selects and batches ready stages."""
+    def test_micro_scheduler_picks_nodes(self):
+        """Test that MicroScheduler correctly selects and batches ready nodes."""
         graph = self._build_image_gen_graph()
-        subgraph_id = "sg_test"
-        subgraph = Subgraph(
+        worker_graph_id = "sg_test"
+        worker_graph = WorkerGraph(
             section=graph,
-            phases={"image_gen"},
-            subgraph_id=subgraph_id,
+            graph_walks={"image_gen"},
+            worker_graph_id=worker_graph_id,
         )
 
         engine_configs = [
-            {"engine_type": "ar", "stage_names": ["LLM"], "model_config": {}},
-            {"engine_type": "flow", "stage_names": ["flow"], "model_config": {}},
+            {"engine_type": "ar", "node_names": ["LLM"], "model_config": {}},
+            {"engine_type": "flow", "node_names": ["flow"], "model_config": {}},
             {
                 "engine_type": "enc_dec",
-                "stage_names": [
+                "node_names": [
                     "text_emb", "image_emb", "concat_text", "concat_img", "VAE_dec"
                 ],
                 "model_config": {},
@@ -369,49 +369,49 @@ class TestImageGenLoop:
         engine_mgr = EngineManager.from_config(engine_configs, device="cpu")
         scheduler = MicroScheduler(engine_mgr)
 
-        manager = SubgraphsManager(
+        manager = WorkerGraphsManager(
             queues={
-                subgraph_id: SubgraphQueues(
-                    subgraph_id=subgraph_id,
-                    phases={"image_gen"},
-                    subgraph=subgraph,
+                worker_graph_id: WorkerGraphQueues(
+                    worker_graph_id=worker_graph_id,
+                    graph_walks={"image_gen"},
+                    worker_graph=worker_graph,
                     per_request_queues={},
                 )
             },
             per_request_info={},
-            all_subgraph_ids_to_phases={subgraph_id: {"image_gen"}},
-            all_subgraph_ids_to_stages={
-                subgraph_id: graph.get_stage_names()
+            all_worker_graph_ids_to_graph_walks={worker_graph_id: {"image_gen"}},
+            all_worker_graph_ids_to_nodes={
+                worker_graph_id: graph.get_node_names()
             },
         )
 
         request_id = "req_sched"
         manager.add_request(
             request_id=request_id,
-            subgraph_ids=[subgraph_id],
-            subgraph_to_worker={subgraph_id: "w0"},
+            worker_graph_ids=[worker_graph_id],
+            worker_graph_to_worker={worker_graph_id: "w0"},
         )
-        manager.update_phase(request_id, "image_gen")
+        manager.update_graph_walk(request_id, "image_gen")
 
-        # Initially no stages ready
+        # Initially no nodes ready
         batch = scheduler.get_next_batch(manager)
         assert batch is None
 
         # Feed inputs
         initial_inputs = [
-            GraphPointer(name="text", next_stage="text_emb"),
-            GraphPointer(name="images", next_stage="image_emb"),
-            GraphPointer(name="existing_text_emb", next_stage="concat_text"),
-            GraphPointer(name="existing_image_emb", next_stage="concat_img"),
-            GraphPointer(name="latents", next_stage="LLM"),
+            GraphEdge(name="text", next_node="text_emb"),
+            GraphEdge(name="images", next_node="image_emb"),
+            GraphEdge(name="existing_text_emb", next_node="concat_text"),
+            GraphEdge(name="existing_image_emb", next_node="concat_img"),
+            GraphEdge(name="latents", next_node="LLM"),
         ]
         manager.process_new_inputs(request_id, initial_inputs)
 
-        # Now scheduler should find ready stages (text_emb and image_emb)
+        # Now scheduler should find ready nodes (text_emb and image_emb)
         batch = scheduler.get_next_batch(manager)
         assert batch is not None
-        # enc_dec has lowest priority, but these are the only ready stages
-        assert batch.stage_name in ("text_emb", "image_emb")
+        # enc_dec has lowest priority, but these are the only ready nodes
+        assert batch.node_name in ("text_emb", "image_emb")
 
 
 # ======================================================================
@@ -423,15 +423,15 @@ class TestPrefillDecodeGraph:
     def test_prefill_graph(self):
         """Verify prefill graph fires text_emb + image_emb -> concat -> LLM."""
         model = DummyModel()
-        graphs = model.get_phase_graphs()
+        graphs = model.get_graph_walk_graphs()
         prefill = graphs["prefill"]
 
-        queues = PerRequestStageQueues(waiting=prefill)
+        queues = PerRequestNodeQueues(waiting=prefill)
         inputs = [
-            GraphPointer(name="text", next_stage="text_emb"),
-            GraphPointer(name="images", next_stage="image_emb"),
-            GraphPointer(name="existing_text_emb", next_stage="concat_text"),
-            GraphPointer(name="existing_image_emb", next_stage="concat_img"),
+            GraphEdge(name="text", next_node="text_emb"),
+            GraphEdge(name="images", next_node="image_emb"),
+            GraphEdge(name="existing_text_emb", next_node="concat_text"),
+            GraphEdge(name="existing_image_emb", next_node="concat_img"),
         ]
         queues.process_new_inputs(inputs)
 
@@ -440,9 +440,9 @@ class TestPrefillDecodeGraph:
             if not queues.ready and queues.waiting is None:
                 break
             assert queues.ready
-            stage = queues.ready.pop(0)
-            fired.append(stage.name)
-            queues.process_new_inputs(stage.outputs)
+            node = queues.ready.pop(0)
+            fired.append(node.name)
+            queues.process_new_inputs(node.outputs)
 
         assert fired[-1] == "LLM"
         assert "text_emb" in fired

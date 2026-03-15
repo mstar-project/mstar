@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from mminf.engine.base import BaseEngine, EngineType, StageBatch, StageOutput
+from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 
 logger = logging.getLogger(__name__)
 
@@ -412,11 +412,11 @@ class AREngine(BaseEngine):
             device=self.device
         )
 
-    def execute_batch(self, batch: StageBatch) -> StageOutput:
-        submodule = self.submodules.get(batch.stage_name)
+    def execute_batch(self, batch: NodeBatch) -> NodeOutput:
+        submodule = self.submodules.get(batch.node_name)
         if submodule is None:
             # Dummy mode: return empty output per request
-            return StageOutput(
+            return NodeOutput(
                 per_request_output_tensors={
                     rid: {} for rid in batch.request_ids
                 }
@@ -429,17 +429,17 @@ class AREngine(BaseEngine):
             inputs = batch.per_request_input_tensors.get(rid, {})
             metadata = batch.per_request_metadata.get(rid, {})
 
-            preprocessed = submodule.preprocess(batch.phase, **inputs)
+            preprocessed = submodule.preprocess(batch.graph_walk, **inputs)
             with torch.no_grad():
                 output = submodule(
-                    phase=batch.phase,
+                    graph_walk=batch.graph_walk,
                     cache_handle=cache_handle,
                     **preprocessed,
                     **metadata,
                 )
             per_request_outputs[rid] = output
 
-        return StageOutput(per_request_output_tensors=per_request_outputs)
+        return NodeOutput(per_request_output_tensors=per_request_outputs)
 
     def add_request(
         self, request_id: str, cache_labels: list[str] | None = None,

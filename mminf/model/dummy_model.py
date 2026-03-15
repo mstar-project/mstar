@@ -6,8 +6,8 @@ import torch
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
-from mminf.graph.base import GraphPointer, GraphStage, Loop, Parallel, Sequential, TensorPointerInfo
-from mminf.graph.special_destinations import STREAM_OUT
+from mminf.graph.base import GraphEdge, GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
+from mminf.graph.special_destinations import EMIT_TO_CLIENT
 from mminf.model.base import CurrentForwardMetadata, Model
 
 
@@ -17,41 +17,41 @@ class DummyModel(Model):
     """
     def _get_text_emb(self):
         return Sequential([
-            GraphStage(
+            GraphNode(
                 name="text_emb",
                 input_ids=["text_inputs"],
                 outputs=[
-                    GraphPointer(next_stage="concat_text", name="new_text_emb")
+                    GraphEdge(next_node="concat_text", name="new_text_emb")
                 ]
             ),
-            GraphStage(
+            GraphNode(
                 name="concat_text",
                 input_ids=["new_text_emb", "existing_text_emb"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="text_emb", persist=True)
+                    GraphEdge(next_node="LLM", name="text_emb", persist=True)
                 ]
             )
         ])
 
     def _get_img_emb(self):
         return Sequential([
-            GraphStage(
+            GraphNode(
                 name="image_emb",
                 input_ids=["image_inputs"],
                 outputs=[
-                    GraphPointer(next_stage="concat_img", name="new_image_emb")
+                    GraphEdge(next_node="concat_img", name="new_image_emb")
                 ]
             ),
-            GraphStage(
+            GraphNode(
                 name="concat_img",
                 input_ids=["new_image_emb", "existing_image_emb"],
                 outputs=[
-                    GraphPointer(next_stage="LLM", name="img_emb", persist=True)
+                    GraphEdge(next_node="LLM", name="img_emb", persist=True)
                 ]
              )
         ])
 
-    def get_stage_engine_types(self) -> dict[str, EngineType]:
+    def get_node_engine_types(self) -> dict[str, EngineType]:
         return {
             "text_emb": EngineType.ENC_DEC,
             "concat_text": EngineType.ENC_DEC,
@@ -62,15 +62,15 @@ class DummyModel(Model):
             "VAE_dec": EngineType.ENC_DEC,
         }
 
-    def get_phase_graphs(self):
+    def get_graph_walk_graphs(self):
         prefill = Sequential([
             Parallel([self._get_text_emb(), self._get_img_emb()]),
-            GraphStage(
+            GraphNode(
                 name="LLM",
                 input_ids=["text_emb", "img_emb"],
                 outputs=[
-                    GraphPointer(
-                        next_stage=STREAM_OUT,
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
                         output_modality="text",
                         name="new_token",
                         is_new_token=True
@@ -83,32 +83,32 @@ class DummyModel(Model):
             Parallel([self._get_text_emb(), self._get_img_emb()]),
             Loop(
                 section=Sequential([
-                    GraphStage(
+                    GraphNode(
                         name="LLM",
                         input_ids=["text_emb", "img_emb", "latents"],
                         outputs=[
-                            GraphPointer(next_stage="flow", name="hidden_states")
+                            GraphEdge(next_node="flow", name="hidden_states")
                         ]
                     ),
-                    GraphStage(
+                    GraphNode(
                         "flow",
                         input_ids=["hidden_states"],
                         outputs=[
-                            GraphPointer(next_stage="LLM", name="latents")
+                            GraphEdge(next_node="LLM", name="latents")
                         ]
                     )
                 ]),
                 n_iters=10,
                 outputs=[
-                    GraphPointer(next_stage="VAE_dec", name="latents")
+                    GraphEdge(next_node="VAE_dec", name="latents")
                 ]
             ),
-            GraphStage(
+            GraphNode(
                 name="VAE_dec",
                 input_ids=["latents"],
                 outputs=[
-                    GraphPointer(
-                        next_stage=STREAM_OUT,
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
                         output_modality="image",
                         name="image_output",
                         persist=True
@@ -137,7 +137,7 @@ class DummyModel(Model):
         return CurrentForwardMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            phase="prefill",
+            graph_walk="prefill",
             is_prefill=True
         )
 
@@ -145,25 +145,25 @@ class DummyModel(Model):
         self, metadata: CurrentForwardMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         prev_forward_metadata: CurrentForwardMetadata=None,
-    ) -> list[GraphPointer]:
-        text_inp = GraphPointer(
-            next_stage="text_emb",
+    ) -> list[GraphEdge]:
+        text_inp = GraphEdge(
+            next_node="text_emb",
             name="text_inputs",
         )
-        img_inp = GraphPointer(
-            next_stage="image_emb",
+        img_inp = GraphEdge(
+            next_node="image_emb",
             name="image_inputs",
         )
-        existing_text = GraphPointer(
-            next_stage="concat_text",
+        existing_text = GraphEdge(
+            next_node="concat_text",
             name="existing_text_emb",
         )
-        existing_img = GraphPointer(
-            next_stage="concat_img",
+        existing_img = GraphEdge(
+            next_node="concat_img",
             name="existing_image_emb",
         )
 
-        pointers = [
+        graph_edges = [
             text_inp, img_inp, existing_text, existing_img
         ]
 
@@ -173,31 +173,31 @@ class DummyModel(Model):
         else:
             existing_text.tensor_info = persist_signals.get("text_emb", [])
             existing_img.tensor_info = persist_signals.get("img_emb", [])
-            if prev_forward_metadata.phase == "image_gen":
+            if prev_forward_metadata.graph_walk == "image_gen":
                 img_inp.tensor_info = persist_signals.get("image_output", [])
                 text_inp.tensor_info = persist_signals.get("new_token", [])
 
-            if metadata.phase == "image_gen":
-                pointers.append(
-                    GraphPointer(
-                        next_stage="LLM",
+            if metadata.graph_walk == "image_gen":
+                graph_edges.append(
+                    GraphEdge(
+                        next_node="LLM",
                         name="latents",
                         tensor_info=persist_signals.get("latents", [])
                     )
                 )
-        return pointers
+        return graph_edges
 
     def update_for_next_forward(
         self, metadata: CurrentForwardMetadata,
         new_tokens: dict[str, list[int]],
     ) -> CurrentForwardMetadata:
         # dummy model doesn't actually do anything, so this function will just
-        # randomly select a phase
-        if metadata.phase == "image_gen":
+        # randomly select a graph walk
+        if metadata.graph_walk == "image_gen":
             metadata.request_done = True
             return
-        metadata.phase = str(np.random.choice(["decode", "image_gen"]))
-        if metadata.phase == "decode":
+        metadata.graph_walk = str(np.random.choice(["decode", "image_gen"]))
+        if metadata.graph_walk == "decode":
             metadata.output_modalities = ["text"]
         else:
             metadata.output_modalities = ["image"]
@@ -218,5 +218,5 @@ class DummyModel(Model):
             ]
         return result
 
-    def get_submodule(self, stage_name: str, device="cpu") -> torch.nn.Module | None:
+    def get_submodule(self, node_name: str, device="cpu") -> torch.nn.Module | None:
         return None  # dummy mode — no real computation

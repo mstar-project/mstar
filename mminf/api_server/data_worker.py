@@ -235,7 +235,7 @@ class PreprocessWorkerThread:
         result.graph_edge.name = f"{result.modality}_output"
         self.tensor_manager.start_read_tensors(
             request_id=result.request_id,
-            graph_pointers=[result.graph_edge],
+            graph_edges=[result.graph_edge],
             device=self.device
         )
         if result.request_id not in self.tensor_uuid_to_metadata_per_request:

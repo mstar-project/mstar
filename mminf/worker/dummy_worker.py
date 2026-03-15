@@ -8,16 +8,16 @@ from mminf.ipc_formats import (
     InputSignals,
     NewRequest,
     RemoveRequest,
-    SubgraphsDone,
     TensorReceived,
+    WorkerGraphsDone,
     WorkerMessage,
     WorkerMessageType,
 )
-from mminf.model.base import Subgraph
-from mminf.worker.stage_manager_utils import (
-    StageOutputRouting,
-    SubgraphQueues,
-    SubgraphsManager,
+from mminf.model.base import WorkerGraph
+from mminf.worker.node_manager_utils import (
+    NodeOutputRouting,
+    WorkerGraphQueues,
+    WorkerGraphsManager,
 )
 
 
@@ -26,9 +26,9 @@ class DummyWorker:
         self,
         worker_id: str,
         worker_ids: list[str],
-        my_subgraphs: list[Subgraph],
-        all_subgraph_ids_to_phases: dict[str, set[str]], # for all subgraphs
-        all_subgraph_ids_to_stages: dict[str, list[str]], # for all subgraphs
+        my_worker_graphs: list[WorkerGraph],
+        all_worker_graph_ids_to_graph_walks: dict[str, set[str]], # for all worker graphs
+        all_worker_graph_ids_to_nodes: dict[str, list[str]], # for all worker graphs
         hostname: str="localhost", # TODO: figure this out
         socket_path_prefix: str="/tmp/mminf",
         tensor_comm_protocol=CommProtocol.RDMA,
@@ -36,21 +36,21 @@ class DummyWorker:
         """
         Initial in-progress worker implementation. This worker cannnot actually
         do work, but it provides a sense of the data movement between workers
-        and the subgraph queue structure.
+        and the worker graph queue structure.
         """
         self.worker_id = worker_id
-        self.subgraphs_manager = SubgraphsManager(
+        self.worker_graphs_manager = WorkerGraphsManager(
             queues={
-                subgraph.subgraph_id: SubgraphQueues(
-                    subgraph_id=subgraph.subgraph_id,
-                    phases=subgraph.phases,
-                    subgraph=subgraph,
+                worker_graph.worker_graph_id: WorkerGraphQueues(
+                    worker_graph_id=worker_graph.worker_graph_id,
+                    graph_walks=worker_graph.graph_walks,
+                    worker_graph=worker_graph,
                     per_request_queues={}
-                ) for subgraph in my_subgraphs
+                ) for worker_graph in my_worker_graphs
             },
             per_request_info={},
-            all_subgraph_ids_to_phases=all_subgraph_ids_to_phases,
-            all_subgraph_ids_to_stages=all_subgraph_ids_to_stages
+            all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
+            all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes
         )
 
         self.communicator = ZMQCommunicator(
@@ -69,20 +69,20 @@ class DummyWorker:
         self, body: NewRequest
     ):
         """
-        Add a request to the subgraph queues
+        Add a request to the worker graph queues
         """
-        self.subgraphs_manager.add_request(
+        self.worker_graphs_manager.add_request(
             request_id=body.request_id,
-            subgraph_ids=body.subgraph_ids,
-            subgraph_to_worker_id=body.subgraph_to_worker
+            worker_graph_ids=body.worker_graph_ids,
+            worker_graph_to_worker=body.worker_graph_to_worker
         )
 
         # TODO Atindra: start reading in tensors from body.initial_inputs
 
-        self.subgraphs_manager.update_phase(
-            body.request_id, body.initial_phase
+        self.worker_graphs_manager.update_graph_walk(
+            body.request_id, body.initial_graph_walk
         )
-        self.subgraphs_manager.process_new_inputs(
+        self.worker_graphs_manager.process_new_inputs(
             request_id=body.request_id,
             inputs=body.initial_inputs
         )
@@ -92,7 +92,7 @@ class DummyWorker:
         Upon seeing EOS, we want to remove the queues for the request that has
         just completed
         """
-        self.subgraphs_manager.remove_request(body.request_id)
+        self.worker_graphs_manager.remove_request(body.request_id)
         self.tensor_manager.cleanup_request(body.request_id)
 
     def _handle_tensor_received(self, body: TensorReceived):
@@ -109,14 +109,14 @@ class DummyWorker:
         """
         When either the conductor or other workers send tensors to this worker,
         process those inputs (update the ready/waiting queues for the proper
-        subgraphs on this worker, e.g.)
+        worker graphs on this worker, e.g.)
         """
-        self.subgraphs_manager.update_phase(
-            body.request_id, body.phase
+        self.worker_graphs_manager.update_graph_walk(
+            body.request_id, body.graph_walk
         )
 
         # TODO Atindra: start reading in tensors from body.initial_inputs
-        # Also, somewhere else, we will have to call self.subgraphs_manager.process_new_inputs
+        # Also, somewhere else, we will have to call self.worker_graphs_manager.process_new_inputs
         # when the tensors are actually ready
 
     def _process_messages(self):
@@ -137,19 +137,19 @@ class DummyWorker:
     def _send_outputs(
         self,
         request_id: str,
-        outputs: StageOutputRouting
+        outputs: NodeOutputRouting
     ):
         """
         Sends outputs to other workers and to the conductor.
         Persist signals are buffered and sent together with the
-        SUBGRAPHS_DONE message to avoid race conditions.
+        WORKER_GRAPHS_DONE message to avoid race conditions.
         """
         for worker in outputs.to_workers:
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
                     request_id=request_id,
-                    phase=self.subgraphs_manager.get_phase(request_id),
+                    graph_walk=self.worker_graphs_manager.get_graph_walk(request_id),
                     inputs=outputs.to_workers[worker]
                 )
             )
@@ -157,17 +157,17 @@ class DummyWorker:
 
         # Buffer persist signals for this request
         if outputs.persist:
-            self.subgraphs_manager.buffer_persist_signals(
+            self.worker_graphs_manager.buffer_persist_signals(
                 request_id, outputs.persist
             )
 
-        if outputs.completed_subgraphs:
+        if outputs.completed_worker_graph_ids:
             message = ConductorMessage(
-                message_type=ConductorMessageType.SUBGRAPHS_DONE,
-                body=SubgraphsDone(
+                message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
+                body=WorkerGraphsDone(
                     request_id=request_id,
-                    subgraph_ids=outputs.completed_subgraphs,
-                    persist_signals=self.subgraphs_manager.flush_persist_signals(request_id),
+                    worker_graph_ids=outputs.completed_worker_graph_ids,
+                    persist_signals=self.worker_graphs_manager.flush_persist_signals(request_id),
                 )
             )
             self.communicator.send("conductor", message)
@@ -176,19 +176,19 @@ class DummyWorker:
         # TODO: this is just a dummy version
         while True:
             self._process_messages()
-            for queue in self.subgraphs_manager.queues.values():
-                ready_stage_names = queue.get_ready_stage_names()
+            for queue in self.worker_graphs_manager.queues.values():
+                ready_node_names = queue.get_ready_node_names()
 
-                for request_id, names in ready_stage_names.items():
-                    stages = queue.pop_ready_stages(request_id, names)
-                    for s in stages:
-                        outputs = self.subgraphs_manager.process_stage_outputs(
-                            request_id, s.outputs
+                for request_id, names in ready_node_names.items():
+                    nodes = queue.pop_ready_nodes(request_id, names)
+                    for node in nodes:
+                        outputs = self.worker_graphs_manager.process_node_outputs(
+                            request_id, node.outputs
                         )
                         # TODO: in the real worker, we have to update
-                        # self.subgraphs_manager.per_request_info[request_id].tensors
-                        # with the tensors from the stage output, for all tensor IDs
-                        # in outputs.routed_to_this_subgraph
+                        # self.worker_graphs_manager.per_request_info[request_id].tensors
+                        # with the tensors from the node output, for all tensor IDs
+                        # in outputs.routed_to_this_worker_graph
 
                         self._send_outputs(request_id, outputs)
             time.sleep(0.1) # just for dummy worker to simulate work being done

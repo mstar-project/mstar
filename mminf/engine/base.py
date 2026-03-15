@@ -15,10 +15,10 @@ class EngineType(Enum):
 
 
 @dataclass
-class StageBatch:
+class NodeBatch:
     """Input to an engine's execute_batch()."""
-    stage_name: str
-    phase: str
+    node_name: str
+    graph_walk: str
     request_ids: list[str]
 
     # {request_id: {input_name: list[tensor]}}
@@ -29,7 +29,7 @@ class StageBatch:
 
 
 @dataclass
-class StageOutput:
+class NodeOutput:
     """Output from an engine's execute_batch()."""
     # {request_id: {output_name: [tensor]}}
     per_request_output_tensors: dict[str, NameToTensorList]
@@ -51,13 +51,13 @@ class BaseEngine(ABC):
     ) -> None:
         """
         Receive the submodules this engine is responsible for
-        (keyed by stage name) and perform engine-specific initialization
+        (keyed by node name) and perform engine-specific initialization
         (KV cache allocation, FlashInfer workspace, etc.).
         """
         ...
 
     @abstractmethod
-    def execute_batch(self, batch: StageBatch) -> StageOutput:
+    def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         ...
 
     @abstractmethod
