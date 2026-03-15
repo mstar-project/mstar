@@ -2,3 +2,12 @@
 *.egg-info
 __pycache__/
 uv.lock
+*.nvvp
+*.nsys-rep
+*.qdrep
+*.ncu-rep
+*.sqlite
+*.prof
+*.json
+profiler/
+traces/
