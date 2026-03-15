@@ -50,6 +50,7 @@ def _conductor_process_target(
     model_name: str,
     config_path: str,
     socket_path_prefix: str,
+    enable_nvtx: bool = False,
     log_level: str = "INFO",
 ):
     """Runs DummyConductor.run() in a spawned process."""
@@ -68,6 +69,7 @@ def _conductor_process_target(
         model=model,
         model_config_file=config_path,
         socket_path_prefix=socket_path_prefix,
+        nvtx_enabled=enable_nvtx,
         log_level=log_level,
     )
     conductor.run()
@@ -487,6 +489,11 @@ def main():
         help="Per-request timeout in seconds",
     )
     parser.add_argument(
+        "--enable-nvtx",
+        action="store_true",
+        help="Enable torch.cuda.nvtx markers during execution",
+    )
+    parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
@@ -506,8 +513,13 @@ def main():
     ctx = mp.get_context("spawn")
     conductor_proc = ctx.Process(
         target=_conductor_process_target,
-        args=(model_name, args.config,
-              args.socket_path_prefix, args.log_level),
+        args=(
+            model_name,
+            args.config,
+            args.socket_path_prefix,
+            args.enable_nvtx,
+            args.log_level,
+        ),
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)

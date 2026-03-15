@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import torch
 
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
+from mminf.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -333,8 +334,10 @@ class AREngine(BaseEngine):
 
     def __init__(
         self,
-        kv_cache_config: KVCacheConfig | dict
+        kv_cache_config: KVCacheConfig | dict,
+        nvtx_enabled: bool = False,
     ):
+        super().__init__(nvtx_enabled=nvtx_enabled)
         if isinstance(kv_cache_config, dict):
             kv_cache_config = KVCacheConfig(**kv_cache_config)
         self.submodules: dict[str, torch.nn.Module] = {}
@@ -413,33 +416,40 @@ class AREngine(BaseEngine):
         )
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
+        if self.nvtx_enabled:
+            range_push(f"engine.ar.{batch.node_name}.{batch.graph_walk}")
+
         submodule = self.submodules.get(batch.node_name)
         if submodule is None:
-            # Dummy mode: return empty output per request
-            return NodeOutput(
-                per_request_output_tensors={
-                    rid: {} for rid in batch.request_ids
-                }
+            output = NodeOutput(
+                per_request_output_tensors={rid: {} for rid in batch.request_ids}
             )
+            if self.nvtx_enabled:
+                range_pop()
+            return output
 
-        # Per-request execution with CacheHandle
-        per_request_outputs = {}
-        for rid in batch.request_ids:
-            cache_handle = self._create_cache_handle(rid)
-            inputs = batch.per_request_input_tensors.get(rid, {})
-            metadata = batch.per_request_metadata.get(rid, {})
+        try:
+            # Per-request execution with CacheHandle
+            per_request_outputs = {}
+            for rid in batch.request_ids:
+                cache_handle = self._create_cache_handle(rid)
+                inputs = batch.per_request_input_tensors.get(rid, {})
+                metadata = batch.per_request_metadata.get(rid, {})
 
-            preprocessed = submodule.preprocess(batch.graph_walk, **inputs)
-            with torch.no_grad():
-                output = submodule(
-                    graph_walk=batch.graph_walk,
-                    cache_handle=cache_handle,
-                    **preprocessed,
-                    **metadata,
-                )
-            per_request_outputs[rid] = output
+                preprocessed = submodule.preprocess(batch.graph_walk, **inputs)
+                with torch.no_grad():
+                    output = submodule(
+                        graph_walk=batch.graph_walk,
+                        cache_handle=cache_handle,
+                        **preprocessed,
+                        **metadata,
+                    )
+                per_request_outputs[rid] = output
 
-        return NodeOutput(per_request_output_tensors=per_request_outputs)
+            return NodeOutput(per_request_output_tensors=per_request_outputs)
+        finally:
+            if self.nvtx_enabled:
+                range_pop()
 
     def add_request(
         self, request_id: str, cache_labels: list[str] | None = None,

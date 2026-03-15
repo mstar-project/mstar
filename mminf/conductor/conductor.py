@@ -37,6 +37,7 @@ def _worker_process_target(
     all_worker_graph_ids_to_nodes: dict[str, list[str]],
     hostname: str,
     socket_path_prefix: str,
+    nvtx_enabled: bool = False,
     model: Model | None = None,
     device: str = "cuda",
     log_level: str = "INFO",
@@ -62,6 +63,7 @@ def _worker_process_target(
         all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
         hostname=hostname,
         socket_path_prefix=socket_path_prefix,
+        nvtx_enabled=nvtx_enabled,
         device=torch.device(device),
         model=model,
     )
@@ -108,6 +110,7 @@ class Conductor:
         model_config_file: str,
         socket_path_prefix: str = "/tmp/mminf",
         hostname: str = "localhost",
+        nvtx_enabled: bool = False,
         log_level: str = "INFO",
     ):
         self.requests: dict[str, RequestData] = {}
@@ -115,6 +118,7 @@ class Conductor:
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
+        self.nvtx_enabled = nvtx_enabled
 
         self._worker_processes: list[mp.Process] = []
 
@@ -204,6 +208,7 @@ class Conductor:
                     "hostname": self.hostname,
                     "socket_path_prefix": self.socket_path_prefix,
                     "model": self.model,
+                    "nvtx_enabled": self.nvtx_enabled,
                     "device": f"cuda:{rank}",
                     "log_level": self.log_level,
                 },
@@ -486,7 +491,12 @@ class Conductor:
         return done_with_forward
 
     def run(self):
+        from mminf.profiler import range_push, range_pop
+
         while True:
+            if self.nvtx_enabled:
+                range_push("conductor.run_loop")
+
             try:
                 done_forward_passes = []
                 for message in self.communicator.get_all_new_messages():
@@ -511,5 +521,8 @@ class Conductor:
                     self._process_request_done(request_id)
             except Exception:
                 logger.exception("Conductor error in main loop")
+            finally:
+                if self.nvtx_enabled:
+                    range_pop()
 
             time.sleep(0.001)

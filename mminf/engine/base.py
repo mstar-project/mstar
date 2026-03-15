@@ -38,6 +38,9 @@ class NodeOutput:
 
 
 class BaseEngine(ABC):
+    def __init__(self, nvtx_enabled: bool = False):
+        self.nvtx_enabled = nvtx_enabled
+
     @abstractmethod
     def engine_type(self) -> EngineType:
         ...

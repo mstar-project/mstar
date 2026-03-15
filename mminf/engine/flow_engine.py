@@ -1,6 +1,7 @@
 import torch
 
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
+from mminf.profiler import range_pop, range_push
 
 
 class FlowEngine(BaseEngine):
@@ -9,7 +10,8 @@ class FlowEngine(BaseEngine):
     Loop iteration is handled by the graph system.
     """
 
-    def __init__(self):
+    def __init__(self, nvtx_enabled: bool = False):
+        super().__init__(nvtx_enabled=nvtx_enabled)
         self.submodules: dict[str, torch.nn.Module] = {}
         self.device = None
 
@@ -26,31 +28,39 @@ class FlowEngine(BaseEngine):
         self.device = device
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
+        if self.nvtx_enabled:
+            range_push(f"engine.flow.{batch.node_name}.{batch.graph_walk}")
+
         submodule = self.submodules.get(batch.node_name)
         if submodule is None:
             # Dummy mode
-            return NodeOutput(
-                per_request_output_tensors={
-                    rid: {} for rid in batch.request_ids
-                }
+            output = NodeOutput(
+                per_request_output_tensors={rid: {} for rid in batch.request_ids}
             )
+            if self.nvtx_enabled:
+                range_pop()
+            return output
 
-        with torch.no_grad():
-            outputs = {}
-            for rid in batch.request_ids:
-                inputs = batch.per_request_input_tensors.get(rid, {})
-                if hasattr(submodule, 'preprocess'):
-                    preprocessed = submodule.preprocess(batch.graph_walk, **inputs)
-                    outputs[rid] = submodule(**preprocessed)
-                else:
-                    result = submodule(**{k: v[0] for k, v in inputs.items()})
-                    if isinstance(result, dict):
-                        outputs[rid] = result
-                    elif isinstance(result, torch.Tensor):
-                        outputs[rid] = {"output": [result]}
+        try:
+            with torch.no_grad():
+                outputs = {}
+                for rid in batch.request_ids:
+                    inputs = batch.per_request_input_tensors.get(rid, {})
+                    if hasattr(submodule, 'preprocess'):
+                        preprocessed = submodule.preprocess(batch.graph_walk, **inputs)
+                        outputs[rid] = submodule(**preprocessed)
                     else:
-                        outputs[rid] = {}
-            return NodeOutput(per_request_output_tensors=outputs)
+                        result = submodule(**{k: v[0] for k, v in inputs.items()})
+                        if isinstance(result, dict):
+                            outputs[rid] = result
+                        elif isinstance(result, torch.Tensor):
+                            outputs[rid] = {"output": [result]}
+                        else:
+                            outputs[rid] = {}
+                return NodeOutput(per_request_output_tensors=outputs)
+        finally:
+            if self.nvtx_enabled:
+                range_pop()
 
     def add_request(self, request_id: str) -> None:
         pass
