@@ -1,13 +1,22 @@
+import logging
+
 import torch
 
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.utils.profiler import range_pop, range_push
+
+logger = logging.getLogger(__name__)
 
 
 class FlowEngine(BaseEngine):
     """
     Flow/diffusion engine. Executes a single denoising step per call.
     Loop iteration is handled by the graph system.
+
+    For BAGEL's image_gen, each flow step is a full LLM forward. Multiple
+    requests' latents can be concatenated into a single LLM forward when
+    the submodule supports forward_batched() (leveraging BatchedCacheManager
+    from Phase 1).
     """
 
     def __init__(self, enable_nvtx: bool = False):
@@ -27,13 +36,31 @@ class FlowEngine(BaseEngine):
         self.submodules = submodules
         self.device = device
 
+    def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
+        """Original per-request execution."""
+        outputs = {}
+        for rid in batch.request_ids:
+            inputs = batch.per_request_input_tensors.get(rid, {})
+            metadata = batch.per_request_metadata.get(rid, {})
+            if hasattr(submodule, 'preprocess'):
+                preprocessed = submodule.preprocess(batch.graph_walk, **inputs)
+                outputs[rid] = submodule(**preprocessed, **metadata)
+            else:
+                result = submodule(**{k: v[0] for k, v in inputs.items()})
+                if isinstance(result, dict):
+                    outputs[rid] = result
+                elif isinstance(result, torch.Tensor):
+                    outputs[rid] = {"output": [result]}
+                else:
+                    outputs[rid] = {}
+        return NodeOutput(per_request_output_tensors=outputs)
+
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         if self.enable_nvtx:
             range_push(f"engine.flow.{batch.node_name}.{batch.graph_walk}")
 
         submodule = self.submodules.get(batch.node_name)
         if submodule is None:
-            # Dummy mode
             output = NodeOutput(
                 per_request_output_tensors={rid: {} for rid in batch.request_ids}
             )
@@ -43,21 +70,7 @@ class FlowEngine(BaseEngine):
 
         try:
             with torch.no_grad():
-                outputs = {}
-                for rid in batch.request_ids:
-                    inputs = batch.per_request_input_tensors.get(rid, {})
-                    if hasattr(submodule, 'preprocess'):
-                        preprocessed = submodule.preprocess(batch.graph_walk, **inputs)
-                        outputs[rid] = submodule(**preprocessed)
-                    else:
-                        result = submodule(**{k: v[0] for k, v in inputs.items()})
-                        if isinstance(result, dict):
-                            outputs[rid] = result
-                        elif isinstance(result, torch.Tensor):
-                            outputs[rid] = {"output": [result]}
-                        else:
-                            outputs[rid] = {}
-                return NodeOutput(per_request_output_tensors=outputs)
+                return self._execute_sequential(batch, submodule)
         finally:
             if self.enable_nvtx:
                 range_pop()
