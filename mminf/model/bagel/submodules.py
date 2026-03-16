@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.engine.ar_engine import CacheHandle
+from mminf.engine.ar_engine import BatchedCacheManager, CacheHandle
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -676,6 +676,150 @@ class LLMSubmodule(NodeSubmodule):
             "latents": [latents],
             "time_index": [time_index + 1]
         }
+
+    # ------------------------------------------------------------------
+    # Batched forward paths
+    # ------------------------------------------------------------------
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        cache_manager: "BatchedCacheManager",
+        per_request_inputs: dict[str, dict],
+        per_request_metadata: dict[str, dict],
+    ) -> dict[str, "NameToTensorList"]:
+        """Batched forward pass for decode and prefill_text.
+
+        Concatenates inputs across requests, runs a single LLM forward with
+        the BatchedCacheManager, then splits outputs back per-request.
+        """
+        if graph_walk == "decode":
+            return self._forward_decode_batched(
+                cache_manager, per_request_inputs, per_request_metadata
+            )
+        elif graph_walk == "prefill_text":
+            return self._forward_prefill_text_batched(
+                cache_manager, per_request_inputs, per_request_metadata
+            )
+        else:
+            raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
+
+    def _forward_decode_batched(
+        self,
+        cache_manager: "BatchedCacheManager",
+        per_request_inputs: dict[str, dict],
+        per_request_metadata: dict[str, dict],
+    ) -> dict[str, "NameToTensorList"]:
+        """Batched decode: all requests generate 1 token each.
+
+        1. Concatenate embeddings: [N, hidden] where N = num_requests
+        2. Single LLM forward with cache_manager (batched attention)
+        3. If any request requires CFG, run a second pass for cfg_img
+        4. Per-request lm_head + argmax
+        """
+        request_ids = cache_manager.request_ids
+
+        # 1. Embed and concatenate
+        embs = []
+        for rid in request_ids:
+            inputs = per_request_inputs[rid]
+            emb = self.embed_tokens(inputs["text_inputs"])
+            embs.append(emb)
+
+        emb_cat = torch.cat(embs, dim=0)
+        seq_lens = [emb.shape[0] for emb in embs]
+
+        # Pop non-LLM kwargs from metadata
+        cleaned_metadata = {}
+        has_cfg = False
+        for rid in request_ids:
+            meta = dict(per_request_metadata.get(rid, {}))
+            if meta.pop("requires_cfg", False):
+                has_cfg = True
+            meta.pop("cache_labels", None)
+            meta.pop("snapshot_after", None)
+            meta.pop("is_prefill", None)
+            cleaned_metadata[rid] = meta
+
+        # 2. Single LLM forward (main cache)
+        cache_manager.set_active_label("main")
+        hidden = self.language_model(
+            emb_cat, is_causal=True, mode="und",
+            cache_handle=cache_manager,
+            seq_lens=seq_lens,
+        )
+
+        # 3. CFG sync pass for cfg_img if needed
+        if has_cfg:
+            cache_manager.set_active_label("cfg_img")
+            self.language_model(
+                emb_cat, is_causal=True, mode="und",
+                cache_handle=cache_manager,
+                seq_lens=seq_lens,
+            )
+
+        # 4. Per-request lm_head + argmax
+        outputs = {}
+        offset = 0
+        for rid, sl in zip(request_ids, seq_lens):
+            h = hidden[offset:offset + sl]
+            logits = self.lm_head(h[-1:])
+            token = torch.argmax(logits, dim=-1)
+            outputs[rid] = {"new_token": [token]}
+            offset += sl
+
+        return outputs
+
+    def _forward_prefill_text_batched(
+        self,
+        cache_manager: "BatchedCacheManager",
+        per_request_inputs: dict[str, dict],
+        per_request_metadata: dict[str, dict],
+    ) -> dict[str, "NameToTensorList"]:
+        """Batched text prefill: embed and run LLM forward for all requests.
+
+        For requests with requires_cfg, we need snapshots and multi-label
+        forwarding which complicates batching. If ANY request in the batch
+        requires CFG, we fall back to handling CFG for all (snapshot + dual
+        forward for main and cfg_img).
+        """
+        request_ids = cache_manager.request_ids
+
+        # Embed and concatenate
+        embs = []
+        for rid in request_ids:
+            inputs = per_request_inputs[rid]
+            emb = self.embed_tokens(inputs["text_inputs"])
+            embs.append(emb)
+
+        emb_cat = torch.cat(embs, dim=0)
+        seq_lens = [emb.shape[0] for emb in embs]
+
+        # Check if any request needs CFG
+        has_cfg = any(
+            per_request_metadata.get(rid, {}).get("requires_cfg", False)
+            for rid in request_ids
+        )
+
+        if has_cfg:
+            # Snapshot main -> cfg_text for all requests, then forward [main, cfg_img]
+            cache_manager.snapshot_all("main", "cfg_text")
+            for label in ["main", "cfg_img"]:
+                cache_manager.set_active_label(label)
+                self.language_model(
+                    emb_cat, is_causal=True, mode="und",
+                    cache_handle=cache_manager,
+                    seq_lens=seq_lens,
+                )
+        else:
+            cache_manager.set_active_label("main")
+            self.language_model(
+                emb_cat, is_causal=True, mode="und",
+                cache_handle=cache_manager,
+                seq_lens=seq_lens,
+            )
+
+        return {rid: {} for rid in request_ids}
 
     def _wrap_with_boi_eoi(self, emb: torch.Tensor) -> torch.Tensor:
         """Wrap embeddings with <|vision_start|> and <|vision_end|> tokens."""
