@@ -293,15 +293,21 @@ class LLMSubmodule(NodeSubmodule):
             self.config.vae_config.z_channels * self.config.latent_patch_size ** 2,
         ).to(device=device, dtype=torch.bfloat16)
 
-    def preprocess(self, graph_walk: str, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Unwrap single-element tensor lists and handle latent initialization.
+    def preprocess(
+        self, graph_walk: str,
+        cache_handle=None,
+        requires_cfg: bool = False,
+        **inputs: list[torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Data transform + plan attention/rope for all relevant labels.
 
-        For image_gen graph walk: if "latents" input is empty (first flow matching
-        iteration), initializes random noise. The latent shape (latent_seq_len,
-        latent_dim) must be provided via per-request metadata since it depends
-        on the output image dimensions.
+        When cache_handle is provided (sequential execution), calls
+        plan_attention/plan_rope for every cache label needed by this
+        graph walk. This must happen outside forward() because plan
+        operations are CUDA graph incompatible.
 
-        For all other graph walks: standard unwrapping of list[Tensor] -> Tensor.
+        When cache_handle is None (batched execution preprocesses per-request
+        without planning; planning is done separately via preprocess_batched).
         """
         device = next(self.parameters()).device
         result = {}
@@ -373,7 +379,60 @@ class LLMSubmodule(NodeSubmodule):
                 text_len, dtype=torch.int32, device=device
             )
 
+        # Plan attention/rope for all needed labels (CUDA graph incompatible)
+        if cache_handle is not None:
+            self._plan_for_graph_walk(graph_walk, cache_handle, requires_cfg, result)
+
         return result
+
+    def _plan_for_graph_walk(
+        self, graph_walk: str, cache_handle, requires_cfg: bool,
+        preprocessed: dict,
+    ) -> None:
+        """Plan attention and rope for all cache labels needed by this graph walk."""
+        if graph_walk == "prefill_text":
+            seq_len = preprocessed["text_inputs"].shape[0]
+            if requires_cfg:
+                cache_handle.snapshot("main", "cfg_text")
+                for label in ["main", "cfg_img"]:
+                    cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True, label=label)
+                    cache_handle.plan_rope(seq_lens=[seq_len], label=label)
+            else:
+                cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True, label="main")
+                cache_handle.plan_rope(seq_lens=[seq_len], label="main")
+
+        elif graph_walk == "prefill_vit":
+            seq_len = preprocessed["combined_emb"].shape[0]
+            pos_ids = preprocessed["empty_pos_ids"] + cache_handle._get_state("main").position_id_start
+            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False, label="main")
+            cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids, label="main")
+
+        elif graph_walk == "prefill_vae":
+            seq_len = preprocessed["combined_emb"].shape[0]
+            pos_ids = preprocessed["empty_pos_ids"] + cache_handle._get_state("main").position_id_start
+            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False, label="main")
+            cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids, label="main")
+
+        elif graph_walk == "decode":
+            seq_len = preprocessed["text_inputs"].shape[0]
+            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True, label="main")
+            cache_handle.plan_rope(seq_lens=[seq_len], label="main")
+            if requires_cfg:
+                cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True, label="cfg_img")
+                cache_handle.plan_rope(seq_lens=[seq_len], label="cfg_img")
+
+        elif graph_walk == "image_gen":
+            seq_len = preprocessed["empty_combined_emb"].shape[0]
+            empty_pos_ids = preprocessed["empty_pos_ids"]
+            if requires_cfg:
+                for label in ["main", "cfg_text", "cfg_img"]:
+                    pos_ids = empty_pos_ids + cache_handle._get_state(label).position_id_start
+                    cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False, label=label)
+                    cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids, label=label)
+            else:
+                pos_ids = empty_pos_ids + cache_handle._get_state("main").position_id_start
+                cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False, label="main")
+                cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids, label="main")
 
     def forward(self, graph_walk: str, cache_handle=None, **kwargs) -> NameToTensorList:
         inputs_and_shapes = ", ".join([
@@ -402,8 +461,10 @@ class LLMSubmodule(NodeSubmodule):
         """embed_tokens -> LLM forward (causal, mode='und') -> KV cache update.
 
         When requires_cfg is True (image generation mode):
-        1. Snapshot main -> cfg_text BEFORE forward (cfg_text = context without this text)
+        1. Snapshot main -> cfg_text BEFORE forward (done in preprocess)
         2. Forward for main and cfg_img (both see the text tokens)
+
+        plan_attention/plan_rope are called in preprocess for all needed labels.
         """
         emb = self.embed_tokens(text_inputs)
         requires_cfg = kwargs.pop("requires_cfg", False)
@@ -411,14 +472,9 @@ class LLMSubmodule(NodeSubmodule):
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
 
-        seq_len = emb.shape[0]
-
         if requires_cfg and cache_handle is not None:
-            cache_handle.snapshot("main", "cfg_text")
             for label in ["main", "cfg_img"]:
                 cache_handle.set_active_label(label)
-                cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True)
-                cache_handle.plan_rope(seq_lens=[seq_len])
                 self.language_model(
                     emb, mode="und",
                     cache_handle=cache_handle, **kwargs
@@ -426,8 +482,6 @@ class LLMSubmodule(NodeSubmodule):
         else:
             if cache_handle is not None:
                 cache_handle.set_active_label("main")
-                cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True)
-                cache_handle.plan_rope(seq_lens=[seq_len])
             self.language_model(
                 emb, mode="und",
                 cache_handle=cache_handle, **kwargs
@@ -443,19 +497,16 @@ class LLMSubmodule(NodeSubmodule):
 
         When requires_cfg is True: forward for main only, then snapshot
         main -> cfg_text (cfg_text = context including this image).
+
+        plan_attention/plan_rope are called in preprocess.
         """
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
 
-        seq_len = combined_emb.shape[0]
-
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-            pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
-            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False)
-            cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids)
         self.language_model(
             combined_emb, mode="und",
             custom_advance_pos_id=1,
@@ -477,19 +528,16 @@ class LLMSubmodule(NodeSubmodule):
 
         When requires_cfg is True: forward for main only, then snapshot
         main -> cfg_text (cfg_text = context including this image).
+
+        plan_attention/plan_rope are called in preprocess.
         """
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
 
-        seq_len = combined_emb.shape[0]
-
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-            pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
-            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False)
-            cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids)
         self.language_model(
             combined_emb, mode="gen",
             cache_handle=cache_handle,
@@ -511,6 +559,8 @@ class LLMSubmodule(NodeSubmodule):
 
         When requires_cfg is True: also forward for cfg_img to keep its
         KV cache in sync (cfg_img tracks all text, no images).
+
+        plan_attention/plan_rope are called in preprocess for all needed labels.
         """
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
@@ -518,12 +568,8 @@ class LLMSubmodule(NodeSubmodule):
         kwargs.pop("is_prefill", None)
         emb = self.embed_tokens(text_inputs)
 
-        seq_len = emb.shape[0]
-
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True)
-            cache_handle.plan_rope(seq_lens=[seq_len])
         hidden = self.language_model(
             emb, mode="und",
             cache_handle=cache_handle, **kwargs
@@ -531,8 +577,6 @@ class LLMSubmodule(NodeSubmodule):
 
         if requires_cfg and cache_handle is not None:
             cache_handle.set_active_label("cfg_img")
-            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True)
-            cache_handle.plan_rope(seq_lens=[seq_len])
             self.language_model(
                 emb, mode="und",
                 cache_handle=cache_handle, **kwargs
@@ -618,13 +662,11 @@ class LLMSubmodule(NodeSubmodule):
             effective_text_scale = cfg_text_scale if in_cfg_interval else 1.0
             effective_img_scale = cfg_img_scale if in_cfg_interval else 1.0
 
+            # plan_attention/plan_rope for all 3 labels done in preprocess
             velocities = {}
             for label in ["main", "cfg_text", "cfg_img"]:
                 if cache_handle is not None:
                     cache_handle.set_active_label(label)
-                    pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
-                    cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False)
-                    cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids)
                 hidden = self.language_model(
                     empty_combined_emb, mode="gen",
                     cache_handle=cache_handle, write_cache=False,
@@ -670,12 +712,9 @@ class LLMSubmodule(NodeSubmodule):
                     ).clamp(min=cfg_renorm_min, max=1.0)
                 v_final = v_combined * renorm_scale
         else:
-            # No CFG: single forward pass
+            # No CFG: single forward pass (plan done in preprocess)
             if cache_handle is not None:
                 cache_handle.set_active_label("main")
-                pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
-                cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False)
-                cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids)
             hidden = self.language_model(
                 empty_combined_emb, mode="gen",
                 cache_handle=cache_handle, write_cache=False,
@@ -692,8 +731,51 @@ class LLMSubmodule(NodeSubmodule):
         }
 
     # ------------------------------------------------------------------
-    # Batched forward paths
+    # Batched planning + forward paths
     # ------------------------------------------------------------------
+
+    def preprocess_batched(
+        self,
+        graph_walk: str,
+        cache_manager: "BatchedCacheManager",
+        per_request_inputs: dict[str, dict],
+        per_request_metadata: dict[str, dict],
+    ) -> None:
+        """Plan attention/rope on shared cache_manager for batched execution.
+
+        Called by the engine after per-request preprocess (data transform) but
+        before forward_batched. Plans for all cache labels needed by this
+        graph walk so that forward_batched is CUDA graph compatible.
+        """
+        request_ids = cache_manager.request_ids
+
+        has_cfg = any(
+            per_request_metadata.get(rid, {}).get("requires_cfg", False)
+            for rid in request_ids
+        )
+
+        if graph_walk == "decode":
+            # Compute seq_lens from preprocessed inputs
+            seq_lens = [per_request_inputs[rid]["text_inputs"].shape[0] for rid in request_ids]
+            cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
+            cache_manager.plan_rope(seq_lens=seq_lens, label="main")
+            if has_cfg:
+                cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="cfg_img")
+                cache_manager.plan_rope(seq_lens=seq_lens, label="cfg_img")
+
+        elif graph_walk == "prefill_text":
+            seq_lens = [per_request_inputs[rid]["text_inputs"].shape[0] for rid in request_ids]
+            if has_cfg:
+                cache_manager.snapshot_all("main", "cfg_text")
+                for label in ["main", "cfg_img"]:
+                    cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label=label)
+                    cache_manager.plan_rope(seq_lens=seq_lens, label=label)
+            else:
+                cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
+                cache_manager.plan_rope(seq_lens=seq_lens, label="main")
+
+        else:
+            raise ValueError(f"Batched preprocess not supported for graph walk: {graph_walk!r}")
 
     def forward_batched(
         self,
@@ -730,6 +812,8 @@ class LLMSubmodule(NodeSubmodule):
         2. Single LLM forward with cache_manager (batched attention)
         3. If any request requires CFG, run a second pass for cfg_img
         4. Per-request lm_head + argmax
+
+        plan_attention/plan_rope are called in preprocess_batched.
         """
         request_ids = cache_manager.request_ids
 
@@ -743,32 +827,21 @@ class LLMSubmodule(NodeSubmodule):
         emb_cat = torch.cat(embs, dim=0)
         seq_lens = [emb.shape[0] for emb in embs]
 
-        # Pop non-LLM kwargs from metadata
-        cleaned_metadata = {}
-        has_cfg = False
-        for rid in request_ids:
-            meta = dict(per_request_metadata.get(rid, {}))
-            if meta.pop("requires_cfg", False):
-                has_cfg = True
-            meta.pop("cache_labels", None)
-            meta.pop("snapshot_after", None)
-            meta.pop("is_prefill", None)
-            cleaned_metadata[rid] = meta
+        has_cfg = any(
+            per_request_metadata.get(rid, {}).get("requires_cfg", False)
+            for rid in request_ids
+        )
 
-        # 2. Single LLM forward (main cache)
+        # 2. Single LLM forward (main cache, already planned)
         cache_manager.set_active_label("main")
-        cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True)
-        cache_manager.plan_rope(seq_lens=seq_lens)
         hidden = self.language_model(
             emb_cat, mode="und",
             cache_handle=cache_manager,
         )
 
-        # 3. CFG sync pass for cfg_img if needed
+        # 3. CFG sync pass for cfg_img if needed (already planned)
         if has_cfg:
             cache_manager.set_active_label("cfg_img")
-            cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True)
-            cache_manager.plan_rope(seq_lens=seq_lens)
             self.language_model(
                 emb_cat, mode="und",
                 cache_handle=cache_manager,
@@ -798,6 +871,8 @@ class LLMSubmodule(NodeSubmodule):
         forwarding which complicates batching. If ANY request in the batch
         requires CFG, we fall back to handling CFG for all (snapshot + dual
         forward for main and cfg_img).
+
+        plan_attention/plan_rope and snapshot are called in preprocess_batched.
         """
         request_ids = cache_manager.request_ids
 
@@ -809,7 +884,6 @@ class LLMSubmodule(NodeSubmodule):
             embs.append(emb)
 
         emb_cat = torch.cat(embs, dim=0)
-        seq_lens = [emb.shape[0] for emb in embs]
 
         # Check if any request needs CFG
         has_cfg = any(
@@ -818,20 +892,14 @@ class LLMSubmodule(NodeSubmodule):
         )
 
         if has_cfg:
-            # Snapshot main -> cfg_text for all requests, then forward [main, cfg_img]
-            cache_manager.snapshot_all("main", "cfg_text")
             for label in ["main", "cfg_img"]:
                 cache_manager.set_active_label(label)
-                cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True)
-                cache_manager.plan_rope(seq_lens=seq_lens)
                 self.language_model(
                     emb_cat, mode="und",
                     cache_handle=cache_manager,
                 )
         else:
             cache_manager.set_active_label("main")
-            cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True)
-            cache_manager.plan_rope(seq_lens=seq_lens)
             self.language_model(
                 emb_cat, mode="und",
                 cache_handle=cache_manager,
