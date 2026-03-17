@@ -411,20 +411,25 @@ class LLMSubmodule(NodeSubmodule):
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
 
+        seq_len = emb.shape[0]
+
         if requires_cfg and cache_handle is not None:
-            # cfg_text = main before this text (everything except subsequent text)
             cache_handle.snapshot("main", "cfg_text")
             for label in ["main", "cfg_img"]:
                 cache_handle.set_active_label(label)
+                cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True)
+                cache_handle.plan_rope(seq_lens=[seq_len])
                 self.language_model(
-                    emb, is_causal=True, mode="und",
+                    emb, mode="und",
                     cache_handle=cache_handle, **kwargs
                 )
         else:
             if cache_handle is not None:
                 cache_handle.set_active_label("main")
+                cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True)
+                cache_handle.plan_rope(seq_lens=[seq_len])
             self.language_model(
-                emb, is_causal=True, mode="und",
+                emb, mode="und",
                 cache_handle=cache_handle, **kwargs
             )
         return {}
@@ -444,14 +449,15 @@ class LLMSubmodule(NodeSubmodule):
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
 
+        seq_len = combined_emb.shape[0]
+
         if cache_handle is not None:
             cache_handle.set_active_label("main")
             pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
-        else:
-            pos_ids = empty_pos_ids
+            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False)
+            cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids)
         self.language_model(
-            combined_emb, is_causal=False, mode="und",
-            pos_ids=pos_ids,
+            combined_emb, mode="und",
             custom_advance_pos_id=1,
             cache_handle=cache_handle, **kwargs
         )
@@ -477,15 +483,18 @@ class LLMSubmodule(NodeSubmodule):
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
 
+        seq_len = combined_emb.shape[0]
+
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-            empty_pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
+            pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
+            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False)
+            cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids)
         self.language_model(
-            combined_emb, is_causal=False, mode="gen",
+            combined_emb, mode="gen",
             cache_handle=cache_handle,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
-            pos_ids=empty_pos_ids,
             custom_advance_pos_id=1,
             **kwargs
         )
@@ -509,18 +518,23 @@ class LLMSubmodule(NodeSubmodule):
         kwargs.pop("is_prefill", None)
         emb = self.embed_tokens(text_inputs)
 
+        seq_len = emb.shape[0]
+
         if cache_handle is not None:
             cache_handle.set_active_label("main")
+            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True)
+            cache_handle.plan_rope(seq_lens=[seq_len])
         hidden = self.language_model(
-            emb, is_causal=True, mode="und",
+            emb, mode="und",
             cache_handle=cache_handle, **kwargs
         )
 
         if requires_cfg and cache_handle is not None:
-            # Keep cfg_img KV cache in sync (discard output)
             cache_handle.set_active_label("cfg_img")
+            cache_handle.plan_attention(seq_lens=[seq_len], is_causal=True)
+            cache_handle.plan_rope(seq_lens=[seq_len])
             self.language_model(
-                emb, is_causal=True, mode="und",
+                emb, mode="und",
                 cache_handle=cache_handle, **kwargs
             )
 
@@ -588,6 +602,8 @@ class LLMSubmodule(NodeSubmodule):
         empty_combined_emb[1:-1] = latents_
         logger.debug(f"packed_seq = {empty_combined_emb}")
 
+        seq_len = empty_combined_emb.shape[0]
+
         if requires_cfg:
             logger.debug("Running 3 fwd passes for cfg gen")
             cfg_text_scale = kwargs.pop("cfg_text_scale", self.config.cfg_text_scale)
@@ -607,13 +623,12 @@ class LLMSubmodule(NodeSubmodule):
                 if cache_handle is not None:
                     cache_handle.set_active_label(label)
                     pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
-                else:
-                    pos_ids = empty_pos_ids
+                    cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False)
+                    cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids)
                 hidden = self.language_model(
-                    empty_combined_emb, is_causal=False, mode="gen",
+                    empty_combined_emb, mode="gen",
                     cache_handle=cache_handle, write_cache=False,
                     vae_token_indexes=vae_token_indexes,
-                    pos_ids=pos_ids,
                     text_indexes=text_indexes, **kwargs,
                 )
                 velocities[label] = hidden
@@ -659,13 +674,12 @@ class LLMSubmodule(NodeSubmodule):
             if cache_handle is not None:
                 cache_handle.set_active_label("main")
                 pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
-            else:
-                pos_ids = empty_pos_ids
+                cache_handle.plan_attention(seq_lens=[seq_len], is_causal=False)
+                cache_handle.plan_rope(seq_lens=[seq_len], pos_ids=pos_ids)
             hidden = self.language_model(
-                empty_combined_emb, is_causal=False, mode="gen",
+                empty_combined_emb, mode="gen",
                 cache_handle=cache_handle, write_cache=False,
                 vae_token_indexes=vae_token_indexes,
-                pos_ids=pos_ids,
                 text_indexes=text_indexes, **kwargs,
             )
             v_final = self.llm2vae(hidden)[1:-1]
@@ -743,19 +757,21 @@ class LLMSubmodule(NodeSubmodule):
 
         # 2. Single LLM forward (main cache)
         cache_manager.set_active_label("main")
+        cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True)
+        cache_manager.plan_rope(seq_lens=seq_lens)
         hidden = self.language_model(
-            emb_cat, is_causal=True, mode="und",
+            emb_cat, mode="und",
             cache_handle=cache_manager,
-            seq_lens=seq_lens,
         )
 
         # 3. CFG sync pass for cfg_img if needed
         if has_cfg:
             cache_manager.set_active_label("cfg_img")
+            cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True)
+            cache_manager.plan_rope(seq_lens=seq_lens)
             self.language_model(
-                emb_cat, is_causal=True, mode="und",
+                emb_cat, mode="und",
                 cache_handle=cache_manager,
-                seq_lens=seq_lens,
             )
 
         # 4. Per-request lm_head + argmax
@@ -806,17 +822,19 @@ class LLMSubmodule(NodeSubmodule):
             cache_manager.snapshot_all("main", "cfg_text")
             for label in ["main", "cfg_img"]:
                 cache_manager.set_active_label(label)
+                cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True)
+                cache_manager.plan_rope(seq_lens=seq_lens)
                 self.language_model(
-                    emb_cat, is_causal=True, mode="und",
+                    emb_cat, mode="und",
                     cache_handle=cache_manager,
-                    seq_lens=seq_lens,
                 )
         else:
             cache_manager.set_active_label("main")
+            cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True)
+            cache_manager.plan_rope(seq_lens=seq_lens)
             self.language_model(
-                emb_cat, is_causal=True, mode="und",
+                emb_cat, mode="und",
                 cache_handle=cache_manager,
-                seq_lens=seq_lens,
             )
 
         return {rid: {} for rid in request_ids}
