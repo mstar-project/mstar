@@ -94,12 +94,20 @@ class MicroScheduler:
         # Pop ready nodes for all requests of this node name
         entries = node_name_to_requests[best_node_name]
 
+        # Enforce same graph_walk for the entire batch.
+        # Pick the most common graph_walk to maximize batch size;
+        # remaining requests stay in the queue for the next cycle.
+        walk_counts: dict[str, int] = {}
+        for e in entries:
+            walk_counts[e.graph_walk] = walk_counts.get(e.graph_walk, 0) + 1
+        graph_walk = max(walk_counts, key=walk_counts.get)
+        entries = [e for e in entries if e.graph_walk == graph_walk]
+
         # Limit batch size if requested (e.g., for CUDA graph compatibility)
         if max_batch_size is not None and len(entries) > max_batch_size:
             entries = entries[:max_batch_size]
 
         node_objects = {}
-        graph_walk = entries[0].graph_walk
 
         for entry in entries:
             queue = worker_graphs_manager.queues[entry.worker_graph_id]
@@ -107,7 +115,6 @@ class MicroScheduler:
             if popped:
                 assert len(popped) == 1
                 node_objects[entry.request_id] = popped[0]
-                graph_walk = entry.graph_walk
 
         if not node_objects:
             return None
