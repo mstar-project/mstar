@@ -3,7 +3,6 @@ import logging
 import torch
 
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
-from mminf.model.base import NodeSubmodule
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -37,7 +36,7 @@ class FlowEngine(BaseEngine):
         self.submodules = submodules
         self.device = device
 
-    def _execute_sequential(self, batch: NodeBatch, submodule: NodeSubmodule) -> NodeOutput:
+    def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Original per-request execution."""
         outputs = {}
         for rid in batch.request_ids:

@@ -6,7 +6,6 @@ import torch
 
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.engine.cuda_graph_runner import CudaGraphRunner
-from mminf.model.base import NodeSubmodule
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -610,15 +609,15 @@ class AREngine(BaseEngine):
         """Compile submodules and capture CUDA graphs."""
         from mminf.engine.cuda_graph_runner import CudaGraphRunner
 
+        # TODO rework cuda graph capture
+        return
+    
         if self.kv_cache is None or self.device is None:
             logger.info("AREngine: skipping warmup (no KV cache or device)")
             return
 
         # Step 1: torch.compile (before CUDA graph capture)
         self._compile_submodules()
-
-        # TODO rework cuda graph capture
-        return
 
         # Step 2: CUDA graph capture
         for node_name in self.submodules:
@@ -645,7 +644,7 @@ class AREngine(BaseEngine):
             return False
         return True
 
-    def _execute_batched(self, batch: NodeBatch, submodule: NodeSubmodule) -> NodeOutput:
+    def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
         cache_manager = BatchedCacheManager(
             request_ids=batch.request_ids,
@@ -681,7 +680,7 @@ class AREngine(BaseEngine):
 
         return NodeOutput(per_request_output_tensors=batched_output)
 
-    def _execute_sequential(self, batch: NodeBatch, submodule: NodeSubmodule) -> NodeOutput:
+    def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Original per-request execution with CacheHandle."""
         per_request_outputs = {}
         for rid in batch.request_ids:
@@ -720,7 +719,7 @@ class AREngine(BaseEngine):
             return False
         return runner.can_run(len(batch.request_ids))
 
-    def _execute_with_cuda_graph(self, batch: NodeBatch, submodule: NodeSubmodule) -> NodeOutput:
+    def _execute_with_cuda_graph(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Execute using a captured CUDA graph."""
         runner = self.cuda_graph_runners[batch.node_name]
 
