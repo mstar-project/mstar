@@ -194,6 +194,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         # Use hostname:port as the Mooncake session ID for RDMA handshake.
         # Each entity must use a unique port.
         self.my_session_id = hostname
+        self.copy_stream = torch.cuda.Stream()
 
         self.copy_stream = torch.cuda.Stream()
 
@@ -226,7 +227,6 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
     def store_and_return_tensor_info(
         self, request_id: str, tensors: NameToTensorList,
     ) -> dict[str, list[TensorPointerInfo]]: # name to list[tensorPointerInfo]
-        torch.cuda.default_stream().synchronize()
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
             tensor_info[name] = []
@@ -439,7 +439,6 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         register memory, call engine.transfer_read_on_cuda(), record CUDA event.
         For each edge WITHOUT tensor_info (signal-only): no data to transfer.
         """
-        stream = self.copy_stream
         for graph_edge in graph_edges:
             if len(graph_edge.tensor_info) == 0:
                 continue  # signal-only edge, no data to transfer
@@ -448,53 +447,53 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 "Starting to read in %d tensors %s for graph node %s",
                 len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node
             )
-
-            for info in graph_edge.tensor_info:
-                if info.source_entity == self.my_entity_id or self.tensor_store.check_uuid_presence(
-                    request_id, info.uuid
-                ): # we already have this tensor!
+            with torch.cuda.stream(self.copy_stream):
+                for info in graph_edge.tensor_info:
+                    if info.source_entity == self.my_entity_id or self.tensor_store.check_uuid_presence(
+                        request_id, info.uuid
+                    ): # we already have this tensor!
+                        self.tensor_store.increment_ref(
+                            request_id, info.uuid, 1 # increment reference while it is being read
+                        )
+                        continue
+                    buffer = torch.empty(info.dims, dtype=info.dtype, device=device).as_strided(
+                        info.dims, stride=info.stride
+                    )
+                    self.tensor_store.put_tensor(
+                        request_id=request_id, uuid=info.uuid, tensor=buffer
+                    )
+                    self.tensor_store.set_metadata(
+                        request_id, info.uuid, mem_registered=True
+                    )
                     self.tensor_store.increment_ref(
                         request_id, info.uuid, 1 # increment reference while it is being read
                     )
-                    continue
-                buffer = torch.empty(info.dims, dtype=info.dtype, device=device).as_strided(
-                    info.dims, stride=info.stride
-                )
-                self.tensor_store.put_tensor(
-                    request_id=request_id, uuid=info.uuid, tensor=buffer
-                )
-                self.tensor_store.set_metadata(
-                    request_id, info.uuid, mem_registered=True
-                )
-                self.tensor_store.increment_ref(
-                    request_id, info.uuid, 1 # increment reference while it is being read
-                )
 
-                if self.protocol == CommProtocol.RDMA:
-                    if self.engine is None:
+                    if self.protocol == CommProtocol.RDMA:
+                        if self.engine is None:
+                            raise RuntimeError(
+                                "Cannot start RDMA reads: TransferEngine is not available."
+                            )
+                        self.engine.register_memory(buffer.data_ptr(), info.nbytes)
+                    else:
                         raise RuntimeError(
-                            "Cannot start RDMA reads: TransferEngine is not available."
+                            "Tensor transport for IPC is not implemented yet in this build."
                         )
-                    self.engine.register_memory(buffer.data_ptr(), info.nbytes)
-                else:
-                    raise RuntimeError(
-                        "Tensor transport for IPC is not implemented yet in this build."
-                    )
 
-                with torch.cuda.stream(stream):
+                
                     self.engine.transfer_read_on_cuda(
                         info.source_session_id,
                         buffer.data_ptr(),
                         info.address,
                         info.nbytes,
-                        stream.cuda_stream,
+                        self.copy_stream.cuda_stream,
                     )
                 logger.debug("Started transfer read for uuid %s", info.uuid)
-            # For now, have one cuda event for all tensors in this graph edge
-            event = torch.cuda.Event()
-            event.record(stream)
+                # For now, have one cuda event for all tensors in this graph edge
+                event = self.copy_stream.record_event()
             self.pending.append(
                 EventAndPointers(
-                    event=event, graph_edges=[graph_edge], request_id=request_id
+                    event=event, graph_edges=[graph_edge],
+                    request_id=request_id
                 )
             )

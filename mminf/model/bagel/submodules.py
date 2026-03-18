@@ -75,7 +75,6 @@ class ViTEncoderSubmodule(NodeSubmodule):
         pixel_val_list = []
         seq_lens = []
         for inputs in per_request_inputs:
-            print("hi")
             image_inputs = inputs["image_inputs"]
 
             image_tensor = self.vae_transform.resize_transform(image_inputs[0])
@@ -94,7 +93,6 @@ class ViTEncoderSubmodule(NodeSubmodule):
             pixel_val_list.append(pixel_values)
             pos_id_list.append(position_ids)
         n_head = self.vit_model.config.num_attention_heads
-        print(seq_lens)
         attn_wrapper = FlashInferAttentionNoCache(
             device=device,
             num_qo_heads=n_head,
@@ -117,7 +115,6 @@ class ViTEncoderSubmodule(NodeSubmodule):
         attn_wrapper: FlashInferAttentionNoCache,
         **kwargs,
     ) -> NameToTensorList:
-        print(packed_position_ids)
         logger.debug(
             "Running BAGEL ViT with packed_pixel_values shape=%s, packed_position_ids shape=%s",
             packed_pixel_values.shape, packed_position_ids.shape
@@ -130,7 +127,6 @@ class ViTEncoderSubmodule(NodeSubmodule):
         features = self.connector(features)
         pos_emb = self.vit_pos_embed(packed_position_ids)
         features = features + pos_emb
-        print(features)
         return {"img_emb": [features]}
     
     def forward_batched(
@@ -886,6 +882,18 @@ class LLMSubmodule(NodeSubmodule):
                 requires_cfg=has_cfg, **packed_inputs
             ) # prefill is the same batched and unbatched
             return {rid: [] for rid in request_ids}
+        elif graph_walk == "prefill_vit":
+            self._forward_prefill_vit(
+                cache_handle=cache_manager,
+                requires_cfg=has_cfg, **packed_inputs
+            ) # prefill is the same batched and unbatched
+            return {rid: [] for rid in request_ids}
+        elif graph_walk == "prefill_vae":
+            self._forward_prefill_vae(
+                cache_handle=cache_manager,
+                requires_cfg=has_cfg, **packed_inputs
+            ) # prefill is the same batched and unbatched
+            return {rid: [] for rid in request_ids}
         else:
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
 
@@ -948,7 +956,7 @@ class LLMSubmodule(NodeSubmodule):
         return torch.cat([boi_emb, emb, eoi_emb], dim=0)
     
     def can_batch(self, batch: NodeBatch) -> bool:
-        return batch.graph_walk in ["prefill_text", "decode"]
+        return batch.graph_walk != "image_gen"
 
 
 class VAEDecoderSubmodule(NodeSubmodule):

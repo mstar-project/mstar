@@ -57,6 +57,7 @@ class Worker:
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = enable_nvtx
+        torch.cuda.set_device(device)
 
         self.worker_graphs_manager = WorkerGraphsManager(
             queues={
@@ -418,6 +419,7 @@ class Worker:
     def run(self) -> None:
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
+        torch.cuda.synchronize()
 
         while True:
             from mminf.utils.profiler import range_pop, range_push
