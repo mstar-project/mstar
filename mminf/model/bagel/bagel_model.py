@@ -112,15 +112,21 @@ class BagelModel(Model):
     def __init__(
         self,
         model_path_hf: str,
+        cache_dir: str | None = None,
         **kwargs
     ):
-        config_path = hf_hub_download(repo_id=model_path_hf, filename="config.json", revision=None)
+        self.cache_dir = cache_dir
+
+        config_path = hf_hub_download(
+            repo_id=model_path_hf, filename="config.json",
+            revision=None, cache_dir=cache_dir,
+        )
         with open(config_path) as f:
             self.config = load_bagel_config(json.load(f))
 
         self.model_path_hf = model_path_hf
 
-        self.tokenizer = BagelTokenizer.from_pretrained(model_path_hf)
+        self.tokenizer = BagelTokenizer.from_pretrained(model_path_hf, cache_dir=cache_dir)
         self.tokenizer, new_token_ids, _ = add_special_tokens(self.tokenizer)
 
         # Special token IDs
@@ -150,8 +156,10 @@ class BagelModel(Model):
     def _download_hf(self):
         if self.repo is not None:
             return
-        cache_dir = snapshot_download(repo_id=self.model_path_hf)
-        self.repo = Path(cache_dir)
+        local_dir = snapshot_download(
+            repo_id=self.model_path_hf, cache_dir=self.cache_dir,
+        )
+        self.repo = Path(local_dir)
 
     def _init_language_model_components(self, device):
         self._download_hf()

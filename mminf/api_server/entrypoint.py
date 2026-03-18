@@ -54,6 +54,7 @@ def _conductor_process_target(
     socket_path_prefix: str,
     enable_nvtx: bool = False,
     log_level: str = "INFO",
+    cache_dir: str | None = None,
 ):
     """Runs DummyConductor.run() in a spawned process."""
     logging.basicConfig(
@@ -66,6 +67,7 @@ def _conductor_process_target(
 
     model = get_model_class(model_name)(
         model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
+        cache_dir=cache_dir,
     )
     conductor = Conductor(
         model=model,
@@ -90,7 +92,7 @@ def _shutdown_conductor_process(
     try:
         conductor_proc.send_signal(signal.SIGINT)
         conductor_proc.join(timeout=timeout)
-    except Exception:
+    except BaseException:
         logger.exception("Failed graceful conductor shutdown")
 
     if conductor_proc.is_alive():
@@ -522,6 +524,10 @@ def main():
         help="Enable torch.cuda.nvtx markers during execution",
     )
     parser.add_argument(
+        "--cache-dir", type=str, default=None,
+        help="Directory for caching downloaded HuggingFace model files",
+    )
+    parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
@@ -547,6 +553,7 @@ def main():
             args.socket_path_prefix,
             args.enable_nvtx,
             args.log_level,
+            args.cache_dir,
         ),
     )
     conductor_proc.start()
@@ -557,6 +564,7 @@ def main():
     from mminf.model.registry import get_model_class
     model = get_model_class(model_name)(
         model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
+        cache_dir=args.cache_dir,
     )
 
     global api_server

@@ -2,20 +2,29 @@
 
 import base64
 import json
-import sys
-
 import requests
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 URL = "http://0.0.0.0:8000/generate"
 
+print_lock = threading.Lock()
+start_barrier = threading.Barrier(9)  # ensure simultaneous start
 
-def main():
+
+def make_request(prompt: str, idx: int) -> str:
     data = {
-        "text": "What is the 7th value after the decimal point in pi?",
+        "text": prompt,
         "model_kwargs": json.dumps({
             "think_mode": True,
         }),
     }
+
+    output_chunks = []
+
+    # Synchronize all threads to start at once
+    start_barrier.wait()
+
     with requests.post(
         URL,
         data=data,
@@ -35,9 +44,45 @@ def main():
             if msg.get("modality") == "text":
                 data_b64 = msg.get("data", "")
                 decoded = base64.b64decode(data_b64)
+                output_chunks.append(decoded.decode("utf-8", errors="replace"))
 
-                sys.stdout.write(decoded.decode("utf-8", errors="replace"))
-                sys.stdout.flush()
+    result = "".join(output_chunks)
+
+    # Thread-safe print
+    with print_lock:
+        print(f"PROMPT={prompt}\nRES={result}\n" + ("-" * 60))
+
+    return result
+
+
+def main():
+    prompts = [
+        "What is the 7th value after the decimal point in pi?",
+        "Explain what a black hole is in one paragraph.",
+        "Write a haiku about recursion.",
+        "What is 3 * 4?",
+        "Summarize the theory of relativity briefly.",
+        "What is the capital of France?",
+        "Explain gradient descent in simple terms. Please respond in English.",
+        "What is the Fibonacci sequence?",
+        "Give a fun fact about octopuses.",
+    ]
+
+    results = []
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [
+            executor.submit(make_request, prompt, i)
+            for i, prompt in enumerate(prompts)
+        ]
+
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    # # Optional: final summary print
+    # print("\n===== ALL RESPONSES COLLECTED =====")
+    # for i, res in enumerate(results):
+    #     print(f"--- {i} ---\n{res}\n")
 
 
 if __name__ == "__main__":

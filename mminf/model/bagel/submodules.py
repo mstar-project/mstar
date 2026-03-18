@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.engine.ar_engine import CacheHandle
+from mminf.engine.ar_engine import BatchedCacheManager
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -51,7 +51,13 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self.transform = ImageTransform(980, 224, 14)
         self.vae_transform = ImageTransform(1024, 512, 16)
 
-    def preprocess(self, graph_walk: str, image_inputs: list[torch.Tensor]) -> dict:
+    def preprocess(
+        self, graph_walk: str,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_metadata: dict[str, dict],
+        cache_manager: BatchedCacheManager=None,
+    ) -> dict[str, torch.Tensor]: # input name to tensor
         """Convert raw images to packed ViT input format.
 
         Full implementation should include prepare_vit_images logic from BAGEL:
@@ -60,6 +66,10 @@ class ViTEncoderSubmodule(NodeSubmodule):
         - Position ID computation from image grid
         - Packing multiple images with cu_seqlens for FlashAttention
         """
+        
+        assert len(per_request_inputs) == 1, "Batching not supported for ViTEncoder"
+        image_inputs = per_request_inputs[0]["image_inputs"]
+
         image_tensor = self.vae_transform.resize_transform(image_inputs[0])
         image_tensor = self.transform(image_tensor)
 
@@ -142,7 +152,13 @@ class VAEEncoderSubmodule(NodeSubmodule):
         self.max_latent_size = max_latent_size
         self.transform = ImageTransform(1024, 512, 16)
 
-    def preprocess(self, graph_walk: str, image_inputs: list[torch.Tensor]) -> dict:
+    def preprocess(
+        self, graph_walk: str,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_metadata: dict[str, dict],
+        cache_manager: BatchedCacheManager=None,
+    ) -> dict[str, torch.Tensor]: # input name to tensor
         """Convert raw images to VAE encoder input format.
 
         Computes patchified dimensions as Python ints for CUDA graph
@@ -153,7 +169,10 @@ class VAEEncoderSubmodule(NodeSubmodule):
         - VAE position ID computation from latent grid
         - Timestep preparation
         """
-        image_tensor: torch.Tensor = self.transform(self.transform.resize_transform(image_inputs[0]))  # [C, H, W]
+        assert len(per_request_inputs) == 1, "Batching not supported for ViTEncoder"
+        image_inputs = per_request_inputs[0]["image_inputs"]
+
+        image_tensor: torch.Tensor = self.transform(self.transform.resize_transform(image_inputs[0].contiguous()))  # [C, H, W]
         device = image_tensor.device
 
         # Compute patchified dimensions as ints (CUDA graph compatible)
@@ -172,7 +191,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
         return {
             "padded_images": image_tensor.unsqueeze(0).to(torch.bfloat16),
             "packed_vae_position_ids": packed_vae_position_ids,
-            "packed_timesteps": torch.tensor([0], device=device),
+            "packed_timesteps": torch.tensor([0.0], device=device),
             "h": h,
             "w": w,
         }
@@ -292,51 +311,132 @@ class LLMSubmodule(NodeSubmodule):
             num_image_tokens,
             self.config.vae_config.z_channels * self.config.latent_patch_size ** 2,
         ).to(device=device, dtype=torch.bfloat16)
+    
+    def _preprocess_prefill_text(
+        self, text_inputs: torch.Tensor
+    ):
+        out = text_inputs.new_zeros(text_inputs.shape[0] + 2)
+        out[0] = self.bos_token_id
+        out[-1] = self.eos_token_id
+        out[1:-1] = text_inputs
+        return out
+    
+    def _get_image_pos_ids(
+        self, labels: list[str],
+        cache_manager: BatchedCacheManager,
+        device: str,
+        seq_lens: list[int],
+        request_ids: list[str]
+    ):
+        return {
+            label: [
+                torch.zeros(
+                    seq_len, dtype=torch.int32, device=device
+                ) + cache_manager._get_state(rid, label).position_id_start \
+                    for (seq_len, rid) in zip(seq_lens, request_ids)
+            ] for label in labels
+        }
+    
+    def _get_text_vae_idxs(
+        self, seq_lens: list[int], device: str
+    ):
+        result = {
+            "text_indexes": [],
+            "vae_token_indexes": []
+        }
+        for seq_len in seq_lens:
+            text_idxs = torch.zeros(
+                seq_len, dtype=torch.bool, device=device
+            )
+            text_idxs[0] = True
+            text_idxs[-1] = True
+            result["text_indexes"].append(text_idxs)
+            result["vae_token_indexes"].append(
+                torch.arange(
+                    1, seq_len-1,
+                    dtype=torch.long, device=device
+                )
+            )
+        return result
+    
+    def _get_active_labels(
+        self, graph_walk: str, cfg: bool
+    ):
+        if graph_walk == "prefill_text" or graph_walk == "decode":
+            if cfg:
+                return ["main", "cfg_img"]
+        elif graph_walk == "image_gen":
+            if cfg:
+                return ["main", "cfg_text", "cfg_img"]
+        return ["main"]
 
-    def preprocess(self, graph_walk: str, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Unwrap single-element tensor lists and handle latent initialization.
+    def preprocess(
+        self, graph_walk: str,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_metadata: dict[str, dict],
+        cache_manager: BatchedCacheManager,
+    ) -> dict[str, torch.Tensor]: # input name to tensor
+        """Data transform + plan attention/rope for all relevant labels.
 
-        For image_gen graph walk: if "latents" input is empty (first flow matching
-        iteration), initializes random noise. The latent shape (latent_seq_len,
-        latent_dim) must be provided via per-request metadata since it depends
-        on the output image dimensions.
+        When cache_handle is provided (sequential execution), calls
+        plan_attention/plan_rope for every cache label needed by this
+        graph walk. This must happen outside forward() because plan
+        operations are CUDA graph incompatible.
 
-        For all other graph walks: standard unwrapping of list[Tensor] -> Tensor.
+        When cache_handle is None (batched execution preprocesses per-request
+        without planning; planning is done separately via preprocess_batched).
         """
         device = next(self.parameters()).device
+
+        has_cfg = any(
+            per_request_metadata.get(rid, {}).get("requires_cfg", False)
+            for rid in request_ids
+        )
+        labels = self._get_active_labels(graph_walk, has_cfg)
+
+         # these will get filled in
+        seq_lens = []
+        per_label_custom_pos_ids = {}
         result = {}
+
         if graph_walk == "prefill_text":
-            # Wrap with BOS EOS
-            result["text_inputs"] = inputs["text_inputs"][0].new_zeros(inputs["text_inputs"][0].shape[0] + 2)
-            result["text_inputs"][0] = self.bos_token_id
-            result["text_inputs"][-1] = self.eos_token_id
-            result["text_inputs"][1:-1] = inputs["text_inputs"][0]
-        elif graph_walk == "decode" and len(inputs["text_inputs"]) > 0:
-            result["text_inputs"] = inputs["text_inputs"][0]
+            result["text_inputs"] = [
+                self._preprocess_prefill_text(inp["text_inputs"][0]) \
+                    for inp in per_request_inputs
+            ]
+            seq_lens = [inp.shape[0] for inp in result["text_inputs"]]
+
         elif graph_walk == "decode":
-            result["text_inputs"] = torch.tensor([self.bos_token_id], device=device)
+            bos = torch.tensor([self.bos_token_id], device=device)
+            result["text_inputs"] = [
+                inp["text_inputs"][0] if len(inp["text_inputs"]) > 0 else bos.clone() \
+                    for inp in per_request_inputs
+            ]
+            seq_lens = [1] * len(per_request_inputs)
 
         if graph_walk in ["prefill_vit", "prefill_vae"]:
-            img_emb = inputs["img_emb"][0]
-            result["combined_emb"] = self._wrap_with_boi_eoi(img_emb)
-            result["empty_pos_ids"] = torch.zeros(
-                result["combined_emb"].shape[0], dtype=torch.int32, device=device
+            result["combined_emb"] = [
+                self._wrap_with_boi_eoi(inp["img_emb"][0]) for inp in per_request_inputs
+            ]
+            seq_lens = [inp.shape[0] for inp in result["combined_emb"]]
+            per_label_custom_pos_ids = self._get_image_pos_ids(
+                labels, cache_manager, device, seq_lens, request_ids
             )
 
         if graph_walk == "prefill_vae":
-            text_len = result["combined_emb"].shape[0]
-            result["text_indexes"] = torch.zeros(
-                text_len, dtype=torch.bool, device=device
-            )
-            result["text_indexes"][0] = True
-            result["text_indexes"][text_len - 1] = True
-            result["vae_token_indexes"] = torch.arange(
-                1, result["combined_emb"].shape[0]-1,
-                dtype=torch.long, device=device
-            )
+            result = {
+                **result,
+                **self._get_text_vae_idxs(seq_lens, device)
+            }
 
         if graph_walk == "image_gen":
             H, W = 1024, 1024 # TODO: make this configurable?
+
+            # TODO support batching for image gen
+            assert len(per_request_inputs) == 1, "Batching not supported for image gen"
+            inputs = per_request_inputs[0]
+    
             result["vae_position_ids"] = get_flattened_position_ids_extrapolate(
                 H, W,
                 self.config.latent_downsample,
@@ -359,28 +459,61 @@ class LLMSubmodule(NodeSubmodule):
                     device=device
                 )
             )
-            text_len = result["empty_combined_emb"].shape[0]
-            result["text_indexes"] = torch.zeros(
-                text_len, dtype=torch.bool, device=device
+            seq_lens = [result["empty_combined_emb"].shape[0]]
+            per_label_custom_pos_ids = self._get_image_pos_ids(
+                labels, cache_manager, device, seq_lens, request_ids
             )
-            result["text_indexes"][0] = True
-            result["text_indexes"][text_len - 1] = True
-            result["vae_token_indexes"] = torch.arange(
-                1, result["empty_combined_emb"].shape[0]-1,
-                dtype=torch.long, device=device
-            )
-            result["empty_pos_ids"] = torch.zeros(
-                text_len, dtype=torch.int32, device=device
-            )
+            result = {
+                **result,
+                **self._get_text_vae_idxs(seq_lens, device)
+            }
+
+        self._plan_for_graph_walk(
+            cache_handle=cache_manager,
+            seq_lens=seq_lens,
+            per_label_custom_pos_ids=per_label_custom_pos_ids,
+            is_causal=graph_walk in [
+                "prefill_text", "decode"
+            ],
+            labels=labels,
+            snapshots=[("main", "cfg_text")] if graph_walk == "prefill_text" else []
+        )
+
+        result = {
+            key: torch.cat(val) if (
+                isinstance(val, list) and isinstance(val[0], torch.Tensor)
+            ) else val for (key, val) in result.items()
+        }
+        result["seq_lens"] = seq_lens
 
         return result
 
+    def _plan_for_graph_walk(
+        self, cache_handle: BatchedCacheManager,
+        seq_lens: list[int],
+        per_label_custom_pos_ids: dict[str, list[torch.Tensor]] = {},
+        is_causal=True,
+        labels=["main"],
+        snapshots=[],
+    ) -> None:
+        """Plan attention and rope for all cache labels needed by this graph walk."""
+        for snap in snapshots:
+            cache_handle.snapshot_all(*snap)
+        
+        
+        for label in labels:
+            pos_ids = per_label_custom_pos_ids.get(label)
+            if pos_ids is not None:
+                pos_ids = torch.cat(pos_ids)
+            cache_handle.plan_attention(
+                seq_lens=seq_lens, is_causal=is_causal, label=label
+            )
+            cache_handle.plan_rope(
+                seq_lens=seq_lens, pos_ids=pos_ids, label=label
+            )
+
     def forward(self, graph_walk: str, cache_handle=None, **kwargs) -> NameToTensorList:
-        inputs_and_shapes = ", ".join([
-            (f"{key} (shape={val.shape})" if isinstance(val, torch.Tensor) else key) \
-                for key, val in kwargs.items()
-        ])
-        logger.debug("Running BAGEL LLM for graph walk %s and inputs %s", graph_walk, inputs_and_shapes)
+        logger.debug("Running BAGEL LLM for graph walk %s and inputs %s", graph_walk)
 
         if graph_walk == "prefill_text":
             return self._forward_prefill_text(cache_handle=cache_handle, **kwargs)
@@ -397,13 +530,16 @@ class LLMSubmodule(NodeSubmodule):
 
     def _forward_prefill_text(
         self, text_inputs: torch.Tensor,
-        cache_handle: CacheHandle, **kwargs
+        cache_handle: BatchedCacheManager,
+        **kwargs
     ) -> NameToTensorList:
         """embed_tokens -> LLM forward (causal, mode='und') -> KV cache update.
 
         When requires_cfg is True (image generation mode):
-        1. Snapshot main -> cfg_text BEFORE forward (cfg_text = context without this text)
+        1. Snapshot main -> cfg_text BEFORE forward (done in preprocess)
         2. Forward for main and cfg_img (both see the text tokens)
+
+        plan_attention/plan_rope are called in preprocess for all needed labels.
         """
         emb = self.embed_tokens(text_inputs)
         requires_cfg = kwargs.pop("requires_cfg", False)
@@ -412,65 +548,62 @@ class LLMSubmodule(NodeSubmodule):
         kwargs.pop("is_prefill", None)
 
         if requires_cfg and cache_handle is not None:
-            # cfg_text = main before this text (everything except subsequent text)
-            cache_handle.snapshot("main", "cfg_text")
             for label in ["main", "cfg_img"]:
                 cache_handle.set_active_label(label)
                 self.language_model(
-                    emb, is_causal=True, mode="und",
+                    emb, mode="und",
                     cache_handle=cache_handle, **kwargs
                 )
         else:
             if cache_handle is not None:
                 cache_handle.set_active_label("main")
             self.language_model(
-                emb, is_causal=True, mode="und",
+                emb, mode="und",
                 cache_handle=cache_handle, **kwargs
             )
         return {}
 
     def _forward_prefill_vit(
         self, combined_emb: torch.Tensor,
-        empty_pos_ids: torch.Tensor,
-        cache_handle: CacheHandle, **kwargs
+        cache_handle: BatchedCacheManager,
+        **kwargs
     ) -> NameToTensorList:
         """Wrap img_emb with BOI/EOI tokens -> LLM forward (bidirectional).
 
         When requires_cfg is True: forward for main only, then snapshot
         main -> cfg_text (cfg_text = context including this image).
+
+        plan_attention/plan_rope are called in preprocess.
         """
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
 
-        if cache_handle is not None:
-            cache_handle.set_active_label("main")
-            pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
-        else:
-            pos_ids = empty_pos_ids
+        cache_handle.set_active_label("main")
         self.language_model(
-            combined_emb, is_causal=False, mode="und",
-            pos_ids=pos_ids,
+            combined_emb, mode="und",
             custom_advance_pos_id=1,
             cache_handle=cache_handle, **kwargs
         )
 
-        if requires_cfg and cache_handle is not None:
-            cache_handle.snapshot("main", "cfg_text")
+        if requires_cfg:
+            cache_handle.snapshot_all("main", "cfg_text")
         return {}
 
     def _forward_prefill_vae(
         self, combined_emb: torch.Tensor,
-        empty_pos_ids: torch.Tensor,
         vae_token_indexes: torch.Tensor,
         text_indexes: torch.Tensor,
-        cache_handle: CacheHandle, **kwargs
+        cache_handle: BatchedCacheManager,
+        **kwargs
     ) -> NameToTensorList:
         """VAE image emb -> LLM forward (bidirectional, gen mode).
 
         When requires_cfg is True: forward for main only, then snapshot
         main -> cfg_text (cfg_text = context including this image).
+
+        plan_attention/plan_rope are called in preprocess.
         """
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
@@ -479,29 +612,30 @@ class LLMSubmodule(NodeSubmodule):
 
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-            empty_pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
         self.language_model(
-            combined_emb, is_causal=False, mode="gen",
+            combined_emb, mode="gen",
             cache_handle=cache_handle,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
-            pos_ids=empty_pos_ids,
             custom_advance_pos_id=1,
             **kwargs
         )
 
         if requires_cfg and cache_handle is not None:
-            cache_handle.snapshot("main", "cfg_text")
+            cache_handle.snapshot_all("main", "cfg_text")
         return {}
 
     def _forward_decode(
         self, text_inputs: torch.Tensor,
-        cache_handle: CacheHandle, **kwargs
+        cache_handle: BatchedCacheManager, 
+        **kwargs
     ) -> NameToTensorList:
         """embed_tokens -> LLM forward -> lm_head -> argmax.
 
         When requires_cfg is True: also forward for cfg_img to keep its
         KV cache in sync (cfg_img tracks all text, no images).
+
+        plan_attention/plan_rope are called in preprocess for all needed labels.
         """
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
@@ -512,15 +646,14 @@ class LLMSubmodule(NodeSubmodule):
         if cache_handle is not None:
             cache_handle.set_active_label("main")
         hidden = self.language_model(
-            emb, is_causal=True, mode="und",
+            emb, mode="und",
             cache_handle=cache_handle, **kwargs
         )
 
         if requires_cfg and cache_handle is not None:
-            # Keep cfg_img KV cache in sync (discard output)
             cache_handle.set_active_label("cfg_img")
             self.language_model(
-                emb, is_causal=True, mode="und",
+                emb, mode="und",
                 cache_handle=cache_handle, **kwargs
             )
 
@@ -547,8 +680,7 @@ class LLMSubmodule(NodeSubmodule):
         text_indexes: torch.Tensor,
         vae_token_indexes: torch.Tensor,
         time_index: torch.Tensor,
-        empty_pos_ids: torch.Tensor,
-        cache_handle: CacheHandle,
+        cache_handle: BatchedCacheManager,
         requires_cfg: bool = True,
         **kwargs,
     ) -> NameToTensorList:
@@ -602,18 +734,15 @@ class LLMSubmodule(NodeSubmodule):
             effective_text_scale = cfg_text_scale if in_cfg_interval else 1.0
             effective_img_scale = cfg_img_scale if in_cfg_interval else 1.0
 
+            # plan_attention/plan_rope for all 3 labels done in preprocess
             velocities = {}
             for label in ["main", "cfg_text", "cfg_img"]:
                 if cache_handle is not None:
                     cache_handle.set_active_label(label)
-                    pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
-                else:
-                    pos_ids = empty_pos_ids
                 hidden = self.language_model(
-                    empty_combined_emb, is_causal=False, mode="gen",
+                    empty_combined_emb, mode="gen",
                     cache_handle=cache_handle, write_cache=False,
                     vae_token_indexes=vae_token_indexes,
-                    pos_ids=pos_ids,
                     text_indexes=text_indexes, **kwargs,
                 )
                 velocities[label] = hidden
@@ -655,17 +784,13 @@ class LLMSubmodule(NodeSubmodule):
                     ).clamp(min=cfg_renorm_min, max=1.0)
                 v_final = v_combined * renorm_scale
         else:
-            # No CFG: single forward pass
+            # No CFG: single forward pass (plan done in preprocess)
             if cache_handle is not None:
                 cache_handle.set_active_label("main")
-                pos_ids = empty_pos_ids + cache_handle._get_state().position_id_start
-            else:
-                pos_ids = empty_pos_ids
             hidden = self.language_model(
-                empty_combined_emb, is_causal=False, mode="gen",
+                empty_combined_emb, mode="gen",
                 cache_handle=cache_handle, write_cache=False,
                 vae_token_indexes=vae_token_indexes,
-                pos_ids=pos_ids,
                 text_indexes=text_indexes, **kwargs,
             )
             v_final = self.llm2vae(hidden)[1:-1]
@@ -676,6 +801,86 @@ class LLMSubmodule(NodeSubmodule):
             "latents": [latents],
             "time_index": [time_index + 1]
         }
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        cache_manager: BatchedCacheManager,
+        packed_inputs: dict[str, torch.Tensor],
+        per_request_metadata: dict[str, dict],
+    ) -> dict[str, NameToTensorList]:
+        """Batched forward pass for decode and prefill_text.
+
+        Concatenates inputs across requests, runs a single LLM forward with
+        the BatchedCacheManager, then splits outputs back per-request.
+        """
+        has_cfg = any(
+            per_request_metadata.get(rid, {}).get("requires_cfg", False)
+            for rid in request_ids
+        )
+
+        if graph_walk == "decode":
+            return self._forward_decode_batched(
+                cache_manager=cache_manager,
+                request_ids=request_ids,
+                packed_inputs=packed_inputs,
+                has_cfg=has_cfg
+            )
+        elif graph_walk == "prefill_text":
+            self._forward_prefill_text(
+                cache_handle=cache_manager,
+                requires_cfg=has_cfg, **packed_inputs
+            ) # prefill is the same batched and unbatched
+            return {rid: [] for rid in request_ids}
+        else:
+            raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
+
+    def _forward_decode_batched(
+        self,
+        cache_manager: BatchedCacheManager,
+        request_ids: list[str],
+        packed_inputs: dict[str, torch.Tensor],
+        has_cfg: bool=False
+    ) -> dict[str, NameToTensorList]:
+        """Batched decode: all requests generate 1 token each.
+
+        1. Concatenate embeddings: [N, hidden] where N = num_requests
+        2. Single LLM forward with cache_manager (batched attention)
+        3. If any request requires CFG, run a second pass for cfg_img
+        4. Per-request lm_head + argmax
+
+        plan_attention/plan_rope are called in preprocess_batched.
+        """
+        request_ids = cache_manager.request_ids
+
+        # 1. Embed and concatenate
+        embs = self.embed_tokens(packed_inputs["text_inputs"])
+
+        # 2. Single LLM forward (main cache, already planned)
+        cache_manager.set_active_label("main")
+        hidden = self.language_model(
+            embs, mode="und",
+            cache_handle=cache_manager,
+        )
+
+        # 3. CFG sync pass for cfg_img if needed (already planned)
+        if has_cfg:
+            cache_manager.set_active_label("cfg_img")
+            self.language_model(
+                embs, mode="und",
+                cache_handle=cache_manager,
+            )
+
+        # 4. Per-request lm_head + argmax
+        logits = self.lm_head(hidden)
+        # decode has seq_len == 1 for all inputs in batch
+        tokens = torch.argmax(logits, dim=-1)
+
+        return {
+            rid: {"new_token": [tokens[i:i+1]]} for i, rid in enumerate(request_ids)
+        }
+
 
     def _wrap_with_boi_eoi(self, emb: torch.Tensor) -> torch.Tensor:
         """Wrap embeddings with <|vision_start|> and <|vision_end|> tokens."""
@@ -688,19 +893,6 @@ class LLMSubmodule(NodeSubmodule):
             boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
             eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
         return torch.cat([boi_emb, emb, eoi_emb], dim=0)
-
-    def _wrap_with_boi_eoi_inplace(self, emb: torch.Tensor) -> torch.Tensor:
-        """Wrap embeddings with <|vision_start|> and <|vision_end|> tokens."""
-        assert self.boi_token_id is not None and self.eoi_token_id is not None
-        device = emb.device
-        boi_ids = torch.tensor([self.boi_token_id], device=device)
-        eoi_ids = torch.tensor([self.eoi_token_id], device=device)
-        with torch.no_grad():
-            boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
-            eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
-        emb[0, :] = boi_emb
-        emb[-1, :] = eoi_emb
-        return emb
 
 
 class VAEDecoderSubmodule(NodeSubmodule):
@@ -719,14 +911,21 @@ class VAEDecoderSubmodule(NodeSubmodule):
         self.latent_channel = latent_channel
         self.latent_downsample = latent_downsample
 
-    def preprocess(self, graph_walk: str, latents: list[torch.Tensor]) -> dict:
+    def preprocess(
+        self, graph_walk: str,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_metadata: dict[str, dict],
+        cache_manager: BatchedCacheManager=None,
+    ):
         """Prepare VAE decoder inputs.
 
         Unwraps latents from list. Image dimensions (image_h, image_w)
         are provided via per-request metadata and converted to ints for
         CUDA graph compatibility.
         """
-        return {"latents": latents[0]}
+        assert len(per_request_inputs) == 1
+        return {"latents": per_request_inputs[0]["latents"][0]}
 
     def forward(
         self,

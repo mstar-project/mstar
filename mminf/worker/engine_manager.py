@@ -86,6 +86,15 @@ class EngineManager:
 
         return cls(node_to_engine=node_to_engine)
 
+    def warmup_all(self) -> None:
+        """Call warmup() on all unique engines for CUDA graph capture."""
+        seen = set()
+        for engine in self.node_to_engine.values():
+            eid = id(engine)
+            if eid not in seen:
+                seen.add(eid)
+                engine.warmup()
+
     def get_engine(self, node_name: str) -> BaseEngine:
         return self.node_to_engine[node_name]
 

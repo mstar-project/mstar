@@ -381,7 +381,7 @@ class Loop(GraphSection):
         curr_iter_section = self.nxt_iter_section
         nxt_iter_section = deepcopy(self.section)
 
-        logger.debug(
+        logger.info(
             "Advancing loop with nodes %s from iter %d -> %d (out of %d)",
             str(self.section.get_node_names()), self.curr_iter,
             self.curr_iter + 1, self.n_iters

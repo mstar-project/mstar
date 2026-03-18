@@ -9,7 +9,7 @@ import torch
 import yaml
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.engine.ar_engine import KVCacheConfig
+from mminf.engine.ar_engine import BatchedCacheManager, KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 
@@ -27,15 +27,24 @@ class NodeSubmodule(torch.nn.Module):
         result = submodule(**preprocessed)                     # tensor → tensor (compilable)
     """
 
-    def preprocess(self, graph_walk: str, **inputs: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+    def preprocess(
+        self, graph_walk: str,
+        cache_manager: BatchedCacheManager,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_metadata: dict[str, dict]
+    ) -> dict[str, torch.Tensor]: # input name to tensor
         """
         Convert variable-length list[Tensor] inputs to fixed tensors.
         NOT compiled — handles Python-level variability.
 
-        Default: assert each input has exactly 1 tensor and unwrap it.
+        Returns a dict of input name to batched tensor.
+
+        Default: assume one request. 
+        assert each input has exactly 1 tensor and unwrap it.
         Override for nodes that handle multiple tensors (e.g., stacking images).
         """
-        return {k: v[0] for k, v in inputs.items()}
+        return {k: v[0] for k, v in per_request_inputs[0].items()}
 
     @abstractmethod
     def forward(self, **kwargs) -> NameToTensorList:
