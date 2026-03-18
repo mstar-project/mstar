@@ -1,16 +1,17 @@
 from mminf.model.bagel.bagel_model import BagelModel
 from mminf.model.base import Model
 from mminf.model.dummy_model import DummyModel
+from mminf.model.orpheus.orpheus_model import OrpheusModel
 
 MODEL_REGISTRY: dict[str, type[Model]] = {
     "dummy": DummyModel,
     "bagel": BagelModel,
+    "orpheus": OrpheusModel,
 }
 
 HF_MODELS: dict[str, dict] = {
-    "bagel": {
-        "model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"
-    }
+    "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
+    "orpheus": {"model_path_hf": "canopylabs/orpheus-tts-0.1-finetune-prod"},
 }
 
 
