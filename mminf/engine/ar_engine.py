@@ -331,6 +331,7 @@ class BatchedCacheManager:
         else:
             self._plan_states[effective_label].pos_ids = computed_pos_ids
 
+    @torch.compiler.disable
     def run_attention(
         self,
         q: torch.Tensor,
@@ -385,17 +386,19 @@ class BatchedCacheManager:
     ):
         """Apply RoPE using the active label's pre-computed position IDs."""
         label = next(iter(self.active_labels.values()))
+    
         ps = self._plan_states[label]
         assert ps.pos_ids is not None
 
         import flashinfer
-        return flashinfer.rope.apply_rope_pos_ids(
+        flashinfer.rope.apply_rope_pos_ids_inplace(
             q, k, ps.pos_ids,
             rotary_dim=rotary_dim,
             interleave=interleave,
             rope_scale=rope_scale,
             rope_theta=rope_theta,
         )
+        return q, k
 
     def advance_seq_len(self, n: int | None = None, pos_id_n: int | None = None) -> None:
         """Advance seq_len for all requests.

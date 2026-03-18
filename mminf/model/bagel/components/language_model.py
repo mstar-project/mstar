@@ -20,9 +20,6 @@ from mminf.engine.ar_engine import BatchedCacheManager
 from mminf.model.bagel.config import BagelModelConfig
 from mminf.utils.flashinfer_utils import run_rms_norm
 
-torch._dynamo.config.cache_size_limit = 512
-torch._dynamo.config.accumulated_cache_size_limit = 4096
-
 
 def _to_text_mask(
     text_indexes: torch.Tensor | None,

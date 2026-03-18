@@ -22,6 +22,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+@torch.compiler.disable
 def run_rms_norm(
         input: torch.Tensor,
         weight: torch.Tensor,

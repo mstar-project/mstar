@@ -251,7 +251,8 @@ class CudaGraphRunner:
                     request_ids=dummy_rids,
                     per_request_metadata=dummy_metadata,
                 )
-
+            
+            torch.cuda.set_device(self.device)
             # Warmup: 2 forward passes
             torch.cuda.synchronize()
             for _ in range(2):
@@ -385,8 +386,7 @@ class CudaGraphRunner:
         # Pad with dummy inputs for remaining slots
         for i in range(batch_size, padded_bs):
             real_inputs.append(
-                {"text_inputs": [torch.zeros(1, dtype=torch.long,
-                                             device=self.device)]}
+                {"text_inputs": []}
             )
 
         # Update metadata for real requests
@@ -399,7 +399,7 @@ class CudaGraphRunner:
                 real_metadata[dummy_rid] = {"requires_cfg": requires_cfg}
 
         # Preprocess re-plans attention+rope with real page tables
-        submodule.preprocess(
+        real_inputs = submodule.preprocess(
             graph_walk=graph_walk,
             cache_manager=static_cm,
             per_request_inputs=real_inputs,
@@ -408,15 +408,12 @@ class CudaGraphRunner:
         )
 
         # --- Step 3: Copy real embeddings to static buffer ---
-        real_text = torch.cat([
-            inp["text_inputs"][0] if isinstance(inp["text_inputs"], list)
-            else inp["text_inputs"]
-            for inp in real_inputs
-        ])
+        real_text = real_inputs["text_inputs"]
         preprocessed["text_inputs"][:real_text.shape[0]].copy_(real_text)
 
         # --- Step 4: Replay ---
         graph.replay()
+        torch.cuda.default_stream().synchronize()
 
         # --- Step 5: Advance seq_lens on REAL request states ---
         # During replay, advance_seq_lens ran on dummy states (which point
