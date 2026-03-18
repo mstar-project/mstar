@@ -252,7 +252,11 @@ class BatchedCacheManager:
                     dtype=dtype,
                 )
 
-            # Update page_indices etc. on the existing _PlanState
+            # Note: plain assignment (not .copy_()) is intentional here.
+            # These fields are NOT read inside the CUDA graph — run_attention()
+            # uses wrapper.set_kv_cache()/run() which rely on the wrapper's own
+            # internal static tensors (updated via .copy_() inside wrapper.plan()).
+            # These are stored on _PlanState only for bookkeeping/debugging.
             ps.page_indices = page_indices
             ps.page_offsets = page_offsets
             ps.token_offsets = token_offsets
@@ -369,6 +373,7 @@ class BatchedCacheManager:
             self.kv_cache[layer_idx, ps.page_indices, 1, ps.page_offsets] = v[ps.token_offsets]
             return ps.wrapper.run(q, self.kv_cache[layer_idx])
 
+    @torch.compiler.disable
     def apply_rope(
         self,
         q: torch.Tensor,
