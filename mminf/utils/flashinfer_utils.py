@@ -18,6 +18,9 @@ Adapted from VoxServe's flashinfer_utils.py for our KV cache layout:
 import logging
 
 import torch
+import flashinfer
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -28,26 +31,8 @@ def run_rms_norm(
         weight: torch.Tensor,
         eps: float = 1e-06
     ):
-    import flashinfer
     return flashinfer.norm.rmsnorm(
         input, weight, eps=eps
-    )
-
-
-def run_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    scale: float=1.0,
-    causal: bool=True,
-):
-    import flashinfer
-    return flashinfer.single_prefill_with_kv_cache(
-        q,
-        k,
-        v,
-        causal=causal,
-        sm_scale=scale,
     )
 
 
@@ -391,3 +376,124 @@ class FlashInferDecodeWrapper:
         positions = self.kv_cache_locations[:n, 1]
         kv_cache_layer[pages, 0, positions] = k[:n]
         kv_cache_layer[pages, 1, positions] = v[:n]
+
+
+class FlashInferAttentionNoCache:
+    def __init__(
+        self,
+        device: torch.device,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        seq_lens: list[int],
+        workspace_buffer: torch.Tensor = None,
+        causal: bool=True,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.device = device
+        self.orig_head_dim = head_dim
+        self.dtype = dtype
+
+        # ---- decide target head dim ----
+        if head_dim in (64, 128, 256):
+            self.head_dim = head_dim
+            self.needs_pad = False
+        elif head_dim < 64:
+            self.head_dim = 64
+            self.needs_pad = True
+        elif head_dim < 128:
+            self.head_dim = 128
+            self.needs_pad = True
+        else:
+            self.head_dim = 256
+            self.needs_pad = True
+
+        logger.info(
+            f"[FlashInfer] heads={num_qo_heads}/{num_kv_heads}, "
+            f"head_dim={head_dim} → {self.head_dim} (pad={self.needs_pad})"
+        )
+
+        if workspace_buffer is None:
+            self.workspace = torch.empty(
+                128 * 1024 * 1024,
+                dtype=torch.uint8,
+                device=device,
+            )
+        else:
+            self.workspace = workspace_buffer
+
+        self.wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            float_workspace_buffer=self.workspace,
+            kv_layout="NHD",
+        )
+
+        # ---- indptr ----
+        qo_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
+        kv_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
+
+        torch.cumsum(
+            torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            dim=0,
+            out=qo_indptr[1:]
+        )
+        kv_indptr.copy_(qo_indptr)
+
+        self.wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            num_qo_heads,
+            num_kv_heads,
+            self.head_dim,  # IMPORTANT: padded dim
+            causal=causal,
+            q_data_type=dtype
+        )
+        self.qo_indptr = qo_indptr
+
+        # ---- preallocate buffers if needed ----
+        self.total_tokens = qo_indptr[-1].item()
+
+        if self.needs_pad:
+            shape = (self.total_tokens, num_qo_heads, self.head_dim)
+            self.q_buf = torch.empty(shape, dtype=dtype, device=device)
+
+            shape_kv = (self.total_tokens, num_kv_heads, self.head_dim)
+            self.k_buf = torch.empty(shape_kv, dtype=dtype, device=device)
+            self.v_buf = torch.empty(shape_kv, dtype=dtype, device=device)
+        else:
+            self.q_buf = None
+            self.k_buf = None
+            self.v_buf = None
+
+    @torch.compiler.disable
+    def run(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        """
+        q: (T, num_qo_heads, orig_head_dim)
+        k,v: (T, num_kv_heads, orig_head_dim)
+        """
+
+        if not self.needs_pad:
+            return self.wrapper.run(q, k, v)
+
+        # ---- copy into padded buffers ----
+        T = q.shape[0]
+        d = self.orig_head_dim
+
+        # zero the padding region (important!)
+        self.q_buf[:, :, d:] = 0
+        self.k_buf[:, :, d:] = 0
+        self.v_buf[:, :, d:] = 0
+
+        # copy valid region
+        self.q_buf[:, :, :d].copy_(q)
+        self.k_buf[:, :, :d].copy_(k)
+        self.v_buf[:, :, :d].copy_(v)
+
+        out = self.wrapper.run(self.q_buf, self.k_buf, self.v_buf)
+
+        # ---- slice back to original dim ----
+        return out[:, :, :d]

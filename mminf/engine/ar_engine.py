@@ -629,7 +629,7 @@ class AREngine(BaseEngine):
         # Step 1: torch.compile (before CUDA graph capture)
         self._compile_submodules()
 
-    def _can_batch(self, batch: NodeBatch) -> bool:
+    def _can_batch(self, batch: NodeBatch, submodule) -> bool:
         """Only batch when all requests share a batchable graph_walk path.
 
         image_gen with 3-pass CFG is too complex to batch initially due to
@@ -637,13 +637,12 @@ class AREngine(BaseEngine):
         """
         if len(batch.request_ids) <= 1:
             return False
-        if batch.graph_walk not in ("decode", "prefill_text"):
-            return False
+        return submodule.can_batch(batch)
         # Ensure the submodule supports batched forward
-        submodule = self.submodules.get(batch.node_name)
-        if submodule is None or not hasattr(submodule, "forward_batched"):
-            return False
-        return True
+        # submodule = self.submodules.get(batch.node_name)
+        # if submodule is None or not hasattr(submodule, "forward_batched"):
+        #     return False
+        # return True
 
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
@@ -787,7 +786,7 @@ class AREngine(BaseEngine):
             # Priority: CUDA graph > batched > sequential
             if self._can_use_cuda_graph(batch):
                 return self._execute_with_cuda_graph(batch, submodule)
-            elif self._can_batch(batch):
+            elif self._can_batch(batch, submodule):
                 return self._execute_batched(batch, submodule)
             else:
                 return self._execute_sequential(batch, submodule)

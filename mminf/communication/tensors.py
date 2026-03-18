@@ -226,6 +226,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
     def store_and_return_tensor_info(
         self, request_id: str, tensors: NameToTensorList,
     ) -> dict[str, list[TensorPointerInfo]]: # name to list[tensorPointerInfo]
+        torch.cuda.default_stream().synchronize()
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
             tensor_info[name] = []
@@ -263,7 +264,6 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 tensor = self.tensor_store.get_tensor(
                     request_id=request_id, uuid=uuid
                 )
-
                 torch.cuda.default_stream().synchronize()
                 ret_value = self.engine.register_memory(
                     tensor.data_ptr(), tensor.nbytes

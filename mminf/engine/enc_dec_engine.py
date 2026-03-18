@@ -35,38 +35,39 @@ class EncoderDecoderEngine(BaseEngine):
         self.submodules = submodules
         self.device = device
 
-    def _can_batch_inputs(self, batch: NodeBatch) -> bool:
+    def _can_batch_inputs(self, batch: NodeBatch, submodule) -> bool:
         """Check if all requests have same-shaped inputs for stacking."""
         if len(batch.request_ids) <= 1:
             return False
+        
+        return submodule.can_batch(batch)
 
         # Get reference shapes from first request
-        first_rid = batch.request_ids[0]
-        first_inputs = batch.per_request_input_tensors.get(first_rid, {})
-        if not first_inputs:
-            return False
+        # first_rid = batch.request_ids[0]
+        # first_inputs = batch.per_request_input_tensors.get(first_rid, {})
+        # if not first_inputs:
+        #     return False
 
-        ref_shapes = {}
-        for name, tensor_list in first_inputs.items():
-            if not tensor_list:
-                continue
-            ref_shapes[name] = [t.shape for t in tensor_list]
+        # ref_shapes = {}
+        # for name, tensor_list in first_inputs.items():
+        #     if not tensor_list:
+        #         continue
+        #     ref_shapes[name] = [t.shape for t in tensor_list]
 
-        # Check all other requests match
-        for rid in batch.request_ids[1:]:
-            inputs = batch.per_request_input_tensors.get(rid, {})
-            if set(inputs.keys()) != set(first_inputs.keys()):
-                return False
-            for name, tensor_list in inputs.items():
-                if name not in ref_shapes:
-                    continue
-                if len(tensor_list) != len(ref_shapes[name]):
-                    return False
-                for t, ref_shape in zip(tensor_list, ref_shapes[name]):
-                    if t.shape != ref_shape:
-                        return False
+        # # Check all other requests match
+        # for rid in batch.request_ids[1:]:
+        #     inputs = batch.per_request_input_tensors.get(rid, {})
+        #     if set(inputs.keys()) != set(first_inputs.keys()):
+        #         return False
+        #     for name, tensor_list in inputs.items():
+        #         if name not in ref_shapes:
+        #             continue
+        #         if len(tensor_list) != len(ref_shapes[name]):
+        #             return False
+        #         for t, ref_shape in zip(tensor_list, ref_shapes[name]):
+        #             if t.shape != ref_shape:
+        #                 return False
 
-        return True
 
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Stack same-shaped inputs and run a single forward pass."""
@@ -75,46 +76,21 @@ class EncoderDecoderEngine(BaseEngine):
         # Preprocess all requests
         all_preprocessed = submodule.preprocess(
             batch.graph_walk,
-            per_request_inputs=batch.per_request_input_tensors,
+            per_request_inputs=[
+                batch.per_request_input_tensors[rid] for rid in request_ids
+            ],
             request_ids=batch.request_ids,
             per_request_metadata=batch.per_request_metadata,
         )
 
-        # # Stack inputs along batch dimension (dim=0)
-        # first_preprocessed = all_preprocessed[request_ids[0]]
-        # stacked_inputs = {}
-        # stackable_keys = []
-        # for key, val in first_preprocessed.items():
-        #     if isinstance(val, torch.Tensor):
-        #         tensors = [all_preprocessed[rid][key] for rid in request_ids]
-        #         stacked_inputs[key] = torch.stack(tensors, dim=0)
-        #         stackable_keys.append(key)
-        #     else:
-        #         # Non-tensor values (ints, etc.) — use first request's value
-        #         stacked_inputs[key] = val
+        batched_output = submodule.forward_batched(
+            graph_walk=batch.graph_walk,
+            packed_inputs=all_preprocessed,
+            request_ids=request_ids,
+            per_request_metadata=batch.per_request_metadata,
+        )
 
-        # Single forward pass
-        result = submodule(**all_preprocessed)
-
-        # Split outputs back per-request
-        outputs = {}
-        if isinstance(result, dict):
-            for rid_idx, rid in enumerate(request_ids):
-                per_req = {}
-                for name, tensor_list in result.items():
-                    if isinstance(tensor_list, list):
-                        per_req[name] = [t[rid_idx] for t in tensor_list]
-                    elif isinstance(tensor_list, torch.Tensor):
-                        per_req[name] = [tensor_list[rid_idx]]
-                    else:
-                        per_req[name] = tensor_list
-                outputs[rid] = per_req
-        else:
-            # Fallback: return same output for all
-            for rid in request_ids:
-                outputs[rid] = result if isinstance(result, dict) else {}
-
-        return NodeOutput(per_request_output_tensors=outputs)
+        return NodeOutput(per_request_output_tensors=batched_output)
 
     def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Original per-request execution."""
@@ -157,7 +133,7 @@ class EncoderDecoderEngine(BaseEngine):
 
         try:
             with torch.no_grad():
-                if self._can_batch_inputs(batch):
+                if self._can_batch_inputs(batch, submodule):
                     return self._execute_batched(batch, submodule)
                 else:
                     return self._execute_sequential(batch, submodule)

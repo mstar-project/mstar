@@ -11,6 +11,7 @@ from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import BatchedCacheManager
+from mminf.engine.base import NodeBatch
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -19,8 +20,10 @@ from mminf.model.bagel.components.modeling_utils import (
     get_flattened_position_ids_extrapolate,
     patchify,
 )
+from mminf.model.bagel.components.vit_encoder import BagelVisionModel
 from mminf.model.bagel.config import BagelModelConfig
 from mminf.model.base import NodeSubmodule
+from mminf.utils.flashinfer_utils import FlashInferAttentionNoCache
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +39,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
 
     def __init__(
         self,
-        vit_model: nn.Module,
+        vit_model: BagelVisionModel,
         connector: nn.Module,
         vit_pos_embed: nn.Module,
         vit_patch_size: int,
@@ -68,46 +71,53 @@ class ViTEncoderSubmodule(NodeSubmodule):
         - Packing multiple images with cu_seqlens for FlashAttention
         """
         
-        assert len(per_request_inputs) == 1, "Batching not supported for ViTEncoder"
-        image_inputs = per_request_inputs[0]["image_inputs"]
+        pos_id_list = []
+        pixel_val_list = []
+        seq_lens = []
+        for inputs in per_request_inputs:
+            print("hi")
+            image_inputs = inputs["image_inputs"]
 
-        image_tensor = self.vae_transform.resize_transform(image_inputs[0])
-        image_tensor = self.transform(image_tensor)
+            image_tensor = self.vae_transform.resize_transform(image_inputs[0])
+            image_tensor = self.transform(image_tensor)
 
-        num_tokens = image_tensor.shape[0]
-        device = image_tensor.device
+            device = image_tensor.device
 
-        position_ids = get_flattened_position_ids_extrapolate(
-            image_tensor.size(1), image_tensor.size(2),
-            self.vit_patch_size,
-            max_num_patches_per_side=self.vit_max_num_patch_per_side
-        ).to(device)
-        pixel_values = patchify(image_tensor, self.vit_patch_size)
+            position_ids = get_flattened_position_ids_extrapolate(
+                image_tensor.size(1), image_tensor.size(2),
+                self.vit_patch_size,
+                max_num_patches_per_side=self.vit_max_num_patch_per_side
+            ).to(device)
+            pixel_values = patchify(image_tensor, self.vit_patch_size)
 
-        # Compute cu_seqlens for FlashAttention
-        vit_token_seqlens = torch.tensor(
-            [num_tokens], dtype=torch.int32, device=device
+            seq_lens.append(pixel_values.shape[0])
+            pixel_val_list.append(pixel_values)
+            pos_id_list.append(position_ids)
+        n_head = self.vit_model.config.num_attention_heads
+        print(seq_lens)
+        attn_wrapper = FlashInferAttentionNoCache(
+            device=device,
+            num_qo_heads=n_head,
+            num_kv_heads=n_head,
+            head_dim=self.vit_model.config.hidden_size // n_head,
+            seq_lens=seq_lens,
+            causal=False
         )
-        cu_seqlens = torch.nn.functional.pad(
-            torch.cumsum(vit_token_seqlens, dim=0), (1, 0)
-        ).to(torch.int32)
-        max_seqlen = int(num_tokens)
 
         return {
-            "packed_pixel_values": pixel_values.to(torch.bfloat16),
-            "packed_position_ids": position_ids,
-            "cu_seqlens": cu_seqlens,
-            "max_seqlen": max_seqlen,
+            "packed_pixel_values": torch.cat(pixel_val_list).to(torch.bfloat16),
+            "packed_position_ids":  torch.cat(pos_id_list),
+            "attn_wrapper": attn_wrapper,
         }
 
     def forward(
         self,
         packed_pixel_values: torch.Tensor,
         packed_position_ids: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
+        attn_wrapper: FlashInferAttentionNoCache,
         **kwargs,
     ) -> NameToTensorList:
+        print(packed_position_ids)
         logger.debug(
             "Running BAGEL ViT with packed_pixel_values shape=%s, packed_position_ids shape=%s",
             packed_pixel_values.shape, packed_position_ids.shape
@@ -115,13 +125,30 @@ class ViTEncoderSubmodule(NodeSubmodule):
         features = self.vit_model(
             packed_pixel_values=packed_pixel_values,
             packed_flattened_position_ids=packed_position_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
+            attn_wrapper=attn_wrapper,
         )
         features = self.connector(features)
         pos_emb = self.vit_pos_embed(packed_position_ids)
         features = features + pos_emb
+        print(features)
         return {"img_emb": [features]}
+    
+    def forward_batched(
+        self,
+        request_ids: list[str],
+        packed_inputs: dict[str, torch.Tensor],
+        **kwargs
+    ) -> dict[str, NameToTensorList]:
+        features = self.forward(**packed_inputs)["img_emb"][0]
+        qo_indptr = packed_inputs["attn_wrapper"].qo_indptr
+        return {
+            req_id: {
+                "img_emb": [features[qo_indptr[i]:qo_indptr[i+1]]]
+            } for i, req_id in enumerate(request_ids)
+        }
+    
+    def can_batch(self, batch: NodeBatch) -> bool:
+        return True
 
 
 class VAEEncoderSubmodule(NodeSubmodule):
@@ -234,6 +261,9 @@ class VAEEncoderSubmodule(NodeSubmodule):
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
         return {"img_emb": [packed_latent]}
+
+    def can_batch(self, batch: NodeBatch) -> bool:
+        return False
 
 
 class LLMSubmodule(NodeSubmodule):
@@ -916,6 +946,9 @@ class LLMSubmodule(NodeSubmodule):
             boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
             eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
         return torch.cat([boi_emb, emb, eoi_emb], dim=0)
+    
+    def can_batch(self, batch: NodeBatch) -> bool:
+        return batch.graph_walk in ["prefill_text", "decode"]
 
 
 class VAEDecoderSubmodule(NodeSubmodule):
@@ -979,3 +1012,6 @@ class VAEDecoderSubmodule(NodeSubmodule):
         image = self.vae_model.decode(latent)
         image = (image * 0.5 + 0.5).clamp(0, 1)
         return {"image_output": [image]}
+    
+    def can_batch(self, batch: NodeBatch):
+        return False

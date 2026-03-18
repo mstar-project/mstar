@@ -10,7 +10,7 @@ import yaml
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import BatchedCacheManager, KVCacheConfig
-from mminf.engine.base import EngineType
+from mminf.engine.base import EngineType, NodeBatch
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 
 
@@ -53,6 +53,9 @@ class NodeSubmodule(torch.nn.Module):
         Compilable + CUDA-graphable.
         """
         ...
+    
+    def can_batch(self, batch: NodeBatch) -> bool:
+        return True
 
 
 @dataclass

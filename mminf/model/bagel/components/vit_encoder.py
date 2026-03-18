@@ -18,33 +18,33 @@ from transformers.activations import ACT2FN
 from mminf.model.bagel.config import BagelViTConfig
 
 
-def run_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    causal: bool = False,
-):
-    """
-    q,k,v: (total_tokens, num_heads, head_dim)
-    cu_seqlens: (batch + 1)
-    """
+# def run_attention(
+#     q: torch.Tensor,
+#     k: torch.Tensor,
+#     v: torch.Tensor,
+#     causal: bool = False,
+# ):
+#     """
+#     q,k,v: (total_tokens, num_heads, head_dim)
+#     cu_seqlens: (batch + 1)
+#     """
 
-    # (1, heads, seq, dim)
-    q = q.permute(1, 0, 2).unsqueeze(0)
-    k = k.permute(1, 0, 2).unsqueeze(0)
-    v = v.permute(1, 0, 2).unsqueeze(0)
+#     # (1, heads, seq, dim)
+#     q = q.permute(1, 0, 2).unsqueeze(0)
+#     k = k.permute(1, 0, 2).unsqueeze(0)
+#     v = v.permute(1, 0, 2).unsqueeze(0)
 
-    out = F.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=0.0,
-        is_causal=causal,
-    )
+#     out = F.scaled_dot_product_attention(
+#         q,
+#         k,
+#         v,
+#         attn_mask=None,
+#         dropout_p=0.0,
+#         is_causal=causal,
+#     )
 
-    # back to (seq, heads, dim)
-    return out.squeeze(0).permute(1, 0, 2)
+#     # back to (seq, heads, dim)
+#     return out.squeeze(0).permute(1, 0, 2)
 
 
 class RotaryEmbedding2D(torch.nn.Module):
@@ -169,8 +169,7 @@ class BagelViTAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.IntTensor,
-        max_seqlen: int,
+        attn_wrapper,
         cos_h: torch.Tensor = None,
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
@@ -199,12 +198,7 @@ class BagelViTAttention(nn.Module):
             q = torch.cat([qh, qw], dim=-1)
             k = torch.cat([kh, kw], dim=-1)
 
-        attn_output = run_attention(
-            q,
-            k,
-            v,
-            causal=False,
-        )
+        attn_output = attn_wrapper.run(q, k, v)
 
         attn_output = attn_output.reshape(total_q_len, -1)
 
@@ -239,8 +233,7 @@ class BagelViTEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.IntTensor,
-        max_seqlen: int,
+        attn_wrapper,
         cos_h: torch.Tensor = None,
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
@@ -251,8 +244,7 @@ class BagelViTEncoderLayer(nn.Module):
         hidden_states = self.layer_norm1(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
+            attn_wrapper=attn_wrapper,
             cos_h=cos_h,
             sin_h=sin_h,
             cos_w=cos_w,
@@ -279,8 +271,7 @@ class BagelViTEncoder(nn.Module):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        cu_seqlens: torch.IntTensor,
-        max_seqlen: int,
+        attn_wrapper,
         cos_h: torch.Tensor = None,
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
@@ -289,8 +280,10 @@ class BagelViTEncoder(nn.Module):
 
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            hidden_states = encoder_layer(hidden_states, cu_seqlens, max_seqlen,
-                                          cos_h=cos_h, sin_h=sin_h, cos_w=cos_w, sin_w=sin_w)
+            hidden_states = encoder_layer(
+                hidden_states, attn_wrapper=attn_wrapper,
+                cos_h=cos_h, sin_h=sin_h, cos_w=cos_w, sin_w=sin_w
+            )
 
         return hidden_states
 
@@ -314,8 +307,7 @@ class BagelVisionTransformer(nn.Module):
         self,
         packed_pixel_values: torch.Tensor,
         packed_flattened_position_ids: torch.LongTensor,
-        cu_seqlens: torch.IntTensor,
-        max_seqlen: int,
+        attn_wrapper,
     ) -> torch.Tensor:
         hidden_states = self.embeddings(
             packed_pixel_values=packed_pixel_values,
@@ -332,7 +324,7 @@ class BagelVisionTransformer(nn.Module):
             )
 
         last_hidden_state = self.encoder(
-            inputs_embeds=hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            inputs_embeds=hidden_states, attn_wrapper=attn_wrapper,
             **extra_inputs
         )
         last_hidden_state = self.post_layernorm(last_hidden_state)
@@ -342,6 +334,7 @@ class BagelVisionTransformer(nn.Module):
 class BagelVisionModel(nn.Module):
     def __init__(self, config: BagelViTConfig):
         super().__init__()
+        self.config = config
         self.vision_model = BagelVisionTransformer(config)
 
     def get_input_embeddings(self) -> nn.Module:
@@ -351,13 +344,11 @@ class BagelVisionModel(nn.Module):
         self,
         packed_pixel_values: torch.Tensor,
         packed_flattened_position_ids: torch.LongTensor,
-        cu_seqlens: torch.IntTensor,
-        max_seqlen: int,
+        attn_wrapper,
     ) -> torch.Tensor:
 
         return self.vision_model(
             packed_pixel_values=packed_pixel_values,
             packed_flattened_position_ids=packed_flattened_position_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
+            attn_wrapper=attn_wrapper
         )
