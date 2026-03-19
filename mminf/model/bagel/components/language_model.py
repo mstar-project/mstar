@@ -165,7 +165,6 @@ class BagelAttentionMoT(nn.Module):
     def __init__(self, config: BagelModelConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
-        self.layer_idx = layer_idx
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -302,7 +301,6 @@ class BagelAttentionMoT(nn.Module):
             q=query_states,
             k=key_states,
             v=value_states,
-            layer_idx=self.layer_idx,
         )
 
         attn_output = attn_output.reshape(-1, self.hidden_size)
@@ -491,6 +489,9 @@ class BagelLanguageModel(nn.Module):
                 )
 
         for _layer_idx, decoder_layer in enumerate(self.layers):
+            # torch.compile complains about the attetion module having an integer layer_idx
+            # field that varies across the layers (forcing recompiles), so this is a workaround
+            cache_handle.set_layer_idx(_layer_idx)
             query_sequence = decoder_layer(
                 query_sequence=query_sequence,
                 cache_handle=cache_handle,

@@ -710,7 +710,7 @@ class LLMSubmodule(NodeSubmodule):
         t_uniform_next = 1.0 - (time_index + 1) / (N - 1)
         timestep = self._apply_timestep_shift(t=t_uniform, shift=shift)
         timestep_next = self._apply_timestep_shift(t=t_uniform_next, shift=shift)
-        dt = (timestep - timestep_next)[0].item()  # positive step size
+        dt = (timestep - timestep_next)[0]  # positive step size
 
         pos_embed = self.latent_pos_embed(vae_position_ids)
         timestep_embeds = self.time_embedder(timestep)
@@ -729,10 +729,16 @@ class LLMSubmodule(NodeSubmodule):
             # CFG interval: only apply guidance when timestep is within interval
             cfg_interval = kwargs.pop("cfg_interval", self.config.cfg_interval)
             cfg_lo, cfg_hi = cfg_interval
-            t_val = timestep[0].item() if isinstance(timestep, torch.Tensor) else float(timestep)
-            in_cfg_interval = (t_val > cfg_lo) and (t_val <= cfg_hi)
-            effective_text_scale = cfg_text_scale if in_cfg_interval else 1.0
-            effective_img_scale = cfg_img_scale if in_cfg_interval else 1.0
+            # t_val = timestep[0].item() if isinstance(timestep, torch.Tensor) else float(timestep)
+            # in_cfg_interval = (t_val > cfg_lo) and (t_val <= cfg_hi)
+            # effective_text_scale = cfg_text_scale if in_cfg_interval else 1.0
+            # effective_img_scale = cfg_img_scale if in_cfg_interval else 1.0
+
+            # torch.compile compatible logic
+            t_val = timestep[0]
+            in_cfg_interval = ((t_val > cfg_lo) & (t_val <= cfg_hi)).float()
+            effective_text_scale = cfg_text_scale * in_cfg_interval + 1.0  * (1 - in_cfg_interval)
+            effective_img_scale = cfg_img_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
 
             # plan_attention/plan_rope for all 3 labels done in preprocess
             velocities = {}

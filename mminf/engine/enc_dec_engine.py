@@ -179,9 +179,7 @@ class EncoderDecoderEngine(BaseEngine):
                 if hasattr(submodule, 'forward'):
                     submodule.forward = torch.compile(
                         submodule.forward,
-                        mode="max-autotune-no-cudagraphs",
                         fullgraph=False,
-                        dynamic=False,
                     )
                     logger.info("EncDecEngine: torch.compile applied to %s", node_name)
             except Exception:

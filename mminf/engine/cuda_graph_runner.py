@@ -243,8 +243,15 @@ class CudaGraphRunner:
             # Static input buffer for the concatenated embeddings
             static_text_inputs = preprocessed["text_inputs"].clone()
 
+            forward = torch.compile(
+                submodule.forward_batched,
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=False,
+                dynamic=False,
+            )
+
             def run_forward():
-                return submodule.forward_batched(
+                return forward(
                     graph_walk=config.graph_walk,
                     cache_manager=cache_manager,
                     packed_inputs=preprocessed,
@@ -278,6 +285,7 @@ class CudaGraphRunner:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = run_forward()
+            torch.cuda.synchronize()
 
             self.graphs[key] = graph
             self.static_outputs[key] = output
@@ -350,7 +358,6 @@ class CudaGraphRunner:
 
         preprocessed = static["preprocessed"]
         dummy_rids = static["dummy_rids"]
-        dummy_metadata = static["dummy_metadata"]
         config_labels = ["main", "cfg_img"] if requires_cfg else ["main"]
 
         # --- Step 1: Set up real request states on dummy request IDs ---

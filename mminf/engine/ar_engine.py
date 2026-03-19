@@ -114,6 +114,7 @@ class BatchedCacheManager:
         self.workspace_buffer = workspace_buffer
         self.kv_cache_config = kv_cache_config
         self.device = device
+        self.layer_idx = 0
 
         # CUDA graph mode: persistent wrappers passed in from CudaGraphRunner.
         # When set, plan_attention() uses the persistent wrapper's plan()
@@ -145,6 +146,10 @@ class BatchedCacheManager:
     def set_active_label(self, label: str) -> None:
         """Switch all requests to the same cache label."""
         self.active_labels = {rid: label for rid in self.request_ids}
+    
+    @torch.compiler.disable
+    def set_layer_idx(self, layer_idx: int):
+        self.layer_idx = layer_idx
 
     def plan_attention(
         self,
@@ -337,7 +342,7 @@ class BatchedCacheManager:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer_idx: int,
+        layer_idx: int | None=None,
     ) -> torch.Tensor:
         """Run pre-planned FlashInfer attention with KV cache write.
 
@@ -360,6 +365,8 @@ class BatchedCacheManager:
         Returns:
             output: [total_tokens, num_q_heads, head_dim]
         """
+        if layer_idx is None:
+            layer_idx = self.layer_idx
         label = next(iter(self.active_labels.values()))
         ps = self._plan_states[label]
         assert self.kv_cache is not None and ps.wrapper is not None
@@ -575,16 +582,20 @@ class AREngine(BaseEngine):
             return
 
         for node_name, submodule in self.submodules.items():
-            if not hasattr(submodule, 'language_model'):
-                continue
             try:
-                lm = submodule.language_model
-                lm.model.forward = torch.compile(
-                    lm.model.forward,
-                    mode="max-autotune-no-cudagraphs",
+                submodule.forward = torch.compile(
+                    submodule.forward,
                     fullgraph=False,
-                    dynamic=False,
+                    dynamic=True,
                 )
+                # TODO @nsagan refactor to just have one forward function that handles batched
+                # and sequential
+                if hasattr(submodule, 'forward_batched'):
+                    submodule.forward_batched = torch.compile(
+                        submodule.forward_batched,
+                        fullgraph=False,
+                        dynamic=True,
+                    )
                 logger.info("AREngine: torch.compile applied to %s language_model", node_name)
             except Exception:
                 logger.warning("AREngine: torch.compile failed for %s, using eager mode",
@@ -598,9 +609,6 @@ class AREngine(BaseEngine):
             logger.info("AREngine: skipping warmup (no KV cache or device)")
             return
 
-        # Step 1: torch.compile (before CUDA graph capture)
-        self._compile_submodules()
-
         # Step 2: CUDA graph capture for decode (Option A keying)
         for node_name in self.submodules:
             runner = CudaGraphRunner(self, node_name, self.kv_cache_config)
@@ -609,6 +617,8 @@ class AREngine(BaseEngine):
                 self.cuda_graph_runners[node_name] = runner
                 logger.info("AREngine: CUDA graphs captured for %s (%d configs)",
                             node_name, len(runner.graphs))
+        # Step 1: torch.compile (before CUDA graph capture)
+        self._compile_submodules()
 
     def _can_batch(self, batch: NodeBatch) -> bool:
         """Only batch when all requests share a batchable graph_walk path.
