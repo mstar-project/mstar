@@ -97,7 +97,9 @@ class Benchmark:
         requests = dataset.get_requests()[: self.config.num_requests]
 
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300)
+            timeout=aiohttp.ClientTimeout(total=300),
+            connector=aiohttp.TCPConnector(),
+            read_bufsize=5 * 2**20,  # 1MB read buffer
         ) as session:
             print("--- Warmup ---")
             warmup_req = requests[0]

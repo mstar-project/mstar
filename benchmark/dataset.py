@@ -130,7 +130,7 @@ class VBenchDataset(BaseDataset):
         """Load I2V data from VBench I2V dataset."""
         path = self._auto_download_i2v_dataset()
         if not path:
-            return []
+            raise Exception("Failed to load I2V Data for VBench. Note that you need to pip install gdown to load the data.")
 
         # Try to load from i2v-bench-info.json
         info_json_path = os.path.join(path, "data", "i2v-bench-info.json")

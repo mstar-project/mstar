@@ -81,7 +81,7 @@ class AggregateMetrics:
             f"Request type breakdown: {breakdown}\n"
             f"Requests : {self.n_success}/{self.n_requests} succeeded\n"
             f"TTFT     : {self.ttft}\n"
-            f"E2E      : {self.e2e_latency}"
+            f"E2E      : {self.e2e_latency}\n"
             f"{tpt}"
             f"Total wall time: {self.wall_time:.2f}s"
         )
@@ -198,6 +198,7 @@ async def send_request(
                 f"Expected {output_mod} output but got modalities: {output_modalities_recvd}"
             )
     except Exception as e:
+        print(f"ERROR in request {request_id}: {e}")
         metrics.record_error(str(e))
     else:
         metrics.record_completion()
