@@ -8,7 +8,7 @@ python -m benchmark.runner \
     --url "${URL:-http://localhost:8000}" \
     --model "${MODEL:-bagel}" \
     --dataset vbench \
-    --request-type "${TASK:-image_to_image}" \
+    --request-type "${TASK:-image_to_text}" \
     --vbench-cache-dir "$CACHE_DIR" \
     --num-requests "${NUM_REQUESTS:-10}" \
     ${RATE:+--rate "$RATE"}

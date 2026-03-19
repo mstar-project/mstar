@@ -24,6 +24,9 @@ class BaseDataset(ABC):
         ]
 
 
+UND_PROMPT = "Describe this image in detail."
+
+
 class VBenchDataset(BaseDataset):
     """
     Dataset loader for VBench prompts.
@@ -52,7 +55,7 @@ class VBenchDataset(BaseDataset):
     def _load_data(self) -> list[RequestInput]:
         if self.task == RequestType.T2I:
             return self._load_t2v_prompts()
-        elif self.task == RequestType.I2I:
+        elif self.task in [RequestType.I2I, RequestType.I2T]:
             return self._load_i2v_data()
         else:
             raise NotImplementedError(
@@ -71,11 +74,7 @@ class VBenchDataset(BaseDataset):
         path = os.path.join(self.cache_dir, "vbench_subject_consistency.txt")
         if not os.path.exists(path):
             print(f"Downloading VBench T2V prompts to {path}...")
-            try:
-                self._download_file(self.T2V_PROMPT_URL, path)
-            except Exception as e:
-                print(f"Failed to download VBench prompts: {e}")
-                return [{"prompt": "A cat sitting on a bench"}] * 50
+            self._download_file(self.T2V_PROMPT_URL, path)
 
         reqs = []
         with open(path) as f:
@@ -161,7 +160,9 @@ class VBenchDataset(BaseDataset):
             if os.path.exists(img_path):
                 reqs.append(RequestInput(
                     req_type=self.task,
-                    prompt=item.get("caption", ""),
+                    prompt=item.get("caption", "") \
+                        if self.task == RequestType.I2I \
+                            else UND_PROMPT,
                     image_path=img_path,
                 ))
             else:
@@ -184,7 +185,9 @@ class VBenchDataset(BaseDataset):
         return [
             RequestInput(
                 req_type=self.task,
-                prompt=os.path.splitext(os.path.basename(f))[0],
+                prompt=os.path.splitext(os.path.basename(f))[0] \
+                    if self.task == RequestType.I2I \
+                        else UND_PROMPT,
                 image_path=f,
             )
             for f in files
