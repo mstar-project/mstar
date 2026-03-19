@@ -86,6 +86,10 @@ class CudaGraphRunner:
         self.static_outputs: dict[tuple, dict] = {}
         self.static_cache_managers: dict[tuple, Any] = {}
 
+        self.workspace = torch.empty(
+            256 * 1024 * 1024, dtype=torch.uint8, device=self.device
+        )
+
         self.memory_pool = None
 
     def warmup_and_capture(self) -> None:
@@ -142,13 +146,11 @@ class CudaGraphRunner:
         # multi-pass captures (e.g., main + cfg_img in same graph).
         plan_states = {}
         for label in config.labels:
-            workspace = torch.empty(
-                256 * 1024 * 1024, dtype=torch.uint8, device=self.device
-            )
+            
 
             if config.graph_walk == "decode":
                 wrapper = FlashInferDecodeWrapper(
-                    workspace_buffer=workspace,
+                    workspace_buffer=self.workspace,
                     num_qo_heads=cfg.num_qo_heads,
                     num_kv_heads=cfg.num_kv_heads,
                     head_dim=cfg.head_dim,
@@ -160,7 +162,7 @@ class CudaGraphRunner:
                 )
             else:
                 wrapper = FlashInferPrefillWrapper(
-                    workspace_buffer=workspace,
+                    workspace_buffer=self.workspace,
                     num_qo_heads=cfg.num_qo_heads,
                     num_kv_heads=cfg.num_kv_heads,
                     head_dim=cfg.head_dim,
