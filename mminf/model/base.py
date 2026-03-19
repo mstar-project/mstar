@@ -55,6 +55,17 @@ class NodeSubmodule(torch.nn.Module):
         ...
     
     def can_batch(self, batch: NodeBatch) -> bool:
+        """
+        Determine if this submodule can batch the given node batch.
+        Examines the node batch properties (graph_walk, input tensors, etc.) to decide
+        whether batched execution is supported. Returns True if the submodule can handle
+        vectorized batching for this specific batch configuration, False otherwise.
+        Args:
+            batch: NodeBatch containing request_ids, graph_walk, per_request_input_tensors,
+                and per_request_metadata.
+        Returns:
+            bool: True if batching is supported for this batch, False otherwise.
+        """
         return True
 
 
