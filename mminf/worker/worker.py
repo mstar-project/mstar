@@ -419,7 +419,6 @@ class Worker:
     def run(self) -> None:
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
-        torch.cuda.synchronize()
 
         while True:
             from mminf.utils.profiler import range_pop, range_push

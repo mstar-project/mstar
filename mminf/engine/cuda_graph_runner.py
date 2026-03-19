@@ -434,6 +434,7 @@ class CudaGraphRunner:
         preprocessed["text_inputs"][:real_text.shape[0]].copy_(real_text)
 
         # --- Step 4: Replay ---
+        torch.cuda.default_stream().synchronize()
         graph.replay()
         torch.cuda.default_stream().synchronize()
 

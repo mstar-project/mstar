@@ -22,7 +22,7 @@ class EncoderDecoderEngine(BaseEngine):
     def __init__(self, enable_nvtx: bool = False):
         super().__init__(enable_nvtx=enable_nvtx)
         self.submodules: dict[str, torch.nn.Module] = {}
-        self.flash_infer_buffer = None
+        self.attn_wrapper = None
         self.device = None
 
     def engine_type(self) -> EngineType:

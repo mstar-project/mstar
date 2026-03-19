@@ -22,8 +22,6 @@ import flashinfer
 
 logger = logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__)
-
 
 @torch.compiler.disable
 def run_rms_norm(

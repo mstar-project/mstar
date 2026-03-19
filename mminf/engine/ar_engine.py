@@ -638,11 +638,6 @@ class AREngine(BaseEngine):
         if len(batch.request_ids) <= 1:
             return False
         return submodule.can_batch(batch)
-        # Ensure the submodule supports batched forward
-        # submodule = self.submodules.get(batch.node_name)
-        # if submodule is None or not hasattr(submodule, "forward_batched"):
-        #     return False
-        # return True
 
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""

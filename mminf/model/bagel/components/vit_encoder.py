@@ -18,35 +18,6 @@ from transformers.activations import ACT2FN
 from mminf.model.bagel.config import BagelViTConfig
 
 
-# def run_attention(
-#     q: torch.Tensor,
-#     k: torch.Tensor,
-#     v: torch.Tensor,
-#     causal: bool = False,
-# ):
-#     """
-#     q,k,v: (total_tokens, num_heads, head_dim)
-#     cu_seqlens: (batch + 1)
-#     """
-
-#     # (1, heads, seq, dim)
-#     q = q.permute(1, 0, 2).unsqueeze(0)
-#     k = k.permute(1, 0, 2).unsqueeze(0)
-#     v = v.permute(1, 0, 2).unsqueeze(0)
-
-#     out = F.scaled_dot_product_attention(
-#         q,
-#         k,
-#         v,
-#         attn_mask=None,
-#         dropout_p=0.0,
-#         is_causal=causal,
-#     )
-
-#     # back to (seq, heads, dim)
-#     return out.squeeze(0).permute(1, 0, 2)
-
-
 class RotaryEmbedding2D(torch.nn.Module):
     def __init__(self, dim, max_h, max_w, base=10000):
         super().__init__()

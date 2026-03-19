@@ -3,7 +3,7 @@
 WHO=naomi
 
 CACHE_DIR=/mnt/storage/$WHO/mminf/bagel/
-DEVICES=1,3
+DEVICES=1,2
 
 CUDA_VISIBLE_DEVICES=$DEVICES python mminf/api_server/entrypoint.py \
     --config configs/bagel.yaml \
