@@ -382,15 +382,28 @@ class FlashInferAttentionNoCache:
     def __init__(
         self,
         device: torch.device,
+        workspace_buffer: torch.Tensor,
+    ):
+        self.device = device
+        self.workspace = workspace_buffer
+        self.wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            float_workspace_buffer=self.workspace,
+            kv_layout="NHD",
+        )
+
+        self.q_buf = None
+        self.k_buf = None
+        self.v_buf = None
+
+    def plan_attention(
+        self,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
         seq_lens: list[int],
-        workspace_buffer: torch.Tensor = None,
         causal: bool=True,
         dtype: torch.dtype = torch.bfloat16,
     ):
-        self.device = device
         self.orig_head_dim = head_dim
         self.dtype = dtype
 
@@ -412,27 +425,13 @@ class FlashInferAttentionNoCache:
             f"[FlashInfer] heads={num_qo_heads}/{num_kv_heads}, "
             f"head_dim={head_dim} → {self.head_dim} (pad={self.needs_pad})"
         )
-
-        if workspace_buffer is None:
-            self.workspace = torch.empty(
-                128 * 1024 * 1024,
-                dtype=torch.uint8,
-                device=device,
-            )
-        else:
-            self.workspace = workspace_buffer
-
-        self.wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-            float_workspace_buffer=self.workspace,
-            kv_layout="NHD",
-        )
-
+    
         # ---- indptr ----
-        qo_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
-        kv_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
+        qo_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=self.device)
+        kv_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=self.device)
 
         torch.cumsum(
-            torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
             dim=0,
             out=qo_indptr[1:]
         )
@@ -454,18 +453,18 @@ class FlashInferAttentionNoCache:
 
         if self.needs_pad:
             shape = (self.total_tokens, num_qo_heads, self.head_dim)
-            self.q_buf = torch.empty(shape, dtype=dtype, device=device)
+            self.q_buf = torch.empty(shape, dtype=dtype, device=self.device)
 
             shape_kv = (self.total_tokens, num_kv_heads, self.head_dim)
-            self.k_buf = torch.empty(shape_kv, dtype=dtype, device=device)
-            self.v_buf = torch.empty(shape_kv, dtype=dtype, device=device)
+            self.k_buf = torch.empty(shape_kv, dtype=dtype, device=self.device)
+            self.v_buf = torch.empty(shape_kv, dtype=dtype, device=self.device)
         else:
             self.q_buf = None
             self.k_buf = None
             self.v_buf = None
 
     @torch.compiler.disable
-    def run(
+    def run_attention(
         self,
         q: torch.Tensor,
         k: torch.Tensor,

@@ -3,6 +3,7 @@ import logging
 import torch
 
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
+from mminf.utils.flashinfer_utils import FlashInferAttentionNoCache
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ class EncoderDecoderEngine(BaseEngine):
     def __init__(self, enable_nvtx: bool = False):
         super().__init__(enable_nvtx=enable_nvtx)
         self.submodules: dict[str, torch.nn.Module] = {}
+        self.flash_infer_buffer = None
         self.device = None
 
     def engine_type(self) -> EngineType:
@@ -34,39 +36,23 @@ class EncoderDecoderEngine(BaseEngine):
     ) -> None:
         self.submodules = submodules
         self.device = device
+        self.attn_wrapper = FlashInferAttentionNoCache(
+            device=device,
+            workspace_buffer=torch.empty(
+                128 * 1024 * 1024,
+                dtype=torch.uint8,
+                device=device,
+            )
+        )
 
     def _can_batch_inputs(self, batch: NodeBatch, submodule) -> bool:
         """Check if all requests have same-shaped inputs for stacking."""
         if len(batch.request_ids) <= 1:
             return False
         
+        # Some modules, like ViT, can batch via packing inputs even if the
+        # inputs are not the same shape, so we push this check to the model
         return submodule.can_batch(batch)
-
-        # Get reference shapes from first request
-        # first_rid = batch.request_ids[0]
-        # first_inputs = batch.per_request_input_tensors.get(first_rid, {})
-        # if not first_inputs:
-        #     return False
-
-        # ref_shapes = {}
-        # for name, tensor_list in first_inputs.items():
-        #     if not tensor_list:
-        #         continue
-        #     ref_shapes[name] = [t.shape for t in tensor_list]
-
-        # # Check all other requests match
-        # for rid in batch.request_ids[1:]:
-        #     inputs = batch.per_request_input_tensors.get(rid, {})
-        #     if set(inputs.keys()) != set(first_inputs.keys()):
-        #         return False
-        #     for name, tensor_list in inputs.items():
-        #         if name not in ref_shapes:
-        #             continue
-        #         if len(tensor_list) != len(ref_shapes[name]):
-        #             return False
-        #         for t, ref_shape in zip(tensor_list, ref_shapes[name]):
-        #             if t.shape != ref_shape:
-        #                 return False
 
 
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
@@ -81,6 +67,7 @@ class EncoderDecoderEngine(BaseEngine):
             ],
             request_ids=batch.request_ids,
             per_request_metadata=batch.per_request_metadata,
+            attn_wrapper=self.attn_wrapper
         )
 
         batched_output = submodule.forward_batched(
@@ -106,6 +93,7 @@ class EncoderDecoderEngine(BaseEngine):
                     per_request_metadata={
                         rid: batch.per_request_metadata.get(rid, {})
                     },
+                    attn_wrapper=self.attn_wrapper
                 )
                 outputs[rid] = submodule(**preprocessed, **metadata)
             else:

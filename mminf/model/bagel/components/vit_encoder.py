@@ -198,8 +198,7 @@ class BagelViTAttention(nn.Module):
             q = torch.cat([qh, qw], dim=-1)
             k = torch.cat([kh, kw], dim=-1)
 
-        attn_output = attn_wrapper.run(q, k, v)
-
+        attn_output = attn_wrapper.run_attention(q, k, v)
         attn_output = attn_output.reshape(total_q_len, -1)
 
         attn_output = self.out_proj(attn_output)

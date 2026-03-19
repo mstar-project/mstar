@@ -60,7 +60,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
         per_request_metadata: dict[str, dict],
-        cache_manager: BatchedCacheManager=None,
+        attn_wrapper: FlashInferAttentionNoCache,
     ) -> dict[str, torch.Tensor]: # input name to tensor
         """Convert raw images to packed ViT input format.
 
@@ -93,8 +93,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
             pixel_val_list.append(pixel_values)
             pos_id_list.append(position_ids)
         n_head = self.vit_model.config.num_attention_heads
-        attn_wrapper = FlashInferAttentionNoCache(
-            device=device,
+        attn_wrapper.plan_attention(
             num_qo_heads=n_head,
             num_kv_heads=n_head,
             head_dim=self.vit_model.config.hidden_size // n_head,
@@ -181,7 +180,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
         per_request_metadata: dict[str, dict],
-        cache_manager: BatchedCacheManager=None,
+        attn_wrapper: FlashInferAttentionNoCache=None,
     ) -> dict[str, torch.Tensor]: # input name to tensor
         """Convert raw images to VAE encoder input format.
 
@@ -980,7 +979,7 @@ class VAEDecoderSubmodule(NodeSubmodule):
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
         per_request_metadata: dict[str, dict],
-        cache_manager: BatchedCacheManager=None,
+        attn_wrapper: FlashInferAttentionNoCache=None,
     ):
         """Prepare VAE decoder inputs.
 

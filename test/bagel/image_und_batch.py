@@ -12,11 +12,11 @@ URL = "http://0.0.0.0:8000/generate"
 
 # 5 image paths (can be the same image if you just want to test batching)
 IMAGE_PATHS = [
-    "test/bagel/bagel.png",
-    "test/bagel/bagel.png",
-    "test/bagel/bagel.png",
-    "test/bagel/bagel.png",
-    "test/bagel/bagel.png"
+    "test/assets/bagel.png",
+    "test/assets/dog.jpg",
+    "test/assets/person.jpg",
+    "test/assets/strawberries.jpg",
+    "test/assets/bagel.png"
 ]
 
 # Barrier to synchronize all threads
