@@ -20,7 +20,7 @@ def main():
         ]
 
         data = {
-            "text": "Please describe how this food is made",
+            "text": "Please describe this image in detail",
             # "model_kwargs": json.dumps({
             #     "think_mode": True,
             # })

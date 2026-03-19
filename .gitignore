@@ -11,3 +11,7 @@ uv.lock
 *.json
 profiler/
 traces/
+
+# output filenames
+output.png
+output_edit.png

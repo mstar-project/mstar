@@ -195,6 +195,8 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         # Each entity must use a unique port.
         self.my_session_id = hostname
 
+        self.copy_stream = torch.cuda.Stream()
+
         if TransferEngine is not None:
             self.engine = TransferEngine()
             self.engine.initialize(
@@ -402,9 +404,13 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         # request_id -> ready graph edges
         ready: dict[str, list[GraphEdge]] = {}
         still_pending = []
+        torch.cuda.default_stream().synchronize()
 
         for ep in self.pending:
             if ep.event.query():
+                # TODO: the system sometimes hangs under many requests unless we have this,
+                # but we don't want to wait for unrelated copies before proceeding...
+                self.copy_stream.synchronize()
                 for edge in ep.graph_edges:
                     ready.setdefault(ep.request_id, []).append(edge)
                     logger.debug(
@@ -433,7 +439,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         register memory, call engine.transfer_read_on_cuda(), record CUDA event.
         For each edge WITHOUT tensor_info (signal-only): no data to transfer.
         """
-        stream = torch.cuda.Stream()
+        stream = self.copy_stream
         for graph_edge in graph_edges:
             if len(graph_edge.tensor_info) == 0:
                 continue  # signal-only edge, no data to transfer
