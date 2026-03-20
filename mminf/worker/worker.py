@@ -379,6 +379,9 @@ class Worker:
                 )
 
         if outputs.emit_to_client:
+            self.worker_graphs_manager.increment_out_chunks(
+                request_id, n=len(outputs.emit_to_client)
+            )
             for graph_edge in outputs.emit_to_client:
                 message = APIServerMessage(
                     message_type="result_tensors",
@@ -399,6 +402,7 @@ class Worker:
                     worker_graph_ids=outputs.completed_worker_graph_ids,
                     persist_signals=self.worker_graphs_manager.flush_persist_signals(request_id),
                     new_tokens=self.worker_graphs_manager.flush_new_tokens(request_id),
+                    num_output_chunks=self.worker_graphs_manager.flush_num_output_chunks(request_id)
                 ),
             )
             self.communicator.send("conductor", message)

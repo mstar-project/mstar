@@ -24,6 +24,7 @@ class ResultTensors:
 class RequestComplete:
     """Signals that a request has finished processing."""
     request_id: str
+    num_output_chunks: int = field(default=0)
 
 
 @dataclass

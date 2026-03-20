@@ -98,6 +98,7 @@ class WorkerGraphsDone(MessageBody):
     worker_graph_ids: list[str]
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
+    num_output_chunks: int = field(default=0)
 
 
 @dataclass

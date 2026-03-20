@@ -51,6 +51,7 @@ class PreprocessWorker:
         self.stop_event = threading.Event()
 
         self.per_request_reading_tensors = {}
+        self.per_request_num_chunks = {}
 
         self.thread = threading.Thread(
             target=_preprocess_loop,
@@ -71,8 +72,10 @@ class PreprocessWorker:
     def new_request(self, input: PreprocessInput):
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
+        self.per_request_num_chunks[input.request_id] = 0
 
     def new_result_tensors(self, input: ResultTensors):
+        self.per_request_num_chunks[input.request_id] += 1
         self.per_request_reading_tensors[input.request_id] += len(input.graph_edge.tensor_info)
         logger.debug(
             "Data worker reading queue for request %s increased to length %d",
@@ -82,6 +85,12 @@ class PreprocessWorker:
 
     def has_pending_tensors(self, request_id: str):
         return self.per_request_reading_tensors.get(request_id, 0) > 0
+    
+    def received_all_chunks(self, request_id: str, expected_n: int):
+        logger.debug(
+            "Expected %d chunks, got %d", self.per_request_num_chunks[request_id], expected_n
+        )
+        return self.per_request_num_chunks[request_id] >= expected_n
 
     def get_result_chunks(self)-> list[ResultChunk]:
         results = []
@@ -97,6 +106,8 @@ class PreprocessWorker:
 
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
+        del self.per_request_num_chunks[request_id]
+        del self.per_request_reading_tensors[request_id]
 
     def shutdown(self):
         self.stop_event.set()

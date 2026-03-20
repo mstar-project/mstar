@@ -86,6 +86,7 @@ class RequestData:
     current_worker_graph_ids: set[str]
     # make sure to check all tensors in the list are completed (BLOCKING case)
     completed_worker_graph_ids: set[str] = field(default_factory=set)
+    num_output_chunks: int = field(default=0)
 
     def remove_persist_signal_uuids(self, uuids: list[str]):
         uuids = set(uuids)
@@ -397,7 +398,8 @@ class Conductor:
             APIServerMessage(
                 message_type="request_complete",
                 body=RequestComplete(
-                    request_id=request_id
+                    request_id=request_id,
+                    num_output_chunks=self.requests[request_id].num_output_chunks
                 )
             )
         )
@@ -484,6 +486,7 @@ class Conductor:
         request_data.completed_worker_graph_ids.update(
             body.worker_graph_ids
         )
+        request_data.num_output_chunks += body.num_output_chunks
 
         done_with_forward = request_data.current_worker_graph_ids.issubset(
             request_data.completed_worker_graph_ids

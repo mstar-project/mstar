@@ -134,6 +134,7 @@ class PerRequestInfo:
 
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
     pending_new_tokens: dict[str, list[int]] = field(default_factory=dict)
+    num_output_chunks: int = field(default=0)
 
 
 @dataclass
@@ -306,6 +307,9 @@ class WorkerGraphsManager:
             if name not in self.per_request_info[request_id].pending_new_tokens:
                 self.per_request_info[request_id].pending_new_tokens[name] = []
             self.per_request_info[request_id].pending_new_tokens[name].extend(tokens)
+    
+    def increment_out_chunks(self, request_id: str, n=1):
+        self.per_request_info[request_id].num_output_chunks += n
 
     def flush_persist_signals(self, request_id: str) -> dict[str, list[TensorPointerInfo]]:
         """Pop and return all buffered persist signals for a request.
@@ -327,3 +331,8 @@ class WorkerGraphsManager:
         new_tokens = info.pending_new_tokens
         info.pending_new_tokens = {}
         return new_tokens
+    
+    def flush_num_output_chunks(self, request_id: str) -> int:
+        out_chunks = self.per_request_info[request_id].num_output_chunks
+        self.per_request_info[request_id].num_output_chunks = 0
+        return out_chunks
