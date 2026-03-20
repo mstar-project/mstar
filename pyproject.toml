@@ -17,6 +17,7 @@ dependencies = [
     "python-multipart",
     "torch",
     "uvicorn",
+    "gdown"
 ]
 
 [project.scripts]
