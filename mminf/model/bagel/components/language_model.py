@@ -139,15 +139,7 @@ class BagelAttentionMoT(nn.Module):
         vae_token_indexes=None,
         text_indexes=None,
         text_mask=None,
-    ):
-        mot_kwargs = dict(
-            query_sequence=query_sequence,
-            text_idxs=text_indexes,
-            img_idxs=vae_token_indexes,
-            text_mask=text_mask,
-            static_vae_idxs=static_vae_idxs
-        )
-        
+    ):  
         if mode == "und":
             query_states = self.q_proj(query_sequence).view(
                 -1, self.num_heads, self.head_dim
@@ -167,6 +159,13 @@ class BagelAttentionMoT(nn.Module):
             )
 
         elif mode == "gen":
+            mot_kwargs = dict(
+                query_sequence=query_sequence,
+                text_idxs=text_indexes,
+                img_idxs=vae_token_indexes,
+                text_mask=text_mask,
+                static_vae_idxs=static_vae_idxs
+            )
             query_states = split_function_mot(
                 text_function=lambda seq: run_rms_norm(
                     self.q_proj(seq).view(
@@ -230,7 +229,11 @@ class BagelAttentionMoT(nn.Module):
             attn_output = split_function_mot(
                 text_function=self.o_proj,
                 image_fuction=self.o_proj_moe_gen,
-                **mot_kwargs
+                query_sequence=attn_output,
+                text_idxs=text_indexes,
+                img_idxs=vae_token_indexes,
+                text_mask=text_mask,
+                static_vae_idxs=static_vae_idxs
             )
 
         return attn_output
