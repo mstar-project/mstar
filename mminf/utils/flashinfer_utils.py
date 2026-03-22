@@ -443,23 +443,19 @@ class FlashInferAttentionNoCache:
         torch.cumsum(
             torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
             dim=0,
-            out=qo_indptr[1:n+1]
-        )
-
-        torch.cumsum(
-            torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
-            dim=0,
             out=qo_indptr[1:]
         )
         kv_indptr.copy_(qo_indptr)
 
+        import math
         self.wrapper.plan(
             qo_indptr,
             kv_indptr,
             self.num_qo_heads,
             self.num_kv_heads,
-            self.head_dim,  # IMPORTANT: padded dim
+            self.head_dim,  # padded dim for kernel selection
             causal=causal,
+            sm_scale=1.0 / math.sqrt(self.orig_head_dim),
             q_data_type=self.dtype
         )
 
