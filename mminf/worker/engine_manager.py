@@ -61,7 +61,7 @@ class EngineManager:
 
             engine_cls = ENGINE_TYPE_TO_CLASS[engine_type_str]
 
-            if engine_type_str == "ar":
+            if engine_type_str == "ar" or engine_cls == "enc_dec":
                 engine = engine_cls(
                     kv_cache_config=model_config.get("kv_cache", {}),
                     enable_nvtx=enable_nvtx,

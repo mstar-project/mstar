@@ -29,14 +29,17 @@ class NodeSubmodule(torch.nn.Module):
 
     def preprocess(
         self, graph_walk: str,
-        cache_manager: BatchedCacheManager,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict]
+        per_request_metadata: dict[str, dict],
+        **kwargs
     ) -> dict[str, torch.Tensor]: # input name to tensor
         """
         Convert variable-length list[Tensor] inputs to fixed tensors.
         NOT compiled — handles Python-level variability.
+
+        kwargs include engine-specific inputs, such as KV cache handles.
+        TODO @nsagan: maybe refactor these kwargs into a dataclass
 
         Returns a dict of input name to batched tensor.
 
@@ -66,7 +69,7 @@ class NodeSubmodule(torch.nn.Module):
         Returns:
             bool: True if batching is supported for this batch, False otherwise.
         """
-        return True
+        return False
 
 
 @dataclass
@@ -260,7 +263,11 @@ class Model(ABC):
         ], start=[])
 
     @abstractmethod
-    def get_kv_cache_config(self) -> KVCacheConfig:
+    def get_kv_cache_config(self) -> dict[str, KVCacheConfig]:
+        """
+        Returns a dict of node name to kv cache config for all nodes that
+        have a KV cache associated with them or use flash infer
+        """
         pass
 
     @abstractmethod

@@ -164,6 +164,7 @@ def parse_args() -> BenchmarkConfig:
     parser.add_argument("--rate", type=float, default=None,
                         help="Requests/sec. Omit for sequential mode.")
     parser.add_argument("--request-type", choices=[r.value for r in RequestType])
+    parser.add_argument("--random-seed",type=int, default=42)
     # VBench args
     vbench = parser.add_argument_group("vbench")
     
@@ -171,6 +172,7 @@ def parse_args() -> BenchmarkConfig:
                         help="Directory to cache downloaded VBench data (default: ./vbench_cache)")
 
     args = parser.parse_args()
+    random.seed(args.random_seed)
 
     return BenchmarkConfig(
         url=args.url,

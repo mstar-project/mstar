@@ -226,6 +226,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
     def store_and_return_tensor_info(
         self, request_id: str, tensors: NameToTensorList,
     ) -> dict[str, list[TensorPointerInfo]]: # name to list[tensorPointerInfo]
+        torch.cuda.default_stream().synchronize()
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
             tensor_info[name] = []
@@ -264,7 +265,6 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     request_id=request_id, uuid=uuid
                 )
 
-                torch.cuda.default_stream().synchronize()
                 ret_value = self.engine.register_memory(
                     tensor.data_ptr(), tensor.nbytes
                 )
@@ -372,7 +372,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         for uuid in self.tensor_store.get_all_uuids(request_id):
             self.tensor_store.set_metadata(request_id, uuid, persist=False)
             if not self.tensor_store.can_gc(request_id, uuid):
-                logger.warning(
+                # note: channged from warning -> debug because this is a fairly common
+                # and expected event, and warning messages were cluttering the log
+                logger.debug(
                     "Deferring cleanup of tensor uuid %s "
                     "(awaiting TENSOR_RECEIVED ACK)", uuid
                 )
@@ -404,7 +406,6 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         # request_id -> ready graph edges
         ready: dict[str, list[GraphEdge]] = {}
         still_pending = []
-        torch.cuda.default_stream().synchronize()
 
         for ep in self.pending:
             if ep.event.query():
@@ -428,6 +429,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         req_id, info.uuid, 1
                     )
 
+        torch.cuda.default_stream().synchronize()
         return ready
 
     def start_read_tensors(

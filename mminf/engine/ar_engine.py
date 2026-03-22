@@ -18,6 +18,9 @@ class KVCacheConfig:
     num_kv_heads: int
     head_dim: int
     max_seq_len: int
+
+    # specific to modules that use paged attention; can be ignored for, e.g.,
+    # ViT encoders that do not have KV cache
     max_num_pages: int = 2048
     page_size: int = 128
     num_qo_heads: int | None = None  # Optional, defaults to num_kv_heads
@@ -482,6 +485,19 @@ class BatchedCacheManager:
             )
 
 
+@dataclass
+class PerSubmoduleStateInfo:
+    kv_cache_config: KVCacheConfig
+    page_allocator: PageAllocator | None=field(default=None)
+    kv_cache: torch.Tensor | None=field(default=None)
+
+    # Keyed by (request_id, cache_label) to support multiple KV 
+    # caches per request (needed for BAGEL's classifier-free guidance which
+    # maintains "main", "cfg_text", and "cfg_img" caches).
+    request_states: dict[tuple[str, str], KVRequestState] = field(
+        default_factory=dict
+    )
+
 class AREngine(BaseEngine):
     """
     Autoregressive engine with paged KV cache.
@@ -495,25 +511,18 @@ class AREngine(BaseEngine):
 
     def __init__(
         self,
-        kv_cache_config: KVCacheConfig | dict,
+        kv_cache_config: dict[str, KVCacheConfig],
         enable_nvtx: bool = False,
     ):
         super().__init__(enable_nvtx=enable_nvtx)
-        if isinstance(kv_cache_config, dict):
-            kv_cache_config = KVCacheConfig(**kv_cache_config)
         self.submodules: dict[str, torch.nn.Module] = {}
-        self.kv_cache_config = kv_cache_config
-        self.device = None
-        self.kv_cache = None  # [num_layers, max_pages, 2, page_size, num_kv_heads, head_dim]
-        self.page_allocator: PageAllocator | None = None
-        # Keyed by (request_id, cache_label) to support multiple KV caches
-        # per request (needed for BAGEL's classifier-free guidance which
-        # maintains "main", "cfg_text", and "cfg_img" caches).
-        self.request_states: dict[tuple[str, str], KVRequestState] = {}
 
+        self.state: dict[str, PerSubmoduleStateInfo] = {
+            node: PerSubmoduleStateInfo(cfg) for node, cfg in kv_cache_config.items()
+        }
+
+        self.device = None
         # FlashInfer wrappers (initialized in load_model if available)
-        self.prefill_wrapper = None
-        self.decode_wrapper = None
         self.workspace_buffer = None
 
         # CUDA graph runners (initialized in warmup())
@@ -530,53 +539,56 @@ class AREngine(BaseEngine):
     ) -> None:
         self.submodules = submodules
         self.device = device
-        cfg = model_config.get(
-            "kv_cache", self.kv_cache_config
+
+        cfgs_override: dict[str, KVCacheConfig] = model_config.get(
+            "kv_cache", None 
         )
-        if not cfg:
-            return  # dummy mode without config
-        if isinstance(cfg, dict):
-            cfg = KVCacheConfig(**cfg)
-
-        num_layers = cfg.num_layers
-        max_num_pages = cfg.max_num_pages
-        page_size = cfg.page_size
-        num_kv_heads = cfg.num_kv_heads
-        head_dim = cfg.head_dim
-
-        self.kv_cache = torch.zeros(
-            num_layers, max_num_pages, 2,
-            page_size, num_kv_heads, head_dim,
-            dtype=torch.bfloat16, device=device,
-        )
-        self.page_allocator = PageAllocator(max_num_pages)
-
+        
         # 256MB workspace for FlashInfer
         self.workspace_buffer = torch.empty(
             256 * 1024 * 1024, dtype=torch.uint8, device=device
         )
 
-        try:
-            import flashinfer
-            self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                self.workspace_buffer, "NHD"
-            )
-            self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace_buffer, "NHD"
-            )
-        except ImportError:
-            pass  # Dummy mode — no FlashInfer
+        for node_name in submodules:
 
-    def _create_cache_manager(self, request_id: str) -> BatchedCacheManager:
+            if node_name not in cfgs_override and node_name not in self.state:
+                continue
+
+            if node_name not in self.state:
+                self.state[node_name] = PerSubmoduleStateInfo(
+                    cfgs_override[node_name]
+                )
+            if node_name in cfgs_override:
+                self.state[node_name].kv_cache_config = cfgs_override[node_name]
+
+            cfg = self.state[node_name].kv_cache_config
+
+            num_layers = cfg.num_layers
+            max_num_pages = cfg.max_num_pages
+            page_size = cfg.page_size
+            num_kv_heads = cfg.num_kv_heads
+            head_dim = cfg.head_dim
+
+            self.state[node_name].kv_cache = torch.zeros(
+                num_layers, max_num_pages, 2,
+                page_size, num_kv_heads, head_dim,
+                dtype=torch.bfloat16, device=device,
+            )
+            self.state[node_name].page_allocator = PageAllocator(max_num_pages)
+
+    def _create_cache_manager(self, request_id: str, node_name: str) -> BatchedCacheManager:
         """Create a CacheHandle for a single request."""
+        if node_name not in self.state:
+            return None
+        state = self.state[node_name]
         return BatchedCacheManager(
             request_ids=[request_id],
             active_labels_per_request={request_id: "main"},
-            kv_cache=self.kv_cache,
-            page_allocator=self.page_allocator,
-            request_states=self.request_states,
+            kv_cache=state.kv_cache,
+            page_allocator=state.page_allocator,
+            request_states=state.request_states,
             workspace_buffer=self.workspace_buffer,
-            kv_cache_config=self.kv_cache_config,
+            kv_cache_config=state.kv_cache_config,
             device=self.device
         )
 
@@ -614,13 +626,14 @@ class AREngine(BaseEngine):
         """Compile submodules and capture CUDA graphs."""
         from mminf.engine.cuda_graph_runner import CudaGraphRunner
 
-        if self.kv_cache is None or self.device is None:
-            logger.info("AREngine: skipping warmup (no KV cache or device)")
-            return
-
         # Step 2: CUDA graph capture for decode (Option A keying)
         for node_name in self.submodules:
-            runner = CudaGraphRunner(self, node_name, self.kv_cache_config)
+            if self.device is None or (
+                node_name not in self.state or self.state[node_name].kv_cache is None
+            ):
+                logger.info("AREngine: skipping warmup (no KV cache or device)")
+                return
+            runner = CudaGraphRunner(self, node_name, self.state[node_name].kv_cache_config)
             runner.warmup_and_capture()
             if runner.graphs:
                 self.cuda_graph_runners[node_name] = runner
@@ -641,23 +654,23 @@ class AREngine(BaseEngine):
 
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
-        cache_manager = BatchedCacheManager(
-            request_ids=batch.request_ids,
-            active_labels_per_request={rid: "main" for rid in batch.request_ids},
-            kv_cache=self.kv_cache,
-            page_allocator=self.page_allocator,
-            request_states=self.request_states,
-            workspace_buffer=self.workspace_buffer,
-            kv_cache_config=self.kv_cache_config,
-            device=self.device,
-        )
+        if batch.node_name in self.state:
+            state = self.state[batch.node_name]
+            cache_manager = BatchedCacheManager(
+                request_ids=batch.request_ids,
+                active_labels_per_request={rid: "main" for rid in batch.request_ids},
+                kv_cache=state.kv_cache,
+                page_allocator=state.page_allocator,
+                request_states=state.request_states,
+                workspace_buffer=self.workspace_buffer,
+                kv_cache_config=state.kv_cache_config,
+                device=self.device,
+            )
+        else:
+            cache_manager = None
 
         # Preprocess all requests
         rids = list(batch.per_request_input_tensors.keys())
-        seq_lens = {
-            rid: cache_manager._get_state(rid, "main").seq_len for rid in rids
-        }
-        logger.debug(f"Execute batched {seq_lens}")
         input_tensors = [
             batch.per_request_input_tensors[rid] for rid in rids
         ]
@@ -685,14 +698,9 @@ class AREngine(BaseEngine):
         per_request_outputs = {}
         
         for rid in batch.request_ids:
-            cache_handle = self._create_cache_manager(rid)
+            cache_handle = self._create_cache_manager(rid, batch.node_name)
             inputs = batch.per_request_input_tensors.get(rid, {})
             metadata = {rid: batch.per_request_metadata.get(rid, {})}
-
-            seq_lens = {
-                rid: cache_handle._get_state(rid, "main").seq_len
-            }
-            logger.debug(f"Execute sequential {seq_lens}")
 
             preprocessed = submodule.preprocess(
                 batch.graph_walk,
@@ -765,6 +773,8 @@ class AREngine(BaseEngine):
         return NodeOutput(per_request_output_tensors=batched_output)
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
+        if batch.graph_walk != "decode":
+            print(batch.graph_walk, [rid for rid in batch.request_ids])
         if self.enable_nvtx:
             range_push(f"engine.ar.{batch.node_name}.{batch.graph_walk}")
 
@@ -793,35 +803,40 @@ class AREngine(BaseEngine):
         self, request_id: str, cache_labels: list[str] | None = None,
     ) -> None:
         labels = cache_labels or ["main"]
-        for label in labels:
-            self.request_states[(request_id, label)] = KVRequestState()
+        for state in self.state.values():
+            for label in labels:
+                state.request_states[(request_id, label)] = KVRequestState()
 
     def remove_request(self, request_id: str) -> None:
-        keys_to_remove = [
-            k for k in self.request_states if k[0] == request_id
-        ]
-        for key in keys_to_remove:
-            if self.page_allocator is not None:
-                self.page_allocator.free(self.request_states[key].page_indices)
-            del self.request_states[key]
+        for state in self.state.values():
+            keys_to_remove = [
+                k for k in state.request_states if k[0] == request_id
+            ]
+            for key in keys_to_remove:
+                if state.page_allocator is not None:
+                    state.page_allocator.free(state.request_states[key].page_indices)
+                del state.request_states[key]
 
     def pause_request(
         self, request_id: str, cache_label: str = "main",
     ) -> None:
         """For interleaved loop: mark as paused, keep KV pages allocated."""
         key = (request_id, cache_label)
-        if key in self.request_states:
-            self.request_states[key].is_paused = True
+        for state in self.state.values():
+            if key in state.request_states:
+                state.request_states[key].is_paused = True
 
     def resume_request(
         self, request_id: str, cache_label: str = "main",
     ) -> None:
         """Resume from paused state for next LLM step in loop."""
         key = (request_id, cache_label)
-        if key in self.request_states:
-            self.request_states[key].is_paused = False
+        for state in self.state.values():
+            if key in state.request_states:
+                state.request_states[key].is_paused = False
 
     def shutdown(self) -> None:
         self.kv_cache = None
         self.workspace_buffer = None
-        self.request_states.clear()
+        for state in self.state.values():
+            state.request_states.clear()

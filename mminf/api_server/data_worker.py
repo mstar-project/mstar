@@ -78,6 +78,9 @@ class PreprocessWorker:
         self.request_input_queue.put(input)
 
     def new_result_tensors(self, input: ResultTensors):
+        if input.request_id not in self.per_request_reading_tensors:
+            # Request already cleaned up...
+            return
         name = input.graph_edge.name
         self.output_fwd_pass_numbers[input.request_id][name] = max(
             self.output_fwd_pass_numbers[input.request_id].get(name, -1),
@@ -98,6 +101,8 @@ class PreprocessWorker:
         self, request_id: str, final_forward_pass: int,
         final_forward_outputs: list[str]
     ):
+        if request_id not in self.output_fwd_pass_numbers:
+            return False
         return all([
           self.output_fwd_pass_numbers[request_id].get(
               name, -1
@@ -108,6 +113,9 @@ class PreprocessWorker:
         results = []
         while not self.output_queue.empty():
             result: ResultChunk = self.output_queue.get()
+            if result.request_id not in self.per_request_reading_tensors:
+                # Request already cleaned up...
+                return
             self.per_request_reading_tensors[result.request_id] -= 1
             logger.debug(
                 "Data worker reading queue for request %s decreased to length %d",

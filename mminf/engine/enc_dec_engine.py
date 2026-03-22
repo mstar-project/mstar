@@ -2,6 +2,7 @@ import logging
 
 import torch
 
+from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.utils.flashinfer_utils import FlashInferAttentionNoCache
 from mminf.utils.profiler import range_pop, range_push
@@ -19,10 +20,15 @@ class EncoderDecoderEngine(BaseEngine):
     Falls back to per-request sequential execution for variable-shape inputs.
     """
 
-    def __init__(self, enable_nvtx: bool = False):
+    def __init__(
+        self,
+        kv_cache_config: dict[str, KVCacheConfig] = {},
+        enable_nvtx: bool = False
+    ):
         super().__init__(enable_nvtx=enable_nvtx)
         self.submodules: dict[str, torch.nn.Module] = {}
-        self.attn_wrapper = None
+        self.attn_config = kv_cache_config
+        self.attn_wrapper = {}
         self.device = None
 
     def engine_type(self) -> EngineType:
@@ -34,16 +40,31 @@ class EncoderDecoderEngine(BaseEngine):
         model_config: dict,
         device: torch.device,
     ) -> None:
+        self.workspace_buffer = torch.empty(
+            128 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=device,
+        )
         self.submodules = submodules
         self.device = device
-        self.attn_wrapper = FlashInferAttentionNoCache(
-            device=device,
-            workspace_buffer=torch.empty(
-                128 * 1024 * 1024,
-                dtype=torch.uint8,
-                device=device,
-            )
+
+        cfgs_override: dict[str, KVCacheConfig] = model_config.get(
+            "kv_cache", None 
         )
+        self.attn_config = {
+            **self.attn_config,
+            **cfgs_override
+        }
+
+        for node, cfg in self.attn_config.items():
+            self.attn_wrapper[node] = FlashInferAttentionNoCache(
+                device=device,
+                workspace_buffer=self.workspace_buffer,
+                head_dim=cfg.head_dim,
+                max_seq_len=cfg.max_seq_len,
+                num_qo_heads=cfg.num_qo_heads,
+                num_kv_heads=cfg.num_kv_heads
+            )
 
     def _can_batch_inputs(self, batch: NodeBatch, submodule) -> bool:
         """Check if all requests have same-shaped inputs for stacking."""
@@ -67,8 +88,9 @@ class EncoderDecoderEngine(BaseEngine):
             ],
             request_ids=batch.request_ids,
             per_request_metadata=batch.per_request_metadata,
-            attn_wrapper=self.attn_wrapper
+            attn_wrapper=self.attn_wrapper.get(batch.node_name, None)
         )
+
 
         batched_output = submodule.forward_batched(
             graph_walk=batch.graph_walk,
@@ -93,9 +115,10 @@ class EncoderDecoderEngine(BaseEngine):
                     per_request_metadata={
                         rid: batch.per_request_metadata.get(rid, {})
                     },
-                    attn_wrapper=self.attn_wrapper
+                    attn_wrapper=self.attn_wrapper.get(batch.node_name, None)
                 )
                 outputs[rid] = submodule(**preprocessed, **metadata)
+                print("hi")
             else:
                 result = submodule(**{k: v[0] for k, v in inputs.items()})
                 if isinstance(result, dict):
@@ -119,6 +142,7 @@ class EncoderDecoderEngine(BaseEngine):
                 range_pop()
             return output
 
+        print(batch.node_name, [rid for rid in batch.request_ids])
         try:
             with torch.no_grad():
                 if self._can_batch_inputs(batch, submodule):

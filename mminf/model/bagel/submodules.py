@@ -92,11 +92,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
             seq_lens.append(pixel_values.shape[0])
             pixel_val_list.append(pixel_values)
             pos_id_list.append(position_ids)
-        n_head = self.vit_model.config.num_attention_heads
         attn_wrapper.plan_attention(
-            num_qo_heads=n_head,
-            num_kv_heads=n_head,
-            head_dim=self.vit_model.config.hidden_size // n_head,
             seq_lens=seq_lens,
             causal=False
         )
@@ -135,7 +131,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         **kwargs
     ) -> dict[str, NameToTensorList]:
         features = self.forward(**packed_inputs)["img_emb"][0]
-        qo_indptr = packed_inputs["attn_wrapper"].qo_indptr
+        qo_indptr = packed_inputs["attn_wrapper"].qo_indptr.tolist()
         return {
             req_id: {
                 "img_emb": [features[qo_indptr[i]:qo_indptr[i+1]]]
@@ -143,7 +139,8 @@ class ViTEncoderSubmodule(NodeSubmodule):
         }
     
     def can_batch(self, batch: NodeBatch) -> bool:
-        return True
+        # Disabling bathing for the ViT 
+        return False
 
 
 class VAEEncoderSubmodule(NodeSubmodule):
@@ -955,7 +952,9 @@ class LLMSubmodule(NodeSubmodule):
         return torch.cat([boi_emb, emb, eoi_emb], dim=0)
     
     def can_batch(self, batch: NodeBatch) -> bool:
-        return batch.graph_walk != "image_gen"
+        # TODO
+        # return batch.graph_walk != "image_gen"
+        return batch.graph_walk == "decode"
 
 
 class VAEDecoderSubmodule(NodeSubmodule):

@@ -381,6 +381,11 @@ class FlashInferAttentionNoCache:
         self,
         device: torch.device,
         workspace_buffer: torch.Tensor,
+        head_dim: int,
+        max_seq_len: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        dtype: torch.dtype = torch.bfloat16,
     ):
         self.device = device
         self.workspace = workspace_buffer
@@ -388,24 +393,12 @@ class FlashInferAttentionNoCache:
             float_workspace_buffer=self.workspace,
             kv_layout="NHD",
         )
-
-        self.q_buf = None
-        self.k_buf = None
-        self.v_buf = None
-
-    def plan_attention(
-        self,
-        num_qo_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        seq_lens: list[int],
-        causal: bool=True,
-        dtype: torch.dtype = torch.bfloat16,
-    ):
         self.orig_head_dim = head_dim
         self.dtype = dtype
+        self.num_qo_heads = num_qo_heads
+        self.num_kv_heads = num_kv_heads
 
-        # ---- decide target head dim ----
+         # ---- decide target head dim ----
         if head_dim in (64, 128, 256):
             self.head_dim = head_dim
             self.needs_pad = False
@@ -423,10 +416,35 @@ class FlashInferAttentionNoCache:
             f"[FlashInfer] heads={num_qo_heads}/{num_kv_heads}, "
             f"head_dim={head_dim} → {self.head_dim} (pad={self.needs_pad})"
         )
-    
-        # ---- indptr ----
+
+        if self.needs_pad:
+            shape = (max_seq_len, num_qo_heads, self.head_dim)
+            self.q_buf = torch.empty(shape, dtype=dtype, device=self.device)
+
+            shape_kv = (max_seq_len, num_kv_heads, self.head_dim)
+            self.k_buf = torch.empty(shape_kv, dtype=dtype, device=self.device)
+            self.v_buf = torch.empty(shape_kv, dtype=dtype, device=self.device)
+        else:
+            self.q_buf = None
+            self.k_buf = None
+            self.v_buf = None
+        self.total_tokens = 0
+
+
+    def plan_attention(
+        self,
+        seq_lens: list[int],
+        causal: bool=True,
+    ):
+        n = sum(seq_lens)
+
         qo_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=self.device)
         kv_indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=self.device)
+        torch.cumsum(
+            torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
+            dim=0,
+            out=qo_indptr[1:n+1]
+        )
 
         torch.cumsum(
             torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
@@ -438,28 +456,16 @@ class FlashInferAttentionNoCache:
         self.wrapper.plan(
             qo_indptr,
             kv_indptr,
-            num_qo_heads,
-            num_kv_heads,
+            self.num_qo_heads,
+            self.num_kv_heads,
             self.head_dim,  # IMPORTANT: padded dim
             causal=causal,
-            q_data_type=dtype
+            q_data_type=self.dtype
         )
+
+        self.total_tokens = n
         self.qo_indptr = qo_indptr
 
-        # ---- preallocate buffers if needed ----
-        self.total_tokens = qo_indptr[-1].item()
-
-        if self.needs_pad:
-            shape = (self.total_tokens, num_qo_heads, self.head_dim)
-            self.q_buf = torch.empty(shape, dtype=dtype, device=self.device)
-
-            shape_kv = (self.total_tokens, num_kv_heads, self.head_dim)
-            self.k_buf = torch.empty(shape_kv, dtype=dtype, device=self.device)
-            self.v_buf = torch.empty(shape_kv, dtype=dtype, device=self.device)
-        else:
-            self.q_buf = None
-            self.k_buf = None
-            self.v_buf = None
 
     @torch.compiler.disable
     def run_attention(
@@ -477,7 +483,6 @@ class FlashInferAttentionNoCache:
             return self.wrapper.run(q, k, v)
 
         # ---- copy into padded buffers ----
-        T = q.shape[0]
         d = self.orig_head_dim
 
         # zero the padding region (important!)
@@ -486,11 +491,15 @@ class FlashInferAttentionNoCache:
         self.v_buf[:, :, d:] = 0
 
         # copy valid region
-        self.q_buf[:, :, :d].copy_(q)
-        self.k_buf[:, :, :d].copy_(k)
-        self.v_buf[:, :, :d].copy_(v)
+        self.q_buf[:self.total_tokens, :, :d].copy_(q)
+        self.k_buf[:self.total_tokens, :, :d].copy_(k)
+        self.v_buf[:self.total_tokens, :, :d].copy_(v)
 
-        out = self.wrapper.run(self.q_buf, self.k_buf, self.v_buf)
+        out = self.wrapper.run(
+            self.q_buf[:self.total_tokens],
+            self.k_buf[:self.total_tokens],
+            self.v_buf[:self.total_tokens]
+        )
 
         # ---- slice back to original dim ----
         return out[:, :, :d]

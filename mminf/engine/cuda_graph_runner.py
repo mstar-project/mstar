@@ -215,13 +215,15 @@ class CudaGraphRunner:
             # Create persistent wrappers
             plan_states = self._create_persistent_wrappers(bs, config)
 
+            ar_kv_info = self.ar_engine.state[self.submodule_name]
+
             # Create BatchedCacheManager with CUDA graph plan states
             cache_manager = BatchedCacheManager(
                 request_ids=dummy_rids,
                 active_labels_per_request={rid: "main" for rid in dummy_rids},
-                kv_cache=self.ar_engine.kv_cache,
-                page_allocator=self.ar_engine.page_allocator,
-                request_states=self.ar_engine.request_states,
+                kv_cache=ar_kv_info.kv_cache,
+                page_allocator=ar_kv_info.page_allocator,
+                request_states=ar_kv_info.request_states,
                 workspace_buffer=self.ar_engine.workspace_buffer,
                 kv_cache_config=cfg,
                 device=self.device,
@@ -378,17 +380,19 @@ class CudaGraphRunner:
         # --- Step 1: Set up real request states on dummy request IDs ---
         # Save the dummy states, swap in real request states
         saved_states = {}
+        ar_kv_info = self.ar_engine.state[self.submodule_name]
+        
         for i, rid in enumerate(request_ids):
             dummy_rid = dummy_rids[i]
             for label in config_labels:
-                real_state = self.ar_engine.request_states.get(
+                real_state = ar_kv_info.request_states.get(
                     (rid, label))
                 if real_state is not None:
                     # Save dummy state, point dummy at real state
                     saved_states[(dummy_rid, label)] = (
-                        self.ar_engine.request_states.get(
+                        ar_kv_info.request_states.get(
                             (dummy_rid, label)))
-                    self.ar_engine.request_states[
+                    ar_kv_info.request_states[
                         (dummy_rid, label)] = real_state
 
         # For padding slots (i >= batch_size), ensure dummy states exist
@@ -396,9 +400,9 @@ class CudaGraphRunner:
             dummy_rid = dummy_rids[i]
             for label in config_labels:
                 dk = (dummy_rid, label)
-                if dk not in self.ar_engine.request_states:
+                if dk not in ar_kv_info.request_states:
                     from mminf.engine.ar_engine import KVRequestState
-                    self.ar_engine.request_states[dk] = KVRequestState()
+                    ar_kv_info.request_states[dk] = KVRequestState()
 
         # --- Step 2: Re-plan with real page tables (outside graph) ---
         # Build real per-request inputs for the real slots
@@ -434,7 +438,6 @@ class CudaGraphRunner:
         preprocessed["text_inputs"][:real_text.shape[0]].copy_(real_text)
 
         # --- Step 4: Replay ---
-        torch.cuda.default_stream().synchronize()
         graph.replay()
         torch.cuda.default_stream().synchronize()
 
@@ -466,10 +469,10 @@ class CudaGraphRunner:
         # --- Step 7: Restore dummy states ---
         for (dummy_rid, label), old_state in saved_states.items():
             if old_state is not None:
-                self.ar_engine.request_states[
+                ar_kv_info.request_states[
                     (dummy_rid, label)] = old_state
             else:
-                self.ar_engine.request_states.pop(
+                ar_kv_info.request_states.pop(
                     (dummy_rid, label), None)
 
         # Clean up padding slot states
@@ -477,12 +480,12 @@ class CudaGraphRunner:
             dummy_rid = dummy_rids[i]
             for label in config_labels:
                 dk = (dummy_rid, label)
-                if dk in self.ar_engine.request_states:
-                    state = self.ar_engine.request_states[dk]
+                if dk in ar_kv_info.request_states:
+                    state = ar_kv_info.request_states[dk]
                     if state.page_indices:
-                        self.ar_engine.page_allocator.free(
+                        ar_kv_info.page_allocator.free(
                             state.page_indices)
-                    del self.ar_engine.request_states[dk]
+                    del ar_kv_info.request_states[dk]
 
         return outputs
 
