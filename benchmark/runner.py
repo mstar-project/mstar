@@ -103,6 +103,7 @@ class Benchmark:
                 prompt=req.prompt,
                 image_path=req.image_path,
             )
+            print(f"request time: {result.e2e_latency}")
             results.append(result)
         return results
 

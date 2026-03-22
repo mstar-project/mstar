@@ -10,6 +10,7 @@
 # This modified file is released under the same license.
 
 
+import time
 from typing import Optional
 
 import torch
@@ -19,28 +20,6 @@ from transformers.activations import ACT2FN
 from mminf.engine.ar_engine import BatchedCacheManager
 from mminf.model.bagel.config import BagelModelConfig
 from mminf.utils.flashinfer_utils import run_rms_norm
-
-
-def _to_text_mask(
-    text_indexes: torch.Tensor | None,
-    vae_token_indexes: torch.Tensor | None,
-    sequence_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if text_indexes is None and vae_token_indexes is None:
-        return torch.ones(sequence_len, dtype=torch.bool, device=device)
-
-    if text_indexes is not None and text_indexes.dtype == torch.bool:
-        return text_indexes.to(device=device)
-
-    seq_indexes = torch.arange(sequence_len, device=device)
-    if text_indexes is not None:
-        return torch.isin(seq_indexes, text_indexes.to(device=device, dtype=torch.long))
-
-    if vae_token_indexes is None or vae_token_indexes.numel() == 0:
-        return torch.ones(sequence_len, dtype=torch.bool, device=device)
-
-    return ~torch.isin(seq_indexes, vae_token_indexes.to(device=device, dtype=torch.long))
 
 
 class BagelRMSNorm(nn.Module):
@@ -80,85 +59,34 @@ class BagelMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
-# class BagelAttention(nn.Module):
-#     def __init__(self,config: BagelModelConfig, layer_idx: Optional[int] = None):
-#         super().__init__()
-#         self.config = config
-#         self.layer_idx = layer_idx
+def split_function_mot(
+    text_function,
+    image_fuction,
+    query_sequence: torch.Tensor,
+    text_idxs: torch.Tensor,
+    img_idxs: torch.Tensor,
+    text_mask: torch.Tensor,
+    static_vae_idxs=True
+):
+    if static_vae_idxs:
+        text_part  = query_sequence[text_idxs]   # [n_text_total, D]
+        image_part = query_sequence[img_idxs]  # [n_image_total, D]
 
-#         self.hidden_size = config.hidden_size
-#         self.num_heads = config.num_attention_heads
-#         self.head_dim = self.hidden_size // self.num_heads
-#         self.num_key_value_heads = config.num_key_value_heads
-#         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-#         self.max_position_embeddings = config.max_position_embeddings
-#         self.rope_theta = config.rope_theta
-#         self.is_causal = config.is_causal
-#         self.attention_dropout = config.attention_dropout
+        text_out = text_function(text_part)
+        image_out = image_fuction(image_part)
 
-#         if (self.head_dim * self.num_heads) != self.hidden_size:
-#             raise ValueError(
-#                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-#                 f" and `num_heads`: {self.num_heads})."
-#             )
-#         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-#         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-#         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-#         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-
-#         if self.config.qk_norm:
-#             self.q_norm = BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-#             self.k_norm = BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-#         else:
-#             self.q_norm = nn.Identity()
-#             self.k_norm = nn.Identity()
-
-#     def forward(
-#         self,
-#         query_sequence: torch.Tensor,
-#         cache_handle: CacheHandle,
-#         write_cache=True,
-#         is_causal=True,
-#     ):
-#         query_states = self.q_proj(query_sequence).view(
-#             -1, self.num_heads, self.head_dim
-#         )
-#         key_states = self.k_proj(query_sequence).view(
-#             -1, self.num_key_value_heads, self.head_dim
-#         )
-#         value_states = self.v_proj(query_sequence).view(
-#             -1, self.num_key_value_heads, self.head_dim
-#         )
-
-#         query_states = run_rms_norm(
-#             query_states, self.q_norm.weight, eps=self.q_norm.variance_epsilon
-#         )
-#         key_states = run_rms_norm(
-#             key_states, self.k_norm.weight, eps=self.k_norm.variance_epsilon
-#         )
-
-#         query_states, key_states = cache_handle.apply_rope_default(
-#             query_states, key_states, rope_theta=self.rope_theta
-#         )
-
-#         query_states = query_states.to(torch.bfloat16)
-#         key_states = key_states.to(torch.bfloat16)
-#         value_states = value_states.to(torch.bfloat16)
-
-#         # Run paged attention
-#         attn_output = cache_handle.run_attention(
-#             q=query_states,
-#             k=key_states,
-#             v=value_states,
-#             layer_idx=self.layer_idx,
-#             is_causal=is_causal,
-#             write_cache=write_cache,
-#         )
-
-#         attn_output = attn_output.reshape(-1, self.hidden_size)
-#         attn_output = self.o_proj(attn_output)
-
-#         return attn_output
+        out = torch.empty(
+            (text_out.shape[0] + image_out.shape[0], *text_out.shape[1:]),
+            device=query_sequence.device, dtype=query_sequence.dtype
+        )
+        out[text_idxs]  = text_out
+        out[img_idxs] = image_out
+        return out
+    
+    text_query = text_function(query_sequence)
+    vae_query = image_fuction(query_sequence)
+    return torch.where(text_mask[:, None], text_query, vae_query)
+    
 
 
 class BagelAttentionMoT(nn.Module):
@@ -207,9 +135,11 @@ class BagelAttentionMoT(nn.Module):
         query_sequence: torch.Tensor,
         cache_handle,
         mode="und",
+        static_vae_idxs=True,
         vae_token_indexes=None,
         text_indexes=None,
-    ):
+        text_mask=None,
+    ):  
         if mode == "und":
             query_states = self.q_proj(query_sequence).view(
                 -1, self.num_heads, self.head_dim
@@ -229,65 +159,52 @@ class BagelAttentionMoT(nn.Module):
             )
 
         elif mode == "gen":
-            text_mask = _to_text_mask(
-                text_indexes, vae_token_indexes, query_sequence.shape[0], query_sequence.device
+            mot_kwargs = dict(
+                query_sequence=query_sequence,
+                text_idxs=text_indexes,
+                img_idxs=vae_token_indexes,
+                text_mask=text_mask,
+                static_vae_idxs=static_vae_idxs
             )
-            query_sequence = query_sequence.to(torch.bfloat16)
-
-            text_query_states = self.q_proj(query_sequence).view(
-                -1, self.num_heads, self.head_dim
+            query_states = split_function_mot(
+                text_function=lambda seq: run_rms_norm(
+                    self.q_proj(seq).view(
+                        -1, self.num_heads, self.head_dim
+                    ),
+                    self.q_norm.weight,
+                    eps=self.q_norm.variance_epsilon
+                ),
+                image_fuction=lambda seq: run_rms_norm(
+                    self.q_proj_moe_gen(seq).view(
+                        -1, self.num_heads, self.head_dim
+                    ),
+                    self.q_norm_moe_gen.weight,
+                    eps=self.q_norm_moe_gen.variance_epsilon
+                ), **mot_kwargs
             )
-
-            vae_query_states = self.q_proj_moe_gen(query_sequence).view(
-                -1, self.num_heads, self.head_dim
+            key_states = split_function_mot(
+                text_function=lambda seq: run_rms_norm(
+                    self.k_proj(seq).view(
+                        -1, self.num_key_value_heads, self.head_dim
+                    ),
+                    self.k_norm.weight,
+                    eps=self.k_norm.variance_epsilon
+                ),
+                image_fuction=lambda seq: run_rms_norm(
+                    self.k_proj_moe_gen(seq).view(
+                        -1, self.num_key_value_heads, self.head_dim
+                    ),
+                    self.k_norm_moe_gen.weight,
+                    eps=self.k_norm_moe_gen.variance_epsilon
+                ), **mot_kwargs
             )
-
-            text_key_states = self.k_proj(query_sequence).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
-
-            vae_key_states = self.k_proj_moe_gen(query_sequence).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
-
-            text_value_states = self.v_proj(query_sequence).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
-
-            vae_value_states = self.v_proj_moe_gen(query_sequence).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
-
-            text_query_states = run_rms_norm(
-                text_query_states,
-                self.q_norm.weight,
-                eps=self.q_norm.variance_epsilon
-            )
-            text_key_states = run_rms_norm(
-                text_key_states,
-                self.k_norm.weight,
-                eps=self.k_norm.variance_epsilon
-            )
-            vae_query_states = run_rms_norm(
-                vae_query_states,
-                self.q_norm_moe_gen.weight,
-                eps=self.q_norm_moe_gen.variance_epsilon
-            )
-            vae_key_states = run_rms_norm(
-                vae_key_states,
-                self.k_norm_moe_gen.weight,
-                eps=self.k_norm_moe_gen.variance_epsilon
-            )
-
-            text_mask = text_mask[:, None, None]
-            query_states = torch.where(
-                text_mask, text_query_states, vae_query_states
-            )
-            key_states = torch.where(
-                text_mask, text_key_states, vae_key_states
-            )
-            value_states = torch.where(
-                text_mask, text_value_states, vae_value_states
+            value_states = split_function_mot(
+                text_function=lambda seq: self.v_proj(seq).view(
+                    -1, self.num_key_value_heads, self.head_dim
+                ),
+                image_fuction=lambda seq: self.v_proj_moe_gen(seq).view(
+                    -1, self.num_key_value_heads, self.head_dim
+                ), **mot_kwargs
             )
 
         # RoPE: pos_ids pre-computed by plan_rope before the LLM forward
@@ -309,59 +226,17 @@ class BagelAttentionMoT(nn.Module):
             attn_output = self.o_proj(attn_output)
 
         elif mode == "gen":
-            text_mask = _to_text_mask(
-                text_indexes,
-                vae_token_indexes,
-                query_sequence.shape[0],
-                query_sequence.device,
+            attn_output = split_function_mot(
+                text_function=self.o_proj,
+                image_fuction=self.o_proj_moe_gen,
+                query_sequence=attn_output,
+                text_idxs=text_indexes,
+                img_idxs=vae_token_indexes,
+                text_mask=text_mask,
+                static_vae_idxs=static_vae_idxs
             )
-            attn_text = self.o_proj(attn_output)
-            attn_vae = self.o_proj_moe_gen(attn_output)
-            attn_output = torch.where(text_mask[:, None], attn_text, attn_vae)
 
         return attn_output
-
-
-# class BagelDecoderLayer(nn.Module):
-#     def __init__(self, config:BagelModelConfig, layer_idx: Optional[int] = None):
-#         super().__init__()
-#         self.hidden_size = config.hidden_size
-
-#         self.self_attn = BagelAttention(config, layer_idx)
-
-#         self.mlp = Qwen2MLP(config)
-#         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-#         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-#     def forward(
-#         self,
-#         query_sequence: torch.Tensor,
-#         query_position_embeddings: torch.Tensor,
-#         cache_handle: CacheHandle,
-#         write_cache=True,
-#         is_causal=True,
-#     ):
-
-#         residual = query_sequence
-#         query_sequence = self.input_layernorm(query_sequence)
-
-#         # Self Attention
-#         query_sequence = self.self_attn(
-#             query_sequence=query_sequence,
-#             query_position_embeddings=query_position_embeddings,
-#             cache_handle=cache_handle,
-#             write_cache=write_cache,
-#             is_causal=is_causal,
-#         )
-#         query_sequence = residual + query_sequence
-
-#         # Fully Connected
-#         residual = query_sequence
-#         query_sequence = self.post_attention_layernorm(query_sequence)
-#         query_sequence = self.mlp(query_sequence)
-#         query_sequence = residual + query_sequence
-
-#         return query_sequence
 
 
 class BagelMoTDecoderLayer(nn.Module):
@@ -389,8 +264,10 @@ class BagelMoTDecoderLayer(nn.Module):
         query_sequence: torch.Tensor,
         cache_handle,
         mode="und",
+        static_vae_idxs=True,
         vae_token_indexes=None,
         text_indexes=None,
+        text_mask=None,
     ):
         residual = query_sequence
         if mode == "und":
@@ -398,26 +275,31 @@ class BagelMoTDecoderLayer(nn.Module):
                 query_sequence, self.input_layernorm.weight, eps=self.input_layernorm.variance_epsilon
             )
         elif mode == "gen":
-            text_mask = _to_text_mask(text_indexes, vae_token_indexes, query_sequence.shape[0], query_sequence.device)
-            text_query = run_rms_norm(
-                query_sequence,
-                self.input_layernorm.weight,
-                eps=self.input_layernorm.variance_epsilon,
+            query_sequence = split_function_mot(
+                text_function=lambda seq: run_rms_norm(
+                    seq, self.input_layernorm.weight,
+                    eps=self.input_layernorm.variance_epsilon,
+                ),
+                image_fuction=lambda seq: run_rms_norm(
+                    seq, self.input_layernorm_moe_gen.weight,
+                    eps=self.input_layernorm_moe_gen.variance_epsilon,
+                ),
+                query_sequence=query_sequence,
+                text_idxs=text_indexes,
+                img_idxs=vae_token_indexes,
+                text_mask=text_mask,
+                static_vae_idxs=static_vae_idxs
             )
-            vae_query = run_rms_norm(
-                query_sequence,
-                self.input_layernorm_moe_gen.weight,
-                eps=self.input_layernorm_moe_gen.variance_epsilon,
-            )
-            query_sequence = torch.where(text_mask[:, None], text_query, vae_query)
 
         # Self Attention
         query_sequence = self.self_attn(
             query_sequence=query_sequence,
             cache_handle=cache_handle,
             mode=mode,
+            static_vae_idxs=static_vae_idxs,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
+            text_mask=text_mask
         )
         query_sequence = residual + query_sequence
 
@@ -430,20 +312,25 @@ class BagelMoTDecoderLayer(nn.Module):
             )
             query_sequence = self.mlp(query_sequence)
         elif mode == "gen":
-            text_mask = _to_text_mask(text_indexes, vae_token_indexes, query_sequence.shape[0], query_sequence.device)
-            text_query = run_rms_norm(
-                query_sequence,
-                self.post_attention_layernorm.weight,
-                eps=self.post_attention_layernorm.variance_epsilon,
+            query_sequence = split_function_mot(
+                text_function=lambda seq: self.mlp(
+                    run_rms_norm(
+                        seq, self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    )
+                ),
+                image_fuction=lambda seq: self.mlp_moe_gen(
+                    run_rms_norm(
+                        seq, self.post_attention_layernorm_moe_gen.weight,
+                        eps=self.post_attention_layernorm_moe_gen.variance_epsilon,
+                    )
+                ),
+                query_sequence=query_sequence,
+                text_idxs=text_indexes,
+                img_idxs=vae_token_indexes,
+                text_mask=text_mask,
+                static_vae_idxs=static_vae_idxs
             )
-            vae_query = run_rms_norm(
-                query_sequence,
-                self.post_attention_layernorm_moe_gen.weight,
-                eps=self.post_attention_layernorm_moe_gen.variance_epsilon,
-            )
-            text_query = self.mlp(text_query)
-            vae_query = self.mlp_moe_gen(vae_query)
-            query_sequence = torch.where(text_mask[:, None], text_query, vae_query)
 
         query_sequence = residual + query_sequence
 
@@ -473,8 +360,10 @@ class BagelLanguageModel(nn.Module):
         cache_handle: BatchedCacheManager,
         write_cache=True,
         mode="und",
+        static_vae_idxs=None,
         vae_token_indexes=None,
         text_indexes=None,
+        text_mask=None,
         custom_advance_pos_id=None,
     ):
         extra_inputs = {}
@@ -486,6 +375,8 @@ class BagelLanguageModel(nn.Module):
                 extra_inputs.update(
                     vae_token_indexes=vae_token_indexes,
                     text_indexes=text_indexes,
+                    text_mask=text_mask,
+                    static_vae_idxs=static_vae_idxs
                 )
 
         for _layer_idx, decoder_layer in enumerate(self.layers):
@@ -507,23 +398,21 @@ class BagelLanguageModel(nn.Module):
                     query_sequence, self.norm.weight, eps=self.norm.variance_epsilon
                 )
             elif mode == "gen":
-                text_mask = _to_text_mask(
-                    text_indexes,
-                    vae_token_indexes,
-                    query_sequence.shape[0],
-                    query_sequence.device,
+                query_sequence = split_function_mot(
+                    text_function=lambda seq: run_rms_norm(
+                        seq, self.norm.weight,
+                        eps=self.norm.variance_epsilon,
+                    ),
+                    image_fuction=lambda seq: run_rms_norm(
+                        seq, self.norm_moe_gen.weight,
+                        eps=self.norm_moe_gen.variance_epsilon,
+                    ),
+                    query_sequence=query_sequence,
+                    text_idxs=text_indexes,
+                    img_idxs=vae_token_indexes,
+                    text_mask=text_mask,
+                    static_vae_idxs=static_vae_idxs
                 )
-                query_text = run_rms_norm(
-                    query_sequence,
-                    self.norm.weight,
-                    eps=self.norm.variance_epsilon,
-                )
-                query_vae = run_rms_norm(
-                    query_sequence,
-                    self.norm_moe_gen.weight,
-                    eps=self.norm_moe_gen.variance_epsilon,
-                )
-                query_sequence = torch.where(text_mask[:, None], query_text, query_vae)
         else:
             query_sequence = run_rms_norm(
                 query_sequence, self.norm.weight, eps=self.norm.variance_epsilon
@@ -553,8 +442,10 @@ class BagelForCausalLM(nn.Module):
         cache_handle,
         write_cache=True,
         mode="und",
+        static_vae_idxs=True,
         vae_token_indexes=None,
         text_indexes=None,
+        text_mask=None,
         custom_advance_pos_id=None,
         **kwargs
     ):
@@ -566,6 +457,8 @@ class BagelForCausalLM(nn.Module):
             mode=mode,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
+            text_mask=text_mask,
+            static_vae_idxs=static_vae_idxs,
             custom_advance_pos_id=custom_advance_pos_id,
         )
 

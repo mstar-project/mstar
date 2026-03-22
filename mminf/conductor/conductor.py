@@ -86,6 +86,8 @@ class RequestData:
     current_worker_graph_ids: set[str]
     # make sure to check all tensors in the list are completed (BLOCKING case)
     completed_worker_graph_ids: set[str] = field(default_factory=set)
+    fwd_pass_number: int = field(default=0)
+    curr_forward_outputs: list[str] = field(default_factory=list)
 
     def remove_persist_signal_uuids(self, uuids: list[str]):
         uuids = set(uuids)
@@ -397,7 +399,9 @@ class Conductor:
             APIServerMessage(
                 message_type="request_complete",
                 body=RequestComplete(
-                    request_id=request_id
+                    request_id=request_id,
+                    final_forward_pass=self.requests[request_id].fwd_pass_number,
+                    final_forward_outputs=self.requests[request_id].curr_forward_outputs
                 )
             )
         )
@@ -434,6 +438,9 @@ class Conductor:
         self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
         if fwd_args.request_done:
             return True # stop the request
+        
+        request_data.fwd_pass_number += 1
+        request_data.curr_forward_outputs.clear()
 
         logger.debug("Forward inputs: %s", str(fwd_args.inputs))
 
@@ -451,6 +458,7 @@ class Conductor:
                     graph_walk=request_data.current_forward_metadata.graph_walk,
                     inputs=inputs,
                     per_request_metadata=fwd_args.step_metadata,
+                    fwd_pass_number=request_data.fwd_pass_number
                 )
             )
             self.communicator.send(worker, message)
@@ -484,6 +492,7 @@ class Conductor:
         request_data.completed_worker_graph_ids.update(
             body.worker_graph_ids
         )
+        request_data.curr_forward_outputs += body.output_signal_names
 
         done_with_forward = request_data.current_worker_graph_ids.issubset(
             request_data.completed_worker_graph_ids

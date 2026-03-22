@@ -17,6 +17,7 @@ class ResultTensors:
     request_id: str
     modality: str
     graph_edge: GraphEdge
+    fwd_pass_number: int
     metadata: dict = field(default_factory=dict)
 
 
@@ -24,6 +25,8 @@ class ResultTensors:
 class RequestComplete:
     """Signals that a request has finished processing."""
     request_id: str
+    final_forward_pass: int
+    final_forward_outputs: list[str]
 
 
 @dataclass

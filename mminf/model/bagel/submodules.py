@@ -4,6 +4,7 @@
 
 
 import logging
+import time
 
 import torch
 from torch import nn
@@ -342,14 +343,13 @@ class LLMSubmodule(NodeSubmodule):
     ):
         result = {
             "text_indexes": [],
-            "vae_token_indexes": []
+            "vae_token_indexes": [],
+            "text_mask": []
         }
         for seq_len in seq_lens:
-            text_idxs = torch.zeros(
-                seq_len, dtype=torch.bool, device=device
+            text_idxs = torch.tensor(
+                [0, seq_len-1], dtype=torch.long, device=device
             )
-            text_idxs[0] = True
-            text_idxs[-1] = True
             result["text_indexes"].append(text_idxs)
             result["vae_token_indexes"].append(
                 torch.arange(
@@ -357,6 +357,12 @@ class LLMSubmodule(NodeSubmodule):
                     dtype=torch.long, device=device
                 )
             )
+            text_mask = torch.zeros(
+                seq_len, dtype=torch.bool, device=device
+            )
+            text_mask[0] = True
+            text_mask[-1] = True
+            result["text_mask"].append(text_mask)
         return result
     
     def _get_active_labels(
@@ -389,9 +395,8 @@ class LLMSubmodule(NodeSubmodule):
         """
         device = next(self.parameters()).device
 
-        has_cfg = any(
-            per_request_metadata.get(rid, {}).get("requires_cfg", False)
-            for rid in request_ids
+        has_cfg = has_cfg = self._batch_get_requires_cfg(
+            per_request_metadata, request_ids
         )
         labels = self._get_active_labels(graph_walk, has_cfg)
 
@@ -595,6 +600,7 @@ class LLMSubmodule(NodeSubmodule):
         self, combined_emb: torch.Tensor,
         vae_token_indexes: torch.Tensor,
         text_indexes: torch.Tensor,
+        text_mask: torch.Tensor,
         cache_handle: BatchedCacheManager,
         **kwargs
     ) -> NameToTensorList:
@@ -617,6 +623,7 @@ class LLMSubmodule(NodeSubmodule):
             cache_handle=cache_handle,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
+            text_mask=text_mask,
             custom_advance_pos_id=1,
             **kwargs
         )
@@ -679,6 +686,7 @@ class LLMSubmodule(NodeSubmodule):
         vae_position_ids: torch.Tensor,
         text_indexes: torch.Tensor,
         vae_token_indexes: torch.Tensor,
+        text_mask: torch.Tensor,
         time_index: torch.Tensor,
         cache_handle: BatchedCacheManager,
         requires_cfg: bool = True,
@@ -721,7 +729,6 @@ class LLMSubmodule(NodeSubmodule):
         logger.debug(f"packed_seq = {empty_combined_emb}")
 
         if requires_cfg:
-            logger.debug("Running 3 fwd passes for cfg gen")
             cfg_text_scale = kwargs.pop("cfg_text_scale", self.config.cfg_text_scale)
             cfg_img_scale = kwargs.pop("cfg_img_scale", self.config.cfg_img_scale)
             renorm_type = kwargs.pop("cfg_renorm_type", self.config.cfg_renorm_type)
@@ -749,7 +756,9 @@ class LLMSubmodule(NodeSubmodule):
                     empty_combined_emb, mode="gen",
                     cache_handle=cache_handle, write_cache=False,
                     vae_token_indexes=vae_token_indexes,
-                    text_indexes=text_indexes, **kwargs,
+                    text_indexes=text_indexes,
+                    text_mask=text_mask,
+                    **kwargs,
                 )
                 velocities[label] = hidden
 
@@ -797,7 +806,9 @@ class LLMSubmodule(NodeSubmodule):
                 empty_combined_emb, mode="gen",
                 cache_handle=cache_handle, write_cache=False,
                 vae_token_indexes=vae_token_indexes,
-                text_indexes=text_indexes, **kwargs,
+                text_indexes=text_indexes, 
+                text_mask=text_mask,
+                **kwargs,
             )
             v_final = self.llm2vae(hidden)[1:-1]
 
@@ -807,6 +818,13 @@ class LLMSubmodule(NodeSubmodule):
             "latents": [latents],
             "time_index": [time_index + 1]
         }
+    
+    @torch.compiler.disable
+    def _batch_get_requires_cfg(self, per_request_metadata, request_ids):
+        return any(
+            per_request_metadata.get(rid, {}).get("requires_cfg", False)
+            for rid in request_ids
+        )
 
     def forward_batched(
         self,
@@ -821,9 +839,8 @@ class LLMSubmodule(NodeSubmodule):
         Concatenates inputs across requests, runs a single LLM forward with
         the BatchedCacheManager, then splits outputs back per-request.
         """
-        has_cfg = any(
-            per_request_metadata.get(rid, {}).get("requires_cfg", False)
-            for rid in request_ids
+        has_cfg = self._batch_get_requires_cfg(
+            per_request_metadata, request_ids
         )
 
         if graph_walk == "decode":

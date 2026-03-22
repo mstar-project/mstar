@@ -128,12 +128,14 @@ class PerRequestInfo:
     node_to_worker: dict[NodeAndGraphWalk, str]  # for all nodes
     worker_graph_ids: list[str] # for this worker
     current_graph_walk: str = field(default=None)
+    current_fwd_number: int = field(default=0)
 
     # graph_walk_worker_graph_ids = worker graphs for current graph walk
     graph_walk_worker_graph_ids: list[str] = field(default_factory=list) # for this worker
 
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
     pending_new_tokens: dict[str, list[int]] = field(default_factory=dict)
+    current_output_chunks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -151,9 +153,12 @@ class WorkerGraphsManager:
     all_worker_graph_ids_to_graph_walks: dict[str, set[str]] # for worker graphs on different workers too
     all_worker_graph_ids_to_nodes: dict[str, str] # for worker graphs on different workers too
 
-    def update_graph_walk(self, request_id: str, graph_walk: str):
+    def update_graph_walk_and_fwd_number(
+        self, request_id: str, graph_walk: str, fwd_number: int
+    ):
         if self.per_request_info[request_id].current_graph_walk != graph_walk:
             self.per_request_info[request_id].current_graph_walk = graph_walk
+            self.per_request_info[request_id].current_fwd_number = fwd_number
             self.per_request_info[request_id].graph_walk_worker_graph_ids = [
                 graph_id for graph_id in self.per_request_info[request_id].worker_graph_ids \
                     if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
@@ -161,6 +166,9 @@ class WorkerGraphsManager:
 
     def get_graph_walk(self, request_id: str):
         return self.per_request_info[request_id].current_graph_walk
+    
+    def get_fwd_number(self, request_id: str):
+        return self.per_request_info[request_id].current_fwd_number
 
     def process_new_inputs(
         self,
@@ -306,6 +314,11 @@ class WorkerGraphsManager:
             if name not in self.per_request_info[request_id].pending_new_tokens:
                 self.per_request_info[request_id].pending_new_tokens[name] = []
             self.per_request_info[request_id].pending_new_tokens[name].extend(tokens)
+    
+    def buffer_output_signals(self, request_id: str, out_signals: list[GraphEdge]):
+        self.per_request_info[request_id].current_output_chunks += [
+            signal.name for signal in out_signals
+        ]
 
     def flush_persist_signals(self, request_id: str) -> dict[str, list[TensorPointerInfo]]:
         """Pop and return all buffered persist signals for a request.
@@ -327,3 +340,8 @@ class WorkerGraphsManager:
         new_tokens = info.pending_new_tokens
         info.pending_new_tokens = {}
         return new_tokens
+    
+    def flush_output_signals(self, request_id: str) -> list[str]:
+        out_chunks = self.per_request_info[request_id].current_output_chunks
+        self.per_request_info[request_id].current_output_chunks.clear()
+        return out_chunks

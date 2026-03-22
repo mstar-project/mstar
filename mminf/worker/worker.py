@@ -108,8 +108,8 @@ class Worker:
         )
         self.engine_manager.add_request(body.request_id)
 
-        self.worker_graphs_manager.update_graph_walk(
-            body.request_id, body.initial_graph_walk
+        self.worker_graphs_manager.update_graph_walk_and_fwd_number(
+            body.request_id, body.initial_graph_walk, fwd_number=0
         )
         logger.debug(
             "Request %s set to graph walk %s on worker %s",
@@ -154,7 +154,9 @@ class Worker:
             )
 
     def _process_new_inputs(self, body: InputSignals) -> None:
-        self.worker_graphs_manager.update_graph_walk(body.request_id, body.graph_walk)
+        self.worker_graphs_manager.update_graph_walk_and_fwd_number(
+            body.request_id, body.graph_walk,body.fwd_pass_number
+        )
         logger.debug(
             "Request %s set to graph walk %s on worker %s",
             body.request_id, body.graph_walk, self.worker_id
@@ -349,6 +351,7 @@ class Worker:
                 body=InputSignals(
                     request_id=request_id,
                     graph_walk=self.worker_graphs_manager.get_graph_walk(request_id),
+                    fwd_pass_number=self.worker_graphs_manager.get_fwd_number(request_id),
                     inputs=edges,
                 ),
             )
@@ -379,6 +382,9 @@ class Worker:
                 )
 
         if outputs.emit_to_client:
+            self.worker_graphs_manager.buffer_output_signals(
+                request_id, outputs.emit_to_client
+            )
             for graph_edge in outputs.emit_to_client:
                 message = APIServerMessage(
                     message_type="result_tensors",
@@ -386,6 +392,7 @@ class Worker:
                         request_id=request_id,
                         modality=graph_edge.output_modality,
                         graph_edge=graph_edge,
+                        fwd_pass_number=self.worker_graphs_manager.get_fwd_number(request_id),
                         metadata={}
                     )
                 )
@@ -399,6 +406,7 @@ class Worker:
                     worker_graph_ids=outputs.completed_worker_graph_ids,
                     persist_signals=self.worker_graphs_manager.flush_persist_signals(request_id),
                     new_tokens=self.worker_graphs_manager.flush_new_tokens(request_id),
+                    output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id)
                 ),
             )
             self.communicator.send("conductor", message)

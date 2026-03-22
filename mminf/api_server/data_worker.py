@@ -4,7 +4,7 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 import torch
 import torchaudio
@@ -36,6 +36,9 @@ def _preprocess_loop(**kwargs):
     worker.run()
 
 
+NameToFwdPassNumber = dict[str, int]
+
+
 class PreprocessWorker:
     def __init__(
         self,
@@ -51,6 +54,7 @@ class PreprocessWorker:
         self.stop_event = threading.Event()
 
         self.per_request_reading_tensors = {}
+        self.output_fwd_pass_numbers: dict[str, NameToFwdPassNumber] = {}
 
         self.thread = threading.Thread(
             target=_preprocess_loop,
@@ -69,10 +73,17 @@ class PreprocessWorker:
         self.thread.start()
 
     def new_request(self, input: PreprocessInput):
+        self.output_fwd_pass_numbers[input.request_id] = {}
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
 
     def new_result_tensors(self, input: ResultTensors):
+        name = input.graph_edge.name
+        self.output_fwd_pass_numbers[input.request_id][name] = max(
+            self.output_fwd_pass_numbers[input.request_id].get(name, -1),
+            input.fwd_pass_number
+        )
+
         self.per_request_reading_tensors[input.request_id] += len(input.graph_edge.tensor_info)
         logger.debug(
             "Data worker reading queue for request %s increased to length %d",
@@ -82,6 +93,16 @@ class PreprocessWorker:
 
     def has_pending_tensors(self, request_id: str):
         return self.per_request_reading_tensors.get(request_id, 0) > 0
+    
+    def received_final_chunks(
+        self, request_id: str, final_forward_pass: int,
+        final_forward_outputs: list[str]
+    ):
+        return all([
+          self.output_fwd_pass_numbers[request_id].get(
+              name, -1
+            ) >= final_forward_pass for name in final_forward_outputs
+        ])
 
     def get_result_chunks(self)-> list[ResultChunk]:
         results = []
@@ -97,6 +118,8 @@ class PreprocessWorker:
 
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
+        del self.output_fwd_pass_numbers[request_id]
+        del self.per_request_reading_tensors[request_id]
 
     def shutdown(self):
         self.stop_event.set()

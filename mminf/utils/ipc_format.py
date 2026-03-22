@@ -51,6 +51,7 @@ class RemoveRequest(MessageBody):
 class InputSignals(MessageBody):
     request_id: str
     graph_walk: str
+    fwd_pass_number: int
     inputs: list[GraphEdge]
     per_request_metadata: dict = field(default_factory=dict)
 
@@ -98,6 +99,7 @@ class WorkerGraphsDone(MessageBody):
     worker_graph_ids: list[str]
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
+    output_signal_names: int = field(default=0)
 
 
 @dataclass

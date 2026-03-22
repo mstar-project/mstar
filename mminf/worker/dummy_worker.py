@@ -79,7 +79,7 @@ class DummyWorker:
 
         # TODO Atindra: start reading in tensors from body.initial_inputs
 
-        self.worker_graphs_manager.update_graph_walk(
+        self.worker_graphs_manager.update_graph_walk_and_fwd_number(
             body.request_id, body.initial_graph_walk
         )
         self.worker_graphs_manager.process_new_inputs(
@@ -111,7 +111,7 @@ class DummyWorker:
         process those inputs (update the ready/waiting queues for the proper
         worker graphs on this worker, e.g.)
         """
-        self.worker_graphs_manager.update_graph_walk(
+        self.worker_graphs_manager.update_graph_walk_and_fwd_number(
             body.request_id, body.graph_walk
         )
 

@@ -1,6 +1,7 @@
 import logging
 import queue
 from dataclasses import dataclass, field
+import time
 
 import torch
 
@@ -132,6 +133,7 @@ class BatchedCacheManager:
             kv_cache_config.max_seq_len, dtype=torch.long, device=device
         )
 
+    @torch.compiler.disable
     def _get_state(self, request_id: str, label: str | None = None) -> KVRequestState:
         label = label or self.active_labels.get(request_id, "main")
         key = (request_id, label)
@@ -139,10 +141,12 @@ class BatchedCacheManager:
             self.request_states[key] = KVRequestState()
         return self.request_states[key]
 
+    @torch.compiler.disable
     def set_active_labels(self, labels: dict[str, str]) -> None:
         """Switch active cache labels for all requests at once."""
         self.active_labels = labels
 
+    @torch.compiler.disable
     def set_active_label(self, label: str) -> None:
         """Switch all requests to the same cache label."""
         self.active_labels = {rid: label for rid in self.request_ids}
