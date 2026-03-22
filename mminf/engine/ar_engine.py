@@ -773,8 +773,7 @@ class AREngine(BaseEngine):
         return NodeOutput(per_request_output_tensors=batched_output)
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
-        if batch.graph_walk != "decode":
-            print(batch.graph_walk, [rid for rid in batch.request_ids])
+        print(batch.graph_walk, [rid for rid in batch.request_ids])
         if self.enable_nvtx:
             range_push(f"engine.ar.{batch.node_name}.{batch.graph_walk}")
 

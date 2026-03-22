@@ -118,7 +118,6 @@ class EncoderDecoderEngine(BaseEngine):
                     attn_wrapper=self.attn_wrapper.get(batch.node_name, None)
                 )
                 outputs[rid] = submodule(**preprocessed, **metadata)
-                print("hi")
             else:
                 result = submodule(**{k: v[0] for k, v in inputs.items()})
                 if isinstance(result, dict):

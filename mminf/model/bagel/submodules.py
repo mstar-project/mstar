@@ -954,7 +954,7 @@ class LLMSubmodule(NodeSubmodule):
     def can_batch(self, batch: NodeBatch) -> bool:
         # TODO
         # return batch.graph_walk != "image_gen"
-        return batch.graph_walk == "decode"
+        return batch.graph_walk in ["decode", "prefill_text"]
 
 
 class VAEDecoderSubmodule(NodeSubmodule):
