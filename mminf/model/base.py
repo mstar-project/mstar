@@ -14,6 +14,9 @@ from mminf.engine.base import EngineType
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 
 
+MAX_OUTPUT_TOKENS = 2048
+
+
 class NodeSubmodule(torch.nn.Module):
     """
     Base class for node wrapper submodules.
@@ -337,3 +340,6 @@ class Model(ABC):
         FlashInfer, etc.).
         """
         pass
+
+    def get_max_output_tokens(self, **model_kwargs):
+        return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)

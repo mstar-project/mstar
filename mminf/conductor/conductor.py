@@ -84,6 +84,7 @@ class RequestData:
     # for tracking progress
     all_worker_graph_ids: set[str]
     current_worker_graph_ids: set[str]
+    max_output_tokens: int
     # make sure to check all tensors in the list are completed (BLOCKING case)
     completed_worker_graph_ids: set[str] = field(default_factory=set)
     fwd_pass_number: int = field(default=0)
@@ -324,6 +325,7 @@ class Conductor:
         """
         logger.debug("Conductor ingesting request %s", body.request_id)
         worker_graph_to_worker = self._assign_worker_graphs_to_workers()
+        max_output_tokens = self.model.get_max_output_tokens(**body.model_kwargs)
         request_data = RequestData(
             current_forward_metadata=None,
             fwd_inputs=[],
@@ -333,6 +335,7 @@ class Conductor:
             all_worker_graph_ids=set(worker_graph_to_worker.keys()),
             current_worker_graph_ids=set(),
             new_tokens={},
+            max_output_tokens=max_output_tokens,
         )
         self.requests[body.request_id] = request_data
 
@@ -436,6 +439,13 @@ class Conductor:
             str(fwd_args.request_done)
         )
         self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
+
+        if request_data.fwd_pass_number + 1 >= request_data.max_output_tokens:
+            logger.info(
+                "Request %s reached max output tokens %d. Ending request.",
+                request_id, request_data.max_output_tokens
+            )
+            fwd_args.request_done = True
         if fwd_args.request_done:
             return True # stop the request
         
