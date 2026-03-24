@@ -85,6 +85,7 @@ class RequestData:
     all_worker_graph_ids: set[str]
     current_worker_graph_ids: set[str]
     max_output_tokens: int
+    num_output_tokens: int = field(default=0)
     # make sure to check all tensors in the list are completed (BLOCKING case)
     completed_worker_graph_ids: set[str] = field(default_factory=set)
     fwd_pass_number: int = field(default=0)
@@ -325,7 +326,8 @@ class Conductor:
         """
         logger.debug("Conductor ingesting request %s", body.request_id)
         worker_graph_to_worker = self._assign_worker_graphs_to_workers()
-        max_output_tokens = self.model.get_max_output_tokens(**body.model_kwargs)
+        model_kwargs = body.model_kwargs or {}
+        max_output_tokens = self.model.get_max_output_tokens(**model_kwargs)
         request_data = RequestData(
             current_forward_metadata=None,
             fwd_inputs=[],
@@ -440,7 +442,7 @@ class Conductor:
         )
         self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
 
-        if request_data.fwd_pass_number + 1 >= request_data.max_output_tokens:
+        if request_data.num_output_tokens >= request_data.max_output_tokens:
             logger.info(
                 "Request %s reached max output tokens %d. Ending request.",
                 request_id, request_data.max_output_tokens
@@ -498,6 +500,7 @@ class Conductor:
                 if name not in request_data.new_tokens:
                     request_data.new_tokens[name] = []
                 request_data.new_tokens[name] += body.new_tokens[name]
+                request_data.num_output_tokens += len(body.new_tokens[name])
 
         request_data.completed_worker_graph_ids.update(
             body.worker_graph_ids

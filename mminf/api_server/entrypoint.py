@@ -135,7 +135,7 @@ class APIServer:
         self.recently_completed: collections.OrderedDict[str, float] = (
             collections.OrderedDict()
         )
-        self._recently_completed_ttl = 5.0
+        self._recently_completed_ttl = 15.0
         self.request_lock = threading.Lock()
         self.running = True
 
