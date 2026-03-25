@@ -65,6 +65,11 @@ class BagelModelConfig:
     cfg_renorm_min: float = 0.0
     think_mode: bool = False
 
+    # Sampling defaults (per-request overridable via model_kwargs)
+    temperature: float = 0.0  # 0 = greedy (argmax)
+    top_k: int = 0            # 0 = disabled
+    top_p: float = 1.0        # 1.0 = disabled
+
     vocab_size: int = 151936
     hidden_size: int = 4096
     intermediate_size: int = 22016
