@@ -67,11 +67,12 @@ def sample_tokens(
     # Disabled top_k (0) → use vocab_size (keep all)
     safe_top_k = top_k.masked_fill(top_k == 0, vocab_size)
 
-    # FlashInfer fused sampling kernel
+    # FlashInfer fused sampling kernel (return arity varies by version)
     import flashinfer
-    sampled_tokens, _ = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+    result = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         scaled_logits, safe_top_k, top_p, filter_apply_order="joint",
     )
+    sampled_tokens = result[0] if isinstance(result, tuple) else result
 
     # Blend: greedy where temperature==0, sampled otherwise
     return torch.where(greedy_mask, greedy_tokens, sampled_tokens)
