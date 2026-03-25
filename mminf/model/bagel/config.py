@@ -66,7 +66,7 @@ class BagelModelConfig:
     think_mode: bool = False
 
     # Sampling defaults (per-request overridable via model_kwargs)
-    temperature: float = 0.0  # 0 = greedy (argmax)
+    temperature: float = 0.6  # 0 = greedy (argmax), >0 = sampling
     top_k: int = 0            # 0 = disabled
     top_p: float = 1.0        # 1.0 = disabled
 
