@@ -78,13 +78,16 @@ class OrpheusLLMSubmodule(NodeSubmodule):
         cache_handle: BatchedCacheManager,
         **kwargs,
     ) -> NameToTensorList:
-        """Embed text tokens and run LLM forward to fill KV cache."""
+        """Embed text tokens, fill KV cache, and sample the first audio token."""
         kwargs.pop("is_prefill", None)
         emb = self.embed_tokens(text_inputs)
         if cache_handle is not None:
             cache_handle.set_active_label("main")
-        self.language_model(emb, cache_handle=cache_handle, **kwargs)
-        return {}
+        hidden = self.language_model(emb, cache_handle=cache_handle, **kwargs)
+
+        logits = self.lm_head(hidden[-1:])
+        token = torch.argmax(logits, dim=-1)
+        return {"new_token": [token]}
 
     def _forward_decode(
         self,
@@ -122,8 +125,9 @@ class OrpheusLLMSubmodule(NodeSubmodule):
                 packed_inputs=packed_inputs,
             )
         elif graph_walk == "prefill":
-            self._forward_prefill(cache_handle=cache_manager, **packed_inputs)
-            return {rid: {} for rid in request_ids}
+            result = self._forward_prefill(cache_handle=cache_manager, **packed_inputs)
+            # Each request gets the same first token (single-request prefill)
+            return {rid: result for rid in request_ids}
         else:
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
 
@@ -194,7 +198,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         if code < 0 or code > 4096:
             # Invalid code, skip but still track position
             buf.append(code)
-            return {"audio_chunk": [torch.zeros(0, dtype=torch.int16, device=device)]}
+            return {}
 
         buf.append(code)
 
@@ -202,7 +206,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         if len(buf) >= 7 and len(buf) % 7 == 0:
             return self._decode_latest_frames(buf, device)
 
-        return {"audio_chunk": [torch.zeros(0, dtype=torch.int16, device=device)]}
+        return {}
 
     def _decode_latest_frames(self, buf: list[int], device: torch.device) -> NameToTensorList:
         """Decode the last 4 frames (28 tokens) worth of audio, return slice [2048:4096]."""
@@ -234,7 +238,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             or torch.any(codes_2_t < 0)
             or torch.any(codes_2_t > 4096)
         ):
-            return {"audio_chunk": [torch.zeros(0, dtype=torch.int16, device=device)]}
+            return {}
 
         codes = [codes_0_t, codes_1_t, codes_2_t]
 

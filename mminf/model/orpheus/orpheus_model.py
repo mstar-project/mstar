@@ -16,6 +16,7 @@ Graph walks (2):
 """
 
 import logging
+from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
@@ -24,11 +25,25 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Sequential, TensorPointerInfo
-from mminf.graph.special_destinations import EMIT_TO_CLIENT
+from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
+    from huggingface_hub import snapshot_download
+
+    try:
+        local_dir = snapshot_download(
+            repo_id=repo_id,
+            cache_dir=cache_dir,
+            local_files_only=True,
+        )
+    except Exception:
+        return repo_id
+    return str(Path(local_dir))
 
 
 class OrpheusModel(Model):
@@ -44,8 +59,12 @@ class OrpheusModel(Model):
         self.model_path_hf = model_path_hf
         self.config = OrpheusModelConfig()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_source = _resolve_local_hf_snapshot(
             "canopylabs/orpheus-3b-0.1-pretrained",
+            cache_dir=cache_dir,
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source,
             cache_dir=cache_dir,
         )
 
@@ -82,7 +101,14 @@ class OrpheusModel(Model):
         prefill = GraphNode(
             name="LLM",
             input_ids=["text_inputs"],
-            outputs=[],
+            outputs=[
+                GraphEdge(
+                    next_node=EMPTY_DESTINATION,
+                    name="new_token",
+                    is_new_token=True,
+                    persist=True,
+                ),
+            ],
         )
 
         decode = Sequential(
@@ -96,11 +122,10 @@ class OrpheusModel(Model):
                             name="audio_token",
                         ),
                         GraphEdge(
-                            next_node=EMIT_TO_CLIENT,
+                            next_node=EMPTY_DESTINATION,
                             name="new_token",
                             is_new_token=True,
                             persist=True,
-                            output_modality="audio",
                         ),
                     ],
                 ),
@@ -255,20 +280,24 @@ class OrpheusModel(Model):
         return None
 
     def _create_llm_submodule(self, device: str) -> NodeSubmodule:
-        from huggingface_hub import snapshot_download
-        from transformers import LlamaForCausalLM
-
+        from mminf.model.orpheus.components.language_model import OrpheusForCausalLM
         from mminf.model.orpheus.submodules import OrpheusLLMSubmodule
+        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
-        local_dir = snapshot_download(
-            repo_id=self.model_path_hf,
+        local_dir = _resolve_local_hf_snapshot(
+            self.model_path_hf,
             cache_dir=self.cache_dir,
         )
-        language_model = LlamaForCausalLM.from_pretrained(
-            local_dir,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
+
+        with torch.device("meta"):
+            language_model = OrpheusForCausalLM(self.config)
+
+        load_weights_from_hf_shards(
+            repo_dir=local_dir,
+            modules=[ModuleAndPrefix(language_model)],
+            device=device,
         )
+
         language_model.eval()
         return OrpheusLLMSubmodule(
             language_model=language_model,
@@ -276,11 +305,14 @@ class OrpheusModel(Model):
         )
 
     def _create_snac_submodule(self, device: str) -> NodeSubmodule:
-        from snac import SNAC
-
+        from mminf.model.orpheus.components.snac import SNAC
         from mminf.model.orpheus.submodules import SNACDecoderSubmodule
 
-        snac_model = SNAC.from_pretrained(self.config.snac_model_id).eval().to(device)
+        snac_source = _resolve_local_hf_snapshot(
+            self.config.snac_model_id,
+            cache_dir=self.cache_dir,
+        )
+        snac_model = SNAC.from_pretrained(snac_source).eval().to(device)
         return SNACDecoderSubmodule(
             snac_model=snac_model,
             config=self.config,

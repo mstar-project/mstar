@@ -9,7 +9,11 @@ class OrpheusModelConfig:
     num_key_value_heads: int = 8
     hidden_size: int = 3072
     head_dim: int = 128
+    intermediate_size: int = 8192
     max_position_embeddings: int = 131072
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 500000.0
+    vocab_size: int = 156940
 
     # Special token IDs
     start_token_id: int = 128259
