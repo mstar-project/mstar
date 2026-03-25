@@ -17,7 +17,7 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 
-from mminf.engine.ar_engine import BatchedCacheManager
+from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.model.bagel.config import BagelModelConfig
 from mminf.utils.flashinfer_utils import run_rms_norm
 

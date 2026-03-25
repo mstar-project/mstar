@@ -5,6 +5,7 @@ from enum import Enum
 import torch
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.utils.ipc_format import SequenceInfo
 
 
 class EngineType(Enum):
@@ -23,6 +24,9 @@ class NodeBatch:
 
     # {request_id: {input_name: list[tensor]}}
     per_request_input_tensors: dict[str, NameToTensorList]
+
+    # req_id -> {label: SequenceInfo}
+    per_request_seq_info: dict[str, dict[str, SequenceInfo]]
     metadata: dict = field(default_factory=dict)
     # {request_id: {key: value}} — per-request metadata (e.g., cache_label)
     per_request_metadata: dict[str, dict] = field(default_factory=dict)
@@ -51,6 +55,7 @@ class BaseEngine(ABC):
         submodules: dict[str, torch.nn.Module],
         model_config: dict,
         device: torch.device,
+        **kwargs
     ) -> None:
         """
         Receive the submodules this engine is responsible for

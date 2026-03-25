@@ -20,6 +20,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from torch import nn
+
+from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
+from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +41,7 @@ class CudaGraphData:
     graph: torch.cuda.CUDAGraph
     static_inputs: dict
     static_outputs: dict
-    static_cache_manager: Any
+    static_cache_manager: BatchedCacheManager
     config: CudaGraphConfig
     bs: int
 
@@ -82,14 +86,21 @@ class CudaGraphRunner:
 
     def __init__(
         self,
-        ar_engine: Any,
         submodule_name: str,
-        kv_cache_config: Any,
+        submodule: nn.Module,
+        kv_cache_config: KVCacheConfig,
+        alloc_manager: PagedAllocationManager,
+        buffer_manager: WorkspaceBufferManager,
+        device: torch.device,
+        autocast_dtype: torch.dtype
     ):
-        self.ar_engine = ar_engine
         self.submodule_name = submodule_name
+        self.submodule = submodule
         self.kv_cache_config = kv_cache_config
-        self.device = ar_engine.device
+        self.alloc_manager = alloc_manager
+        self.device = device
+        self.autocast_dtype = autocast_dtype
+        self.buffer_manager = buffer_manager
 
         # Keyed by (graph_walk, requires_cfg, batch_size)
         self.graphs: dict[tuple, CudaGraphData] = {}
@@ -103,13 +114,7 @@ class CudaGraphRunner:
                            self.submodule_name)
             return
 
-        submodule = self.ar_engine.submodules.get(self.submodule_name)
-        if submodule is None:
-            logger.warning("Submodule %s not found, skipping graph capture",
-                           self.submodule_name)
-            return
-
-        if not hasattr(submodule, 'forward_batched'):
+        if not hasattr(self.submodule, 'forward_batched'):
             logger.info("Submodule %s does not support batched forward, "
                         "skipping CUDA graph capture", self.submodule_name)
             return
@@ -120,7 +125,7 @@ class CudaGraphRunner:
             for bs in reversed(self.CAPTURE_BATCH_SIZES):
                 key = (config.graph_walk, config.requires_cfg, bs)
                 try:
-                    self._capture_one(bs, config, submodule)
+                    self._capture_one(bs, config, self.submodule)
                     logger.info("Captured CUDA graph for %s: %s bs=%d",
                                 self.submodule_name, key, bs)
                 except Exception:
@@ -135,7 +140,7 @@ class CudaGraphRunner:
 
         Returns dict of label -> _PlanState with persistent wrappers.
         """
-        from mminf.engine.ar_engine import _PlanState
+        from mminf.engine.cache_manager import _PlanState
         from mminf.utils.flashinfer_utils import (
             FlashInferDecodeWrapper,
             FlashInferPrefillWrapper,
@@ -152,7 +157,7 @@ class CudaGraphRunner:
         for label in config.labels:
             if config.graph_walk == "decode":
                 wrapper = FlashInferDecodeWrapper(
-                    workspace_buffer=self.ar_engine.buffer_manager.get(f"{label}_cugraph"),
+                    workspace_buffer=self.buffer_manager.get(f"{label}_cugraph"),
                     num_qo_heads=cfg.num_qo_heads,
                     num_kv_heads=cfg.num_kv_heads,
                     head_dim=cfg.head_dim,
@@ -164,7 +169,7 @@ class CudaGraphRunner:
                 )
             else:
                 wrapper = FlashInferPrefillWrapper(
-                    workspace_buffer=self.ar_engine.buffer_manager.get(f"{label}_cugraph"),
+                    workspace_buffer=self.buffer_manager.get(f"{label}_cugraph"),
                     num_qo_heads=cfg.num_qo_heads,
                     num_kv_heads=cfg.num_kv_heads,
                     head_dim=cfg.head_dim,
@@ -192,7 +197,7 @@ class CudaGraphRunner:
         self, bs: int, config: CudaGraphConfig, submodule
     ) -> None:
         """Capture a single CUDA graph for the given batch size and config."""
-        from mminf.engine.ar_engine import BatchedCacheManager
+        from mminf.engine.cache_manager import BatchedCacheManager
 
         cfg = self.kv_cache_config
         key = (config.graph_walk, config.requires_cfg, bs)
@@ -203,7 +208,7 @@ class CudaGraphRunner:
 
         # Add dummy requests with all needed labels
         for rid in dummy_rids:
-            self.ar_engine.add_request(rid, cache_labels=config.labels)
+            self.alloc_manager.add_request(rid, cache_labels=config.labels)
 
         try:
             # Create persistent wrappers
@@ -213,13 +218,13 @@ class CudaGraphRunner:
             cache_manager = BatchedCacheManager(
                 request_ids=dummy_rids,
                 active_labels_per_request={rid: "main" for rid in dummy_rids},
-                kv_cache=self.ar_engine.kv_cache,
-                page_allocator=self.ar_engine.page_allocator,
-                request_states=self.ar_engine.request_states,
-                buffer_manager=self.ar_engine.buffer_manager,
+                kv_cache=self.alloc_manager.kv_cache,
+                alloc_manager=self.alloc_manager,
+                buffer_manager=self.buffer_manager,
                 kv_cache_config=cfg,
                 device=self.device,
                 cuda_graph_plan_states=plan_states,
+                auto_write_store=False
             )
 
             # Build dummy per-request inputs
@@ -267,12 +272,12 @@ class CudaGraphRunner:
             # Warmup: 2 forward passes
             torch.cuda.synchronize()
             for _ in range(2):
-                with torch.amp.autocast("cuda", enabled=True, dtype=self.ar_engine.autocast_dtype):
+                with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
                     output = run_forward()
                 # Reset seq_lens after warmup passes so capture starts clean
                 for rid in dummy_rids:
                     for label in config.labels:
-                        state = cache_manager._get_state(rid, label)
+                        state = self.alloc_manager.get_state(rid, label)
                         state.seq_len = max(0, state.seq_len - 1)
                         state.position_id_start = max(
                             0, state.position_id_start - 1)
@@ -288,7 +293,7 @@ class CudaGraphRunner:
 
             # Capture
             graph = torch.cuda.CUDAGraph()
-            with torch.amp.autocast("cuda", enabled=True, dtype=self.ar_engine.autocast_dtype):
+            with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
                 with torch.cuda.graph(graph, pool=self.memory_pool):
                     output = run_forward()
             torch.cuda.synchronize()
@@ -313,7 +318,8 @@ class CudaGraphRunner:
         finally:
             # Clean up dummy requests
             for rid in dummy_rids:
-                self.ar_engine.remove_request(rid)
+                # AREngine.remove_request just calls the below
+                self.alloc_manager.remove_request(rid)
 
     def can_run(
         self,
@@ -373,28 +379,20 @@ class CudaGraphRunner:
 
         # --- Step 1: Set up real request states on dummy request IDs ---
         # Save the dummy states, swap in real request states
-        saved_states = {}
         for i, rid in enumerate(request_ids):
             dummy_rid = dummy_rids[i]
             for label in config_labels:
-                real_state = self.ar_engine.request_states.get(
-                    (rid, label))
-                if real_state is not None:
-                    # Save dummy state, point dummy at real state
-                    saved_states[(dummy_rid, label)] = (
-                        self.ar_engine.request_states.get(
-                            (dummy_rid, label)))
-                    self.ar_engine.request_states[
-                        (dummy_rid, label)] = real_state
+                real_state = self.alloc_manager.get_state(rid, label)
+                # makes state if it doesn't exist
+                self.alloc_manager.get_state(dummy_rid, label) 
+                self.alloc_manager.request_states[dummy_rid][label] = real_state
 
         # For padding slots (i >= batch_size), ensure dummy states exist
         for i in range(batch_size, padded_bs):
             dummy_rid = dummy_rids[i]
             for label in config_labels:
-                dk = (dummy_rid, label)
-                if dk not in self.ar_engine.request_states:
-                    from mminf.engine.paged_attention import KVRequestState
-                    self.ar_engine.request_states[dk] = KVRequestState()
+                # makes state if it doesn't exist
+                self.alloc_manager.get_state(dummy_rid, label)
 
         # --- Step 2: Re-plan with real page tables (outside graph) ---
         # Build real per-request inputs for the real slots
@@ -471,25 +469,13 @@ class CudaGraphRunner:
                         outputs[rid][out_key] = val
 
         # --- Step 7: Restore dummy states ---
-        for (dummy_rid, label), old_state in saved_states.items():
-            if old_state is not None:
-                self.ar_engine.request_states[
-                    (dummy_rid, label)] = old_state
-            else:
-                self.ar_engine.request_states.pop(
-                    (dummy_rid, label), None)
-
-        # Clean up padding slot states
-        for i in range(batch_size, padded_bs):
-            dummy_rid = dummy_rids[i]
+        for i, rid in enumerate(dummy_rids):
             for label in config_labels:
-                dk = (dummy_rid, label)
-                if dk in self.ar_engine.request_states:
-                    state = self.ar_engine.request_states[dk]
-                    if state.page_indices:
-                        self.ar_engine.page_allocator.free(
-                            state.page_indices)
-                    del self.ar_engine.request_states[dk]
+                self.alloc_manager.reset_label(
+                    dummy_rid, label, free=i>=batch_size
+                )
+                if i < batch_size and static_cm.write_store:
+                    self.alloc_manager.flush_to_store(rid, label)
 
         return outputs
 

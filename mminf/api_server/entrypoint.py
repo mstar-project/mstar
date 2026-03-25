@@ -8,6 +8,7 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -106,6 +107,33 @@ def _shutdown_conductor_process(
 
 
 # ------------------------------------------------------------------
+# Mooncake KV store setup
+# ------------------------------------------------------------------
+def start_mooncake_master(log_file: str | None = None):
+    cmd = [
+        "mooncake_master",
+        "--enable_http_metadata_server=true",
+        "--http_metadata_server_host=0.0.0.0",
+        "--http_metadata_server_port=8080",
+    ]
+
+    stdout = open(log_file, "a") if log_file else subprocess.DEVNULL
+    stderr = subprocess.STDOUT
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=stdout,
+        stderr=stderr,
+        preexec_fn=os.setsid,  # start new process group
+    )
+
+    return process
+
+
+def stop_mooncake_master(process: subprocess.Popen):
+    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+
+# ------------------------------------------------------------------
 # APIServer
 # ------------------------------------------------------------------
 
@@ -123,6 +151,8 @@ class APIServer:
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
+
+        self.mooncake_pid = start_mooncake_master()
 
         self.preprocess_worker = PreprocessWorker(
             model=model,
@@ -360,6 +390,7 @@ class APIServer:
     # ----------------------------------------------------------
 
     def cleanup(self) -> None:
+        stop_mooncake_master(self.mooncake_pid)
         self.preprocess_worker.shutdown()
         self.running = False
         if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():

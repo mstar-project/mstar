@@ -8,6 +8,7 @@ from mminf.engine.audio_codec_engine import AudioCodecEngine
 from mminf.engine.base import BaseEngine
 from mminf.engine.enc_dec_engine import EncoderDecoderEngine
 from mminf.engine.flow_engine import FlowEngine
+from mminf.engine.kv_store import MooncakeStoreConfig
 from mminf.model.base import Model
 
 ENGINE_TYPE_TO_CLASS: dict[str, type[BaseEngine]] = {
@@ -30,6 +31,7 @@ class EngineManager:
         cls,
         engine_configs: list[dict],
         device: torch.device,
+        mooncake_cfg: MooncakeStoreConfig,
         enable_nvtx: bool = False,
         model: Model | None = None,
     ) -> "EngineManager":
@@ -78,7 +80,10 @@ class EngineManager:
                             dtype=model.get_autocast_dtype()
                         )
 
-            engine.load_model(submodules, model_config, device)
+            engine.load_model(
+                submodules, model_config, device,
+                mooncake_cfg=mooncake_cfg
+            )
             logger.info("Engine %s loaded in on device %s", cfg["engine_type"], str(device))
 
             for name in node_names:

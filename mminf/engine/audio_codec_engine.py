@@ -28,6 +28,7 @@ class AudioCodecEngine(BaseEngine):
         submodules: dict[str, torch.nn.Module],
         model_config: dict,
         device: torch.device,
+        **kwargs
     ) -> None:
         self.submodules = submodules
         self.device = device

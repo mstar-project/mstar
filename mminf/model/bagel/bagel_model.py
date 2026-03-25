@@ -40,7 +40,7 @@ from PIL import Image
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.engine.paged_attention import KVCacheConfig
+from mminf.engine.kv_store import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import (
     GraphEdge,

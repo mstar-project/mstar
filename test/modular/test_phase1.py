@@ -8,7 +8,7 @@ import sys
 sys.path.insert(0, ".")
 
 
-from mminf.engine.paged_attention import PageAllocator
+from mminf.engine.kv_store import PageAllocator
 import pytest
 
 from mminf.engine.ar_engine import AREngine

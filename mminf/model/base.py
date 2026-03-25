@@ -9,9 +9,9 @@ import torch
 import yaml
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.engine.ar_engine import BatchedCacheManager
+from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.base import EngineType
-from mminf.engine.paged_attention import KVCacheConfig
+from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 
 

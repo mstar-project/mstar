@@ -10,6 +10,7 @@ from mminf.graph.request_queues import (
 )
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, SPECIAL_DESTINATIONS
 from mminf.model.base import WorkerGraph
+from mminf.utils.ipc_format import SequenceInfo
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,8 @@ class PerRequestInfo:
     current_graph_walk: str = field(default=None)
     current_fwd_number: int = field(default=0)
 
+    per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
+
     # graph_walk_worker_graph_ids = worker graphs for current graph walk
     graph_walk_worker_graph_ids: list[str] = field(default_factory=list) # for this worker
 
@@ -153,19 +156,30 @@ class WorkerGraphsManager:
     all_worker_graph_ids_to_graph_walks: dict[str, set[str]] # for worker graphs on different workers too
     all_worker_graph_ids_to_nodes: dict[str, str] # for worker graphs on different workers too
 
-    def update_graph_walk_and_fwd_number(
-        self, request_id: str, graph_walk: str, fwd_number: int
+    def update_request_info(
+        self, request_id: str, graph_walk: str,
+        fwd_number: int,
+        per_label_seq_info: dict={}
     ):
-        if self.per_request_info[request_id].current_graph_walk != graph_walk:
-            self.per_request_info[request_id].current_graph_walk = graph_walk
-            self.per_request_info[request_id].current_fwd_number = fwd_number
-            self.per_request_info[request_id].graph_walk_worker_graph_ids = [
+        req_info = self.per_request_info[request_id]
+        if req_info.current_graph_walk != graph_walk:
+            req_info.current_graph_walk = graph_walk
+            req_info.graph_walk_worker_graph_ids = [
                 graph_id for graph_id in self.per_request_info[request_id].worker_graph_ids \
                     if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
             ]
+        req_info.current_fwd_number = fwd_number
+        req_info.per_label_seq_info = {
+            **req_info.per_label_seq_info,
+            **per_label_seq_info
+        }
+        
 
     def get_graph_walk(self, request_id: str):
         return self.per_request_info[request_id].current_graph_walk
+    
+    def get_seq_info(self, request_id: str):
+        return self.per_request_info[request_id].per_label_seq_info
     
     def get_fwd_number(self, request_id: str):
         return self.per_request_info[request_id].current_fwd_number

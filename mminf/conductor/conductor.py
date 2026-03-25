@@ -20,6 +20,7 @@ from mminf.utils.ipc_format import (
     NewRequest,
     NewRequestConductor,
     RemoveRequest,
+    SequenceInfo,
     UnpersistTensors,
     WorkerGraphsDone,
     WorkerMessage,
@@ -91,9 +92,7 @@ class RequestData:
     completed_worker_graph_ids: set[str] = field(default_factory=set)
     fwd_pass_number: int = field(default=0)
     curr_forward_outputs: list[str] = field(default_factory=list)
-
-    # For KV cache transfer; cache label -> seq len
-    prefill_seq_len: dict[str, int] = field(default_factory=dict)
+    per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
 
     def remove_persist_signal_uuids(self, uuids: list[str]):
         uuids = set(uuids)
@@ -494,7 +493,7 @@ class Conductor:
                     inputs=inputs,
                     per_request_metadata=fwd_args.step_metadata,
                     fwd_pass_number=request_data.fwd_pass_number,
-                    prefill_seq_len=self.requests[request_id].prefill_seq_len
+                    per_label_seq_info=self.requests[request_id].per_label_seq_info
                 )
             )
             self.communicator.send(worker, message)
@@ -516,10 +515,13 @@ class Conductor:
         """
         request_data = self.requests[body.request_id]
 
-        self.requests[body.request_id].prefill_seq_len = {
-            **self.requests[body.request_id].prefill_seq_len,
-            **body.prefill_seq_len
-        }
+        for label, seq_info in body.per_label_seq_info.items():
+            if label not in request_data.per_label_seq_info:
+                request_data.per_label_seq_info[label] = seq_info
+                continue
+            request_data.per_label_seq_info[label] = seq_info.update(
+                request_data.per_label_seq_info[label]
+            )
 
         # Absorb persist signals and new tokens sent with this message
         if body.persist_signals:

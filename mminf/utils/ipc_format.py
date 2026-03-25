@@ -51,6 +51,16 @@ class RemoveRequest(MessageBody):
 
 
 @dataclass
+class SequenceInfo:
+    seq_len: int
+    pos_id: int
+
+    def update(self, other: "SequenceInfo"):
+        self.seq_len = max(self.seq_len, other.seq_len)
+        self.pos_id = max(self.pos_id, other.pos_id)
+
+
+@dataclass
 class InputSignals(MessageBody):
     request_id: str
     graph_walk: str
@@ -59,7 +69,7 @@ class InputSignals(MessageBody):
     per_request_metadata: dict = field(default_factory=dict)
 
     # for KV cache transfer (PD disaggregation)
-    prefill_seq_len: dict = field(default_factory=dict) # label -> seq_len
+    per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
 
 
 @dataclass
@@ -106,35 +116,10 @@ class WorkerGraphsDone(MessageBody):
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
     output_signal_names: int = field(default=0)
-
-    # for KV cache transfer (PD disaggregation)
-    prefill_seq_len: dict = field(default_factory=dict)
+    per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
 
 
 @dataclass
 class ConductorMessage:
     message_type: ConductorMessageType
     body: MessageBody
-
-
-######################################
-# PD Disaggregation
-######################################
-
-@dataclass
-class KVLayerTransfer:
-    request_id: str
-    label: str
-    layer_idx: int
-    kv_cache_graph_edge: GraphEdge
-    seq_len_at_start: int = field(default=0)
-
-
-@dataclass
-class KVTransferMeta:
-    request_id: str
-    labels: list[str]
-    num_layers: int
-    final_seq_len: dict[str, int]
-    next_pos_id: dict[str, int]
-    seq_len_at_start: dict[str, int]

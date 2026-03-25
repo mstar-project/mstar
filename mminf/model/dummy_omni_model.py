@@ -1,5 +1,5 @@
 
-from mminf.engine.paged_attention import KVCacheConfig
+from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT
 from mminf.model.base import CurrentForwardMetadata, Model

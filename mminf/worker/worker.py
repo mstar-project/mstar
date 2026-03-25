@@ -6,7 +6,7 @@ from mminf.api_server.request_types import APIServerMessage, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.engine.base import NodeBatch, NodeOutput
-from mminf.engine.pd_disaggregation import KVCacheReceiver, KVCacheSender
+from mminf.engine.kv_store import MooncakeStoreConfig
 from mminf.graph.base import GraphEdge
 from mminf.graph.request_queues import format_graph_edge_list
 from mminf.model.base import Model, WorkerGraph
@@ -49,6 +49,8 @@ class Worker:
         all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
         all_worker_graph_ids_to_nodes: dict[str, list[str]],
         hostname: str = "localhost",
+        metadata_server: str = "http://localhost:8080/metadata",
+        master_service: str = "localhost:50051",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         device: torch.device = torch.device("cuda"),
@@ -75,7 +77,14 @@ class Worker:
         )
 
         self.engine_manager = EngineManager.from_config(
-            engine_configs=engine_configs, device=device, model=model,
+            engine_configs=engine_configs, device=device,
+            mooncake_cfg=MooncakeStoreConfig(
+                hostname=hostname,
+                metadata_server=metadata_server,
+                protocol=tensor_comm_protocol,
+                master_service=master_service
+            ),
+            model=model,
             enable_nvtx=self.enable_nvtx
         )
         self.scheduler = MicroScheduler(self.engine_manager)
@@ -96,11 +105,6 @@ class Worker:
         self._per_request_metadata: dict[str, dict] = {}
         self._unprocessed_messages = {} # req_id -> messages for requests that are not in the queue
 
-        # KV cache transfer (PD disaggregation)
-        # TODO: maybe up this in the per-request data?
-        self.kv_senders: dict[str, KVCacheSender] = {}
-        self.kv_receivers: dict[str, KVCacheReceiver] = {}
-
     # ------------------------------------------------------------------
     # Message handling
     # ------------------------------------------------------------------
@@ -114,7 +118,7 @@ class Worker:
         )
         self.engine_manager.add_request(body.request_id)
 
-        self.worker_graphs_manager.update_graph_walk_and_fwd_number(
+        self.worker_graphs_manager.update_request_info(
             body.request_id, body.initial_graph_walk, fwd_number=0
         )
         logger.debug(
@@ -160,8 +164,10 @@ class Worker:
             )
 
     def _process_new_inputs(self, body: InputSignals) -> None:
-        self.worker_graphs_manager.update_graph_walk_and_fwd_number(
-            body.request_id, body.graph_walk,body.fwd_pass_number
+        self.worker_graphs_manager.update_request_info(
+            body.request_id, body.graph_walk,
+            body.fwd_pass_number,
+            body.per_label_seq_info
         )
         logger.debug(
             "Request %s set to graph walk %s on worker %s",
@@ -248,6 +254,7 @@ class Worker:
         """Gather input tensors from tensor_manager for all requests in the batch."""
         per_request_inputs: dict[str, NameToTensorList] = {}
         per_request_metadata: dict[str, dict] = {}
+        per_request_seq_info: dict[str, dict] = {}
 
         for request_id, node in batch.node_objects.items():
             tensors = {}
@@ -258,6 +265,7 @@ class Worker:
                     ) for info in node.ready_inputs[input_name].tensor_info
                 ]
             per_request_inputs[request_id] = tensors
+            per_request_seq_info[request_id] = self.worker_graphs_manager.get_seq_info(request_id)
 
             # Include per-request metadata (e.g., cache_labels, snapshot_after)
             if request_id in self._per_request_metadata:
@@ -269,6 +277,7 @@ class Worker:
             request_ids=list(batch.node_objects.keys()),
             per_request_input_tensors=per_request_inputs,
             per_request_metadata=per_request_metadata,
+            per_request_seq_info=per_request_seq_info
         )
 
     # ------------------------------------------------------------------
@@ -359,6 +368,8 @@ class Worker:
                     graph_walk=self.worker_graphs_manager.get_graph_walk(request_id),
                     fwd_pass_number=self.worker_graphs_manager.get_fwd_number(request_id),
                     inputs=edges,
+                    per_label_seq_info=self.worker_graphs_manager.get_seq_info(request_id),
+                    per_request_metadata=self._per_request_metadata[request_id]
                 ),
             )
             self.communicator.send(worker_id, message)
@@ -412,7 +423,8 @@ class Worker:
                     worker_graph_ids=outputs.completed_worker_graph_ids,
                     persist_signals=self.worker_graphs_manager.flush_persist_signals(request_id),
                     new_tokens=self.worker_graphs_manager.flush_new_tokens(request_id),
-                    output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id)
+                    output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id),
+                    per_label_seq_info=self.worker_graphs_manager.get_seq_info(request_id),
                 ),
             )
             self.communicator.send("conductor", message)
