@@ -641,7 +641,10 @@ class LLMSubmodule(NodeSubmodule):
         cache_handle: BatchedCacheManager,
         **kwargs
     ) -> NameToTensorList:
-        """embed_tokens -> LLM forward -> lm_head -> sample token.
+        """embed_tokens -> LLM forward -> lm_head -> logits.
+
+        Returns logits; token sampling is done by the engine post-forward
+        (outside CUDA graph capture).
 
         When requires_cfg is True: also forward for cfg_img to keep its
         KV cache in sync (cfg_img tracks all text, no images).
@@ -652,9 +655,9 @@ class LLMSubmodule(NodeSubmodule):
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
-        temperature = kwargs.pop("temperature", 0.6)
-        top_k = kwargs.pop("top_k", 0)
-        top_p = kwargs.pop("top_p", 1.0)
+        kwargs.pop("temperature", None)
+        kwargs.pop("top_k", None)
+        kwargs.pop("top_p", None)
         emb = self.embed_tokens(text_inputs)
 
         if cache_handle is not None:
@@ -672,10 +675,8 @@ class LLMSubmodule(NodeSubmodule):
             )
 
         logits = self.lm_head(hidden[-1:])
-        from mminf.utils.sampling import sample_tokens
-        token = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
         return {
-            "new_token": [token],
+            "logits": [logits],
         }
 
     @staticmethod
@@ -857,7 +858,6 @@ class LLMSubmodule(NodeSubmodule):
                 request_ids=request_ids,
                 packed_inputs=packed_inputs,
                 has_cfg=has_cfg,
-                per_request_metadata=per_request_metadata,
             )
         elif graph_walk == "prefill_text":
             self._forward_prefill_text(
@@ -881,7 +881,10 @@ class LLMSubmodule(NodeSubmodule):
         1. Concatenate embeddings: [N, hidden] where N = num_requests
         2. Single LLM forward with cache_manager (batched attention)
         3. If any request requires CFG, run a second pass for cfg_img
-        4. Per-request lm_head + sample token
+        4. Per-request lm_head -> logits
+
+        Returns logits per request. Token sampling is done by the engine
+        post-forward (outside CUDA graph capture).
 
         plan_attention/plan_rope are called in preprocess_batched.
         """
@@ -905,26 +908,11 @@ class LLMSubmodule(NodeSubmodule):
                 cache_handle=cache_manager,
             )
 
-        # 4. Per-request lm_head + sample
+        # 4. Per-request lm_head -> logits (no sampling — done post-forward)
         logits = self.lm_head(hidden)
 
-        # Build per-request sampling params
-        meta = per_request_metadata or {}
-        temperature = self._batch_get_sampling_param(
-            meta, request_ids, "temperature", 0.6, logits.device
-        )
-        top_k = self._batch_get_sampling_param(
-            meta, request_ids, "top_k", 0, logits.device, dtype=torch.int32
-        )
-        top_p = self._batch_get_sampling_param(
-            meta, request_ids, "top_p", 1.0, logits.device
-        )
-
-        from mminf.utils.sampling import sample_tokens
-        tokens = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
-
         return {
-            rid: {"new_token": [tokens[i:i+1]]} for i, rid in enumerate(request_ids)
+            rid: {"logits": [logits[i:i+1]]} for i, rid in enumerate(request_ids)
         }
 
     @torch.compiler.disable
