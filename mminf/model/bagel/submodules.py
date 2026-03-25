@@ -652,7 +652,7 @@ class LLMSubmodule(NodeSubmodule):
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
-        temperature = kwargs.pop("temperature", 0.0)
+        temperature = kwargs.pop("temperature", 0.6)
         top_k = kwargs.pop("top_k", 0)
         top_p = kwargs.pop("top_p", 1.0)
         emb = self.embed_tokens(text_inputs)
@@ -908,13 +908,17 @@ class LLMSubmodule(NodeSubmodule):
         # 4. Per-request lm_head + sample
         logits = self.lm_head(hidden)
 
-        # Build per-request sampling params (default: greedy)
+        # Build per-request sampling params
         meta = per_request_metadata or {}
         temperature = self._batch_get_sampling_param(
-            meta, request_ids, "temperature", 0.0, logits.device
+            meta, request_ids, "temperature", 0.6, logits.device
         )
-        top_k = meta.get(request_ids[0], {}).get("top_k", 0) if meta else 0
-        top_p = meta.get(request_ids[0], {}).get("top_p", 1.0) if meta else 1.0
+        top_k = self._batch_get_sampling_param(
+            meta, request_ids, "top_k", 0, logits.device, dtype=torch.int32
+        )
+        top_p = self._batch_get_sampling_param(
+            meta, request_ids, "top_p", 1.0, logits.device
+        )
 
         from mminf.utils.sampling import sample_tokens
         tokens = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
@@ -929,9 +933,10 @@ class LLMSubmodule(NodeSubmodule):
         per_request_metadata: dict[str, dict],
         request_ids: list[str],
         key: str,
-        default: float,
+        default: float | int,
         device,
-    ) -> float | torch.Tensor:
+        dtype: torch.dtype = torch.float32,
+    ) -> float | int | torch.Tensor:
         """Extract a sampling param. Returns scalar if uniform, tensor if per-request."""
         values = [
             per_request_metadata.get(rid, {}).get(key, default)
@@ -939,7 +944,7 @@ class LLMSubmodule(NodeSubmodule):
         ]
         if len(set(values)) == 1:
             return values[0]
-        return torch.tensor(values, device=device, dtype=torch.float32).unsqueeze(-1)
+        return torch.tensor(values, device=device, dtype=dtype)
 
 
     def _wrap_with_boi_eoi(self, emb: torch.Tensor) -> torch.Tensor:
