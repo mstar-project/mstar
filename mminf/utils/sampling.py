@@ -53,15 +53,9 @@ def sample_tokens(
     greedy_tokens = torch.argmax(logits, dim=-1)
     greedy_mask = (temperature == 0).squeeze(-1)  # [batch_size]
 
-    # If entire batch is greedy, skip sampling entirely
-    if greedy_mask.all():
-        return greedy_tokens
-
     # For greedy requests, set temperature=1 to avoid division by zero
-    # (their results will be masked out anyway)
-    safe_temperature = temperature.masked_fill(temperature == 0, 1.0)
-    if safe_temperature.dim() == 1:
-        safe_temperature = safe_temperature.unsqueeze(-1)
+    # (their results will be masked out by torch.where at the end)
+    safe_temperature = temperature.masked_fill(temperature == 0, 1.0).unsqueeze(-1)
     scaled_logits = logits / safe_temperature
 
     # Disabled top_k (0) → use vocab_size (keep all)
