@@ -393,7 +393,7 @@ class CudaGraphRunner:
             for label in config_labels:
                 dk = (dummy_rid, label)
                 if dk not in self.ar_engine.request_states:
-                    from mminf.engine.ar_engine import KVRequestState
+                    from mminf.engine.paged_attention import KVRequestState
                     self.ar_engine.request_states[dk] = KVRequestState()
 
         # --- Step 2: Re-plan with real page tables (outside graph) ---

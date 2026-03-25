@@ -1,66 +1,16 @@
 import logging
-import queue
-from dataclasses import dataclass, field
-import time
+from dataclasses import dataclass
 
 import torch
 
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.engine.cuda_graph_runner import CudaGraphRunner
+from mminf.engine.pd_disaggregation import KVCacheSender
+from mminf.engine.paged_attention import KVCacheConfig, KVRequestState, PageAllocator
 from mminf.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPrefillWrapper
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
-
-@dataclass
-class KVCacheConfig:
-    num_layers: int
-    num_kv_heads: int
-    head_dim: int
-    max_seq_len: int
-    max_num_pages: int = 2048
-    page_size: int = 128
-    num_qo_heads: int | None = None  # Optional, defaults to num_kv_heads
-
-    def __post_init__(self):
-        if self.num_qo_heads is None:
-            self.num_qo_heads = self.num_kv_heads
-
-
-@dataclass
-class KVRequestState:
-    """Per-request KV cache state for the AR engine."""
-    page_indices: list[int] = field(default_factory=list)
-    seq_len: int = 0
-    position_id_start: int = 0
-    is_paused: bool = False
-
-
-class PageAllocator:
-    """Simple page allocator using a FIFO queue of free page indices."""
-
-    def __init__(self, max_num_pages: int):
-        self.max_num_pages = max_num_pages
-        self.free_pages: queue.Queue[int] = queue.Queue()
-        for i in range(max_num_pages):
-            self.free_pages.put(i)
-
-    def allocate(self, n: int) -> list[int]:
-        if self.free_pages.qsize() < n:
-            raise RuntimeError(
-                f"Not enough free pages: requested {n}, "
-                f"available {self.free_pages.qsize()}"
-            )
-        return [self.free_pages.get() for _ in range(n)]
-
-    def free(self, pages: list[int]) -> None:
-        for page in pages:
-            self.free_pages.put(page)
-
-    @property
-    def num_free(self) -> int:
-        return self.free_pages.qsize()
-
 
 class WorkspaceBufferManager:
     def __init__(
@@ -92,6 +42,8 @@ class _PlanState:
     """
     wrapper: FlashInferPrefillWrapper | FlashInferDecodeWrapper | None = None
     page_indices: torch.Tensor | None = None
+    per_req_page_indices: dict[str, torch.Tensor] | None = None
+    seq_len_at_start: int | None = None
     page_offsets: torch.Tensor | None = None
     token_offsets: torch.Tensor | None = None
     pos_ids: torch.Tensor | None = None
@@ -122,6 +74,7 @@ class BatchedCacheManager:
         kv_cache_config: KVCacheConfig,
         device,
         cuda_graph_plan_states: dict[str, _PlanState] | None = None,
+        kv_cache_senders: dict[str, KVCacheSender] = {}
     ):
         self.request_ids = request_ids
         self.active_labels = active_labels_per_request  # {req_id: label}
@@ -133,10 +86,15 @@ class BatchedCacheManager:
         self.device = device
         self.layer_idx = 0
 
+        self.kv_cache_senders = kv_cache_senders
+
         # CUDA graph mode: persistent wrappers passed in from CudaGraphRunner.
         # When set, plan_attention() uses the persistent wrapper's plan()
         # method instead of creating a new wrapper each call.
         self._cuda_graph_mode = cuda_graph_plan_states is not None
+        if self._cuda_graph_mode:
+            for req_id in kv_cache_senders:
+                kv_cache_senders[req_id].delayed_transfer = True
 
         # Per-label plan state: plan_attention/plan_rope store results here,
         # run_attention/apply_rope look up by active label.
@@ -217,6 +175,8 @@ class BatchedCacheManager:
 
         page_indices_all = []
         page_offsets_all = []
+
+        per_req_page_indices = {}
         for i, rid in enumerate(self.request_ids):
             state = self._get_state(rid, effective_label)
             sl = seq_lens[i]
@@ -236,6 +196,7 @@ class BatchedCacheManager:
             page_offset = pos % page_size
 
             page_indices_all.append(page_idx)
+            per_req_page_indices[rid] = page_idx
             page_offsets_all.append(page_offset)
 
             # Build indptr entries
@@ -307,6 +268,8 @@ class BatchedCacheManager:
         ps.page_offsets = page_offsets
         ps.token_offsets = token_offsets
         ps.seq_lens = seq_lens
+        ps.per_req_page_indices = per_req_page_indices
+        ps.seq_len_at_start = self._get_state(rid, effective_label).seq_len
     
     def plan_rope(
         self,
@@ -393,6 +356,15 @@ class BatchedCacheManager:
         assert self.kv_cache is not None and ps.wrapper is not None
 
         ps.wrapper.set_kv_cache(self.kv_cache[layer_idx], k, v)
+
+        for req_id in self.kv_cache_senders:
+            self.kv_cache_senders[req_id].transfer_layer(
+                layer_idx=layer_idx,
+                label=label,
+                page_idxs=ps.per_req_page_indices[req_id],
+                seq_len_at_start=ps.seq_len_at_start
+            )
+
         return ps.wrapper.run(q, self.kv_cache[layer_idx])
 
     @torch.compiler.disable
@@ -520,6 +492,31 @@ class BatchedCacheManager:
                 page_indices=new_pages,
                 seq_len=from_state.seq_len,
                 position_id_start=from_state.position_id_start,
+            )
+    
+    def finish_transfers(self):
+        for rid in self.kv_cache_senders:
+            final_seq_len = {}
+            next_pos_id = {}
+            seq_len_at_start = {}
+            labels = []
+
+            for label, plan_state in self._plan_states.items():
+                state = self._get_state(rid, label)
+                if state.seq_len - plan_state.seq_len_at_start == 0:
+                    continue
+                labels.append(label)
+                final_seq_len[label] = state.seq_len
+                next_pos_id[label] = state.position_id_start
+                seq_len_at_start[label] = plan_state.seq_len_at_start
+
+            self.kv_cache_senders[rid].finish_transfer(
+                request_id=rid,
+                labels=labels,
+                num_layers=self.kv_cache_config.num_layers,
+                final_seq_len=final_seq_len,
+                next_pos_id=next_pos_id,
+                seq_len_at_start=seq_len_at_start
             )
 
 

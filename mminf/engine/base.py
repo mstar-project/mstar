@@ -64,7 +64,7 @@ class BaseEngine(ABC):
         ...
 
     @abstractmethod
-    def add_request(self, request_id: str) -> None:
+    def add_request(self, request_id: str, **kwargs) -> None:
         ...
 
     @abstractmethod

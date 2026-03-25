@@ -11,8 +11,9 @@ import yaml
 
 from mminf.api_server.request_types import APIServerMessage, RequestComplete
 from mminf.communication.communicator import ZMQCommunicator
+from mminf.engine.base import EngineType
 from mminf.graph.base import GraphEdge, TensorPointerInfo
-from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, WorkerGraph
+from mminf.model.base import DECODE, CurrentForwardMetadata, ForwardPassArgs, Model, WorkerGraph
 from mminf.utils.ipc_format import (
     ConductorMessageType,
     InputSignals,
@@ -90,6 +91,9 @@ class RequestData:
     completed_worker_graph_ids: set[str] = field(default_factory=set)
     fwd_pass_number: int = field(default=0)
     curr_forward_outputs: list[str] = field(default_factory=list)
+
+    # For KV cache transfer; cache label -> seq len
+    prefill_seq_len: dict[str, int] = field(default_factory=dict)
 
     def remove_persist_signal_uuids(self, uuids: list[str]):
         uuids = set(uuids)
@@ -327,6 +331,23 @@ class Conductor:
         """
         logger.debug("Conductor ingesting request %s", body.request_id)
         worker_graph_to_worker = self._assign_worker_graphs_to_workers()
+
+        # find decode worker
+        decode_wg_ids = []
+        engine_types = self.model.get_node_engine_types()
+        for id, wg in self.worker_graphs.items():
+            has_ar = any(
+                [engine_types[node] == EngineType.AR for node in wg.section.get_node_names()]
+            )
+            if DECODE in wg.graph_walks and has_ar:
+                decode_wg_ids.append(id)
+        assert len(decode_wg_ids) <= 1, "Multiple decode worker graphs found. This is not supported yet."
+        decode_wg_id = decode_wg_ids[0] if decode_wg_ids else None
+        decode_worker_id = None
+        if decode_wg_id:
+            decode_worker_id = worker_graph_to_worker[decode_wg_id]
+
+        # set up request data
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self.model.get_max_output_tokens(**model_kwargs)
         request_data = RequestData(
@@ -371,6 +392,7 @@ class Conductor:
                 initial_graph_walk=request_data.current_forward_metadata.graph_walk,
                 initial_inputs=inputs_per_worker.get(worker, []),
                 per_request_metadata=fwd_args.step_metadata,
+                decode_worker_id=decode_worker_id
             )
             self.communicator.send(
                 worker, WorkerMessage(
@@ -471,7 +493,8 @@ class Conductor:
                     graph_walk=request_data.current_forward_metadata.graph_walk,
                     inputs=inputs,
                     per_request_metadata=fwd_args.step_metadata,
-                    fwd_pass_number=request_data.fwd_pass_number
+                    fwd_pass_number=request_data.fwd_pass_number,
+                    prefill_seq_len=self.requests[request_id].prefill_seq_len
                 )
             )
             self.communicator.send(worker, message)
@@ -492,6 +515,11 @@ class Conductor:
         worker graphs for the current computation graph walk have been completed)
         """
         request_data = self.requests[body.request_id]
+
+        self.requests[body.request_id].prefill_seq_len = {
+            **self.requests[body.request_id].prefill_seq_len,
+            **body.prefill_seq_len
+        }
 
         # Absorb persist signals and new tokens sent with this message
         if body.persist_signals:

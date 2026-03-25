@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.engine.ar_engine import KVCacheConfig
+from mminf.engine.paged_attention import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphEdge, GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT

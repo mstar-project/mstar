@@ -40,7 +40,7 @@ from PIL import Image
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.engine.ar_engine import KVCacheConfig
+from mminf.engine.paged_attention import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import (
     GraphEdge,
@@ -58,7 +58,7 @@ from mminf.model.bagel.components.tokenization import BagelTokenizer, add_specia
 from mminf.model.bagel.components.vit_encoder import BagelVisionModel
 from mminf.model.bagel.config import load_bagel_config
 from mminf.model.bagel.submodules import LLMSubmodule, VAEDecoderSubmodule, VAEEncoderSubmodule, ViTEncoderSubmodule
-from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, NodeSubmodule
+from mminf.model.base import DECODE, CurrentForwardMetadata, ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.utils import ModuleAndPrefix, load_weights_from_file
 
 logger = logging.getLogger(__name__)
@@ -495,13 +495,13 @@ class BagelModel(Model):
             ),
         ])
 
-        return dict(
-            prefill_text=prefill_text,
-            prefill_vit=prefill_vit,
-            prefill_vae=prefill_vae,
-            decode=decode,
-            image_gen=image_gen,
-        )
+        return {
+            "prefill_text": prefill_text,
+            "prefill_vit": prefill_vit,
+            "prefill_vae": prefill_vae,
+            DECODE: decode,
+            "image_gen": image_gen,
+        }
 
     def _build_prefill_schedule(
         self, input_modalities: list[str],
@@ -597,7 +597,7 @@ class BagelModel(Model):
             graph_edge.tensor_info = input_tensor_info
             return [graph_edge]
 
-        elif graph_walk == "decode":
+        elif graph_walk == DECODE:
             # Previous token feeds back as text_inputs
             graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
             graph_edge.tensor_info = persist_signals.get("new_token", [])
@@ -661,7 +661,7 @@ class BagelModel(Model):
             think_mode=think_mode
         )
 
-        first_graph_walk = schedule[0][0] if schedule else "decode"
+        first_graph_walk = schedule[0][0] if schedule else DECODE
         full_metadata = CurrentForwardMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
@@ -722,15 +722,15 @@ class BagelModel(Model):
                 metadata.is_prefill = False
                 target = metadata.kwargs["target_output"]
                 if target == "text":
-                    metadata.graph_walk = "decode"
+                    metadata.graph_walk = DECODE
                 elif target == "image":
                     if metadata.kwargs.get("think_mode", False):
                         # Think first: decode to generate reasoning, then
                         # EOS triggers transition to image_gen.
-                        metadata.graph_walk = "decode"
+                        metadata.graph_walk = DECODE
                     else:
                         metadata.graph_walk = "image_gen"
-        elif metadata.graph_walk == "decode":
+        elif metadata.graph_walk == DECODE:
             tokens = new_tokens.get("new_token", [])
             if self.eos_token_id is not None and self.eos_token_id in tokens:
                 target = metadata.kwargs["target_output"]

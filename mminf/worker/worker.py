@@ -6,6 +6,7 @@ from mminf.api_server.request_types import APIServerMessage, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.engine.base import NodeBatch, NodeOutput
+from mminf.engine.pd_disaggregation import KVCacheReceiver, KVCacheSender
 from mminf.graph.base import GraphEdge
 from mminf.graph.request_queues import format_graph_edge_list
 from mminf.model.base import Model, WorkerGraph
@@ -94,6 +95,11 @@ class Worker:
         # Per-request metadata from conductor (e.g., cache_labels, snapshot_after)
         self._per_request_metadata: dict[str, dict] = {}
         self._unprocessed_messages = {} # req_id -> messages for requests that are not in the queue
+
+        # KV cache transfer (PD disaggregation)
+        # TODO: maybe up this in the per-request data?
+        self.kv_senders: dict[str, KVCacheSender] = {}
+        self.kv_receivers: dict[str, KVCacheReceiver] = {}
 
     # ------------------------------------------------------------------
     # Message handling
