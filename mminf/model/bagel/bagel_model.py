@@ -555,6 +555,9 @@ class BagelModel(Model):
             "cfg_interval": full_metadata.kwargs["cfg_interval"],
             "cfg_renorm_type": full_metadata.kwargs["cfg_renorm_type"],
             "cfg_renorm_min": full_metadata.kwargs["cfg_renorm_min"],
+            "temperature": full_metadata.kwargs.get("temperature", 0.0),
+            "top_k": full_metadata.kwargs.get("top_k", 0),
+            "top_p": full_metadata.kwargs.get("top_p", 1.0),
         }
 
     def _get_fwd_pass_inputs(
@@ -642,6 +645,7 @@ class BagelModel(Model):
         overridable_keys = [
             "cfg_text_scale", "cfg_img_scale", "cfg_interval",
             "cfg_renorm_type", "cfg_renorm_min", "think_mode",
+            "temperature", "top_k", "top_p",
         ]
         params = {k: getattr(self.config, k) for k in overridable_keys}
         if model_kwargs:
