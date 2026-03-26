@@ -58,6 +58,7 @@ class SequenceInfo:
     def update(self, other: "SequenceInfo"):
         self.seq_len = max(self.seq_len, other.seq_len)
         self.pos_id = max(self.pos_id, other.pos_id)
+        return self
 
 
 @dataclass

@@ -318,8 +318,8 @@ class CudaGraphRunner:
         finally:
             # Clean up dummy requests
             for rid in dummy_rids:
-                # AREngine.remove_request just calls the below
-                self.alloc_manager.remove_request(rid)
+                for label in config.labels:
+                    self.alloc_manager.reset_label(rid, label, free=True)
 
     def can_run(
         self,

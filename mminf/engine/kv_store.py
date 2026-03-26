@@ -141,10 +141,11 @@ class PagedAllocationManager:
                     ptr=self.kv_cache[layer, page_idx].data_ptr(),
                     nbytes=self.kv_cache[layer, page_idx].nbytes
                 ))
+        
         status = self.mooncake_store.batch_put_tensor_from(
             keys=[x.key for x in alloc_info],
             buffer_ptrs=[x.ptr for x in alloc_info],
-            size=[x.nbytes for x in alloc_info]
+            sizes=[x.nbytes for x in alloc_info]
         )
         # TODO error handling
         assert all([s == 0 for s in status])
@@ -196,11 +197,10 @@ class PagedAllocationManager:
                     nbytes=self.kv_cache[layer, page_idx].nbytes
                 ))
         
-        # def batch_get_tensor_into(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[torch.Tensor]
         tensors = self.mooncake_store.batch_get_tensor_into(
-            base_keys=[x.key for x in alloc_info],
+            keys=[x.key for x in alloc_info],
             buffer_ptrs=[x.ptr for x in alloc_info],
-            size=[x.nbytes for x in alloc_info]
+            sizes=[x.nbytes for x in alloc_info]
         )
         # TODO error handling
         assert all([t is not None for t in tensors])

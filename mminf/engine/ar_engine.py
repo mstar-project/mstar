@@ -6,6 +6,7 @@ from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
 from mminf.engine.cuda_graph_runner import CudaGraphRunner
 from mminf.engine.kv_store import KVCacheConfig, MooncakeStoreConfig, PagedAllocationManager
+from mminf.utils.ipc_format import SequenceInfo
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -356,6 +357,12 @@ class AREngine(BaseEngine):
                     else:
                         return self._execute_sequential(batch, submodule)
         finally:
+            for req_id in batch.request_ids:
+                for label, state in self.alloc_manager.request_states[req_id].items():
+                    batch.per_request_seq_info.setdefault(req_id, {})[label] = SequenceInfo(
+                        seq_len=state.seq_len,
+                        pos_id=state.position_id_start
+                    )
             if self.enable_nvtx:
                 range_pop()
 

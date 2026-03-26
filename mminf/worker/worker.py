@@ -467,6 +467,12 @@ class Worker:
                 finally:
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
+                print(node_batch.per_request_seq_info)
+                
+                for rid, per_label_seq_info in node_batch.per_request_seq_info.items():
+                    self.worker_graphs_manager.update_request_info(
+                        rid, per_label_seq_info=per_label_seq_info
+                    )
 
                 # 5b. Free consumed input tensors
                 self._cleanup_consumed_inputs(batch)

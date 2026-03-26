@@ -157,18 +157,21 @@ class WorkerGraphsManager:
     all_worker_graph_ids_to_nodes: dict[str, str] # for worker graphs on different workers too
 
     def update_request_info(
-        self, request_id: str, graph_walk: str,
-        fwd_number: int,
+        self, request_id: str,
+        graph_walk: str | None = None,
+        fwd_number: int | None = None,
         per_label_seq_info: dict={}
     ):
         req_info = self.per_request_info[request_id]
-        if req_info.current_graph_walk != graph_walk:
-            req_info.current_graph_walk = graph_walk
-            req_info.graph_walk_worker_graph_ids = [
-                graph_id for graph_id in self.per_request_info[request_id].worker_graph_ids \
-                    if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
-            ]
-        req_info.current_fwd_number = fwd_number
+        if graph_walk is not None:
+            if req_info.current_graph_walk != graph_walk:
+                req_info.current_graph_walk = graph_walk
+                req_info.graph_walk_worker_graph_ids = [
+                    graph_id for graph_id in self.per_request_info[request_id].worker_graph_ids \
+                        if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
+                ]
+        if fwd_number is not None:
+            req_info.current_fwd_number = fwd_number
         req_info.per_label_seq_info = {
             **req_info.per_label_seq_info,
             **per_label_seq_info

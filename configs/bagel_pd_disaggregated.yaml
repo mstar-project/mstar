@@ -1,0 +1,31 @@
+model: "bagel"
+max_seq_len: 32768
+
+node_groups:
+  - node_names:
+      - vit_encoder
+    ranks:
+      - 0
+  
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+  
+  - node_names:
+      - LLM
+    ranks:
+      - 0
+    graph_walks:
+      - prefill_text
+      - prefill_vit
+      - prefill_vae
+  
+  - node_names:
+      - LLM
+    ranks:
+      - 1
+    graph_walks:
+      - decode
+      - image_gen

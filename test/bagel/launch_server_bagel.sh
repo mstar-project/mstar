@@ -6,7 +6,7 @@ CACHE_DIR=/mnt/storage/$WHO/mminf/bagel/
 DEVICES=1,3
 
 CUDA_VISIBLE_DEVICES=$DEVICES python mminf/api_server/entrypoint.py \
-    --config configs/bagel.yaml \
+    --config configs/bagel_pd_disaggregation.yaml \
     --cache-dir $CACHE_DIR \
     --socket-path-prefix /tmp/mminf_$WHO/ \
     --upload-dir /tmp/mminf_uploads_$WHO/ \
