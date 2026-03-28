@@ -68,7 +68,7 @@ class BatchedCacheManager:
         kv_cache_config: KVCacheConfig,
         device,
         cuda_graph_plan_states: dict[str, _PlanState] | None = None,
-        auto_write_store: bool=False # this should be false for now
+        auto_write_store: bool=False
     ):
         self.request_ids = request_ids
         self.active_labels = active_labels_per_request  # {req_id: label}
