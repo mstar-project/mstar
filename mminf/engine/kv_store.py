@@ -1,3 +1,5 @@
+import logging
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 import queue
@@ -7,6 +9,8 @@ from mooncake.engine import TransferEngine
 import torch
 
 from mminf.communication.communicator import CommProtocol
+
+logger = logging.getLogger(__name__)
 
 
 # NOTE: when this is changed to be different from the page size (or perhaps when
@@ -110,9 +114,66 @@ class TransferEngineInfo:
     transfer_engine: TransferEngine 
 
 
-class TransferType(Enum):
-    GET = "get"
-    PUT = "put"
+class StoreWritePolicy(Enum):
+    ALWAYS = "always"   # disaggregated: this worker's KV may be needed elsewhere
+    NEVER = "never"     # non-disaggregated: all AR graph walks on same worker
+
+
+class AsyncStoreWriter:
+    """Background thread for non-blocking mooncake PUT operations.
+
+    Follows SGLang's pattern: caller records CUDA event on default stream,
+    submits write task to thread pool. Worker thread waits on event via
+    dedicated CUDA stream, then does blocking mooncake PUTs.
+    The default stream is never blocked by store writes.
+    """
+
+    def __init__(self, mooncake_store: MooncakeDistributedStore, device, max_workers: int = 1):
+        self._store = mooncake_store
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._pending: list[Future] = []
+        self._write_stream = torch.cuda.Stream(device=device)
+
+    def submit(self, alloc_info: list["StoreAllocInfo"]):
+        """Non-blocking: enqueue a batch of PUTs.
+
+        Records a CUDA event on the current stream to ensure GPU data
+        is ready before the background thread reads it.
+        """
+        if not alloc_info:
+            return
+        event = torch.cuda.current_stream().record_event()
+        future = self._executor.submit(self._do_write, alloc_info, event)
+        self._pending.append(future)
+        # Prune completed futures to avoid unbounded growth
+        self._pending = [f for f in self._pending if not f.done()]
+
+    def _do_write(self, alloc_info: list["StoreAllocInfo"], event: torch.cuda.Event):
+        """Worker thread: wait for GPU data via CUDA event, then PUT."""
+        self._write_stream.wait_event(event)
+        self._write_stream.synchronize()
+        for start in range(0, len(alloc_info), MAX_TRANSFERS):
+            end = min(start + MAX_TRANSFERS, len(alloc_info))
+            status = self._store.batch_put_from_multi_buffers(
+                keys=[a.key for a in alloc_info[start:end]],
+                all_buffer_ptrs=[a.ptr for a in alloc_info[start:end]],
+                all_sizes=[a.nbytes for a in alloc_info[start:end]],
+            )
+            if any(s < 0 for s in status):
+                raise RuntimeError(
+                    f"Mooncake async write failed: {status}"
+                )
+
+    def wait_all(self):
+        """Block until all pending writes complete. Re-raises exceptions."""
+        for f in self._pending:
+            f.result()
+        self._pending.clear()
+
+    def shutdown(self):
+        """Wait for pending writes and shut down the thread pool."""
+        self.wait_all()
+        self._executor.shutdown(wait=True)
 
 
 class PagedAllocationManager:
@@ -127,6 +188,7 @@ class PagedAllocationManager:
         self.page_allocator = PageAllocator(config.max_num_pages)
         self.request_states: dict[str, LabelToState] = {}
         self.kv_cache = kv_cache
+        self.write_policy = StoreWritePolicy.ALWAYS
     
         self.mooncake_store = MooncakeDistributedStore()
         self.engine = transfer_engine_info.transfer_engine
@@ -145,6 +207,10 @@ class PagedAllocationManager:
         )
         self.my_entity_id = transfer_engine_info.my_entity_id
         self.my_session_id = transfer_engine_info.my_session_id
+
+        self._async_writer = AsyncStoreWriter(
+            self.mooncake_store, device=kv_cache.device
+        )
 
     def _key(self, request_id: str, label: str, pos: int, layer: int):
         return f"{request_id}_{label}_{pos}_{layer}"
@@ -176,33 +242,31 @@ class PagedAllocationManager:
 
         return ptrs, [nbytes, nbytes]
     
-    def _transfer_all(
-        self, alloc_info: list[StoreAllocInfo],
-        direction: TransferType
-    ):
+    def _read_from_store(self, alloc_info: list[StoreAllocInfo]):
+        """Synchronous mooncake GET. Used by retrieve_from_store only.
+
+        No pre-transfer sync needed: destination pages are freshly allocated
+        and not in use by any GPU kernel. Post-transfer sync ensures DMA
+        writes are visible to subsequent GPU kernels.
+        """
         if not alloc_info:
             return
-        
-        if direction == TransferType.GET:
-            transfer_fn = self.mooncake_store.batch_get_into_multi_buffers
-        else:
-            transfer_fn = self.mooncake_store.batch_put_from_multi_buffers
-
-        torch.cuda.default_stream().synchronize()
         for start in range(0, len(alloc_info), MAX_TRANSFERS):
             end = min(start + MAX_TRANSFERS, len(alloc_info))
-            status = transfer_fn(
+            status = self.mooncake_store.batch_get_into_multi_buffers(
                 keys=[alloc_info[i].key for i in range(start, end)],
                 all_buffer_ptrs=[alloc_info[i].ptr for i in range(start, end)],
                 all_sizes=[alloc_info[i].nbytes for i in range(start, end)]
             )
             if any(s < 0 for s in status):
-                raise RuntimeError("Mooncake transfer failed")
+                raise RuntimeError("Mooncake read failed")
         torch.cuda.default_stream().synchronize()
 
     def flush_to_store(
         self, request_id: str, label: str, layers: int | list[int] | None = None
     ):
+        if self.write_policy == StoreWritePolicy.NEVER:
+            return
         assert self.config.page_size % KV_STORE_CHUNK_SIZE == 0, (
             f"page_size ({self.config.page_size}) must be a multiple of "
             f"KV_STORE_CHUNK_SIZE ({KV_STORE_CHUNK_SIZE})"
@@ -251,8 +315,8 @@ class PagedAllocationManager:
                     nbytes=nbytes
                 ))
         
-        self._transfer_all(alloc_info, TransferType.PUT)
-    
+        self._async_writer.submit(alloc_info)
+
     def _new_state(self):
         state = KVRequestState()
         state.store_seq_len_per_layer = [0] * self.config.num_layers
@@ -315,9 +379,7 @@ class PagedAllocationManager:
                     ptr=ptr,
                     nbytes=nbytes
                 ))
-        self._transfer_all(
-            alloc_info, TransferType.GET
-        )
+        self._read_from_store(alloc_info)
         
         # --- Path 2: transfer_sync_read for trailing partial chunk ---
         if trailing_tokens > 0:
@@ -365,7 +427,7 @@ class PagedAllocationManager:
     def get_per_label_seq_info(
         self, request_id: str,
     ):
-        torch.cuda.default_stream().synchronize()
+        self._async_writer.wait_all()
         per_label_seq_info: dict[str, SequenceInfo] = {}
         for label, state in self.request_states.get(request_id, {}).items():
             state = self.get_state(request_id, label)
@@ -390,6 +452,7 @@ class PagedAllocationManager:
         self.request_states[request_id][label] = self._new_state()
 
     def cleanup(self):
+        self._async_writer.shutdown()
         self.mooncake_store.unregister_buffer(
             self.kv_cache.data_ptr()
         )
@@ -402,6 +465,7 @@ class PagedAllocationManager:
         }
     
     def remove_request(self, request_id: str):
+        self._async_writer.wait_all()
         for label in self.request_states[request_id]:
             state = self.request_states[request_id][label]
             self.page_allocator.free(state.page_indices)
