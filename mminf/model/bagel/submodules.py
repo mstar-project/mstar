@@ -477,17 +477,32 @@ class LLMSubmodule(NodeSubmodule):
                 **self._get_text_vae_idxs(seq_lens, device)
             }
 
-        self._plan_for_graph_walk(
-            cache_handle=cache_manager,
-            seq_lens=seq_lens,
-            per_label_custom_pos_ids=per_label_custom_pos_ids,
-            is_causal=graph_walk in [
-                "prefill_text", "decode"
-            ],
-            labels=labels,
-            snapshots=[("main", "cfg_text")] if graph_walk == "prefill_text" and has_cfg else [],
-            write_cache=graph_walk != "image_gen"
-        )
+        if graph_walk == "image_gen" and has_cfg:
+            # Batched CFG: plan a single FlashInfer batch across all 3 labels
+            # so that image_gen can run one forward pass instead of 3.
+            cache_manager.plan_attention_batched_cfg(
+                labels=labels,
+                seq_lens=seq_lens,
+                is_causal=False,
+                write_store=False,
+            )
+            cache_manager.plan_rope_batched_cfg(
+                labels=labels,
+                seq_lens=seq_lens,
+                per_label_pos_ids=per_label_custom_pos_ids,
+            )
+        else:
+            self._plan_for_graph_walk(
+                cache_handle=cache_manager,
+                seq_lens=seq_lens,
+                per_label_custom_pos_ids=per_label_custom_pos_ids,
+                is_causal=graph_walk in [
+                    "prefill_text", "decode"
+                ],
+                labels=labels,
+                snapshots=[("main", "cfg_text")] if graph_walk == "prefill_text" and has_cfg else [],
+                write_cache=graph_walk != "image_gen"
+            )
 
         result = {
             key: torch.cat(val) if (
@@ -748,35 +763,42 @@ class LLMSubmodule(NodeSubmodule):
             # CFG interval: only apply guidance when timestep is within interval
             cfg_interval = kwargs.pop("cfg_interval", self.config.cfg_interval)
             cfg_lo, cfg_hi = cfg_interval
-            # t_val = timestep[0].item() if isinstance(timestep, torch.Tensor) else float(timestep)
-            # in_cfg_interval = (t_val > cfg_lo) and (t_val <= cfg_hi)
-            # effective_text_scale = cfg_text_scale if in_cfg_interval else 1.0
-            # effective_img_scale = cfg_img_scale if in_cfg_interval else 1.0
 
             # torch.compile compatible logic
             t_val = timestep[0]
             in_cfg_interval = ((t_val > cfg_lo) & (t_val <= cfg_hi)).float()
-            effective_text_scale = cfg_text_scale * in_cfg_interval + 1.0  * (1 - in_cfg_interval)
+            effective_text_scale = cfg_text_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
             effective_img_scale = cfg_img_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
 
-            # plan_attention/plan_rope for all 3 labels done in preprocess
-            velocities = {}
-            for label in ["main", "cfg_text", "cfg_img"]:
-                if cache_handle is not None:
-                    cache_handle.set_active_label(label)
-                hidden = self.language_model(
-                    empty_combined_emb, mode="gen",
-                    cache_handle=cache_handle, write_cache=False,
-                    vae_token_indexes=vae_token_indexes,
-                    text_indexes=text_indexes,
-                    text_mask=text_mask,
-                    **kwargs,
-                )
-                velocities[label] = hidden
+            # Batched CFG: run all 3 branches in a single LLM forward.
+            # plan_attention_batched_cfg created a single FlashInfer plan
+            # treating (main, cfg_text, cfg_img) as 3 "virtual requests".
+            S = empty_combined_emb.shape[0]
+            batched_emb = empty_combined_emb.repeat(3, 1)  # [3S, hidden]
 
-            v_main = self.llm2vae(velocities["main"])[1:-1]
-            v_cfg_text = self.llm2vae(velocities["cfg_text"])[1:-1]
-            v_cfg_img = self.llm2vae(velocities["cfg_img"])[1:-1]
+            # Expand MoT indexes with absolute offsets for each copy
+            batched_text_indexes = torch.cat([
+                text_indexes + i * S for i in range(3)
+            ])
+            batched_vae_indexes = torch.cat([
+                vae_token_indexes + i * S for i in range(3)
+            ])
+            batched_text_mask = text_mask.repeat(3)
+
+            cache_handle.set_active_label("_cfg_batched")
+            hidden = self.language_model(
+                batched_emb, mode="gen",
+                cache_handle=cache_handle, write_cache=False,
+                vae_token_indexes=batched_vae_indexes,
+                text_indexes=batched_text_indexes,
+                text_mask=batched_text_mask,
+                **kwargs,
+            )
+
+            # Split output back to 3 branches and project to VAE space
+            v_main = self.llm2vae(hidden[:S])[1:-1]
+            v_cfg_text = self.llm2vae(hidden[S:2*S])[1:-1]
+            v_cfg_img = self.llm2vae(hidden[2*S:])[1:-1]
 
             # Two-node CFG velocity combination + renormalization
             cfg_renorm_min = kwargs.pop("cfg_renorm_min", self.config.cfg_renorm_min)
