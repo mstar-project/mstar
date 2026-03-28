@@ -475,8 +475,9 @@ class CudaGraphRunner:
                     rid, label, free=i>=batch_size
                 )
         for rid in request_ids:
-            if static_cm.write_store:
-                for label in config_labels:
+            for label in config_labels:
+                ps = static_cm._plan_states.get(label)
+                if ps is not None and ps.write_store:
                     self.alloc_manager.flush_to_store(rid, label)
 
         return outputs

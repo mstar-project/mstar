@@ -26,6 +26,7 @@ class _PlanState:
     token_offsets: torch.Tensor | None = None
     pos_ids: torch.Tensor | None = None
     seq_lens: list[int] | None = None
+    write_store: bool = True
 
 
 class WorkspaceBufferManager:
@@ -67,7 +68,7 @@ class BatchedCacheManager:
         kv_cache_config: KVCacheConfig,
         device,
         cuda_graph_plan_states: dict[str, _PlanState] | None = None,
-        auto_write_store: bool=True
+        auto_write_store: bool=False # this should be false for now
     ):
         self.request_ids = request_ids
         self.active_labels = active_labels_per_request  # {req_id: label}
@@ -79,7 +80,6 @@ class BatchedCacheManager:
         self.layer_idx = 0
 
         self.auto_write_store = auto_write_store
-        self.write_store = True
 
         # CUDA graph mode: persistent wrappers passed in from CudaGraphRunner.
         # When set, plan_attention() uses the persistent wrapper's plan()
@@ -142,9 +142,6 @@ class BatchedCacheManager:
             label: cache label to plan for. If None, uses the current active label.
         """
         assert self.kv_cache is not None
-
-        self.write_store = write_store
-        self.auto_write_store = write_store and self.auto_write_store
 
         effective_label = label
         if effective_label is None:
@@ -257,6 +254,7 @@ class BatchedCacheManager:
         ps.token_offsets = token_offsets
         ps.seq_lens = seq_lens
         ps.per_req_page_indices = per_req_page_indices
+        ps.write_store = write_store
 
     def plan_rope(
         self,
@@ -344,7 +342,7 @@ class BatchedCacheManager:
 
         ps.wrapper.set_kv_cache(self.kv_cache[layer_idx], k, v)
 
-        if self.auto_write_store:
+        if self.auto_write_store and ps.write_store:
             for req_id in self.request_ids:
                 self.alloc_manager.flush_to_store(
                     req_id, label=label, layers=layer_idx
@@ -456,7 +454,12 @@ class BatchedCacheManager:
                 state.position_id_start += pos_id_ns[i]
 
     @torch.compiler.disable
-    def snapshot_all(self, from_label: str, to_label: str, reset_store: bool=False) -> None:
+    def snapshot_all(
+        self, from_label: str,
+        to_label: str,
+        reset_store: bool=False,
+        write_store: bool=True
+    ) -> None:
         """Snapshot KV cache for all requests in batch."""
         for rid in self.request_ids:
             from_state = self._get_state(rid, from_label)
@@ -480,15 +483,16 @@ class BatchedCacheManager:
                 strict=True
             ):
                 self.kv_cache[:, dst_page] = self.kv_cache[:, src_page]
-            if self.write_store:
+            if write_store:
                 self.alloc_manager.flush_to_store(
                     rid, label=to_label
                 )
 
     @torch.compiler.disable
     def flush_to_store(self):
-        if not self.write_store:
-            return
         for rid in self.request_ids:
             for label in self.alloc_manager.request_states[rid]:
+                ps = self._plan_states.get(label)
+                if ps is None or not ps.write_store:
+                    continue
                 self.alloc_manager.flush_to_store(rid, label)

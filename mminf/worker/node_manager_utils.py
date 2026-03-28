@@ -160,7 +160,7 @@ class WorkerGraphsManager:
         self, request_id: str,
         graph_walk: str | None = None,
         fwd_number: int | None = None,
-        per_label_seq_info: dict={}
+        per_label_seq_info: dict | None=None
     ):
         req_info = self.per_request_info[request_id]
         if graph_walk is not None:
@@ -172,10 +172,11 @@ class WorkerGraphsManager:
                 ]
         if fwd_number is not None:
             req_info.current_fwd_number = fwd_number
-        req_info.per_label_seq_info = {
-            **req_info.per_label_seq_info,
-            **per_label_seq_info
-        }
+        if per_label_seq_info is not None:
+            req_info.per_label_seq_info = {
+                **req_info.per_label_seq_info,
+                **per_label_seq_info
+            }
         
 
     def get_graph_walk(self, request_id: str):

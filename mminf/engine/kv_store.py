@@ -291,7 +291,7 @@ class PagedAllocationManager:
         num_complete_chunks = seq_len // tokens_per_chunk
         trailing_tokens = seq_len % tokens_per_chunk
 
-        first_chunk = (state.seq_len + 1) // tokens_per_chunk
+        first_chunk = state.seq_len // tokens_per_chunk
 
         self.alloc(request_id, label, seq_len)
 
@@ -392,7 +392,9 @@ class PagedAllocationManager:
             self.kv_cache.data_ptr()
         )
     
-    def add_request(self, request_id: str, labels: list[str]=[]):
+    def add_request(self, request_id: str, labels: list[str]=None):
+        if labels is None:
+            labels = []
         self.request_states[request_id] = {
             label: self._new_state() for label in labels
         }

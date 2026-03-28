@@ -49,13 +49,13 @@ class Worker:
         all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
         all_worker_graph_ids_to_nodes: dict[str, list[str]],
         hostname: str = "localhost",
-        metadata_server: str = "http://localhost:8080/metadata",
         master_service: str = "localhost:50051",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         device: torch.device = torch.device("cuda"),
         enable_nvtx: bool = False,
         model: Model | None = None,
+        mooncake_port: int=8080
     ):
         self.worker_id = worker_id
         self.device = device
@@ -93,7 +93,7 @@ class Worker:
             engine_configs=engine_configs, device=device,
             mooncake_cfg=MooncakeStoreConfig(
                 hostname=hostname,
-                metadata_server=metadata_server,
+                metadata_server=f"http://localhost:{mooncake_port}/metadata",
                 protocol=tensor_comm_protocol,
                 master_service=master_service
             ),

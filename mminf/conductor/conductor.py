@@ -43,6 +43,7 @@ def _worker_process_target(
     model: Model | None = None,
     device: str = "cuda",
     log_level: str = "INFO",
+    mooncake_port: int=8080
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
     logging.basicConfig(
@@ -68,6 +69,7 @@ def _worker_process_target(
         enable_nvtx=enable_nvtx,
         device=torch.device(device),
         model=model,
+        mooncake_port=mooncake_port
     )
     worker.run()
 
@@ -119,6 +121,7 @@ class Conductor:
         hostname: str = "localhost",
         enable_nvtx: bool = False,
         log_level: str = "INFO",
+        mooncake_port: int=8080
     ):
         self.requests: dict[str, RequestData] = {}
         self.model = model
@@ -126,6 +129,7 @@ class Conductor:
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
         self.enable_nvtx = enable_nvtx
+        self.mooncake_port = mooncake_port
 
         self._worker_processes: list[mp.Process] = []
 
@@ -219,6 +223,7 @@ class Conductor:
                     "enable_nvtx": self.enable_nvtx,
                     "device": f"cuda:{rank}",
                     "log_level": self.log_level,
+                    "mooncake_port": self.mooncake_port
                 },
                 daemon=False,
             )
@@ -331,21 +336,6 @@ class Conductor:
         logger.debug("Conductor ingesting request %s", body.request_id)
         worker_graph_to_worker = self._assign_worker_graphs_to_workers()
 
-        # find decode worker
-        decode_wg_ids = []
-        engine_types = self.model.get_node_engine_types()
-        for id, wg in self.worker_graphs.items():
-            has_ar = any(
-                [engine_types[node] == EngineType.AR for node in wg.section.get_node_names()]
-            )
-            if DECODE in wg.graph_walks and has_ar:
-                decode_wg_ids.append(id)
-        assert len(decode_wg_ids) <= 1, "Multiple decode worker graphs found. This is not supported yet."
-        decode_wg_id = decode_wg_ids[0] if decode_wg_ids else None
-        decode_worker_id = None
-        if decode_wg_id:
-            decode_worker_id = worker_graph_to_worker[decode_wg_id]
-
         # set up request data
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self.model.get_max_output_tokens(**model_kwargs)
@@ -391,7 +381,6 @@ class Conductor:
                 initial_graph_walk=request_data.current_forward_metadata.graph_walk,
                 initial_inputs=inputs_per_worker.get(worker, []),
                 per_request_metadata=fwd_args.step_metadata,
-                decode_worker_id=decode_worker_id
             )
             self.communicator.send(
                 worker, WorkerMessage(

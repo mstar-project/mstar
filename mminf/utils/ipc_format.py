@@ -43,7 +43,6 @@ class NewRequest(MessageBody):
     initial_graph_walk: str
     initial_inputs: list[GraphEdge]
     per_request_metadata: dict = field(default_factory=dict)
-    decode_worker_id: str | None = field(default_factory=None)
 
 
 @dataclass
