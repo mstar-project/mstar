@@ -5,8 +5,8 @@ import torch
 from mminf.api_server.request_types import APIServerMessage, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
-from mminf.engine.base import NodeBatch, NodeOutput
-from mminf.engine.kv_store import MooncakeStoreConfig, TransferEngineInfo
+from mminf.engine.base import EngineType, NodeBatch, NodeOutput
+from mminf.engine.kv_store import MooncakeStoreConfig, StoreWritePolicy, TransferEngineInfo
 from mminf.graph.base import GraphEdge
 from mminf.graph.request_queues import format_graph_edge_list
 from mminf.model.base import Model, WorkerGraph
@@ -107,9 +107,61 @@ class Worker:
         )
         self.scheduler = MicroScheduler(self.engine_manager)
 
+        # Determine store write policy based on worker graph topology
+        write_policy = self._compute_store_write_policy(
+            my_worker_graphs, all_worker_graph_ids_to_graph_walks,
+            all_worker_graph_ids_to_nodes,
+        )
+        alloc_mgr = self.engine_manager.get_ar_alloc_manager()
+        if alloc_mgr is not None:
+            alloc_mgr.write_policy = write_policy
+        logger.info(
+            "Worker %s: store write policy = %s", worker_id, write_policy.value
+        )
+
         # Per-request metadata from conductor (e.g., cache_labels, snapshot_after)
         self._per_request_metadata: dict[str, dict] = {}
         self._unprocessed_messages = {} # req_id -> messages for requests that are not in the queue
+
+    def _compute_store_write_policy(
+        self,
+        my_worker_graphs: list[WorkerGraph],
+        all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
+        all_worker_graph_ids_to_nodes: dict[str, list[str]],
+    ) -> StoreWritePolicy:
+        """Determine whether this worker needs to write KV to the mooncake store.
+
+        If this worker handles ALL AR engine graph walks, no other worker
+        needs its KV cache — return NEVER. Otherwise return ALWAYS.
+        """
+        my_ar_walks: set[str] = set()
+        all_ar_walks: set[str] = set()
+
+        # Collect this worker's AR graph walks
+        for wg in my_worker_graphs:
+            for node_name in wg.section.get_node_names():
+                engine = self.engine_manager.node_to_engine.get(node_name)
+                if engine is not None and engine.engine_type() == EngineType.AR:
+                    my_ar_walks.update(wg.graph_walks)
+
+        # Collect all workers' AR graph walks
+        for wg_id, walks in all_worker_graph_ids_to_graph_walks.items():
+            nodes = all_worker_graph_ids_to_nodes.get(wg_id, [])
+            for node_name in nodes:
+                # We can only check engines on THIS worker; for other workers,
+                # check if the node is known to be AR on this worker too
+                # (same node name = same engine type across workers)
+                engine = self.engine_manager.node_to_engine.get(node_name)
+                if engine is not None and engine.engine_type() == EngineType.AR:
+                    all_ar_walks.update(walks)
+
+        if not all_ar_walks:
+            return StoreWritePolicy.NEVER  # no AR engines at all
+
+        if my_ar_walks == all_ar_walks:
+            return StoreWritePolicy.NEVER  # all AR walks on this worker
+
+        return StoreWritePolicy.ALWAYS
 
     # ------------------------------------------------------------------
     # Message handling
