@@ -591,14 +591,16 @@ class BagelModel(Model):
             ),
         ])
 
-        return {
+        walks = {
             "prefill_text": prefill_text,
             "prefill_vit": prefill_vit,
             "prefill_vae": prefill_vae,
             DECODE: decode,
             "image_gen": image_gen,
-            "image_gen_cfg": image_gen_cfg,
         }
+        if self._has_cfg_parallel:
+            walks["image_gen_cfg"] = image_gen_cfg
+        return walks
 
     def _build_prefill_schedule(
         self, input_modalities: list[str],
