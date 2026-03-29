@@ -108,9 +108,11 @@ class Worker:
         self.scheduler = MicroScheduler(self.engine_manager)
 
         # Determine store write policy based on worker graph topology
+        node_engine_types = model.get_node_engine_types() if model is not None else {}
         write_policy = self._compute_store_write_policy(
             my_worker_graphs, all_worker_graph_ids_to_graph_walks,
             all_worker_graph_ids_to_nodes,
+            node_engine_types=node_engine_types,
         )
         alloc_mgr = self.engine_manager.get_ar_alloc_manager()
         if alloc_mgr is not None:
@@ -128,6 +130,7 @@ class Worker:
         my_worker_graphs: list[WorkerGraph],
         all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
         all_worker_graph_ids_to_nodes: dict[str, list[str]],
+        node_engine_types: dict[str, EngineType] | None = None,
     ) -> StoreWritePolicy:
         """Determine whether this worker needs to write KV to the mooncake store.
 
@@ -137,22 +140,26 @@ class Worker:
         my_ar_walks: set[str] = set()
         all_ar_walks: set[str] = set()
 
+        def _is_ar(node_name: str) -> bool:
+            # Check local engine first, then fall back to model's type map
+            engine = self.engine_manager.node_to_engine.get(node_name)
+            if engine is not None:
+                return engine.engine_type() == EngineType.AR
+            if node_engine_types and node_name in node_engine_types:
+                return node_engine_types[node_name] == EngineType.AR
+            return False
+
         # Collect this worker's AR graph walks
         for wg in my_worker_graphs:
             for node_name in wg.section.get_node_names():
-                engine = self.engine_manager.node_to_engine.get(node_name)
-                if engine is not None and engine.engine_type() == EngineType.AR:
+                if _is_ar(node_name):
                     my_ar_walks.update(wg.graph_walks)
 
         # Collect all workers' AR graph walks
         for wg_id, walks in all_worker_graph_ids_to_graph_walks.items():
             nodes = all_worker_graph_ids_to_nodes.get(wg_id, [])
             for node_name in nodes:
-                # We can only check engines on THIS worker; for other workers,
-                # check if the node is known to be AR on this worker too
-                # (same node name = same engine type across workers)
-                engine = self.engine_manager.node_to_engine.get(node_name)
-                if engine is not None and engine.engine_type() == EngineType.AR:
+                if _is_ar(node_name):
                     all_ar_walks.update(walks)
 
         if not all_ar_walks:
