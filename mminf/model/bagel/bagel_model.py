@@ -47,6 +47,7 @@ from mminf.graph.base import (
     GraphNode,
     GraphSection,
     Loop,
+    Parallel,
     Sequential,
     TensorPointerInfo,
 )
@@ -57,7 +58,7 @@ from mminf.model.bagel.components.modeling_utils import BagelMLPconnector, Posit
 from mminf.model.bagel.components.tokenization import BagelTokenizer, add_special_tokens
 from mminf.model.bagel.components.vit_encoder import BagelVisionModel
 from mminf.model.bagel.config import load_bagel_config
-from mminf.model.bagel.submodules import LLMSubmodule, VAEDecoderSubmodule, VAEEncoderSubmodule, ViTEncoderSubmodule
+from mminf.model.bagel.submodules import CombineCFGSubmodule, LLMSubmodule, VAEDecoderSubmodule, VAEEncoderSubmodule, ViTEncoderSubmodule
 from mminf.model.base import DECODE, CurrentForwardMetadata, ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.utils import ModuleAndPrefix, load_weights_from_file
 
@@ -151,6 +152,14 @@ class BagelModel(Model):
         self.repo = None
         self.vae_initialized = False
         self.llm_initialized = False
+
+        # Set by get_worker_graphs() when config has LLM_cfg_text/LLM_cfg_img
+        self._has_cfg_parallel = False
+
+    @property
+    def _image_gen_walk(self) -> str:
+        """Return the appropriate image_gen graph walk based on config."""
+        return "image_gen_cfg" if self._has_cfg_parallel else "image_gen"
 
 
     def _download_hf(self):
@@ -273,7 +282,7 @@ class BagelModel(Model):
     def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
         """Create a submodule wrapper on first access."""
         logger.debug("Creating submodule for BAGEL model node %s", node_name)
-        if node_name == "LLM":
+        if node_name in ("LLM", "LLM_cfg_text", "LLM_cfg_img"):
             self._init_language_model_components(device)
             return LLMSubmodule(
                 language_model=self.language_model,
@@ -285,7 +294,14 @@ class BagelModel(Model):
                 boi_token_id=self.boi_token_id,
                 eoi_token_id=self.eoi_token_id,
                 bos_token_id=self.bos_token_id,
-                eos_token_id=self.eos_token_id
+                eos_token_id=self.eos_token_id,
+                node_name=node_name,
+            )
+        elif node_name == "combine_cfg":
+            self._init_language_model_components(device)
+            return CombineCFGSubmodule(
+                llm2vae=self.llm2vae,
+                config=self.config,
             )
         elif node_name == "vit_encoder":
             self._init_vit_components(device)
@@ -403,8 +419,22 @@ class BagelModel(Model):
             "vit_encoder": EngineType.ENC_DEC,
             "vae_encoder": EngineType.ENC_DEC,
             "LLM": EngineType.AR,
+            "LLM_cfg_text": EngineType.AR,
+            "LLM_cfg_img": EngineType.AR,
+            "combine_cfg": EngineType.ENC_DEC,
             "vae_decoder": EngineType.ENC_DEC,
         }
+
+    def get_worker_graphs(self, config_path: str):
+        import yaml
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        node_groups = config.get("node_groups", [])
+        all_node_names = {
+            name for g in node_groups for name in g["node_names"]
+        }
+        self._has_cfg_parallel = "LLM_cfg_text" in all_node_names
+        return super().get_worker_graphs(config_path)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --
@@ -495,12 +525,79 @@ class BagelModel(Model):
             ),
         ])
 
+        # -- image_gen_cfg: parallel 3-branch CFG denoising loop -> VAE decode --
+        # Each CFG branch (main, cfg_text, cfg_img) runs on its own GPU.
+        # combine_cfg applies the CFG formula + Euler step after each iteration.
+        image_gen_cfg = Sequential([
+            Loop(
+                section=Sequential([
+                    Parallel([
+                        GraphNode(
+                            name="LLM",
+                            input_ids=["latents", "time_index"],
+                            outputs=[
+                                GraphEdge(next_node="combine_cfg", name="v_main"),
+                                GraphEdge(next_node="combine_cfg", name="latents"),
+                                GraphEdge(next_node="combine_cfg", name="time_index"),
+                            ],
+                        ),
+                        GraphNode(
+                            name="LLM_cfg_text",
+                            input_ids=["latents", "time_index"],
+                            outputs=[
+                                GraphEdge(next_node="combine_cfg", name="v_cfg_text"),
+                            ],
+                        ),
+                        GraphNode(
+                            name="LLM_cfg_img",
+                            input_ids=["latents", "time_index"],
+                            outputs=[
+                                GraphEdge(next_node="combine_cfg", name="v_cfg_img"),
+                            ],
+                        ),
+                    ]),
+                    GraphNode(
+                        name="combine_cfg",
+                        input_ids=[
+                            "v_main", "v_cfg_text", "v_cfg_img",
+                            "latents", "time_index",
+                        ],
+                        outputs=[
+                            GraphEdge(next_node="LLM", name="latents"),
+                            GraphEdge(next_node="LLM", name="time_index"),
+                            GraphEdge(next_node="LLM_cfg_text", name="latents"),
+                            GraphEdge(next_node="LLM_cfg_text", name="time_index"),
+                            GraphEdge(next_node="LLM_cfg_img", name="latents"),
+                            GraphEdge(next_node="LLM_cfg_img", name="time_index"),
+                        ],
+                    ),
+                ]),
+                n_iters=self.config.num_timesteps - 1,
+                outputs=[
+                    GraphEdge(next_node="vae_decoder", name="latents"),
+                ],
+            ),
+            GraphNode(
+                name="vae_decoder",
+                input_ids=["latents"],
+                outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="image_output",
+                        output_modality="image",
+                        persist=True,
+                    ),
+                ],
+            ),
+        ])
+
         return {
             "prefill_text": prefill_text,
             "prefill_vit": prefill_vit,
             "prefill_vae": prefill_vae,
             DECODE: decode,
             "image_gen": image_gen,
+            "image_gen_cfg": image_gen_cfg,
         }
 
     def _build_prefill_schedule(
@@ -614,6 +711,17 @@ class BagelModel(Model):
                 graph_edge,
                 GraphEdge(next_node="LLM", name="time_index")
             ]
+
+        elif graph_walk == "image_gen_cfg":
+            # Parallel CFG: provide initial latents + time_index to all 3 LLM nodes
+            latent_info = persist_signals.get("latents", [])
+            edges = []
+            for node in ["LLM", "LLM_cfg_text", "LLM_cfg_img"]:
+                latent_edge = GraphEdge(next_node=node, name="latents")
+                latent_edge.tensor_info = latent_info
+                edges.append(latent_edge)
+                edges.append(GraphEdge(next_node=node, name="time_index"))
+            return edges
 
         return []
 
@@ -729,18 +837,18 @@ class BagelModel(Model):
                         # EOS triggers transition to image_gen.
                         metadata.graph_walk = DECODE
                     else:
-                        metadata.graph_walk = "image_gen"
+                        metadata.graph_walk = self._image_gen_walk
         elif metadata.graph_walk == DECODE:
             tokens = new_tokens.get("new_token", [])
             if self.eos_token_id is not None and self.eos_token_id in tokens:
                 target = metadata.kwargs["target_output"]
                 if metadata.kwargs.get("think_mode", False) and target == "image":
                     # Thinking graph walk complete — transition to image generation.
-                    metadata.graph_walk = "image_gen"
+                    metadata.graph_walk = self._image_gen_walk
                 else:
                     request_done = True
 
-        elif metadata.graph_walk == "image_gen":
+        elif metadata.graph_walk in ("image_gen", "image_gen_cfg"):
             # Image generation complete (one image per request)
             request_done = True
 
