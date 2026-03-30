@@ -345,8 +345,19 @@ class AREngine(BaseEngine):
             return output
 
         try:
+            # Filter to only retrieve cache labels this node actually needs
+            needed_labels = None
+            if hasattr(submodule, 'get_needed_cache_labels'):
+                needed = submodule.get_needed_cache_labels(
+                    batch.graph_walk, batch.per_request_metadata
+                )
+                if needed is not None:
+                    needed_labels = set(needed)
+
             for req_id, per_label_seq_info in batch.per_request_seq_info.items():
                 for label, seq_info in per_label_seq_info.items():
+                    if needed_labels is not None and label not in needed_labels:
+                        continue
                     self.alloc_manager.retrieve_from_store(
                         req_id, label, seq_info
                     )
