@@ -404,6 +404,13 @@ class LLMSubmodule(NodeSubmodule):
             result["text_mask"].append(text_mask)
         return result
     
+    def get_needed_cache_labels(
+        self, graph_walk: str, per_request_metadata: dict[str, dict]
+    ) -> list[str] | None:
+        any_meta = next(iter(per_request_metadata.values()), {})
+        cfg = any_meta.get("requires_cfg", False)
+        return self._get_active_labels(graph_walk, cfg)
+
     def _get_active_labels(
         self, graph_walk: str, cfg: bool
     ):
