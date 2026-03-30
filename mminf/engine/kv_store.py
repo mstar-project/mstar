@@ -30,7 +30,7 @@ class SequenceInfo:
     latest_entity_id: str = ""
     latest_session_id: str = ""
     kv_cache_addr: int = -1
-    last_page_idx: int = -1
+    page_indices: list[int] = field(default_factory=list)
 
 
 class PageAllocator:
@@ -150,6 +150,7 @@ class AsyncStoreWriter:
 
     def _do_write(self, alloc_info: list["StoreAllocInfo"], event: torch.cuda.Event):
         """Worker thread: wait for GPU data via CUDA event, then PUT."""
+        return
         self._write_stream.wait_event(event)
         self._write_stream.synchronize()
         for start in range(0, len(alloc_info), MAX_TRANSFERS):
@@ -359,66 +360,48 @@ class PagedAllocationManager:
 
         num_complete_chunks = seq_len // tokens_per_chunk
         trailing_tokens = seq_len % tokens_per_chunk
-
         first_chunk = state.seq_len // tokens_per_chunk
+        total_chunks = num_complete_chunks + (1 if trailing_tokens > 0 else 0)
 
         self.alloc(request_id, label, seq_len)
 
-        # --- Path 1: mooncake store for complete chunks ---
-        alloc_info: list[StoreAllocInfo] = []
-        for chunk_idx in range(first_chunk, num_complete_chunks):
+        local_addrs, remote_addrs, nbytes_list = [], [], []
+
+        for chunk_idx in range(first_chunk, total_chunks):
             page_pos = chunk_idx // chunks_per_page
             chunk_within_page = chunk_idx % chunks_per_page
             token_start = chunk_within_page * tokens_per_chunk
-            token_end = token_start + tokens_per_chunk
+            token_end = token_start + (
+                trailing_tokens if chunk_idx == num_complete_chunks else tokens_per_chunk
+            )
 
-            page_idx = state.page_indices[page_pos]
+            local_page_idx = state.page_indices[page_pos]
+            remote_page_idx = seq_info.page_indices[page_pos]
+
             for layer in range(self.config.num_layers):
-                ptr, nbytes = self._get_ptr_nbytes(
-                    layer, page_idx, token_start, token_end
-                )
-
-                alloc_info.append(StoreAllocInfo(
-                    key=self._key(request_id, label, chunk_idx, layer),
-                    ptr=ptr,
-                    nbytes=nbytes
-                ))
-        self._read_from_store(alloc_info)
-        
-        # --- Path 2: transfer_sync_read for trailing partial chunk ---
-        if trailing_tokens > 0:
-            chunk_idx = num_complete_chunks  # index of the trailing chunk
-            page_pos = chunk_idx // chunks_per_page
-            chunk_within_page = chunk_idx % chunks_per_page
-            token_start = chunk_within_page * tokens_per_chunk
-            token_end = token_start + trailing_tokens
-            
-            page_idx = state.page_indices[page_pos]
-
-            local_addrs, remote_addrs, nbytes_list = [], [], []
-            for layer in range(self.config.num_layers):
-                ptrs, nbytes = self._get_ptr_nbytes(
-                    layer, page_idx, token_start, token_end
+                local_ptrs, nbytes = self._get_ptr_nbytes(
+                    layer, local_page_idx, token_start, token_end
                 )
                 remote_ptrs, _ = self._get_ptr_nbytes(
-                    layer, seq_info.last_page_idx, token_start, token_end,
+                    layer, remote_page_idx, token_start, token_end,
                     base_ptr=seq_info.kv_cache_addr
                 )
-
-                local_addrs.extend(ptrs)
+                local_addrs.extend(local_ptrs)
                 remote_addrs.extend(remote_ptrs)
                 nbytes_list.extend(nbytes)
 
-            # TODO: we might want to make this asynchronous to overlap
-            # communication with computation, like in the main tensor mgr
+        for batch_start in range(0, len(local_addrs), MAX_TRANSFERS):
+            batch_end = batch_start + MAX_TRANSFERS
             status = self.engine.batch_transfer_sync_read(
                 seq_info.latest_session_id,
-                local_addrs,
-                remote_addrs,
-                nbytes_list,
+                local_addrs[batch_start:batch_end],
+                remote_addrs[batch_start:batch_end],
+                nbytes_list[batch_start:batch_end],
             )
             if status < 0:
                 raise RuntimeError("Mooncake retrieve failed")
+
+        if local_addrs:
             torch.cuda.default_stream().synchronize()
 
         state.seq_len = seq_len
@@ -427,7 +410,7 @@ class PagedAllocationManager:
         ]
         state.local_cache_seq_len = seq_len
         state.position_id_start = seq_info.pos_id
-
+    
     def get_per_label_seq_info(
         self, request_id: str,
     ):
@@ -441,10 +424,8 @@ class PagedAllocationManager:
                 latest_entity_id = self.my_entity_id,
                 latest_session_id = self.my_session_id,
                 kv_cache_addr = self.kv_cache.data_ptr(),
+                page_indices=state.page_indices
             )
-            if state.seq_len > 0:
-                per_label_seq_info[label].last_page_idx = state.page_indices[
-                    (state.seq_len - 1) // self.config.page_size]
         return per_label_seq_info
     
     def reset_label(self, request_id: str, label: str, free: bool=True, clear_store=True):
