@@ -283,9 +283,12 @@ class VLLMOmni(InferenceSystem):
         payload = {
             "model": model.get_hf_url(),
             "messages": messages,
-            "modalities": [output_modality],
             "max_tokens": 2048,
         }
+        # Only send modalities for image output — vLLM-Omni returns empty
+        # content for I2T when modalities: ["text"] is explicitly set
+        if output_modality != "text":
+            payload["modalities"] = [output_modality]
         if extra_body:
             payload["extra_body"] = extra_body
 
