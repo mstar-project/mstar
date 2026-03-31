@@ -5,7 +5,7 @@ from enum import Enum
 import torch
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.engine.kv_store import SequenceInfo
+from mminf.conductor.request_info import CurrentForwardPassInfo, SequenceInfo
 
 
 class EngineType(Enum):
@@ -24,12 +24,10 @@ class NodeBatch:
 
     # {request_id: {input_name: list[tensor]}}
     per_request_input_tensors: dict[str, NameToTensorList]
+    per_request_info: dict[str, CurrentForwardPassInfo] = field(default_factory=dict)
 
-    # req_id -> {label: SequenceInfo}
-    per_request_seq_info: dict[str, dict[str, SequenceInfo]]
+    # unused for now
     metadata: dict = field(default_factory=dict)
-    # {request_id: {key: value}} — per-request metadata (e.g., cache_label)
-    per_request_metadata: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -37,8 +35,6 @@ class NodeOutput:
     """Output from an engine's execute_batch()."""
     # {request_id: {output_name: [tensor]}}
     per_request_output_tensors: dict[str, NameToTensorList]
-    # {request_id: engine-specific metadata (e.g., generated token id)}
-    per_request_metadata: dict[str, dict] = field(default_factory=dict)
 
 
 class BaseEngine(ABC):

@@ -84,7 +84,7 @@ class EncoderDecoderEngine(BaseEngine):
             batch.graph_walk,
             per_request_inputs=batch.per_request_input_tensors,
             request_ids=batch.request_ids,
-            per_request_metadata=batch.per_request_metadata,
+            per_request_info=batch.per_request_info,
         )
 
         # Single forward pass
@@ -115,17 +115,17 @@ class EncoderDecoderEngine(BaseEngine):
         outputs = {}
         for rid in batch.request_ids:
             inputs = batch.per_request_input_tensors.get(rid, {})
-            metadata = batch.per_request_metadata.get(rid, {})
+            metadata = batch.per_request_info[rid]
             if hasattr(submodule, 'preprocess'):
                 preprocessed = submodule.preprocess(
                     batch.graph_walk,
                     per_request_inputs=[inputs],
                     request_ids=[rid],
-                    per_request_metadata={
-                        rid: batch.per_request_metadata.get(rid, {})
+                    per_request_info={
+                        rid: metadata
                     },
                 )
-                outputs[rid] = submodule(**preprocessed, **metadata)
+                outputs[rid] = submodule(request_info=metadata,**preprocessed)
             else:
                 result = submodule(**{k: v[0] for k, v in inputs.items()})
                 if isinstance(result, dict):

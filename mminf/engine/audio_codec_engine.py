@@ -57,8 +57,8 @@ class AudioCodecEngine(BaseEngine):
                                 batch.graph_walk,
                                 per_request_inputs=[inputs],
                                 request_ids=[rid],
-                                per_request_metadata={
-                                    rid: batch.per_request_metadata.get(rid, {})
+                                per_request_info={
+                                    rid: batch.per_request_info[rid]
                                 },
                             )
                             outputs[rid] = submodule(**preprocessed)

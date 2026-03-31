@@ -6,7 +6,7 @@ from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
 from mminf.engine.cuda_graph_runner import CudaGraphRunner
 from mminf.engine.kv_store import KVCacheConfig, MooncakeStoreConfig, PagedAllocationManager, TransferEngineInfo
-from mminf.engine.kv_store import SequenceInfo
+from mminf.conductor.request_info import CurrentForwardPassInfo, SequenceInfo
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -161,7 +161,7 @@ class AREngine(BaseEngine):
     def _sample_decode_outputs(
         self,
         output: NodeOutput,
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo]
     ) -> NodeOutput:
         """Post-process decode outputs: sample tokens from logits.
 
@@ -174,10 +174,11 @@ class AREngine(BaseEngine):
             if "logits" not in tensors:
                 continue
             logits = tensors["logits"][0]  # [1, vocab_size]
-            meta = per_request_metadata.get(rid, {})
+            meta = per_request_info.get(rid).step_metadata
             temperature = meta.get("temperature", 0.6)
             top_k = meta.get("top_k", 0)
             top_p = meta.get("top_p", 1.0)
+            # TODO add random seed here
             token = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
             tensors["new_token"] = [token]
             del tensors["logits"]
@@ -228,7 +229,7 @@ class AREngine(BaseEngine):
             cache_manager=cache_manager,
             per_request_inputs=input_tensors,
             request_ids=rids,
-            per_request_metadata=batch.per_request_metadata,
+            per_request_info=batch.per_request_info,
         )
 
         batched_output = submodule.forward_batched(
@@ -236,13 +237,13 @@ class AREngine(BaseEngine):
             cache_manager=cache_manager,
             packed_inputs=preprocessed,
             request_ids=rids,
-            per_request_metadata=batch.per_request_metadata,
+            per_request_info=batch.per_request_info,
         )
         cache_manager.flush_to_store()
 
         output = NodeOutput(per_request_output_tensors=batched_output)
         if batch.graph_walk == "decode":
-            output = self._sample_decode_outputs(output, batch.per_request_metadata)
+            output = self._sample_decode_outputs(output, batch.per_request_info)
         return output
 
     def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
@@ -252,7 +253,9 @@ class AREngine(BaseEngine):
         for rid in batch.request_ids:
             cache_manager = self._create_cache_manager(rid)
             inputs = batch.per_request_input_tensors.get(rid, {})
-            metadata = {rid: batch.per_request_metadata.get(rid, {})}
+            metadata = {
+                rid: batch.per_request_info[rid]
+            }
 
             seq_lens = {
                 rid: cache_manager._get_state(rid, "main").seq_len
@@ -264,20 +267,20 @@ class AREngine(BaseEngine):
                 cache_manager=cache_manager,
                 per_request_inputs=[inputs],
                 request_ids=[rid],
-                per_request_metadata=metadata,
+                per_request_info=metadata,
             )
             output = submodule(
                 graph_walk=batch.graph_walk,
                 cache_handle=cache_manager,
+                request_info=metadata[rid],
                 **preprocessed,
-                **metadata[rid],
             )
             cache_manager.flush_to_store()
             per_request_outputs[rid] = output
 
         output = NodeOutput(per_request_output_tensors=per_request_outputs)
         if batch.graph_walk == "decode":
-            output = self._sample_decode_outputs(output, batch.per_request_metadata)
+            output = self._sample_decode_outputs(output, batch.per_request_info)
         return output
 
     def _can_use_cuda_graph(self, batch: NodeBatch) -> bool:
@@ -289,7 +292,7 @@ class AREngine(BaseEngine):
             return False
 
         has_cfg = any(
-            batch.per_request_metadata.get(rid, {}).get("requires_cfg", False)
+            batch.per_request_info[rid].requires_cfg
             for rid in batch.request_ids
         )
         return runner.can_run(
@@ -312,7 +315,7 @@ class AREngine(BaseEngine):
 
         # TODO: don't hardcode it like this
         has_cfg = any(
-            batch.per_request_metadata.get(rid, {}).get("requires_cfg", False)
+            batch.per_request_info[rid].requires_cfg
             for rid in batch.request_ids
         )
         rids = list(batch.per_request_input_tensors.keys())
@@ -325,7 +328,7 @@ class AREngine(BaseEngine):
             requires_cfg=has_cfg,
             request_ids=rids,
             per_request_inputs=input_tensors,
-            per_request_metadata=batch.per_request_metadata,
+            per_request_info=batch.per_request_info,
             submodule=submodule,
         )
 
@@ -345,8 +348,20 @@ class AREngine(BaseEngine):
             return output
 
         try:
-            for req_id, per_label_seq_info in batch.per_request_seq_info.items():
+            # Filter to only retrieve cache labels this node actually needs
+            needed_labels = None
+            if hasattr(submodule, 'get_needed_cache_labels'):
+                needed = submodule.get_needed_cache_labels(
+                    batch.graph_walk, batch.per_request_info
+                )
+                if needed is not None:
+                    needed_labels = set(needed)
+
+            for req_id, info in batch.per_request_info.items():
+                per_label_seq_info = info.per_label_seq_info
                 for label, seq_info in per_label_seq_info.items():
+                    if needed_labels is not None and label not in needed_labels:
+                        continue
                     self.alloc_manager.retrieve_from_store(
                         req_id, label, seq_info
                     )
@@ -362,7 +377,7 @@ class AREngine(BaseEngine):
                         return self._execute_sequential(batch, submodule)
         finally:
             for req_id in batch.request_ids:
-                batch.per_request_seq_info[req_id] = \
+                batch.per_request_info[req_id].per_label_seq_info = \
                     self.alloc_manager.get_per_label_seq_info(req_id)
             if self.enable_nvtx:
                 range_pop()

@@ -1,0 +1,38 @@
+model: "bagel"
+max_seq_len: 32768
+
+node_groups:
+  - node_names:
+      - vit_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+
+  # Main LLM: handles all prefill + decode + image_gen main branch + combine_cfg
+  - node_names:
+      - init_latents
+      - LLM
+      - combine_cfg
+    ranks:
+      - 0
+
+  # CFG text branch (separate GPU, only active during image_gen_cfg)
+  - node_names:
+      - LLM_cfg_text
+    ranks:
+      - 1
+    graph_walks:
+      - image_gen_cfg
+
+  # CFG img branch (separate GPU, only active during image_gen_cfg)
+  - node_names:
+      - LLM_cfg_img
+    ranks:
+      - 2
+    graph_walks:
+      - image_gen_cfg

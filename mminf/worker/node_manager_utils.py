@@ -10,7 +10,7 @@ from mminf.graph.request_queues import (
 )
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, SPECIAL_DESTINATIONS
 from mminf.model.base import WorkerGraph
-from mminf.engine.kv_store import SequenceInfo
+from mminf.conductor.request_info import CurrentForwardPassInfo, SequenceInfo
 
 logger = logging.getLogger(__name__)
 
@@ -128,10 +128,7 @@ class PerRequestInfo:
     """
     node_to_worker: dict[NodeAndGraphWalk, str]  # for all nodes
     worker_graph_ids: list[str] # for this worker
-    current_graph_walk: str = field(default=None)
-    current_fwd_number: int = field(default=0)
-
-    per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
+    current_fwd_info: CurrentForwardPassInfo
 
     # graph_walk_worker_graph_ids = worker graphs for current graph walk
     graph_walk_worker_graph_ids: list[str] = field(default_factory=list) # for this worker
@@ -158,35 +155,35 @@ class WorkerGraphsManager:
 
     def update_request_info(
         self, request_id: str,
-        graph_walk: str | None = None,
-        fwd_number: int | None = None,
+        current_fwd_info: CurrentForwardPassInfo | None=None,
         per_label_seq_info: dict | None=None
     ):
         req_info = self.per_request_info[request_id]
-        if graph_walk is not None:
-            if req_info.current_graph_walk != graph_walk:
-                req_info.current_graph_walk = graph_walk
+        if current_fwd_info is not None:
+            graph_walk = current_fwd_info.graph_walk
+            if self.get_graph_walk(request_id) != graph_walk:
                 req_info.graph_walk_worker_graph_ids = [
                     graph_id for graph_id in self.per_request_info[request_id].worker_graph_ids \
                         if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
                 ]
-        if fwd_number is not None:
-            req_info.current_fwd_number = fwd_number
+            req_info.current_fwd_info = current_fwd_info
         if per_label_seq_info is not None:
-            req_info.per_label_seq_info = {
-                **req_info.per_label_seq_info,
+            req_info.current_fwd_info.per_label_seq_info = {
+                **req_info.current_fwd_info.per_label_seq_info,
                 **per_label_seq_info
             }
-        
 
     def get_graph_walk(self, request_id: str):
-        return self.per_request_info[request_id].current_graph_walk
+        return self.per_request_info[request_id].current_fwd_info.graph_walk
     
     def get_seq_info(self, request_id: str):
-        return self.per_request_info[request_id].per_label_seq_info
+        return self.per_request_info[request_id].current_fwd_info.per_label_seq_info
     
     def get_fwd_number(self, request_id: str):
-        return self.per_request_info[request_id].current_fwd_number
+        return self.per_request_info[request_id].current_fwd_info.fwd_index
+    
+    def get_fwd_info(self, request_id: str):
+        return self.per_request_info[request_id].current_fwd_info
 
     def process_new_inputs(
         self,
@@ -286,7 +283,8 @@ class WorkerGraphsManager:
     def add_request(
         self, request_id: str,
         worker_graph_ids: list[str], # for this worker's worker graphs
-        worker_graph_to_worker: dict[str, str] # for other / all worker graphs
+        worker_graph_to_worker: dict[str, str], # for other / all worker graphs
+        current_fwd_info: CurrentForwardPassInfo,
     ):
         """
         Set up queues and info for a new request. This includes adding the request
@@ -305,9 +303,15 @@ class WorkerGraphsManager:
                         graph_walk=graph_walk
                     ): worker_id for name in self.all_worker_graph_ids_to_nodes[worker_graph_id]
                 })
+        graph_walk = current_fwd_info.graph_walk
         self.per_request_info[request_id] = PerRequestInfo(
             node_to_worker=node_to_worker,
-            worker_graph_ids=worker_graph_ids
+            worker_graph_ids=worker_graph_ids,
+            current_fwd_info=current_fwd_info,
+            graph_walk_worker_graph_ids = [
+                graph_id for graph_id in worker_graph_ids \
+                    if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
+            ]
         )
 
     def remove_request(self, request_id: str):

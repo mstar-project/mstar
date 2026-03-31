@@ -21,23 +21,34 @@ class RequestMetrics:
     ttft: Optional[float]=None
     e2e_latency: Optional[float]=None
     error: Optional[str]=None
+    output_tokens: int=0
+    # Output content for saving (not used in timing)
+    output_content: Optional[str | bytes]=None
 
     def __post_init__(self):
         if self.start_time is None:
             self.start_time = time.monotonic()
-    
+
     def record_token(self):
         if self.ttft is None:
             self.ttft = time.monotonic() - self.start_time
-    
+
     def record_completion(self):
         self.e2e_latency = time.monotonic() - self.start_time
         self.status = Status.SUCCESS
-    
+
     def record_error(self, msg: str):
         self.e2e_latency = time.monotonic() - self.start_time
         self.status = Status.FAILED
         self.error = msg
+
+    @property
+    def mean_itl(self) -> Optional[float]:
+        """Mean inter-token latency: (E2E - TTFT) / (output_tokens - 1)."""
+        if (self.e2e_latency is not None and self.ttft is not None
+                and self.output_tokens > 1):
+            return (self.e2e_latency - self.ttft) / (self.output_tokens - 1)
+        return None
 
 
 @dataclass
@@ -60,7 +71,10 @@ class AggregateMetrics:
     wall_time: float
     ttft: LatencyStats
     e2e_latency: LatencyStats
+    itl: LatencyStats
     type_counts: dict[str, int]
+    total_output_tokens: int=0
+    mean_output_tokens: Optional[float]=None
     rate: Optional[float]=None
 
     def __str__(self) -> str:
@@ -74,7 +88,14 @@ class AggregateMetrics:
         if self.wall_time > 0:
             throughput = self.n_success / self.wall_time
             tpt = f"Throughput: {throughput:.2f} req/s (successful only)\n"
-        
+
+        tok_str = ""
+        if self.total_output_tokens > 0:
+            tok_str = (
+                f"Output tokens: {self.total_output_tokens} total"
+                f" ({self.mean_output_tokens:.1f} avg/req)\n"
+            )
+
         breakdown = ", ".join(f"{k}={v}" for k, v in sorted(self.type_counts.items()))
 
         return (
@@ -83,6 +104,8 @@ class AggregateMetrics:
             f"Requests : {self.n_success}/{self.n_requests} succeeded\n"
             f"TTFT     : {self.ttft}\n"
             f"E2E      : {self.e2e_latency}\n"
+            f"ITL      : {self.itl}\n"
+            f"{tok_str}"
             f"{tpt}"
             f"Total wall time: {self.wall_time:.2f}s"
         )
@@ -115,19 +138,26 @@ def aggregate_metrics(
     n_success = sum(1 for r in requests if r.status == Status.SUCCESS)
     ttft_vals = [r.ttft for r in requests if r.ttft is not None]
     e2e_vals = [r.e2e_latency for r in requests if r.e2e_latency is not None]
+    itl_vals = [r.mean_itl for r in requests if r.mean_itl is not None]
+
+    total_tokens = sum(r.output_tokens for r in requests)
+    token_counts = [r.output_tokens for r in requests if r.output_tokens > 0]
 
     type_counts: dict[str, int] = {}
     for r in requests:
         type_counts[r.type.value] = type_counts.get(r.type.value, 0) + 1
-    
+
     return AggregateMetrics(
         n_requests=len(requests),
         n_success=n_success,
         ttft=_latency_stats(ttft_vals),
         e2e_latency=_latency_stats(e2e_vals),
+        itl=_latency_stats(itl_vals),
         wall_time=wall_time,
         rate=rate,
-        type_counts=type_counts
+        type_counts=type_counts,
+        total_output_tokens=total_tokens,
+        mean_output_tokens=statistics.mean(token_counts) if token_counts else None,
     )
 
 
@@ -188,6 +218,8 @@ class OurSystem(InferenceSystem):
                 form.add_field("files", file_bytes, filename=path.name, content_type="application/octet-stream")
 
             output_modalities_recvd = []
+            text_chunks = []
+            image_bytes = None
 
             async with session.post(f"{base_url}/generate", data=form, read_bufsize=2**24) as resp:
                 resp.raise_for_status()
@@ -203,10 +235,20 @@ class OurSystem(InferenceSystem):
                         continue
                     metrics.record_token()
                     mod = msg.get("modality")
-                    if mod == "image":
-                        decoded = base64.b64decode(msg.get("data"))
-                        assert decoded, "Image output unable to be decoded"
+                    data_b64 = msg.get("data", "")
+                    if mod == "text":
+                        decoded = base64.b64decode(data_b64).decode("utf-8", errors="replace")
+                        text_chunks.append(decoded)
+                        metrics.output_tokens += 1
+                    elif mod == "image":
+                        image_bytes = base64.b64decode(data_b64)
+                        assert image_bytes, "Image output unable to be decoded"
                     output_modalities_recvd.append(mod)
+
+            if output_mod == "text":
+                metrics.output_content = "".join(text_chunks)
+            elif image_bytes is not None:
+                metrics.output_content = image_bytes
 
             if output_mod not in output_modalities_recvd:
                 raise Exception(f"Expected {output_mod} output but got modalities: {output_modalities_recvd}")
@@ -279,13 +321,16 @@ class VLLMOmni(InferenceSystem):
             messages = [{"role": "user", "content": f"<|im_start|>{prompt}<|im_end|>"}]
 
         extra_body = {k: v for k, v in additional_model_kwargs.items()}
-        # if output_modality != "text":
-        #     extra_body.setdefault("modalities", [output_modality])
 
         payload = {
             "model": model.get_hf_url(),
             "messages": messages,
+            "max_tokens": 2048,
         }
+        # Only send modalities for image output — vLLM-Omni returns empty
+        # content for I2T when modalities: ["text"] is explicitly set
+        if output_modality != "text":
+            payload["modalities"] = [output_modality]
         if extra_body:
             payload["extra_body"] = extra_body
 
@@ -300,13 +345,24 @@ class VLLMOmni(InferenceSystem):
             if not choices:
                 raise Exception(f"No choices in response: {resp_json}")
 
-            msg = choices[0].get("message", {})
-            content = msg.get("content", [])
+            # Extract token count from usage if available
+            usage = resp_json.get("usage", {})
+            metrics.output_tokens = usage.get("completion_tokens", 0)
 
-            # content is a list of modality chunks for image output, plain string for text
+            msg = choices[0].get("message", {})
+            content = msg.get("content", "")
+
             if isinstance(content, list):
                 for chunk in content:
-                    if chunk.get("type") == "image_url" or chunk.get("type") == "text":
+                    if chunk.get("type") == "image_url":
+                        metrics.record_token()
+                        # Extract image bytes
+                        url = chunk.get("image_url", {}).get("url", "")
+                        if url.startswith("data:image"):
+                            _, b64_data = url.split(",", 1)
+                            metrics.output_content = base64.b64decode(b64_data)
+                    elif chunk.get("type") == "text":
                         metrics.record_token()
             elif content:
                 metrics.record_token()
+                metrics.output_content = content

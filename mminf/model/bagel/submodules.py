@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import (
@@ -56,7 +57,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self, graph_walk: str,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
         cache_manager: BatchedCacheManager=None,
     ) -> dict[str, torch.Tensor]: # input name to tensor
         """Convert raw images to packed ViT input format.
@@ -102,6 +103,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
 
     def forward(
         self,
+        request_info: CurrentForwardPassInfo,
         packed_pixel_values: torch.Tensor,
         packed_position_ids: torch.Tensor,
         cu_seqlens: torch.Tensor,
@@ -157,7 +159,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
         self, graph_walk: str,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
         cache_manager: BatchedCacheManager=None,
     ) -> dict[str, torch.Tensor]: # input name to tensor
         """Convert raw images to VAE encoder input format.
@@ -236,6 +238,32 @@ class VAEEncoderSubmodule(NodeSubmodule):
         return {"img_emb": [packed_latent]}
 
 
+def _init_latents_and_time_index(
+    config: BagelModelConfig,
+    device,
+    seed: int,
+    H: int=1024,
+    W: int=1024,
+):
+    
+    h, w = (H // config.latent_downsample,
+            W // config.latent_downsample)
+    num_image_tokens = h * w
+
+    g = torch.Generator(device=device)
+    g.manual_seed(seed)
+    latents = torch.randn(
+        num_image_tokens,
+        config.vae_config.z_channels * config.latent_patch_size ** 2,
+        generator=g,
+        device=device,
+    )
+    if torch.is_autocast_enabled():
+        latents = latents.to(torch.get_autocast_gpu_dtype())
+    time_idx = torch.zeros(latents.shape[0], device=device)
+    return latents, time_idx
+
+
 class LLMSubmodule(NodeSubmodule):
     """Fat LLM wrapper that dispatches based on graph walk.
 
@@ -271,6 +299,13 @@ class LLMSubmodule(NodeSubmodule):
     allocation, and KV data copying.
     """
 
+    # Node name → cache label mapping for image_gen_cfg
+    _NODE_TO_CFG_LABEL = {
+        "LLM": "main",
+        "LLM_cfg_text": "cfg_text",
+        "LLM_cfg_img": "cfg_img",
+    }
+
     def __init__(
         self,
         language_model: BagelForCausalLM,
@@ -283,8 +318,10 @@ class LLMSubmodule(NodeSubmodule):
         eoi_token_id: int | None = None,
         bos_token_id: int | None = None,
         eos_token_id: int | None = None,
+        node_name: str = "LLM",
     ):
         super().__init__()
+        self.node_name = node_name
         self.language_model = language_model
         self.embed_tokens = language_model.model.embed_tokens
         self.lm_head = language_model.lm_head
@@ -297,25 +334,6 @@ class LLMSubmodule(NodeSubmodule):
         self.eoi_token_id = eoi_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
-
-    def _init_latents(
-        self,
-        device,
-        H: int=1024,
-        W: int=1024,
-    ):
-        
-        h, w = (H // self.config.latent_downsample,
-                W // self.config.latent_downsample)
-        num_image_tokens = h * w
-        # torch.random.manual_seed(42)
-        latents = torch.randn(
-            num_image_tokens,
-            self.config.vae_config.z_channels * self.config.latent_patch_size ** 2,
-        ).to(device=device)
-        if torch.is_autocast_enabled():
-            latents = latents.to(torch.get_autocast_gpu_dtype())
-        return latents
     
     def _preprocess_prefill_text(
         self, text_inputs: torch.Tensor
@@ -369,6 +387,12 @@ class LLMSubmodule(NodeSubmodule):
             result["text_mask"].append(text_mask)
         return result
     
+    def get_needed_cache_labels(
+        self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> list[str] | None:
+        cfg = any([info.requires_cfg for info in per_request_info.values()])
+        return self._get_active_labels(graph_walk, cfg)
+
     def _get_active_labels(
         self, graph_walk: str, cfg: bool
     ):
@@ -378,13 +402,16 @@ class LLMSubmodule(NodeSubmodule):
         elif graph_walk == "image_gen":
             if cfg:
                 return ["main", "cfg_text", "cfg_img"]
+        elif graph_walk == "image_gen_cfg":
+            # Parallel CFG: each LLM node handles one label only
+            return [self._NODE_TO_CFG_LABEL.get(self.node_name, "main")]
         return ["main"]
 
     def preprocess(
         self, graph_walk: str,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
         cache_manager: BatchedCacheManager,
     ) -> dict[str, torch.Tensor]: # input name to tensor
         """Data transform + plan attention/rope for all relevant labels.
@@ -400,7 +427,7 @@ class LLMSubmodule(NodeSubmodule):
         device = next(self.parameters()).device
 
         has_cfg = self._batch_get_requires_cfg(
-            per_request_metadata, request_ids
+            per_request_info, request_ids
         )
         labels = self._get_active_labels(graph_walk, has_cfg)
 
@@ -439,24 +466,23 @@ class LLMSubmodule(NodeSubmodule):
                 **self._get_text_vae_idxs(seq_lens, device)
             }
 
-        if graph_walk == "image_gen":
+        if graph_walk in ("image_gen", "image_gen_cfg"):
             H, W = 1024, 1024 # TODO: make this configurable?
 
             # TODO support batching for image gen
             assert len(per_request_inputs) == 1, "Batching not supported for image gen"
             inputs = per_request_inputs[0]
-    
+            metadata = per_request_info[request_ids[0]]
+
             result["vae_position_ids"] = get_flattened_position_ids_extrapolate(
                 H, W,
                 self.config.latent_downsample,
                 max_num_patches_per_side=self.config.max_latent_size
             )
             if "latents" not in inputs or len(inputs["latents"]) == 0:
-                result["latents"] = self._init_latents(
-                    device=device,
-                    H=H, W=W
+                result["latents"], result["time_index"] = _init_latents_and_time_index(
+                    self.config, device, seed=metadata.random_seed, H=H, W=W
                 )
-                result["time_index"] = torch.zeros(result["latents"].shape[0], device=device)
             else:
                result["latents"] = inputs["latents"][0]
                result["time_index"] = inputs["time_index"][0]
@@ -501,7 +527,7 @@ class LLMSubmodule(NodeSubmodule):
                 ],
                 labels=labels,
                 snapshots=[("main", "cfg_text")] if graph_walk == "prefill_text" and has_cfg else [],
-                write_cache=graph_walk != "image_gen"
+                write_cache=graph_walk not in ("image_gen", "image_gen_cfg")
             )
 
         result = {
@@ -552,6 +578,8 @@ class LLMSubmodule(NodeSubmodule):
             return self._forward_decode(cache_handle=cache_handle, **kwargs)
         elif graph_walk == "image_gen":
             return self._forward_image_gen(cache_handle=cache_handle, **kwargs)
+        elif graph_walk == "image_gen_cfg":
+            return self._forward_image_gen_single_branch(cache_handle=cache_handle, **kwargs)
         else:
             raise ValueError(f"Unknown LLM graph walk: {graph_walk!r}")
 
@@ -854,11 +882,76 @@ class LLMSubmodule(NodeSubmodule):
             "latents": [latents],
             "time_index": [time_index + 1]
         }
-    
+
+    def _forward_image_gen_single_branch(
+        self,
+        latents: torch.Tensor,
+        empty_combined_emb: torch.Tensor,
+        vae_position_ids: torch.Tensor,
+        text_indexes: torch.Tensor,
+        vae_token_indexes: torch.Tensor,
+        text_mask: torch.Tensor,
+        time_index: torch.Tensor,
+        cache_handle: "BatchedCacheManager",
+        **kwargs,
+    ) -> NameToTensorList:
+        """Single-branch LLM forward for parallel CFG (image_gen_cfg walk).
+
+        Each parallel LLM node (LLM, LLM_cfg_text, LLM_cfg_img) runs this
+        method with its own cache label. The velocity output is sent to the
+        combine_cfg node which applies the CFG formula and Euler step.
+        """
+        kwargs.pop("cache_labels", None)
+        kwargs.pop("snapshot_after", None)
+        kwargs.pop("is_prefill", None)
+        kwargs.pop("requires_cfg", None)
+        kwargs.pop("cfg_text_scale", None)
+        kwargs.pop("cfg_img_scale", None)
+        kwargs.pop("cfg_renorm_type", None)
+        kwargs.pop("cfg_interval", None)
+        kwargs.pop("cfg_renorm_min", None)
+
+        pos_embed = self.latent_pos_embed(vae_position_ids)
+
+        N = self.config.num_timesteps
+        shift = self.config.timestep_shift
+        t_uniform = 1.0 - time_index / (N - 1)
+        timestep = self._apply_timestep_shift(t=t_uniform, shift=shift)
+        timestep_embeds = self.time_embedder(timestep)
+
+        latents_ = self.vae2llm(latents) + timestep_embeds + pos_embed
+        empty_combined_emb[1:-1] = latents_
+
+        label = self._NODE_TO_CFG_LABEL.get(self.node_name, "main")
+        if cache_handle is not None:
+            cache_handle.set_active_label(label)
+        hidden = self.language_model(
+            empty_combined_emb, mode="gen",
+            cache_handle=cache_handle, write_cache=False,
+            vae_token_indexes=vae_token_indexes,
+            text_indexes=text_indexes,
+            text_mask=text_mask,
+            **kwargs,
+        )
+
+        # Output velocity. Main LLM also passes through latents/time_index
+        # for the combine_cfg node.
+        output_name = {
+            "LLM": "v_main",
+            "LLM_cfg_text": "v_cfg_text",
+            "LLM_cfg_img": "v_cfg_img",
+        }.get(self.node_name, "v_main")
+
+        result: NameToTensorList = {output_name: [hidden]}
+        if self.node_name == "LLM":
+            result["latents"] = [latents]
+            result["time_index"] = [time_index]
+        return result
+
     @torch.compiler.disable
-    def _batch_get_requires_cfg(self, per_request_metadata, request_ids):
+    def _batch_get_requires_cfg(self, per_request_info: dict[str, CurrentForwardPassInfo], request_ids):
         return any(
-            per_request_metadata.get(rid, {}).get("requires_cfg", False)
+            per_request_info[rid].requires_cfg
             for rid in request_ids
         )
 
@@ -868,7 +961,7 @@ class LLMSubmodule(NodeSubmodule):
         request_ids: list[str],
         cache_manager: BatchedCacheManager,
         packed_inputs: dict[str, torch.Tensor],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo]
     ) -> dict[str, NameToTensorList]:
         """Batched forward pass for decode and prefill_text.
 
@@ -876,7 +969,7 @@ class LLMSubmodule(NodeSubmodule):
         the BatchedCacheManager, then splits outputs back per-request.
         """
         has_cfg = self._batch_get_requires_cfg(
-            per_request_metadata, request_ids
+            per_request_info, request_ids
         )
 
         if graph_walk == "decode":
@@ -901,7 +994,7 @@ class LLMSubmodule(NodeSubmodule):
         request_ids: list[str],
         packed_inputs: dict[str, torch.Tensor],
         has_cfg: bool = False,
-        per_request_metadata: dict[str, dict] | None = None,
+        per_request_info: dict[str, CurrentForwardPassInfo] | None=None
     ) -> dict[str, NameToTensorList]:
         """Batched decode: all requests generate 1 token each.
 
@@ -945,7 +1038,7 @@ class LLMSubmodule(NodeSubmodule):
     @torch.compiler.disable
     def _batch_get_sampling_param(
         self,
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
         request_ids: list[str],
         key: str,
         default: float | int,
@@ -954,7 +1047,7 @@ class LLMSubmodule(NodeSubmodule):
     ) -> float | int | torch.Tensor:
         """Extract a sampling param. Returns scalar if uniform, tensor if per-request."""
         values = [
-            per_request_metadata.get(rid, {}).get(key, default)
+            per_request_info[rid].step_metadata.get(key, default)
             for rid in request_ids
         ]
         if len(set(values)) == 1:
@@ -995,7 +1088,7 @@ class VAEDecoderSubmodule(NodeSubmodule):
         self, graph_walk: str,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo] | None=None,
         cache_manager: BatchedCacheManager=None,
     ):
         """Prepare VAE decoder inputs.
@@ -1036,3 +1129,146 @@ class VAEDecoderSubmodule(NodeSubmodule):
         image = self.vae_model.decode(latent)
         image = (image * 0.5 + 0.5).clamp(0, 1)
         return {"image_output": [image]}
+
+
+class CombineCFGSubmodule(NodeSubmodule):
+    """Lightweight node: applies CFG formula + Euler step.
+
+    Receives 3 velocity tensors (v_main, v_cfg_text, v_cfg_img) plus
+    latents and time_index from the parallel LLM branches. Projects
+    velocities to VAE space, applies the 2-node CFG formula with
+    renormalization, then performs an Euler step.
+
+    Used in the image_gen_cfg graph walk (parallel CFG architecture).
+    Runs on the same GPU as the main LLM branch (enc_dec engine, no KV cache).
+    """
+
+    def __init__(
+        self,
+        llm2vae: nn.Linear,
+        config: "BagelModelConfig",
+    ):
+        super().__init__()
+        self.llm2vae = llm2vae
+        self.config = config
+
+    @staticmethod
+    def _apply_timestep_shift(t: torch.Tensor, shift: float) -> torch.Tensor:
+        return shift * t / (1 + (shift - 1) * t)
+
+    def preprocess(
+        self, graph_walk: str,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        cache_manager: BatchedCacheManager = None,
+    ) -> dict[str, torch.Tensor]:
+        assert len(per_request_inputs) == 1
+        inputs = per_request_inputs[0]
+        device = inputs["v_main"][0].device
+        metadata = per_request_info[request_ids[0]]
+
+        result = {
+            "v_main": inputs["v_main"][0],
+            "v_cfg_text": inputs["v_cfg_text"][0],
+            "v_cfg_img": inputs["v_cfg_img"][0],
+        }
+        if "latents" not in inputs or len(inputs["latents"]) == 0:
+            H, W = 1024, 1024
+            result["latents"], result["time_index"] = _init_latents_and_time_index(
+                self.config, device=device, seed=metadata.random_seed, H=H, W=W
+            )
+        else:
+            result = {
+                "latents": inputs["latents"][0],
+                "time_index": inputs["time_index"][0],
+                **result,
+            }
+        return result
+
+    def forward(
+        self,
+        v_main: torch.Tensor,
+        v_cfg_text: torch.Tensor,
+        v_cfg_img: torch.Tensor,
+        latents: torch.Tensor,
+        time_index: torch.Tensor,
+        cfg_text_scale: float = None,
+        cfg_img_scale: float = None,
+        cfg_renorm_type: str = None,
+        cfg_renorm_min: float = None,
+        cfg_interval: tuple = None,
+        **kwargs,
+    ) -> NameToTensorList:
+        if cfg_text_scale is None:
+            cfg_text_scale = self.config.cfg_text_scale
+        if cfg_img_scale is None:
+            cfg_img_scale = self.config.cfg_img_scale
+        if cfg_renorm_type is None:
+            cfg_renorm_type = self.config.cfg_renorm_type
+        if cfg_renorm_min is None:
+            cfg_renorm_min = self.config.cfg_renorm_min
+        if cfg_interval is None:
+            cfg_interval = self.config.cfg_interval
+
+        N = self.config.num_timesteps
+        shift = self.config.timestep_shift
+
+        # Compute timestep and step size
+        t_uniform = 1.0 - time_index / (N - 1)
+        t_uniform_next = 1.0 - (time_index + 1) / (N - 1)
+        timestep = self._apply_timestep_shift(t=t_uniform, shift=shift)
+        timestep_next = self._apply_timestep_shift(t=t_uniform_next, shift=shift)
+        dt = (timestep - timestep_next)[0]
+
+        # Project to VAE space, strip BOI/EOI
+        v_m = self.llm2vae(v_main)[1:-1]
+        v_ct = self.llm2vae(v_cfg_text)[1:-1]
+        v_ci = self.llm2vae(v_cfg_img)[1:-1]
+
+        # CFG interval
+        cfg_lo, cfg_hi = cfg_interval
+        t_val = timestep[0]
+        in_cfg_interval = ((t_val > cfg_lo) & (t_val <= cfg_hi)).float()
+        effective_text_scale = cfg_text_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
+        effective_img_scale = cfg_img_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
+
+        # CFG formula
+        if cfg_renorm_type == "text_channel":
+            v_text_guided = v_ct + effective_text_scale * (v_m - v_ct)
+            norm_v = torch.norm(v_m, dim=-1, keepdim=True)
+            norm_v_text = torch.norm(v_text_guided, dim=-1, keepdim=True)
+            scale = (norm_v / (norm_v_text + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+            v_text_renormed = v_text_guided * scale
+            if effective_img_scale > 1.0:
+                v_final = v_ci + effective_img_scale * (v_text_renormed - v_ci)
+            else:
+                v_final = v_text_renormed
+        else:
+            v_text_guided = v_ct + effective_text_scale * (v_m - v_ct)
+            if effective_img_scale > 1.0:
+                v_combined = v_ci + effective_img_scale * (v_text_guided - v_ci)
+            else:
+                v_combined = v_text_guided
+
+            if cfg_renorm_type == "channel":
+                renorm_scale = (
+                    v_m.norm(dim=-1, keepdim=True) /
+                    (v_combined.norm(dim=-1, keepdim=True) + 1e-8)
+                ).clamp(min=cfg_renorm_min, max=1.0)
+            else:
+                renorm_scale = (
+                    v_m.norm() / (v_combined.norm() + 1e-8)
+                ).clamp(min=cfg_renorm_min, max=1.0)
+            v_final = v_combined * renorm_scale
+
+        # Euler step
+        new_latents = latents - v_final * dt
+        if torch.is_autocast_enabled():
+            new_latents = new_latents.to(torch.get_autocast_gpu_dtype())
+
+        new_time_index = time_index + 1
+        return {
+            "latents": [new_latents],
+            "time_index": [new_time_index],
+        }

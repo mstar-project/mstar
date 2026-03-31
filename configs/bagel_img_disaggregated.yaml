@@ -21,7 +21,6 @@ node_groups:
       - prefill_text
       - prefill_vit
       - prefill_vae
-      - image_gen
   
   - node_names:
       - LLM
@@ -29,3 +28,10 @@ node_groups:
       - 1
     graph_walks:
       - decode
+
+  - node_names:
+      - LLM
+    ranks:
+      - 2
+    graph_walks:
+      - image_gen

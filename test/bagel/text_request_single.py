@@ -6,7 +6,7 @@ import sys
 
 import requests
 
-URL = "http://0.0.0.0:8000/generate"
+URL = "http://0.0.0.0:8001/generate"
 
 
 def main():
