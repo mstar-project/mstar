@@ -182,7 +182,8 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         hostname: str,
         communicator: BaseCommunicator,
         protocol: CommProtocol=CommProtocol.RDMA,
-        metadata_server: str="P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
+        metadata_server: str="P2PHANDSHAKE", # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
+        tcp_transfer_device="",
 
     ):
         self.my_entity_id = my_entity_id
@@ -191,19 +192,23 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 
         self.communicator = communicator
         self.protocol = protocol
-        # Use hostname:port as the Mooncake session ID for RDMA handshake.
-        # Each entity must use a unique port.
         self.my_session_id = hostname
 
         self.copy_stream = torch.cuda.Stream()
 
         if TransferEngine is not None:
+            if self.protocol == CommProtocol.RDMA:
+                transfer_device = ""
+            elif self.protocol == CommProtocol.TCP:
+                transfer_device = tcp_transfer_device
+            else:
+                raise NotImplementedError(f"Unknown protocol {self.protocol} for mooncake")
             self.engine = TransferEngine()
             self.engine.initialize(
                 hostname,
                 metadata_server,
-                protocol.value,
-                ""
+                self.protocol.value.lower(),
+                transfer_device
             )
             self.my_session_id =f"{hostname}:{self.engine.get_rpc_port()}"
         else:
@@ -476,18 +481,24 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                             "Cannot start RDMA reads: TransferEngine is not available."
                         )
                     self.engine.register_memory(buffer.data_ptr(), info.nbytes)
-                else:
-                    raise RuntimeError(
-                        "Tensor transport for IPC is not implemented yet in this build."
-                    )
 
-                with torch.cuda.stream(stream):
-                    self.engine.transfer_read_on_cuda(
+
+                if hasattr(self.engine, "transfer_read_on_cuda"):
+                    with torch.cuda.stream(stream):
+                        self.engine.transfer_read_on_cuda(
+                            info.source_session_id,
+                            buffer.data_ptr(),
+                            info.address,
+                            info.nbytes,
+                            stream.cuda_stream,
+                        )
+                else:
+                    # TODO: maybe replace both transfer read paths with a thread-based mechanism
+                    self.engine.transfer_sync_read(
                         info.source_session_id,
                         buffer.data_ptr(),
                         info.address,
                         info.nbytes,
-                        stream.cuda_stream,
                     )
                 logger.debug("Started transfer read for uuid %s", info.uuid)
             # For now, have one cuda event for all tensors in this graph edge

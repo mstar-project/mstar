@@ -24,7 +24,7 @@ from starlette.concurrency import run_in_threadpool
 
 from mminf.api_server.data_worker import PreprocessWorker
 from mminf.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
-from mminf.communication.communicator import ZMQCommunicator
+from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.model.registry import HF_MODELS
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,8 @@ def _conductor_process_target(
     log_level: str = "INFO",
     cache_dir: str | None = None,
     mooncake_port: int=8080,
+    tensor_comm_protocol=CommProtocol.RDMA,
+    tcp_transfer_device=""
 ):
     """Runs DummyConductor.run() in a spawned process."""
     logging.basicConfig(
@@ -78,7 +80,9 @@ def _conductor_process_target(
         socket_path_prefix=socket_path_prefix,
         enable_nvtx=enable_nvtx,
         log_level=log_level,
-        mooncake_port=mooncake_port
+        mooncake_port=mooncake_port,
+        tensor_comm_protocol=tensor_comm_protocol,
+        tcp_transfer_device=tcp_transfer_device
     )
     try:
         conductor.run()
@@ -164,18 +168,22 @@ class APIServer:
         hostname: str="localhost",
         timeout_seconds: float = 600.0,
         mooncake_port=8080,
+        tensor_comm_protocol=CommProtocol.RDMA,
+        tcp_transfer_device="",
         model=None,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
 
-        self.mooncake_pid = start_mooncake_master(port=mooncake_port)
+        # self.mooncake_pid = start_mooncake_master(port=mooncake_port)
 
         self.preprocess_worker = PreprocessWorker(
             model=model,
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
+            tensor_comm_protocol=tensor_comm_protocol,
+            tcp_transfer_device=tcp_transfer_device
         )
 
         # Concurrent request tracking
@@ -408,7 +416,7 @@ class APIServer:
     # ----------------------------------------------------------
 
     def cleanup(self) -> None:
-        stop_mooncake_master(self.mooncake_pid)
+        # stop_mooncake_master(self.mooncake_pid)
         self.preprocess_worker.shutdown()
         self.running = False
         if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
@@ -584,6 +592,15 @@ def main():
         help="Enable torch.cuda.nvtx markers during execution",
     )
     parser.add_argument(
+        "--tensor-comm-protocol",
+        type=str, default="RDMA",
+        help="RDMA or TCP"
+    )
+    parser.add_argument(
+        "--tcp-transfer-device",
+        type=str, default="",
+    )
+    parser.add_argument(
         "--cache-dir", type=str, default=None,
         help="Directory for caching downloaded HuggingFace model files",
     )
@@ -617,7 +634,9 @@ def main():
         upload_dir=args.upload_dir,
         timeout_seconds=args.timeout,
         mooncake_port=args.mooncake_port,
+        tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
+        tcp_transfer_device=args.tcp_transfer_device
     )
 
     # Spawn conductor in a separate process
@@ -632,6 +651,8 @@ def main():
             args.log_level,
             args.cache_dir,
             args.mooncake_port,
+            CommProtocol(args.tensor_comm_protocol),
+            args.tcp_transfer_device
         ),
     )
     conductor_proc.start()

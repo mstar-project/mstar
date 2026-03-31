@@ -2,6 +2,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
+import os
 import random
 import time
 from typing import Optional
@@ -37,6 +38,7 @@ class BenchmarkConfig:
     request_type: RequestType
     inference_system: InferenceSystemType = InferenceSystemType.OURS
     rate: Optional[float] = None  # None = sequential, >0 = requests/sec
+    output_dir: Optional[str] = None  # Save outputs here (text files / images)
     # VBench args
     vbench_cache_dir: str = "./vbench_cache"
 
@@ -54,6 +56,30 @@ class Benchmark:
                 num_requests=self.config.num_requests,
             )
         raise ValueError(f"Unknown dataset: {self.config.dataset}")
+
+    def _save_outputs(self, metrics: list[RequestMetrics]) -> None:
+        """Save outputs to disk (after timing). Text → .txt, images → .png."""
+        output_dir = self.config.output_dir
+        if output_dir is None:
+            return
+
+        os.makedirs(output_dir, exist_ok=True)
+        saved = 0
+        for m in metrics:
+            if m.output_content is None:
+                continue
+            if isinstance(m.output_content, str):
+                path = os.path.join(output_dir, f"req_{m.request_id}.txt")
+                with open(path, "w") as f:
+                    f.write(m.output_content)
+            elif isinstance(m.output_content, bytes):
+                path = os.path.join(output_dir, f"req_{m.request_id}.png")
+                with open(path, "wb") as f:
+                    f.write(m.output_content)
+            saved += 1
+
+        if saved:
+            print(f"\nSaved {saved} outputs to {output_dir}/")
 
     def _print_errors(self, metrics: list[RequestMetrics]) -> None:
         errors = [(m.request_id, m.error) for m in metrics if m.error is not None]
@@ -103,7 +129,7 @@ class Benchmark:
                 prompt=req.prompt,
                 image_path=req.image_path,
             )
-            print(f"request time: {result.e2e_latency}")
+            print(f"request time: {result.e2e_latency:.3f}s  tokens: {result.output_tokens}")
             results.append(result)
         return results
 
@@ -149,6 +175,7 @@ class Benchmark:
         print(f"\n--- Benchmark Results (wall time: {wall_time:.2f}s) ---")
         print(agg)
         self._print_errors(metrics)
+        self._save_outputs(metrics)
 
         return metrics, agg
 
@@ -164,6 +191,8 @@ def parse_args() -> BenchmarkConfig:
     parser.add_argument("--rate", type=float, default=None,
                         help="Requests/sec. Omit for sequential mode.")
     parser.add_argument("--request-type", choices=[r.value for r in RequestType])
+    parser.add_argument("--output-dir", default=None,
+                        help="Directory to save outputs (text files / images). Omit to skip.")
     # VBench args
     vbench = parser.add_argument_group("vbench")
     
@@ -181,6 +210,7 @@ def parse_args() -> BenchmarkConfig:
         rate=args.rate,
         vbench_cache_dir=args.vbench_cache_dir,
         inference_system=InferenceSystemType(args.inference_system),
+        output_dir=args.output_dir,
     )
 
 

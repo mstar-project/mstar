@@ -1,10 +1,12 @@
 import logging
+from time import sleep
 
 import torch
 
 from mminf.api_server.request_types import APIServerMessage, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
+from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
 from mminf.engine.kv_store import MooncakeStoreConfig, StoreWritePolicy, TransferEngineInfo
 from mminf.graph.base import GraphEdge
@@ -55,7 +57,8 @@ class Worker:
         device: torch.device = torch.device("cuda"),
         enable_nvtx: bool = False,
         model: Model | None = None,
-        mooncake_port: int=8080
+        mooncake_port: int=8080,
+        tcp_transfer_device=""
     ):
         self.worker_id = worker_id
         self.device = device
@@ -87,6 +90,7 @@ class Worker:
             hostname=hostname,
             communicator=self.communicator,
             protocol=tensor_comm_protocol,
+            tcp_transfer_device=tcp_transfer_device,
         )
 
         self.engine_manager = EngineManager.from_config(
@@ -121,8 +125,6 @@ class Worker:
             "Worker %s: store write policy = %s", worker_id, write_policy.value
         )
 
-        # Per-request metadata from conductor (e.g., cache_labels, snapshot_after)
-        self._per_request_metadata: dict[str, dict] = {}
         self._unprocessed_messages = {} # req_id -> messages for requests that are not in the queue
 
     def _compute_store_write_policy(
@@ -184,20 +186,9 @@ class Worker:
             request_id=body.request_id,
             worker_graph_ids=body.worker_graph_ids,
             worker_graph_to_worker=body.worker_graph_to_worker,
+            current_fwd_info=body.request_info
         )
         self.engine_manager.add_request(body.request_id)
-
-        self.worker_graphs_manager.update_request_info(
-            body.request_id, body.initial_graph_walk, fwd_number=0
-        )
-        logger.debug(
-            "Request %s set to graph walk %s on worker %s",
-            body.request_id, body.initial_graph_walk, self.worker_id
-        )
-
-        # Store per-request metadata from conductor
-        if body.per_request_metadata:
-            self._per_request_metadata[body.request_id] = body.per_request_metadata
 
         # Start RDMA reads for tensors that have tensor_info
         self.tensor_manager.start_read_tensors(
@@ -223,7 +214,6 @@ class Worker:
         self.engine_manager.remove_request(body.request_id)
         self.worker_graphs_manager.remove_request(body.request_id)
         self.tensor_manager.cleanup_request(body.request_id)
-        self._per_request_metadata.pop(body.request_id, None)
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
@@ -234,23 +224,13 @@ class Worker:
 
     def _process_new_inputs(self, body: InputSignals) -> None:
         self.worker_graphs_manager.update_request_info(
-            body.request_id, body.graph_walk,
-            body.fwd_pass_number,
-            body.per_label_seq_info
-        )
-        logger.debug(
-            "Request %s set to graph walk %s on worker %s",
-            body.request_id, body.graph_walk, self.worker_id
+            body.request_id, current_fwd_info=body.request_info
         )
 
         logger.debug(
             "Received new signals %s at worker %s for request %s",
             format_graph_edge_list(body.inputs), self.worker_id, body.request_id
         )
-
-        # Update per-request metadata from conductor
-        if body.per_request_metadata:
-            self._per_request_metadata[body.request_id] = body.per_request_metadata
 
         # Start RDMA reads for tensors with tensor_info
         self.tensor_manager.start_read_tensors(
@@ -282,7 +262,7 @@ class Worker:
         for message in messages:
             if (
                 message.message_type in msg_types_needing_active_request and \
-                message.body.request_id not in self._per_request_metadata
+                message.body.request_id not in self.worker_graphs_manager.per_request_info
             ):
                 # got an out-of-order request
                 self._unprocessed_messages.setdefault(
@@ -322,8 +302,7 @@ class Worker:
     def _build_node_batch(self, batch: ScheduledBatch) -> NodeBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
         per_request_inputs: dict[str, NameToTensorList] = {}
-        per_request_metadata: dict[str, dict] = {}
-        per_request_seq_info: dict[str, dict] = {}
+        per_request_info: dict[CurrentForwardPassInfo] = {}
 
         for request_id, node in batch.node_objects.items():
             tensors = {}
@@ -334,19 +313,14 @@ class Worker:
                     ) for info in node.ready_inputs[input_name].tensor_info
                 ]
             per_request_inputs[request_id] = tensors
-            per_request_seq_info[request_id] = self.worker_graphs_manager.get_seq_info(request_id)
-
-            # Include per-request metadata (e.g., cache_labels, snapshot_after)
-            if request_id in self._per_request_metadata:
-                per_request_metadata[request_id] = self._per_request_metadata[request_id]
+            per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id)
 
         return NodeBatch(
             node_name=batch.node_name,
             graph_walk=batch.graph_walk,
             request_ids=list(batch.node_objects.keys()),
             per_request_input_tensors=per_request_inputs,
-            per_request_metadata=per_request_metadata,
-            per_request_seq_info=per_request_seq_info
+            per_request_info=per_request_info
         )
 
     # ------------------------------------------------------------------
@@ -434,11 +408,8 @@ class Worker:
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
                     request_id=request_id,
-                    graph_walk=self.worker_graphs_manager.get_graph_walk(request_id),
-                    fwd_pass_number=self.worker_graphs_manager.get_fwd_number(request_id),
                     inputs=edges,
-                    per_label_seq_info=self.worker_graphs_manager.get_seq_info(request_id),
-                    per_request_metadata=self._per_request_metadata[request_id]
+                    request_info=self.worker_graphs_manager.get_fwd_info(request_id)
                 ),
             )
             self.communicator.send(worker_id, message)
@@ -537,9 +508,9 @@ class Worker:
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
                 
-                for rid, per_label_seq_info in node_batch.per_request_seq_info.items():
+                for rid, req_info in node_batch.per_request_info.items():
                     self.worker_graphs_manager.update_request_info(
-                        rid, per_label_seq_info=per_label_seq_info
+                        rid, per_label_seq_info=req_info.per_label_seq_info
                     )
 
                 # 5b. Free consumed input tensors
@@ -561,3 +532,4 @@ class Worker:
                     self._send_outputs(request_id, routing_per_request[request_id])
             except Exception:
                 logger.exception("Worker %s error in main loop", self.worker_id)
+                sleep(0.01)

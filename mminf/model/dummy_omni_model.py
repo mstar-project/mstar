@@ -1,8 +1,9 @@
 
+from mminf.conductor.request_info import CurrentForwardConductorMetadata
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT
-from mminf.model.base import CurrentForwardMetadata, Model
+from mminf.model.base import Model
 
 
 class DummyOmniModel(Model):
@@ -83,7 +84,7 @@ class DummyOmniModel(Model):
     def get_initial_forward_pass_args(
         self, input_modalities, output_modalities,
     ):
-        return CurrentForwardMetadata(
+        return CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             graph_walk="prefill",
@@ -91,18 +92,18 @@ class DummyOmniModel(Model):
         )
 
     def get_forward_pass_args(
-        self, metadata: CurrentForwardMetadata,
+        self, metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        prev_forward_metadata: CurrentForwardMetadata = None,
+        prev_forward_metadata: CurrentForwardConductorMetadata = None,
     ) -> list[GraphEdge]:
         graph_edge = GraphEdge(next_node="ThinkerLLM", name="input_ids")
         graph_edge.tensor_info = persist_signals.get("input_ids", [])
         return [graph_edge]
 
     def update_for_next_forward(
-        self, metadata: CurrentForwardMetadata,
+        self, metadata: CurrentForwardConductorMetadata,
         new_tokens: dict[str, list[int]],
-    ) -> CurrentForwardMetadata:
+    ) -> CurrentForwardConductorMetadata:
         if metadata.graph_walk == "prefill":
             metadata.is_prefill = False
             metadata.graph_walk = "decode"

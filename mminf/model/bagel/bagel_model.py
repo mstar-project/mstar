@@ -40,6 +40,7 @@ from PIL import Image
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.conductor.request_info import CurrentForwardConductorMetadata
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import (
@@ -58,8 +59,8 @@ from mminf.model.bagel.components.modeling_utils import BagelMLPconnector, Posit
 from mminf.model.bagel.components.tokenization import BagelTokenizer, add_special_tokens
 from mminf.model.bagel.components.vit_encoder import BagelVisionModel
 from mminf.model.bagel.config import load_bagel_config
-from mminf.model.bagel.submodules import CombineCFGSubmodule, InitLatents, LLMSubmodule, VAEDecoderSubmodule, VAEEncoderSubmodule, ViTEncoderSubmodule
-from mminf.model.base import DECODE, CurrentForwardMetadata, ForwardPassArgs, Model, NodeSubmodule
+from mminf.model.bagel.submodules import CombineCFGSubmodule, LLMSubmodule, VAEDecoderSubmodule, VAEEncoderSubmodule, ViTEncoderSubmodule
+from mminf.model.base import DECODE, ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.utils import ModuleAndPrefix, load_weights_from_file
 
 logger = logging.getLogger(__name__)
@@ -332,10 +333,6 @@ class BagelModel(Model):
                 latent_channel=self.config.vae_config.z_channels,
                 latent_downsample=self.config.latent_downsample,
             )
-        elif node_name == "init_latents":
-            return InitLatents(
-                config=self.config
-            )
         return None
 
     # -----------------------------------------------------------------------
@@ -534,20 +531,6 @@ class BagelModel(Model):
         # Each CFG branch (main, cfg_text, cfg_img) runs on its own GPU.
         # combine_cfg applies the CFG formula + Euler step after each iteration.
         image_gen_cfg = Sequential([
-            GraphNode(
-                name="init_latents",
-                input_ids=["start_flag"],
-                outputs=[
-                    GraphEdge(next_node="LLM", name="latents"),
-                    GraphEdge(next_node="LLM", name="time_index"),
-                    GraphEdge(next_node="LLM_cfg_text", name="latents"),
-                    GraphEdge(next_node="LLM_cfg_text", name="time_index"),
-                    GraphEdge(next_node="LLM_cfg_img", name="latents"),
-                    GraphEdge(next_node="LLM_cfg_img", name="time_index"),
-                    GraphEdge(next_node="combine_cfg", name="latents"),
-                    GraphEdge(next_node="combine_cfg", name="time_index"),
-                ]
-            ),
             Loop(
                 section=Sequential([
                     Parallel([
@@ -654,19 +637,22 @@ class BagelModel(Model):
                 schedule.append(("prefill_vit", images[image_idx]))
                 image_idx += 1
         return schedule
-
-    def _get_step_metadata(
-        self, full_metadata: CurrentForwardMetadata,
-    ) -> dict:
-        requires_cfg = (
-            full_metadata.kwargs["target_output"] == "image" \
+    
+    def _requires_cfg(
+        self, **kwargs,
+    ):
+        return (
+            kwargs["target_output"] == "image" \
                 and (
-                    full_metadata.kwargs["cfg_img_scale"] > 1.0 \
-                    or full_metadata.kwargs["cfg_text_scale"] > 1.0
+                    kwargs["cfg_img_scale"] > 1.0 \
+                    or kwargs["cfg_text_scale"] > 1.0
                 )
         )
+
+    def _get_step_metadata(
+        self, full_metadata: CurrentForwardConductorMetadata,
+    ) -> dict:
         return {
-            "requires_cfg": requires_cfg,
             "is_prefill": full_metadata.is_prefill,
             "cfg_text_scale": full_metadata.kwargs["cfg_text_scale"],
             "cfg_img_scale": full_metadata.kwargs["cfg_img_scale"],
@@ -680,7 +666,7 @@ class BagelModel(Model):
 
     def _get_fwd_pass_inputs(
         self,
-        metadata: CurrentForwardMetadata,
+        metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
     ) -> list[GraphEdge]:
         """Construct the external inputs for the current forward pass.
@@ -735,11 +721,14 @@ class BagelModel(Model):
 
         elif graph_walk == "image_gen_cfg":
             return [
-                GraphEdge(
-                    next_node="init_latents",
-                    name="start_flag",
-                    tensor_info=[]
-                )
+                GraphEdge(next_node="LLM", name="latents"),
+                GraphEdge(next_node="LLM", name="time_index"),
+                GraphEdge(next_node="LLM_cfg_text", name="latents"),
+                GraphEdge(next_node="LLM_cfg_text", name="time_index"),
+                GraphEdge(next_node="LLM_cfg_img", name="latents"),
+                GraphEdge(next_node="LLM_cfg_img", name="time_index"),
+                GraphEdge(next_node="combine_cfg", name="latents"),
+                GraphEdge(next_node="combine_cfg", name="time_index"),
             ]
 
         return []
@@ -789,19 +778,21 @@ class BagelModel(Model):
         )
 
         first_graph_walk = schedule[0][0] if schedule else DECODE
-        full_metadata = CurrentForwardMetadata(
+        kwargs = {
+            "prefill_schedule": schedule,
+            "prefill_step": 0,
+            "target_output": target_output,
+            "num_timesteps": self.config.num_timesteps,
+            "think_mode": think_mode,
+            **params,  # CFG params
+        }
+        full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             graph_walk=first_graph_walk,
             is_prefill=bool(schedule),
-            kwargs={
-                "prefill_schedule": schedule,
-                "prefill_step": 0,
-                "target_output": target_output,
-                "num_timesteps": self.config.num_timesteps,
-                "think_mode": think_mode,
-                **params,  # CFG params
-            },
+            requires_cfg=self._requires_cfg(**kwargs),
+            kwargs=kwargs,
         )
         step_metadata =  self._get_step_metadata(full_metadata)
         inputs = self._get_fwd_pass_inputs(
@@ -816,7 +807,7 @@ class BagelModel(Model):
         )
 
     def get_forward_pass_args(
-        self, metadata: CurrentForwardMetadata,
+        self, metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         new_tokens: dict[str, list[int]],
     ) -> ForwardPassArgs:

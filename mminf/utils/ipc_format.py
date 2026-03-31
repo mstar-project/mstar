@@ -1,7 +1,7 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 
-from mminf.engine.kv_store import SequenceInfo
+from mminf.conductor.request_info import CurrentForwardPassInfo, SequenceInfo
 from mminf.graph.base import GraphEdge, TensorPointerInfo
 
 
@@ -40,9 +40,8 @@ class NewRequest(MessageBody):
     request_id: str
     worker_graph_ids: list[str]
     worker_graph_to_worker: dict[str, str]
-    initial_graph_walk: str
     initial_inputs: list[GraphEdge]
-    per_request_metadata: dict = field(default_factory=dict)
+    request_info: CurrentForwardPassInfo
 
 
 @dataclass
@@ -53,13 +52,8 @@ class RemoveRequest(MessageBody):
 @dataclass
 class InputSignals(MessageBody):
     request_id: str
-    graph_walk: str
-    fwd_pass_number: int
     inputs: list[GraphEdge]
-    per_request_metadata: dict = field(default_factory=dict)
-
-    # for KV cache transfer (PD disaggregation)
-    per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
+    request_info: CurrentForwardPassInfo
 
 
 @dataclass

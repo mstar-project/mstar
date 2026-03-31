@@ -9,6 +9,7 @@ import torch
 import yaml
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
@@ -39,7 +40,7 @@ class NodeSubmodule(torch.nn.Module):
         cache_manager: BatchedCacheManager,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict]
+        per_request_info: dict[str, CurrentForwardPassInfo]
     ) -> dict[str, torch.Tensor]: # input name to tensor
         """
         Convert variable-length list[Tensor] inputs to fixed tensors.
@@ -53,8 +54,22 @@ class NodeSubmodule(torch.nn.Module):
         """
         return {k: v[0] for k, v in per_request_inputs[0].items()}
 
+    def get_needed_cache_labels(
+        self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo]
+    ) -> list[str] | None:
+        """Return cache labels this node needs, or None to retrieve all.
+
+        Used by AREngine to skip redundant KV cache transfers.
+        Override in subclasses that only need a subset of available labels.
+        """
+        return None
+
     @abstractmethod
-    def forward(self, **kwargs) -> NameToTensorList:
+    def forward(
+        self,
+        request_info: CurrentForwardPassInfo,
+        **kwargs
+    ) -> NameToTensorList:
         """
         Pure tensor → NameToTensorList computation.
         Compilable + CUDA-graphable.
@@ -186,22 +201,9 @@ def _divide_into_worker_graphs(
 
 
 @dataclass
-class CurrentForwardMetadata:
-    """
-    Full-model forward pass-level metadata for running the current
-    forward pass
-    """
-    input_modalities: list[str]
-    output_modalities: list[str]
-    graph_walk: str
-    is_prefill: bool
-    kwargs: dict = field(default_factory=dict)
-
-
-@dataclass
 class ForwardPassArgs:
     # full_metadata is at the conductor level
-    full_metadata: CurrentForwardMetadata
+    full_metadata: CurrentForwardConductorMetadata
     inputs: list[GraphEdge]
 
     # de_persist_tensors are tensors that will be used for the final time and
@@ -276,7 +278,7 @@ class Model(ABC):
 
     @abstractmethod
     def get_forward_pass_args(
-        self, metadata: CurrentForwardMetadata,
+        self, metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         new_tokens: dict[str, list[int]],
     ) -> ForwardPassArgs:

@@ -4,11 +4,12 @@ import numpy as np
 import torch
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.conductor.request_info import CurrentForwardConductorMetadata
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphEdge, GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT
-from mminf.model.base import CurrentForwardMetadata, Model
+from mminf.model.base import Model
 
 
 class DummyModel(Model):
@@ -134,7 +135,7 @@ class DummyModel(Model):
     def get_initial_forward_pass_args(
         self, input_modalities, output_modalities
     ):
-        return CurrentForwardMetadata(
+        return CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             graph_walk="prefill",
@@ -142,9 +143,9 @@ class DummyModel(Model):
         )
 
     def get_forward_pass_args(
-        self, metadata: CurrentForwardMetadata,
+        self, metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        prev_forward_metadata: CurrentForwardMetadata=None,
+        prev_forward_metadata: CurrentForwardConductorMetadata=None,
     ) -> list[GraphEdge]:
         text_inp = GraphEdge(
             next_node="text_emb",
@@ -188,9 +189,9 @@ class DummyModel(Model):
         return graph_edges
 
     def update_for_next_forward(
-        self, metadata: CurrentForwardMetadata,
+        self, metadata: CurrentForwardConductorMetadata,
         new_tokens: dict[str, list[int]],
-    ) -> CurrentForwardMetadata:
+    ) -> CurrentForwardConductorMetadata:
         # dummy model doesn't actually do anything, so this function will just
         # randomly select a graph walk
         if metadata.graph_walk == "image_gen":

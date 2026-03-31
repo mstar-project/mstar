@@ -7,12 +7,12 @@ import time
 from dataclasses import asdict, dataclass
 
 import torch
-import torchaudio
 import torchvision
 
 try:
+    import torchaudio
     from torchcodec.decoders import VideoDecoder
-except (ImportError, RuntimeError):
+except (ImportError, RuntimeError, OSError):
     VideoDecoder = None
 
 from mminf.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
@@ -46,6 +46,7 @@ class PreprocessWorker:
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
+        tcp_transfer_device="",
     ):
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -68,6 +69,7 @@ class PreprocessWorker:
                 socket_path_prefix=socket_path_prefix,
                 tensor_comm_protocol=tensor_comm_protocol,
                 model=model,
+                tcp_transfer_device=tcp_transfer_device
             )
         )
         self.thread.start()
@@ -140,6 +142,7 @@ class PreprocessWorkerThread:
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         device: str = "cpu",
         model: Model | None = None,
+        tcp_transfer_device="",
     ):
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
@@ -163,6 +166,7 @@ class PreprocessWorkerThread:
             hostname=hostname,
             communicator=self.communicator,
             protocol=tensor_comm_protocol,
+            tcp_transfer_device=tcp_transfer_device,
         )
 
     def _process_input(

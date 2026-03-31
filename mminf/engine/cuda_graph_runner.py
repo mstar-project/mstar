@@ -22,6 +22,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from mminf.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
 
@@ -236,8 +237,13 @@ class CudaGraphRunner:
 
             # Build per-request metadata
             dummy_metadata = {
-                rid: {"requires_cfg": config.requires_cfg}
-                for rid in dummy_rids
+                rid: CurrentForwardPassInfo(
+                    graph_walk=config.graph_walk,
+                    requires_cfg=config.requires_cfg,
+                    fwd_index=0,
+                    random_seed=0,
+                    per_label_seq_info={}
+                ) for rid in dummy_rids
             }
 
             # Preprocess (plans attention+rope outside graph)
@@ -246,7 +252,7 @@ class CudaGraphRunner:
                 cache_manager=cache_manager,
                 per_request_inputs=dummy_inputs,
                 request_ids=dummy_rids,
-                per_request_metadata=dummy_metadata,
+                per_request_info=dummy_metadata,
             )
 
             # Static input buffer for the concatenated embeddings
@@ -265,7 +271,7 @@ class CudaGraphRunner:
                     cache_manager=cache_manager,
                     packed_inputs=preprocessed,
                     request_ids=dummy_rids,
-                    per_request_metadata=dummy_metadata,
+                    per_request_info=dummy_metadata,
                 )
             
             torch.cuda.set_device(self.device)
@@ -287,7 +293,7 @@ class CudaGraphRunner:
                     cache_manager=cache_manager,
                     per_request_inputs=dummy_inputs,
                     request_ids=dummy_rids,
-                    per_request_metadata=dummy_metadata,
+                    per_request_info=dummy_metadata,
                 )
             torch.cuda.synchronize()
 
@@ -349,7 +355,7 @@ class CudaGraphRunner:
         requires_cfg: bool,
         request_ids: list[str],
         per_request_inputs: list[dict],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: Any,
     ) -> dict:
         """Run using a captured CUDA graph.
@@ -409,10 +415,9 @@ class CudaGraphRunner:
         real_metadata = {}
         for i, dummy_rid in enumerate(dummy_rids):
             if i < batch_size:
-                real_metadata[dummy_rid] = per_request_metadata.get(
-                    request_ids[i], {})
+                real_metadata[dummy_rid] = per_request_info[request_ids[i]]
             else:
-                real_metadata[dummy_rid] = {"requires_cfg": requires_cfg}
+                real_metadata[dummy_rid] = static["dummy_metadata"][dummy_rid]
 
         # Preprocess re-plans attention+rope with real page tables
         real_inputs = submodule.preprocess(
@@ -420,7 +425,7 @@ class CudaGraphRunner:
             cache_manager=static_cm,
             per_request_inputs=real_inputs,
             request_ids=dummy_rids,
-            per_request_metadata=real_metadata,
+            per_request_info=real_metadata,
         )
 
         # --- Step 3: Copy real embeddings to static buffer ---
@@ -453,7 +458,7 @@ class CudaGraphRunner:
                     if out_key == "logits":
                         # Sample token from logits (post-graph, CUDA-graph safe)
                         logits = val[0] if isinstance(val, list) else val
-                        meta = per_request_metadata.get(rid, {})
+                        meta = per_request_info[rid].step_metadata
                         token = sample_tokens(
                             logits,
                             temperature=meta.get("temperature", 0.6),

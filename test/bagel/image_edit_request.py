@@ -8,7 +8,7 @@ from pathlib import Path
 import requests
 
 URL = "http://0.0.0.0:8000/generate"
-IMAGE_PATH = "test/bagel/bagel.png"
+IMAGE_PATH = "test/bagel/bagel_gen.png"
 
 
 def main():
@@ -26,7 +26,7 @@ def main():
                 "cfg_img_scale": 2.0,
                 "cfg_interval": [0.0, 1.0],
                 "cfg_renorm_type": "text_channel",
-                "think_mode": True
+                # "think_mode": True
             }),
         }
 

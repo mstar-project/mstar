@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import (
@@ -56,7 +57,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self, graph_walk: str,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
         cache_manager: BatchedCacheManager=None,
     ) -> dict[str, torch.Tensor]: # input name to tensor
         """Convert raw images to packed ViT input format.
@@ -102,6 +103,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
 
     def forward(
         self,
+        request_info: CurrentForwardPassInfo,
         packed_pixel_values: torch.Tensor,
         packed_position_ids: torch.Tensor,
         cu_seqlens: torch.Tensor,
@@ -157,7 +159,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
         self, graph_walk: str,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
         cache_manager: BatchedCacheManager=None,
     ) -> dict[str, torch.Tensor]: # input name to tensor
         """Convert raw images to VAE encoder input format.
@@ -239,6 +241,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
 def _init_latents_and_time_index(
     config: BagelModelConfig,
     device,
+    seed: int,
     H: int=1024,
     W: int=1024,
 ):
@@ -246,39 +249,19 @@ def _init_latents_and_time_index(
     h, w = (H // config.latent_downsample,
             W // config.latent_downsample)
     num_image_tokens = h * w
-    # torch.random.manual_seed(42)
+
+    g = torch.Generator(device=device)
+    g.manual_seed(seed)
     latents = torch.randn(
         num_image_tokens,
         config.vae_config.z_channels * config.latent_patch_size ** 2,
-    ).to(device=device)
+        generator=g,
+        device=device,
+    )
     if torch.is_autocast_enabled():
         latents = latents.to(torch.get_autocast_gpu_dtype())
     time_idx = torch.zeros(latents.shape[0], device=device)
     return latents, time_idx
-
-
-class InitLatents(NodeSubmodule):
-    def __init__(self, config: BagelModelConfig, **kwargs):
-        super().__init__()
-        self.config = config
-        self.register_buffer("detect_device", torch.zeros(1))
-    
-    def preprocess(
-        self, *args, **kwargs
-    ) -> dict[str, torch.Tensor]:
-        result = {}
-        H, W = 1024, 1024
-        device = self.detect_device.device
-        result["latents"], result["time_index"] = _init_latents_and_time_index(
-            self.config, device, H=H, W=W
-        )
-        return result
-    
-    def forward(self, latents, time_index, **kwargs) -> NameToTensorList:
-        return {
-            "latents": [latents],
-            "time_index": [time_index]
-        }
 
 
 class LLMSubmodule(NodeSubmodule):
@@ -404,6 +387,12 @@ class LLMSubmodule(NodeSubmodule):
             result["text_mask"].append(text_mask)
         return result
     
+    def get_needed_cache_labels(
+        self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> list[str] | None:
+        cfg = any([info.requires_cfg for info in per_request_info.values()])
+        return self._get_active_labels(graph_walk, cfg)
+
     def _get_active_labels(
         self, graph_walk: str, cfg: bool
     ):
@@ -422,7 +411,7 @@ class LLMSubmodule(NodeSubmodule):
         self, graph_walk: str,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
         cache_manager: BatchedCacheManager,
     ) -> dict[str, torch.Tensor]: # input name to tensor
         """Data transform + plan attention/rope for all relevant labels.
@@ -438,7 +427,7 @@ class LLMSubmodule(NodeSubmodule):
         device = next(self.parameters()).device
 
         has_cfg = self._batch_get_requires_cfg(
-            per_request_metadata, request_ids
+            per_request_info, request_ids
         )
         labels = self._get_active_labels(graph_walk, has_cfg)
 
@@ -483,6 +472,7 @@ class LLMSubmodule(NodeSubmodule):
             # TODO support batching for image gen
             assert len(per_request_inputs) == 1, "Batching not supported for image gen"
             inputs = per_request_inputs[0]
+            metadata = per_request_info[request_ids[0]]
 
             result["vae_position_ids"] = get_flattened_position_ids_extrapolate(
                 H, W,
@@ -491,7 +481,7 @@ class LLMSubmodule(NodeSubmodule):
             )
             if "latents" not in inputs or len(inputs["latents"]) == 0:
                 result["latents"], result["time_index"] = _init_latents_and_time_index(
-                    self.config, device, H=H, W=W
+                    self.config, device, seed=metadata.random_seed, H=H, W=W
                 )
             else:
                result["latents"] = inputs["latents"][0]
@@ -959,9 +949,9 @@ class LLMSubmodule(NodeSubmodule):
         return result
 
     @torch.compiler.disable
-    def _batch_get_requires_cfg(self, per_request_metadata, request_ids):
+    def _batch_get_requires_cfg(self, per_request_info: dict[str, CurrentForwardPassInfo], request_ids):
         return any(
-            per_request_metadata.get(rid, {}).get("requires_cfg", False)
+            per_request_info[rid].requires_cfg
             for rid in request_ids
         )
 
@@ -971,7 +961,7 @@ class LLMSubmodule(NodeSubmodule):
         request_ids: list[str],
         cache_manager: BatchedCacheManager,
         packed_inputs: dict[str, torch.Tensor],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo]
     ) -> dict[str, NameToTensorList]:
         """Batched forward pass for decode and prefill_text.
 
@@ -979,7 +969,7 @@ class LLMSubmodule(NodeSubmodule):
         the BatchedCacheManager, then splits outputs back per-request.
         """
         has_cfg = self._batch_get_requires_cfg(
-            per_request_metadata, request_ids
+            per_request_info, request_ids
         )
 
         if graph_walk == "decode":
@@ -1004,7 +994,7 @@ class LLMSubmodule(NodeSubmodule):
         request_ids: list[str],
         packed_inputs: dict[str, torch.Tensor],
         has_cfg: bool = False,
-        per_request_metadata: dict[str, dict] | None = None,
+        per_request_info: dict[str, CurrentForwardPassInfo] | None=None
     ) -> dict[str, NameToTensorList]:
         """Batched decode: all requests generate 1 token each.
 
@@ -1048,7 +1038,7 @@ class LLMSubmodule(NodeSubmodule):
     @torch.compiler.disable
     def _batch_get_sampling_param(
         self,
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
         request_ids: list[str],
         key: str,
         default: float | int,
@@ -1057,7 +1047,7 @@ class LLMSubmodule(NodeSubmodule):
     ) -> float | int | torch.Tensor:
         """Extract a sampling param. Returns scalar if uniform, tensor if per-request."""
         values = [
-            per_request_metadata.get(rid, {}).get(key, default)
+            per_request_info[rid].step_metadata.get(key, default)
             for rid in request_ids
         ]
         if len(set(values)) == 1:
@@ -1098,7 +1088,7 @@ class VAEDecoderSubmodule(NodeSubmodule):
         self, graph_walk: str,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo] | None=None,
         cache_manager: BatchedCacheManager=None,
     ):
         """Prepare VAE decoder inputs.
@@ -1170,18 +1160,31 @@ class CombineCFGSubmodule(NodeSubmodule):
         self, graph_walk: str,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
         cache_manager: BatchedCacheManager = None,
     ) -> dict[str, torch.Tensor]:
         assert len(per_request_inputs) == 1
         inputs = per_request_inputs[0]
-        return {
+        device = inputs["v_main"][0].device
+        metadata = per_request_info[request_ids[0]]
+
+        result = {
             "v_main": inputs["v_main"][0],
             "v_cfg_text": inputs["v_cfg_text"][0],
             "v_cfg_img": inputs["v_cfg_img"][0],
-            "latents": inputs["latents"][0],
-            "time_index": inputs["time_index"][0],
         }
+        if "latents" not in inputs or len(inputs["latents"]) == 0:
+            H, W = 1024, 1024
+            result["latents"], result["time_index"] = _init_latents_and_time_index(
+                self.config, device=device, seed=metadata.random_seed, H=H, W=W
+            )
+        else:
+            result = {
+                "latents": inputs["latents"][0],
+                "time_index": inputs["time_index"][0],
+                **result,
+            }
+        return result
 
     def forward(
         self,
