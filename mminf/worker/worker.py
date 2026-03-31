@@ -1,4 +1,5 @@
 import logging
+from time import sleep
 
 import torch
 
@@ -529,3 +530,4 @@ class Worker:
                     self._send_outputs(request_id, routing_per_request[request_id])
             except Exception:
                 logger.exception("Worker %s error in main loop", self.worker_id)
+                sleep(0.01)

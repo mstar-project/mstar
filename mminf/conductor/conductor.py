@@ -10,7 +10,7 @@ import numpy as np
 import yaml
 
 from mminf.api_server.request_types import APIServerMessage, RequestComplete
-from mminf.communication.communicator import ZMQCommunicator
+from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
 from mminf.engine.base import EngineType
 from mminf.conductor.request_info import SequenceInfo
@@ -48,7 +48,8 @@ def _worker_process_target(
     model: Model | None = None,
     device: str = "cuda",
     log_level: str = "INFO",
-    mooncake_port: int=8080
+    mooncake_port: int=8080,
+    tensor_comm_protocol=CommProtocol.RDMA
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
     logging.basicConfig(
@@ -74,7 +75,8 @@ def _worker_process_target(
         enable_nvtx=enable_nvtx,
         device=torch.device(device),
         model=model,
-        mooncake_port=mooncake_port
+        mooncake_port=mooncake_port,
+        tensor_comm_protocol=tensor_comm_protocol
     )
     worker.run()
 
@@ -128,7 +130,8 @@ class Conductor:
         hostname: str = "localhost",
         enable_nvtx: bool = False,
         log_level: str = "INFO",
-        mooncake_port: int=8080
+        mooncake_port: int=8080,
+        tensor_comm_protocol=CommProtocol.RDMA,
     ):
         self.requests: dict[str, RequestData] = {}
         self.model = model
@@ -137,6 +140,7 @@ class Conductor:
         self.log_level = log_level
         self.enable_nvtx = enable_nvtx
         self.mooncake_port = mooncake_port
+        self.tensor_comm_protocol = tensor_comm_protocol
 
         self._worker_processes: list[mp.Process] = []
 
@@ -230,7 +234,8 @@ class Conductor:
                     "enable_nvtx": self.enable_nvtx,
                     "device": f"cuda:{rank}",
                     "log_level": self.log_level,
-                    "mooncake_port": self.mooncake_port
+                    "mooncake_port": self.mooncake_port,
+                    "tensor_comm_protocol": self.tensor_comm_protocol
                 },
                 daemon=False,
             )

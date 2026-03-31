@@ -24,7 +24,7 @@ from starlette.concurrency import run_in_threadpool
 
 from mminf.api_server.data_worker import PreprocessWorker
 from mminf.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
-from mminf.communication.communicator import ZMQCommunicator
+from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.model.registry import HF_MODELS
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,7 @@ def _conductor_process_target(
     log_level: str = "INFO",
     cache_dir: str | None = None,
     mooncake_port: int=8080,
+    tensor_comm_protocol=CommProtocol.RDMA
 ):
     """Runs DummyConductor.run() in a spawned process."""
     logging.basicConfig(
@@ -78,7 +79,8 @@ def _conductor_process_target(
         socket_path_prefix=socket_path_prefix,
         enable_nvtx=enable_nvtx,
         log_level=log_level,
-        mooncake_port=mooncake_port
+        mooncake_port=mooncake_port,
+        tensor_comm_protocol=tensor_comm_protocol
     )
     try:
         conductor.run()
@@ -164,6 +166,7 @@ class APIServer:
         hostname: str="localhost",
         timeout_seconds: float = 600.0,
         mooncake_port=8080,
+        tensor_comm_protocol=CommProtocol.RDMA,
         model=None,
     ):
         self.upload_dir = Path(upload_dir)
@@ -176,6 +179,7 @@ class APIServer:
             model=model,
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
+            tensor_comm_protocol=tensor_comm_protocol
         )
 
         # Concurrent request tracking
@@ -584,6 +588,11 @@ def main():
         help="Enable torch.cuda.nvtx markers during execution",
     )
     parser.add_argument(
+        "--tensor-comm-protocol",
+        type=str, default="RDMA",
+        help="RDMA or TCP"
+    )
+    parser.add_argument(
         "--cache-dir", type=str, default=None,
         help="Directory for caching downloaded HuggingFace model files",
     )
@@ -617,6 +626,7 @@ def main():
         upload_dir=args.upload_dir,
         timeout_seconds=args.timeout,
         mooncake_port=args.mooncake_port,
+        tensor_comm_protocol=args.tensor_comm_protocol,
         model=model,
     )
 
@@ -632,6 +642,7 @@ def main():
             args.log_level,
             args.cache_dir,
             args.mooncake_port,
+            CommProtocol(args.tensor_comm_protocol)
         ),
     )
     conductor_proc.start()
