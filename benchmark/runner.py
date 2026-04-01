@@ -45,6 +45,7 @@ class BenchmarkConfig:
     num_warmup: int = 3
     profiling_type: ProfilingType = ProfilingType.OFFLINE
     inference_system: InferenceSystemType = InferenceSystemType.OURS
+    verbose: bool = False
 
     batch_size: Optional[int] = 1
     rate: Optional[float] = 1
@@ -148,7 +149,8 @@ class Benchmark:
             tic = time.perf_counter()
             metrics = await self._run_batch(session, batch)
             toc = time.perf_counter()
-            print(toc - tic)
+            if self.config.verbose:
+                print(toc - tic)
             all_metrics.extend(metrics)
             await asyncio.sleep(0.01)
 
@@ -191,10 +193,12 @@ class Benchmark:
             connector=aiohttp.TCPConnector(),
             read_bufsize=5 * 2**20,  # 1MB read buffer
         ) as session:
-            print("--- Warmup ---")
+            if self.config.verbose:
+                print("--- Warmup ---")
             warmup_req = requests[0]
             for i in range(self.config.num_warmup):
-                print(f"Warmup {i+1} / {self.config.num_warmup}")
+                if self.config.verbose:
+                    print(f"Warmup {i+1} / {self.config.num_warmup}")
                 await self.inference_system.send_request(
                     session=session,
                     base_url=self.config.url,
@@ -204,7 +208,8 @@ class Benchmark:
                     prompt=warmup_req.prompt,
                     image_path=warmup_req.image_path,
                 )
-            print("Warmup complete.\n")
+            if self.config.verbose:
+                print("Warmup complete.")
 
             wall_start = time.monotonic()
 
@@ -248,6 +253,7 @@ def parse_args() -> BenchmarkConfig:
                         help="Requests/sec (default: 1.0)")
     parser.add_argument("--output-dir", default=None,
                         help="Directory to save outputs (text files / images). Omit to skip.")
+    parser.add_argument("--verbose", action="store_true")
 
     # VBench args
     vbench = parser.add_argument_group("vbench")
@@ -274,9 +280,10 @@ def parse_args() -> BenchmarkConfig:
         inference_system=InferenceSystemType(args.inference_system),
         batch_size=args.batch_size,
         rate=args.rate,
+        verbose=args.verbose,
         output_dir=args.output_dir,
         vbench_cache_dir=args.vbench_cache_dir,
-        request_txt_file=args.request_txt_file
+        request_txt_file=args.request_txt_file,
     )
 
 
