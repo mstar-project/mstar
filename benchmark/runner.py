@@ -10,12 +10,13 @@ from typing import Optional
 import aiohttp
 
 from benchmark.base import Model, RequestType
-from benchmark.dataset import BaseDataset, VBenchDataset
+from benchmark.dataset import BaseDataset, TxtFileDataset, VBenchDataset
 from benchmark.request import AggregateMetrics, InferenceSystem, OurSystem, RequestInput, RequestMetrics, VLLMOmni, aggregate_metrics
 
 
 class DatasetType(Enum):
     VBENCH = "vbench"
+    TEXT = "text"
 
 
 class InferenceSystemType(Enum):
@@ -51,6 +52,9 @@ class BenchmarkConfig:
     # VBench args
     vbench_cache_dir: str = "./vbench_cache"
 
+    # text dataset args
+    request_txt_file: str = "benchmark/assets/simple_text_queries.txt"
+
 
 class Benchmark:
     def __init__(self, config: BenchmarkConfig):
@@ -63,6 +67,12 @@ class Benchmark:
                 cache_dir=self.config.vbench_cache_dir,
                 task=self.config.request_type,
                 num_requests=self.config.num_requests,
+            )
+        elif self.config.dataset == DatasetType.TEXT:
+            return TxtFileDataset(
+                filename=self.config.request_txt_file,
+                num_requests=self.config.num_requests,
+                req_type=self.config.request_type 
             )
         raise ValueError(f"Unknown dataset: {self.config.dataset}")
 
@@ -243,6 +253,13 @@ def parse_args() -> BenchmarkConfig:
     vbench = parser.add_argument_group("vbench")
     vbench.add_argument("--vbench-cache-dir", default="./vbench_cache",
                         help="Directory to cache downloaded VBench data (default: ./vbench_cache)")
+    
+    # Text dataset args
+    text_dataset = parser.add_argument_group("text_dataset")
+    text_dataset.add_argument(
+        "--request-txt-file", default="benchmark/assets/simple_text_queries.txt",
+        help="Text file with one line per prompt"
+    )
 
     args = parser.parse_args()
 
@@ -259,6 +276,7 @@ def parse_args() -> BenchmarkConfig:
         rate=args.rate,
         output_dir=args.output_dir,
         vbench_cache_dir=args.vbench_cache_dir,
+        request_txt_file=args.request_txt_file
     )
 
 

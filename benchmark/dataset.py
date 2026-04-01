@@ -22,6 +22,58 @@ class BaseDataset(ABC):
         return [
             self[i] for i in range(len(self))
         ]
+    
+    @property
+    @abstractmethod
+    def num_requests(self) -> int:
+        pass
+    
+    def _resize_data(self, data: list[RequestInput]) -> list[RequestInput]:
+        """Resize data to match num_prompts."""
+        if not self.num_requests:
+            return data
+
+        if len(data) < self.num_requests:
+            factor = (self.num_requests // len(data)) + 1
+            data = data * factor
+
+        return data[: self.num_requests]
+
+
+class TxtFileDataset(BaseDataset):
+    """
+    Dataset loader for text-to-text prompts, coming from a provided text file
+    with one line per prompt
+    """
+
+    def __init__(
+        self,
+        filename: str,
+        num_requests: int,
+        req_type=RequestType.T2T
+    ):
+        assert req_type in [
+            RequestType.T2T, RequestType.T2I
+        ]
+        self.items = []
+        self._num_requests = num_requests
+        with open(filename, "r") as f:
+            for line in f.readlines():
+                self.items.append(RequestInput(
+                    req_type=RequestType.T2T,
+                    prompt=line.strip()
+                ))
+        self._resize_data(self.items)
+    
+    @property
+    def num_requests(self):
+        return self._num_requests
+    
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestInput:
+        return self.items[idx]
 
 
 UND_PROMPT = "Describe this image in detail."
@@ -48,9 +100,13 @@ class VBenchDataset(BaseDataset):
     ):
         self.cache_dir = cache_dir
         self.task = task
-        self.num_requests = num_requests
+        self._num_requests = num_requests
         self.items = self._load_data()
         self._resize_data(self.items)
+    
+    @property
+    def num_requests(self):
+        return self._num_requests
 
     def _load_data(self) -> list[RequestInput]:
         if self.task == RequestType.T2I:
@@ -192,17 +248,6 @@ class VBenchDataset(BaseDataset):
             )
             for f in files
         ]
-
-    def _resize_data(self, data: list[RequestInput]) -> list[RequestInput]:
-        """Resize data to match num_prompts."""
-        if not self.num_requests:
-            return data
-
-        if len(data) < self.num_requests:
-            factor = (self.num_requests // len(data)) + 1
-            data = data * factor
-
-        return data[: self.num_requests]
 
     def __len__(self) -> int:
         return len(self.items)

@@ -1,0 +1,105 @@
+What is the capital of France?
+Explain the difference between machine learning and deep learning.
+Write a haiku about autumn leaves.
+Summarize the French Revolution in three sentences.
+What are the main causes of climate change?
+Translate "Good morning, how are you?" into Spanish.
+What is the Pythagorean theorem?
+Write a professional email declining a job offer.
+Explain how photosynthesis works.
+What is the difference between a virus and a bacterium?
+Give me a recipe for chocolate chip cookies.
+What were the main causes of World War I?
+Explain the concept of supply and demand.
+What is quantum entanglement?
+Write a short story opening about a lighthouse keeper.
+What is the time complexity of quicksort?
+How does the human immune system work?
+What is the difference between a simile and a metaphor?
+Explain the water cycle.
+What are the symptoms of dehydration?
+Write a product description for a wireless ergonomic keyboard.
+What is Occam's Razor?
+How does GPS work?
+What is the difference between affect and effect?
+Explain the concept of compound interest.
+What are the five stages of grief?
+Write a one-paragraph bio for a fictional marine biologist.
+What is the speed of light?
+How do vaccines work?
+What is the difference between a democracy and a republic?
+Explain what RAM does in a computer.
+What is the plot of Romeo and Juliet?
+How do black holes form?
+What are the benefits of meditation?
+Write a limerick about a sleepy cat.
+What is the difference between weather and climate?
+Explain recursion to a beginner programmer.
+What is the significance of the Magna Carta?
+How does the stock market work?
+What is the difference between a hypothesis and a theory?
+Describe three common logical fallacies.
+What is the mitochondria's role in the cell?
+How does bread rise when you bake it?
+Write a tagline for a fictional coffee shop called "The Daily Grind."
+What is Moore's Law?
+Explain the concept of natural selection.
+What is the difference between latitude and longitude?
+How does a combustion engine work?
+What are the primary colors of light?
+Summarize the plot of George Orwell's 1984.
+What is the difference between syntax and semantics in programming?
+How does the moon affect ocean tides?
+What is a sonnet?
+Explain what inflation is and what causes it.
+What are the branches of the U.S. federal government?
+How does Wi-Fi work?
+What is the difference between a CV and a resume?
+Explain the trolley problem.
+What is CRISPR and how does it work?
+Write a two-sentence horror story.
+What is the difference between a Roman and an Arabic numeral?
+How does a neural network learn?
+What is the Turing Test?
+Explain the concept of opportunity cost.
+What causes rainbows?
+How does the Electoral College work?
+What is the difference between renewable and nonrenewable energy?
+Explain what a REST API is.
+What is the significance of the Rosetta Stone?
+How do noise-canceling headphones work?
+What is the difference between empathy and sympathy?
+Describe the steps of the scientific method.
+What is the difference between a copyright and a trademark?
+Explain what dark matter is.
+How does a search engine index the web?
+What is the difference between TCP and UDP?
+Write a short motivational quote about perseverance.
+What is the Fermi Paradox?
+Explain how a microwave oven heats food.
+What are the key principles of object-oriented programming?
+What is the difference between a saturated and unsaturated fat?
+How does anesthesia work?
+What is the difference between monetary and fiscal policy?
+Explain what a hash function does.
+What caused the fall of the Roman Empire?
+How does carbon dating work?
+What is the difference between deductive and inductive reasoning?
+Write a one-sentence pitch for an app that helps people track their reading habits.
+What is the significance of the Heisenberg Uncertainty Principle?
+How does sleep affect memory consolidation?
+What is the difference between a mutation and a genetic disorder?
+Explain what net neutrality means.
+What is the Baader-Meinhof phenomenon?
+How does an airplane generate lift?
+What is the difference between a primary and a secondary source?
+What are the main differences between Python and JavaScript?
+Explain the concept of entropy in thermodynamics.
+What is the prisoner's dilemma?
+How does the human eye perceive color?
+What is the difference between a compiler and an interpreter?
+Explain the concept of cognitive dissonance.
+What is the Drake Equation?
+How does mRNA work in protein synthesis?
+Write a brief explanation of blockchain for a non-technical audience.
+What is the difference between weather forecasting and climate modeling?
