@@ -526,9 +526,10 @@ class Conductor:
                 request_id, request_data.max_output_tokens
             )
             fwd_args.request_done = True
+
         if fwd_args.request_done:
-            return True # stop the request
-        
+            return True  # stop the request
+
         request_data.fwd_pass_number += 1
         request_data.random_seed += 1
         request_data.curr_forward_outputs.clear()
@@ -622,11 +623,17 @@ class Conductor:
                     if message.message_type == ConductorMessageType.NEW_REQUEST:
                         self._ingest_request(message.body)
                     elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
-                        done_with_fwd = self._process_worker_graphs_done(
+                        rid = message.body.request_id
+                        if rid not in self.requests:
+                            logger.debug(
+                                "WORKER_GRAPHS_DONE for unknown request %s (already completed?)", rid
+                            )
+                            continue
+                        result = self._process_worker_graphs_done(
                             message.body
                         )
-                        if done_with_fwd:
-                            done_forward_passes.append(message.body.request_id)
+                        if result:
+                            done_forward_passes.append(rid)
                     else:
                         raise ValueError(f"Unknown message type: {message.message_type}")
 

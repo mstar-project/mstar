@@ -104,10 +104,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
 
         logits = self.lm_head(hidden[-1:])
         token = torch.argmax(logits, dim=-1)
-        return {
-            "new_token": [token],
-            "audio_token": [token],
-        }
+        return {"new_token": [token]}
 
     def forward_batched(
         self,
@@ -147,7 +144,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
         tokens = torch.argmax(logits, dim=-1)
 
         return {
-            rid: {"new_token": [tokens[i : i + 1]], "audio_token": [tokens[i : i + 1]]}
+            rid: {"new_token": [tokens[i : i + 1]]}
             for i, rid in enumerate(request_ids)
         }
 
@@ -155,15 +152,14 @@ class OrpheusLLMSubmodule(NodeSubmodule):
 class SNACDecoderSubmodule(NodeSubmodule):
     """SNAC 24kHz decoder submodule.
 
-    Accumulates audio tokens per-request and decodes a full frame (7 tokens)
-    into PCM audio when ready.
+    Receives a batch of audio token IDs (already converted to SNAC codes)
+    via per_request_metadata and decodes the full utterance into PCM audio.
     """
 
     def __init__(self, snac_model: nn.Module, config: OrpheusModelConfig):
         super().__init__()
         self.snac_model = snac_model
         self.config = config
-        self._buffers: dict[str, list[int]] = {}
 
     def preprocess(
         self,
@@ -173,47 +169,42 @@ class SNACDecoderSubmodule(NodeSubmodule):
         per_request_metadata: dict[str, dict],
         cache_manager: BatchedCacheManager = None,
     ) -> dict[str, torch.Tensor]:
-        assert len(per_request_inputs) == 1, "SNAC decoder processes one request at a time"
+        assert len(request_ids) == 1, "SNAC decoder processes one request at a time"
         request_id = request_ids[0]
-        audio_token = per_request_inputs[0]["audio_token"][0]
+        meta = per_request_metadata.get(request_id, {})
+        audio_token_ids = meta.get("audio_token_ids", [])
         return {
             "request_id": request_id,
-            "audio_token": audio_token,
+            "audio_token_ids": audio_token_ids,
         }
 
-    def forward(self, request_id: str, audio_token: torch.Tensor, **kwargs) -> NameToTensorList:
-        device = audio_token.device
-        token_id = audio_token.item()
-
-        # Initialize buffer for new requests
-        if request_id not in self._buffers:
-            self._buffers[request_id] = []
-
-        buf = self._buffers[request_id]
-        pos = len(buf)
-
-        # Convert token ID to SNAC code: token_id - 10 - ((pos % 7) * 4096)
-        code = token_id - 10 - ((pos % 7) * 4096)
-
-        if code < 0 or code > 4096:
-            # Invalid code, skip but still track position
-            buf.append(code)
+    def forward(self, request_id: str, audio_token_ids: list[int], **kwargs) -> NameToTensorList:
+        if not audio_token_ids or len(audio_token_ids) < 7:
+            logger.warning(
+                "SNAC forward: no/insufficient token IDs for request %s (got %d)",
+                request_id, len(audio_token_ids) if audio_token_ids else 0,
+            )
             return {}
+        device = next(self.snac_model.parameters()).device
+        result = self._decode_tokens(audio_token_ids, device)
+        if not result:
+            logger.warning(
+                "SNAC decode returned empty for request %s (codes may be out of range)",
+                request_id,
+            )
+        else:
+            logger.debug(
+                "SNAC produced final audio for request %s (%d samples)",
+                request_id, result["audio_chunk"][0].numel(),
+            )
+        return result
 
-        buf.append(code)
-
-        # Check if we have a complete frame (multiple of 7 tokens, at least 7)
-        if len(buf) >= 7 and len(buf) % 7 == 0:
-            return self._decode_latest_frames(buf, device)
-
-        return {}
-
-    def _decode_latest_frames(self, buf: list[int], device: torch.device) -> NameToTensorList:
-        """Decode the last 4 frames (28 tokens) worth of audio, return slice [2048:4096]."""
-        # Use last 28 tokens (4 frames) for context, matching reference implementation
-        num_context_tokens = min(len(buf), 28)
-        frame_tokens = buf[-num_context_tokens:]
-        num_frames = len(frame_tokens) // 7
+    def _decode_tokens(self, token_ids: list[int], device: torch.device) -> NameToTensorList:
+        """Decode a full SNAC token sequence into one PCM utterance."""
+        num_frames = len(token_ids) // 7
+        if num_frames == 0:
+            return {}
+        frame_tokens = token_ids[: num_frames * 7]
 
         codes_0 = []
         codes_1 = []
@@ -245,12 +236,5 @@ class SNACDecoderSubmodule(NodeSubmodule):
         with torch.inference_mode():
             audio_hat = self.snac_model.decode(codes)
 
-        # Slice [2048:4096] to get the relevant audio chunk (matching reference)
-        audio_slice = audio_hat[:, :, 2048:4096].detach()
-        # Convert to int16 PCM
-        audio_int16 = (audio_slice * 32767).to(torch.int16).squeeze()
+        audio_int16 = (audio_hat.clamp(-1, 1) * 32767).to(torch.int16).squeeze().detach()
         return {"audio_chunk": [audio_int16]}
-
-    def clear_request(self, request_id: str):
-        """Clean up buffer when request completes."""
-        self._buffers.pop(request_id, None)

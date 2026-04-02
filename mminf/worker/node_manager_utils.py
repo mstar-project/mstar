@@ -195,7 +195,7 @@ class WorkerGraphsManager:
     def process_new_inputs(
         self,
         request_id: str,
-        inputs: list[GraphEdge]
+        inputs: list[GraphEdge],
     ):
         """
         Updates queues with new inputs for a request.
@@ -207,7 +207,8 @@ class WorkerGraphsManager:
 
     def process_node_outputs(
         self, request_id: str,
-        outputs: list[GraphEdge]
+        outputs: list[GraphEdge],
+        graph_walk: str | None = None,
     ) -> NodeOutputRouting:
         """
         After a node has finished processing, use its outputs to update
@@ -218,12 +219,19 @@ class WorkerGraphsManager:
         worker, and directs external outputs to worker graphs on the appropriate
         (different) worker.
         """
+        if graph_walk is None:
+            graph_walk = self.get_graph_walk(request_id)
+
         # (1) find back_to_conductor flags
         to_conductor = [edge for edge in outputs if edge.persist]
         new_token_outputs = [edge for edge in outputs if edge.is_new_token]
 
         # (2) process all internal-facing outputs
-        worker_graph_ids = self.per_request_info[request_id].graph_walk_worker_graph_ids
+        worker_graph_ids = [
+            gid
+            for gid in self.per_request_info[request_id].worker_graph_ids
+            if graph_walk in self.all_worker_graph_ids_to_graph_walks[gid]
+        ]
 
         completed_worker_graph_ids = []
         routed_to_this_worker: list[GraphEdge] = [] # list of graph edges
@@ -253,7 +261,7 @@ class WorkerGraphsManager:
         emit_to_client: list[GraphEdge] = []
         for edge in external_outputs:
             node_graph_walk = NodeAndGraphWalk(
-                node=edge.next_node, graph_walk=self.get_graph_walk(request_id)
+                node=edge.next_node, graph_walk=graph_walk
             )
             if node_graph_walk not in self.per_request_info[request_id].node_to_worker:
                 if edge.next_node in SPECIAL_DESTINATIONS or edge.persist:
@@ -371,6 +379,7 @@ class WorkerGraphsManager:
         return new_tokens
     
     def flush_output_signals(self, request_id: str) -> list[str]:
-        out_chunks = self.per_request_info[request_id].current_output_chunks
-        self.per_request_info[request_id].current_output_chunks.clear()
+        info = self.per_request_info[request_id]
+        out_chunks = list(info.current_output_chunks)  # copy before clearing
+        info.current_output_chunks.clear()
         return out_chunks

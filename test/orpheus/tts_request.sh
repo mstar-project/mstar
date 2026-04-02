@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Quick curl test for Orpheus TTS.
-# Streams NDJSON with base64-encoded PCM audio chunks.
+# Returns one final PCM audio payload after decode completes.
 
-URL="${1:-http://127.0.0.1:8000/generate}"
+URL="${1:-http://127.0.0.1:20001/generate}"
 
 curl -v -X POST "$URL" \
   -F 'text=Hello, how are you doing today?' \

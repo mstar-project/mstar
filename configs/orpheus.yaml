@@ -4,4 +4,4 @@ node_groups:
   - node_names: [LLM]
     ranks: [0]
   - node_names: [snac_decoder]
-    ranks: [0]
+    ranks: [1]

@@ -249,7 +249,8 @@ class Worker:
         signal_only = [edge for edge in body.inputs if len(edge.tensor_info) == 0]
         if signal_only:
             self.worker_graphs_manager.process_new_inputs(
-                request_id=body.request_id, inputs=signal_only
+                request_id=body.request_id,
+                inputs=signal_only,
             )
 
     def _unpersist_tensors(self, body: UnpersistTensors):
@@ -488,13 +489,16 @@ class Worker:
         return output_edges
 
     def _send_outputs(
-        self, request_id: str, outputs: NodeOutputRouting
+        self, request_id: str, outputs: NodeOutputRouting,
+        graph_walk: str | None = None,
     ) -> None:
         """
         Send outputs to other workers and to the conductor.
         Persist signals are buffered and sent together with the
         WORKER_GRAPHS_DONE message to avoid race conditions.
         """
+        if graph_walk is None:
+            graph_walk = self.worker_graphs_manager.get_graph_walk(request_id)
         for worker_id, edges in outputs.to_workers.items():
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
@@ -647,9 +651,9 @@ class Worker:
 
                 # 6. Route outputs through WorkerGraphsManager first to determine routing
                 routing_per_request: dict[str, NodeOutputRouting] = {}
-                for request_id,node in batch.node_objects.items():
+                for request_id, node in batch.node_objects.items():
                     routing = self.worker_graphs_manager.process_node_outputs(
-                        request_id, node.outputs
+                        request_id, node.outputs, graph_walk=batch.graph_walk
                     )
                     routing_per_request[request_id] = routing
 
@@ -658,7 +662,10 @@ class Worker:
 
                 # 8. Send outputs to other workers / conductor
                 for request_id in batch.node_objects.keys():
-                    self._send_outputs(request_id, routing_per_request[request_id])
+                    self._send_outputs(
+                        request_id, routing_per_request[request_id],
+                        graph_walk=batch.graph_walk,
+                    )
             except Exception:
                 logger.exception("Worker %s error in main loop", self.worker_id)
                 sleep(0.01)

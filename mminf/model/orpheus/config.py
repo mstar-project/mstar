@@ -33,4 +33,6 @@ class OrpheusModelConfig:
     max_new_tokens: int = 4096
 
     # Available voices
-    available_voices: list[str] = field(default_factory=lambda: ["zoe", "zac", "jess", "leo", "mia", "julia", "leah"])
+    available_voices: list[str] = field(
+        default_factory=lambda: ["tara", "zoe", "zac", "jess", "leo", "mia", "julia", "leah"]
+    )

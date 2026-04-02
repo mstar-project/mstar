@@ -222,7 +222,6 @@ class ForwardPassArgs:
     # is passed into the fwd pass
     step_metadata: dict = field(default_factory=dict)
 
-
 class Model(ABC):
     def _get_worker_graphs_for_graph_walk(
         self, graph_walk: str, graph: GraphSection,

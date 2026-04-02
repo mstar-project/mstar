@@ -10,9 +10,14 @@ Architecture (2 nodes):
     LLM           (ar)          - Llama 3.2 3B with extended vocab for audio tokens
     snac_decoder  (audio_codec) - SNAC 24kHz decoder
 
-Graph walks (2):
-    prefill - LLM only: fills KV cache with text prompt tokens
-    decode  - Sequential[LLM, snac_decoder]: generate audio token, decode to PCM
+Graph walks (3):
+    prefill   - LLM only: fills KV cache with text prompt tokens
+    decode    - LLM only: autoregressive audio token generation
+    audio_gen - snac_decoder only: decode the full generated token buffer to PCM
+
+For the current MVP path, generation is non-streaming: the conductor stays on
+the LLM decode walk until EOS, then performs a single audio_gen walk on the
+SNAC decoder using the full accumulated token buffer.
 """
 
 import logging
@@ -24,7 +29,7 @@ from transformers import AutoTokenizer
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
-from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Sequential, TensorPointerInfo
+from mminf.graph.base import GraphEdge, GraphNode, GraphSection, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
@@ -111,41 +116,35 @@ class OrpheusModel(Model):
             ],
         )
 
-        decode = Sequential(
-            [
-                GraphNode(
-                    name="LLM",
-                    input_ids=["text_inputs"],
-                    outputs=[
-                        GraphEdge(
-                            next_node="snac_decoder",
-                            name="audio_token",
-                        ),
-                        GraphEdge(
-                            next_node=EMPTY_DESTINATION,
-                            name="new_token",
-                            is_new_token=True,
-                            persist=True,
-                        ),
-                    ],
+        decode = GraphNode(
+            name="LLM",
+            input_ids=["text_inputs"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMPTY_DESTINATION,
+                    name="new_token",
+                    is_new_token=True,
+                    persist=True,
                 ),
-                GraphNode(
-                    name="snac_decoder",
-                    input_ids=["audio_token"],
-                    outputs=[
-                        GraphEdge(
-                            next_node=EMIT_TO_CLIENT,
-                            name="audio_chunk",
-                            output_modality="audio",
-                        ),
-                    ],
+            ],
+        )
+
+        audio_gen = GraphNode(
+            name="snac_decoder",
+            input_ids=["audio_tokens"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="audio_chunk",
+                    output_modality="audio",
                 ),
-            ]
+            ],
         )
 
         return dict(
             prefill=prefill,
             decode=decode,
+            audio_gen=audio_gen,
         )
 
     # -------------------------------------------------------------------
@@ -218,30 +217,71 @@ class OrpheusModel(Model):
             # Transition from prefill to decode
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # Check for stop token
-            tokens = new_tokens.get("new_token", [])
-            if self.config.stop_token_id in tokens:
-                request_done = True
+            # Initialise per-request token accumulation.
+            metadata.kwargs["audio_token_buffer"] = []
+            metadata.kwargs["audio_token_count"] = 0
+            metadata.kwargs["decode_finished"] = False
 
-        # Build inputs for this forward pass
-        if metadata.graph_walk == "prefill":
-            graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-            graph_edge.tensor_info = persist_signals.get("text_inputs", [])
-            inputs = [graph_edge]
-        else:
-            # decode: previous token feeds back as text_inputs
+        elif metadata.graph_walk == "audio_gen":
+            # audio_gen is the terminal pass for the non-streaming path.
+            request_done = metadata.kwargs.get("decode_finished", False)
+
+        elif metadata.graph_walk == "decode":
+            tokens = new_tokens.get("new_token", [])
+            buf = metadata.kwargs["audio_token_buffer"]
+            count = metadata.kwargs["audio_token_count"]
+
+            for t in tokens:
+                if t == self.config.stop_token_id:
+                    request_done = True
+                    metadata.kwargs["decode_finished"] = True
+                    break
+                code = t - 10 - ((count % 7) * 4096)
+                buf.append(code)
+                count += 1
+            metadata.kwargs["audio_token_count"] = count
+
+            if request_done and count >= self.config.tokens_per_frame:
+                logger.debug(
+                    "Decode complete; switching to audio_gen with %d audio tokens",
+                    count,
+                )
+                metadata.graph_walk = "audio_gen"
+                request_done = False
+
+        if request_done:
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
+            )
+
+        # Build inputs depending on current walk
+        if metadata.graph_walk == "decode":
             graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
             graph_edge.tensor_info = persist_signals.get("new_token", [])
             inputs = [graph_edge]
+            unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+            step_metadata = {"is_prefill": False}
 
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+        elif metadata.graph_walk == "audio_gen":
+            # Signal-only trigger for snac_decoder; the full token buffer is
+            # provided via per-request metadata.
+            graph_edge = GraphEdge(next_node="snac_decoder", name="audio_tokens")
+            inputs = [graph_edge]
+            unpersist_tensors = []
+            buf = metadata.kwargs["audio_token_buffer"]
+            step_metadata = {"audio_token_ids": list(buf)}
+
+        else:
+            raise ValueError(f"Unexpected graph_walk: {metadata.graph_walk!r}")
 
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
+            step_metadata=step_metadata,
             request_done=request_done,
         )
 
