@@ -17,7 +17,7 @@ class RequestMetrics:
     request_id: str
     type: RequestType
     start_time: Optional[float]=None
-    status: Status=Status.PROGRESS,
+    status: Status=Status.PROGRESS
     ttft: Optional[float]=None
     e2e_latency: Optional[float]=None
     error: Optional[str]=None
@@ -75,8 +75,8 @@ class AggregateMetrics:
     type_counts: dict[str, int]
     total_output_tokens: int=0
     mean_output_tokens: Optional[float]=None
-    online: bool=False,
-    batch_size: int=1,
+    online: bool=False
+    batch_size: int=1
     rate: Optional[float]=None
 
     def __str__(self) -> str:
