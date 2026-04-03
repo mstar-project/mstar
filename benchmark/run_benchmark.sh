@@ -13,5 +13,5 @@ python -m benchmark.runner \
     --vbench-cache-dir "$CACHE_DIR" \
     --num-requests "${NUM_REQUESTS:-10}" \
     --inference-system "${INF_SYS:-ours}" \
-    ${BATCH_SIZE:+--batch-size "$BATCH_SIZE"}
+    ${BATCH_SIZE:+--batch-size "$BATCH_SIZE"} \
     ${RATE:+--rate "$RATE"}
