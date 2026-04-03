@@ -1,9 +1,5 @@
 #!/bin/bash
 
-#!/bin/bash
-
-#!/bin/bash
-
 BATCH_SIZES=(1 2 4 8 16)
 NUM_BATCHES="${NUM_BATCHES:-10}"
 MIN_NUM_REQUESTS="${MIN_NUM_REQUESTS:-20}"

@@ -567,7 +567,11 @@ class LLMSubmodule(NodeSubmodule):
                 seq_lens=seq_lens, pos_ids=pos_ids, label=label
             )
 
-    def forward(self, graph_walk: str, cache_handle=None, **kwargs) -> NameToTensorList:
+    def forward(
+        self, graph_walk: str, request_info: CurrentForwardPassInfo,
+        cache_handle=None, **kwargs
+    ) -> NameToTensorList:
+        kwargs.update(request_info.step_metadata)
         logger.debug("Running BAGEL LLM for graph walk %s and inputs %s", graph_walk)
 
         if graph_walk == "prefill_text":
