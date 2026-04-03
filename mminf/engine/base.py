@@ -35,6 +35,8 @@ class NodeOutput:
     """Output from an engine's execute_batch()."""
     # {request_id: {output_name: [tensor]}}
     per_request_output_tensors: dict[str, NameToTensorList]
+    # Set to True when page allocation failed; worker should hold and retry.
+    allocation_failed: bool = False
 
 
 class BaseEngine(ABC):
