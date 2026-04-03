@@ -42,39 +42,6 @@ class EncoderDecoderEngine(BaseEngine):
         self.submodules = submodules
         self.device = device
 
-    def _can_batch_inputs(self, batch: NodeBatch) -> bool:
-        """Check if all requests have same-shaped inputs for stacking."""
-        if len(batch.request_ids) <= 1:
-            return False
-
-        # Get reference shapes from first request
-        first_rid = batch.request_ids[0]
-        first_inputs = batch.per_request_input_tensors.get(first_rid, {})
-        if not first_inputs:
-            return False
-
-        ref_shapes = {}
-        for name, tensor_list in first_inputs.items():
-            if not tensor_list:
-                continue
-            ref_shapes[name] = [t.shape for t in tensor_list]
-
-        # Check all other requests match
-        for rid in batch.request_ids[1:]:
-            inputs = batch.per_request_input_tensors.get(rid, {})
-            if set(inputs.keys()) != set(first_inputs.keys()):
-                return False
-            for name, tensor_list in inputs.items():
-                if name not in ref_shapes:
-                    continue
-                if len(tensor_list) != len(ref_shapes[name]):
-                    return False
-                for t, ref_shape in zip(tensor_list, ref_shapes[name]):
-                    if t.shape != ref_shape:
-                        return False
-
-        return True
-
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Stack same-shaped inputs and run a single forward pass."""
         request_ids = batch.request_ids
@@ -152,7 +119,7 @@ class EncoderDecoderEngine(BaseEngine):
         try:
             with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
                 with torch.no_grad():
-                    if self._can_batch_inputs(batch):
+                    if submodule.can_batch(batch):
                         return self._execute_batched(batch, submodule)
                     else:
                         return self._execute_sequential(batch, submodule)

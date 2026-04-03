@@ -1,3 +1,4 @@
+from enum import Enum
 import logging
 from dataclasses import dataclass
 
@@ -34,6 +35,10 @@ PRIORITY = {
     EngineType.AUDIO_CODEC: 3,
 }
 
+class SchedulingType(Enum):
+    PRIORITY = "priority"
+    ROUND_ROBIN = "round_robin"
+
 
 class MicroScheduler:
     """
@@ -41,8 +46,62 @@ class MicroScheduler:
     groups by node name, returns the highest-priority group.
     """
 
-    def __init__(self, engine_manager: EngineManager):
+    def __init__(
+        self, engine_manager: EngineManager,
+        sched_type=SchedulingType.ROUND_ROBIN
+    ):
         self.engine_manager = engine_manager
+        self.batch_number = 0
+        self.sched_type = sched_type
+        self.node_and_walk_to_last_batch_num = {}
+    
+    def _select_node_priority(
+        self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
+    ):
+        # Pick the node name with highest priority (lowest PRIORITY value)
+        best_node_name = None
+        best_priority = float("inf")
+
+        for node_name in node_name_to_requests:
+            if node_name not in self.engine_manager.node_to_engine:
+                continue
+            engine = self.engine_manager.get_engine(node_name)
+            prio = PRIORITY.get(engine.engine_type(), 99)
+            if prio < best_priority:
+                best_priority = prio
+                best_node_name = node_name
+        if best_node_name is None:
+            return None, None
+        entries = node_name_to_requests[best_node_name]
+
+        # Enforce same graph_walk for the entire batch.
+        # Pick the most common graph_walk to maximize batch size;
+        # remaining requests stay in the queue for the next cycle.
+        walk_counts: dict[str, int] = {}
+        for e in entries:
+            walk_counts[e.graph_walk] = walk_counts.get(e.graph_walk, 0) + 1
+        graph_walk = max(walk_counts, key=walk_counts.get)
+
+        return node_name, graph_walk
+
+    def _select_node_rr(
+        self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
+    ):
+        best_node_name = None
+        best_graph_walk = None
+        least_recent_step = float('inf')
+
+        for node_name, reqs in node_name_to_requests.items():
+            for req in reqs:
+                step = self.node_and_walk_to_last_batch_num.get((
+                    node_name, req.graph_walk
+                ), 0)
+                if step < least_recent_step:
+                    least_recent_step = step
+                    best_node_name = node_name
+                    best_graph_walk = req.graph_walk
+        return best_node_name, best_graph_walk
+
 
     def get_next_batch(
         self,
@@ -67,7 +126,13 @@ class MicroScheduler:
                 if request_id not in worker_graphs_manager.per_request_info:
                     continue  # request was removed between scheduling cycles
                 graph_walk = worker_graphs_manager.get_graph_walk(request_id)
+                fwd_info = worker_graphs_manager.get_fwd_info(request_id)
                 for sname in node_names:
+                    # check if the node is ready on the engine level
+                    # (e.g., for AR, whether the kv cache is read in)
+                    engine = self.engine_manager.get_engine(sname)
+                    if not engine.check_ready(sname, request_id, fwd_info):
+                        continue
                     node_name_to_requests.setdefault(sname, []).append(
                         ReadyNodeEntry(request_id, worker_graph_id, graph_walk)
                     )
@@ -75,33 +140,19 @@ class MicroScheduler:
         if not node_name_to_requests:
             return None
 
-        # Pick the node name with highest priority (lowest PRIORITY value)
-        best_node_name = None
-        best_priority = float("inf")
-
-        for node_name in node_name_to_requests:
-            if node_name not in self.engine_manager.node_to_engine:
-                continue
-            engine = self.engine_manager.get_engine(node_name)
-            prio = PRIORITY.get(engine.engine_type(), 99)
-            if prio < best_priority:
-                best_priority = prio
-                best_node_name = node_name
+        if self.sched_type == SchedulingType.PRIORITY:
+            best_node_name, graph_walk = self._select_node_priority(node_name_to_requests)
+        elif self.sched_type == SchedulingType.ROUND_ROBIN:
+            best_node_name, graph_walk = self._select_node_rr(node_name_to_requests)
+        else:
+            raise NotImplementedError(f"Unkown scheduling type {self.sched_type}")
 
         if best_node_name is None:
             return None
 
         # Pop ready nodes for all requests of this node name
-        entries = node_name_to_requests[best_node_name]
-
-        # Enforce same graph_walk for the entire batch.
-        # Pick the most common graph_walk to maximize batch size;
-        # remaining requests stay in the queue for the next cycle.
-        walk_counts: dict[str, int] = {}
-        for e in entries:
-            walk_counts[e.graph_walk] = walk_counts.get(e.graph_walk, 0) + 1
-        graph_walk = max(walk_counts, key=walk_counts.get)
-        entries = [e for e in entries if e.graph_walk == graph_walk]
+        entries = [e for e in node_name_to_requests[best_node_name] \
+                   if e.graph_walk == graph_walk]
 
         # Limit batch size if requested (e.g., for CUDA graph compatibility)
         if max_batch_size is not None and len(entries) > max_batch_size:
@@ -123,6 +174,10 @@ class MicroScheduler:
             "MicroScheduler scheduling node %s with graph walk %s for %d requests",
             best_node_name, graph_walk, len(node_objects)
         )
+        self.batch_number += 1
+        self.node_and_walk_to_last_batch_num[(
+            best_node_name, graph_walk
+        )] = self.batch_number
 
         return ScheduledBatch(
             node_name=best_node_name,

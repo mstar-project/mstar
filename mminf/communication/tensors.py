@@ -1,3 +1,4 @@
+from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -22,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class EventAndPointers:
-    event: torch.cuda.Event
+class FutureAndPointers:
+    future: Future | None
     graph_edges: list[GraphEdge]
     request_id: str = ""
 
@@ -175,11 +176,90 @@ class TensorCommunicationManager(ABC):
         pass
 
 
+@dataclass
+class TransferReadInfo:
+    source_session_id: str
+    local_ptr: int
+    remote_ptr: int
+    nbytes: int
+
+
+class AsyncMooncakeReader:
+    """Background thread for non-blocking mooncake READ operations.
+
+    Follows SGLang's pattern: caller records CUDA event on default stream,
+    submits write task to thread pool. Worker thread waits on event via
+    dedicated CUDA stream, then does blocking mooncake PUTs.
+    The default stream is never blocked by store writes.
+    """
+
+    def __init__(self, engine, device, max_workers: int = 1, max_batch_size=500):
+        self._engine = engine
+        self.max_batch_size = max_batch_size
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._pending: list[Future] = []
+        if device != "cpu":
+            self._copy_stream = torch.cuda.Stream(device=device)
+        else:
+            self._copy_stream = torch.cuda.Stream()
+
+    def submit(self, read_info: list[TransferReadInfo]) -> Future:
+        """Non-blocking: enqueue a batch of READs.
+
+        Records a CUDA event on the current stream to ensure GPU data
+        is ready before the background thread reads it.
+        """
+        if not read_info:
+            return
+        event = torch.cuda.current_stream().record_event()
+        future = self._executor.submit(self._do_read, read_info, event)
+        self._pending.append(future)
+        # Prune completed futures to avoid unbounded growth
+        self._pending = [f for f in self._pending if not f.done()]
+        return future
+
+    def _do_read(self, read_info: list["TransferReadInfo"], event: torch.cuda.Event):
+        """Worker thread: wait for GPU data via CUDA event, then PUT."""
+        self._copy_stream.wait_event(event)
+        self._copy_stream.synchronize()
+
+        # group read_info by session id for batch read
+        grouped_read = {}
+        for info in read_info:
+            grouped_read.setdefault(info.source_session_id, []).append(info)
+
+        for (session_id, infos) in grouped_read.items():
+            for start in range(0, len(infos), self.max_batch_size):
+                end = min(start + self.max_batch_size, len(infos))
+            
+                status = self._engine.batch_transfer_sync_read(
+                    session_id,
+                    [infos[i].local_ptr for i in range(start, end)],
+                    [infos[i].remote_ptr for i in range(start, end)],
+                    [infos[i].nbytes for i in range(start, end)],
+                )
+                if status < 0:
+                    raise RuntimeError(f"Mooncake read failed. Status: {status}")
+
+    def wait_all(self):
+        """Block until all pending writes complete. Re-raises exceptions."""
+        for f in self._pending:
+            f.result()
+        self._pending.clear()
+
+    def shutdown(self):
+        """Wait for pending writes and shut down the thread pool."""
+        self.wait_all()
+        self._executor.shutdown(wait=True)
+
+
+
 class MooncakeCommunicationManager(TensorCommunicationManager):
     def __init__(
         self,
         my_entity_id: str,
         hostname: str,
+        device: str,
         communicator: BaseCommunicator,
         protocol: CommProtocol=CommProtocol.RDMA,
         metadata_server: str="P2PHANDSHAKE", # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
@@ -193,8 +273,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         self.communicator = communicator
         self.protocol = protocol
         self.my_session_id = hostname
-
-        self.copy_stream = torch.cuda.Stream()
+        self.device = device
 
         if TransferEngine is not None:
             if self.protocol == CommProtocol.RDMA:
@@ -225,12 +304,16 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     "Install mooncake-transfer-engine or set tensor protocol to IPC."
                 )
             self.engine = None
+        self._async_reader = AsyncMooncakeReader(
+            self.engine, device=device
+        )
         # Per-transfer pending list (allows partial tensor readiness)
-        self.pending: list[EventAndPointers] = []
+        self.pending: list[FutureAndPointers] = []
 
     def store_and_return_tensor_info(
         self, request_id: str, tensors: NameToTensorList,
     ) -> dict[str, list[TensorPointerInfo]]: # name to list[tensorPointerInfo]
+        torch.cuda.default_stream().synchronize()
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
             tensor_info[name] = []
@@ -256,6 +339,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         return tensor_info
 
     def register_for_send(self, request_id, uuids):
+        torch.cuda.default_stream().synchronize()
         for uuid in uuids:
             if self.protocol == CommProtocol.RDMA:
                 if self.engine is None:
@@ -269,7 +353,6 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     request_id=request_id, uuid=uuid
                 )
 
-                torch.cuda.default_stream().synchronize()
                 ret_value = self.engine.register_memory(
                     tensor.data_ptr(), tensor.nbytes
                 )
@@ -409,13 +492,11 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         # request_id -> ready graph edges
         ready: dict[str, list[GraphEdge]] = {}
         still_pending = []
-        torch.cuda.default_stream().synchronize()
 
         for ep in self.pending:
-            if ep.event.query():
-                # TODO: the system sometimes hangs under many requests unless we have this,
-                # but we don't want to wait for unrelated copies before proceeding...
-                self.copy_stream.synchronize()
+            if ep.future is None or ep.future.done():
+                if ep.future is not None:
+                    ep.future.result()
                 for edge in ep.graph_edges:
                     ready.setdefault(ep.request_id, []).append(edge)
                     logger.debug(
@@ -436,15 +517,14 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         return ready
 
     def start_read_tensors(
-        self, request_id: str, graph_edges: list[GraphEdge],
-        device: str="cuda"
+        self, request_id: str,
+        graph_edges: list[GraphEdge],
     ):
         """
         For each edge with tensor_info (RDMA source): allocate dst tensor,
         register memory, call engine.transfer_read_on_cuda(), record CUDA event.
         For each edge WITHOUT tensor_info (signal-only): no data to transfer.
         """
-        stream = self.copy_stream
         for graph_edge in graph_edges:
             if len(graph_edge.tensor_info) == 0:
                 continue  # signal-only edge, no data to transfer
@@ -454,6 +534,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node
             )
 
+            read_info = []
             for info in graph_edge.tensor_info:
                 if info.source_entity == self.my_entity_id or self.tensor_store.check_uuid_presence(
                     request_id, info.uuid
@@ -462,9 +543,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         request_id, info.uuid, 1 # increment reference while it is being read
                     )
                     continue
-                buffer = torch.empty(info.dims, dtype=info.dtype, device=device).as_strided(
-                    info.dims, stride=info.stride
-                )
+                buffer = torch.empty(
+                    info.dims, dtype=info.dtype, device=self.device
+                ).as_strided(info.dims, stride=info.stride)
                 self.tensor_store.put_tensor(
                     request_id=request_id, uuid=info.uuid, tensor=buffer
                 )
@@ -482,30 +563,17 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         )
                     self.engine.register_memory(buffer.data_ptr(), info.nbytes)
 
-
-                if hasattr(self.engine, "transfer_read_on_cuda"):
-                    with torch.cuda.stream(stream):
-                        self.engine.transfer_read_on_cuda(
-                            info.source_session_id,
-                            buffer.data_ptr(),
-                            info.address,
-                            info.nbytes,
-                            stream.cuda_stream,
-                        )
-                else:
-                    # TODO: maybe replace both transfer read paths with a thread-based mechanism
-                    self.engine.transfer_sync_read(
-                        info.source_session_id,
-                        buffer.data_ptr(),
-                        info.address,
-                        info.nbytes,
-                    )
+                read_info.append(TransferReadInfo(
+                    source_session_id=info.source_session_id,
+                    local_ptr=buffer.data_ptr(),
+                    remote_ptr=info.address,
+                    nbytes=info.nbytes,
+                ))
                 logger.debug("Started transfer read for uuid %s", info.uuid)
-            # For now, have one cuda event for all tensors in this graph edge
-            event = torch.cuda.Event()
-            event.record(stream)
+            fut = self._async_reader.submit(read_info)
             self.pending.append(
-                EventAndPointers(
-                    event=event, graph_edges=[graph_edge], request_id=request_id
+                FutureAndPointers(
+                    future=fut, graph_edges=[graph_edge],
+                    request_id=request_id
                 )
             )

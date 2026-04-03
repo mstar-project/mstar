@@ -478,7 +478,6 @@ class CudaGraphRunner:
             for label in config_labels:
                 self.alloc_manager.reset_label(
                     rid, label, free=i>=batch_size,
-                    clear_store=False # there should be nothing with the dummy rid in the store
                 )
         for rid in request_ids:
             for label in config_labels:

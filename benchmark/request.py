@@ -17,7 +17,7 @@ class RequestMetrics:
     request_id: str
     type: RequestType
     start_time: Optional[float]=None
-    status: Status=Status.PROGRESS,
+    status: Status=Status.PROGRESS
     ttft: Optional[float]=None
     e2e_latency: Optional[float]=None
     error: Optional[str]=None
@@ -75,13 +75,15 @@ class AggregateMetrics:
     type_counts: dict[str, int]
     total_output_tokens: int=0
     mean_output_tokens: Optional[float]=None
+    online: bool=False
+    batch_size: int=1
     rate: Optional[float]=None
 
     def __str__(self) -> str:
-        if self.rate is not None:
-            header = f"Benchmark Results ({self.n_requests} requests, rate={self.rate} req/s)"
+        if self.online:
+            header = f"Online Benchmark Results ({self.n_requests} requests, rate={self.rate} req/s)"
         else:
-            header = f"Benchmark Results ({self.n_requests} requests, sequential)"
+            header = f"Offline Benchmark Results ({self.n_requests} requests, batch={self.batch_size})"
         header += "\n" + ("\u2500" * 50)
 
         tpt = ""
@@ -133,6 +135,8 @@ def _latency_stats(values: list[float]) -> LatencyStats:
 def aggregate_metrics(
     requests: list[RequestMetrics],
     wall_time: float,
+    online: bool=False,
+    batch_size: int=1,
     rate: Optional[float]=None,
 ) -> AggregateMetrics:
     n_success = sum(1 for r in requests if r.status == Status.SUCCESS)
@@ -154,6 +158,8 @@ def aggregate_metrics(
         e2e_latency=_latency_stats(e2e_vals),
         itl=_latency_stats(itl_vals),
         wall_time=wall_time,
+        online=online,
+        batch_size=batch_size,
         rate=rate,
         type_counts=type_counts,
         total_output_tokens=total_tokens,

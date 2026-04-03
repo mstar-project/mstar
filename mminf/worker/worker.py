@@ -91,16 +91,11 @@ class Worker:
             communicator=self.communicator,
             protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
+            device=self.device
         )
 
         self.engine_manager = EngineManager.from_config(
             engine_configs=engine_configs, device=device,
-            mooncake_cfg=MooncakeStoreConfig(
-                hostname=hostname,
-                metadata_server=f"http://localhost:{mooncake_port}/metadata",
-                protocol=tensor_comm_protocol,
-                master_service=master_service
-            ),
             transfer_engine_info=TransferEngineInfo(
                 my_entity_id=worker_id,
                 my_session_id=self.tensor_manager.my_session_id,
@@ -193,7 +188,6 @@ class Worker:
         # Start RDMA reads for tensors that have tensor_info
         self.tensor_manager.start_read_tensors(
             body.request_id, body.initial_inputs,
-            device=self.device
         )
 
         # Signal-only edges (tensor_info is None) can be processed immediately
@@ -235,7 +229,6 @@ class Worker:
         # Start RDMA reads for tensors with tensor_info
         self.tensor_manager.start_read_tensors(
             body.request_id, body.inputs,
-            device=self.device
         )
 
         # Signal-only edges can be processed immediately
@@ -489,6 +482,7 @@ class Worker:
                 # 3. Pick next batch via MicroScheduler
                 batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
                 if batch is None:
+                    sleep(0.001) # added this (with my original original code) and it works!
                     continue
 
                 # 4. Gather input tensors for the batch

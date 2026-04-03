@@ -167,6 +167,7 @@ class PreprocessWorkerThread:
             communicator=self.communicator,
             protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
+            device=self.device
         )
 
     def _process_input(
@@ -263,7 +264,6 @@ class PreprocessWorkerThread:
         self.tensor_manager.start_read_tensors(
             request_id=result.request_id,
             graph_edges=[result.graph_edge],
-            device=self.device
         )
         if result.request_id not in self.tensor_uuid_to_metadata_per_request:
             self.tensor_uuid_to_metadata_per_request[result.request_id] = {}

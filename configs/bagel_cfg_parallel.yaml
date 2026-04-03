@@ -15,7 +15,6 @@ node_groups:
 
   # Main LLM: handles all prefill + decode + image_gen main branch + combine_cfg
   - node_names:
-      - init_latents
       - LLM
       - combine_cfg
     ranks:

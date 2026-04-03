@@ -50,7 +50,6 @@ class AREngine(BaseEngine):
         submodules: dict[str, torch.nn.Module],
         model_config: dict,
         device: torch.device,
-        mooncake_cfg: MooncakeStoreConfig,
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=torch.bfloat16,
     ) -> None:
@@ -78,7 +77,6 @@ class AREngine(BaseEngine):
         self.alloc_manager = PagedAllocationManager(
             config=cfg,
             kv_cache=self.kv_cache,
-            mooncake_cfg=mooncake_cfg,
             transfer_engine_info=transfer_engine_info
         )
 
@@ -184,22 +182,6 @@ class AREngine(BaseEngine):
             del tensors["logits"]
 
         return output
-
-    def _can_batch(self, batch: NodeBatch) -> bool:
-        """Only batch when all requests share a batchable graph_walk path.
-
-        image_gen with 3-pass CFG is too complex to batch initially due to
-        multi-label switching and snapshot operations within the forward pass.
-        """
-        if len(batch.request_ids) <= 1:
-            return False
-        if batch.graph_walk not in ("decode", "prefill_text"):
-            return False
-        # Ensure the submodule supports batched forward
-        submodule = self.submodules.get(batch.node_name)
-        if submodule is None or not hasattr(submodule, "forward_batched"):
-            return False
-        return True
 
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
@@ -348,21 +330,14 @@ class AREngine(BaseEngine):
             return output
 
         try:
-            # Filter to only retrieve cache labels this node actually needs
-            needed_labels = None
-            if hasattr(submodule, 'get_needed_cache_labels'):
-                needed = submodule.get_needed_cache_labels(
-                    batch.graph_walk, batch.per_request_info
-                )
-                if needed is not None:
-                    needed_labels = set(needed)
-
+            needed_labels = self._get_needed_labels(
+                batch.node_name, batch.graph_walk, batch.per_request_info
+            )
             for req_id, info in batch.per_request_info.items():
-                per_label_seq_info = info.per_label_seq_info
-                for label, seq_info in per_label_seq_info.items():
+                for label, seq_info in info.per_label_seq_info.items():
                     if needed_labels is not None and label not in needed_labels:
                         continue
-                    self.alloc_manager.retrieve_from_store(
+                    self.alloc_manager.sync_retrieve(
                         req_id, label, seq_info
                     )
 
@@ -371,7 +346,7 @@ class AREngine(BaseEngine):
                     # Priority: CUDA graph > batched > sequential
                     if self._can_use_cuda_graph(batch):
                         return self._execute_with_cuda_graph(batch, submodule)
-                    elif self._can_batch(batch):
+                    elif submodule.can_batch(batch):
                         return self._execute_batched(batch, submodule)
                     else:
                         return self._execute_sequential(batch, submodule)
@@ -382,6 +357,42 @@ class AREngine(BaseEngine):
             if self.enable_nvtx:
                 range_pop()
 
+    def _get_needed_labels(
+        self, node_name: str, graph_walk: str,
+        request_info: dict[str, CurrentForwardPassInfo]
+    ):
+        submodule = self.submodules.get(node_name)
+        needed_labels = None
+        if hasattr(submodule, 'get_needed_cache_labels'):
+            needed = submodule.get_needed_cache_labels(
+                graph_walk, request_info)
+            if needed is not None:
+                needed_labels = set(needed)
+        return needed_labels
+
+    def check_ready(
+        self, node_name: str, request_id: str,
+        request_info: CurrentForwardPassInfo,
+    ):
+        needed_labels = self._get_needed_labels(
+            node_name, request_info.graph_walk, {
+                    request_id: request_info
+            }
+        )
+
+        labels_to_check = []
+        for label, seq_info in request_info.per_label_seq_info.items():
+            if needed_labels is not None and label not in needed_labels:
+                continue
+            self.alloc_manager.start_async_retrieve(
+                request_id, label, seq_info
+            )
+            labels_to_check.append(label)
+        return all([
+            self.alloc_manager.check_retrieve_ready(request_id, label) \
+                for label in labels_to_check
+        ])
+        
     def add_request(
         self, request_id: str, cache_labels: list[str] | None = None,
     ) -> None:

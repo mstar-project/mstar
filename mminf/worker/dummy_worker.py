@@ -63,6 +63,7 @@ class DummyWorker:
             hostname=hostname,
             communicator=self.communicator,
             protocol=tensor_comm_protocol,
+            device="cpu"
         )
 
     def _add_new_request(

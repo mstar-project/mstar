@@ -169,7 +169,6 @@ class BatchedCacheManager:
             state = self._get_state(rid, effective_label)
             sl = seq_lens[i]
             total_len = state.seq_len + sl
-            state.local_cache_seq_len = total_len
 
             self.alloc_manager.alloc(
                 rid, label=effective_label, seq_len=total_len
@@ -346,7 +345,6 @@ class BatchedCacheManager:
                 state = self._get_state(rid, label)
                 sl = seq_lens[i]
                 total_len = state.seq_len + sl
-                state.local_cache_seq_len = total_len
 
                 self.alloc_manager.alloc(rid, label=label, seq_len=total_len)
 
@@ -609,7 +607,7 @@ class BatchedCacheManager:
             from_state = self._get_state(rid, from_label)
 
             if realloc:
-                self.alloc_manager.reset_label(rid, to_label, clear_store=True)
+                self.alloc_manager.reset_label(rid, to_label)
 
             to_state = self._get_state(rid, to_label)
             start_pos =  to_state.seq_len // self.kv_cache_config.page_size
@@ -619,7 +617,6 @@ class BatchedCacheManager:
 
             to_state.seq_len = from_state.seq_len
             to_state.position_id_start = from_state.position_id_start
-            to_state.local_cache_seq_len = from_state.local_cache_seq_len
 
             for src_page, dst_page in zip(
                 from_state.page_indices[start_pos:],

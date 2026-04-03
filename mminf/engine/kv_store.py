@@ -1,25 +1,17 @@
 import logging
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
 import queue
-# from mooncake.store import MooncakeDistributedStore
 from mooncake.engine import TransferEngine
 
 import torch
 
 from mminf.communication.communicator import CommProtocol
+from mminf.communication.tensors import AsyncMooncakeReader, TransferReadInfo
 from mminf.conductor.request_info import SequenceInfo
 
 logger = logging.getLogger(__name__)
-
-
-# NOTE: when this is changed to be different from the page size (or perhaps when
-# it is made too small), writing large amounts of data to the mooncake store is 
-# sometimes very slow.
-KV_STORE_CHUNK_SIZE = 128
-
-MAX_TRANSFERS = 1000
 
 
 class PageAllocator:
@@ -67,13 +59,12 @@ class KVCacheConfig:
 class KVRequestState:
     """Per-request KV cache state for the AR engine."""
     page_indices: list[int] = field(default_factory=list)
-    seq_len: int = 0
+    seq_len: int = 0 # includes read in progress
     position_id_start: int = 0
 
-    # this must be properly set by the BatchedCacheManager
-    local_cache_seq_len: int = 0
+    read_in_progress: bool = False
+
     # sequence length of the in-distributed-store KV cache
-    store_seq_len_per_layer: list | None = None
     is_paused: bool = False
 
 
@@ -108,70 +99,11 @@ class StoreWritePolicy(Enum):
     NEVER = "never"     # non-disaggregated: all AR graph walks on same worker
 
 
-# class AsyncStoreWriter:
-#     """Background thread for non-blocking mooncake PUT operations.
-
-#     Follows SGLang's pattern: caller records CUDA event on default stream,
-#     submits write task to thread pool. Worker thread waits on event via
-#     dedicated CUDA stream, then does blocking mooncake PUTs.
-#     The default stream is never blocked by store writes.
-#     """
-
-#     def __init__(self, mooncake_store: MooncakeDistributedStore, device, max_workers: int = 1):
-#         self._store = mooncake_store
-#         self._executor = ThreadPoolExecutor(max_workers=max_workers)
-#         self._pending: list[Future] = []
-#         self._write_stream = torch.cuda.Stream(device=device)
-
-#     def submit(self, alloc_info: list["StoreAllocInfo"]):
-#         """Non-blocking: enqueue a batch of PUTs.
-
-#         Records a CUDA event on the current stream to ensure GPU data
-#         is ready before the background thread reads it.
-#         """
-#         if not alloc_info:
-#             return
-#         event = torch.cuda.current_stream().record_event()
-#         future = self._executor.submit(self._do_write, alloc_info, event)
-#         self._pending.append(future)
-#         # Prune completed futures to avoid unbounded growth
-#         self._pending = [f for f in self._pending if not f.done()]
-
-#     def _do_write(self, alloc_info: list["StoreAllocInfo"], event: torch.cuda.Event):
-#         """Worker thread: wait for GPU data via CUDA event, then PUT."""
-#         return
-#         self._write_stream.wait_event(event)
-#         self._write_stream.synchronize()
-#         for start in range(0, len(alloc_info), MAX_TRANSFERS):
-#             end = min(start + MAX_TRANSFERS, len(alloc_info))
-#             status = self._store.batch_put_from_multi_buffers(
-#                 keys=[a.key for a in alloc_info[start:end]],
-#                 all_buffer_ptrs=[a.ptr for a in alloc_info[start:end]],
-#                 all_sizes=[a.nbytes for a in alloc_info[start:end]],
-#             )
-#             if any(s < 0 for s in status):
-#                 raise RuntimeError(
-#                     f"Mooncake async write failed: {status}"
-#                 )
-
-#     def wait_all(self):
-#         """Block until all pending writes complete. Re-raises exceptions."""
-#         for f in self._pending:
-#             f.result()
-#         self._pending.clear()
-
-#     def shutdown(self):
-#         """Wait for pending writes and shut down the thread pool."""
-#         self.wait_all()
-#         self._executor.shutdown(wait=True)
-
-
 class PagedAllocationManager:
     def __init__(
         self,
         config: KVCacheConfig,
         kv_cache: torch.Tensor,
-        mooncake_cfg: MooncakeStoreConfig,
         transfer_engine_info: TransferEngineInfo
     ):
         self.config = config
@@ -180,33 +112,26 @@ class PagedAllocationManager:
         self.kv_cache = kv_cache
         self.write_policy = StoreWritePolicy.ALWAYS
     
-        # self.mooncake_store = MooncakeDistributedStore()
         self.engine = transfer_engine_info.transfer_engine
+        self._async_reader = AsyncMooncakeReader(
+            engine=self.engine, device=kv_cache.device
+        )
 
-        # self.mooncake_store.setup(
-        #     mooncake_cfg.hostname,
-        #     mooncake_cfg.metadata_server,
-        #     mooncake_cfg.segment_size,
-        #     mooncake_cfg.local_buff_size,
-        #     mooncake_cfg.protocol.value.lower(),
-        #     "",
-        #     mooncake_cfg.master_service
-        # )
         self.engine.register_memory(
             self.kv_cache.data_ptr(), self.kv_cache.nbytes
         )
         self.my_entity_id = transfer_engine_info.my_entity_id
         self.my_session_id = transfer_engine_info.my_session_id
 
-        # self._async_writer = AsyncStoreWriter(
-        #     self.mooncake_store, device=kv_cache.device
-        # )
+        # {req_id: {label: futures}}
+        self.pending_reads: dict[str, dict[str, list[Future]]] = {}
 
     def _key(self, request_id: str, label: str, pos: int, layer: int):
         return f"{request_id}_{label}_{pos}_{layer}"
 
     def _get_ptr_nbytes(
-        self, layer, page_idx, token_start, token_end,
+        self, layer, page_idx,
+        token_start, token_end,
         base_ptr=None
     ):
         token_stride = self.kv_cache.stride(3)
@@ -230,31 +155,7 @@ class PagedAllocationManager:
                 ) * element_size for kv_idx in [0, 1]
         ]
 
-        return ptrs, [nbytes, nbytes]
-    
-    # def _read_from_store(self, alloc_info: list[StoreAllocInfo]):
-    #     """Synchronous mooncake GET. Used by retrieve_from_store only.
-
-    #     No pre-transfer sync needed: destination pages are freshly allocated
-    #     and not in use by any GPU kernel. Post-transfer sync ensures DMA
-    #     writes are visible to subsequent GPU kernels.
-    #     """
-    #     if not alloc_info:
-    #         return
-    #     for start in range(0, len(alloc_info), MAX_TRANSFERS):
-    #         end = min(start + MAX_TRANSFERS, len(alloc_info))
-    #         keys = [alloc_info[i].key for i in range(start, end)]
-    #         status = self.mooncake_store.batch_get_into_multi_buffers(
-    #             keys=keys,
-    #             all_buffer_ptrs=[alloc_info[i].ptr for i in range(start, end)],
-    #             all_sizes=[alloc_info[i].nbytes for i in range(start, end)]
-    #         )
-    #         if any(s < 0 for s in status):
-    #             bad_key_status = str({
-    #                 keys[i]: s for i, s in enumerate(status) if s < 0
-    #             })
-    #             raise RuntimeError("Mooncake read failed: " + bad_key_status[:1000] + ("..." if len(bad_key_status) > 1000 else ""))
-    #     torch.cuda.default_stream().synchronize()
+        return ptrs, nbytes
 
     def flush_to_store(
         self, request_id: str, label: str, layers: int | list[int] | None = None
@@ -263,61 +164,9 @@ class PagedAllocationManager:
         # this function will posibly send ZMQ requests to potential receivers, who can do
         # RDMA reads on this Engine's KV cache
         return
-        # if self.write_policy == StoreWritePolicy.NEVER:
-        #     return
-        # assert self.config.page_size % KV_STORE_CHUNK_SIZE == 0, (
-        #     f"page_size ({self.config.page_size}) must be a multiple of "
-        #     f"KV_STORE_CHUNK_SIZE ({KV_STORE_CHUNK_SIZE})"
-        # )
-        # tokens_per_chunk = KV_STORE_CHUNK_SIZE
-        # chunks_per_page = self.config.page_size // tokens_per_chunk
-
-        # if isinstance(layers, int):
-        #     layers = [layers]
-        # if layers is None:
-        #     layers = list(range(self.config.num_layers))
-
-        # state = self.request_states[request_id][label]
-
-        # # Only flush complete chunks — drop any trailing partial chunk
-        # num_complete_chunks = state.local_cache_seq_len // tokens_per_chunk
-        # flush_up_to = num_complete_chunks * tokens_per_chunk  # token boundary
-
-        # alloc_info: list[StoreAllocInfo] = []
-
-        # for layer in layers:
-        #     if state.store_seq_len_per_layer[layer] >= flush_up_to:
-        #         continue
-
-        #     first_chunk = state.store_seq_len_per_layer[layer] // tokens_per_chunk
-        #     last_chunk = num_complete_chunks  # exclusive
-
-        #     state.store_seq_len_per_layer[layer] = flush_up_to
-
-        #     for chunk_idx in range(first_chunk, last_chunk):
-        #         page_pos = chunk_idx // chunks_per_page
-        #         chunk_within_page = chunk_idx % chunks_per_page
-
-        #         page_idx = state.page_indices[page_pos]
-
-        #         # Slice the chunk out of the page tensor
-        #         token_start = chunk_within_page * tokens_per_chunk
-        #         token_end = token_start + tokens_per_chunk
-
-        #         ptr, nbytes = self._get_ptr_nbytes(
-        #             layer, page_idx, token_start, token_end
-        #         )
-        #         alloc_info.append(StoreAllocInfo(
-        #             key=self._key(request_id, label, chunk_idx, layer),
-        #             ptr=ptr,
-        #             nbytes=nbytes
-        #         ))
-        
-        # self._async_writer.submit(alloc_info)
 
     def _new_state(self):
         state = KVRequestState()
-        state.store_seq_len_per_layer = [0] * self.config.num_layers
         return state
 
     def get_state(self, request_id: str, label: str):
@@ -335,37 +184,59 @@ class PagedAllocationManager:
         if num_new_pages > 0:
             new_pages = self.page_allocator.allocate(num_new_pages)
             state.page_indices.extend(new_pages)
+    
+    def wait_for_retrieves(
+        self, request_id: str, label: str
+    ):
+        for future in self.pending_reads[request_id].get(label, []):
+            future.result()
+        state = self.get_state(request_id, label)
+        state.read_in_progress = False
+        self.pending_reads[request_id][label] = []
 
-    def retrieve_from_store(
+    def check_retrieve_ready(
+        self, request_id: str, label: str
+    ) -> bool:
+        """
+        Returns true if all retrieves are done
+        """
+        state = self.get_state(request_id, label)
+        if not state.read_in_progress:
+            return True
+        futures = [
+            fut for fut in self.pending_reads[request_id].get(label, []) \
+                if not fut.done()
+        ]
+        in_progress = (len(futures) > 0)
+        state.read_in_progress = in_progress
+        self.pending_reads[request_id][label] = futures
+        return not in_progress
+
+    def sync_retrieve(
         self, request_id: str, label: str, seq_info: SequenceInfo
     ):
-        assert self.config.page_size % KV_STORE_CHUNK_SIZE == 0, (
-            f"page_size ({self.config.page_size}) must be a multiple of "
-            f"KV_STORE_CHUNK_SIZE ({KV_STORE_CHUNK_SIZE})"
-        )
-        tokens_per_chunk = KV_STORE_CHUNK_SIZE
-        chunks_per_page = self.config.page_size // tokens_per_chunk
+        self.start_async_retrieve(request_id, label, seq_info)
+        self.wait_for_retrieves(request_id, label)
 
+    def start_async_retrieve(
+        self, request_id: str, label: str, seq_info: SequenceInfo
+    ):
         seq_len = seq_info.seq_len
         state = self.get_state(request_id, label)
         if state.seq_len >= seq_len:
             return  # nothing to do
 
-        num_complete_chunks = seq_len // tokens_per_chunk
-        trailing_tokens = seq_len % tokens_per_chunk
-        first_chunk = state.seq_len // tokens_per_chunk
-        total_chunks = num_complete_chunks + (1 if trailing_tokens > 0 else 0)
+        first_page = state.seq_len // self.config.page_size
+        last_page = (seq_len - 1) // self.config.page_size
 
         self.alloc(request_id, label, seq_len)
 
-        local_addrs, remote_addrs, nbytes_list = [], [], []
+        read_info = []
 
-        for chunk_idx in range(first_chunk, total_chunks):
-            page_pos = chunk_idx // chunks_per_page
-            chunk_within_page = chunk_idx % chunks_per_page
-            token_start = chunk_within_page * tokens_per_chunk
-            token_end = token_start + (
-                trailing_tokens if chunk_idx == num_complete_chunks else tokens_per_chunk
+        for page_pos in range(first_page, last_page + 1):
+            token_start = 0 if page_pos > first_page else (state.seq_len % self.config.page_size)
+            token_end = self.config.page_size if page_pos != last_page else (
+                seq_len % self.config.page_size or self.config.page_size
             )
 
             local_page_idx = state.page_indices[page_pos]
@@ -379,37 +250,25 @@ class PagedAllocationManager:
                     layer, remote_page_idx, token_start, token_end,
                     base_ptr=seq_info.kv_cache_addr
                 )
-                local_addrs.extend(local_ptrs)
-                remote_addrs.extend(remote_ptrs)
-                nbytes_list.extend(nbytes)
 
-        for batch_start in range(0, len(local_addrs), MAX_TRANSFERS):
-            batch_end = batch_start + MAX_TRANSFERS
-            status = self.engine.batch_transfer_sync_read(
-                seq_info.latest_session_id,
-                local_addrs[batch_start:batch_end],
-                remote_addrs[batch_start:batch_end],
-                nbytes_list[batch_start:batch_end],
-            )
-            if status < 0:
-                raise RuntimeError("Mooncake retrieve failed")
-
-        if local_addrs:
-            torch.cuda.default_stream().synchronize()
-
+                read_info.extend([
+                    TransferReadInfo(
+                        seq_info.latest_session_id,
+                        local_ptr, remote_ptr, nbytes
+                    ) for local_ptr, remote_ptr in zip(local_ptrs, remote_ptrs)
+                ])
+        future = self._async_reader.submit(read_info)
+        if future is not None:
+            self.pending_reads[request_id].setdefault(label, []).append(future)
         state.seq_len = seq_len
-        state.store_seq_len_per_layer = [
-            num_complete_chunks * tokens_per_chunk for _ in range(self.config.num_layers)
-        ]
-        state.local_cache_seq_len = seq_len
         state.position_id_start = seq_info.pos_id
+        state.read_in_progress = True
     
-    def get_per_label_seq_info(
-        self, request_id: str,
-    ):
-        # self._async_writer.wait_all()
+    def get_per_label_seq_info(self, request_id: str):
         per_label_seq_info: dict[str, SequenceInfo] = {}
         for label, state in self.request_states.get(request_id, {}).items():
+            self.wait_for_retrieves(request_id, label)
+
             state = self.get_state(request_id, label)
             per_label_seq_info[label] = SequenceInfo(
                 seq_len = state.seq_len,
@@ -421,16 +280,16 @@ class PagedAllocationManager:
             )
         return per_label_seq_info
     
-    def reset_label(self, request_id: str, label: str, free: bool=True, clear_store=True):
+    def reset_label(self, request_id: str, label: str, free: bool=True):
+        self.wait_for_retrieves(request_id, label)
         if label in self.request_states[request_id] and free:
             state = self.request_states[request_id][label]
             self.page_allocator.free(state.page_indices)
-        # if clear_store:
-        #     self.mooncake_store.remove_by_regex(f"^{request_id}_{label}.*")
         self.request_states[request_id][label] = self._new_state()
 
     def cleanup(self):
-        # self._async_writer.shutdown()
+        # wait for reads to finish before registering memory!
+        self._async_reader.shutdown()
         self.engine.unregister_memory(
             self.kv_cache.data_ptr()
         )
@@ -441,15 +300,15 @@ class PagedAllocationManager:
         self.request_states[request_id] = {
             label: self._new_state() for label in labels
         }
+        self.pending_reads[request_id] = {
+            label: [] for label in labels
+        }
     
     def remove_request(self, request_id: str):
-        # self._async_writer.wait_all()
         for label in self.request_states[request_id]:
+            self.wait_for_retrieves(request_id, label)
             state = self.request_states[request_id][label]
             self.page_allocator.free(state.page_indices)
         del self.request_states[request_id]
+        del self.pending_reads[request_id]
 
-        # count = self.mooncake_store.remove_by_regex(f"^{request_id}_.*")
-        # # TODO error handling
-        # if count < 0:
-        #     raise RuntimeError("Mooncake remove failed")

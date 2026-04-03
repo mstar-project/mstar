@@ -31,7 +31,6 @@ class EngineManager:
         cls,
         engine_configs: list[dict],
         device: torch.device,
-        mooncake_cfg: MooncakeStoreConfig,
         transfer_engine_info: TransferEngineInfo,
         enable_nvtx: bool = False,
         model: Model | None = None,
@@ -83,7 +82,6 @@ class EngineManager:
 
             engine.load_model(
                 submodules, model_config, device,
-                mooncake_cfg=mooncake_cfg,
                 transfer_engine_info=transfer_engine_info
             )
             logger.info("Engine %s loaded in on device %s", cfg["engine_type"], str(device))
