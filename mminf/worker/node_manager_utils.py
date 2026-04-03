@@ -99,6 +99,13 @@ class WorkerGraphQueues:
             q.ready = [node for i, node in enumerate(q.ready) if i not in pop_idxs]
         return nodes
 
+    def push_back_node(
+        self, request_id: str, node: GraphNode
+    ) -> None:
+        """Push a previously popped node back onto the ready queue (e.g., after OOM hold)."""
+        if request_id in self.per_request_queues:
+            self.per_request_queues[request_id].ready.append(node)
+
     def reset(self, request_id):
         """
         At the end of a worker graph, reset the queues for a request so it can
