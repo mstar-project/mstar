@@ -347,6 +347,7 @@ class AREngine(BaseEngine):
             needed_labels = self._get_needed_labels(
                 batch.node_name, batch.graph_walk, batch.per_request_info
             )
+            self.alloc_manager.alloc_status.reset()
             try:
                 for req_id, info in batch.per_request_info.items():
                     for label, seq_info in info.per_label_seq_info.items():
@@ -355,19 +356,24 @@ class AREngine(BaseEngine):
                         self.alloc_manager.sync_retrieve(
                             req_id, label, seq_info
                         )
-            except RuntimeError as e:
-                if "Not enough free pages" in str(e):
+            except RuntimeError:
+                if not self.alloc_manager.alloc_status.success:
+                    status = self.alloc_manager.alloc_status
                     logger.warning(
                         "KV cache page allocation failed for batch "
-                        "(node=%s, walk=%s, requests=%s): %s",
+                        "(node=%s, walk=%s, request=%s, label=%s, "
+                        "pages_short=%d)",
                         batch.node_name, batch.graph_walk,
-                        batch.request_ids, e,
+                        status.request_id, status.label,
+                        status.pages_short,
                     )
                     return NodeOutput(
                         per_request_output_tensors={
                             rid: {} for rid in batch.request_ids
                         },
                         allocation_failed=True,
+                        alloc_pages_short=status.pages_short,
+                        alloc_failed_request_id=status.request_id,
                     )
                 raise
 
