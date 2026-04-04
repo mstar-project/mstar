@@ -292,31 +292,46 @@ class Worker:
     # CPU offloading
     # ------------------------------------------------------------------
 
-    def _try_offload_cold_request(self, exclude_ids: set[str]) -> bool:
-        """Offload the request with the most GPU pages (not in *exclude_ids*) to CPU.
+    def _try_offload_cold_request(
+        self, batch_ids: set[str]
+    ) -> str | None:
+        """Offload the request with the most GPU pages to CPU.
 
-        Returns True if a request was offloaded, False otherwise.
+        Prefers requests outside *batch_ids*. If none exist, falls back to
+        offloading the largest request *within* the batch (the caller should
+        then exclude it from execution).
+
+        Returns the victim request_id, or None if offloading wasn't possible.
         """
         ar_engine = self.engine_manager.get_ar_engine()
         if ar_engine is None or ar_engine.cpu_page_pool is None:
-            return False
+            return None
         alloc = ar_engine.alloc_manager
-        # Pick the request with the most allocated GPU pages
-        candidates = []
+
+        # Gather all candidates, split into external vs in-batch
+        external: list[tuple[str, int]] = []
+        in_batch: list[tuple[str, int]] = []
         for rid, labels in alloc.request_states.items():
-            if rid in exclude_ids:
-                continue
             total_pages = sum(len(s.page_indices) for s in labels.values())
-            if total_pages > 0:
-                candidates.append((rid, total_pages))
+            if total_pages == 0:
+                continue
+            if rid in batch_ids:
+                in_batch.append((rid, total_pages))
+            else:
+                external.append((rid, total_pages))
+
+        # Prefer external victims; fall back to in-batch
+        candidates = external or in_batch
         if not candidates:
-            return False
+            return None
+
         victim_id = max(candidates, key=lambda x: x[1])[0]
         freed = alloc.offload_request(victim_id, ar_engine.cpu_page_pool)
         logger.info(
-            "Offloaded request %s to CPU (%d GPU pages freed)", victim_id, freed
+            "Offloaded request %s to CPU (%d GPU pages freed, in_batch=%s)",
+            victim_id, freed, victim_id in batch_ids,
         )
-        return freed > 0
+        return victim_id if freed > 0 else None
 
     def _try_reload_request(self, request_id: str) -> bool:
         """Reload an offloaded request back to GPU. Returns True if reloaded."""
@@ -550,23 +565,35 @@ class Worker:
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
 
-                # 5a. Handle allocation failure: push nodes back, try offload, backoff
+                # 5a. Handle allocation failure: offload a victim, retry the rest
                 if output.allocation_failed:
-                    # Try to offload a cold request to free GPU pages
-                    self._try_offload_cold_request(
-                        exclude_ids=set(batch.node_objects.keys())
-                    )
+                    batch_ids = set(batch.node_objects.keys())
+                    victim_id = self._try_offload_cold_request(batch_ids)
+
+                    # Push all batch nodes back to their queues
                     for request_id, node in batch.node_objects.items():
                         wg_id = batch.request_to_worker_graph[request_id]
                         self.worker_graphs_manager.queues[wg_id].push_back_node(
                             request_id, node
                         )
-                    self.scheduler.hold_requests(list(batch.node_objects.keys()))
-                    logger.warning(
-                        "Batch held (OOM): node=%s walk=%s requests=%s",
-                        batch.node_name, batch.graph_walk,
-                        list(batch.node_objects.keys()),
-                    )
+
+                    if victim_id is not None:
+                        # Only hold the offloaded victim (needs CPU→GPU reload)
+                        self.scheduler.hold_requests([victim_id])
+                        logger.warning(
+                            "OOM on node=%s walk=%s: offloaded victim=%s, "
+                            "retrying %d remaining requests",
+                            batch.node_name, batch.graph_walk, victim_id,
+                            len(batch_ids) - (1 if victim_id in batch_ids else 0),
+                        )
+                    else:
+                        # No offloading possible; hold all requests briefly
+                        self.scheduler.hold_requests(list(batch_ids))
+                        logger.warning(
+                            "OOM on node=%s walk=%s: no offload possible, "
+                            "holding %d requests",
+                            batch.node_name, batch.graph_walk, len(batch_ids),
+                        )
                     continue
 
                 for rid, req_info in node_batch.per_request_info.items():
