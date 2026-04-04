@@ -27,11 +27,12 @@ import torch
 from transformers import AutoTokenizer
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mminf.model.base import CurrentForwardMetadata, ForwardPassArgs, Model, NodeSubmodule
+from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
 
 logger = logging.getLogger(__name__)
@@ -141,10 +142,200 @@ class OrpheusModel(Model):
             ],
         )
 
+        # Streaming graph walks for async partition mode
+        decode_llm = GraphNode(
+            name="LLM",
+            input_ids=["text_inputs"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMPTY_DESTINATION,
+                    name="new_token",
+                    is_new_token=True,
+                    persist=True,
+                ),
+                GraphEdge(
+                    next_node="snac_decoder",
+                    name="streaming_token",
+                    is_streaming=True,
+                ),
+            ],
+        )
+
+        snac_chunk = GraphNode(
+            name="snac_decoder",
+            input_ids=["trigger"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="audio_chunk",
+                    output_modality="audio",
+                ),
+            ],
+        )
+
         return dict(
             prefill=prefill,
             decode=decode,
             audio_gen=audio_gen,
+            decode_llm=decode_llm,
+            snac_chunk=snac_chunk,
+        )
+
+    # -------------------------------------------------------------------
+    # Partition API: async streaming (LLM + SNAC)
+    # -------------------------------------------------------------------
+
+    def get_partitions(self) -> list[PartitionDefinition]:
+        return [
+            PartitionDefinition(
+                name="LLM",
+                graph_walks={"prefill", "decode_llm"},
+                initial_walk="prefill",
+                producer_partitions=[],
+            ),
+            PartitionDefinition(
+                name="SNAC",
+                graph_walks={"snac_chunk"},
+                initial_walk=None,
+                producer_partitions=["LLM"],
+            ),
+        ]
+
+    def check_partition_ready(
+        self,
+        partition_name: str,
+        accumulated_token_count: int,
+        consumed_token_count: int,
+        producer_done: bool,
+    ) -> bool:
+        if partition_name != "SNAC":
+            return True
+        window = self.config.snac_window_tokens
+        # Need a full window of tokens starting from the consumed position
+        needed = consumed_token_count + window
+        if accumulated_token_count >= needed:
+            return True
+        # Producer done: drain any remaining tokens as a partial chunk
+        return producer_done and accumulated_token_count > consumed_token_count
+
+    def get_partition_forward_pass_args(
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+        new_tokens: dict[str, list[int]],
+        token_buffer_count: int,
+        producer_done: bool,
+    ) -> ForwardPassArgs:
+        if partition_name == "LLM":
+            return self._get_llm_partition_forward(
+                partition_metadata, persist_signals, new_tokens,
+            )
+        elif partition_name == "SNAC":
+            return self._get_snac_partition_forward(
+                partition_metadata, token_buffer_count, producer_done,
+            )
+        raise ValueError(f"Unknown partition: {partition_name!r}")
+
+    def _get_llm_partition_forward(
+        self,
+        metadata: CurrentForwardConductorMetadata,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+        new_tokens: dict[str, list[int]],
+    ) -> ForwardPassArgs:
+        """LLM partition: prefill -> decode_llm loop until EOS."""
+        request_done = False
+
+        if metadata.is_prefill:
+            metadata.is_prefill = False
+            metadata.graph_walk = "decode_llm"
+            metadata.kwargs["audio_token_count"] = 0
+            metadata.kwargs["decode_finished"] = False
+        elif metadata.graph_walk == "decode_llm":
+            tokens = new_tokens.get("new_token", [])
+            count = metadata.kwargs["audio_token_count"]
+            for t in tokens:
+                if t == self.config.stop_token_id:
+                    request_done = True
+                    metadata.kwargs["decode_finished"] = True
+                    break
+                count += 1
+            metadata.kwargs["audio_token_count"] = count
+
+        if request_done:
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
+            )
+
+        # Build inputs for the next decode_llm forward
+        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
+        graph_edge.tensor_info = persist_signals.get("new_token", [])
+        inputs = [graph_edge]
+        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+        step_metadata = {"is_prefill": metadata.is_prefill}
+
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata=step_metadata,
+        )
+
+    def _get_snac_partition_forward(
+        self,
+        metadata: CurrentForwardConductorMetadata,
+        token_buffer_count: int,
+        producer_done: bool,
+    ) -> ForwardPassArgs:
+        """SNAC partition: decode one streaming chunk."""
+        consumed = metadata.kwargs.get("snac_consumed", 0)
+        window = self.config.snac_window_tokens
+        stride = self.config.snac_stride_tokens
+
+        metadata.graph_walk = "snac_chunk"
+
+        available = token_buffer_count - consumed
+
+        # Check if there's anything left to decode
+        if available <= 0 and producer_done:
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
+            )
+
+        # For the last partial chunk when producer is done
+        chunk_size = min(window, available)
+        window_start = max(0, consumed + chunk_size - window) if consumed > 0 else 0
+
+        # Advance consumed count by stride
+        new_consumed = consumed + stride
+        metadata.kwargs["snac_consumed"] = new_consumed
+
+        # Signal-only trigger for the snac_decoder node
+        graph_edge = GraphEdge(next_node="snac_decoder", name="trigger")
+        inputs = [graph_edge]
+
+        step_metadata = {
+            "window_start": window_start,
+            "window_size": chunk_size,
+            "consumed_tokens": stride,  # used by conductor to track consumption
+        }
+
+        # Check if this is the last chunk
+        remaining_after = token_buffer_count - new_consumed
+        is_last = producer_done and remaining_after < stride
+
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=inputs,
+            unpersist_tensors=[],
+            step_metadata=step_metadata,
+            request_done=is_last,
         )
 
     # -------------------------------------------------------------------
@@ -185,7 +376,7 @@ class OrpheusModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardMetadata(
+        full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             graph_walk="prefill",
@@ -207,7 +398,7 @@ class OrpheusModel(Model):
 
     def get_forward_pass_args(
         self,
-        metadata: CurrentForwardMetadata,
+        metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         new_tokens: dict[str, list[int]],
     ) -> ForwardPassArgs:

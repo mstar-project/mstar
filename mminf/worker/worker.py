@@ -10,7 +10,7 @@ from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
-from mminf.engine.kv_store import MooncakeStoreConfig, StoreWritePolicy, TransferEngineInfo
+from mminf.engine.kv_store import StoreWritePolicy, TransferEngineInfo
 from mminf.graph.base import GraphEdge
 from mminf.graph.request_queues import format_graph_edge_list
 from mminf.model.base import Model, WorkerGraph
@@ -134,6 +134,14 @@ class Worker:
         self._last_active: dict[str, float] = {}  # request_id -> monotonic timestamp
         self.eviction_policy = EvictionPolicy.LRU
 
+        # Streaming buffers: request_id -> edge_name -> list of tensors
+        # Accumulates tokens from streaming edges for consumer nodes (e.g., SNAC)
+        self.streaming_buffers: dict[str, dict[str, list[torch.Tensor]]] = {}
+
+        # Give all engines a reference to streaming buffers
+        for engine in self.engine_manager._unique_engines():
+            engine.set_streaming_buffers(self.streaming_buffers)
+
     def _compute_store_write_policy(
         self,
         my_worker_graphs: list[WorkerGraph],
@@ -222,6 +230,7 @@ class Worker:
         self.worker_graphs_manager.remove_request(body.request_id)
         self.tensor_manager.cleanup_request(body.request_id)
         self._last_active.pop(body.request_id, None)
+        self.streaming_buffers.pop(body.request_id, None)
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
@@ -240,13 +249,27 @@ class Worker:
             format_graph_edge_list(body.inputs), self.worker_id, body.request_id
         )
 
-        # Start RDMA reads for tensors with tensor_info
-        self.tensor_manager.start_read_tensors(
-            body.request_id, body.inputs,
-        )
+        # Separate streaming edges — they'll be handled when tensors are ready
+        # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
+        non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
+        streaming_with_tensors = [edge for edge in body.inputs if edge.is_streaming and edge.tensor_info]
+        streaming_signal_only = [edge for edge in body.inputs if edge.is_streaming and not edge.tensor_info]
 
-        # Signal-only edges can be processed immediately
-        signal_only = [edge for edge in body.inputs if len(edge.tensor_info) == 0]
+        # Start RDMA reads for non-streaming edges with tensor_info
+        self.tensor_manager.start_read_tensors(
+            body.request_id, non_streaming,
+        )
+        # Start RDMA reads for streaming edges with tensor_info (will be routed to buffer in _check_ready_tensors)
+        if streaming_with_tensors:
+            self.tensor_manager.start_read_tensors(
+                body.request_id, streaming_with_tensors,
+            )
+
+        # Streaming signal-only edges: nothing to buffer (no tensor data)
+        # This shouldn't normally happen for streaming edges
+
+        # Signal-only non-streaming edges can be processed immediately
+        signal_only = [edge for edge in non_streaming if len(edge.tensor_info) == 0]
         if signal_only:
             self.worker_graphs_manager.process_new_inputs(
                 request_id=body.request_id,
@@ -299,9 +322,24 @@ class Worker:
         """Poll for completed RDMA transfers, feed ready graph edges to worker graph queues."""
         ready = self.tensor_manager.get_ready_tensors()
         for request_id, edges in ready.items():
-            self.worker_graphs_manager.process_new_inputs(
-                request_id=request_id, inputs=edges
-            )
+            # Separate streaming edges from normal edges
+            streaming = [e for e in edges if e.is_streaming]
+            normal = [e for e in edges if not e.is_streaming]
+
+            # Streaming edges go to the streaming buffer
+            for edge in streaming:
+                buf = self.streaming_buffers.setdefault(request_id, {})
+                edge_buf = buf.setdefault(edge.name, [])
+                for info in edge.tensor_info:
+                    tensor = self.tensor_manager.get_tensor(
+                        request_id=request_id, uuid=info.uuid,
+                    )
+                    edge_buf.append(tensor.clone())
+
+            if normal:
+                self.worker_graphs_manager.process_new_inputs(
+                    request_id=request_id, inputs=normal,
+                )
 
     # ------------------------------------------------------------------
     # CPU offloading
@@ -469,12 +507,13 @@ class Worker:
             routing = routing_per_request[request_id]
             uuids = set()
             for edge in (
-                routing.persist + \
-                sum(routing.to_workers.values(), start=[]) + \
-                routing.emit_to_client
+                routing.persist +
+                sum(routing.to_workers.values(), start=[]) +
+                routing.emit_to_client +
+                sum(routing.streaming_to_workers.values(), start=[])
             ):
                 uuids.update([
-                    info.uuid for info in edge.tensor_info \
+                    info.uuid for info in edge.tensor_info
                 ])
             self.tensor_manager.register_for_send(
                 request_id=request_id, uuids=uuids
@@ -551,7 +590,33 @@ class Worker:
                 )
                 self.communicator.send("api_server", message)
 
+        # Handle streaming edges
+        # Local streaming: store directly in buffer
+        for edge in outputs.streaming_local:
+            buf = self.streaming_buffers.setdefault(request_id, {})
+            edge_buf = buf.setdefault(edge.name, [])
+            for info in edge.tensor_info:
+                tensor = self.tensor_manager.get_tensor(
+                    request_id=request_id, uuid=info.uuid,
+                )
+                edge_buf.append(tensor.clone())
+
+        # Remote streaming: send to destination workers
+        for worker_id, edges in outputs.streaming_to_workers.items():
+            message = WorkerMessage(
+                message_type=WorkerMessageType.INPUT_SIGNALS,
+                body=InputSignals(
+                    request_id=request_id,
+                    inputs=edges,
+                    request_info=self.worker_graphs_manager.get_fwd_info(request_id),
+                ),
+            )
+            self.communicator.send(worker_id, message)
+
         if outputs.completed_worker_graph_ids:
+            # Determine partition_name from the current forward info
+            fwd_info = self.worker_graphs_manager.get_fwd_info(request_id)
+            partition_name = getattr(fwd_info, 'partition_name', 'default')
             message = ConductorMessage(
                 message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
                 body=WorkerGraphsDone(
@@ -561,6 +626,7 @@ class Worker:
                     new_tokens=self.worker_graphs_manager.flush_new_tokens(request_id),
                     output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id),
                     per_label_seq_info=self.worker_graphs_manager.get_seq_info(request_id),
+                    partition_name=partition_name,
                 ),
             )
             self.communicator.send("conductor", message)

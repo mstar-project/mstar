@@ -9,12 +9,15 @@ import torch
 import yaml
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
-from mminf.engine.cache_manager import BatchedCacheManager
+from mminf.conductor.request_info import (
+    CurrentForwardConductorMetadata,
+    CurrentForwardPassInfo,
+    PartitionDefinition,
+)
 from mminf.engine.base import EngineType, NodeBatch
+from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
-
 
 DECODE = "decode"
 
@@ -48,7 +51,7 @@ class NodeSubmodule(torch.nn.Module):
 
         Returns a dict of input name to batched tensor.
 
-        Default: assume one request. 
+        Default: assume one request.
         assert each input has exactly 1 tensor and unwrap it.
         Override for nodes that handle multiple tensors (e.g., stacking images).
         """
@@ -75,7 +78,7 @@ class NodeSubmodule(torch.nn.Module):
         Compilable + CUDA-graphable.
         """
         ...
-    
+
     def can_batch(
         self, batch: NodeBatch
     ):
@@ -353,6 +356,54 @@ class Model(ABC):
 
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
-    
+
     def get_autocast_dtype(self):
         return torch.bfloat16
+
+    # ------------------------------------------------------------------
+    # Partition API (optional, backward-compatible defaults)
+    # ------------------------------------------------------------------
+
+    def get_partitions(self) -> list[PartitionDefinition]:
+        """Return partition definitions.
+
+        Default: single "default" partition containing all graph walks.
+        Override for models with async partitions (e.g., Orpheus LLM + SNAC).
+        """
+        walks = set(self.get_graph_walk_graphs().keys())
+        return [PartitionDefinition(
+            name="default", graph_walks=walks,
+            initial_walk=None, producer_partitions=[],
+        )]
+
+    def get_partition_forward_pass_args(
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+        new_tokens: dict[str, list[int]],
+        token_buffer_count: int,
+        producer_done: bool,
+    ) -> "ForwardPassArgs":
+        """Per-partition transition logic.
+
+        Default: delegate to ``get_forward_pass_args`` (single-partition path).
+        """
+        return self.get_forward_pass_args(
+            partition_metadata, persist_signals, new_tokens,
+        )
+
+    def check_partition_ready(
+        self,
+        partition_name: str,
+        accumulated_token_count: int,
+        consumed_token_count: int,
+        producer_done: bool,
+    ) -> bool:
+        """Check whether a consumer partition should be triggered.
+
+        Called by the conductor after a producer partition completes a
+        forward pass.  Return ``True`` to kick off the consumer's next
+        forward pass.  Default: always ready.
+        """
+        return True

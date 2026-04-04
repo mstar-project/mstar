@@ -1,5 +1,6 @@
 import torch
 
+from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.utils.profiler import range_pop, range_push
 
@@ -7,7 +8,11 @@ from mminf.utils.profiler import range_pop, range_push
 class AudioCodecEngine(BaseEngine):
     """
     Wraps submodules for audio codec forward passes.
-    Stateless — identical lifecycle to EncoderDecoderEngine.
+
+    Supports streaming mode: when ``set_streaming_buffers`` is called with a
+    reference to the worker-level streaming buffer dict, the engine exposes the
+    buffer to submodules via ``per_request_info.step_metadata`` during
+    ``execute_batch`` so submodules can read accumulated tokens.
     """
 
     def __init__(
@@ -19,6 +24,14 @@ class AudioCodecEngine(BaseEngine):
         self.submodules: dict[str, torch.nn.Module] = {}
         self.device = None
         self.autocast_dtype = autocast_dtype
+        # Reference to worker-level streaming buffers (set by Worker.__init__)
+        self._streaming_buffers: dict[str, dict[str, list[torch.Tensor]]] | None = None
+
+    def set_streaming_buffers(
+        self, buffers: dict[str, dict[str, list[torch.Tensor]]],
+    ):
+        """Called by Worker to provide a reference to the shared streaming buffer."""
+        self._streaming_buffers = buffers
 
     def engine_type(self) -> EngineType:
         return EngineType.AUDIO_CODEC
@@ -32,6 +45,24 @@ class AudioCodecEngine(BaseEngine):
     ) -> None:
         self.submodules = submodules
         self.device = device
+
+    def check_ready(
+        self, node_name: str, request_id: str, request_info: CurrentForwardPassInfo,
+    ) -> bool:
+        """Check if enough streaming tokens have accumulated for this request.
+
+        Delegates to the submodule's ``check_streaming_ready`` if it exists,
+        allowing model-defined chunking strategies.
+        """
+        submodule = self.submodules.get(node_name)
+        if submodule is None or self._streaming_buffers is None:
+            return True
+
+        if not hasattr(submodule, 'check_streaming_ready'):
+            return True
+
+        buf = self._streaming_buffers.get(request_id, {})
+        return submodule.check_streaming_ready(buf, request_info)
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         if self.enable_nvtx:
@@ -52,13 +83,22 @@ class AudioCodecEngine(BaseEngine):
                     outputs = {}
                     for rid in batch.request_ids:
                         inputs = batch.per_request_input_tensors.get(rid, {})
+
+                        # Inject streaming buffer into step_metadata if available
+                        fwd_info = batch.per_request_info[rid]
+                        if self._streaming_buffers and rid in self._streaming_buffers:
+                            fwd_info.step_metadata = {
+                                **fwd_info.step_metadata,
+                                "_streaming_buffer": self._streaming_buffers[rid],
+                            }
+
                         if hasattr(submodule, 'preprocess'):
                             preprocessed = submodule.preprocess(
                                 batch.graph_walk,
                                 per_request_inputs=[inputs],
                                 request_ids=[rid],
                                 per_request_info={
-                                    rid: batch.per_request_info[rid]
+                                    rid: fwd_info,
                                 },
                             )
                             outputs[rid] = submodule(**preprocessed)

@@ -5,5 +5,5 @@ node_groups:
     ranks: [0]
     graph_walks: [prefill, decode, decode_llm, audio_gen]
   - node_names: [snac_decoder]
-    ranks: [1]
+    ranks: [0]
     graph_walks: [audio_gen, snac_chunk]

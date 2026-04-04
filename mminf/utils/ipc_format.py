@@ -101,6 +101,7 @@ class WorkerGraphsDone(MessageBody):
     new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
     output_signal_names: int = field(default=0)
     per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
+    partition_name: str = field(default="default")
 
 
 @dataclass

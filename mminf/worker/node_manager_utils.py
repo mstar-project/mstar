@@ -2,6 +2,7 @@ import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 
+from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.graph.base import GraphEdge, GraphNode, TensorPointerInfo
 from mminf.graph.request_queues import (
     PerRequestNodeQueues,
@@ -10,7 +11,6 @@ from mminf.graph.request_queues import (
 )
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, SPECIAL_DESTINATIONS
 from mminf.model.base import WorkerGraph
-from mminf.conductor.request_info import CurrentForwardPassInfo, SequenceInfo
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +26,14 @@ class NodeAndGraphWalk:
 
 @dataclass
 class NodeOutputRouting:
-    routed_to_this_worker_graph:list[GraphEdge]
+    routed_to_this_worker_graph: list[GraphEdge]
     persist: list[GraphEdge] # outputs that are going back to the conductor
     to_workers: dict[str, list[GraphEdge]] # worker id to signals
     emit_to_client: list[GraphEdge] = field(default_factory=list)
     new_token_outputs: list[GraphEdge] = field(default_factory=list)
     completed_worker_graph_ids: list[str] = field(default_factory=list)
+    streaming_to_workers: dict[str, list[GraphEdge]] = field(default_factory=dict)  # streaming edges to other workers
+    streaming_local: list[GraphEdge] = field(default_factory=list)  # streaming edges staying on this worker
 
 
 @dataclass
@@ -182,13 +184,13 @@ class WorkerGraphsManager:
 
     def get_graph_walk(self, request_id: str):
         return self.per_request_info[request_id].current_fwd_info.graph_walk
-    
+
     def get_seq_info(self, request_id: str):
         return self.per_request_info[request_id].current_fwd_info.per_label_seq_info
-    
+
     def get_fwd_number(self, request_id: str):
         return self.per_request_info[request_id].current_fwd_info.fwd_index
-    
+
     def get_fwd_info(self, request_id: str):
         return self.per_request_info[request_id].current_fwd_info
 
@@ -222,9 +224,13 @@ class WorkerGraphsManager:
         if graph_walk is None:
             graph_walk = self.get_graph_walk(request_id)
 
+        # (0) separate streaming edges — they bypass the queue system
+        streaming_edges = [edge for edge in outputs if edge.is_streaming]
+        non_streaming_outputs = [edge for edge in outputs if not edge.is_streaming]
+
         # (1) find back_to_conductor flags
-        to_conductor = [edge for edge in outputs if edge.persist]
-        new_token_outputs = [edge for edge in outputs if edge.is_new_token]
+        to_conductor = [edge for edge in non_streaming_outputs if edge.persist]
+        new_token_outputs = [edge for edge in non_streaming_outputs if edge.is_new_token]
 
         # (2) process all internal-facing outputs
         worker_graph_ids = [
@@ -235,7 +241,7 @@ class WorkerGraphsManager:
 
         completed_worker_graph_ids = []
         routed_to_this_worker: list[GraphEdge] = [] # list of graph edges
-        external_outputs: list[GraphEdge] = outputs
+        external_outputs: list[GraphEdge] = non_streaming_outputs
         for worker_graph_id in worker_graph_ids:
             queue = self.queues[worker_graph_id] # ready / waiting graph node queue
             # process_new_inputs consumes outputs that are used as
@@ -277,11 +283,37 @@ class WorkerGraphsManager:
                 to_workers[worker_id] = []
             to_workers[worker_id].append(edge)
 
+        # (4) route streaming edges — find destination workers for streaming outputs
+        streaming_to_workers: dict[str, list[GraphEdge]] = {}
+        streaming_local: list[GraphEdge] = []
+        my_node_names = set()
+        for gid in self.per_request_info[request_id].worker_graph_ids:
+            my_node_names.update(self.all_worker_graph_ids_to_nodes.get(gid, []))
+
+        for edge in streaming_edges:
+            if edge.next_node in my_node_names:
+                # Destination node is on this worker — store locally
+                streaming_local.append(edge)
+            else:
+                # Find the worker that has this node (check all graph walks)
+                dest_worker = None
+                for wg_id, worker_id in self.per_request_info[request_id].node_to_worker.items():
+                    if wg_id.node == edge.next_node:
+                        dest_worker = worker_id
+                        break
+                if dest_worker is not None:
+                    streaming_to_workers.setdefault(dest_worker, []).append(edge)
+                else:
+                    logger.warning(
+                        "Streaming edge to %s has no known destination worker", edge.next_node,
+                    )
+
         logger.debug(
             ("Finished processing outputs from rid %s. \n"
-             "Routed to this worker: %s; sent to others: %s; persist signals: %s"),
+             "Routed to this worker: %s; sent to others: %s; persist signals: %s; streaming: %d"),
             request_id, format_graph_edge_list(routed_to_this_worker),
             format_graph_edge_list(external_outputs), format_graph_edge_list(to_conductor),
+            len(streaming_edges),
         )
         if completed_worker_graph_ids:
             logger.debug("Completed %d worker graphs", len(completed_worker_graph_ids))
@@ -293,6 +325,8 @@ class WorkerGraphsManager:
             emit_to_client=emit_to_client,
             new_token_outputs=new_token_outputs,
             completed_worker_graph_ids=completed_worker_graph_ids,
+            streaming_to_workers=streaming_to_workers,
+            streaming_local=streaming_local,
         )
 
     def add_request(
@@ -351,7 +385,7 @@ class WorkerGraphsManager:
             if name not in self.per_request_info[request_id].pending_new_tokens:
                 self.per_request_info[request_id].pending_new_tokens[name] = []
             self.per_request_info[request_id].pending_new_tokens[name].extend(tokens)
-    
+
     def buffer_output_signals(self, request_id: str, out_signals: list[GraphEdge]):
         self.per_request_info[request_id].current_output_chunks += [
             signal.name for signal in out_signals
@@ -377,7 +411,7 @@ class WorkerGraphsManager:
         new_tokens = info.pending_new_tokens
         info.pending_new_tokens = {}
         return new_tokens
-    
+
     def flush_output_signals(self, request_id: str) -> list[str]:
         info = self.per_request_info[request_id]
         out_chunks = list(info.current_output_chunks)  # copy before clearing

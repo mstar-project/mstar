@@ -45,7 +45,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
                 "text_inputs": [inp["text_inputs"][0] for inp in per_request_inputs],
             }
             seq_lens = [inp.shape[0] for inp in result["text_inputs"]]
-        elif graph_walk == "decode":
+        elif graph_walk in ("decode", "decode_llm"):
             result = {
                 "text_inputs": [inp["text_inputs"][0] for inp in per_request_inputs],
             }
@@ -67,7 +67,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
     def forward(self, graph_walk: str, cache_handle=None, **kwargs) -> NameToTensorList:
         if graph_walk == "prefill":
             return self._forward_prefill(cache_handle=cache_handle, **kwargs)
-        elif graph_walk == "decode":
+        elif graph_walk in ("decode", "decode_llm"):
             return self._forward_decode(cache_handle=cache_handle, **kwargs)
         else:
             raise ValueError(f"Unknown graph walk for OrpheusLLM: {graph_walk!r}")
@@ -115,7 +115,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
         per_request_metadata: dict[str, dict],
     ) -> dict[str, NameToTensorList]:
         """Batched forward pass for prefill and decode."""
-        if graph_walk == "decode":
+        if graph_walk in ("decode", "decode_llm"):
             return self._forward_decode_batched(
                 cache_manager=cache_manager,
                 request_ids=request_ids,
@@ -152,8 +152,11 @@ class OrpheusLLMSubmodule(NodeSubmodule):
 class SNACDecoderSubmodule(NodeSubmodule):
     """SNAC 24kHz decoder submodule.
 
-    Receives a batch of audio token IDs (already converted to SNAC codes)
-    via per_request_metadata and decodes the full utterance into PCM audio.
+    Supports two modes:
+      - **Full decode** (audio_gen walk): receives all audio token IDs via
+        per_request_metadata and decodes the full utterance.
+      - **Streaming decode** (snac_chunk walk): reads a 28-token sliding window
+        from the streaming buffer and decodes the middle region of the audio.
     """
 
     def __init__(self, snac_model: nn.Module, config: OrpheusModelConfig):
@@ -161,24 +164,87 @@ class SNACDecoderSubmodule(NodeSubmodule):
         self.snac_model = snac_model
         self.config = config
 
+    def check_streaming_ready(
+        self,
+        streaming_buffer: dict[str, list[torch.Tensor]],
+        request_info,
+    ) -> bool:
+        """Check if the streaming buffer has enough tokens for a chunk."""
+        tokens = streaming_buffer.get("streaming_token", [])
+        window = self.config.snac_window_tokens
+        return len(tokens) >= window
+
     def preprocess(
         self,
         graph_walk: str,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_metadata: dict[str, dict],
+        per_request_metadata: dict[str, dict] | None = None,
+        per_request_info: dict | None = None,
         cache_manager: BatchedCacheManager = None,
     ) -> dict[str, torch.Tensor]:
         assert len(request_ids) == 1, "SNAC decoder processes one request at a time"
         request_id = request_ids[0]
-        meta = per_request_metadata.get(request_id, {})
-        audio_token_ids = meta.get("audio_token_ids", [])
+
+        if graph_walk == "snac_chunk":
+            return self._preprocess_streaming(
+                request_id, per_request_info or {},
+            )
+        else:
+            meta = (per_request_metadata or {}).get(request_id, {})
+            if not meta and per_request_info:
+                meta = per_request_info.get(request_id, {})
+                if hasattr(meta, 'step_metadata'):
+                    meta = meta.step_metadata
+            audio_token_ids = meta.get("audio_token_ids", [])
+            return {
+                "request_id": request_id,
+                "audio_token_ids": audio_token_ids,
+                "graph_walk": graph_walk,
+            }
+
+    def _preprocess_streaming(
+        self, request_id: str, per_request_info: dict,
+    ) -> dict[str, torch.Tensor]:
+        """Extract a sliding window of tokens from the streaming buffer."""
+        fwd_info = per_request_info.get(request_id)
+        step_meta = fwd_info.step_metadata if fwd_info else {}
+
+        streaming_buffer = step_meta.get("_streaming_buffer", {})
+        token_tensors = streaming_buffer.get("streaming_token", [])
+
+        window_start = step_meta.get("window_start", 0)
+        window_size = step_meta.get("window_size", self.config.snac_window_tokens)
+
+        # Convert token tensors to audio codes
+        audio_codes = []
+        for tensor in token_tensors:
+            vals = tensor.cpu().numpy().tolist()
+            if isinstance(vals, list):
+                audio_codes.extend(vals)
+            else:
+                audio_codes.append(int(vals))
+
+        # Extract the window
+        window_end = window_start + window_size
+        window_tokens = audio_codes[window_start:window_end]
+
+        # Convert LLM token IDs to SNAC codes
+        snac_codes = []
+        for idx, t in enumerate(window_tokens):
+            code = t - 10 - ((idx % 7) * 4096)
+            snac_codes.append(code)
+
         return {
             "request_id": request_id,
-            "audio_token_ids": audio_token_ids,
+            "audio_token_ids": snac_codes,
+            "graph_walk": "snac_chunk",
         }
 
-    def forward(self, request_id: str, audio_token_ids: list[int], **kwargs) -> NameToTensorList:
+    def forward(
+        self, request_id: str, audio_token_ids: list[int],
+        graph_walk: str = "audio_gen", **kwargs,
+    ) -> NameToTensorList:
         if not audio_token_ids or len(audio_token_ids) < 7:
             logger.warning(
                 "SNAC forward: no/insufficient token IDs for request %s (got %d)",
@@ -186,7 +252,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             )
             return {}
         device = next(self.snac_model.parameters()).device
-        result = self._decode_tokens(audio_token_ids, device)
+        result = self._decode_tokens(audio_token_ids, device, streaming=(graph_walk == "snac_chunk"))
         if not result:
             logger.warning(
                 "SNAC decode returned empty for request %s (codes may be out of range)",
@@ -194,13 +260,20 @@ class SNACDecoderSubmodule(NodeSubmodule):
             )
         else:
             logger.debug(
-                "SNAC produced final audio for request %s (%d samples)",
-                request_id, result["audio_chunk"][0].numel(),
+                "SNAC produced audio for request %s (%d samples, walk=%s)",
+                request_id, result["audio_chunk"][0].numel(), graph_walk,
             )
         return result
 
-    def _decode_tokens(self, token_ids: list[int], device: torch.device) -> NameToTensorList:
-        """Decode a full SNAC token sequence into one PCM utterance."""
+    def _decode_tokens(
+        self, token_ids: list[int], device: torch.device,
+        streaming: bool = False,
+    ) -> NameToTensorList:
+        """Decode SNAC token sequence into PCM audio.
+
+        When ``streaming=True``, only the middle region of the decoded audio
+        is returned (sliding window overlap strategy).
+        """
         num_frames = len(token_ids) // 7
         if num_frames == 0:
             return {}
@@ -236,5 +309,11 @@ class SNACDecoderSubmodule(NodeSubmodule):
         with torch.inference_mode():
             audio_hat = self.snac_model.decode(codes)
 
-        audio_int16 = (audio_hat.clamp(-1, 1) * 32767).to(torch.int16).squeeze().detach()
+        if streaming:
+            # Streaming mode: take the middle region of the decoded audio
+            audio_slice = audio_hat[:, :, self.config.snac_audio_slice_start:self.config.snac_audio_slice_end]
+            audio_int16 = (audio_slice.clamp(-1, 1) * 32767).to(torch.int16).squeeze().detach()
+        else:
+            audio_int16 = (audio_hat.clamp(-1, 1) * 32767).to(torch.int16).squeeze().detach()
+
         return {"audio_chunk": [audio_int16]}

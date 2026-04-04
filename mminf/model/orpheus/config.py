@@ -26,6 +26,12 @@ class OrpheusModelConfig:
     tokens_per_frame: int = 7
     sample_rate: int = 24000
 
+    # Streaming chunking params (for async partition mode)
+    snac_window_tokens: int = 28      # 4 frames * 7 tokens/frame
+    snac_stride_tokens: int = 7       # 1 frame advance per chunk
+    snac_audio_slice_start: int = 2048  # middle region start in decoded audio
+    snac_audio_slice_end: int = 4096    # middle region end in decoded audio
+
     # Generation defaults
     temperature: float = 0.6
     top_p: float = 0.95
