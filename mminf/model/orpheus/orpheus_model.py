@@ -279,9 +279,10 @@ class OrpheusModel(Model):
                 request_done=True,
             )
 
-        # For the last partial chunk when producer is done
+        # Window starts at consumed position (always frame-aligned since stride=7).
+        # For a full window we take [consumed : consumed+window].
+        window_start = consumed
         chunk_size = min(window, available)
-        window_start = max(0, consumed + chunk_size - window) if consumed > 0 else 0
 
         # Advance consumed count by stride
         new_consumed = consumed + stride

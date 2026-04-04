@@ -240,10 +240,6 @@ class Worker:
             )
 
     def _process_new_inputs(self, body: InputSignals) -> None:
-        self.worker_graphs_manager.update_request_info(
-            body.request_id, current_fwd_info=body.request_info
-        )
-
         logger.debug(
             "Received new signals %s at worker %s for request %s",
             format_graph_edge_list(body.inputs), self.worker_id, body.request_id
@@ -253,7 +249,15 @@ class Worker:
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
         non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
         streaming_with_tensors = [edge for edge in body.inputs if edge.is_streaming and edge.tensor_info]
-        streaming_signal_only = [edge for edge in body.inputs if edge.is_streaming and not edge.tensor_info]
+
+        # Only update fwd_info when there are non-streaming edges (i.e., this is
+        # a conductor-triggered forward pass, not just streaming data from another
+        # partition). Streaming-only InputSignals must not overwrite the current
+        # partition's fwd_info.
+        if non_streaming:
+            self.worker_graphs_manager.update_request_info(
+                body.request_id, current_fwd_info=body.request_info
+            )
 
         # Start RDMA reads for non-streaming edges with tensor_info
         self.tensor_manager.start_read_tensors(
@@ -614,18 +618,8 @@ class Worker:
             self.communicator.send(worker_id, message)
 
         if outputs.completed_worker_graph_ids:
-            # Determine partition_name: prefer the graph_walk-based lookup,
-            # fall back to current fwd_info. This is necessary because with
-            # async partitions, a worker may have multiple partitions' fwd_info
-            # and the "current" one may not match the completing graph walk.
             fwd_info = self.worker_graphs_manager.get_fwd_info(request_id)
             partition_name = getattr(fwd_info, 'partition_name', 'default')
-            if graph_walk is not None and graph_walk != fwd_info.graph_walk:
-                # The completing walk doesn't match current fwd_info — this
-                # happens when streaming edges from another partition updated
-                # fwd_info. Use "default" and let the conductor resolve it
-                # from the worker_graph_ids.
-                partition_name = "default"
             message = ConductorMessage(
                 message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
                 body=WorkerGraphsDone(
@@ -660,7 +654,7 @@ class Worker:
                 # 3. Pick next batch via MicroScheduler
                 batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
                 if batch is None:
-                    sleep(0.001) # added this (with my original original code) and it works!
+                    sleep(0.001)
                     continue
 
                 # 4. Gather input tensors for the batch

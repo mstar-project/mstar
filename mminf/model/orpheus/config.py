@@ -20,6 +20,7 @@ class OrpheusModelConfig:
     end_token_ids: list[int] = field(default_factory=lambda: [128009, 128260, 128261, 128257])
     stop_token_id: int = 128258
     pad_token_id: int = 128263
+    custom_token_base_id: int = 128256  # vocab_id of <custom_token_0>
 
     # SNAC params
     snac_model_id: str = "hubertsiuzdak/snac_24khz"

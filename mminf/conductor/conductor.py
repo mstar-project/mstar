@@ -758,18 +758,20 @@ class Conductor:
 
         request_data = self.requests[body.request_id]
 
-        # Determine which partition this completion belongs to
-        partition_name = body.partition_name
-        if partition_name == "default":
-            # Fall back to graph_walk lookup if worker didn't set partition_name
-            for wg_id in body.worker_graph_ids:
-                for walk in self.worker_graphs[wg_id].graph_walks:
-                    found = self._get_partition_for_graph_walk(body.request_id, walk)
-                    if found:
-                        partition_name = found
-                        break
-                if partition_name != "default":
+        # Determine which partition this completion belongs to by looking up the
+        # worker_graph_ids' graph walks. This is authoritative — the partition_name
+        # in the message may be stale if the worker had concurrent partitions.
+        partition_name = None
+        for wg_id in body.worker_graph_ids:
+            for walk in self.worker_graphs[wg_id].graph_walks:
+                found = self._get_partition_for_graph_walk(body.request_id, walk)
+                if found:
+                    partition_name = found
                     break
+            if partition_name is not None:
+                break
+        if partition_name is None:
+            partition_name = body.partition_name  # fallback to what the worker sent
 
         pstate = request_data.partition_states.get(partition_name)
         if pstate is None:
@@ -922,7 +924,7 @@ class Conductor:
                 continue
             pdef = request_data.partition_definitions[pname]
             if not pdef.producer_partitions:
-                continue  # not a consumer
+                continue  # not a consumer (LLM)
 
             # Already running a forward pass — don't double-trigger
             if pstate.current_worker_graph_ids and \
