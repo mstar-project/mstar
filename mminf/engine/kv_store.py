@@ -77,6 +77,22 @@ class KVRequestState:
 
 LabelToState = dict[str, KVRequestState]
 
+
+@dataclass
+class AllocationStatus:
+    """Tracks the outcome of the most recent page allocation attempt."""
+    success: bool = True
+    pages_short: int = 0       # how many pages we couldn't allocate
+    request_id: str | None = None  # which request failed
+    label: str | None = None       # which cache label failed
+
+    def reset(self):
+        self.success = True
+        self.pages_short = 0
+        self.request_id = None
+        self.label = None
+
+
 @dataclass
 class StoreAllocInfo:
     key: str
@@ -132,6 +148,10 @@ class PagedAllocationManager:
 
         # Stream for async GPU↔CPU page copies (Feature 3: CPU offloading)
         self._offload_stream: torch.cuda.Stream | None = None
+
+        # Tracks the outcome of the most recent allocation attempt per batch.
+        # Reset at the start of each batch by the engine.
+        self.alloc_status = AllocationStatus()
 
         # {req_id: {label: futures}}
         self.pending_reads: dict[str, dict[str, list[Future]]] = {}
@@ -200,7 +220,18 @@ class PagedAllocationManager:
         num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
         num_new_pages = num_pages_needed - len(state.page_indices)
         if num_new_pages > 0:
-            new_pages = self.page_allocator.allocate(num_new_pages)
+            new_pages = self.page_allocator.try_allocate(num_new_pages)
+            if new_pages is None:
+                self.alloc_status = AllocationStatus(
+                    success=False,
+                    pages_short=num_new_pages - self.page_allocator.num_free,
+                    request_id=request_id,
+                    label=label,
+                )
+                raise RuntimeError(
+                    f"Not enough free pages: requested {num_new_pages}, "
+                    f"available {self.page_allocator.num_free}"
+                )
             state.page_indices.extend(new_pages)
     
     def wait_for_retrieves(
