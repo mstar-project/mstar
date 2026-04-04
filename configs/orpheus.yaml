@@ -3,7 +3,7 @@ max_seq_len: 131072
 node_groups:
   - node_names: [LLM]
     ranks: [0]
-    graph_walks: [prefill, decode, decode_llm, audio_gen]
+    graph_walks: [prefill, decode]
   - node_names: [snac_decoder]
     ranks: [1]
-    graph_walks: [audio_gen, snac_chunk]
+    graph_walks: [snac_chunk]

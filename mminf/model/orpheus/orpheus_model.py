@@ -1,23 +1,23 @@
 """
-OrpheusModel: Model implementation for Orpheus TTS.
+OrpheusModel: Model implementation for Orpheus TTS (streaming).
 
 Orpheus consists of a Llama 3.2 3B LLM that generates custom audio tokens
 and a SNAC decoder that converts those tokens to 24kHz PCM audio. The LLM
 generates 7 tokens per audio frame; each group of 7 tokens decomposes into
 3 SNAC codebook levels which the SNAC model decodes into a waveform chunk.
 
-Architecture (2 nodes):
+Architecture (2 nodes, 2 async partitions):
     LLM           (ar)          - Llama 3.2 3B with extended vocab for audio tokens
     snac_decoder  (audio_codec) - SNAC 24kHz decoder
 
-Graph walks (3):
-    prefill   - LLM only: fills KV cache with text prompt tokens
-    decode    - LLM only: autoregressive audio token generation
-    audio_gen - snac_decoder only: decode the full generated token buffer to PCM
+Partitions:
+    LLM  — walks: prefill → decode (autoregressive token generation)
+    SNAC — walks: snac_chunk (streaming decode, triggered when tokens accumulate)
 
-For the current MVP path, generation is non-streaming: the conductor stays on
-the LLM decode walk until EOS, then performs a single audio_gen walk on the
-SNAC decoder using the full accumulated token buffer.
+The LLM and SNAC partitions run asynchronously. The LLM produces tokens that
+stream directly to the SNAC worker via StreamingGraphEdge. The conductor
+triggers SNAC chunks using a sliding window (28 tokens, stride 7) and extracts
+the middle region of the decoded audio for low-latency output.
 """
 
 import logging
@@ -127,32 +127,6 @@ class OrpheusModel(Model):
                     is_new_token=True,
                     persist=True,
                 ),
-            ],
-        )
-
-        audio_gen = GraphNode(
-            name="snac_decoder",
-            input_ids=["audio_tokens"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="audio_chunk",
-                    output_modality="audio",
-                ),
-            ],
-        )
-
-        # Streaming graph walks for async partition mode
-        decode_llm = GraphNode(
-            name="LLM",
-            input_ids=["text_inputs"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMPTY_DESTINATION,
-                    name="new_token",
-                    is_new_token=True,
-                    persist=True,
-                ),
                 GraphEdge(
                     next_node="snac_decoder",
                     name="streaming_token",
@@ -176,8 +150,6 @@ class OrpheusModel(Model):
         return dict(
             prefill=prefill,
             decode=decode,
-            audio_gen=audio_gen,
-            decode_llm=decode_llm,
             snac_chunk=snac_chunk,
         )
 
@@ -189,7 +161,7 @@ class OrpheusModel(Model):
         return [
             PartitionDefinition(
                 name="LLM",
-                graph_walks={"prefill", "decode_llm"},
+                graph_walks={"prefill", "decode"},
                 initial_walk="prefill",
                 producer_partitions=[],
             ),
@@ -243,15 +215,15 @@ class OrpheusModel(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         new_tokens: dict[str, list[int]],
     ) -> ForwardPassArgs:
-        """LLM partition: prefill -> decode_llm loop until EOS."""
+        """LLM partition: prefill -> decode loop until EOS."""
         request_done = False
 
         if metadata.is_prefill:
             metadata.is_prefill = False
-            metadata.graph_walk = "decode_llm"
+            metadata.graph_walk = "decode"
             metadata.kwargs["audio_token_count"] = 0
             metadata.kwargs["decode_finished"] = False
-        elif metadata.graph_walk == "decode_llm":
+        elif metadata.graph_walk == "decode":
             tokens = new_tokens.get("new_token", [])
             count = metadata.kwargs["audio_token_count"]
             for t in tokens:
@@ -270,7 +242,6 @@ class OrpheusModel(Model):
                 request_done=True,
             )
 
-        # Build inputs for the next decode_llm forward
         graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
         graph_edge.tensor_info = persist_signals.get("new_token", [])
         inputs = [graph_edge]
@@ -402,79 +373,8 @@ class OrpheusModel(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         new_tokens: dict[str, list[int]],
     ) -> ForwardPassArgs:
-        request_done = False
-
-        if metadata.is_prefill:
-            # Transition from prefill to decode
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-            # Initialise per-request token accumulation.
-            metadata.kwargs["audio_token_buffer"] = []
-            metadata.kwargs["audio_token_count"] = 0
-            metadata.kwargs["decode_finished"] = False
-
-        elif metadata.graph_walk == "audio_gen":
-            # audio_gen is the terminal pass for the non-streaming path.
-            request_done = metadata.kwargs.get("decode_finished", False)
-
-        elif metadata.graph_walk == "decode":
-            tokens = new_tokens.get("new_token", [])
-            buf = metadata.kwargs["audio_token_buffer"]
-            count = metadata.kwargs["audio_token_count"]
-
-            for t in tokens:
-                if t == self.config.stop_token_id:
-                    request_done = True
-                    metadata.kwargs["decode_finished"] = True
-                    break
-                code = t - 10 - ((count % 7) * 4096)
-                buf.append(code)
-                count += 1
-            metadata.kwargs["audio_token_count"] = count
-
-            if request_done and count >= self.config.tokens_per_frame:
-                logger.debug(
-                    "Decode complete; switching to audio_gen with %d audio tokens",
-                    count,
-                )
-                metadata.graph_walk = "audio_gen"
-                request_done = False
-
-        if request_done:
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        # Build inputs depending on current walk
-        if metadata.graph_walk == "decode":
-            graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-            graph_edge.tensor_info = persist_signals.get("new_token", [])
-            inputs = [graph_edge]
-            unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-            step_metadata = {"is_prefill": False}
-
-        elif metadata.graph_walk == "audio_gen":
-            # Signal-only trigger for snac_decoder; the full token buffer is
-            # provided via per-request metadata.
-            graph_edge = GraphEdge(next_node="snac_decoder", name="audio_tokens")
-            inputs = [graph_edge]
-            unpersist_tensors = []
-            buf = metadata.kwargs["audio_token_buffer"]
-            step_metadata = {"audio_token_ids": list(buf)}
-
-        else:
-            raise ValueError(f"Unexpected graph_walk: {metadata.graph_walk!r}")
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=step_metadata,
-            request_done=request_done,
-        )
+        # Delegate to the LLM partition logic (single-partition fallback path).
+        return self._get_llm_partition_forward(metadata, persist_signals, new_tokens)
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
