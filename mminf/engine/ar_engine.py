@@ -356,6 +356,16 @@ class AREngine(BaseEngine):
                         self.alloc_manager.sync_retrieve(
                             req_id, label, seq_info
                         )
+
+                with torch.no_grad():
+                    with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                        # Priority: CUDA graph > batched > sequential
+                        if self._can_use_cuda_graph(batch):
+                            return self._execute_with_cuda_graph(batch, submodule)
+                        elif submodule.can_batch(batch):
+                            return self._execute_batched(batch, submodule)
+                        else:
+                            return self._execute_sequential(batch, submodule)
             except RuntimeError:
                 if not self.alloc_manager.alloc_status.success:
                     status = self.alloc_manager.alloc_status
@@ -376,16 +386,6 @@ class AREngine(BaseEngine):
                         alloc_failed_request_id=status.request_id,
                     )
                 raise
-
-            with torch.no_grad():
-                with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                    # Priority: CUDA graph > batched > sequential
-                    if self._can_use_cuda_graph(batch):
-                        return self._execute_with_cuda_graph(batch, submodule)
-                    elif submodule.can_batch(batch):
-                        return self._execute_batched(batch, submodule)
-                    else:
-                        return self._execute_sequential(batch, submodule)
         finally:
             for req_id in batch.request_ids:
                 batch.per_request_info[req_id].per_label_seq_info = \
