@@ -1,5 +1,10 @@
 model: "bagel"
 max_seq_len: 32768
+max_concurrent_requests: 8
+
+kv_cache:
+  max_num_pages: 4096
+  cpu_offload_pages: 4096
 
 node_groups:
   - node_names:
