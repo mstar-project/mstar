@@ -87,8 +87,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
         hidden = self.language_model(emb, cache_handle=cache_handle, **kwargs)
 
         logits = self.lm_head(hidden[-1:])
-        token = torch.argmax(logits, dim=-1)
-        return {"new_token": [token]}
+        return {"logits": [logits]}
 
     def _forward_decode(
         self,
@@ -96,7 +95,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
         cache_handle: BatchedCacheManager,
         **kwargs,
     ) -> NameToTensorList:
-        """Embed previous token, run LLM forward, sample next token."""
+        """Embed previous token, run LLM forward, return logits for sampling."""
         kwargs.pop("is_prefill", None)
         emb = self.embed_tokens(text_inputs)
         if cache_handle is not None:
@@ -104,8 +103,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
         hidden = self.language_model(emb, cache_handle=cache_handle, **kwargs)
 
         logits = self.lm_head(hidden[-1:])
-        token = torch.argmax(logits, dim=-1)
-        return {"new_token": [token]}
+        return {"logits": [logits]}
 
     def forward_batched(
         self,
@@ -143,10 +141,9 @@ class OrpheusLLMSubmodule(NodeSubmodule):
         hidden = self.language_model(embs, cache_handle=cache_manager)
 
         logits = self.lm_head(hidden)
-        tokens = torch.argmax(logits, dim=-1)
 
         return {
-            rid: {"new_token": [tokens[i : i + 1]]}
+            rid: {"logits": [logits[i : i + 1]]}
             for i, rid in enumerate(request_ids)
         }
 
@@ -225,7 +222,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             if t < min_audio_token:
                 continue
             code = (t - base_id) - 10 - ((count % 7) * 4096)
-            if 0 <= code <= 4096:
+            if code > 0:  # reference uses `token > 0` (strictly greater)
                 all_codes.append(code)
                 count += 1
 

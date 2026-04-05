@@ -43,7 +43,11 @@ class AudioCodecEngine(BaseEngine):
         device: torch.device,
         **kwargs
     ) -> None:
-        self.submodules = submodules
+        # Audio codecs need float32 precision (reference runs without autocast).
+        # Override bfloat16 cast from engine_manager.
+        self.submodules = {
+            name: mod.float() for name, mod in submodules.items()
+        }
         self.device = device
 
     def check_ready(
@@ -78,39 +82,38 @@ class AudioCodecEngine(BaseEngine):
             return output
 
         try:
-            with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                with torch.no_grad():
-                    outputs = {}
-                    for rid in batch.request_ids:
-                        inputs = batch.per_request_input_tensors.get(rid, {})
+            with torch.inference_mode():
+                outputs = {}
+                for rid in batch.request_ids:
+                    inputs = batch.per_request_input_tensors.get(rid, {})
 
-                        # Inject streaming buffer into step_metadata if available
-                        fwd_info = batch.per_request_info[rid]
-                        if self._streaming_buffers and rid in self._streaming_buffers:
-                            fwd_info.step_metadata = {
-                                **fwd_info.step_metadata,
-                                "_streaming_buffer": self._streaming_buffers[rid],
-                            }
+                    # Inject streaming buffer into step_metadata if available
+                    fwd_info = batch.per_request_info[rid]
+                    if self._streaming_buffers and rid in self._streaming_buffers:
+                        fwd_info.step_metadata = {
+                            **fwd_info.step_metadata,
+                            "_streaming_buffer": self._streaming_buffers[rid],
+                        }
 
-                        if hasattr(submodule, 'preprocess'):
-                            preprocessed = submodule.preprocess(
-                                batch.graph_walk,
-                                per_request_inputs=[inputs],
-                                request_ids=[rid],
-                                per_request_info={
-                                    rid: fwd_info,
-                                },
-                            )
-                            outputs[rid] = submodule(**preprocessed)
+                    if hasattr(submodule, 'preprocess'):
+                        preprocessed = submodule.preprocess(
+                            batch.graph_walk,
+                            per_request_inputs=[inputs],
+                            request_ids=[rid],
+                            per_request_info={
+                                rid: fwd_info,
+                            },
+                        )
+                        outputs[rid] = submodule(**preprocessed)
+                    else:
+                        result = submodule(**{k: v[0] for k, v in inputs.items()})
+                        if isinstance(result, dict):
+                            outputs[rid] = result
+                        elif isinstance(result, torch.Tensor):
+                            outputs[rid] = {"output": [result]}
                         else:
-                            result = submodule(**{k: v[0] for k, v in inputs.items()})
-                            if isinstance(result, dict):
-                                outputs[rid] = result
-                            elif isinstance(result, torch.Tensor):
-                                outputs[rid] = {"output": [result]}
-                            else:
-                                outputs[rid] = {}
-                    return NodeOutput(per_request_output_tensors=outputs)
+                            outputs[rid] = {}
+                return NodeOutput(per_request_output_tensors=outputs)
         finally:
             if self.enable_nvtx:
                 range_pop()

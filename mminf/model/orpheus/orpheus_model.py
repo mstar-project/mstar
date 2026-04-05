@@ -246,7 +246,11 @@ class OrpheusModel(Model):
         graph_edge.tensor_info = persist_signals.get("new_token", [])
         inputs = [graph_edge]
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        step_metadata = {"is_prefill": metadata.is_prefill}
+        step_metadata = {
+            "is_prefill": metadata.is_prefill,
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+        }
 
         return ForwardPassArgs(
             full_metadata=metadata,
@@ -358,7 +362,11 @@ class OrpheusModel(Model):
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
+            step_metadata={
+                "is_prefill": True,
+                "temperature": self.config.temperature,
+                "top_p": self.config.top_p,
+            },
         )
 
     def get_forward_pass_args(

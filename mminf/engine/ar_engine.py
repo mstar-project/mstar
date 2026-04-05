@@ -238,8 +238,7 @@ class AREngine(BaseEngine):
         cache_manager.flush_to_store()
 
         output = NodeOutput(per_request_output_tensors=batched_output)
-        if batch.graph_walk == "decode":
-            output = self._sample_decode_outputs(output, batch.per_request_info)
+        output = self._sample_decode_outputs(output, batch.per_request_info)
         return output
 
     def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
@@ -275,8 +274,7 @@ class AREngine(BaseEngine):
             per_request_outputs[rid] = output
 
         output = NodeOutput(per_request_output_tensors=per_request_outputs)
-        if batch.graph_walk == "decode":
-            output = self._sample_decode_outputs(output, batch.per_request_info)
+        output = self._sample_decode_outputs(output, batch.per_request_info)
         return output
 
     def _can_use_cuda_graph(self, batch: NodeBatch) -> bool:
