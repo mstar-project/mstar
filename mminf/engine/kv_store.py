@@ -31,6 +31,12 @@ class PageAllocator:
             )
         return [self.free_pages.get() for _ in range(n)]
 
+    def try_allocate(self, n: int) -> list[int] | None:
+        """Like allocate() but returns None instead of raising on failure."""
+        if self.free_pages.qsize() < n:
+            return None
+        return [self.free_pages.get() for _ in range(n)]
+
     def free(self, pages: list[int]) -> None:
         for page in pages:
             self.free_pages.put(page)
@@ -49,6 +55,7 @@ class KVCacheConfig:
     max_num_pages: int = 2048
     page_size: int = 128
     num_qo_heads: int | None = None  # Optional, defaults to num_kv_heads
+    cpu_offload_pages: int = 0  # >0 enables CPU offloading with this many CPU pages
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -69,6 +76,22 @@ class KVRequestState:
 
 
 LabelToState = dict[str, KVRequestState]
+
+
+@dataclass
+class AllocationStatus:
+    """Tracks the outcome of the most recent page allocation attempt."""
+    success: bool = True
+    pages_short: int = 0       # how many pages we couldn't allocate
+    request_id: str | None = None  # which request failed
+    label: str | None = None       # which cache label failed
+
+    def reset(self):
+        self.success = True
+        self.pages_short = 0
+        self.request_id = None
+        self.label = None
+
 
 @dataclass
 class StoreAllocInfo:
@@ -123,8 +146,23 @@ class PagedAllocationManager:
         self.my_entity_id = transfer_engine_info.my_entity_id
         self.my_session_id = transfer_engine_info.my_session_id
 
+        # Stream for async GPU↔CPU page copies (Feature 3: CPU offloading)
+        self._offload_stream: torch.cuda.Stream | None = None
+
+        # Tracks the outcome of the most recent allocation attempt per batch.
+        # Reset at the start of each batch by the engine.
+        self.alloc_status = AllocationStatus()
+
         # {req_id: {label: futures}}
         self.pending_reads: dict[str, dict[str, list[Future]]] = {}
+
+    @property
+    def num_free_pages(self) -> int:
+        return self.page_allocator.num_free
+
+    @property
+    def total_pages(self) -> int:
+        return self.config.max_num_pages
 
     def _key(self, request_id: str, label: str, pos: int, layer: int):
         return f"{request_id}_{label}_{pos}_{layer}"
@@ -182,7 +220,18 @@ class PagedAllocationManager:
         num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
         num_new_pages = num_pages_needed - len(state.page_indices)
         if num_new_pages > 0:
-            new_pages = self.page_allocator.allocate(num_new_pages)
+            new_pages = self.page_allocator.try_allocate(num_new_pages)
+            if new_pages is None:
+                self.alloc_status = AllocationStatus(
+                    success=False,
+                    pages_short=num_new_pages - self.page_allocator.num_free,
+                    request_id=request_id,
+                    label=label,
+                )
+                raise RuntimeError(
+                    f"Not enough free pages: requested {num_new_pages}, "
+                    f"available {self.page_allocator.num_free}"
+                )
             state.page_indices.extend(new_pages)
     
     def wait_for_retrieves(
@@ -311,4 +360,41 @@ class PagedAllocationManager:
             self.page_allocator.free(state.page_indices)
         del self.request_states[request_id]
         del self.pending_reads[request_id]
+
+    # ----- CPU offloading helpers -----
+
+    def offload_request(self, request_id: str, cpu_pool) -> int:
+        """Offload all labels for a request to *cpu_pool*, free GPU pages.
+
+        Returns the total number of GPU pages freed.
+        """
+        freed = 0
+        for label, state in self.request_states[request_id].items():
+            if not state.page_indices:
+                continue
+            self.wait_for_retrieves(request_id, label)
+            cpu_pool.offload_pages(
+                request_id, label, self.kv_cache,
+                state.page_indices, state.seq_len, state.position_id_start,
+            )
+            freed += len(state.page_indices)
+            self.page_allocator.free(state.page_indices)
+            state.page_indices = []
+            state.seq_len = 0
+        return freed
+
+    def reload_request(self, request_id: str, cpu_pool) -> None:
+        """Reload all labels for a request from *cpu_pool* back to GPU."""
+        for label in list(cpu_pool.offloaded.get(request_id, {}).keys()):
+            offloaded = cpu_pool.offloaded[request_id][label]
+            n_pages = len(offloaded.cpu_page_indices)
+            gpu_pages = self.page_allocator.allocate(n_pages)
+            state = self.get_state(request_id, label)
+            state.page_indices = gpu_pages
+            seq_len, pos_id = cpu_pool.reload_pages(
+                request_id, label, self.kv_cache, gpu_pages,
+            )
+            state.seq_len = seq_len
+            state.position_id_start = pos_id
+        cpu_pool.sync()
 

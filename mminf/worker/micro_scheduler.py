@@ -1,6 +1,7 @@
 from enum import Enum
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphNode
@@ -24,6 +25,8 @@ class ScheduledBatch:
     node_name: str
     graph_walk: str
     node_objects: dict[str,GraphNode]
+    # request_id -> worker_graph_id (for push-back on OOM)
+    request_to_worker_graph: dict[str, str] = None
 
 
 # Priority: lower value = higher priority
@@ -46,6 +49,9 @@ class MicroScheduler:
     groups by node name, returns the highest-priority group.
     """
 
+    # Seconds to wait before retrying a held request after OOM
+    HOLD_BACKOFF_SECONDS = 0.05
+
     def __init__(
         self, engine_manager: EngineManager,
         sched_type=SchedulingType.ROUND_ROBIN
@@ -54,6 +60,8 @@ class MicroScheduler:
         self.batch_number = 0
         self.sched_type = sched_type
         self.node_and_walk_to_last_batch_num = {}
+        # request_id -> monotonic time until which the request is held
+        self.held_until: dict[str, float] = {}
     
     def _select_node_priority(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
@@ -102,6 +110,11 @@ class MicroScheduler:
                     best_graph_walk = req.graph_walk
         return best_node_name, best_graph_walk
 
+    def hold_requests(self, request_ids: list[str]) -> None:
+        """Put requests on hold for a brief backoff period after OOM."""
+        deadline = time.monotonic() + self.HOLD_BACKOFF_SECONDS
+        for rid in request_ids:
+            self.held_until[rid] = deadline
 
     def get_next_batch(
         self,
@@ -119,12 +132,21 @@ class MicroScheduler:
         # Collect all ready (node_name, request_id, graph_walk) tuples
         # grouped by node name
         node_name_to_requests: dict[str, list[ReadyNodeEntry]] = {}
+        now = time.monotonic()
+
+        # Expire stale hold entries
+        self.held_until = {
+            rid: t for rid, t in self.held_until.items() if t > now
+        }
 
         for worker_graph_id, queue in worker_graphs_manager.queues.items():
             ready_map = queue.get_ready_node_names()
             for request_id, node_names in ready_map.items():
                 if request_id not in worker_graphs_manager.per_request_info:
                     continue  # request was removed between scheduling cycles
+                # Skip requests in OOM backoff
+                if request_id in self.held_until:
+                    continue
                 graph_walk = worker_graphs_manager.get_graph_walk(request_id)
                 fwd_info = worker_graphs_manager.get_fwd_info(request_id)
                 for sname in node_names:
@@ -159,6 +181,7 @@ class MicroScheduler:
             entries = entries[:max_batch_size]
 
         node_objects = {}
+        request_to_worker_graph = {}
 
         for entry in entries:
             queue = worker_graphs_manager.queues[entry.worker_graph_id]
@@ -166,6 +189,7 @@ class MicroScheduler:
             if popped:
                 assert len(popped) == 1
                 node_objects[entry.request_id] = popped[0]
+                request_to_worker_graph[entry.request_id] = entry.worker_graph_id
 
         if not node_objects:
             return None
@@ -182,5 +206,6 @@ class MicroScheduler:
         return ScheduledBatch(
             node_name=best_node_name,
             graph_walk=graph_walk,
-            node_objects=node_objects
+            node_objects=node_objects,
+            request_to_worker_graph=request_to_worker_graph,
         )

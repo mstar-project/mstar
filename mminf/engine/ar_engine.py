@@ -4,6 +4,7 @@ import torch
 
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
+from mminf.engine.cpu_page_pool import CPUPagePool
 from mminf.engine.cuda_graph_runner import CudaGraphRunner
 from mminf.engine.kv_store import KVCacheConfig, MooncakeStoreConfig, PagedAllocationManager, TransferEngineInfo
 from mminf.conductor.request_info import CurrentForwardPassInfo, SequenceInfo
@@ -38,6 +39,7 @@ class AREngine(BaseEngine):
         self.kv_cache = None  # [num_layers, max_pages, 2, page_size, num_kv_heads, head_dim]
         self.alloc_manager: PagedAllocationManager | None = None
         self.buffer_manager = None
+        self.cpu_page_pool: CPUPagePool | None = None
 
         # CUDA graph runners (initialized in warmup())
         self.cuda_graph_runners: dict[str, "CudaGraphRunner"] = {}
@@ -84,6 +86,18 @@ class AREngine(BaseEngine):
         self.buffer_manager = WorkspaceBufferManager(
             256 * 1024 * 1024, device=device
         )
+
+        # CPU page pool for KV cache offloading
+        if cfg.cpu_offload_pages > 0:
+            self.cpu_page_pool = CPUPagePool(
+                kv_cache_config=cfg,
+                max_cpu_pages=cfg.cpu_offload_pages,
+                kv_cache_dtype=kv_cache_type,
+            )
+            logger.info(
+                "AREngine: CPU page pool initialized with %d pages",
+                cfg.cpu_offload_pages,
+            )
 
     def _create_cache_manager(self, request_id: str) -> BatchedCacheManager:
         """Create a CacheHandle for a single request."""
@@ -333,23 +347,45 @@ class AREngine(BaseEngine):
             needed_labels = self._get_needed_labels(
                 batch.node_name, batch.graph_walk, batch.per_request_info
             )
-            for req_id, info in batch.per_request_info.items():
-                for label, seq_info in info.per_label_seq_info.items():
-                    if needed_labels is not None and label not in needed_labels:
-                        continue
-                    self.alloc_manager.sync_retrieve(
-                        req_id, label, seq_info
-                    )
+            self.alloc_manager.alloc_status.reset()
+            try:
+                for req_id, info in batch.per_request_info.items():
+                    for label, seq_info in info.per_label_seq_info.items():
+                        if needed_labels is not None and label not in needed_labels:
+                            continue
+                        self.alloc_manager.sync_retrieve(
+                            req_id, label, seq_info
+                        )
 
-            with torch.no_grad():
-                with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                    # Priority: CUDA graph > batched > sequential
-                    if self._can_use_cuda_graph(batch):
-                        return self._execute_with_cuda_graph(batch, submodule)
-                    elif submodule.can_batch(batch):
-                        return self._execute_batched(batch, submodule)
-                    else:
-                        return self._execute_sequential(batch, submodule)
+                with torch.no_grad():
+                    with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                        # Priority: CUDA graph > batched > sequential
+                        if self._can_use_cuda_graph(batch):
+                            return self._execute_with_cuda_graph(batch, submodule)
+                        elif submodule.can_batch(batch):
+                            return self._execute_batched(batch, submodule)
+                        else:
+                            return self._execute_sequential(batch, submodule)
+            except RuntimeError:
+                if not self.alloc_manager.alloc_status.success:
+                    status = self.alloc_manager.alloc_status
+                    logger.warning(
+                        "KV cache page allocation failed for batch "
+                        "(node=%s, walk=%s, request=%s, label=%s, "
+                        "pages_short=%d)",
+                        batch.node_name, batch.graph_walk,
+                        status.request_id, status.label,
+                        status.pages_short,
+                    )
+                    return NodeOutput(
+                        per_request_output_tensors={
+                            rid: {} for rid in batch.request_ids
+                        },
+                        allocation_failed=True,
+                        alloc_pages_short=status.pages_short,
+                        alloc_failed_request_id=status.request_id,
+                    )
+                raise
         finally:
             for req_id in batch.request_ids:
                 batch.per_request_info[req_id].per_label_seq_info = \
@@ -374,6 +410,14 @@ class AREngine(BaseEngine):
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
     ):
+        # If this request was offloaded to CPU, try reloading first
+        if self.cpu_page_pool is not None and self.cpu_page_pool.is_offloaded(request_id):
+            try:
+                self.alloc_manager.reload_request(request_id, self.cpu_page_pool)
+                logger.info("Reloaded offloaded request %s from CPU", request_id)
+            except RuntimeError:
+                return False  # can't reload yet, not ready
+
         needed_labels = self._get_needed_labels(
             node_name, request_info.graph_walk, {
                     request_id: request_info
@@ -381,13 +425,18 @@ class AREngine(BaseEngine):
         )
 
         labels_to_check = []
-        for label, seq_info in request_info.per_label_seq_info.items():
-            if needed_labels is not None and label not in needed_labels:
-                continue
-            self.alloc_manager.start_async_retrieve(
-                request_id, label, seq_info
-            )
-            labels_to_check.append(label)
+        try:
+            for label, seq_info in request_info.per_label_seq_info.items():
+                if needed_labels is not None and label not in needed_labels:
+                    continue
+                self.alloc_manager.start_async_retrieve(
+                    request_id, label, seq_info
+                )
+                labels_to_check.append(label)
+        except RuntimeError:
+            # Not enough pages to allocate for retrieval — not ready
+            return False
+
         return all([
             self.alloc_manager.check_retrieve_ready(request_id, label) \
                 for label in labels_to_check
@@ -399,6 +448,8 @@ class AREngine(BaseEngine):
         self.alloc_manager.add_request(request_id, cache_labels or ["main"])
 
     def remove_request(self, request_id: str) -> None:
+        if self.cpu_page_pool is not None:
+            self.cpu_page_pool.remove_request(request_id)
         self.alloc_manager.remove_request(request_id)
 
     def pause_request(

@@ -147,9 +147,13 @@ class Conductor:
         self.tcp_transfer_device = tcp_transfer_device
 
         self._worker_processes: list[mp.Process] = []
+        self.waiting_queue: list[NewRequestConductor] = []
 
         with open(model_config_file, "r") as f:
             self.model_config = yaml.safe_load(f)
+        self.max_concurrent_requests: int = self.model_config.get(
+            "max_concurrent_requests", None
+        )
         assert "max_seq_len" in self.model_config
         assert "node_groups" in self.model_config
 
@@ -185,8 +189,18 @@ class Conductor:
         self._per_worker_graphs: dict[str, list[WorkerGraph]] = {}
         self._per_worker_engine_configs: dict[str, list[dict]] = {}
 
+        kv_cache_config = self.model.get_kv_cache_config()
+        # Apply any KV cache overrides from the YAML config
+        yaml_kv_overrides = self.model_config.get("kv_cache", {})
+        if yaml_kv_overrides:
+            from dataclasses import fields
+            for f in fields(kv_cache_config):
+                if f.name in yaml_kv_overrides:
+                    setattr(kv_cache_config, f.name, yaml_kv_overrides[f.name])
+            logger.info("KV cache config after YAML overrides: %s", kv_cache_config)
+
         engine_model_cfg = {
-            "kv_cache": self.model.get_kv_cache_config(),
+            "kv_cache": kv_cache_config,
             "autocast_dtype": self.model.get_autocast_dtype()
         }
         for rank in self._sorted_ranks:
@@ -341,6 +355,20 @@ class Conductor:
                 )
             )
 
+    def _try_admit_waiting(self):
+        """Drain the waiting queue up to the concurrency cap."""
+        while self.waiting_queue:
+            if (self.max_concurrent_requests is not None
+                    and len(self.requests) >= self.max_concurrent_requests):
+                break
+            body = self.waiting_queue.pop(0)
+            logger.info(
+                "Admitting queued request %s (%d/%s in-flight)",
+                body.request_id, len(self.requests),
+                str(self.max_concurrent_requests),
+            )
+            self._do_ingest_request(body)
+
     def _ingest_request(
         self, body: NewRequestConductor
     ):
@@ -350,6 +378,21 @@ class Conductor:
         and notify the workers that the request has arrived + provide the appropriate
         workers with the appropriate initial inputs for the forward pass.
         """
+        if (self.max_concurrent_requests is not None
+                and len(self.requests) >= self.max_concurrent_requests):
+            logger.info(
+                "Request %s queued (at capacity: %d/%d)",
+                body.request_id, len(self.requests),
+                self.max_concurrent_requests,
+            )
+            self.waiting_queue.append(body)
+            return
+        self._do_ingest_request(body)
+
+    def _do_ingest_request(
+        self, body: NewRequestConductor
+    ):
+        """Actually dispatch a request to workers (no admission check)."""
         logger.debug("Conductor ingesting request %s", body.request_id)
         worker_graph_to_worker = self._assign_worker_graphs_to_workers()
 
@@ -445,6 +488,7 @@ class Conductor:
             )
         )
         del self.requests[request_id]
+        self._try_admit_waiting()
 
     def _process_done_forward(
         self, request_id: str

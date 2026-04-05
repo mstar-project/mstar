@@ -1,4 +1,6 @@
 import logging
+import time as _time
+from enum import Enum
 from time import sleep
 
 import torch
@@ -33,6 +35,12 @@ from mminf.worker.node_manager_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class EvictionPolicy(Enum):
+    """Strategy for choosing which request to offload to CPU on OOM."""
+    LRU = "lru"              # least-recently-used (by execution time)
+    MOST_PAGES = "most_pages"  # request holding the most GPU pages
 
 
 class Worker:
@@ -122,6 +130,10 @@ class Worker:
 
         self._unprocessed_messages = {} # req_id -> messages for requests that are not in the queue
 
+        # CPU offloading: LRU tracking and eviction policy
+        self._last_active: dict[str, float] = {}  # request_id -> monotonic timestamp
+        self.eviction_policy = EvictionPolicy.LRU
+
     def _compute_store_write_policy(
         self,
         my_worker_graphs: list[WorkerGraph],
@@ -177,6 +189,7 @@ class Worker:
 
     def _add_new_request(self, body: NewRequest) -> None:
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
+        self._last_active[body.request_id] = _time.monotonic()
         self.worker_graphs_manager.add_request(
             request_id=body.request_id,
             worker_graph_ids=body.worker_graph_ids,
@@ -208,6 +221,7 @@ class Worker:
         self.engine_manager.remove_request(body.request_id)
         self.worker_graphs_manager.remove_request(body.request_id)
         self.tensor_manager.cleanup_request(body.request_id)
+        self._last_active.pop(body.request_id, None)
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
@@ -287,6 +301,91 @@ class Worker:
             self.worker_graphs_manager.process_new_inputs(
                 request_id=request_id, inputs=edges
             )
+
+    # ------------------------------------------------------------------
+    # CPU offloading
+    # ------------------------------------------------------------------
+
+    def _try_offload_cold_request(
+        self, batch_ids: set[str]
+    ) -> str | None:
+        """Offload one request's KV pages to CPU using the configured eviction policy.
+
+        Prefers requests outside *batch_ids*. If none exist, falls back to
+        picking a victim *within* the batch (the caller should then exclude
+        it from execution).
+
+        Returns the victim request_id, or None if offloading wasn't possible.
+        """
+        ar_engine = self.engine_manager.get_ar_engine()
+        if ar_engine is None or ar_engine.cpu_page_pool is None:
+            return None
+        alloc = ar_engine.alloc_manager
+
+        # Gather all candidates with (rid, total_pages), split by location
+        external: list[tuple[str, int]] = []
+        in_batch: list[tuple[str, int]] = []
+        for rid, labels in alloc.request_states.items():
+            total_pages = sum(len(s.page_indices) for s in labels.values())
+            if total_pages == 0:
+                continue
+            if rid in batch_ids:
+                in_batch.append((rid, total_pages))
+            else:
+                external.append((rid, total_pages))
+
+        # Prefer external victims; fall back to in-batch
+        candidates = external or in_batch
+        if not candidates:
+            return None
+
+        victim_id = self._select_eviction_victim(candidates)
+        freed = alloc.offload_request(victim_id, ar_engine.cpu_page_pool)
+        logger.info(
+            "Offloaded request %s to CPU (%d GPU pages freed, "
+            "policy=%s, in_batch=%s)",
+            victim_id, freed, self.eviction_policy.value,
+            victim_id in batch_ids,
+        )
+        return victim_id if freed > 0 else None
+
+    def _select_eviction_victim(
+        self, candidates: list[tuple[str, int]]
+    ) -> str:
+        """Pick a victim from *candidates* based on ``self.eviction_policy``.
+
+        Each candidate is ``(request_id, total_gpu_pages)``.
+        """
+        if self.eviction_policy == EvictionPolicy.MOST_PAGES:
+            return max(candidates, key=lambda x: x[1])[0]
+
+        # LRU: pick the request with the oldest last_active timestamp.
+        # Ties (or missing entries) broken by most pages.
+        return min(
+            candidates,
+            key=lambda x: (
+                self._last_active.get(x[0], 0.0),  # oldest first
+                -x[1],                               # then most pages
+            ),
+        )[0]
+
+    def _try_reload_request(self, request_id: str) -> bool:
+        """Reload an offloaded request back to GPU. Returns True if reloaded."""
+        ar_engine = self.engine_manager.get_ar_engine()
+        if ar_engine is None or ar_engine.cpu_page_pool is None:
+            return False
+        if not ar_engine.cpu_page_pool.is_offloaded(request_id):
+            return False
+        try:
+            ar_engine.alloc_manager.reload_request(
+                request_id, ar_engine.cpu_page_pool
+            )
+            logger.info("Reloaded request %s from CPU to GPU", request_id)
+            return True
+        except RuntimeError:
+            # Not enough GPU pages to reload; will retry later
+            logger.debug("Cannot reload request %s yet (insufficient GPU pages)", request_id)
+            return False
 
     # ------------------------------------------------------------------
     # Batch building
@@ -501,7 +600,43 @@ class Worker:
                 finally:
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
-                
+
+                # 5a. Handle allocation failure: offload a victim, retry the rest
+                if output.allocation_failed:
+                    batch_ids = set(batch.node_objects.keys())
+                    victim_id = self._try_offload_cold_request(batch_ids)
+
+                    # Push all batch nodes back to their queues
+                    for request_id, node in batch.node_objects.items():
+                        wg_id = batch.request_to_worker_graph[request_id]
+                        self.worker_graphs_manager.queues[wg_id].push_back_node(
+                            request_id, node
+                        )
+
+                    if victim_id is not None:
+                        # Only hold the offloaded victim (needs CPU→GPU reload)
+                        self.scheduler.hold_requests([victim_id])
+                        logger.warning(
+                            "OOM on node=%s walk=%s: offloaded victim=%s, "
+                            "retrying %d remaining requests",
+                            batch.node_name, batch.graph_walk, victim_id,
+                            len(batch_ids) - (1 if victim_id in batch_ids else 0),
+                        )
+                    else:
+                        # No offloading possible; hold all requests briefly
+                        self.scheduler.hold_requests(list(batch_ids))
+                        logger.warning(
+                            "OOM on node=%s walk=%s: no offload possible, "
+                            "holding %d requests",
+                            batch.node_name, batch.graph_walk, len(batch_ids),
+                        )
+                    continue
+
+                # Update LRU timestamps for successfully executed requests
+                now = _time.monotonic()
+                for rid in batch.node_objects:
+                    self._last_active[rid] = now
+
                 for rid, req_info in node_batch.per_request_info.items():
                     self.worker_graphs_manager.update_request_info(
                         rid, per_label_seq_info=req_info.per_label_seq_info

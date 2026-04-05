@@ -129,6 +129,13 @@ class EngineManager:
                 return engine.alloc_manager
         return None
 
+    def get_ar_engine(self) -> "AREngine | None":
+        """Return the first AR engine instance, if any."""
+        for engine in self.node_to_engine.values():
+            if isinstance(engine, AREngine):
+                return engine
+        return None
+
     def shutdown(self) -> None:
         seen = set()
         for engine in self.node_to_engine.values():
