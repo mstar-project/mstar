@@ -189,8 +189,18 @@ class Conductor:
         self._per_worker_graphs: dict[str, list[WorkerGraph]] = {}
         self._per_worker_engine_configs: dict[str, list[dict]] = {}
 
+        kv_cache_config = self.model.get_kv_cache_config()
+        # Apply any KV cache overrides from the YAML config
+        yaml_kv_overrides = self.model_config.get("kv_cache", {})
+        if yaml_kv_overrides:
+            from dataclasses import fields
+            for f in fields(kv_cache_config):
+                if f.name in yaml_kv_overrides:
+                    setattr(kv_cache_config, f.name, yaml_kv_overrides[f.name])
+            logger.info("KV cache config after YAML overrides: %s", kv_cache_config)
+
         engine_model_cfg = {
-            "kv_cache": self.model.get_kv_cache_config(),
+            "kv_cache": kv_cache_config,
             "autocast_dtype": self.model.get_autocast_dtype()
         }
         for rank in self._sorted_ranks:
