@@ -190,17 +190,19 @@ class SNACDecoderSubmodule(NodeSubmodule):
     def _preprocess_streaming(
         self, request_id: str, per_request_info: dict,
     ) -> dict[str, torch.Tensor]:
-        """Extract a sliding window of tokens from the streaming buffer."""
+        """Convert all buffered tokens to codes and take the last 28.
+
+        Matches the reference decoder: each token is converted with a global
+        running count (only valid codes increment the count), and audio is
+        produced from the last 28 valid codes (sliding window from the end).
+        """
         fwd_info = per_request_info.get(request_id)
         step_meta = fwd_info.step_metadata if fwd_info else {}
 
         streaming_buffer = step_meta.get("_streaming_buffer", {})
         token_tensors = streaming_buffer.get("new_token", [])
 
-        window_start = step_meta.get("window_start", 0)
-        window_size = step_meta.get("window_size", self.config.snac_window_tokens)
-
-        # Flatten all token tensors into a list of raw vocab IDs
+        # Flatten all token tensors into raw vocab IDs
         all_token_ids = []
         for tensor in token_tensors:
             vals = tensor.cpu().numpy().tolist()
@@ -209,33 +211,34 @@ class SNACDecoderSubmodule(NodeSubmodule):
             else:
                 all_token_ids.append(int(vals))
 
-        # Extract the window from raw tokens FIRST, then filter + convert
-        window_tokens = all_token_ids[window_start:window_start + window_size]
-
-        # Convert raw LLM vocab IDs to SNAC audio codes, filtering out
-        # non-audio tokens (matching the reference decoder's behavior).
+        # Convert ALL tokens to codes with a global running count
+        # (matching reference decoder's turn_token_into_id + filter).
         base_id = self.config.custom_token_base_id
-        min_audio_token = base_id + 10  # custom_token_10 is the first valid audio token
-        snac_codes = []
+        min_audio_token = base_id + 10
+        all_codes = []
         count = 0
-        for t in window_tokens:
+        for t in all_token_ids:
             if t < min_audio_token:
-                continue  # skip non-audio tokens
+                continue
             code = (t - base_id) - 10 - ((count % 7) * 4096)
             if 0 <= code <= 4096:
-                snac_codes.append(code)
+                all_codes.append(code)
                 count += 1
 
+        # Take the last 28 valid codes (sliding window from the end),
+        # matching the reference's `buffer[-28:]`.
+        window = self.config.snac_window_tokens
+        snac_codes = all_codes[-window:] if len(all_codes) >= window else all_codes
+
         logger.debug(
-            "SNAC preprocess: buf=%d, window=[%d:%d], codes=%d, first=%s",
-            len(all_token_ids), window_start, window_start + window_size,
-            len(snac_codes), snac_codes[:7] if snac_codes else "[]",
+            "SNAC preprocess: raw=%d, valid_codes=%d, chunk=%d, first=%s",
+            len(all_token_ids), len(all_codes), len(snac_codes),
+            snac_codes[:7] if snac_codes else "[]",
         )
 
         return {
             "request_id": request_id,
             "audio_token_ids": snac_codes,
-            "graph_walk": "snac_chunk",
         }
 
     def forward(self, request_id: str, audio_token_ids: list[int], **kwargs) -> NameToTensorList:

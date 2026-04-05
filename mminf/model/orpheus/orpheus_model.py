@@ -261,16 +261,21 @@ class OrpheusModel(Model):
         token_buffer_count: int,
         producer_done: bool,
     ) -> ForwardPassArgs:
-        """SNAC partition: decode one streaming chunk."""
+        """SNAC partition: trigger one streaming chunk decode.
+
+        The SNAC submodule converts ALL buffered tokens to codes and takes
+        the last 28 valid codes (matching the reference decoder). The
+        conductor just needs to trigger it periodically and track whether
+        there are more tokens to process.
+        """
         consumed = metadata.kwargs.get("snac_consumed", 0)
-        window = self.config.snac_window_tokens
         stride = self.config.snac_stride_tokens
 
         metadata.graph_walk = "snac_chunk"
 
         available = token_buffer_count - consumed
 
-        # Check if there's anything left to decode
+        # Nothing left to decode
         if available <= 0 and producer_done:
             return ForwardPassArgs(
                 full_metadata=metadata,
@@ -279,24 +284,12 @@ class OrpheusModel(Model):
                 request_done=True,
             )
 
-        # Window starts at consumed position (always frame-aligned since stride=7).
-        # For a full window we take [consumed : consumed+window].
-        window_start = consumed
-        chunk_size = min(window, available)
-
-        # Advance consumed count by stride
+        # Advance consumed count by stride (raw tokens)
         new_consumed = consumed + stride
         metadata.kwargs["snac_consumed"] = new_consumed
 
-        # Signal-only trigger for the snac_decoder node
         graph_edge = GraphEdge(next_node="snac_decoder", name="trigger")
-        inputs = [graph_edge]
-
-        step_metadata = {
-            "window_start": window_start,
-            "window_size": chunk_size,
-            "consumed_tokens": stride,  # used by conductor to track consumption
-        }
+        step_metadata = {"consumed_tokens": stride}
 
         # Check if this is the last chunk
         remaining_after = token_buffer_count - new_consumed
@@ -304,7 +297,7 @@ class OrpheusModel(Model):
 
         return ForwardPassArgs(
             full_metadata=metadata,
-            inputs=inputs,
+            inputs=[graph_edge],
             unpersist_tensors=[],
             step_metadata=step_metadata,
             request_done=is_last,
