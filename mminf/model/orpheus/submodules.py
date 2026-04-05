@@ -163,6 +163,8 @@ class SNACDecoderSubmodule(NodeSubmodule):
         super().__init__()
         self.snac_model = snac_model
         self.config = config
+        # Track last emitted valid-code count per request to avoid duplicate chunks
+        self._last_emitted_count: dict[str, int] = {}
 
     def check_streaming_ready(
         self,
@@ -190,11 +192,13 @@ class SNACDecoderSubmodule(NodeSubmodule):
     def _preprocess_streaming(
         self, request_id: str, per_request_info: dict,
     ) -> dict[str, torch.Tensor]:
-        """Convert all buffered tokens to codes and take the last 28.
+        """Convert all buffered tokens to codes and emit at frame boundaries.
 
-        Matches the reference decoder: each token is converted with a global
-        running count (only valid codes increment the count), and audio is
-        produced from the last 28 valid codes (sliding window from the end).
+        Matches the reference decoder exactly:
+        - Each token is converted with a global running count
+        - Audio is only produced when count % 7 == 0 and count > 27
+        - The last 28 valid codes are used (buffer[-28:])
+        - Each frame boundary emits exactly once (no duplicates)
         """
         fwd_info = per_request_info.get(request_id)
         step_meta = fwd_info.step_metadata if fwd_info else {}
@@ -225,21 +229,36 @@ class SNACDecoderSubmodule(NodeSubmodule):
                 all_codes.append(code)
                 count += 1
 
-        # Take the last 28 valid codes (sliding window from the end),
-        # matching the reference's `buffer[-28:]`.
-        window = self.config.snac_window_tokens
-        snac_codes = all_codes[-window:] if len(all_codes) >= window else all_codes
+        n_valid = len(all_codes)
+        last_emitted = self._last_emitted_count.get(request_id, 0)
+        window = self.config.snac_window_tokens  # 28
+
+        # Match reference: only emit when at a frame boundary (count % 7 == 0)
+        # and we have enough codes, and this is a NEW boundary we haven't emitted.
+        if n_valid < window or n_valid % 7 != 0 or n_valid <= last_emitted:
+            logger.debug(
+                "SNAC preprocess: skip (valid=%d, last_emitted=%d, %%7=%d)",
+                n_valid, last_emitted, n_valid % 7,
+            )
+            return {"request_id": request_id, "audio_token_ids": []}
+
+        # Take last 28 codes (reference's buffer[-28:])
+        snac_codes = all_codes[-window:]
+        self._last_emitted_count[request_id] = n_valid
 
         logger.debug(
-            "SNAC preprocess: raw=%d, valid_codes=%d, chunk=%d, first=%s",
-            len(all_token_ids), len(all_codes), len(snac_codes),
-            snac_codes[:7] if snac_codes else "[]",
+            "SNAC preprocess: raw=%d, valid=%d, emitting chunk, first=%s",
+            len(all_token_ids), n_valid, snac_codes[:7],
         )
 
         return {
             "request_id": request_id,
             "audio_token_ids": snac_codes,
         }
+
+    def cleanup_request(self, request_id: str):
+        """Clean up per-request state."""
+        self._last_emitted_count.pop(request_id, None)
 
     def forward(self, request_id: str, audio_token_ids: list[int], **kwargs) -> NameToTensorList:
         if not audio_token_ids or len(audio_token_ids) < 7:
