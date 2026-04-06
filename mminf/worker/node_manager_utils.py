@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.graph.base import GraphEdge, GraphNode, TensorPointerInfo
+from mminf.streaming.stream_buffer import StreamBuffer
 from mminf.graph.request_queues import (
     PerRequestNodeQueues,
     ProcessedInputs,
@@ -144,6 +145,8 @@ class PerRequestInfo:
 
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
     pending_new_tokens: dict[str, list[int]] = field(default_factory=dict)
+    stream_buffers: dict[str, StreamBuffer] = field(default_factory=dict)  # edge_name -> StreamBuffer
+    stream_partition_done: bool = False  # set True when last chunk pops with is_final
     current_output_chunks: list[str] = field(default_factory=list)
 
 

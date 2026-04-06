@@ -54,6 +54,8 @@ class InputSignals(MessageBody):
     request_id: str
     inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
+    partition_name: str = ""
+    producer_done: bool = False
 
 
 @dataclass
@@ -102,6 +104,7 @@ class WorkerGraphsDone(MessageBody):
     output_signal_names: int = field(default=0)
     per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
     partition_name: str = field(default="default")
+    partition_done: bool = field(default=False)
 
 
 @dataclass

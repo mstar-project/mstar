@@ -671,7 +671,7 @@ class Conductor:
             metadata = CurrentForwardConductorMetadata(
                 input_modalities=body.initial_input_modalities,
                 output_modalities=body.initial_output_modalities,
-                graph_walk=p.initial_walk or "",
+                graph_walk=p.initial_walk or next(iter(p.graph_walks), ""),
                 is_prefill=(p.initial_walk is not None),
             )
             request_data.partition_states[p.name] = PartitionState(
@@ -722,18 +722,45 @@ class Conductor:
         )
 
         for worker, worker_graph_ids in worker_to_worker_graph_ids.items():
+            # Determine the graph_walk and partition_name for this worker.
+            # For the new topology path, each worker uses its own partition's walk.
+            worker_graph_walk = initial_fwd_args.full_metadata.graph_walk
+            worker_partition_name = initial_partition.name
+            worker_step_metadata = initial_fwd_args.step_metadata
+            worker_fwd_index = pstate.fwd_pass_number
+            worker_seed = pstate.random_seed
+
+            if self.model.get_partition_topology() is not None:
+                # Find which partition this worker serves based on worker_graph_ids
+                for wg_id in worker_graph_ids:
+                    wg_walks = self._all_worker_graph_ids_to_graph_walks.get(wg_id, set())
+                    for p in partitions:
+                        if wg_walks & p.graph_walks:
+                            if p.name != initial_partition.name:
+                                # Consumer partition — use its own walk
+                                cs = request_data.partition_states[p.name]
+                                worker_graph_walk = cs.metadata.graph_walk
+                                worker_partition_name = p.name
+                                worker_step_metadata = {}
+                                worker_fwd_index = cs.fwd_pass_number
+                                worker_seed = cs.random_seed
+                            break
+                    else:
+                        continue
+                    break
+
             message = NewRequest(
                 request_id=body.request_id,
                 worker_graph_ids=worker_graph_ids,
                 worker_graph_to_worker=worker_graph_to_worker,
                 initial_inputs=inputs_per_worker.get(worker, []),
                 request_info=CurrentForwardPassInfo(
-                    graph_walk=initial_fwd_args.full_metadata.graph_walk,
-                    step_metadata=initial_fwd_args.step_metadata,
-                    fwd_index=pstate.fwd_pass_number,
-                    random_seed=pstate.random_seed,
-                    requires_cfg=initial_fwd_args.full_metadata.requires_cfg,
-                    partition_name=initial_partition.name,
+                    graph_walk=worker_graph_walk,
+                    step_metadata=worker_step_metadata,
+                    fwd_index=worker_fwd_index,
+                    random_seed=worker_seed,
+                    requires_cfg=False,
+                    partition_name=worker_partition_name,
                 ),
             )
             self.communicator.send(
@@ -834,6 +861,7 @@ class Conductor:
 
     def _process_partitioned_done_forward(
         self, request_id: str, partition_name: str,
+        partition_done_from_worker: bool = False,
     ) -> bool:
         """Process a completed forward pass for a specific partition.
 
@@ -841,6 +869,20 @@ class Conductor:
         """
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
+        pdef = request_data.partition_definitions[partition_name]
+        has_topology = self.model.get_partition_topology() is not None
+        is_consumer = bool(pdef.producer_partitions)
+
+        # New topology path: consumer partition signals done from worker side
+        if has_topology and is_consumer:
+            if partition_done_from_worker:
+                pstate.is_done = True
+            # Reset state for next iteration (consumer self-triggers)
+            pstate.new_tokens = {}
+            pstate.completed_worker_graph_ids = set()
+            pstate.current_worker_graph_ids = set()
+            pstate.fwd_pass_number += 1
+            return all(ps.is_done for ps in request_data.partition_states.values())
 
         fwd_args = self.model.get_partition_forward_pass_args(
             partition_name=partition_name,
@@ -870,17 +912,22 @@ class Conductor:
             request_data.streaming_token_count,
         )
 
+        has_topology = self.model.get_partition_topology() is not None
+        is_consumer = bool(pdef.producer_partitions)
+
         if fwd_args.request_done:
             pstate.is_done = True
-            # If this is a producer partition, mark producer_done for consumers
-            pdef = request_data.partition_definitions[partition_name]
+            # If this is a producer partition, signal consumers
             for other_name, other_def in request_data.partition_definitions.items():
                 if partition_name in other_def.producer_partitions:
                     request_data.streaming_producer_done = True
                     request_data.partition_states[other_name].producer_done = True
-        else:
-            # Send InputSignals first (registers ref counts for the tensors),
-            # then unpersist old tensors that are no longer needed.
+                    # New topology: send producer_done to consumer workers
+                    if has_topology:
+                        self._send_producer_done(request_id, other_name)
+        elif not (has_topology and is_consumer):
+            # Send InputSignals for producer partitions (or legacy path).
+            # Consumer partitions with new topology self-gate via StreamBuffer.
             self._send_partition_inputs(request_id, partition_name, fwd_args)
 
         self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
@@ -892,8 +939,9 @@ class Conductor:
         pstate.fwd_pass_number += 1
         pstate.random_seed += 1
 
-        # Check if consumer partitions should be triggered
-        self._check_and_kick_consumers(request_id)
+        # Legacy path: kick consumers from conductor
+        if not has_topology:
+            self._check_and_kick_consumers(request_id)
 
         # Request done when ALL partitions are done
         return all(ps.is_done for ps in request_data.partition_states.values())
@@ -941,6 +989,42 @@ class Conductor:
                 ),
             )
             self.communicator.send(worker, message)
+
+    def _send_producer_done(self, request_id: str, consumer_partition_name: str):
+        """Send producer_done signal to the consumer partition's worker(s)."""
+        request_data = self.requests[request_id]
+        pstate = request_data.partition_states[consumer_partition_name]
+
+        # Find which workers handle this consumer partition
+        consumer_workers = set()
+        for wg_id, worker_id in request_data.worker_graph_to_worker.items():
+            walks = self._get_worker_graph_walks(wg_id)
+            pdef = request_data.partition_definitions[consumer_partition_name]
+            if walks & pdef.graph_walks:
+                consumer_workers.add(worker_id)
+
+        for worker_id in consumer_workers:
+            message = WorkerMessage(
+                message_type=WorkerMessageType.INPUT_SIGNALS,
+                body=InputSignals(
+                    request_id=request_id,
+                    inputs=[],
+                    request_info=CurrentForwardPassInfo(
+                        graph_walk=pstate.metadata.graph_walk or "",
+                        fwd_index=pstate.fwd_pass_number,
+                        random_seed=pstate.random_seed,
+                        requires_cfg=False,
+                        partition_name=consumer_partition_name,
+                    ),
+                    partition_name=consumer_partition_name,
+                    producer_done=True,
+                ),
+            )
+            self.communicator.send(worker_id, message)
+
+    def _get_worker_graph_walks(self, worker_graph_id: str) -> set[str]:
+        """Get graph walks for a worker graph ID."""
+        return self._all_worker_graph_ids_to_graph_walks.get(worker_graph_id, set())
 
     def _check_and_kick_consumers(self, request_id: str):
         """Check all consumer partitions and kick off any that are ready."""
@@ -1036,7 +1120,9 @@ class Conductor:
                                 message.body,
                             )
                             for pname in done_parts:
-                                done_partition_forwards.append((rid, pname))
+                                done_partition_forwards.append(
+                                    (rid, pname, message.body.partition_done)
+                                )
                         else:
                             result = self._process_worker_graphs_done(message.body)
                             if result:
@@ -1053,11 +1139,12 @@ class Conductor:
                         completed_requests.append(request_id)
 
                 # Multi-partition forward completions
-                for request_id, partition_name in done_partition_forwards:
+                for request_id, partition_name, p_done in done_partition_forwards:
                     if request_id not in self.requests:
                         continue  # already completed by another partition in this cycle
                     all_done = self._process_partitioned_done_forward(
                         request_id, partition_name,
+                        partition_done_from_worker=p_done,
                     )
                     if all_done:
                         completed_requests.append(request_id)

@@ -53,15 +53,18 @@ class AudioCodecEngine(BaseEngine):
     def check_ready(
         self, node_name: str, request_id: str, request_info: CurrentForwardPassInfo,
     ) -> bool:
-        """Check if enough streaming tokens have accumulated for this request.
+        """Check if the engine is ready to execute.
 
-        Delegates to the submodule's ``check_streaming_ready`` if it exists,
-        allowing model-defined chunking strategies.
+        With the new StreamBuffer architecture, readiness is gated by the
+        StreamBuffer on the consumer worker, not the engine. Always return True.
+        Legacy path delegates to submodule's check_streaming_ready if it exists.
         """
-        submodule = self.submodules.get(node_name)
-        if submodule is None or self._streaming_buffers is None:
-            return True
+        if self._streaming_buffers is None:
+            return True  # new path or no streaming
 
+        submodule = self.submodules.get(node_name)
+        if submodule is None:
+            return True
         if not hasattr(submodule, 'check_streaming_ready'):
             return True
 
@@ -87,8 +90,8 @@ class AudioCodecEngine(BaseEngine):
                 for rid in batch.request_ids:
                     inputs = batch.per_request_input_tensors.get(rid, {})
 
-                    # Inject streaming buffer into step_metadata if available
                     fwd_info = batch.per_request_info[rid]
+                    # Legacy path: inject streaming buffer into step_metadata
                     if self._streaming_buffers and rid in self._streaming_buffers:
                         fwd_info.step_metadata = {
                             **fwd_info.step_metadata,

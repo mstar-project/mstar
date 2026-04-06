@@ -32,6 +32,8 @@ from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mminf.streaming.chunk_policy import SlidingWindowChunkPolicy
+from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
 
@@ -127,17 +129,17 @@ class OrpheusModel(Model):
                     is_new_token=True,
                     persist=True,
                 ),
-                GraphEdge(
+                StreamingGraphEdge(
                     next_node="snac_decoder",
                     name="new_token",
-                    is_streaming=True,
+                    target_partition="SNAC",
                 ),
             ],
         )
 
         snac_chunk = GraphNode(
             name="snac_decoder",
-            input_ids=["trigger"],
+            input_ids=["new_token"],
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
@@ -156,6 +158,22 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
     # Partition API: async streaming (LLM + SNAC)
     # -------------------------------------------------------------------
+
+    def get_partition_topology(self) -> PartitionTopology:
+        return PartitionTopology(
+            partitions=["LLM", "SNAC"],
+            connections=[
+                Connection(
+                    from_partition="LLM",
+                    to_partition="SNAC",
+                    edge_name="new_token",
+                    chunk_policy_factory=lambda: SlidingWindowChunkPolicy(
+                        window=self.config.snac_window_tokens,
+                        stride=self.config.snac_stride_tokens,
+                    ),
+                ),
+            ],
+        )
 
     def get_partitions(self) -> list[PartitionDefinition]:
         return [

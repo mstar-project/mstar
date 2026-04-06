@@ -364,6 +364,14 @@ class Model(ABC):
     # Partition API (optional, backward-compatible defaults)
     # ------------------------------------------------------------------
 
+    def get_partition_topology(self):
+        """Return a PartitionTopology describing async partitions and streaming connections.
+
+        Returns None for single-partition models (backward-compatible default).
+        Override for models with async partitions (e.g., Orpheus LLM + SNAC).
+        """
+        return None
+
     def get_partitions(self) -> list[PartitionDefinition]:
         """Return partition definitions.
 

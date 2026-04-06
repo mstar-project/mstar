@@ -11,7 +11,8 @@ from mminf.communication.tensors import MooncakeCommunicationManager, NameToTens
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
 from mminf.engine.kv_store import StoreWritePolicy, TransferEngineInfo
-from mminf.graph.base import GraphEdge
+from mminf.graph.base import GraphEdge, TensorPointerInfo
+from mminf.streaming.stream_buffer import StreamBuffer
 from mminf.graph.request_queues import format_graph_edge_list
 from mminf.model.base import Model, WorkerGraph
 from mminf.utils.ipc_format import (
@@ -135,12 +136,54 @@ class Worker:
         self.eviction_policy = EvictionPolicy.LRU
 
         # Streaming buffers: request_id -> edge_name -> list of tensors
-        # Accumulates tokens from streaming edges for consumer nodes (e.g., SNAC)
+        # (Legacy path — kept for models without PartitionTopology)
         self.streaming_buffers: dict[str, dict[str, list[torch.Tensor]]] = {}
 
-        # Give all engines a reference to streaming buffers
-        for engine in self.engine_manager._unique_engines():
-            engine.set_streaming_buffers(self.streaming_buffers)
+        # New streaming path: PartitionTopology + StreamBuffer on consumer worker
+        self.partition_topology = model.get_partition_topology() if model else None
+
+        # Determine which partition this worker serves (by checking which node names
+        # appear in my_worker_graphs vs the topology connections)
+        self._my_consumer_connections = []
+        if self.partition_topology:
+            my_node_names = set()
+            for wg in my_worker_graphs:
+                for node in (wg.section if isinstance(wg.section, list) else [wg.section]):
+                    if hasattr(node, 'name'):
+                        my_node_names.add(node.name)
+            for conn in self.partition_topology.connections:
+                # Check if any graph walk graph node for the consumer partition is on this worker
+                # by checking if the streaming edge's next_node is in my nodes
+                if any(n in my_node_names for n in self._get_node_names_for_partition(conn.to_partition, model)):
+                    self._my_consumer_connections.append(conn)
+
+        # Build consumer node cache: edge_name -> next_node name
+        self._consumer_node_cache: dict[str, str] = {}
+        if self._my_consumer_connections and model:
+            walks = model.get_graph_walk_graphs()
+            for conn in self._my_consumer_connections:
+                for _walk_name, section in walks.items():
+                    if hasattr(section, 'input_ids') and conn.edge_name in section.input_ids:
+                        self._consumer_node_cache[conn.edge_name] = section.name
+
+        # Give all engines a reference to streaming buffers (for legacy path)
+        if not self._my_consumer_connections:
+            for engine in self.engine_manager._unique_engines():
+                engine.set_streaming_buffers(self.streaming_buffers)
+
+    def _get_node_names_for_partition(self, partition_name: str, model: Model) -> list[str]:
+        """Get the node names that belong to a partition."""
+        walks = model.get_graph_walk_graphs()
+        partitions = model.get_partitions()
+        for pdef in partitions:
+            if pdef.name == partition_name:
+                nodes = set()
+                for walk_name in pdef.graph_walks:
+                    section = walks.get(walk_name)
+                    if section and hasattr(section, 'name'):
+                        nodes.add(section.name)
+                return list(nodes)
+        return []
 
     def _compute_store_write_policy(
         self,
@@ -206,6 +249,16 @@ class Worker:
         )
         self.engine_manager.add_request(body.request_id)
 
+        # Create StreamBuffers for consumer connections on this worker
+        for conn in self._my_consumer_connections:
+            req_info = self.worker_graphs_manager.per_request_info[body.request_id]
+            req_info.stream_buffers[conn.edge_name] = StreamBuffer(
+                request_id=body.request_id,
+                edge_name=conn.edge_name,
+                from_partition=conn.from_partition,
+                policy=conn.chunk_policy_factory(),
+            )
+
         # Start RDMA reads for tensors that have tensor_info
         self.tensor_manager.start_read_tensors(
             body.request_id, body.initial_inputs,
@@ -244,6 +297,13 @@ class Worker:
             "Received new signals %s at worker %s for request %s",
             format_graph_edge_list(body.inputs), self.worker_id, body.request_id
         )
+
+        # Handle producer_done signal: mark all StreamBuffers for this request as done
+        if body.producer_done:
+            req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
+            if req_info:
+                for sbuf in req_info.stream_buffers.values():
+                    sbuf.signal_done()
 
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
@@ -322,6 +382,51 @@ class Worker:
     # Tensor readiness
     # ------------------------------------------------------------------
 
+    def _route_streaming_tensor(self, request_id: str, edge: GraphEdge) -> None:
+        """Route a streaming tensor to either a StreamBuffer or legacy buffer."""
+        req_info = self.worker_graphs_manager.per_request_info.get(request_id)
+        stream_buf = req_info.stream_buffers.get(edge.name) if req_info else None
+
+        for info in edge.tensor_info:
+            tensor = self.tensor_manager.get_tensor(
+                request_id=request_id, uuid=info.uuid,
+            )
+            if stream_buf is not None:
+                stream_buf.put(tensor.clone())
+            else:
+                # Legacy path
+                buf = self.streaming_buffers.setdefault(request_id, {})
+                edge_buf = buf.setdefault(edge.name, [])
+                edge_buf.append(tensor.clone())
+
+    def _poll_stream_buffers(self) -> None:
+        """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
+        for request_id, req_info in list(self.worker_graphs_manager.per_request_info.items()):
+            for edge_name, sbuf in req_info.stream_buffers.items():
+                while sbuf.has_chunk_ready():
+                    chunk = sbuf.pop_chunk()
+                    chunk_tensor = chunk.data.get("data")
+                    if chunk_tensor is None:
+                        continue
+
+                    if chunk.is_final:
+                        req_info.stream_partition_done = True
+
+                    consumer_node = self._consumer_node_cache.get(edge_name, "")
+
+                    # Store the chunk tensor so _build_node_batch can retrieve it via uuid
+                    tensor_infos = self.tensor_manager.store_and_return_tensor_info(
+                        request_id, {edge_name: [chunk_tensor]},
+                    )
+                    synthetic_edge = GraphEdge(
+                        next_node=consumer_node,
+                        name=edge_name,
+                        tensor_info=tensor_infos.get(edge_name, []),
+                    )
+                    self.worker_graphs_manager.process_new_inputs(
+                        request_id=request_id, inputs=[synthetic_edge],
+                    )
+
     def _check_ready_tensors(self) -> None:
         """Poll for completed RDMA transfers, feed ready graph edges to worker graph queues."""
         ready = self.tensor_manager.get_ready_tensors()
@@ -330,15 +435,8 @@ class Worker:
             streaming = [e for e in edges if e.is_streaming]
             normal = [e for e in edges if not e.is_streaming]
 
-            # Streaming edges go to the streaming buffer
             for edge in streaming:
-                buf = self.streaming_buffers.setdefault(request_id, {})
-                edge_buf = buf.setdefault(edge.name, [])
-                for info in edge.tensor_info:
-                    tensor = self.tensor_manager.get_tensor(
-                        request_id=request_id, uuid=info.uuid,
-                    )
-                    edge_buf.append(tensor.clone())
+                self._route_streaming_tensor(request_id, edge)
 
             if normal:
                 self.worker_graphs_manager.process_new_inputs(
@@ -595,15 +693,9 @@ class Worker:
                 self.communicator.send("api_server", message)
 
         # Handle streaming edges
-        # Local streaming: store directly in buffer
+        # Local streaming: route to StreamBuffer or legacy buffer
         for edge in outputs.streaming_local:
-            buf = self.streaming_buffers.setdefault(request_id, {})
-            edge_buf = buf.setdefault(edge.name, [])
-            for info in edge.tensor_info:
-                tensor = self.tensor_manager.get_tensor(
-                    request_id=request_id, uuid=info.uuid,
-                )
-                edge_buf.append(tensor.clone())
+            self._route_streaming_tensor(request_id, edge)
 
         # Remote streaming: send to destination workers
         for worker_id, edges in outputs.streaming_to_workers.items():
@@ -620,6 +712,8 @@ class Worker:
         if outputs.completed_worker_graph_ids:
             fwd_info = self.worker_graphs_manager.get_fwd_info(request_id)
             partition_name = getattr(fwd_info, 'partition_name', 'default')
+            req_info = self.worker_graphs_manager.per_request_info.get(request_id)
+            p_done = req_info.stream_partition_done if req_info else False
             message = ConductorMessage(
                 message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
                 body=WorkerGraphsDone(
@@ -630,6 +724,7 @@ class Worker:
                     output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id),
                     per_label_seq_info=self.worker_graphs_manager.get_seq_info(request_id),
                     partition_name=partition_name,
+                    partition_done=p_done,
                 ),
             )
             self.communicator.send("conductor", message)
@@ -650,6 +745,9 @@ class Worker:
 
                 # 2. Check for ready RDMA tensors, feed to worker graph queues
                 self._check_ready_tensors()
+
+                # 2b. Poll StreamBuffers — pop chunks when ready, feed as normal inputs
+                self._poll_stream_buffers()
 
                 # 3. Pick next batch via MicroScheduler
                 batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
