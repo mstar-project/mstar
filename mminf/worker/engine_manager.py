@@ -75,10 +75,18 @@ class EngineManager:
                 for name in node_names:
                     submodule = model.get_submodule(name, device)
                     if submodule is not None:
-                        submodules[name] = submodule.to(
-                            device=device,
-                            dtype=model.get_autocast_dtype()
-                        )
+                        # Audio codecs need float32 weights — a bfloat16
+                        # roundtrip irreversibly quantises the weights and
+                        # produces garbled audio.  Skip the dtype cast for
+                        # audio_codec engines; their load_model handles
+                        # precision explicitly.
+                        if engine_type_str == "audio_codec":
+                            submodules[name] = submodule.to(device=device)
+                        else:
+                            submodules[name] = submodule.to(
+                                device=device,
+                                dtype=model.get_autocast_dtype()
+                            )
 
             engine.load_model(
                 submodules, model_config, device,
