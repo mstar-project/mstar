@@ -54,6 +54,9 @@ class BaseEngine(ABC):
         """Called by Worker to provide a reference to the shared streaming buffer."""
         self._streaming_buffers = buffers
 
+    def has_autocast(self):
+        return True
+
     @abstractmethod
     def engine_type(self) -> EngineType:
         ...
