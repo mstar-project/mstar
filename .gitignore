@@ -12,6 +12,9 @@ uv.lock
 profiler/
 traces/
 
+# per-user env config
+test/bagel/.env
+
 # output filenames
 output.png
 output_edit.png

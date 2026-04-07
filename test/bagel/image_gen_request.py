@@ -6,7 +6,9 @@ import sys
 
 import requests
 
-URL = "http://0.0.0.0:8000/generate"
+from _env import get_server_url
+
+URL = get_server_url()
 
 
 def main():

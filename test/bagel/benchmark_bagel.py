@@ -14,6 +14,8 @@ from pathlib import Path
 
 import aiohttp
 
+from _env import get_server_url
+
 DEFAULT_PROMPTS = {
     "text_to_text": "What is the 7th value after the decimal point in pi?",
     "text_to_image": "A cat in a suit and tie",
@@ -25,7 +27,7 @@ REQUEST_TYPES = ["text_to_text", "text_to_image", "image_to_text"]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark the BAGEL serving endpoint")
-    parser.add_argument("--url", default="http://0.0.0.0:8000/generate", help="Server URL")
+    parser.add_argument("--url", default=get_server_url(), help="Server URL")
     parser.add_argument("--num-requests", type=int, default=10, help="Total number of requests to send")
     parser.add_argument("--rate", type=float, default=1.0, help="Requests per second")
     parser.add_argument(
