@@ -180,23 +180,25 @@ class WorkerGraphsManager:
     def update_request_info(
         self, request_id: str,
         current_fwd_info: CurrentForwardPassInfo | None=None,
-        per_label_seq_info: dict | None=None
+        per_label_seq_info: dict | None=None,
+        partition_name: str | None = None,
     ):
         req_info = self.per_request_info[request_id]
         if current_fwd_info is not None:
+            partition_name = partition_name or getattr(current_fwd_info, 'partition_name', 'default')
             graph_walk = current_fwd_info.graph_walk
-            if self.get_graph_walk(request_id) != graph_walk:
+            if self.get_graph_walk(request_id, partition_name) != graph_walk:
                 req_info.graph_walk_worker_graph_ids = [
                     graph_id for graph_id in self.per_request_info[request_id].worker_graph_ids \
                         if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
                 ]
             req_info.current_fwd_info = current_fwd_info
             # Also store per-partition for the colocated case
-            partition_name = getattr(current_fwd_info, 'partition_name', 'default')
             req_info.partition_fwd_infos[partition_name] = current_fwd_info
         if per_label_seq_info is not None:
-            req_info.current_fwd_info.per_label_seq_info = {
-                **req_info.current_fwd_info.per_label_seq_info,
+            fwd_info = self.get_fwd_info(request_id, partition_name)
+            fwd_info.per_label_seq_info = {
+                **fwd_info.per_label_seq_info,
                 **per_label_seq_info
             }
 
