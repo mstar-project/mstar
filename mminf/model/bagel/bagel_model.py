@@ -808,10 +808,13 @@ class BagelModel(Model):
             step_metadata=step_metadata
         )
 
-    def get_forward_pass_args(
-        self, metadata: CurrentForwardConductorMetadata,
+    def get_partition_forward_pass_args(
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         new_tokens: dict[str, list[int]],
+        incoming_connections=None,
     ) -> ForwardPassArgs:
         """Advance graph walk transitions. Schedule-driven, no BOI detection.
 
@@ -828,6 +831,7 @@ class BagelModel(Model):
 
         After image_gen, marks request complete (one image per request).
         """
+        metadata = partition_metadata
         request_done = False
         if metadata.is_prefill:
             step = metadata.kwargs["prefill_step"] + 1
