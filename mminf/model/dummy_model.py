@@ -150,11 +150,15 @@ class DummyModel(Model):
             unpersist_tensors=[],
         )
 
-    def get_forward_pass_args(
-        self, metadata: CurrentForwardConductorMetadata,
+    def get_partition_forward_pass_args(
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        prev_forward_metadata: CurrentForwardConductorMetadata=None,
+        new_tokens: dict[str, list[int]] = None,
+        incoming_connections=None,
     ) -> list[GraphEdge]:
+        metadata = partition_metadata
         text_inp = GraphEdge(
             next_node="text_emb",
             name="text_inputs",
