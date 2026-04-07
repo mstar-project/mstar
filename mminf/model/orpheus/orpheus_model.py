@@ -124,6 +124,11 @@ class OrpheusModel(Model):
                     is_new_token=True,
                     persist=True,
                 ),
+                StreamingGraphEdge(
+                    next_node="snac_decoder",
+                    name="new_token",
+                    target_partition="SNAC",
+                ),
             ],
         )
 
