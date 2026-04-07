@@ -310,9 +310,6 @@ class Worker:
         )
         req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
 
-        if self.worker_id == "worker_1":
-            print(body.request_info.fwd_index)
-
         # Handle producer_done signal: mark all StreamBuffers for this request as done
         if body.producer_done:
             if req_info:
@@ -409,8 +406,8 @@ class Worker:
             tensor = self.tensor_manager.get_tensor(
                 request_id=request_id, uuid=info.uuid,
             )
-            self.tensor_manager.dereference(request_id, info.uuid)
             stream_buf.put(info.uuid, tensor.clone())
+            self.tensor_manager.dereference(request_id, info.uuid)
 
     def _poll_stream_buffers(self) -> None:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
