@@ -691,6 +691,10 @@ class Conductor:
         pstate.fwd_pass_number += 1
         pstate.random_seed += 1
 
+        self._set_partition_worker_graph_ids(
+            request_id, partition_name, fwd_args.full_metadata.graph_walk,
+        )
+
         # Request done when ALL partitions are done
         return all(ps.is_done for ps in request_data.partition_states.values())
 
@@ -700,10 +704,6 @@ class Conductor:
         """Send InputSignals for a specific partition's next forward pass."""
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
-
-        self._set_partition_worker_graph_ids(
-            request_id, partition_name, fwd_args.full_metadata.graph_walk,
-        )
 
         self._update_persist_ref_counts(request_id, fwd_args.inputs)
 
