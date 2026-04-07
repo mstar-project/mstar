@@ -308,10 +308,13 @@ class Worker:
             "Received new signals %s at worker %s for request %s",
             format_graph_edge_list(body.inputs), self.worker_id, body.request_id
         )
+        req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
+
+        if self.worker_id == "worker_1":
+            print(body.request_info.fwd_index)
 
         # Handle producer_done signal: mark all StreamBuffers for this request as done
         if body.producer_done:
-            req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
             if req_info:
                 for sbuf in req_info.stream_buffers.values():
                     sbuf.signal_done()
@@ -339,6 +342,10 @@ class Worker:
             self.tensor_manager.start_read_tensors(
                 body.request_id, streaming_with_tensors,
             )
+            for edge in streaming_with_tensors:
+                stream_buf = req_info.stream_buffers[edge.name]
+                for info in edge.tensor_info:
+                    stream_buf.pre_read_register(info.uuid)
 
         # Streaming signal-only edges: nothing to buffer (no tensor data)
         # This shouldn't normally happen for streaming edges
@@ -394,21 +401,16 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _route_streaming_tensor(self, request_id: str, edge: GraphEdge) -> None:
-        """Route a streaming tensor to either a StreamBuffer or legacy buffer."""
+        """Route a streaming tensor to either a StreamBuffer"""
         req_info = self.worker_graphs_manager.per_request_info.get(request_id)
-        stream_buf = req_info.stream_buffers.get(edge.name) if req_info else None
+        stream_buf = req_info.stream_buffers[edge.name]
 
         for info in edge.tensor_info:
             tensor = self.tensor_manager.get_tensor(
                 request_id=request_id, uuid=info.uuid,
             )
-            if stream_buf is not None:
-                stream_buf.put(tensor.clone())
-            else:
-                # Legacy path
-                buf = self.streaming_buffers.setdefault(request_id, {})
-                edge_buf = buf.setdefault(edge.name, [])
-                edge_buf.append(tensor.clone())
+            self.tensor_manager.dereference(request_id, info.uuid)
+            stream_buf.put(info.uuid, tensor.clone())
 
     def _poll_stream_buffers(self) -> None:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""

@@ -193,7 +193,7 @@ class AsyncMooncakeReader:
     The default stream is never blocked by store writes.
     """
 
-    def __init__(self, engine, device, max_workers: int = 1, max_batch_size=500):
+    def __init__(self, engine, device, max_workers: int = 3, max_batch_size=500):
         self._engine = engine
         self.max_batch_size = max_batch_size
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -571,8 +571,6 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 ))
                 logger.debug("Started transfer read for uuid %s", info.uuid)
             fut = self._async_reader.submit(read_info)
-            if fut is not None:
-                fut.result()
             self.pending.append(
                 FutureAndPointers(
                     future=fut, graph_edges=[graph_edge],
