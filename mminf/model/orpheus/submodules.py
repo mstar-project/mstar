@@ -204,65 +204,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         request_id = request_ids[0]
         inputs = per_request_inputs[0]
 
-        # # The chunk tensor from StreamBuffer: [window_size] of stacked token tensors
-        # chunk_tensor = inputs.get("new_token", [None])[0]
-        # if chunk_tensor is None:
-        #     return {"request_id": request_id, "audio_token_ids": []}
-
-        # # Flatten to raw token IDs
-        # all_token_ids = chunk_tensor.cpu().numpy().flatten().tolist()
-
-        # # How many raw tokens have we already processed?
-        # prev_raw = self._raw_consumed.get(request_id, 0)
-        # # Only process the NEW tokens (skip the overlapping prefix)
-        # new_start = prev_raw  # global position of first new token
-        # # The chunk covers [chunk_start, chunk_start+len). We only need
-        # # tokens from index `prev_raw - chunk_start` onwards.
-        # # With sliding window: chunk covers raw positions [consumed_before, consumed_before+window)
-        # # and consumed_before = chunk_index * stride. prev_raw should equal consumed_before
-        # # for the first chunk (0), then stride for subsequent.
-        # # Since StreamBuffer advances consumed by stride, the overlap is window-stride.
-        # overlap = max(0, prev_raw - (len(all_token_ids) - self.config.snac_stride_tokens))
-        # # Simpler: we know stride=7, window=28. First chunk: all 28 are new.
-        # # Subsequent chunks: first 21 are old, last 7 are new.
-        # stride = self.config.snac_stride_tokens
-        # if prev_raw == 0:
-        #     new_tokens = all_token_ids  # first chunk: all tokens are new
-        # else:
-        #     new_tokens = all_token_ids[-stride:]  # subsequent: only stride new tokens
-
-        # # Convert new tokens to SNAC codes using running count
-        # base_id = self.config.custom_token_base_id
-        # min_audio_token = base_id + 10
-        # count = self._valid_count.get(request_id, 0)
-        # codes = self._all_codes.get(request_id, [])
-
-        # for t in new_tokens:
-        #     if t < min_audio_token:
-        #         continue
-        #     code = (t - base_id - 10) % 4096
-        #     if code > 0:
-        #         codes.append(code)
-        #         count += 1
-
-        # self._valid_count[request_id] = count
-        # self._all_codes[request_id] = codes
-        # self._raw_consumed[request_id] = prev_raw + len(new_tokens)
-
-        # window = self.config.snac_window_tokens
-        # if len(codes) < 7:
-        #     return {"request_id": request_id, "audio_token_ids": []}
-
-        # # Take the last `window` codes (matching reference's buffer[-28:])
-        # snac_codes = codes[-window:] if len(codes) >= window else codes
-
-        # logger.info(
-        #     "SNAC preprocess: new=%d, total_codes=%d, emitting %d codes",
-        #     len(new_tokens), len(codes), len(snac_codes),
-        # )
-
         tokens = inputs["new_token"][0].flatten()
-        print(", ".join([str(a) for a in tokens.cpu().tolist()]))
 
         # Compute how many tokens we need to add
         remainder = tokens.numel() % 28

@@ -469,8 +469,6 @@ class CudaGraphRunner:
                             repetition_penalty=meta.get("repetition_penalty", 1.0),
                             seen_token_ids=meta.get("seen_token_ids", None),
                         )
-                        with open("tmp.txt", "a") as f:
-                            f.write(f"{token.item()}, ")
                         outputs[rid]["new_token"] = [token.clone()]
                     elif isinstance(val, list):
                         outputs[rid][out_key] = [t.clone() for t in val]
