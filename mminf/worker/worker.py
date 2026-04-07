@@ -73,6 +73,18 @@ class Worker:
         self.device = device
         self.enable_nvtx = enable_nvtx
 
+        # Build node_to_partition mapping from model's partitions and graph walks
+        node_to_partition: dict[str, str] = {}
+        if model is not None:
+            partitions = model.get_partitions()
+            walks = model.get_graph_walk_graphs()
+            for pdef in partitions:
+                for walk_name in pdef.graph_walks:
+                    section = walks.get(walk_name)
+                    if section:
+                        for node_name in section.get_node_names():
+                            node_to_partition[node_name] = pdef.name
+
         self.worker_graphs_manager = WorkerGraphsManager(
             queues={
                 worker_graph.worker_graph_id: WorkerGraphQueues(
@@ -86,6 +98,7 @@ class Worker:
             per_request_info={},
             all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
+            node_to_partition=node_to_partition,
         )
 
 
@@ -715,6 +728,13 @@ class Worker:
             partition_name = getattr(fwd_info, 'partition_name', 'default')
             req_info = self.worker_graphs_manager.per_request_info.get(request_id)
             p_done = req_info.stream_partition_done if req_info else False
+
+            # Collect stream consumption info
+            stream_consumed = {}
+            if req_info:
+                for edge_name, sbuf in req_info.stream_buffers.items():
+                    stream_consumed[edge_name] = sbuf._consumed
+
             message = ConductorMessage(
                 message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
                 body=WorkerGraphsDone(
@@ -726,6 +746,7 @@ class Worker:
                     per_label_seq_info=self.worker_graphs_manager.get_seq_info(request_id),
                     partition_name=partition_name,
                     partition_done=p_done,
+                    stream_tokens_consumed=stream_consumed,
                 ),
             )
             self.communicator.send("conductor", message)
