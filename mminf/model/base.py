@@ -13,6 +13,7 @@ from mminf.conductor.request_info import (
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
     PartitionDefinition,
+    StreamingConnectionState,
 )
 from mminf.engine.base import EngineType, NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
@@ -276,7 +277,9 @@ class Model(ABC):
 
     @abstractmethod
     def get_initial_forward_pass_args(
-        self, input_modalities: list[str],
+        self,
+        partition_name: str,
+        input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
@@ -367,10 +370,11 @@ class Model(ABC):
     def get_partition_topology(self):
         """Return a PartitionTopology describing async partitions and streaming connections.
 
-        Returns None for single-partition models (backward-compatible default).
+        Default: single "default" partition with no connections.
         Override for models with async partitions (e.g., Orpheus LLM + SNAC).
         """
-        return None
+        from mminf.streaming.topology import PartitionTopology
+        return PartitionTopology(partitions=["default"], connections=[])
 
     def get_partitions(self) -> list[PartitionDefinition]:
         """Return partition definitions.
@@ -390,8 +394,7 @@ class Model(ABC):
         partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         new_tokens: dict[str, list[int]],
-        token_buffer_count: int,
-        producer_done: bool,
+        incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> "ForwardPassArgs":
         """Per-partition transition logic.
 
@@ -400,18 +403,3 @@ class Model(ABC):
         return self.get_forward_pass_args(
             partition_metadata, persist_signals, new_tokens,
         )
-
-    def check_partition_ready(
-        self,
-        partition_name: str,
-        accumulated_token_count: int,
-        consumed_token_count: int,
-        producer_done: bool,
-    ) -> bool:
-        """Check whether a consumer partition should be triggered.
-
-        Called by the conductor after a producer partition completes a
-        forward pass.  Return ``True`` to kick off the consumer's next
-        forward pass.  Default: always ready.
-        """
-        return True

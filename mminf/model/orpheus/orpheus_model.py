@@ -27,7 +27,7 @@ import torch
 from transformers import AutoTokenizer
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
+from mminf.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, TensorPointerInfo
@@ -191,37 +191,23 @@ class OrpheusModel(Model):
             ),
         ]
 
-    def check_partition_ready(
-        self,
-        partition_name: str,
-        accumulated_token_count: int,
-        consumed_token_count: int,
-        producer_done: bool,
-    ) -> bool:
-        if partition_name != "SNAC":
-            return True
-        window = self.config.snac_window_tokens
-        # Need a full window of tokens starting from the consumed position
-        needed = consumed_token_count + window
-        if accumulated_token_count >= needed:
-            return True
-        # Producer done: drain any remaining tokens as a partial chunk
-        return producer_done and accumulated_token_count > consumed_token_count
-
     def get_partition_forward_pass_args(
         self,
         partition_name: str,
         partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         new_tokens: dict[str, list[int]],
-        token_buffer_count: int,
-        producer_done: bool,
+        incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
         if partition_name == "LLM":
             return self._get_llm_partition_forward(
                 partition_metadata, persist_signals, new_tokens,
             )
         elif partition_name == "SNAC":
+            # Extract streaming state from the incoming connection
+            conn = incoming_connections[0] if incoming_connections else None
+            token_buffer_count = conn.token_count if conn else 0
+            producer_done = conn.producer_done if conn else False
             return self._get_snac_partition_forward(
                 partition_metadata, token_buffer_count, producer_done,
             )
@@ -359,35 +345,52 @@ class OrpheusModel(Model):
 
     def get_initial_forward_pass_args(
         self,
+        partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk="prefill",
-            is_prefill=True,
-        )
+        if partition_name == "LLM":
+            full_metadata = CurrentForwardConductorMetadata(
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk="prefill",
+                is_prefill=True,
+            )
 
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [graph_edge]
+            graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
+            graph_edge.tensor_info = input_signals.get("text_inputs", [])
+            inputs = [graph_edge]
 
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+            unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
 
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={
-                "is_prefill": True,
-                "temperature": self.config.temperature,
-                "top_p": self.config.top_p,
-                "repetition_penalty": self.config.repetition_penalty,
-            },
-        )
+            return ForwardPassArgs(
+                full_metadata=full_metadata,
+                inputs=inputs,
+                unpersist_tensors=unpersist_tensors,
+                step_metadata={
+                    "is_prefill": True,
+                    "temperature": self.config.temperature,
+                    "top_p": self.config.top_p,
+                    "repetition_penalty": self.config.repetition_penalty,
+                },
+            )
+        elif partition_name == "SNAC":
+            # SNAC starts with snac_chunk walk but no inputs —
+            # it will self-trigger via StreamBuffer when tokens arrive.
+            full_metadata = CurrentForwardConductorMetadata(
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk="snac_chunk",
+                is_prefill=False,
+            )
+            return ForwardPassArgs(
+                full_metadata=full_metadata,
+                inputs=[],
+                unpersist_tensors=[],
+            )
+        raise ValueError(f"Unknown partition: {partition_name!r}")
 
     def get_forward_pass_args(
         self,

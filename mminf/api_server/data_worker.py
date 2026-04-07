@@ -100,14 +100,13 @@ class PreprocessWorker:
         return self.per_request_reading_tensors.get(request_id, 0) > 0
     
     def received_final_chunks(
-        self, request_id: str, final_forward_pass: int,
-        final_forward_outputs: list[str]
+        self, request_id: str,
+        final_forward_outputs: dict[str, int],
     ):
-        return all([
-          self.output_fwd_pass_numbers[request_id].get(
-              name, -1
-            ) >= final_forward_pass for name in final_forward_outputs
-        ])
+        return all(
+            self.output_fwd_pass_numbers[request_id].get(name, -1) >= fwd_pass
+            for name, fwd_pass in final_forward_outputs.items()
+        )
 
     def get_result_chunks(self)-> list[ResultChunk]:
         results = []

@@ -5,7 +5,7 @@ from enum import Enum
 import torch
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.conductor.request_info import CurrentForwardPassInfo, SequenceInfo
+from mminf.conductor.request_info import CurrentForwardPassInfo
 
 
 class EngineType(Enum):
@@ -45,6 +45,14 @@ class NodeOutput:
 class BaseEngine(ABC):
     def __init__(self, enable_nvtx: bool = False, **kwargs):
         self.enable_nvtx = enable_nvtx
+        # Reference to worker-level streaming buffers (set by Worker.__init__)
+        self._streaming_buffers: dict[str, dict[str, list[torch.Tensor]]] | None = None
+
+    def set_streaming_buffers(
+        self, buffers: dict[str, dict[str, list[torch.Tensor]]],
+    ):
+        """Called by Worker to provide a reference to the shared streaming buffer."""
+        self._streaming_buffers = buffers
 
     @abstractmethod
     def engine_type(self) -> EngineType:
@@ -81,7 +89,19 @@ class BaseEngine(ABC):
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
     ):
-        return True
+        """Check if the engine is ready to execute.
+
+        Default implementation delegates to submodule's check_streaming_ready
+        if streaming buffers are set and the submodule supports it.
+        """
+        if self._streaming_buffers is None:
+            return True
+        submodules = getattr(self, 'submodules', {})
+        submodule = submodules.get(node_name) if isinstance(submodules, dict) else None
+        if submodule is None or not hasattr(submodule, 'check_streaming_ready'):
+            return True
+        buf = self._streaming_buffers.get(request_id, {})
+        return submodule.check_streaming_ready(buf, request_info)
 
     def warmup(self) -> None:
         """Optional CUDA graph capture. Override in subclasses."""

@@ -1,6 +1,5 @@
 import torch
 
-from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.utils.profiler import range_pop, range_push
 
@@ -9,10 +8,11 @@ class AudioCodecEngine(BaseEngine):
     """
     Wraps submodules for audio codec forward passes.
 
-    Supports streaming mode: when ``set_streaming_buffers`` is called with a
-    reference to the worker-level streaming buffer dict, the engine exposes the
-    buffer to submodules via ``per_request_info.step_metadata`` during
-    ``execute_batch`` so submodules can read accumulated tokens.
+    Supports streaming mode: when ``set_streaming_buffers`` is called (via
+    BaseEngine) with a reference to the worker-level streaming buffer dict,
+    the engine exposes the buffer to submodules via
+    ``per_request_info.step_metadata`` during ``execute_batch`` so submodules
+    can read accumulated tokens.
     """
 
     def __init__(
@@ -24,14 +24,6 @@ class AudioCodecEngine(BaseEngine):
         self.submodules: dict[str, torch.nn.Module] = {}
         self.device = None
         self.autocast_dtype = autocast_dtype
-        # Reference to worker-level streaming buffers (set by Worker.__init__)
-        self._streaming_buffers: dict[str, dict[str, list[torch.Tensor]]] | None = None
-
-    def set_streaming_buffers(
-        self, buffers: dict[str, dict[str, list[torch.Tensor]]],
-    ):
-        """Called by Worker to provide a reference to the shared streaming buffer."""
-        self._streaming_buffers = buffers
 
     def engine_type(self) -> EngineType:
         return EngineType.AUDIO_CODEC
@@ -50,27 +42,6 @@ class AudioCodecEngine(BaseEngine):
         }
         self.device = device
 
-    def check_ready(
-        self, node_name: str, request_id: str, request_info: CurrentForwardPassInfo,
-    ) -> bool:
-        """Check if the engine is ready to execute.
-
-        With the new StreamBuffer architecture, readiness is gated by the
-        StreamBuffer on the consumer worker, not the engine. Always return True.
-        Legacy path delegates to submodule's check_streaming_ready if it exists.
-        """
-        if self._streaming_buffers is None:
-            return True  # new path or no streaming
-
-        submodule = self.submodules.get(node_name)
-        if submodule is None:
-            return True
-        if not hasattr(submodule, 'check_streaming_ready'):
-            return True
-
-        buf = self._streaming_buffers.get(request_id, {})
-        return submodule.check_streaming_ready(buf, request_info)
-
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         if self.enable_nvtx:
             range_push(f"engine.audio_codec.{batch.node_name}.{batch.graph_walk}")
@@ -85,7 +56,7 @@ class AudioCodecEngine(BaseEngine):
             return output
 
         try:
-            with torch.inference_mode():
+            with torch.inference_mode(), torch.autocast("cuda", dtype=self.autocast_dtype):
                 outputs = {}
                 for rid in batch.request_ids:
                     inputs = batch.per_request_input_tensors.get(rid, {})

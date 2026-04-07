@@ -750,7 +750,9 @@ class BagelModel(Model):
         )
 
     def get_initial_forward_pass_args(
-        self, input_modalities: list[str],
+        self,
+        partition_name: str,
+        input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,

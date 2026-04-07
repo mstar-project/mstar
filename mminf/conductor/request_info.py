@@ -60,17 +60,24 @@ class PartitionDefinition:
 
 
 @dataclass
+class StreamingConnectionState:
+    """Per-connection streaming state tracked by the conductor."""
+    from_partition: str
+    to_partition: str
+    edge_name: str
+    token_count: int = 0
+    consumed_count: int = 0
+    producer_done: bool = False
+
+
+@dataclass
 class PartitionState:
     """Per-partition conductor-level state for a request."""
     partition_name: str
     metadata: CurrentForwardConductorMetadata
     fwd_pass_number: int = 0
     random_seed: int = 0
-    accumulated_token_count: int = 0    # total tokens received from producer
-    consumed_token_count: int = 0       # tokens consumed so far (for windowing)
     is_done: bool = False
-    is_started: bool = False
-    producer_done: bool = False
     new_tokens: dict[str, list[int]] = field(default_factory=dict)
     completed_worker_graph_ids: set[str] = field(default_factory=set)
     current_worker_graph_ids: set[str] = field(default_factory=set)

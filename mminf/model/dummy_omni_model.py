@@ -82,13 +82,21 @@ class DummyOmniModel(Model):
         )
 
     def get_initial_forward_pass_args(
-        self, input_modalities, output_modalities,
+        self, partition_name="default",
+        input_modalities=None, output_modalities=None,
+        input_signals=None, model_kwargs=None,
     ):
-        return CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
+        from mminf.model.base import ForwardPassArgs
+        full_metadata = CurrentForwardConductorMetadata(
+            input_modalities=input_modalities or [],
+            output_modalities=output_modalities or [],
             graph_walk="prefill",
             is_prefill=True,
+        )
+        return ForwardPassArgs(
+            full_metadata=full_metadata,
+            inputs=[],
+            unpersist_tensors=[],
         )
 
     def get_forward_pass_args(
