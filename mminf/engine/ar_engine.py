@@ -350,7 +350,7 @@ class AREngine(BaseEngine):
             submod_mgmt.alloc_manager.alloc_status.reset()
             try:
                 for req_id, info in batch.per_request_info.items():
-                    for label, seq_info in info.per_label_seq_info.get(batch.node_name):
+                    for label, seq_info in info.per_label_seq_info.get(batch.node_name).items():
                         if needed_labels is not None and label not in needed_labels:
                             continue
                         submod_mgmt.alloc_manager.sync_retrieve(
@@ -437,7 +437,7 @@ class AREngine(BaseEngine):
 
         labels_to_check = []
         try:
-            for label, seq_info in request_info.per_label_seq_info.get(node_name):
+            for label, seq_info in request_info.per_label_seq_info.get(node_name).items():
                 if needed_labels is not None and label not in needed_labels:
                     continue
                 submod_mgmt.alloc_manager.start_async_retrieve(

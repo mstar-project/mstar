@@ -33,7 +33,7 @@ class PerLabelSeqInfo:
     info: dict[str, dict[str, SequenceInfo]] = field(default_factory=dict)
 
     def update(self, other: "PerLabelSeqInfo"):
-        for node_name, info in other.info:
+        for node_name, info in other.info.items():
             if node_name not in self.info:
                 self.info[node_name] = info
                 continue
