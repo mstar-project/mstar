@@ -180,13 +180,10 @@ class SNACDecoderSubmodule(NodeSubmodule):
     def __init__(self, snac_model: nn.Module, config: OrpheusModelConfig):
         super().__init__()
         self.snac_model = snac_model
+        device = next(self.snac_model.parameters()).device
+        self.idx_14 = torch.tensor([1, 4], dtype=torch.long, device=device)
+        self.idx_2356 = torch.tensor([2, 3, 5, 6], dtype=torch.long, device=device)
         self.config = config
-        # Per-request accumulated valid codes and running count.
-        # We process only the NEW tokens (stride) each chunk, append
-        # to the running code list, and take the last `window` codes.
-        self._all_codes: dict[str, list[int]] = {}
-        self._valid_count: dict[str, int] = {}
-        self._raw_consumed: dict[str, int] = {}
 
     def preprocess(
         self,
@@ -201,83 +198,31 @@ class SNACDecoderSubmodule(NodeSubmodule):
         request_id = request_ids[0]
         inputs = per_request_inputs[0]
 
-        # The chunk tensor from StreamBuffer: [window_size] of stacked token tensors
-        chunk_tensor = inputs.get("new_token", [None])[0]
-        if chunk_tensor is None:
-            return {"request_id": request_id, "audio_token_ids": []}
+        tokens = inputs["new_token"][0].flatten()
 
-        # Flatten to raw token IDs
-        all_token_ids = chunk_tensor.cpu().numpy().flatten().tolist()
+        # Compute how many tokens we need to add
+        remainder = tokens.numel() % 28
+        if remainder != 0:
+            pad_len = 28 - remainder
+            pad = tokens[-1].repeat(pad_len)  # repeat last token
+            tokens = torch.cat([tokens, pad], dim=0)
 
-        # How many raw tokens have we already processed?
-        prev_raw = self._raw_consumed.get(request_id, 0)
-        # Only process the NEW tokens (skip the overlapping prefix)
-        new_start = prev_raw  # global position of first new token
-        # The chunk covers [chunk_start, chunk_start+len). We only need
-        # tokens from index `prev_raw - chunk_start` onwards.
-        # With sliding window: chunk covers raw positions [consumed_before, consumed_before+window)
-        # and consumed_before = chunk_index * stride. prev_raw should equal consumed_before
-        # for the first chunk (0), then stride for subsequent.
-        # Since StreamBuffer advances consumed by stride, the overlap is window-stride.
-        overlap = max(0, prev_raw - (len(all_token_ids) - self.config.snac_stride_tokens))
-        # Simpler: we know stride=7, window=28. First chunk: all 28 are new.
-        # Subsequent chunks: first 21 are old, last 7 are new.
-        stride = self.config.snac_stride_tokens
-        if prev_raw == 0:
-            new_tokens = all_token_ids  # first chunk: all tokens are new
-        else:
-            new_tokens = all_token_ids[-stride:]  # subsequent: only stride new tokens
-
-        # Convert new tokens to SNAC codes using running count
-        base_id = self.config.custom_token_base_id
-        min_audio_token = base_id + 10
-        count = self._valid_count.get(request_id, 0)
-        codes = self._all_codes.get(request_id, [])
-
-        for t in new_tokens:
-            if t < min_audio_token:
-                continue
-            code = (t - base_id) - 10 - ((count % 7) * 4096)
-            if code > 0:
-                codes.append(code)
-                count += 1
-
-        self._valid_count[request_id] = count
-        self._all_codes[request_id] = codes
-        self._raw_consumed[request_id] = prev_raw + len(new_tokens)
-
-        window = self.config.snac_window_tokens
-        if len(codes) < 7:
-            return {"request_id": request_id, "audio_token_ids": []}
-
-        # Take the last `window` codes (matching reference's buffer[-28:])
-        snac_codes = codes[-window:] if len(codes) >= window else codes
-
-        logger.debug(
-            "SNAC preprocess: new=%d, total_codes=%d, emitting %d codes",
-            len(new_tokens), len(codes), len(snac_codes),
-        )
+        tokens = tokens.view(-1, 4, 7)
+        snac_codes = (tokens - 128256 - 10) % 4096
 
         return {
             "request_id": request_id,
             "audio_token_ids": snac_codes,
         }
 
-    def cleanup_request(self, request_id: str):
-        """Clean up per-request state."""
-        self._valid_count.pop(request_id, None)
-        self._all_codes.pop(request_id, None)
-        self._raw_consumed.pop(request_id, None)
-
-    def forward(self, request_id: str, audio_token_ids: list[int], **kwargs) -> NameToTensorList:
-        if not audio_token_ids or len(audio_token_ids) < 7:
+    def forward(self, request_id: str, audio_token_ids: torch.Tensor, **kwargs) -> NameToTensorList:
+        if audio_token_ids is None or audio_token_ids.numel() < 7:
             logger.debug(
                 "SNAC forward: skipping chunk with %d token IDs (need >=7) for request %s",
-                len(audio_token_ids) if audio_token_ids else 0, request_id,
+                audio_token_ids.numel() if audio_token_ids is not None else 0, request_id,
             )
             return {}
-        device = next(self.snac_model.parameters()).device
-        result = self._decode_tokens(audio_token_ids, device)
+        result = self._decode_tokens(audio_token_ids)
         if not result:
             logger.warning(
                 "SNAC decode returned empty for request %s (codes may be out of range)",
@@ -290,43 +235,19 @@ class SNACDecoderSubmodule(NodeSubmodule):
             )
         return result
 
-    def _decode_tokens(self, token_ids: list[int], device: torch.device) -> NameToTensorList:
+    def _decode_tokens(self, mf: torch.Tensor) -> NameToTensorList:
         """Decode a SNAC token window into PCM audio (middle region)."""
-        num_frames = len(token_ids) // 7
-        if num_frames == 0:
-            return {}
-        frame_tokens = token_ids[: num_frames * 7]
 
-        codes_0 = []
-        codes_1 = []
-        codes_2 = []
+        codes_0 = mf[:, :, 0]
 
-        for j in range(num_frames):
-            i = 7 * j
-            codes_0.append(frame_tokens[i])
-            codes_1.extend([frame_tokens[i + 1], frame_tokens[i + 4]])
-            codes_2.extend([frame_tokens[i + 2], frame_tokens[i + 3], frame_tokens[i + 5], frame_tokens[i + 6]])
+        c1 = torch.index_select(mf, dim=2, index=self.idx_14)
+        codes_1 = c1.reshape(-1, 8)
 
-        codes_0_t = torch.tensor(codes_0, device=device, dtype=torch.int32).unsqueeze(0)
-        codes_1_t = torch.tensor(codes_1, device=device, dtype=torch.int32).unsqueeze(0)
-        codes_2_t = torch.tensor(codes_2, device=device, dtype=torch.int32).unsqueeze(0)
+        c2 = torch.index_select(mf, dim=2, index=self.idx_2356)
+        codes_2 = c2.reshape(-1, 16)
 
-        # Validate codes are in range
-        if (
-            torch.any(codes_0_t < 0)
-            or torch.any(codes_0_t > 4096)
-            or torch.any(codes_1_t < 0)
-            or torch.any(codes_1_t > 4096)
-            or torch.any(codes_2_t < 0)
-            or torch.any(codes_2_t > 4096)
-        ):
-            return {}
-
-        codes = [codes_0_t, codes_1_t, codes_2_t]
-
-        with torch.inference_mode():
-            audio_hat = self.snac_model.decode(codes)
-
+        codes = [codes_0, codes_1, codes_2]
+        audio_hat = self.snac_model.decode(codes)
         # Take the middle region of the decoded audio (sliding window overlap strategy)
         audio_slice = audio_hat[:, :, self.config.snac_audio_slice_start:self.config.snac_audio_slice_end]
         audio_int16 = (audio_slice.clamp(-1, 1) * 32767).to(torch.int16).squeeze().detach()

@@ -440,10 +440,13 @@ class AREngine(BaseEngine):
             # Not enough pages to allocate for retrieval — not ready
             return False
 
-        return all([
-            self.alloc_manager.check_retrieve_ready(request_id, label) \
-                for label in labels_to_check
+        ar_ready = all([
+            self.alloc_manager.check_retrieve_ready(request_id, label)
+            for label in labels_to_check
         ])
+        if not ar_ready:
+            return False
+        return super().check_ready(node_name, request_id, request_info)
         
     def add_request(
         self, request_id: str, cache_labels: list[str] | None = None,

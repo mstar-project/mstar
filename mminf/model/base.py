@@ -287,25 +287,6 @@ class Model(ABC):
         pass
 
     @abstractmethod
-    def get_forward_pass_args(
-        self, metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        new_tokens: dict[str, list[int]],
-    ) -> ForwardPassArgs:
-        """
-        Called by the conductor.
-
-        **Important**: this sets ForwardPassArgs.request_done, which is used to
-        end the request.
-
-        Also extracts per-request metadata that will get passed into the model
-        forward pass at the engine level.
-
-        TODO: description
-        """
-        pass
-
-    @abstractmethod
     def process_prompt(
         self,
         prompt: str | None,
@@ -388,6 +369,7 @@ class Model(ABC):
             initial_walk=None, producer_partitions=[],
         )]
 
+    @abstractmethod
     def get_partition_forward_pass_args(
         self,
         partition_name: str,
@@ -396,10 +378,13 @@ class Model(ABC):
         new_tokens: dict[str, list[int]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> "ForwardPassArgs":
-        """Per-partition transition logic.
+        """Return the next forward pass arguments for a specific partition.
 
-        Default: delegate to ``get_forward_pass_args`` (single-partition path).
+        Called by the conductor after each completed forward pass to determine
+        the next graph walk, inputs, and whether the request is done.
+
+        ``incoming_connections`` contains streaming-specific state (token counts,
+        producer_done) for consumer partitions. For single-partition models,
+        this will be ``None`` or an empty list.
         """
-        return self.get_forward_pass_args(
-            partition_metadata, persist_signals, new_tokens,
-        )
+        pass

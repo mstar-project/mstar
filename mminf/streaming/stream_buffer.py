@@ -1,3 +1,5 @@
+from collections import deque
+
 import torch
 from dataclasses import dataclass, field
 
@@ -30,21 +32,44 @@ class StreamBuffer:
     policy: ChunkPolicy
 
     _buffer: list = field(default_factory=list)
+    _tensor_ids_in_order: deque = field(default_factory=deque)
+    _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
     _chunks_popped: int = 0
     producer_done: bool = False
 
-    def put(self, item: torch.Tensor) -> None:
+    _num_tensors_registered = 0
+    _num_buffer_writes = 0
+
+    def pre_read_register(self, tensor_id: str):
+        self._num_tensors_registered += 1
+        self._tensor_ids_in_order.append(tensor_id)
+
+    def put(self, tensor_id: str, item: torch.Tensor) -> None:
         """Called when a tensor arrives via normal RDMA routing."""
-        self._buffer.append(item)
+        self._id_to_tensor[tensor_id] = item
+    
+    def _update_buffer(self):
+        while len(self._tensor_ids_in_order) > 0:
+            tensor_id = self._tensor_ids_in_order[0]
+            if tensor_id not in self._id_to_tensor:
+                return
+            self._tensor_ids_in_order.popleft()
+            self._buffer.append(self._id_to_tensor[tensor_id])
+            self._num_buffer_writes += 1
+            del self._id_to_tensor[tensor_id]
 
     def signal_done(self) -> None:
         """Producer signals no more items will arrive."""
         self.producer_done = True
 
+    def producer_done_and_all_read(self) -> bool:
+        return self.producer_done and self._num_buffer_writes >= self._num_tensors_registered
+
     def has_chunk_ready(self) -> bool:
+        self._update_buffer()
         buf_len = len(self._buffer)
-        if self.producer_done and buf_len > 0:
+        if self.producer_done_and_all_read() and buf_len > 0:
             return True
         return self.policy.is_ready(buf_len, self._consumed)
 
@@ -55,11 +80,12 @@ class StreamBuffer:
         `stride` items, discards items that have fallen out of the window.
         start_offset is the global position of the first item in the chunk.
         """
+        self._update_buffer()
         buf_len = len(self._buffer)
         window = self.policy.window_size()
         offset = self._consumed  # global position of buffer[0]
 
-        if self.producer_done and not self.policy.is_ready(buf_len, self._consumed):
+        if self.producer_done_and_all_read() and not self.policy.is_ready(buf_len, self._consumed):
             # Flush remainder — return whatever is left
             items = list(self._buffer)
             self._buffer.clear()
@@ -72,7 +98,7 @@ class StreamBuffer:
             self._buffer = self._buffer[stride:]
             self._consumed += stride
 
-        is_final = self.producer_done and len(self._buffer) == 0
+        is_final = self.producer_done_and_all_read() and len(self._buffer) == 0
 
         chunk = StreamChunk(
             data=self._collate(items),

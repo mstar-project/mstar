@@ -105,6 +105,7 @@ class WorkerGraphsDone(MessageBody):
     per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)
+    stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
 
 
 @dataclass

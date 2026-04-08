@@ -27,6 +27,9 @@ class AudioCodecEngine(BaseEngine):
 
     def engine_type(self) -> EngineType:
         return EngineType.AUDIO_CODEC
+    
+    def has_autocast(self):
+        return False
 
     def load_model(
         self,
@@ -56,7 +59,7 @@ class AudioCodecEngine(BaseEngine):
             return output
 
         try:
-            with torch.inference_mode(), torch.autocast("cuda", dtype=self.autocast_dtype):
+            with torch.inference_mode():
                 outputs = {}
                 for rid in batch.request_ids:
                     inputs = batch.per_request_input_tensors.get(rid, {})

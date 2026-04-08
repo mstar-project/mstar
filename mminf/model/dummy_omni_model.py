@@ -99,20 +99,26 @@ class DummyOmniModel(Model):
             unpersist_tensors=[],
         )
 
-    def get_forward_pass_args(
-        self, metadata: CurrentForwardConductorMetadata,
+    def get_partition_forward_pass_args(
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        prev_forward_metadata: CurrentForwardConductorMetadata = None,
-    ) -> list[GraphEdge]:
-        graph_edge = GraphEdge(next_node="ThinkerLLM", name="input_ids")
-        graph_edge.tensor_info = persist_signals.get("input_ids", [])
-        return [graph_edge]
+        new_tokens: dict[str, list[int]] = None,
+        incoming_connections=None,
+    ) -> "ForwardPassArgs":
+        from mminf.model.base import ForwardPassArgs
+        metadata = partition_metadata
 
-    def update_for_next_forward(
-        self, metadata: CurrentForwardConductorMetadata,
-        new_tokens: dict[str, list[int]],
-    ) -> CurrentForwardConductorMetadata:
+        # Advance graph walk (merged from update_for_next_forward)
         if metadata.graph_walk == "prefill":
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
-        return metadata
+
+        graph_edge = GraphEdge(next_node="ThinkerLLM", name="input_ids")
+        graph_edge.tensor_info = persist_signals.get("input_ids", [])
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=[graph_edge],
+            unpersist_tensors=[],
+        )
