@@ -8,13 +8,13 @@ import sys
 sys.path.insert(0, ".")
 
 
-from mminf.engine.kv_store import PageAllocator
 import pytest
 
 from mminf.engine.ar_engine import AREngine
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
 from mminf.engine.enc_dec_engine import EncoderDecoderEngine
 from mminf.engine.flow_engine import FlowEngine
+from mminf.engine.kv_store import PageAllocator
 from mminf.graph.base import GraphEdge
 from mminf.graph.request_queues import PerRequestNodeQueues
 from mminf.model.base import WorkerGraph

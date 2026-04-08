@@ -42,6 +42,7 @@ class GraphEdge:
     # Flags
     persist: bool = field(default=False) # previously back_to_conductor
     is_new_token: bool = field(default=False)
+    is_streaming: bool = field(default=False) # streaming edge: tokens accumulate at destination buffer
     # only for EMIT_TO_CLIENT
     output_modality: str = field(default="") # text | image | video | audio
     _persist_for_loop: bool = field(default=False)

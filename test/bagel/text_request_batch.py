@@ -2,10 +2,10 @@
 
 import base64
 import json
-import requests
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 from _env import get_server_url
 
 URL = get_server_url()

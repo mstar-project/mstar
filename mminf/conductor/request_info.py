@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 
 
-
 @dataclass
 class CurrentForwardConductorMetadata:
     """
@@ -39,5 +38,49 @@ class CurrentForwardPassInfo:
     fwd_index: int
     random_seed: int
     step_metadata: dict = field(default_factory=dict)
-    per_label_seq_info: dict[str, SequenceInfo]  = field(default_factory=dict)
-    
+    per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
+    partition_name: str = field(default="default")
+
+
+# ---------------------------------------------------------------------------
+# Partition types for async graph partitions
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PartitionDefinition:
+    """Defines a partition within a model's computation graph.
+
+    Each partition has its own set of graph walks and transition logic,
+    and can run asynchronously relative to other partitions.
+    """
+    name: str                                                   # e.g., "LLM", "SNAC"
+    graph_walks: set[str]                                       # walks this partition uses
+    initial_walk: str | None = None                             # first walk, or None = triggered later
+    producer_partitions: list[str] = field(default_factory=list)  # partitions feeding tokens to this one
+
+
+@dataclass
+class StreamingConnectionState:
+    """Per-connection streaming state tracked by the conductor."""
+    from_partition: str
+    to_partition: str
+    edge_name: str
+    token_count: int = 0
+    consumed_count: int = 0
+    producer_done: bool = False
+
+
+@dataclass
+class PartitionState:
+    """Per-partition conductor-level state for a request."""
+    partition_name: str
+    metadata: CurrentForwardConductorMetadata
+    fwd_pass_number: int = 0
+    random_seed: int = 0
+    is_done: bool = False
+    new_tokens: dict[str, list[int]] = field(default_factory=dict)
+    completed_worker_graph_ids: set[str] = field(default_factory=set)
+    current_worker_graph_ids: set[str] = field(default_factory=set)
+    num_output_tokens: int = 0
+    curr_forward_outputs: list[str] = field(default_factory=list)
+    per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)

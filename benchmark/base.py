@@ -31,7 +31,7 @@ class Model(Enum):
                 "cfg_renorm_type": "text_channel",
             }
         return {}
-    
+
     def get_hf_url(self):
         if self == Model.BAGEL:
             return "ByteDance-Seed/BAGEL-7B-MoT"

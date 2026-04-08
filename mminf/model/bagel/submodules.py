@@ -4,7 +4,6 @@
 
 
 import logging
-import time
 
 import torch
 from torch import nn
@@ -69,7 +68,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         - Position ID computation from image grid
         - Packing multiple images with cu_seqlens for FlashAttention
         """
-        
+
         assert len(per_request_inputs) == 1, "Batching not supported for ViTEncoder"
         image_inputs = per_request_inputs[0]["image_inputs"]
 
@@ -176,7 +175,8 @@ class VAEEncoderSubmodule(NodeSubmodule):
         assert len(per_request_inputs) == 1, "Batching not supported for ViTEncoder"
         image_inputs = per_request_inputs[0]["image_inputs"]
 
-        image_tensor: torch.Tensor = self.transform(self.transform.resize_transform(image_inputs[0].contiguous()))  # [C, H, W]
+        # [C, H, W]
+        image_tensor: torch.Tensor = self.transform(self.transform.resize_transform(image_inputs[0].contiguous()))
         device = image_tensor.device
 
         # Compute patchified dimensions as ints (CUDA graph compatible)
@@ -246,7 +246,7 @@ def _init_latents_and_time_index(
     H: int=1024,
     W: int=1024,
 ):
-    
+
     h, w = (H // config.latent_downsample,
             W // config.latent_downsample)
     num_image_tokens = h * w
@@ -335,7 +335,7 @@ class LLMSubmodule(NodeSubmodule):
         self.eoi_token_id = eoi_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
-    
+
     def _preprocess_prefill_text(
         self, text_inputs: torch.Tensor
     ):
@@ -344,7 +344,7 @@ class LLMSubmodule(NodeSubmodule):
         out[-1] = self.eos_token_id
         out[1:-1] = text_inputs
         return out
-    
+
     def _get_image_pos_ids(
         self, labels: list[str],
         cache_manager: BatchedCacheManager,
@@ -357,10 +357,10 @@ class LLMSubmodule(NodeSubmodule):
                 torch.zeros(
                     seq_len, dtype=torch.int32, device=device
                 ) + cache_manager._get_state(rid, label).position_id_start \
-                    for (seq_len, rid) in zip(seq_lens, request_ids)
+                    for (seq_len, rid) in zip(seq_lens, request_ids, strict=True)
             ] for label in labels
         }
-    
+
     def _get_text_vae_idxs(
         self, seq_lens: list[int], device: str
     ):
@@ -387,7 +387,7 @@ class LLMSubmodule(NodeSubmodule):
             text_mask[-1] = True
             result["text_mask"].append(text_mask)
         return result
-    
+
     def get_needed_cache_labels(
         self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
     ) -> list[str] | None:
@@ -397,7 +397,7 @@ class LLMSubmodule(NodeSubmodule):
     def _get_active_labels(
         self, graph_walk: str, cfg: bool
     ):
-        if graph_walk == "prefill_text" or graph_walk == "decode":
+        if graph_walk in {"prefill_text", "decode"}:
             if cfg:
                 return ["main", "cfg_img"]
         elif graph_walk == "image_gen":
@@ -553,8 +553,8 @@ class LLMSubmodule(NodeSubmodule):
         """Plan attention and rope for all cache labels needed by this graph walk."""
         for snap in snapshots:
             cache_handle.snapshot_all(*snap)
-        
-        
+
+
         for label in labels:
             pos_ids = per_label_custom_pos_ids.get(label)
             if pos_ids is not None:
@@ -572,7 +572,7 @@ class LLMSubmodule(NodeSubmodule):
         cache_handle=None, **kwargs
     ) -> NameToTensorList:
         kwargs.update(request_info.step_metadata)
-        logger.debug("Running BAGEL LLM for graph walk %s and inputs %s", graph_walk)
+        logger.debug("Running BAGEL LLM for graph walk %s", graph_walk)
 
         if graph_walk == "prefill_text":
             return self._forward_prefill_text(cache_handle=cache_handle, **kwargs)
@@ -874,7 +874,7 @@ class LLMSubmodule(NodeSubmodule):
                 empty_combined_emb, mode="gen",
                 cache_handle=cache_handle, write_cache=False,
                 vae_token_indexes=vae_token_indexes,
-                text_indexes=text_indexes, 
+                text_indexes=text_indexes,
                 text_mask=text_mask,
                 **kwargs,
             )

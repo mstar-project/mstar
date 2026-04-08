@@ -1,7 +1,7 @@
-from abc import ABC, abstractmethod
+import glob
 import json
 import os
-import glob
+from abc import ABC, abstractmethod
 
 import requests
 
@@ -22,12 +22,12 @@ class BaseDataset(ABC):
         return [
             self[i] for i in range(len(self))
         ]
-    
+
     @property
     @abstractmethod
     def num_requests(self) -> int:
         pass
-    
+
     def _resize_data(self, data: list[RequestInput]) -> list[RequestInput]:
         """Resize data to match num_prompts."""
         if not self.num_requests:
@@ -64,11 +64,11 @@ class TxtFileDataset(BaseDataset):
                     prompt=line.strip()
                 ))
         self.items = self._resize_data(self.items)
-    
+
     @property
     def num_requests(self):
         return self._num_requests
-    
+
     def __len__(self) -> int:
         return len(self.items)
 
@@ -103,7 +103,7 @@ class VBenchDataset(BaseDataset):
         self._num_requests = num_requests
         self.items = self._load_data()
         self.items = self._resize_data(self.items)
-    
+
     @property
     def num_requests(self):
         return self._num_requests
@@ -167,6 +167,7 @@ class VBenchDataset(BaseDataset):
                 cwd=cache_root,
                 capture_output=True,
                 text=True,
+                check=False,
             )
 
             if result.returncode != 0:
@@ -185,7 +186,9 @@ class VBenchDataset(BaseDataset):
         """Load I2V data from VBench I2V dataset."""
         path = self._auto_download_i2v_dataset()
         if not path:
-            raise Exception("Failed to load I2V Data for VBench. Note that you need to pip install gdown to load the data.")
+            raise Exception(
+                "Failed to load I2V Data for VBench. Note that you need to pip install gdown to load the data."
+            )
 
         # Try to load from i2v-bench-info.json
         info_json_path = os.path.join(path, "data", "i2v-bench-info.json")
@@ -200,7 +203,7 @@ class VBenchDataset(BaseDataset):
             data = self._scan_directory_for_images(path)
             if data:
                 return data
-        
+
         raise Exception("Failed to load I2V Datafor VBench")
 
     def _load_from_i2v_json(self, json_path: str) -> list[RequestInput]:

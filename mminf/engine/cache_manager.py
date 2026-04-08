@@ -1,10 +1,9 @@
 from dataclasses import dataclass
 
+import torch
+
 from mminf.engine.kv_store import KVCacheConfig, KVRequestState, PagedAllocationManager
 from mminf.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPrefillWrapper
-
-
-import torch
 
 
 @dataclass
@@ -286,7 +285,7 @@ class BatchedCacheManager:
             computed_pos_ids = torch.cat([
                 torch.arange(sl, device=self.device, dtype=torch.long)
                 + self._get_state(rid, effective_label).position_id_start
-                for rid, sl in zip(self.request_ids, seq_lens)
+                for rid, sl in zip(self.request_ids, seq_lens, strict=True)
             ])
 
         if self._cuda_graph_mode:
@@ -437,7 +436,7 @@ class BatchedCacheManager:
                 parts.append(torch.cat([
                     torch.arange(sl, device=self.device, dtype=torch.long)
                     + self._get_state(rid, label).position_id_start
-                    for rid, sl in zip(self.request_ids, seq_lens)
+                    for rid, sl in zip(self.request_ids, seq_lens, strict=True)
                 ]))
 
         combined_pos_ids = torch.cat(parts)

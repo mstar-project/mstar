@@ -131,7 +131,7 @@ def start_mooncake_master(port=8080, log_file: str | None = None):
         cmd,
         stdout=stdout,
         stderr=stderr,
-        preexec_fn=os.setsid,  # start new process group
+        process_group=os.setsid,  # start new process group
     )
 
     wait_for_port("localhost", 50051)
@@ -241,8 +241,7 @@ class APIServer:
                 "consumed_chunks": 0,
                 "input_modalities": input_modalities,
                 "output_modalities": output_modalities,
-                "final_forward_pass": 0,
-                "final_forward_outputs": [],
+                "final_forward_outputs": {},
             }
 
         self.preprocess_worker.new_request(PreprocessInput(
@@ -269,12 +268,8 @@ class APIServer:
         stale = [
             rid
             for rid, ts in self.recently_completed.items()
-            if (
-                self.preprocess_worker.received_final_chunks(
-                    rid, self.pending_requests[rid]["final_forward_pass"],
-                    self.pending_requests[rid]["final_forward_outputs"]
-                ) and not self.preprocess_worker.has_pending_tensors(rid)
-            ) or (now - ts) >= self._recently_completed_ttl
+            if not self.preprocess_worker.has_pending_tensors(rid)
+            or (now - ts) >= self._recently_completed_ttl
         ]
         for rid in stale:
             # only set the event when there are no more pending chunks
@@ -310,8 +305,6 @@ class APIServer:
                             elif message.message_type == "request_complete":
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
-                                self.pending_requests[rid]["final_forward_pass"] = \
-                                    message.body.final_forward_pass
                                 self.pending_requests[rid]["final_forward_outputs"] = \
                                     message.body.final_forward_outputs
                         elif rid in self.recently_completed:

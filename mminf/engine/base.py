@@ -5,7 +5,7 @@ from enum import Enum
 import torch
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.conductor.request_info import CurrentForwardPassInfo, SequenceInfo
+from mminf.conductor.request_info import CurrentForwardPassInfo
 
 
 class EngineType(Enum):
@@ -45,6 +45,17 @@ class NodeOutput:
 class BaseEngine(ABC):
     def __init__(self, enable_nvtx: bool = False, **kwargs):
         self.enable_nvtx = enable_nvtx
+        # Reference to worker-level streaming buffers (set by Worker.__init__)
+        self._streaming_buffers: dict[str, dict[str, list[torch.Tensor]]] | None = None
+
+    def set_streaming_buffers(
+        self, buffers: dict[str, dict[str, list[torch.Tensor]]],
+    ):
+        """Called by Worker to provide a reference to the shared streaming buffer."""
+        self._streaming_buffers = buffers
+
+    def has_autocast(self):
+        return True
 
     @abstractmethod
     def engine_type(self) -> EngineType:
@@ -76,11 +87,14 @@ class BaseEngine(ABC):
     @abstractmethod
     def remove_request(self, request_id: str) -> None:
         ...
-    
+
     def check_ready(
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
     ):
+        """
+        Check if the engine is ready to execute.
+        """
         return True
 
     def warmup(self) -> None:

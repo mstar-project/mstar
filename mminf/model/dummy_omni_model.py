@@ -3,7 +3,7 @@ from mminf.conductor.request_info import CurrentForwardConductorMetadata
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT
-from mminf.model.base import Model
+from mminf.model.base import ForwardPassArgs, Model
 
 
 class DummyOmniModel(Model):
@@ -82,29 +82,42 @@ class DummyOmniModel(Model):
         )
 
     def get_initial_forward_pass_args(
-        self, input_modalities, output_modalities,
+        self, partition_name="default",
+        input_modalities=None, output_modalities=None,
+        input_signals=None, model_kwargs=None,
     ):
-        return CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
+        from mminf.model.base import ForwardPassArgs
+        full_metadata = CurrentForwardConductorMetadata(
+            input_modalities=input_modalities or [],
+            output_modalities=output_modalities or [],
             graph_walk="prefill",
             is_prefill=True,
         )
+        return ForwardPassArgs(
+            full_metadata=full_metadata,
+            inputs=[],
+            unpersist_tensors=[],
+        )
 
-    def get_forward_pass_args(
-        self, metadata: CurrentForwardConductorMetadata,
+    def get_partition_forward_pass_args(
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        prev_forward_metadata: CurrentForwardConductorMetadata = None,
-    ) -> list[GraphEdge]:
-        graph_edge = GraphEdge(next_node="ThinkerLLM", name="input_ids")
-        graph_edge.tensor_info = persist_signals.get("input_ids", [])
-        return [graph_edge]
+        new_tokens: dict[str, list[int]] = None,
+        incoming_connections=None,
+    ) -> ForwardPassArgs:
+        metadata = partition_metadata
 
-    def update_for_next_forward(
-        self, metadata: CurrentForwardConductorMetadata,
-        new_tokens: dict[str, list[int]],
-    ) -> CurrentForwardConductorMetadata:
+        # Advance graph walk (merged from update_for_next_forward)
         if metadata.graph_walk == "prefill":
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
-        return metadata
+
+        graph_edge = GraphEdge(next_node="ThinkerLLM", name="input_ids")
+        graph_edge.tensor_info = persist_signals.get("input_ids", [])
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=[graph_edge],
+            unpersist_tensors=[],
+        )

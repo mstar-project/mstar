@@ -1,7 +1,7 @@
-from enum import Enum
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from enum import Enum
 
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphNode
@@ -62,7 +62,7 @@ class MicroScheduler:
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[str, float] = {}
-    
+
     def _select_node_priority(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
     ):
@@ -147,9 +147,10 @@ class MicroScheduler:
                 # Skip requests in OOM backoff
                 if request_id in self.held_until:
                     continue
-                graph_walk = worker_graphs_manager.get_graph_walk(request_id)
-                fwd_info = worker_graphs_manager.get_fwd_info(request_id)
                 for sname in node_names:
+                    node_partition = worker_graphs_manager.get_partition_for_node(sname)
+                    graph_walk = worker_graphs_manager.get_graph_walk(request_id, node_partition)
+                    fwd_info = worker_graphs_manager.get_fwd_info(request_id, node_partition)
                     # check if the node is ready on the engine level
                     # (e.g., for AR, whether the kv cache is read in)
                     engine = self.engine_manager.get_engine(sname)

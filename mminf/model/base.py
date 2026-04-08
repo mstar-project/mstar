@@ -9,12 +9,16 @@ import torch
 import yaml
 
 from mminf.communication.tensors import NameToTensorList
-from mminf.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
-from mminf.engine.cache_manager import BatchedCacheManager
+from mminf.conductor.request_info import (
+    CurrentForwardConductorMetadata,
+    CurrentForwardPassInfo,
+    PartitionDefinition,
+    StreamingConnectionState,
+)
 from mminf.engine.base import EngineType, NodeBatch
+from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
-
 
 DECODE = "decode"
 
@@ -48,7 +52,7 @@ class NodeSubmodule(torch.nn.Module):
 
         Returns a dict of input name to batched tensor.
 
-        Default: assume one request. 
+        Default: assume one request.
         assert each input has exactly 1 tensor and unwrap it.
         Override for nodes that handle multiple tensors (e.g., stacking images).
         """
@@ -75,7 +79,7 @@ class NodeSubmodule(torch.nn.Module):
         Compilable + CUDA-graphable.
         """
         ...
-    
+
     def can_batch(
         self, batch: NodeBatch
     ):
@@ -222,7 +226,6 @@ class ForwardPassArgs:
     # is passed into the fwd pass
     step_metadata: dict = field(default_factory=dict)
 
-
 class Model(ABC):
     def _get_worker_graphs_for_graph_walk(
         self, graph_walk: str, graph: GraphSection,
@@ -274,30 +277,13 @@ class Model(ABC):
 
     @abstractmethod
     def get_initial_forward_pass_args(
-        self, input_modalities: list[str],
+        self,
+        partition_name: str,
+        input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        pass
-
-    @abstractmethod
-    def get_forward_pass_args(
-        self, metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        new_tokens: dict[str, list[int]],
-    ) -> ForwardPassArgs:
-        """
-        Called by the conductor.
-
-        **Important**: this sets ForwardPassArgs.request_done, which is used to
-        end the request.
-
-        Also extracts per-request metadata that will get passed into the model
-        forward pass at the engine level.
-
-        TODO: description
-        """
         pass
 
     @abstractmethod
@@ -354,6 +340,51 @@ class Model(ABC):
 
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
-    
+
     def get_autocast_dtype(self):
         return torch.bfloat16
+
+    # ------------------------------------------------------------------
+    # Partition API (optional, backward-compatible defaults)
+    # ------------------------------------------------------------------
+
+    def get_partition_topology(self):
+        """Return a PartitionTopology describing async partitions and streaming connections.
+
+        Default: single "default" partition with no connections.
+        Override for models with async partitions (e.g., Orpheus LLM + SNAC).
+        """
+        from mminf.streaming.topology import PartitionTopology
+        return PartitionTopology(partitions=["default"], connections=[])
+
+    def get_partitions(self) -> list[PartitionDefinition]:
+        """Return partition definitions.
+
+        Default: single "default" partition containing all graph walks.
+        Override for models with async partitions (e.g., Orpheus LLM + SNAC).
+        """
+        walks = set(self.get_graph_walk_graphs().keys())
+        return [PartitionDefinition(
+            name="default", graph_walks=walks,
+            initial_walk=None, producer_partitions=[],
+        )]
+
+    @abstractmethod
+    def get_partition_forward_pass_args(
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+        new_tokens: dict[str, list[int]],
+        incoming_connections: list[StreamingConnectionState] | None = None,
+    ) -> "ForwardPassArgs":
+        """Return the next forward pass arguments for a specific partition.
+
+        Called by the conductor after each completed forward pass to determine
+        the next graph walk, inputs, and whether the request is done.
+
+        ``incoming_connections`` contains streaming-specific state (token counts,
+        producer_done) for consumer partitions. For single-partition models,
+        this will be ``None`` or an empty list.
+        """
+        pass

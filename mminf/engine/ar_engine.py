@@ -2,12 +2,12 @@ import logging
 
 import torch
 
+from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
 from mminf.engine.cpu_page_pool import CPUPagePool
 from mminf.engine.cuda_graph_runner import CudaGraphRunner
-from mminf.engine.kv_store import KVCacheConfig, MooncakeStoreConfig, PagedAllocationManager, TransferEngineInfo
-from mminf.conductor.request_info import CurrentForwardPassInfo, SequenceInfo
+from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager, TransferEngineInfo
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -191,7 +191,12 @@ class AREngine(BaseEngine):
             top_k = meta.get("top_k", 0)
             top_p = meta.get("top_p", 1.0)
             # TODO add random seed here
-            token = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+            rep_pen = meta.get("repetition_penalty", 1.0)
+            seen_ids = meta.get("seen_token_ids", None)
+            token = sample_tokens(
+                logits, temperature=temperature, top_k=top_k, top_p=top_p,
+                repetition_penalty=rep_pen, seen_token_ids=seen_ids,
+            )
             tensors["new_token"] = [token]
             del tensors["logits"]
 
@@ -238,14 +243,13 @@ class AREngine(BaseEngine):
         cache_manager.flush_to_store()
 
         output = NodeOutput(per_request_output_tensors=batched_output)
-        if batch.graph_walk == "decode":
-            output = self._sample_decode_outputs(output, batch.per_request_info)
+        output = self._sample_decode_outputs(output, batch.per_request_info)
         return output
 
     def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Original per-request execution with CacheHandle."""
         per_request_outputs = {}
-        
+
         for rid in batch.request_ids:
             cache_manager = self._create_cache_manager(rid)
             inputs = batch.per_request_input_tensors.get(rid, {})
@@ -275,8 +279,7 @@ class AREngine(BaseEngine):
             per_request_outputs[rid] = output
 
         output = NodeOutput(per_request_output_tensors=per_request_outputs)
-        if batch.graph_walk == "decode":
-            output = self._sample_decode_outputs(output, batch.per_request_info)
+        output = self._sample_decode_outputs(output, batch.per_request_info)
         return output
 
     def _can_use_cuda_graph(self, batch: NodeBatch) -> bool:
@@ -437,11 +440,14 @@ class AREngine(BaseEngine):
             # Not enough pages to allocate for retrieval — not ready
             return False
 
-        return all([
-            self.alloc_manager.check_retrieve_ready(request_id, label) \
-                for label in labels_to_check
+        ar_ready = all([
+            self.alloc_manager.check_retrieve_ready(request_id, label)
+            for label in labels_to_check
         ])
-        
+        if not ar_ready:
+            return False
+        return super().check_ready(node_name, request_id, request_info)
+
     def add_request(
         self, request_id: str, cache_labels: list[str] | None = None,
     ) -> None:
@@ -451,6 +457,9 @@ class AREngine(BaseEngine):
         if self.cpu_page_pool is not None:
             self.cpu_page_pool.remove_request(request_id)
         self.alloc_manager.remove_request(request_id)
+        for sub in self.submodules.values():
+            if hasattr(sub, 'cleanup_request'):
+                sub.cleanup_request(request_id)
 
     def pause_request(
         self, request_id: str, cache_label: str = "main",

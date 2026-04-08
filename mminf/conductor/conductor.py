@@ -11,11 +11,15 @@ import yaml
 
 from mminf.api_server.request_types import APIServerMessage, RequestComplete
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
-from mminf.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
-from mminf.engine.base import EngineType
-from mminf.conductor.request_info import SequenceInfo
+from mminf.conductor.request_info import (
+    CurrentForwardConductorMetadata,
+    CurrentForwardPassInfo,
+    PartitionDefinition,
+    PartitionState,
+    StreamingConnectionState,
+)
 from mminf.graph.base import GraphEdge, TensorPointerInfo
-from mminf.model.base import DECODE, ForwardPassArgs, Model, WorkerGraph
+from mminf.model.base import ForwardPassArgs, Model, WorkerGraph
 from mminf.utils.ipc_format import (
     ConductorMessageType,
     InputSignals,
@@ -85,27 +89,20 @@ def _worker_process_target(
 
 @dataclass
 class RequestData:
-    current_forward_metadata: CurrentForwardConductorMetadata
-    fwd_inputs: list[GraphEdge]
-    # name -> list[TensorPointerInfo]
-    persist_signals: dict[str, list[TensorPointerInfo]] # signals passed back to conductor
-    persist_signal_ref_cnt: dict[str, int] # uuid -> number of times it was passed to workers
-
+    # Request-level shared state
+    persist_signals: dict[str, list[TensorPointerInfo]]  # signals passed back to conductor
+    persist_signal_ref_cnt: dict[str, int]  # uuid -> number of times it was passed to workers
     worker_graph_to_worker: dict[str, str]
-    new_tokens: dict[str, list[int]]
-
+    all_worker_graph_ids: set[str]
+    max_output_tokens: int
     random_seed: int
 
-    # for tracking progress
-    all_worker_graph_ids: set[str]
-    current_worker_graph_ids: set[str]
-    max_output_tokens: int
-    num_output_tokens: int = field(default=0)
-    # make sure to check all tensors in the list are completed (BLOCKING case)
-    completed_worker_graph_ids: set[str] = field(default_factory=set)
-    fwd_pass_number: int = field(default=0)
-    curr_forward_outputs: list[str] = field(default_factory=list)
-    per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
+    # Partition state (always populated — single-partition models use a "default" partition)
+    partition_states: dict[str, PartitionState] = field(default_factory=dict)
+    partition_definitions: dict[str, PartitionDefinition] = field(default_factory=dict)
+
+    # Per-streaming-connection state (keyed by "from_partition->to_partition")
+    streaming_connections: dict[str, StreamingConnectionState] = field(default_factory=dict)
 
     def remove_persist_signal_uuids(self, uuids: list[str]):
         uuids = set(uuids)
@@ -116,6 +113,13 @@ class RequestData:
 
         for uuid in uuids:
             del self.persist_signal_ref_cnt[uuid]
+
+    def get_incoming_connections(self, partition_name: str) -> list[StreamingConnectionState]:
+        """Return all streaming connections where the given partition is the consumer."""
+        return [
+            conn for conn in self.streaming_connections.values()
+            if conn.to_partition == partition_name
+        ]
 
 
 class Conductor:
@@ -309,19 +313,12 @@ class Conductor:
             ]
         return inputs_per_worker
 
-    def _update_request_info(
-        self, request_id, args: ForwardPassArgs
+    def _update_persist_ref_counts(
+        self, request_id: str, inputs: list[GraphEdge]
     ):
-        self._set_current_worker_graph_ids(
-            request_id,
-            args.full_metadata.graph_walk
-        )
-        self.requests[request_id].current_forward_metadata = args.full_metadata
-        self.requests[request_id].fwd_inputs = args.inputs
-
-        # update reference counts for persist signals
+        """Update reference counts for persist signals in inputs."""
         ref_cnts = self.requests[request_id].persist_signal_ref_cnt
-        for edge in args.inputs:
+        for edge in inputs:
             for info in edge.tensor_info:
                 if info.uuid not in ref_cnts:
                     ref_cnts[info.uuid] = 0
@@ -342,8 +339,10 @@ class Conductor:
             if info.uuid in uuid_to_ref_count:
                 # duplicate; skip
                 continue
-            uuid_to_ref_count[info.uuid] = self.requests[
-                request_id].persist_signal_ref_cnt[info.uuid]
+            ref_cnt = self.requests[request_id].persist_signal_ref_cnt.get(info.uuid)
+            if ref_cnt is None:
+                continue  # tensor not tracked (e.g., from a different partition)
+            uuid_to_ref_count[info.uuid] = ref_cnt
             uuids.append(info.uuid)
         self.requests[request_id].remove_persist_signal_uuids(uuids)
 
@@ -373,10 +372,8 @@ class Conductor:
         self, body: NewRequestConductor
     ):
         """
-        When a new request comes in from the API server, assign workers for each
-        worker graph for all possible graph walks, e.g., prefill, decode, image_gen),
-        and notify the workers that the request has arrived + provide the appropriate
-        workers with the appropriate initial inputs for the forward pass.
+        When a new request comes in from the API server, assign workers,
+        initialize partition states, and kick off all partitions.
         """
         if (self.max_concurrent_requests is not None
                 and len(self.requests) >= self.max_concurrent_requests):
@@ -396,153 +393,322 @@ class Conductor:
         logger.debug("Conductor ingesting request %s", body.request_id)
         worker_graph_to_worker = self._assign_worker_graphs_to_workers()
 
-        # set up request data
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self.model.get_max_output_tokens(**model_kwargs)
+        seed = _req_id_to_seed(body.request_id)
+
+        partitions = self.model.get_partitions()
+        topology = self.model.get_partition_topology()
+
+        # Build partition states and definitions
+        partition_states: dict[str, PartitionState] = {}
+        partition_definitions: dict[str, PartitionDefinition] = {}
+        for p in partitions:
+            partition_definitions[p.name] = p
+            partition_states[p.name] = PartitionState(
+                partition_name=p.name,
+                metadata=CurrentForwardConductorMetadata(
+                    input_modalities=body.initial_input_modalities,
+                    output_modalities=body.initial_output_modalities,
+                    graph_walk="",
+                    is_prefill=True,
+                ),
+                random_seed=seed,
+            )
+
+        # Build per-connection streaming state
+        streaming_connections: dict[str, StreamingConnectionState] = {}
+        for conn in topology.connections:
+            key = f"{conn.from_partition}->{conn.to_partition}"
+            streaming_connections[key] = StreamingConnectionState(
+                from_partition=conn.from_partition,
+                to_partition=conn.to_partition,
+                edge_name=conn.edge_name,
+            )
+
         request_data = RequestData(
-            current_forward_metadata=None,
-            fwd_inputs=[],
             persist_signals=body.initial_signals,
-            random_seed=_req_id_to_seed(body.request_id),
             persist_signal_ref_cnt={},
             worker_graph_to_worker=worker_graph_to_worker,
             all_worker_graph_ids=set(worker_graph_to_worker.keys()),
-            current_worker_graph_ids=set(),
-            new_tokens={},
             max_output_tokens=max_output_tokens,
+            random_seed=seed,
+            partition_states=partition_states,
+            partition_definitions=partition_definitions,
+            streaming_connections=streaming_connections,
         )
         self.requests[body.request_id] = request_data
 
-        fwd_args = self.model.get_initial_forward_pass_args(
-            input_modalities=body.initial_input_modalities,
-            output_modalities=body.initial_output_modalities,
-            input_signals=body.initial_signals,
-            model_kwargs=body.model_kwargs
-        )
-        self._update_request_info(body.request_id, fwd_args)
+        # Collect all worker_graph_ids per worker for the NewRequest
+        worker_to_worker_graph_ids: dict[str, list[str]] = defaultdict(list)
+        for wg_id, worker_id in worker_graph_to_worker.items():
+            worker_to_worker_graph_ids[worker_id].append(wg_id)
 
-        # send data to appropriate workers
-        worker_to_worker_graph_ids: dict[str, list[str]] = {}
-        inputs_per_worker = self._split_inputs_to_workers(
-            worker_graph_to_worker=worker_graph_to_worker,
-            inputs=fwd_args.inputs,
-            graph_walk=fwd_args.full_metadata.graph_walk
-        )
+        # Kick off all partitions by calling get_initial_forward_pass_args per partition
+        partition_fwd_args: dict[str, ForwardPassArgs] = {}
+        for p in partitions:
+            fwd_args = self.model.get_initial_forward_pass_args(
+                partition_name=p.name,
+                input_modalities=body.initial_input_modalities,
+                output_modalities=body.initial_output_modalities,
+                input_signals=body.initial_signals,
+                model_kwargs=body.model_kwargs,
+            )
+            pstate = partition_states[p.name]
+            pstate.metadata = fwd_args.full_metadata
+            self._set_partition_worker_graph_ids(
+                body.request_id, p.name, fwd_args.full_metadata.graph_walk,
+            )
+            self._update_persist_ref_counts(body.request_id, fwd_args.inputs)
+            partition_fwd_args[p.name] = fwd_args
 
-        for worker_graph_id, worker_id in worker_graph_to_worker.items():
-            if worker_id not in worker_to_worker_graph_ids:
-                worker_to_worker_graph_ids[worker_id] = []
-            worker_to_worker_graph_ids[worker_id].append(worker_graph_id)
-
-        for worker, worker_graph_ids in worker_to_worker_graph_ids.items():
-            message = NewRequest(
-                request_id=body.request_id,
-                worker_graph_ids=worker_graph_ids,
-                worker_graph_to_worker=worker_graph_to_worker,
-                initial_inputs=inputs_per_worker.get(worker, []),
-                request_info=CurrentForwardPassInfo(
+        # Send NewRequest to each worker with the appropriate partition's inputs
+        for worker_id, worker_graph_ids in worker_to_worker_graph_ids.items():
+            # Determine which partition this worker serves
+            for partition_name, fwd_args in self._resolve_worker_partition(
+                worker_graph_ids, partitions, partition_fwd_args,
+            ).items():
+                pstate = partition_states[partition_name]
+                inputs_per_worker = self._split_inputs_to_workers(
+                    worker_graph_to_worker=worker_graph_to_worker,
+                    inputs=fwd_args.inputs,
                     graph_walk=fwd_args.full_metadata.graph_walk,
-                    step_metadata=fwd_args.step_metadata,
-                    fwd_index=request_data.fwd_pass_number,
-                    random_seed=request_data.random_seed,
-                    requires_cfg=fwd_args.full_metadata.requires_cfg,
                 )
-            )
-            self.communicator.send(
-                worker, WorkerMessage(
-                    message_type=WorkerMessageType.NEW_REQUEST,
-                    body=message
-                )
-            )
 
-    def _set_current_worker_graph_ids(
-        self, request_id: str, graph_walk: str
+                message = NewRequest(
+                    request_id=body.request_id,
+                    worker_graph_ids=worker_graph_ids,
+                    worker_graph_to_worker=worker_graph_to_worker,
+                    initial_inputs=inputs_per_worker.get(worker_id, []),
+                    request_info=CurrentForwardPassInfo(
+                        graph_walk=fwd_args.full_metadata.graph_walk,
+                        step_metadata=fwd_args.step_metadata,
+                        fwd_index=pstate.fwd_pass_number,
+                        random_seed=pstate.random_seed,
+                        requires_cfg=fwd_args.full_metadata.requires_cfg,
+                        partition_name=partition_name,
+                    ),
+                )
+                self.communicator.send(
+                    worker_id, WorkerMessage(
+                        message_type=WorkerMessageType.NEW_REQUEST,
+                        body=message,
+                    ),
+                )
+
+    def _resolve_worker_partition(
+        self, worker_graph_ids: list[str],
+        partitions: list[PartitionDefinition],
+        partition_fwd_args: dict[str, ForwardPassArgs],
+    ) -> dict[str, ForwardPassArgs]:
+        """Find which partition(s) a set of worker graphs belongs to."""
+        args = {}
+        for wg_id in worker_graph_ids:
+            wg_walks = self._all_worker_graph_ids_to_graph_walks.get(wg_id, set())
+            for p in partitions:
+                if wg_walks & p.graph_walks:
+                    args[p.name] = partition_fwd_args[p.name]
+        return args
+
+    def _set_partition_worker_graph_ids(
+        self, request_id: str, partition_name: str, graph_walk: str,
     ):
-        self.requests[request_id].current_worker_graph_ids = set([
-            worker_graph_id for worker_graph_id in self.requests[request_id].all_worker_graph_ids \
-                if graph_walk in self.worker_graphs[worker_graph_id].graph_walks
-        ])
+        """Update the set of active worker graph IDs for a partition's walk."""
+        pstate = self.requests[request_id].partition_states[partition_name]
+        pstate.current_worker_graph_ids = {
+            wg_id for wg_id in self.requests[request_id].all_worker_graph_ids
+            if graph_walk in self.worker_graphs[wg_id].graph_walks
+        }
 
     def _process_request_done(
         self, request_id: str
     ):
-        """
-        Called when we see an EOS token, e.g.
-        """
+        """Called when all partitions are done."""
         logger.info("Request %s done", request_id)
-        for worker_id in set(self.requests[request_id].worker_graph_to_worker.values()):
+        request_data = self.requests[request_id]
+        for worker_id in set(request_data.worker_graph_to_worker.values()):
             msg = WorkerMessage(
                 message_type=WorkerMessageType.REMOVE_REQUEST,
                 body=RemoveRequest(request_id)
             )
             self.communicator.send(worker_id, msg)
+
+        # Build output dict: output_name -> final forward pass number
+        final_forward_outputs: dict[str, int] = {}
+        for pstate in request_data.partition_states.values():
+            for output_name in pstate.curr_forward_outputs:
+                # fwd_pass_number was already incremented past the last pass
+                final_forward_outputs[output_name] = max(0, pstate.fwd_pass_number - 1)
+
         self.communicator.send(
             "api_server",
             APIServerMessage(
                 message_type="request_complete",
                 body=RequestComplete(
                     request_id=request_id,
-                    final_forward_pass=self.requests[request_id].fwd_pass_number,
-                    final_forward_outputs=self.requests[request_id].curr_forward_outputs
+                    final_forward_outputs=final_forward_outputs,
                 )
             )
         )
         del self.requests[request_id]
         self._try_admit_waiting()
 
-    def _process_done_forward(
-        self, request_id: str
-    ) -> bool:
-        """
-        If the request isn't over, start a new forward pass (determine the input and
-        output modalities for the new forward pass, wrangle input tensors and send
-        them to the appropriate workers)
+    def _process_worker_graphs_done(
+        self, body: WorkerGraphsDone
+    ) -> list[str]:
+        """Process a WorkerGraphsDone message.
 
-        Returns a boolean for whether the request is done
+        Uses the partition_name from the message directly.
+        Returns list of partition names whose full forward pass has completed.
+        """
+        if body.request_id not in self.requests:
+            logger.debug(
+                "Ignoring late WORKER_GRAPHS_DONE for completed request %s",
+                body.request_id
+            )
+            return []
+
+        request_data = self.requests[body.request_id]
+        partition_name = body.partition_name
+
+        pstate = request_data.partition_states.get(partition_name)
+        if pstate is None:
+            logger.warning(
+                "WorkerGraphsDone for unknown partition %s (request %s)",
+                partition_name, body.request_id,
+            )
+            return []
+
+        # Update sequence info
+        pstate.per_label_seq_info = {
+            **pstate.per_label_seq_info,
+            **body.per_label_seq_info,
+        }
+
+        # Absorb persist signals (request-level)
+        if body.persist_signals:
+            request_data.persist_signals.update(body.persist_signals)
+
+        # Absorb new tokens and update streaming connection state
+        if body.new_tokens:
+            for name, tokens in body.new_tokens.items():
+                pstate.new_tokens.setdefault(name, []).extend(tokens)
+                pstate.num_output_tokens += len(tokens)
+                # Update streaming connections where this partition is producer
+                for conn in request_data.streaming_connections.values():
+                    if conn.from_partition == partition_name and conn.edge_name == name:
+                        conn.token_count += len(tokens)
+
+        # Update consumed counts from worker-reported stream consumption
+        if body.stream_tokens_consumed:
+            for conn in request_data.streaming_connections.values():
+                if conn.from_partition == partition_name:
+                    continue  # skip producer connections
+                consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
+                conn.consumed_count = max(conn.consumed_count, consumed)
+
+        pstate.completed_worker_graph_ids.update(body.worker_graph_ids)
+        pstate.curr_forward_outputs += body.output_signal_names if isinstance(
+            body.output_signal_names, list
+        ) else []
+
+        # Check if this partition's forward pass is fully done
+        done_partitions = []
+        if pstate.current_worker_graph_ids.issubset(pstate.completed_worker_graph_ids):
+            done_partitions.append(partition_name)
+
+        return done_partitions
+
+    def _process_done_forward(
+        self, request_id: str, partition_name: str,
+        partition_done_from_worker: bool = False,
+    ) -> bool:
+        """Process a completed forward pass for a specific partition.
+
+        Calls get_partition_forward_pass_args for all partitions uniformly.
+        If the result has inputs, sends them. If not, the partition
+        self-triggers (e.g., via StreamBuffer on the worker).
+
+        Returns True if the **entire** request is done (all partitions finished).
         """
         request_data = self.requests[request_id]
+        pstate = request_data.partition_states[partition_name]
 
-        prev_graph_walk = request_data.current_forward_metadata.graph_walk
-        fwd_args = self.model.get_forward_pass_args(
-            request_data.current_forward_metadata,
+        incoming_connections = request_data.get_incoming_connections(partition_name)
+
+        # For partitions that self-trigger via StreamBuffer (have incoming
+        # connections with topology), worker signals partition_done directly.
+        if incoming_connections and partition_done_from_worker:
+            pstate.is_done = True
+
+        fwd_args = self.model.get_partition_forward_pass_args(
+            partition_name=partition_name,
+            partition_metadata=pstate.metadata,
             persist_signals=request_data.persist_signals,
-            new_tokens=request_data.new_tokens
+            new_tokens=pstate.new_tokens,
+            incoming_connections=incoming_connections,
         )
-        self._update_request_info(request_id, fwd_args)
 
-        logger.debug(
-            ("Request %s completed forward pass; moving from graph_walk %s -> %s.\n"
-             "Received new tokens %s, has persist signals %s.\n"
-             "request_done=%s"),
-            request_id, prev_graph_walk, fwd_args.full_metadata.graph_walk,
-            str(request_data.new_tokens), str(list(request_data.persist_signals.keys())),
-            str(fwd_args.request_done)
-        )
-        self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
+        prev_walk = pstate.metadata.graph_walk
+        pstate.metadata = fwd_args.full_metadata
 
-        if request_data.num_output_tokens >= request_data.max_output_tokens:
+        # Check max output tokens for partitions that produce tokens
+        if pstate.num_output_tokens >= request_data.max_output_tokens:
             logger.info(
-                "Request %s reached max output tokens %d. Ending request.",
-                request_id, request_data.max_output_tokens
+                "Partition %s reached max output tokens %d. Ending.",
+                partition_name, request_data.max_output_tokens,
             )
             fwd_args.request_done = True
-        if fwd_args.request_done:
-            return True # stop the request
-        
-        request_data.fwd_pass_number += 1
-        request_data.random_seed += 1
-        request_data.curr_forward_outputs.clear()
 
-        logger.debug("Forward inputs: %s", str(fwd_args.inputs))
+        logger.debug(
+            "Partition %s of request %s: %s -> %s (request_done=%s, tokens=%d)",
+            partition_name, request_id, prev_walk,
+            fwd_args.full_metadata.graph_walk, fwd_args.request_done,
+            pstate.num_output_tokens,
+        )
+
+        if fwd_args.request_done:
+            pstate.is_done = True
+            # Signal producer_done to all outgoing connections
+            for conn in request_data.streaming_connections.values():
+                if conn.from_partition == partition_name:
+                    conn.producer_done = True
+                    self._send_producer_done(request_id, conn.to_partition)
+        elif fwd_args.inputs:
+            # Partition has inputs to send — conductor-driven
+            self._send_partition_inputs(request_id, partition_name, fwd_args)
+        # else: no inputs — partition self-triggers via StreamBuffer
+
+        self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
+
+        # Reset partition forward pass state
+        pstate.new_tokens = {}
+        pstate.completed_worker_graph_ids = set()
+        pstate.current_worker_graph_ids = set()
+        pstate.fwd_pass_number += 1
+        pstate.random_seed += 1
+
+        self._set_partition_worker_graph_ids(
+            request_id, partition_name, fwd_args.full_metadata.graph_walk,
+        )
+
+        # Request done when ALL partitions are done
+        return all(ps.is_done for ps in request_data.partition_states.values())
+
+    def _send_partition_inputs(
+        self, request_id: str, partition_name: str, fwd_args: ForwardPassArgs,
+    ):
+        """Send InputSignals for a specific partition's next forward pass."""
+        request_data = self.requests[request_id]
+        pstate = request_data.partition_states[partition_name]
+
+        self._update_persist_ref_counts(request_id, fwd_args.inputs)
 
         inputs_per_worker = self._split_inputs_to_workers(
             worker_graph_to_worker=request_data.worker_graph_to_worker,
             inputs=fwd_args.inputs,
-            graph_walk=fwd_args.full_metadata.graph_walk
+            graph_walk=fwd_args.full_metadata.graph_walk,
         )
-
-        request_data.new_tokens = {}
-        request_data.completed_worker_graph_ids = set()
 
         for worker, inputs in inputs_per_worker.items():
             message = WorkerMessage(
@@ -553,61 +719,48 @@ class Conductor:
                     request_info=CurrentForwardPassInfo(
                         graph_walk=fwd_args.full_metadata.graph_walk,
                         step_metadata=fwd_args.step_metadata,
-                        fwd_index=request_data.fwd_pass_number,
-                        random_seed=request_data.random_seed,
-                        per_label_seq_info=self.requests[request_id].per_label_seq_info,
+                        fwd_index=pstate.fwd_pass_number,
+                        random_seed=pstate.random_seed,
+                        per_label_seq_info=pstate.per_label_seq_info,
                         requires_cfg=fwd_args.full_metadata.requires_cfg,
-                    )                    
-                )
+                        partition_name=partition_name,
+                    ),
+                    partition_name=partition_name
+                ),
             )
             self.communicator.send(worker, message)
 
-        return False
+    def _send_producer_done(self, request_id: str, consumer_partition_name: str):
+        """Send producer_done signal to the consumer partition's worker(s)."""
+        request_data = self.requests[request_id]
+        pstate = request_data.partition_states[consumer_partition_name]
 
-    def _process_worker_graphs_done(
-        self, body: WorkerGraphsDone
-    ):
-        """
-        When some worker graphs have completed (the worker notifies the conductor
-        that the worker graphs have completed), update the metadata for this
-        request.
+        # Find which workers handle this consumer partition
+        consumer_workers = set()
+        pdef = request_data.partition_definitions[consumer_partition_name]
+        for wg_id, worker_id in request_data.worker_graph_to_worker.items():
+            walks = self._all_worker_graph_ids_to_graph_walks.get(wg_id, set())
+            if walks & pdef.graph_walks:
+                consumer_workers.add(worker_id)
 
-        Return whether the full model forward pass has been completed (i.e., all
-        worker graphs for the current computation graph walk have been completed)
-        """
-        if body.request_id not in self.requests:
-            logger.debug(
-                "Ignoring late WORKER_GRAPHS_DONE for completed request %s",
-                body.request_id
+        for worker_id in consumer_workers:
+            message = WorkerMessage(
+                message_type=WorkerMessageType.INPUT_SIGNALS,
+                body=InputSignals(
+                    request_id=request_id,
+                    inputs=[],
+                    request_info=CurrentForwardPassInfo(
+                        graph_walk=pstate.metadata.graph_walk or "",
+                        fwd_index=pstate.fwd_pass_number,
+                        random_seed=pstate.random_seed,
+                        requires_cfg=False,
+                        partition_name=consumer_partition_name,
+                    ),
+                    partition_name=consumer_partition_name,
+                    producer_done=True,
+                ),
             )
-            return False
-
-        request_data = self.requests[body.request_id]
-
-        request_data.per_label_seq_info = {
-            **request_data.per_label_seq_info,
-            **body.per_label_seq_info
-        }
-
-        # Absorb persist signals and new tokens sent with this message
-        if body.persist_signals:
-            request_data.persist_signals.update(body.persist_signals)
-        if body.new_tokens:
-            for name in body.new_tokens:
-                if name not in request_data.new_tokens:
-                    request_data.new_tokens[name] = []
-                request_data.new_tokens[name] += body.new_tokens[name]
-                request_data.num_output_tokens += len(body.new_tokens[name])
-
-        request_data.completed_worker_graph_ids.update(
-            body.worker_graph_ids
-        )
-        request_data.curr_forward_outputs += body.output_signal_names
-
-        done_with_forward = request_data.current_worker_graph_ids.issubset(
-            request_data.completed_worker_graph_ids
-        )
-        return done_with_forward
+            self.communicator.send(worker_id, message)
 
     def run(self):
         from mminf.utils.profiler import range_pop, range_push
@@ -617,27 +770,42 @@ class Conductor:
                 range_push("conductor.run_loop")
 
             try:
-                done_forward_passes = []
+                done_partition_forwards: list[tuple[str, str, bool]] = []
+
                 for message in self.communicator.get_all_new_messages():
                     if message.message_type == ConductorMessageType.NEW_REQUEST:
                         self._ingest_request(message.body)
                     elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
-                        done_with_fwd = self._process_worker_graphs_done(
-                            message.body
-                        )
-                        if done_with_fwd:
-                            done_forward_passes.append(message.body.request_id)
+                        rid = message.body.request_id
+                        if rid not in self.requests:
+                            logger.debug(
+                                "WORKER_GRAPHS_DONE for unknown request %s (already completed?)", rid
+                            )
+                            continue
+
+                        done_parts = self._process_worker_graphs_done(message.body)
+                        for pname in done_parts:
+                            done_partition_forwards.append(
+                                (rid, pname, message.body.partition_done)
+                            )
                     else:
                         raise ValueError(f"Unknown message type: {message.message_type}")
 
                 completed_requests = []
-                for request_id in done_forward_passes:
-                    saw_eos = self._process_done_forward(request_id)
-                    if saw_eos:
+
+                for request_id, partition_name, p_done in done_partition_forwards:
+                    if request_id not in self.requests:
+                        continue  # already completed by another partition in this cycle
+                    all_done = self._process_done_forward(
+                        request_id, partition_name,
+                        partition_done_from_worker=p_done,
+                    )
+                    if all_done:
                         completed_requests.append(request_id)
 
-                for request_id in completed_requests:
-                    self._process_request_done(request_id)
+                for request_id in dict.fromkeys(completed_requests):
+                    if request_id in self.requests:
+                        self._process_request_done(request_id)
             except Exception:
                 logger.exception("Conductor error in main loop")
             finally:

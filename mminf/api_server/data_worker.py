@@ -4,7 +4,7 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 
 import torch
 import torchvision
@@ -81,6 +81,9 @@ class PreprocessWorker:
 
     def new_result_tensors(self, input: ResultTensors):
         name = input.graph_edge.name
+        if input.request_id not in self.output_fwd_pass_numbers:
+            logger.debug("Late result_tensors for cleaned-up request %s, ignoring", input.request_id)
+            return
         self.output_fwd_pass_numbers[input.request_id][name] = max(
             self.output_fwd_pass_numbers[input.request_id].get(name, -1),
             input.fwd_pass_number
@@ -95,16 +98,15 @@ class PreprocessWorker:
 
     def has_pending_tensors(self, request_id: str):
         return self.per_request_reading_tensors.get(request_id, 0) > 0
-    
+
     def received_final_chunks(
-        self, request_id: str, final_forward_pass: int,
-        final_forward_outputs: list[str]
+        self, request_id: str,
+        final_forward_outputs: dict[str, int],
     ):
-        return all([
-          self.output_fwd_pass_numbers[request_id].get(
-              name, -1
-            ) >= final_forward_pass for name in final_forward_outputs
-        ])
+        return all(
+            self.output_fwd_pass_numbers[request_id].get(name, -1) >= fwd_pass
+            for name, fwd_pass in final_forward_outputs.items()
+        )
 
     def get_result_chunks(self)-> list[ResultChunk]:
         results = []

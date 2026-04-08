@@ -19,13 +19,42 @@ import torch
 
 
 @torch.compiler.disable
+def _apply_repetition_penalty(
+    logits: torch.Tensor,
+    seen_token_ids: list[int] | torch.Tensor,
+    penalty: float,
+) -> torch.Tensor:
+    """Apply vLLM-style sign-aware repetition penalty in-place.
+
+    For each seen token id: divide logit by penalty if positive,
+    multiply by penalty if negative. Applied before temperature scaling.
+    """
+    if isinstance(seen_token_ids, list):
+        if not seen_token_ids:
+            return logits
+        ids = torch.tensor(seen_token_ids, device=logits.device, dtype=torch.long)
+    else:
+        ids = seen_token_ids
+        if ids.numel() == 0:
+            return logits
+
+    # logits shape: [batch_size, vocab_size] — typically [1, V] here
+    selected = logits[:, ids]
+    penalized = torch.where(selected > 0, selected / penalty, selected * penalty)
+    logits[:, ids] = penalized
+    return logits
+
+
+@torch.compiler.disable
 def sample_tokens(
     logits: torch.Tensor,
     temperature: float | torch.Tensor = 0.6,
     top_k: int | torch.Tensor = 0,
     top_p: float | torch.Tensor = 1.0,
+    repetition_penalty: float = 1.0,
+    seen_token_ids: list[int] | torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Sample tokens from logits with temperature, top-k, and top-p.
+    """Sample tokens from logits with temperature, top-k, top-p, and repetition penalty.
 
     CUDA-graph safe: no Python if/else on tensor values. Uses masking
     to blend greedy argmax with FlashInfer sampled results.
@@ -38,11 +67,17 @@ def sample_tokens(
             0 = disabled (uses vocab_size).
         top_p: Scalar or per-request tensor [batch_size].
             1.0 = disabled.
+        repetition_penalty: vLLM-style sign-aware penalty (1.0 = disabled).
+        seen_token_ids: Token IDs to penalize (prompt + previously generated).
 
     Returns:
         tokens: [batch_size] sampled token IDs.
     """
     batch_size, vocab_size = logits.shape
+
+    # Step 0: Repetition penalty (before temperature scaling)
+    if repetition_penalty != 1.0 and seen_token_ids is not None:
+        logits = _apply_repetition_penalty(logits, seen_token_ids, repetition_penalty)
 
     # Normalize params to tensors [batch_size] for uniform handling
     temperature = _to_tensor(temperature, batch_size, logits.device)

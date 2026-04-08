@@ -1,17 +1,25 @@
 import argparse
 import asyncio
-from dataclasses import dataclass
-from enum import Enum
 import os
 import random
 import time
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 
 import aiohttp
 
 from benchmark.base import Model, RequestType
 from benchmark.dataset import BaseDataset, TxtFileDataset, VBenchDataset
-from benchmark.request import AggregateMetrics, InferenceSystem, OurSystem, RequestInput, RequestMetrics, VLLMOmni, aggregate_metrics
+from benchmark.request import (
+    AggregateMetrics,
+    InferenceSystem,
+    OurSystem,
+    RequestInput,
+    RequestMetrics,
+    VLLMOmni,
+    aggregate_metrics,
+)
 
 
 class DatasetType(Enum):
@@ -73,7 +81,7 @@ class Benchmark:
             return TxtFileDataset(
                 filename=self.config.request_txt_file,
                 num_requests=self.config.num_requests,
-                req_type=self.config.request_type 
+                req_type=self.config.request_type
             )
         raise ValueError(f"Unknown dataset: {self.config.dataset}")
 
@@ -155,7 +163,7 @@ class Benchmark:
             await asyncio.sleep(0.01)
 
         return all_metrics
-    
+
     async def _run_concurrent_online(
         self,
         session: aiohttp.ClientSession,
@@ -259,7 +267,7 @@ def parse_args() -> BenchmarkConfig:
     vbench = parser.add_argument_group("vbench")
     vbench.add_argument("--vbench-cache-dir", default="./vbench_cache",
                         help="Directory to cache downloaded VBench data (default: ./vbench_cache)")
-    
+
     # Text dataset args
     text_dataset = parser.add_argument_group("text_dataset")
     text_dataset.add_argument(

@@ -10,7 +10,6 @@
 # This modified file is released under the same license.
 
 
-import time
 from typing import Optional
 
 import torch
@@ -82,11 +81,11 @@ def split_function_mot(
         out[text_idxs]  = text_out
         out[img_idxs] = image_out
         return out
-    
+
     text_query = text_function(query_sequence)
     vae_query = image_fuction(query_sequence)
     return torch.where(text_mask[:, None], text_query, vae_query)
-    
+
 
 
 class BagelAttentionMoT(nn.Module):
@@ -139,7 +138,7 @@ class BagelAttentionMoT(nn.Module):
         vae_token_indexes=None,
         text_indexes=None,
         text_mask=None,
-    ):  
+    ):
         if mode == "und":
             query_states = self.q_proj(query_sequence).view(
                 -1, self.num_heads, self.head_dim

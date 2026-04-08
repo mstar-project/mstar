@@ -1,11 +1,11 @@
 import logging
+import queue
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
-import queue
-from mooncake.engine import TransferEngine
 
 import torch
+from mooncake.engine import TransferEngine
 
 from mminf.communication.communicator import CommProtocol
 from mminf.communication.tensors import AsyncMooncakeReader, TransferReadInfo
@@ -114,7 +114,7 @@ class MooncakeStoreConfig:
 class TransferEngineInfo:
     my_entity_id: str
     my_session_id: str
-    transfer_engine: TransferEngine 
+    transfer_engine: TransferEngine
 
 
 class StoreWritePolicy(Enum):
@@ -134,7 +134,7 @@ class PagedAllocationManager:
         self.request_states: dict[str, LabelToState] = {}
         self.kv_cache = kv_cache
         self.write_policy = StoreWritePolicy.ALWAYS
-    
+
         self.engine = transfer_engine_info.transfer_engine
         self._async_reader = AsyncMooncakeReader(
             engine=self.engine, device=kv_cache.device
@@ -209,7 +209,7 @@ class PagedAllocationManager:
 
     def get_state(self, request_id: str, label: str):
         if label not in self.request_states[request_id]:
-            
+
             self.request_states[request_id][label] = self._new_state()
         return self.request_states[request_id][label]
 
@@ -233,7 +233,7 @@ class PagedAllocationManager:
                     f"available {self.page_allocator.num_free}"
                 )
             state.page_indices.extend(new_pages)
-    
+
     def wait_for_retrieves(
         self, request_id: str, label: str
     ):
@@ -304,7 +304,7 @@ class PagedAllocationManager:
                     TransferReadInfo(
                         seq_info.latest_session_id,
                         local_ptr, remote_ptr, nbytes
-                    ) for local_ptr, remote_ptr in zip(local_ptrs, remote_ptrs)
+                    ) for local_ptr, remote_ptr in zip(local_ptrs, remote_ptrs, strict=True)
                 ])
         future = self._async_reader.submit(read_info)
         if future is not None:
@@ -312,7 +312,7 @@ class PagedAllocationManager:
         state.seq_len = seq_len
         state.position_id_start = seq_info.pos_id
         state.read_in_progress = True
-    
+
     def get_per_label_seq_info(self, request_id: str):
         per_label_seq_info: dict[str, SequenceInfo] = {}
         for label, state in self.request_states.get(request_id, {}).items():
@@ -328,7 +328,7 @@ class PagedAllocationManager:
                 page_indices=state.page_indices
             )
         return per_label_seq_info
-    
+
     def reset_label(self, request_id: str, label: str, free: bool=True):
         self.wait_for_retrieves(request_id, label)
         if label in self.request_states[request_id] and free:
@@ -342,7 +342,7 @@ class PagedAllocationManager:
         self.engine.unregister_memory(
             self.kv_cache.data_ptr()
         )
-    
+
     def add_request(self, request_id: str, labels: list[str]=None):
         if labels is None:
             labels = []
@@ -352,7 +352,7 @@ class PagedAllocationManager:
         self.pending_reads[request_id] = {
             label: [] for label in labels
         }
-    
+
     def remove_request(self, request_id: str):
         for label in self.request_states[request_id]:
             self.wait_for_retrieves(request_id, label)

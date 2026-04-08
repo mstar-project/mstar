@@ -1,6 +1,6 @@
-from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 from abc import ABC, abstractmethod
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -231,7 +231,7 @@ class AsyncMooncakeReader:
         for (session_id, infos) in grouped_read.items():
             for start in range(0, len(infos), self.max_batch_size):
                 end = min(start + self.max_batch_size, len(infos))
-            
+
                 status = self._engine.batch_transfer_sync_read(
                     session_id,
                     [infos[i].local_ptr for i in range(start, end)],

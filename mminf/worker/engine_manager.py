@@ -8,7 +8,7 @@ from mminf.engine.audio_codec_engine import AudioCodecEngine
 from mminf.engine.base import BaseEngine
 from mminf.engine.enc_dec_engine import EncoderDecoderEngine
 from mminf.engine.flow_engine import FlowEngine
-from mminf.engine.kv_store import MooncakeStoreConfig, PagedAllocationManager, TransferEngineInfo
+from mminf.engine.kv_store import PagedAllocationManager, TransferEngineInfo
 from mminf.model.base import Model
 
 ENGINE_TYPE_TO_CLASS: dict[str, type[BaseEngine]] = {
@@ -75,10 +75,15 @@ class EngineManager:
                 for name in node_names:
                     submodule = model.get_submodule(name, device)
                     if submodule is not None:
-                        submodules[name] = submodule.to(
-                            device=device,
-                            dtype=model.get_autocast_dtype()
-                        )
+                        if engine.has_autocast():
+                            submodules[name] = submodule.to(
+                                device=device,
+                                dtype=model.get_autocast_dtype()
+                            )
+                        else:
+                            submodules[name] = submodule.to(
+                                device=device,
+                            )
 
             engine.load_model(
                 submodules, model_config, device,
@@ -136,10 +141,16 @@ class EngineManager:
                 return engine
         return None
 
-    def shutdown(self) -> None:
+    def _unique_engines(self) -> list[BaseEngine]:
         seen = set()
+        result = []
         for engine in self.node_to_engine.values():
             eid = id(engine)
             if eid not in seen:
                 seen.add(eid)
-                engine.shutdown()
+                result.append(engine)
+        return result
+
+    def shutdown(self) -> None:
+        for engine in self._unique_engines():
+            engine.shutdown()

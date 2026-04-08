@@ -25,8 +25,10 @@ class ResultTensors:
 class RequestComplete:
     """Signals that a request has finished processing."""
     request_id: str
-    final_forward_pass: int
-    final_forward_outputs: list[str]
+    # Maps output signal name to its final forward pass number.
+    # The API server waits until all entries are received before
+    # completing the request.
+    final_forward_outputs: dict[str, int]
 
 
 @dataclass

@@ -1,12 +1,14 @@
 
 import base64
-from dataclasses import dataclass
 import json
 import mimetypes
-from pathlib import Path
-import time
 import statistics
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+
 import aiohttp
 
 from benchmark.base import Model, RequestType, Status
@@ -174,9 +176,6 @@ class RequestInput:
     image_path: Optional[str]=None
 
 
-from abc import ABC, abstractmethod
-
-
 class InferenceSystem(ABC):
     @abstractmethod
     async def send_request(
@@ -282,13 +281,22 @@ class VLLMOmni(InferenceSystem):
         metrics = RequestMetrics(request_id=request_id, type=req_type)
         try:
             if req_type == RequestType.T2I:
-                await self._chat(session, base_url, model, prompt, None, metrics, additional_model_kwargs, output_modality="image")
+                await self._chat(
+                    session, base_url, model, prompt, None, metrics,
+                    additional_model_kwargs, output_modality="image",
+                )
             elif req_type == RequestType.I2I:
                 if image_path is None:
                     raise ValueError("image_path is required for I2I requests")
-                await self._chat(session, base_url, model, prompt, image_path, metrics, additional_model_kwargs, output_modality="image")
+                await self._chat(
+                    session, base_url, model, prompt, image_path, metrics,
+                    additional_model_kwargs, output_modality="image",
+                )
             elif req_type in (RequestType.T2T, RequestType.I2T):
-                await self._chat(session, base_url, model, prompt, image_path, metrics, additional_model_kwargs, output_modality="text")
+                await self._chat(
+                    session, base_url, model, prompt, image_path, metrics,
+                    additional_model_kwargs, output_modality="text",
+                )
             else:
                 raise ValueError(f"Unsupported request type: {req_type}")
         except Exception as e:

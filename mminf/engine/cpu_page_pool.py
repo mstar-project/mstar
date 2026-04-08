@@ -5,7 +5,7 @@ CPU pinned memory here, freeing GPU pages for active requests. Pages are
 reloaded back to GPU when the request is re-scheduled.
 """
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -84,7 +84,7 @@ class CPUPagePool:
 
         stream = self._get_stream()
         with torch.cuda.stream(stream):
-            for gpu_idx, cpu_idx in zip(gpu_page_indices, cpu_pages):
+            for gpu_idx, cpu_idx in zip(gpu_page_indices, cpu_pages, strict=True):
                 # Copy all layers at once: cpu[:, cpu_idx] = gpu[:, gpu_idx]
                 self.cpu_kv_cache[:, cpu_idx].copy_(
                     gpu_kv_cache[:, gpu_idx], non_blocking=True
@@ -111,7 +111,7 @@ class CPUPagePool:
 
         stream = self._get_stream()
         with torch.cuda.stream(stream):
-            for cpu_idx, gpu_idx in zip(state.cpu_page_indices, gpu_page_indices):
+            for cpu_idx, gpu_idx in zip(state.cpu_page_indices, gpu_page_indices, strict=True):
                 gpu_kv_cache[:, gpu_idx].copy_(
                     self.cpu_kv_cache[:, cpu_idx], non_blocking=True
                 )
@@ -132,7 +132,7 @@ class CPUPagePool:
         """Free any CPU pages held by this request (e.g., on request removal)."""
         if request_id not in self.offloaded:
             return
-        for label, state in self.offloaded[request_id].items():
+        for _label, state in self.offloaded[request_id].items():
             self.page_allocator.free(state.cpu_page_indices)
         del self.offloaded[request_id]
 
