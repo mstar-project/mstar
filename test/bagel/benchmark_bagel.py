@@ -13,7 +13,6 @@ import time
 from pathlib import Path
 
 import aiohttp
-
 from _env import get_server_url
 
 DEFAULT_PROMPTS = {
