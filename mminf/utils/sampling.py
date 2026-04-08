@@ -45,8 +45,8 @@ class Sampler:
     
     def set_config(self, request_id: str, **kwargs):
         curr_config = asdict(self._sampling_config[request_id])
-        kwargs = [kwargs[k] for k in kwargs if k in curr_config]
-        self._sampling_config[request_id] = SamplingConfig({
+        kwargs = {k: arg for k, arg in kwargs.items() if k in curr_config.keys()}
+        self._sampling_config[request_id] = SamplingConfig(**{
             **curr_config, **kwargs
         })
     
@@ -56,7 +56,7 @@ class Sampler:
         for rid in request_ids:
             if rid not in self._seen_token_mask:
                 self._seen_token_mask[rid] = torch.zeros(
-                    logits.shape[1], dtype=torch.long, device=logits.device
+                    logits.shape[1], dtype=torch.bool, device=logits.device
                 )
         configs = [
             self._sampling_config[rid] for rid in request_ids
@@ -80,10 +80,9 @@ class Sampler:
 
         res = {}
         for i, rid in enumerate(request_ids):
-            token = tokens[i]
+            token = tokens[i:i+1]
             res[rid] = token
-            self._seen_token_mask[rid][token] = 1
-        
+            self._seen_token_mask[rid][token] = True
         return res
 
 

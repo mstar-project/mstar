@@ -54,7 +54,7 @@ class InputSignals(MessageBody):
     request_id: str
     inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
-    partition_name: str = ""
+    partition_name: str = "default"
     producer_done: bool = False
 
 

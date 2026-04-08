@@ -462,9 +462,9 @@ class CudaGraphRunner:
                     if out_key == "logits":
                         # Sample token from logits (post-graph, CUDA-graph safe)
                         logits = val[0] if isinstance(val, list) else val
-                        outputs[rid]["new_token"] = self.sampler.sample(
+                        outputs[rid]["new_token"] = [self.sampler.sample(
                             [rid],  logits
-                        )[rid].clone()
+                        )[rid].clone()]
                     elif isinstance(val, list):
                         outputs[rid][out_key] = [t.clone() for t in val]
                     elif isinstance(val, torch.Tensor):

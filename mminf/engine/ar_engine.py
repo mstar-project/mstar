@@ -188,9 +188,9 @@ class AREngine(BaseEngine):
             if "logits" not in tensors:
                 continue
             logits = tensors["logits"][0]  # [1, vocab_size]
-            tensors["new_token"] = self.sampler.sample(
+            tensors["new_token"] = [self.sampler.sample(
                 request_ids=[rid], logits=logits
-            )[rid]
+            )[rid]]
             del tensors["logits"]
 
         return output
