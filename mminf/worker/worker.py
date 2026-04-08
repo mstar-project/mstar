@@ -415,12 +415,14 @@ class Worker:
         for request_id, req_info in list(self.worker_graphs_manager.per_request_info.items()):
             for edge_name, sbuf in req_info.stream_buffers.items():
                 synthetic_edge = sbuf.pop_waiting_edge()
+                consumer_node = self._consumer_node_cache.get(edge_name, "")
+                partition_name = self.worker_graphs_manager.get_partition_for_node(consumer_node)
+                
                 if synthetic_edge is None and sbuf.has_chunk_ready():
                     chunk = sbuf.pop_chunk()
                     chunk_tensor = chunk.data.get("data")
-
-                    consumer_node = self._consumer_node_cache.get(edge_name, "")
-                    partition_name = self.worker_graphs_manager.get_partition_for_node(consumer_node)
+                    if chunk_tensor is None:
+                        continue
 
                     # Store the chunk tensor so _build_node_batch can retrieve it via uuid
                     tensor_infos = self.tensor_manager.store_and_return_tensor_info(

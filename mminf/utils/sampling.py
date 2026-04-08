@@ -28,6 +28,8 @@ class SamplingConfig:
     repetition_penalty: float = 1
 
 
+# TODO: add a method for adding prefill tokens to the _seen_token_mask,
+# if applying the repetition penalty to tokens from the prompt is desired
 @dataclass
 class Sampler:
     # per request
@@ -39,7 +41,8 @@ class Sampler:
         # lazy init _seen_token_mask, taking vocab size from logits
     
     def remove_request(self, request_id: str):
-        del self._sampling_config[request_id]
+        if request_id in self._sampling_config:
+            del self._sampling_config[request_id]
         if request_id in self._seen_token_mask:
             del self._seen_token_mask[request_id]
     
@@ -52,7 +55,7 @@ class Sampler:
     
     def sample(
         self, request_ids: list[str], logits: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         for rid in request_ids:
             if rid not in self._seen_token_mask:
                 self._seen_token_mask[rid] = torch.zeros(
