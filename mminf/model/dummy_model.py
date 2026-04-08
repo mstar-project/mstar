@@ -124,13 +124,15 @@ class DummyModel(Model):
             image_gen=image_gen
         )
 
-    def get_kv_cache_config(self) -> KVCacheConfig:
-        return KVCacheConfig(
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=1,
-            max_seq_len=1,
-        )
+    def get_kv_cache_config(self) -> dict[str, KVCacheConfig]:
+        return {
+            "LLM": KVCacheConfig(
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=1,
+                max_seq_len=1,
+            )
+        }
 
     def get_initial_forward_pass_args(
         self, partition_name="default",

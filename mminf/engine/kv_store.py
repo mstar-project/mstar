@@ -101,16 +101,6 @@ class StoreAllocInfo:
 
 
 @dataclass
-class MooncakeStoreConfig:
-    hostname: str
-    metadata_server: str="http://localhost:8080/metadata"
-    segment_size=4 * 1024*1024*1024
-    local_buff_size=4 * 1024*1024*1024
-    protocol: CommProtocol=CommProtocol.RDMA
-    master_service: str="localhost:50051"
-
-
-@dataclass
 class TransferEngineInfo:
     my_entity_id: str
     my_session_id: str

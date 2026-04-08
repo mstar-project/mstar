@@ -10,7 +10,7 @@ from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.tensors import MooncakeCommunicationManager, NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
-from mminf.engine.kv_store import StoreWritePolicy, TransferEngineInfo
+from mminf.engine.kv_store import KVCacheConfig, StoreWritePolicy, TransferEngineInfo
 from mminf.graph.base import GraphEdge
 from mminf.graph.request_queues import format_graph_edge_list
 from mminf.model.base import Model, WorkerGraph
@@ -56,11 +56,10 @@ class Worker:
         worker_id: str,
         worker_ids: list[str],
         my_worker_graphs: list[WorkerGraph],
-        engine_configs: list[dict],
+        kv_config: dict[str, KVCacheConfig],
         all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
         all_worker_graph_ids_to_nodes: dict[str, list[str]],
         hostname: str = "localhost",
-        master_service: str = "localhost:50051",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         device: torch.device = torch.device("cuda"),
@@ -116,8 +115,13 @@ class Worker:
             device=self.device
         )
 
-        self.engine_manager = EngineManager.from_config(
-            engine_configs=engine_configs, device=device,
+        node_names = set(sum([
+            wg.section.get_node_names() for wg in my_worker_graphs
+        ], start=[]))
+        self.engine_manager = EngineManager.build(
+            node_names,
+            device=device,
+            kv_config=kv_config,
             transfer_engine_info=TransferEngineInfo(
                 my_entity_id=worker_id,
                 my_session_id=self.tensor_manager.my_session_id,
@@ -135,9 +139,8 @@ class Worker:
             all_worker_graph_ids_to_nodes,
             node_engine_types=node_engine_types,
         )
-        alloc_mgr = self.engine_manager.get_ar_alloc_manager()
-        if alloc_mgr is not None:
-            alloc_mgr.write_policy = write_policy
+
+        self.engine_manager.set_alloc_write_policies(write_policy)
         logger.info(
             "Worker %s: store write policy = %s", worker_id, write_policy.value
         )
@@ -145,7 +148,7 @@ class Worker:
         self._unprocessed_messages = {} # req_id -> messages for requests that are not in the queue
 
         # CPU offloading: LRU tracking and eviction policy
-        self._last_active: dict[str, float] = {}  # request_id -> monotonic timestamp
+        self._last_active: dict[tuple[str, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
         self.eviction_policy = EvictionPolicy.LRU
 
         # Streaming buffers: request_id -> edge_name -> list of tensors
@@ -251,7 +254,11 @@ class Worker:
 
     def _add_new_request(self, body: NewRequest) -> None:
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
-        self._last_active[body.request_id] = _time.monotonic()
+
+        ar_engine = self.engine_manager.get_ar_engine()
+        if ar_engine is not None:
+            for node_name in ar_engine.submodule_management.keys():
+                self._last_active[(body.request_id, node_name)] = _time.monotonic()
         self.worker_graphs_manager.add_request(
             request_id=body.request_id,
             worker_graph_ids=body.worker_graph_ids,
@@ -293,8 +300,12 @@ class Worker:
         self.engine_manager.remove_request(body.request_id)
         self.worker_graphs_manager.remove_request(body.request_id)
         self.tensor_manager.cleanup_request(body.request_id)
-        self._last_active.pop(body.request_id, None)
         self.streaming_buffers.pop(body.request_id, None)
+
+        ar_engine = self.engine_manager.get_ar_engine()
+        if ar_engine is not None:
+            for node_name in ar_engine.submodule_management.keys():
+                self._last_active.pop((body.request_id, node_name))
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
@@ -468,7 +479,7 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _try_offload_cold_request(
-        self, batch_ids: set[str]
+        self, node_name: str, batch_ids: set[str]
     ) -> str | None:
         """Offload one request's KV pages to CPU using the configured eviction policy.
 
@@ -479,9 +490,13 @@ class Worker:
         Returns the victim request_id, or None if offloading wasn't possible.
         """
         ar_engine = self.engine_manager.get_ar_engine()
-        if ar_engine is None or ar_engine.cpu_page_pool is None:
+        if ar_engine is None:
             return None
-        alloc = ar_engine.alloc_manager
+        
+        submod_mgmt = ar_engine.submodule_management[node_name]
+        if submod_mgmt.cpu_page_pool is None:
+            return None
+        alloc = submod_mgmt.alloc_manager
 
         # Gather all candidates with (rid, total_pages), split by location
         external: list[tuple[str, int]] = []
@@ -500,8 +515,8 @@ class Worker:
         if not candidates:
             return None
 
-        victim_id = self._select_eviction_victim(candidates)
-        freed = alloc.offload_request(victim_id, ar_engine.cpu_page_pool)
+        victim_id = self._select_eviction_victim(node_name, candidates)
+        freed = alloc.offload_request(victim_id, submod_mgmt.cpu_page_pool)
         logger.info(
             "Offloaded request %s to CPU (%d GPU pages freed, "
             "policy=%s, in_batch=%s)",
@@ -511,7 +526,7 @@ class Worker:
         return victim_id if freed > 0 else None
 
     def _select_eviction_victim(
-        self, candidates: list[tuple[str, int]]
+        self, node_name: str, candidates: list[tuple[str, int]]
     ) -> str:
         """Pick a victim from *candidates* based on ``self.eviction_policy``.
 
@@ -525,21 +540,26 @@ class Worker:
         return min(
             candidates,
             key=lambda x: (
-                self._last_active.get(x[0], 0.0),  # oldest first
+                self._last_active.get((x[0], node_name), 0.0),  # oldest first
                 -x[1],                               # then most pages
             ),
         )[0]
 
-    def _try_reload_request(self, request_id: str) -> bool:
+    def _try_reload_request(self, node_name: str, request_id: str) -> bool:
         """Reload an offloaded request back to GPU. Returns True if reloaded."""
         ar_engine = self.engine_manager.get_ar_engine()
-        if ar_engine is None or ar_engine.cpu_page_pool is None:
+        if ar_engine is None:
             return False
-        if not ar_engine.cpu_page_pool.is_offloaded(request_id):
+        
+        submod_mgmt = ar_engine.submodule_management[node_name]
+        if submod_mgmt.cpu_page_pool is None:
+            return False
+
+        if not submod_mgmt.cpu_page_pool.is_offloaded(request_id):
             return False
         try:
-            ar_engine.alloc_manager.reload_request(
-                request_id, ar_engine.cpu_page_pool
+            submod_mgmt.alloc_manager.reload_request(
+                request_id, submod_mgmt.cpu_page_pool
             )
             logger.info("Reloaded request %s from CPU to GPU", request_id)
             return True
@@ -813,7 +833,7 @@ class Worker:
                 # 5a. Handle allocation failure: offload a victim, retry the rest
                 if output.allocation_failed:
                     batch_ids = set(batch.node_objects.keys())
-                    victim_id = self._try_offload_cold_request(batch_ids)
+                    victim_id = self._try_offload_cold_request(node_batch.node_name, batch_ids)
 
                     # Push all batch nodes back to their queues
                     for request_id, node in batch.node_objects.items():
@@ -844,7 +864,7 @@ class Worker:
                 # Update LRU timestamps for successfully executed requests
                 now = _time.monotonic()
                 for rid in batch.node_objects:
-                    self._last_active[rid] = now
+                    self._last_active[(rid, batch.node_name)] = now
 
                 batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 

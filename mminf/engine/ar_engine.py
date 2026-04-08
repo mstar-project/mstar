@@ -1,8 +1,9 @@
+from dataclasses import dataclass, field
 import logging
 
 import torch
 
-from mminf.conductor.request_info import CurrentForwardPassInfo
+from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
 from mminf.engine.cpu_page_pool import CPUPagePool
@@ -12,6 +13,19 @@ from mminf.utils.profiler import range_pop, range_push
 from mminf.utils.sampling import Sampler
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SubmoduleManagement:
+    submodule: torch.nn.Module
+    kv_cache_config: KVCacheConfig
+    kv_cache: torch.Tensor
+    alloc_manager: PagedAllocationManager
+    cpu_page_pool: CPUPagePool | None
+    buffer_manager: WorkspaceBufferManager
+    sampler: Sampler = field(default_factory=Sampler)
+    cuda_graph_runner: CudaGraphRunner | None = None
+    
 
 class AREngine(BaseEngine):
     """
@@ -26,25 +40,15 @@ class AREngine(BaseEngine):
 
     def __init__(
         self,
-        kv_cache_config: KVCacheConfig | dict,
         autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
     ):
         super().__init__(enable_nvtx=enable_nvtx)
-        if isinstance(kv_cache_config, dict):
-            kv_cache_config = KVCacheConfig(**kv_cache_config)
-        self.submodules: dict[str, torch.nn.Module] = {}
-        self.kv_cache_config = kv_cache_config
+
+        self.submodule_management: dict[str, SubmoduleManagement] = {}
+
         self.device = None
         self.autocast_dtype = autocast_dtype
-        self.kv_cache = None  # [num_layers, max_pages, 2, page_size, num_kv_heads, head_dim]
-        self.alloc_manager: PagedAllocationManager | None = None
-        self.buffer_manager = None
-        self.cpu_page_pool: CPUPagePool | None = None
-        self.sampler: Sampler = Sampler()
-
-        # CUDA graph runners (initialized in warmup())
-        self.cuda_graph_runners: dict[str, "CudaGraphRunner"] = {}
 
     def engine_type(self) -> EngineType:
         return EngineType.AR
@@ -52,67 +56,79 @@ class AREngine(BaseEngine):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
-        model_config: dict,
+        kv_cache_config: dict[str, KVCacheConfig],
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=torch.bfloat16,
     ) -> None:
-        self.submodules = submodules
         self.device = device
-        cfg = model_config.get(
-            "kv_cache", self.kv_cache_config
-        )
-        if not cfg:
-            return  # dummy mode without config
-        if isinstance(cfg, dict):
-            cfg = KVCacheConfig(**cfg)
+        assert set(kv_cache_config.keys()).issuperset(set(submodules.keys()))
 
-        num_layers = cfg.num_layers
-        max_num_pages = cfg.max_num_pages
-        page_size = cfg.page_size
-        num_kv_heads = cfg.num_kv_heads
-        head_dim = cfg.head_dim
+        for node_name, submodule in submodules.items():
+            cfg = kv_cache_config[node_name]
 
-        self.kv_cache = torch.zeros(
-            num_layers, max_num_pages, 2,
-            page_size, num_kv_heads, head_dim,
-            dtype=kv_cache_type, device=device,
-        ).contiguous()
-        self.alloc_manager = PagedAllocationManager(
-            config=cfg,
-            kv_cache=self.kv_cache,
-            transfer_engine_info=transfer_engine_info
-        )
+            num_layers = cfg.num_layers
+            max_num_pages = cfg.max_num_pages
+            page_size = cfg.page_size
+            num_kv_heads = cfg.num_kv_heads
+            head_dim = cfg.head_dim
 
-        # 256MB workspace for FlashInfer
-        self.buffer_manager = WorkspaceBufferManager(
-            256 * 1024 * 1024, device=device
-        )
+            kv_cache = torch.zeros(
+                num_layers, max_num_pages, 2,
+                page_size, num_kv_heads, head_dim,
+                dtype=kv_cache_type, device=device,
+            ).contiguous()
+            alloc_manager = PagedAllocationManager(
+                config=cfg,
+                kv_cache=kv_cache,
+                transfer_engine_info=transfer_engine_info
+            )
 
-        # CPU page pool for KV cache offloading
-        if cfg.cpu_offload_pages > 0:
-            self.cpu_page_pool = CPUPagePool(
+            # 256MB workspace for FlashInfer
+            buffer_manager = WorkspaceBufferManager(
+                256 * 1024 * 1024, device=device
+            )
+
+            # CPU page pool for KV cache offloading
+            cpu_page_pool = None
+            if cfg.cpu_offload_pages > 0:
+                cpu_page_pool = CPUPagePool(
+                    kv_cache_config=cfg,
+                    max_cpu_pages=cfg.cpu_offload_pages,
+                    kv_cache_dtype=kv_cache_type,
+                )
+                logger.info(
+                    "AREngine: CPU page pool for nnode %s initialized with %d pages",
+                    node_name, cfg.cpu_offload_pages,
+                )
+            self.submodule_management[node_name] = SubmoduleManagement(
+                submodule=submodule,
                 kv_cache_config=cfg,
-                max_cpu_pages=cfg.cpu_offload_pages,
-                kv_cache_dtype=kv_cache_type,
-            )
-            logger.info(
-                "AREngine: CPU page pool initialized with %d pages",
-                cfg.cpu_offload_pages,
+                kv_cache=kv_cache,
+                alloc_manager=alloc_manager,
+                cpu_page_pool=cpu_page_pool,
+                buffer_manager=buffer_manager
             )
 
-    def _create_cache_manager(self, request_id: str) -> BatchedCacheManager:
+    def _create_cache_manager(
+        self, request_ids: list[str],
+        node_name: str
+    ) -> BatchedCacheManager:
         """Create a CacheHandle for a single request."""
+        submod_mgmt = self.submodule_management[node_name]
+
         from mminf.engine.kv_store import StoreWritePolicy
+        autowrite = (submod_mgmt.alloc_manager.write_policy == StoreWritePolicy.ALWAYS)
+
         return BatchedCacheManager(
-            request_ids=[request_id],
-            active_labels_per_request={request_id: "main"},
-            kv_cache=self.kv_cache,
-            alloc_manager=self.alloc_manager,
-            buffer_manager=self.buffer_manager,
-            kv_cache_config=self.kv_cache_config,
+            request_ids=request_ids,
+            active_labels_per_request={rid: "main" for rid in request_ids},
+            kv_cache=submod_mgmt.kv_cache,
+            alloc_manager=submod_mgmt.alloc_manager,
+            buffer_manager=submod_mgmt.buffer_manager,
+            kv_cache_config=submod_mgmt.kv_cache_config,
             device=self.device,
-            auto_write_store=self.alloc_manager.write_policy == StoreWritePolicy.ALWAYS,
+            auto_write_store=autowrite,
         )
 
     def _compile_submodules(self) -> None:
@@ -125,7 +141,8 @@ class AREngine(BaseEngine):
         if not torch.cuda.is_available():
             return
 
-        for node_name, submodule in self.submodules.items():
+        for node_name, submodule_mgmt in self.submodule_management.items():
+            submodule = submodule_mgmt.submodule
             try:
                 submodule.forward = torch.compile(
                     submodule.forward,
@@ -149,25 +166,21 @@ class AREngine(BaseEngine):
         """Compile submodules and capture CUDA graphs."""
         from mminf.engine.cuda_graph_runner import CudaGraphRunner
 
-        if self.kv_cache is None or self.device is None:
-            logger.info("AREngine: skipping warmup (no KV cache or device)")
-            return
-
         # Step 2: CUDA graph capture for decode (Option A keying)
-        for node_name in self.submodules:
+        for node_name, submodule_mgmt in self.submodule_management.items():
             runner = CudaGraphRunner(
                 submodule_name=node_name,
-                submodule=self.submodules[node_name],
-                kv_cache_config=self.kv_cache_config,
-                alloc_manager=self.alloc_manager,
-                sampler=self.sampler,
-                buffer_manager=self.buffer_manager,
+                submodule=submodule_mgmt.submodule,
+                kv_cache_config=submodule_mgmt.kv_cache_config,
+                alloc_manager=submodule_mgmt.alloc_manager,
+                sampler=submodule_mgmt.sampler,
+                buffer_manager=submodule_mgmt.buffer_manager,
                 device=self.device,
                 autocast_dtype=self.autocast_dtype
             )
             runner.warmup_and_capture()
             if runner.graphs:
-                self.cuda_graph_runners[node_name] = runner
+                submodule_mgmt.cuda_graph_runner = runner
                 logger.info("AREngine: CUDA graphs captured for %s (%d configs)",
                             node_name, len(runner.graphs))
         # Step 1: torch.compile (before CUDA graph capture)
@@ -175,8 +188,8 @@ class AREngine(BaseEngine):
 
     def _sample_decode_outputs(
         self,
+        node_name: str,
         output: NodeOutput,
-        per_request_info: dict[str, CurrentForwardPassInfo]
     ) -> NodeOutput:
         """Post-process decode outputs: sample tokens from logits.
 
@@ -188,25 +201,19 @@ class AREngine(BaseEngine):
             if "logits" not in tensors:
                 continue
             logits = tensors["logits"][0]  # [1, vocab_size]
-            tensors["new_token"] = [self.sampler.sample(
-                request_ids=[rid], logits=logits
-            )[rid]]
+            tensors["new_token"] = [
+                self.submodule_management[node_name].sampler.sample(
+                    request_ids=[rid], logits=logits
+                )[rid]
+            ]
             del tensors["logits"]
 
         return output
 
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
-        from mminf.engine.kv_store import StoreWritePolicy
-        cache_manager = BatchedCacheManager(
-            request_ids=batch.request_ids,
-            active_labels_per_request={rid: "main" for rid in batch.request_ids},
-            kv_cache=self.kv_cache,
-            alloc_manager=self.alloc_manager,
-            buffer_manager=self.buffer_manager,
-            kv_cache_config=self.kv_cache_config,
-            device=self.device,
-            auto_write_store=self.alloc_manager.write_policy == StoreWritePolicy.ALWAYS,
+        cache_manager = self._create_cache_manager(
+            batch.request_ids, batch.node_name
         )
 
         # Preprocess all requests
@@ -236,7 +243,9 @@ class AREngine(BaseEngine):
         cache_manager.flush_to_store()
 
         output = NodeOutput(per_request_output_tensors=batched_output)
-        output = self._sample_decode_outputs(output, batch.per_request_info)
+        output = self._sample_decode_outputs(
+            batch.node_name, output
+        )
         return output
 
     def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
@@ -244,7 +253,7 @@ class AREngine(BaseEngine):
         per_request_outputs = {}
 
         for rid in batch.request_ids:
-            cache_manager = self._create_cache_manager(rid)
+            cache_manager = self._create_cache_manager([rid], batch.node_name)
             inputs = batch.per_request_input_tensors.get(rid, {})
             metadata = {
                 rid: batch.per_request_info[rid]
@@ -272,14 +281,16 @@ class AREngine(BaseEngine):
             per_request_outputs[rid] = output
 
         output = NodeOutput(per_request_output_tensors=per_request_outputs)
-        output = self._sample_decode_outputs(output, batch.per_request_info)
+        output = self._sample_decode_outputs(
+            batch.node_name, output
+        )
         return output
 
     def _can_use_cuda_graph(self, batch: NodeBatch) -> bool:
         """Check if CUDA graph replay is available for this batch."""
         if batch.graph_walk != "decode":
             return False
-        runner = self.cuda_graph_runners.get(batch.node_name)
+        runner = self.submodule_management[batch.node_name].cuda_graph_runner
         if runner is None:
             return False
 
@@ -303,7 +314,7 @@ class AREngine(BaseEngine):
         4. Advancing seq_lens after replay (Python-only, not captured)
         5. Remapping outputs from dummy request IDs to real ones
         """
-        runner = self.cuda_graph_runners[batch.node_name]
+        runner = self.submodule_management[batch.node_name].cuda_graph_runner
 
         # TODO: don't hardcode it like this
         has_cfg = any(
@@ -330,26 +341,19 @@ class AREngine(BaseEngine):
         if self.enable_nvtx:
             range_push(f"engine.ar.{batch.node_name}.{batch.graph_walk}")
 
-        submodule = self.submodules.get(batch.node_name)
-        if submodule is None:
-            output = NodeOutput(
-                per_request_output_tensors={rid: {} for rid in batch.request_ids}
-            )
-            if self.enable_nvtx:
-                range_pop()
-            return output
-
+        submod_mgmt = self.submodule_management[batch.node_name]
+        submodule = submod_mgmt.submodule
         try:
             needed_labels = self._get_needed_labels(
                 batch.node_name, batch.graph_walk, batch.per_request_info
             )
-            self.alloc_manager.alloc_status.reset()
+            submod_mgmt.alloc_manager.alloc_status.reset()
             try:
                 for req_id, info in batch.per_request_info.items():
-                    for label, seq_info in info.per_label_seq_info.items():
+                    for label, seq_info in info.per_label_seq_info.get(batch.node_name):
                         if needed_labels is not None and label not in needed_labels:
                             continue
-                        self.alloc_manager.sync_retrieve(
+                        submod_mgmt.alloc_manager.sync_retrieve(
                             req_id, label, seq_info
                         )
                 
@@ -358,7 +362,7 @@ class AREngine(BaseEngine):
                 # submodule-level sampler, and a fuction on the submodule to set
                 # the sampler config
                 for rid, info in batch.per_request_info.items():
-                    self.sampler.set_config(rid, **info.step_metadata)
+                    submod_mgmt.sampler.set_config(rid, **info.step_metadata)
 
                 with torch.no_grad():
                     with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
@@ -370,8 +374,8 @@ class AREngine(BaseEngine):
                         else:
                             return self._execute_sequential(batch, submodule)
             except RuntimeError:
-                if not self.alloc_manager.alloc_status.success:
-                    status = self.alloc_manager.alloc_status
+                if not submod_mgmt.alloc_manager.alloc_status.success:
+                    status = submod_mgmt.alloc_manager.alloc_status
                     logger.warning(
                         "KV cache page allocation failed for batch "
                         "(node=%s, walk=%s, request=%s, label=%s, "
@@ -391,8 +395,11 @@ class AREngine(BaseEngine):
                 raise
         finally:
             for req_id in batch.request_ids:
-                batch.per_request_info[req_id].per_label_seq_info = \
-                    self.alloc_manager.get_per_label_seq_info(req_id)
+                batch.per_request_info[req_id].per_label_seq_info = PerLabelSeqInfo(
+                    info={
+                        batch.node_name: submod_mgmt.alloc_manager.get_per_label_seq_info(req_id)
+                    }
+                )
             if self.enable_nvtx:
                 range_pop()
 
@@ -400,7 +407,7 @@ class AREngine(BaseEngine):
         self, node_name: str, graph_walk: str,
         request_info: dict[str, CurrentForwardPassInfo]
     ):
-        submodule = self.submodules.get(node_name)
+        submodule = self.submodule_management[node_name].submodule
         needed_labels = None
         if hasattr(submodule, 'get_needed_cache_labels'):
             needed = submodule.get_needed_cache_labels(
@@ -413,10 +420,11 @@ class AREngine(BaseEngine):
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
     ):
+        submod_mgmt = self.submodule_management[node_name]
         # If this request was offloaded to CPU, try reloading first
-        if self.cpu_page_pool is not None and self.cpu_page_pool.is_offloaded(request_id):
+        if submod_mgmt.cpu_page_pool is not None and submod_mgmt.cpu_page_pool.is_offloaded(request_id):
             try:
-                self.alloc_manager.reload_request(request_id, self.cpu_page_pool)
+                submod_mgmt.alloc_manager.reload_request(request_id, submod_mgmt.cpu_page_pool)
                 logger.info("Reloaded offloaded request %s from CPU", request_id)
             except RuntimeError:
                 return False  # can't reload yet, not ready
@@ -429,10 +437,10 @@ class AREngine(BaseEngine):
 
         labels_to_check = []
         try:
-            for label, seq_info in request_info.per_label_seq_info.items():
+            for label, seq_info in request_info.per_label_seq_info.get(node_name):
                 if needed_labels is not None and label not in needed_labels:
                     continue
-                self.alloc_manager.start_async_retrieve(
+                submod_mgmt.alloc_manager.start_async_retrieve(
                     request_id, label, seq_info
                 )
                 labels_to_check.append(label)
@@ -441,7 +449,7 @@ class AREngine(BaseEngine):
             return False
 
         ar_ready = all([
-            self.alloc_manager.check_retrieve_ready(request_id, label)
+            submod_mgmt.alloc_manager.check_retrieve_ready(request_id, label)
             for label in labels_to_check
         ])
         if not ar_ready:
@@ -451,28 +459,33 @@ class AREngine(BaseEngine):
     def add_request(
         self, request_id: str, cache_labels: list[str] | None = None,
     ) -> None:
-        self.alloc_manager.add_request(request_id, cache_labels or ["main"])
-        self.sampler.add_request(request_id)
+        for submodule_mgmt in self.submodule_management.values():
+            submodule_mgmt.alloc_manager.add_request(request_id, cache_labels or ["main"])
+            submodule_mgmt.sampler.add_request(request_id)
 
     def remove_request(self, request_id: str) -> None:
-        if self.cpu_page_pool is not None:
-            self.cpu_page_pool.remove_request(request_id)
-        self.alloc_manager.remove_request(request_id)
-        self.sampler.remove_request(request_id)
+        for submodule_mgmt in self.submodule_management.values():
+            if submodule_mgmt.cpu_page_pool is not None:
+                submodule_mgmt.cpu_page_pool.remove_request(request_id)
+            submodule_mgmt.alloc_manager.remove_request(request_id)
+            submodule_mgmt.sampler.remove_request(request_id)
 
     def pause_request(
         self, request_id: str, cache_label: str = "main",
     ) -> None:
         """For interleaved loop: mark as paused, keep KV pages allocated."""
-        self.alloc_manager.get_state(request_id, cache_label).is_paused = True
+        for submodule_mgmt in self.submodule_management.values():
+            submodule_mgmt.alloc_manager.get_state(request_id, cache_label).is_paused = True
 
     def resume_request(
         self, request_id: str, cache_label: str = "main",
     ) -> None:
         """Resume from paused state for next LLM step in loop."""
-        self.alloc_manager.get_state(request_id, cache_label).is_paused = False
+        for submodule_mgmt in self.submodule_management.values():
+            submodule_mgmt.alloc_manager.get_state(request_id, cache_label).is_paused = False
 
     def shutdown(self) -> None:
-        self.kv_cache = None
-        self.buffer_manager = None
-        self.alloc_manager.cleanup()
+        for submodule_mgmt in self.submodule_management.values():
+            submodule_mgmt.kv_cache = None
+            submodule_mgmt.buffer_manager = None
+            submodule_mgmt.alloc_manager.cleanup()

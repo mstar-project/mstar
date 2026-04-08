@@ -8,7 +8,7 @@ from mminf.engine.audio_codec_engine import AudioCodecEngine
 from mminf.engine.base import BaseEngine
 from mminf.engine.enc_dec_engine import EncoderDecoderEngine
 from mminf.engine.flow_engine import FlowEngine
-from mminf.engine.kv_store import PagedAllocationManager, TransferEngineInfo
+from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager, TransferEngineInfo
 from mminf.model.base import Model
 
 ENGINE_TYPE_TO_CLASS: dict[str, type[BaseEngine]] = {
@@ -27,13 +27,14 @@ class EngineManager:
     node_to_engine: dict[str, BaseEngine] = field(default_factory=dict)
 
     @classmethod
-    def from_config(
+    def build(
         cls,
-        engine_configs: list[dict],
+        node_names: set[str],
         device: torch.device,
+        kv_config: dict[str, KVCacheConfig],
         transfer_engine_info: TransferEngineInfo,
+        model: Model,
         enable_nvtx: bool = False,
-        model: Model | None = None,
     ) -> "EngineManager":
         """
         Build an EngineManager from a list of engine configs.
@@ -42,30 +43,19 @@ class EngineManager:
         each node via model.get_submodule(node_name). In dummy mode
         (model=None or get_submodule returns None), engines run without
         real computation.
-
-        engine_configs example:
-        [
-            {"engine_type": "ar", "node_names": ["LLM"], "model_config": {...}},
-            {"engine_type": "flow", "node_names": ["flow"], "model_config": {...}},
-            {"engine_type": "enc_dec", "node_names": ["text_emb", "image_emb", "VAE_dec"], ...}
-        ]
         """
+        type_to_nodes = {}
+        node_to_engine_type = model.get_node_engine_types()
+        for node_name in node_names:
+            type_to_nodes.setdefault(node_to_engine_type[node_name].value, []).append(node_name)
+
         node_to_engine: dict[str, BaseEngine] = {}
 
-        for cfg in engine_configs:
-            engine_type_str = cfg["engine_type"]
-            if "node_names" not in cfg:
-                raise KeyError(
-                    f"Engine config missing `node_names`: {cfg}"
-                )
-            node_names = cfg["node_names"]
-            model_config = cfg.get("model_config", {})
-
+        for engine_type_str, node_names in type_to_nodes.items():
             engine_cls = ENGINE_TYPE_TO_CLASS[engine_type_str]
 
             engine = engine_cls(
-                kv_cache_config=model_config.get("kv_cache", {}),
-                autocast_dtype=model_config.get("autocast_dtype", torch.bfloat16),
+                autocast_dtype=model.get_autocast_dtype(),
                 enable_nvtx=enable_nvtx,
             )
 
@@ -86,10 +76,15 @@ class EngineManager:
                             )
 
             engine.load_model(
-                submodules, model_config, device,
+                submodules,
+                kv_cache_config={
+                    name: kv_config[name] for name in node_names \
+                        if name in kv_config
+                },
+                device=device,
                 transfer_engine_info=transfer_engine_info
             )
-            logger.info("Engine %s loaded in on device %s", cfg["engine_type"], str(device))
+            logger.info("Engine %s loaded in on device %s", engine_type_str, str(device))
 
             for name in node_names:
                 node_to_engine[name] = engine
@@ -127,12 +122,12 @@ class EngineManager:
                 seen.add(eid)
                 engine.remove_request(request_id)
 
-    def get_ar_alloc_manager(self) -> PagedAllocationManager | None:
+    def set_alloc_write_policies(self, policy):
         """Return the PagedAllocationManager from the first AR engine, if any."""
         for engine in self.node_to_engine.values():
-            if isinstance(engine, AREngine) and engine.alloc_manager is not None:
-                return engine.alloc_manager
-        return None
+            if isinstance(engine, AREngine):
+                for submod_mgmt in engine.submodule_management.values():
+                    submod_mgmt.alloc_manager.write_policy = policy
 
     def get_ar_engine(self) -> "AREngine | None":
         """Return the first AR engine instance, if any."""

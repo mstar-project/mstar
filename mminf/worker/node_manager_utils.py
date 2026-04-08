@@ -2,7 +2,7 @@ import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 
-from mminf.conductor.request_info import CurrentForwardPassInfo
+from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
 from mminf.graph.base import GraphEdge, GraphNode, TensorPointerInfo
 from mminf.graph.request_queues import (
     PerRequestNodeQueues,
@@ -181,7 +181,7 @@ class WorkerGraphsManager:
         self, request_id: str,
         partition_name,
         current_fwd_info: CurrentForwardPassInfo | None=None,
-        per_label_seq_info: dict | None=None,
+        per_label_seq_info: PerLabelSeqInfo | None=None,
     ):
         req_info = self.per_request_info[request_id]
         part_info = req_info.per_partition_info[partition_name]
@@ -198,10 +198,7 @@ class WorkerGraphsManager:
 
         if per_label_seq_info is not None:
             fwd_info = self.get_fwd_info(request_id, partition_name)
-            fwd_info.per_label_seq_info = {
-                **fwd_info.per_label_seq_info,
-                **per_label_seq_info
-            }
+            fwd_info.per_label_seq_info.update(per_label_seq_info)
 
     def get_graph_walk(self, request_id: str, partition_name: str):
         return self.get_fwd_info(request_id, partition_name).graph_walk

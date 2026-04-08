@@ -404,14 +404,17 @@ class BagelModel(Model):
             return img_byte_arr.getvalue()
         raise ValueError(f"Unsupported modality: {modality!r}")
 
-    def get_kv_cache_config(self) -> KVCacheConfig:
-        return KVCacheConfig(
+    def get_kv_cache_config(self) -> dict[str, KVCacheConfig]:
+        cfg = KVCacheConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.hidden_size // self.config.num_attention_heads,
             max_seq_len=self.config.max_position_embeddings,
             num_qo_heads=self.config.num_attention_heads,
         )
+        return  {
+            key: cfg for key in ["LLM", "LLM_cfg_text", "LLM_cfg_img"]
+        }
 
     def get_submodule(self, node_name: str, device: str="cpu") -> torch.nn.Module | None:
         if node_name in self._submodule_cache:

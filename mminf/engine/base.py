@@ -6,6 +6,7 @@ import torch
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
+from mminf.engine.kv_store import KVCacheConfig
 
 
 class EngineType(Enum):
@@ -65,7 +66,7 @@ class BaseEngine(ABC):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
-        model_config: dict,
+        kv_cache_config: dict[str, KVCacheConfig],
         device: torch.device,
         **kwargs
     ) -> None:

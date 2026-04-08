@@ -30,7 +30,6 @@ class FlowEngine(BaseEngine):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
-        model_config: dict,
         device: torch.device,
         **kwargs
     ) -> None:

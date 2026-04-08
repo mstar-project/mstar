@@ -263,7 +263,10 @@ class Model(ABC):
         ], start=[])
 
     @abstractmethod
-    def get_kv_cache_config(self) -> KVCacheConfig:
+    def get_kv_cache_config(self) -> dict[str, KVCacheConfig]:
+        """
+        node name -> KVCacheConfig 
+        """
         pass
 
     @abstractmethod

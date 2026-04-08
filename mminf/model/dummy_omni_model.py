@@ -67,13 +67,15 @@ class DummyOmniModel(Model):
             ),
         ])
 
-    def get_kv_cache_config(self) -> KVCacheConfig:
-        return KVCacheConfig(
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=1,
-            max_seq_len=1,
-        )
+    def get_kv_cache_config(self) -> dict[str, KVCacheConfig]:
+        return  {
+            "LLM": KVCacheConfig(
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=1,
+                max_seq_len=1,
+            )
+        }
 
     def get_graph_walk_graphs(self):
         return dict(

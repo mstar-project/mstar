@@ -1,7 +1,7 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 
-from mminf.conductor.request_info import CurrentForwardPassInfo, SequenceInfo
+from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo, SequenceInfo
 from mminf.graph.base import GraphEdge, TensorPointerInfo
 
 
@@ -102,7 +102,7 @@ class WorkerGraphsDone(MessageBody):
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
     output_signal_names: int = field(default=0)
-    per_label_seq_info: dict[str, SequenceInfo] = field(default_factory=dict)
+    per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)
     stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream

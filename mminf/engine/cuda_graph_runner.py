@@ -245,7 +245,6 @@ class CudaGraphRunner:
                     requires_cfg=config.requires_cfg,
                     fwd_index=0,
                     random_seed=0,
-                    per_label_seq_info={}
                 ) for rid in dummy_rids
             }
 
