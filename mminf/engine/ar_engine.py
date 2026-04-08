@@ -350,7 +350,7 @@ class AREngine(BaseEngine):
             submod_mgmt.alloc_manager.alloc_status.reset()
             try:
                 for req_id, info in batch.per_request_info.items():
-                    for label, seq_info in info.per_label_seq_info.get(batch.node_name).items():
+                    for label, seq_info in info.per_label_seq_info.get_all().items():
                         if needed_labels is not None and label not in needed_labels:
                             continue
                         submod_mgmt.alloc_manager.sync_retrieve(
@@ -396,9 +396,7 @@ class AREngine(BaseEngine):
         finally:
             for req_id in batch.request_ids:
                 batch.per_request_info[req_id].per_label_seq_info = PerLabelSeqInfo(
-                    info={
-                        batch.node_name: submod_mgmt.alloc_manager.get_per_label_seq_info(req_id)
-                    }
+                    info=submod_mgmt.alloc_manager.get_per_label_seq_info(req_id)
                 )
             if self.enable_nvtx:
                 range_pop()
@@ -437,7 +435,7 @@ class AREngine(BaseEngine):
 
         labels_to_check = []
         try:
-            for label, seq_info in request_info.per_label_seq_info.get(node_name).items():
+            for label, seq_info in request_info.per_label_seq_info.get_all().items():
                 if needed_labels is not None and label not in needed_labels:
                     continue
                 submod_mgmt.alloc_manager.start_async_retrieve(

@@ -29,25 +29,18 @@ class SequenceInfo:
 
 @dataclass
 class PerLabelSeqInfo:
-    # {node name -> {label: SequenceInfo}}
-    info: dict[str, dict[str, SequenceInfo]] = field(default_factory=dict)
+    # {label: SequenceInfo}
+    info: dict[str, SequenceInfo] = field(default_factory=dict)
 
     def update(self, other: "PerLabelSeqInfo"):
-        for node_name, info in other.info.items():
-            if node_name not in self.info:
-                self.info[node_name] = info
-                continue
-            self.info[node_name] = {
-                **self.info[node_name],
-                **info
-            }
+        self.info= {
+            **self.info,
+            **other.info
+        }
+        print(self.info)
 
-    def get(self, node_name, label: str | None=None) -> SequenceInfo | dict:
-        if node_name not in self.info:
-            return {}
-        if label is None:
-            return self.info[node_name]
-        return self.info[node_name].get(label)
+    def get_all(self) -> dict:
+        return self.info
 
 
 @dataclass
