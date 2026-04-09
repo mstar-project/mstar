@@ -629,8 +629,49 @@ class ThinkerSubmodule(NodeSubmodule):
     # ---- batching ----
 
     def can_batch(self, batch: NodeBatch) -> bool:
-        # TODO: implement forward_batched for thinker_decode
-        return False
+        return batch.graph_walk == "thinker_decode"
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        cache_manager: BatchedCacheManager,
+        packed_inputs: dict[str, torch.Tensor],
+        per_request_info: dict | None = None,
+        per_request_metadata: dict | None = None,
+    ) -> dict[str, NameToTensorList]:
+        """Batched decode: multiple requests each contribute 1 token."""
+        assert graph_walk == "thinker_decode"
+
+        input_embeds = packed_inputs["input_embeds"]  # (batch, hidden)
+        cos_sin_3d = packed_inputs.get("cos_sin_3d")
+        mrope_section = packed_inputs.get("mrope_section")
+
+        cache_manager.set_active_label("main")
+
+        hidden, layer_0_embed, layer_n_hidden = self.model(
+            input_embeds=input_embeds,
+            cache_handle=cache_manager,
+            cos_sin_3d=cos_sin_3d,
+            mrope_section=mrope_section,
+        )
+
+        logits = self.model.lm_head(hidden)  # (batch, vocab)
+
+        # Pack thinker_states per request
+        if layer_n_hidden is not None:
+            thinker_states = torch.cat([layer_0_embed, layer_n_hidden], dim=-1)
+        else:
+            thinker_states = torch.cat([layer_0_embed, layer_0_embed], dim=-1)
+
+        request_ids = cache_manager.request_ids
+        return {
+            rid: {
+                "logits": [logits[i : i + 1]],
+                "thinker_states": [thinker_states[i : i + 1]],
+            }
+            for i, rid in enumerate(request_ids)
+        }
 
     def get_needed_cache_labels(
         self,
@@ -1181,8 +1222,56 @@ class TalkerSubmodule(NodeSubmodule):
     # ---- batching ----
 
     def can_batch(self, batch: NodeBatch) -> bool:
-        # TODO: implement forward_batched for talker_decode
-        return False
+        return batch.graph_walk == "talker_decode"
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        cache_manager: BatchedCacheManager,
+        packed_inputs: dict[str, torch.Tensor],
+        per_request_info: dict | None = None,
+        per_request_metadata: dict | None = None,
+    ) -> dict[str, NameToTensorList]:
+        """Batched talker_decode: batch the transformer, per-request Code Predictor.
+
+        The Talker transformer runs once on all requests (each seq_len=1).
+        The Code Predictor then runs per-request (31 sequential AR steps
+        can't be batched across different code histories).
+        """
+        assert graph_walk == "talker_decode"
+
+        input_embeds = packed_inputs["input_embeds"]  # (batch, hidden)
+
+        cache_manager.set_active_label("main")
+
+        # Batched Talker transformer forward
+        hidden = self.model(
+            input_embeds=input_embeds, cache_handle=cache_manager
+        )
+        # hidden: (batch, hidden_size) — one token per request
+
+        # Batched layer-0 codec logits
+        logits = self.model.codec_head(hidden)  # (batch, codec_vocab)
+
+        # Per-request: Code Predictor + pack outputs
+        request_ids = cache_manager.request_ids
+        result: dict[str, NameToTensorList] = {}
+
+        for i, rid in enumerate(request_ids):
+            last_hidden_i = hidden[i : i + 1]  # (1, hidden)
+            logits_i = logits[i : i + 1]        # (1, codec_vocab)
+
+            layer0_code = logits_i.argmax(dim=-1)  # (1,)
+            all_codes = self._run_code_predictor(last_hidden_i, layer0_code)
+
+            result[rid] = {
+                "logits": [logits_i.squeeze(0)],
+                "all_codes": [all_codes],
+                "codec_tokens": [all_codes],
+            }
+
+        return result
 
     def get_needed_cache_labels(
         self,
