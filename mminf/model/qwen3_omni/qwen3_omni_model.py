@@ -1,0 +1,1096 @@
+"""
+Qwen3OmniModel: 3-partition streaming model for Qwen3-Omni-Moe.
+
+Qwen3-Omni is a dual-AR multimodal model with a Thinker (30B-A3B MoE)
+that reasons over text/audio/vision inputs and a Talker (3B-A0.3B MoE)
+that converts Thinker hidden states into streaming codec tokens.  A
+Code2Wav vocoder converts codec tokens to 24 kHz PCM audio.
+
+Architecture (3 async partitions):
+    Thinker  — multimodal encoder + MoE LLM (text, audio, vision prefill -> decode)
+    Talker   — smaller MoE LLM that predicts codec tokens from Thinker hidden states
+    Code2Wav — vocoder that converts codec tokens to audio waveform
+
+Streaming topology:
+    Thinker --[thinker_states, FixedChunkPolicy(1)]--> Talker
+    Talker  --[codec_tokens,  FixedChunkPolicy(25)]--> Code2Wav
+
+Conductor-triggered pipelined prefill (Approach C):
+    After each Thinker walk completes (prefill_text, prefill_audio,
+    prefill_vision, thinker_decode), the conductor sends a
+    ``talker_trigger`` to the Talker partition.  During prefill each
+    trigger extends the Talker KV cache with the new Thinker hidden
+    states.  The final trigger (when thinker_decode starts) tells the
+    Talker to sample its first codec token and transition to decode.
+
+Text-only mode:
+    When output_modalities does not include "audio", only the Thinker
+    partition runs.  Talker and Code2Wav are idle.
+"""
+
+import logging
+from pathlib import Path
+
+import torch
+from transformers import AutoTokenizer
+
+from mminf.communication.tensors import NameToTensorList
+from mminf.conductor.request_info import (
+    CurrentForwardConductorMetadata,
+    PartitionDefinition,
+    StreamingConnectionState,
+)
+from mminf.engine.base import EngineType
+from mminf.engine.kv_store import KVCacheConfig
+from mminf.graph.base import GraphEdge, GraphNode, Sequential, TensorPointerInfo
+from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
+from mminf.streaming.chunk_policy import FixedChunkPolicy
+from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
+    """Download (or locate) a HuggingFace snapshot and return the local path."""
+    from huggingface_hub import snapshot_download
+
+    try:
+        local_dir = snapshot_download(
+            repo_id=repo_id,
+            cache_dir=cache_dir,
+            local_files_only=False,
+        )
+    except Exception as e:
+        logger.warning("Error downloading from HuggingFace: %s", str(e))
+        return repo_id
+    return str(Path(local_dir))
+
+
+# ---------------------------------------------------------------------------
+# Qwen3OmniModel
+# ---------------------------------------------------------------------------
+
+class Qwen3OmniModel(Model):
+    """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
+
+    def __init__(
+        self,
+        model_path_hf: str,
+        cache_dir: str | None = None,
+        **kwargs,
+    ):
+        self.cache_dir = cache_dir
+        self.model_path_hf = model_path_hf
+
+        # Load config from pretrained checkpoint
+        from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig
+
+        local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
+        self.config = Qwen3OmniModelConfig.from_pretrained(local_dir)
+        self.local_dir = local_dir
+
+        # Tokenizer (Thinker uses a Qwen-family tokenizer)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            local_dir, cache_dir=cache_dir, trust_remote_code=True,
+        )
+
+        # Lazy submodule cache -- each worker only loads what it needs
+        self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+
+    # -----------------------------------------------------------------------
+    # Model ABC: KV cache config
+    # -----------------------------------------------------------------------
+
+    def get_kv_cache_config(self) -> dict[str, KVCacheConfig]:
+        """Return separate KV cache configs for Thinker and Talker."""
+        thinker_cfg = KVCacheConfig(
+            num_layers=self.config.thinker_text.num_hidden_layers,
+            num_kv_heads=self.config.thinker_text.num_key_value_heads,
+            head_dim=self.config.thinker_head_dim,
+            max_seq_len=self.config.thinker_text.max_position_embeddings,
+            num_qo_heads=self.config.thinker_text.num_attention_heads,
+        )
+        talker_cfg = KVCacheConfig(
+            num_layers=self.config.talker_text.num_hidden_layers,
+            num_kv_heads=self.config.talker_text.num_key_value_heads,
+            head_dim=self.config.talker_head_dim,
+            max_seq_len=self.config.thinker_text.max_position_embeddings,
+            num_qo_heads=self.config.talker_text.num_attention_heads,
+        )
+        return {
+            "Thinker": thinker_cfg,
+            "Talker": talker_cfg,
+        }
+
+    # -----------------------------------------------------------------------
+    # Model ABC: node engine types
+    # -----------------------------------------------------------------------
+
+    def get_node_engine_types(self) -> dict[str, EngineType]:
+        return {
+            "audio_encoder": EngineType.ENC_DEC,
+            "vision_encoder": EngineType.ENC_DEC,
+            "Thinker": EngineType.AR,
+            "Talker": EngineType.AR,
+            "Code2Wav": EngineType.AUDIO_CODEC,
+        }
+
+    # -----------------------------------------------------------------------
+    # Model ABC: graph walk definitions
+    # -----------------------------------------------------------------------
+
+    def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
+        """Define all graph walks for the 3-partition architecture.
+
+        Thinker walks:
+            prefill_text   - text token embedding + Thinker prefill
+            prefill_audio  - audio feature encoding + Thinker prefill
+            prefill_vision - vision feature encoding + Thinker prefill
+            thinker_decode - autoregressive text token generation
+
+        Talker walks:
+            talker_prefill - prefill Talker KV cache from Thinker states
+            talker_decode  - autoregressive codec token generation
+
+        Code2Wav walks:
+            code2wav_chunk - vocoder streaming decode
+        """
+        # -- Thinker prefill walks: process inputs and stream hidden states
+        #    to the Talker partition via StreamingGraphEdge --
+        prefill_text = GraphNode(
+            name="Thinker",
+            input_ids=["text_inputs"],
+            outputs=[
+                StreamingGraphEdge(
+                    next_node="Talker",
+                    name="thinker_states",
+                    target_partition="Talker",
+                ),
+            ],
+        )
+
+        prefill_audio = Sequential([
+            GraphNode(
+                name="audio_encoder",
+                input_ids=["audio_features"],
+                outputs=[GraphEdge(next_node="Thinker", name="audio_embeds")],
+            ),
+            GraphNode(
+                name="Thinker",
+                input_ids=["audio_embeds"],
+                outputs=[
+                    StreamingGraphEdge(
+                        next_node="Talker",
+                        name="thinker_states",
+                        target_partition="Talker",
+                    ),
+                ],
+            ),
+        ])
+
+        prefill_vision = Sequential([
+            GraphNode(
+                name="vision_encoder",
+                input_ids=["pixel_values"],
+                outputs=[GraphEdge(next_node="Thinker", name="vision_embeds")],
+            ),
+            GraphNode(
+                name="Thinker",
+                input_ids=["vision_embeds"],
+                outputs=[
+                    StreamingGraphEdge(
+                        next_node="Talker",
+                        name="thinker_states",
+                        target_partition="Talker",
+                    ),
+                ],
+            ),
+        ])
+
+        # -- Thinker decode: produces new_token (persist) + thinker_states
+        #    (streaming to Talker) --
+        thinker_decode = GraphNode(
+            name="Thinker",
+            input_ids=["text_inputs"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="new_token",
+                    output_modality="text",
+                    is_new_token=True,
+                    persist=True,
+                ),
+                StreamingGraphEdge(
+                    next_node="Talker",
+                    name="thinker_states",
+                    target_partition="Talker",
+                ),
+            ],
+        )
+
+        # -- Talker prefill: receives thinker_states + talker_trigger --
+        # Dual-input gating: both thinker_states from streaming and
+        # talker_trigger from conductor cross-partition trigger must be
+        # present for a prefill step.
+        talker_prefill = GraphNode(
+            name="Talker",
+            input_ids=["thinker_states", "talker_trigger"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMPTY_DESTINATION,
+                    name="new_token",
+                    is_new_token=True,
+                    persist=True,
+                ),
+                GraphEdge(
+                    next_node=EMPTY_DESTINATION,
+                    name="all_codes",
+                    persist=True,
+                ),
+                StreamingGraphEdge(
+                    next_node="Code2Wav",
+                    name="codec_tokens",
+                    target_partition="Code2Wav",
+                ),
+            ],
+        )
+
+        # -- Talker decode: autoregressive codec token generation --
+        talker_decode = GraphNode(
+            name="Talker",
+            input_ids=["all_codes"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMPTY_DESTINATION,
+                    name="all_codes",
+                    is_new_token=True,
+                    persist=True,
+                ),
+                StreamingGraphEdge(
+                    next_node="Code2Wav",
+                    name="codec_tokens",
+                    target_partition="Code2Wav",
+                ),
+            ],
+        )
+
+        # -- Code2Wav chunk: vocoder streaming decode --
+        code2wav_chunk = GraphNode(
+            name="Code2Wav",
+            input_ids=["codec_tokens"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="audio_chunk",
+                    output_modality="audio",
+                ),
+            ],
+        )
+
+        return {
+            "prefill_text": prefill_text,
+            "prefill_audio": prefill_audio,
+            "prefill_vision": prefill_vision,
+            "thinker_decode": thinker_decode,
+            "talker_prefill": talker_prefill,
+            "talker_decode": talker_decode,
+            "code2wav_chunk": code2wav_chunk,
+        }
+
+    # -----------------------------------------------------------------------
+    # Partition API: 3-partition streaming topology
+    # -----------------------------------------------------------------------
+
+    def get_partitions(self) -> list[PartitionDefinition]:
+        return [
+            PartitionDefinition(
+                name="Thinker",
+                graph_walks={
+                    "prefill_text", "prefill_audio",
+                    "prefill_vision", "thinker_decode",
+                },
+                initial_walk="prefill_text",
+                producer_partitions=[],
+            ),
+            PartitionDefinition(
+                name="Talker",
+                graph_walks={"talker_prefill", "talker_decode"},
+                initial_walk=None,  # triggered by conductor after Thinker walks
+                producer_partitions=["Thinker"],
+            ),
+            PartitionDefinition(
+                name="Code2Wav",
+                graph_walks={"code2wav_chunk"},
+                initial_walk=None,  # self-triggered via StreamBuffer
+                producer_partitions=["Talker"],
+            ),
+        ]
+
+    def get_partition_topology(self) -> PartitionTopology:
+        return PartitionTopology(
+            partitions=["Thinker", "Talker", "Code2Wav"],
+            connections=[
+                Connection(
+                    from_partition="Thinker",
+                    to_partition="Talker",
+                    edge_name="thinker_states",
+                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+                ),
+                Connection(
+                    from_partition="Talker",
+                    to_partition="Code2Wav",
+                    edge_name="codec_tokens",
+                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=25),
+                ),
+            ],
+        )
+
+    # -----------------------------------------------------------------------
+    # Conductor-triggered pipelined prefill (Approach C)
+    # -----------------------------------------------------------------------
+
+    def get_consumer_partition_triggers(
+        self,
+        completed_partition: str,
+        completed_walk: str,
+        all_partition_states: dict,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+    ) -> dict[str, ForwardPassArgs]:
+        """Send talker_trigger to Talker after each Thinker walk completes.
+
+        Called by the conductor after _process_done_forward for the completed
+        partition.  While the Talker is still in prefill mode, each Thinker
+        walk completion triggers a Talker prefill step:
+
+        - prefill_text / prefill_audio / prefill_vision completions:
+          is_last_prefill=False  (extend KV cache, no codec output)
+        - thinker_decode start (first decode step completion):
+          is_last_prefill=True   (sample first codec token, transition to decode)
+
+        Once the Talker transitions to decode, no more triggers are sent
+        (the Talker self-drives via its own decode loop).
+        """
+        if completed_partition != "Thinker":
+            return {}
+
+        # Only trigger Talker while it is still in prefill mode
+        talker_state = all_partition_states.get("Talker")
+        if talker_state is None or talker_state.is_done:
+            return {}
+
+        talker_metadata = talker_state.metadata
+        if not talker_metadata.is_prefill:
+            # Talker has already transitioned to decode -- no more triggers
+            return {}
+
+        # Check if the Talker partition has audio output enabled
+        if "audio" not in talker_metadata.output_modalities:
+            return {}
+
+        # Determine if this is the last prefill trigger.
+        # The last prefill trigger is sent when the Thinker's first decode
+        # step completes (completed_walk == "thinker_decode").
+        is_last_prefill = (completed_walk == "thinker_decode")
+
+        trigger_metadata = CurrentForwardConductorMetadata(
+            input_modalities=talker_metadata.input_modalities,
+            output_modalities=talker_metadata.output_modalities,
+            graph_walk="talker_prefill",
+            is_prefill=True,
+            kwargs={
+                **talker_metadata.kwargs,
+                "is_last_prefill": is_last_prefill,
+            },
+        )
+
+        trigger_edge = GraphEdge(next_node="Talker", name="talker_trigger")
+
+        # Determine projection walk_name for the Talker (W2):
+        # The Talker uses walk_name to decide text_projection vs
+        # hidden_projection for the incoming Thinker states.
+        #   - "prefill_text"    -> all text tokens    -> text_projection
+        #   - "prefill_audio"   -> audio embeddings   -> hidden_projection
+        #   - "prefill_vision"  -> vision embeddings   -> hidden_projection
+        #   - "thinker_decode"  -> text decode tokens  -> text_projection
+        projection_walk_name = completed_walk
+
+        return {
+            "Talker": ForwardPassArgs(
+                full_metadata=trigger_metadata,
+                inputs=[trigger_edge],
+                unpersist_tensors=[],
+                step_metadata={
+                    "is_prefill": True,
+                    "is_last_prefill": is_last_prefill,
+                    "sample_token": is_last_prefill,
+                    "walk_name": projection_walk_name,
+                },
+            ),
+        }
+
+    # -----------------------------------------------------------------------
+    # Model ABC: initial forward pass args
+    # -----------------------------------------------------------------------
+
+    def get_initial_forward_pass_args(
+        self,
+        partition_name: str,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict | None = None,
+    ) -> ForwardPassArgs:
+        audio_output = "audio" in output_modalities
+
+        if partition_name == "Thinker":
+            return self._get_thinker_initial_args(
+                input_modalities, output_modalities,
+                input_signals, model_kwargs or {},
+            )
+        elif partition_name == "Talker":
+            # Talker starts in prefill mode, waiting for cross-partition trigger.
+            # No initial inputs -- the conductor triggers it after each Thinker walk.
+            full_metadata = CurrentForwardConductorMetadata(
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk="talker_prefill",
+                is_prefill=True,
+                kwargs={
+                    "audio_output": audio_output,
+                    "talker_prefill_done": False,
+                },
+            )
+            return ForwardPassArgs(
+                full_metadata=full_metadata,
+                inputs=[],
+                unpersist_tensors=[],
+            )
+        elif partition_name == "Code2Wav":
+            # Code2Wav starts with code2wav_chunk walk but no inputs --
+            # it self-triggers via StreamBuffer when codec tokens arrive.
+            full_metadata = CurrentForwardConductorMetadata(
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk="code2wav_chunk",
+                is_prefill=False,
+            )
+            return ForwardPassArgs(
+                full_metadata=full_metadata,
+                inputs=[],
+                unpersist_tensors=[],
+            )
+        raise ValueError(f"Unknown partition: {partition_name!r}")
+
+    def _get_thinker_initial_args(
+        self,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict,
+    ) -> ForwardPassArgs:
+        """Build initial ForwardPassArgs for the Thinker partition.
+
+        Constructs a prefill schedule from the input modalities, then
+        begins the first walk in that schedule (always prefill_text).
+        """
+        audio_output = "audio" in output_modalities
+
+        # Build prefill schedule: list of (graph_walk_name, tensor_info)
+        schedule = self._build_thinker_prefill_schedule(
+            input_modalities, input_signals,
+        )
+
+        first_walk = schedule[0][0] if schedule else "thinker_decode"
+
+        full_metadata = CurrentForwardConductorMetadata(
+            input_modalities=input_modalities,
+            output_modalities=output_modalities,
+            graph_walk=first_walk,
+            is_prefill=bool(schedule),
+            kwargs={
+                "prefill_schedule": schedule,
+                "prefill_step": 0,
+                "audio_output": audio_output,
+                "temperature": model_kwargs.get("temperature", 0.7),
+                "top_p": model_kwargs.get("top_p", 0.9),
+            },
+        )
+
+        # First walk inputs
+        inputs = self._get_thinker_prefill_inputs(full_metadata, input_signals)
+        unpersist_tensors = sum(
+            [inp.tensor_info for inp in inputs], start=[]
+        )
+
+        return ForwardPassArgs(
+            full_metadata=full_metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata={
+                "is_prefill": True,
+                "temperature": full_metadata.kwargs["temperature"],
+                "top_p": full_metadata.kwargs["top_p"],
+            },
+        )
+
+    def _build_thinker_prefill_schedule(
+        self,
+        input_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+    ) -> list[tuple[str, TensorPointerInfo]]:
+        """Build the sequential prefill schedule for the Thinker.
+
+        Order: [prefill_text] + [prefill_audio if audio inputs] + [prefill_vision if vision inputs]
+        The schedule records which graph walk to run and the corresponding
+        tensor pointer for each step.
+        """
+        schedule: list[tuple[str, TensorPointerInfo]] = []
+
+        texts = input_signals.get("text_inputs", [])
+        audio_features = input_signals.get("audio_features", [])
+        pixel_values = input_signals.get("pixel_values", [])
+
+        text_idx, audio_idx, vision_idx = 0, 0, 0
+        for mod in input_modalities:
+            if mod == "text":
+                if text_idx < len(texts):
+                    schedule.append(("prefill_text", texts[text_idx]))
+                    text_idx += 1
+            elif mod == "audio":
+                if audio_idx < len(audio_features):
+                    schedule.append(("prefill_audio", audio_features[audio_idx]))
+                    audio_idx += 1
+            elif mod in ("image", "video"):
+                if vision_idx < len(pixel_values):
+                    schedule.append(("prefill_vision", pixel_values[vision_idx]))
+                    vision_idx += 1
+
+        return schedule
+
+    def _get_thinker_prefill_inputs(
+        self,
+        metadata: CurrentForwardConductorMetadata,
+        input_signals: dict[str, list[TensorPointerInfo]],
+    ) -> list[GraphEdge]:
+        """Construct input GraphEdges for the current Thinker prefill step."""
+        schedule = metadata.kwargs["prefill_schedule"]
+        step = metadata.kwargs["prefill_step"]
+        walk_name, tensor_info = schedule[step]
+
+        if walk_name == "prefill_text":
+            edge = GraphEdge(next_node="Thinker", name="text_inputs")
+        elif walk_name == "prefill_audio":
+            edge = GraphEdge(next_node="Thinker", name="audio_features")
+        elif walk_name == "prefill_vision":
+            edge = GraphEdge(next_node="Thinker", name="pixel_values")
+        else:
+            raise ValueError(f"Unrecognized prefill walk: {walk_name}")
+
+        edge.tensor_info = [tensor_info]
+        return [edge]
+
+    # -----------------------------------------------------------------------
+    # Model ABC: partition forward pass args (STATE MACHINE)
+    # -----------------------------------------------------------------------
+
+    def get_partition_forward_pass_args(
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+        new_tokens: dict[str, list[int]],
+        incoming_connections: list[StreamingConnectionState] | None = None,
+    ) -> ForwardPassArgs:
+        if partition_name == "Thinker":
+            return self._get_thinker_forward(
+                partition_metadata, persist_signals, new_tokens,
+            )
+        elif partition_name == "Talker":
+            return self._get_talker_forward(
+                partition_metadata, persist_signals, new_tokens,
+                incoming_connections,
+            )
+        elif partition_name == "Code2Wav":
+            conn = incoming_connections[0] if incoming_connections else None
+            return self._get_code2wav_forward(
+                partition_metadata, conn,
+            )
+        raise ValueError(f"Unknown partition: {partition_name!r}")
+
+    # -- Thinker state machine ---------------------------------------------
+
+    def _get_thinker_forward(
+        self,
+        metadata: CurrentForwardConductorMetadata,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+        new_tokens: dict[str, list[int]],
+    ) -> ForwardPassArgs:
+        """Thinker partition state machine.
+
+        1. Build prefill schedule: [prefill_text] + [prefill_audio] + [prefill_vision]
+        2. Pop walks from schedule until done
+        3. Transition to thinker_decode
+        4. Each decode step: check new_token for EOS (im_end_token_id)
+        5. On EOS: request_done=True for Thinker
+        """
+        request_done = False
+
+        if metadata.is_prefill:
+            # Advance prefill schedule
+            step = metadata.kwargs["prefill_step"] + 1
+            schedule = metadata.kwargs["prefill_schedule"]
+
+            if step < len(schedule):
+                # More prefill steps remaining
+                metadata.kwargs["prefill_step"] = step
+                metadata.graph_walk = schedule[step][0]
+            else:
+                # All prefill done -- transition to thinker_decode
+                metadata.is_prefill = False
+                metadata.graph_walk = "thinker_decode"
+
+        elif metadata.graph_walk == "thinker_decode":
+            # Check for EOS in newly generated tokens
+            tokens = new_tokens.get("new_token", [])
+            for t in tokens:
+                if t == self.config.im_end_token_id:
+                    request_done = True
+                    break
+
+        # Build inputs for next step
+        if request_done:
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
+            )
+
+        if metadata.is_prefill:
+            # Still in prefill -- use schedule to determine inputs
+            schedule = metadata.kwargs["prefill_schedule"]
+            step = metadata.kwargs["prefill_step"]
+            walk_name, tensor_info = schedule[step]
+
+            if walk_name == "prefill_text":
+                edge = GraphEdge(next_node="Thinker", name="text_inputs")
+            elif walk_name == "prefill_audio":
+                edge = GraphEdge(next_node="Thinker", name="audio_features")
+            elif walk_name == "prefill_vision":
+                edge = GraphEdge(next_node="Thinker", name="pixel_values")
+            else:
+                raise ValueError(f"Unrecognized prefill walk: {walk_name}")
+
+            edge.tensor_info = [tensor_info]
+            inputs = [edge]
+        else:
+            # Decode: previous token feeds back as text_inputs
+            edge = GraphEdge(next_node="Thinker", name="text_inputs")
+            edge.tensor_info = persist_signals.get("new_token", [])
+            inputs = [edge]
+
+        unpersist_tensors = sum(
+            [inp.tensor_info for inp in inputs], start=[]
+        )
+
+        step_metadata = {
+            "is_prefill": metadata.is_prefill,
+            "temperature": metadata.kwargs.get("temperature", 0.7),
+            "top_p": metadata.kwargs.get("top_p", 0.9),
+        }
+
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata=step_metadata,
+        )
+
+    # -- Talker state machine ----------------------------------------------
+
+    def _get_talker_forward(
+        self,
+        metadata: CurrentForwardConductorMetadata,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+        new_tokens: dict[str, list[int]],
+        incoming_connections: list[StreamingConnectionState] | None = None,
+    ) -> ForwardPassArgs:
+        """Talker partition state machine.
+
+        1. While prefill: return empty inputs (wait for cross-partition trigger)
+           - When trigger arrives with is_last_prefill=False:
+             extend KV cache only, no outputs
+           - When trigger arrives with is_last_prefill=True:
+             sample first codec token, produce all_codes
+        2. After last prefill produces all_codes: transition to talker_decode
+           - Set graph_walk="talker_decode", is_prefill=False
+           - Return all_codes as input edge (conductor-driven)
+        3. Each decode step: check all_codes for codec_eos
+           - If codec_eos: request_done=True for Talker
+           - Else: return all_codes as input again (loop)
+        """
+        request_done = False
+
+        if metadata.is_prefill:
+            # Talker is in prefill mode, waiting for conductor triggers.
+            # The actual work happens when get_consumer_partition_triggers()
+            # fires from the Thinker side.  Here we just check if the
+            # last prefill has been completed (the trigger sets this flag).
+            is_last_prefill = metadata.kwargs.get("is_last_prefill", False)
+
+            if is_last_prefill:
+                # Last prefill done -- transition to talker_decode.
+                # The talker_prefill walk should have produced all_codes
+                # as its first codec token output.
+                metadata.is_prefill = False
+                metadata.graph_walk = "talker_decode"
+                metadata.kwargs["talker_prefill_done"] = True
+
+                # Feed all_codes back as input for first decode step
+                edge = GraphEdge(next_node="Talker", name="all_codes")
+                edge.tensor_info = persist_signals.get("all_codes", [])
+                inputs = [edge]
+                unpersist_tensors = sum(
+                    [inp.tensor_info for inp in inputs], start=[]
+                )
+
+                return ForwardPassArgs(
+                    full_metadata=metadata,
+                    inputs=inputs,
+                    unpersist_tensors=unpersist_tensors,
+                    step_metadata={
+                        "is_prefill": False,
+                        "is_last_prefill": False,
+                        # Signal the worker to set passive_drain on the
+                        # thinker_states StreamBuffer so it is no longer
+                        # polled by _poll_stream_buffers; instead the
+                        # TalkerSubmodule drains it via step_metadata.
+                        "_set_passive_drain": ["thinker_states"],
+                    },
+                )
+            else:
+                # Not the last prefill -- just extend KV cache.
+                # Return empty inputs; the trigger ForwardPassArgs from
+                # get_consumer_partition_triggers() drives the actual work.
+                return ForwardPassArgs(
+                    full_metadata=metadata,
+                    inputs=[],
+                    unpersist_tensors=[],
+                    step_metadata={
+                        "is_prefill": True,
+                        "is_last_prefill": False,
+                    },
+                )
+
+        elif metadata.graph_walk == "talker_decode":
+            # Decode loop: check only the layer-0 code (first element) for
+            # codec EOS.  Higher codebook layers (1-31) are residual codes
+            # and should not be compared against the EOS token ID.
+            tokens = new_tokens.get("all_codes", [])
+            codec_eos = self.config.talker.codec_eos_token_id
+            if tokens and tokens[0] == codec_eos:
+                request_done = True
+
+            if request_done:
+                return ForwardPassArgs(
+                    full_metadata=metadata,
+                    inputs=[],
+                    unpersist_tensors=[],
+                    request_done=True,
+                )
+
+            # Feed all_codes back for next decode step
+            edge = GraphEdge(next_node="Talker", name="all_codes")
+            edge.tensor_info = persist_signals.get("all_codes", [])
+            inputs = [edge]
+            unpersist_tensors = sum(
+                [inp.tensor_info for inp in inputs], start=[]
+            )
+
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=inputs,
+                unpersist_tensors=unpersist_tensors,
+                step_metadata={
+                    "is_prefill": False,
+                },
+            )
+
+        raise ValueError(
+            f"Talker in unexpected state: walk={metadata.graph_walk!r}, "
+            f"is_prefill={metadata.is_prefill}"
+        )
+
+    # -- Code2Wav state machine --------------------------------------------
+
+    def _get_code2wav_forward(
+        self,
+        metadata: CurrentForwardConductorMetadata,
+        conn: StreamingConnectionState | None,
+    ) -> ForwardPassArgs:
+        """Code2Wav partition: streaming vocoder, self-triggered by StreamBuffer.
+
+        Same pattern as Orpheus SNAC -- the conductor just tracks whether
+        there are more codec tokens to process.
+        """
+        chunk_size = 25
+        token_count = conn.token_count if conn else 0
+        consumed = conn.consumed_count if conn else 0
+        producer_done = conn.producer_done if conn else False
+
+        metadata.graph_walk = "code2wav_chunk"
+
+        available = token_count - consumed
+
+        # Nothing left to decode
+        if available <= 0 and producer_done:
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
+            )
+
+        step_metadata = {"consumed_tokens": chunk_size}
+
+        # Check if this is the last chunk
+        new_consumed = consumed + chunk_size
+        remaining_after = token_count - new_consumed
+        is_last = producer_done and remaining_after < chunk_size
+
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=[],
+            unpersist_tensors=[],
+            step_metadata=step_metadata,
+            request_done=is_last,
+        )
+
+    # -----------------------------------------------------------------------
+    # Model ABC: prompt processing
+    # -----------------------------------------------------------------------
+
+    def process_prompt(
+        self,
+        prompt: str | None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        **kwargs,
+    ) -> NameToTensorList:
+        """Tokenize text, extract audio features, process images/videos.
+
+        Returns model-specific keys:
+            "text_inputs"     - tokenized text tensor
+            "audio_features"  - pre-extracted audio features (if audio input)
+            "pixel_values"    - pre-processed pixel values (if image/video input)
+        """
+        result: NameToTensorList = {}
+
+        # --- Text tokenization ---
+        if prompt is not None:
+            tokens = self.tokenizer.encode(prompt)
+            result["text_inputs"] = [
+                torch.tensor(tokens, dtype=torch.long)
+            ]
+
+        # --- Audio input processing ---
+        audio_data = kwargs.get("audio_data")
+        if audio_data is not None:
+            # audio_data is expected to be raw waveform bytes or a pre-processed tensor.
+            # The actual feature extraction (mel spectrogram etc.) is done in the
+            # ThinkerSubmodule's preprocess() -- here we just pass through.
+            if isinstance(audio_data, torch.Tensor):
+                result["audio_features"] = [audio_data]
+            else:
+                # Raw bytes -> float tensor (16-bit PCM assumed)
+                import numpy as np
+                audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                result["audio_features"] = [torch.from_numpy(audio_np)]
+
+        # --- Vision input processing ---
+        pixel_values = kwargs.get("pixel_values")
+        if pixel_values is not None:
+            if isinstance(pixel_values, list):
+                result["pixel_values"] = pixel_values
+            elif isinstance(pixel_values, torch.Tensor):
+                result["pixel_values"] = [pixel_values]
+
+        return result
+
+    # -----------------------------------------------------------------------
+    # Model ABC: postprocess
+    # -----------------------------------------------------------------------
+
+    def postprocess(
+        self,
+        output: torch.Tensor,
+        modality: str,
+    ) -> bytes:
+        if modality == "text":
+            detok = self.tokenizer.decode(output)
+            return detok.encode("utf-8")
+        elif modality == "audio":
+            if output.numel() == 0:
+                return b""
+            return output.cpu().numpy().tobytes()
+        raise ValueError(f"Unsupported modality for Qwen3-Omni: {modality!r}")
+
+    # -----------------------------------------------------------------------
+    # Model ABC: submodule loading
+    # -----------------------------------------------------------------------
+
+    def get_submodule(self, node_name: str, device: str = "cpu") -> NodeSubmodule | None:
+        if node_name in self._submodule_cache:
+            return self._submodule_cache[node_name]
+        submodule = self._create_submodule(node_name, device)
+        logger.info("Successfully loaded Qwen3-Omni submodule for %s", node_name)
+        self._submodule_cache[node_name] = submodule
+
+        # W3: If the Thinker was just loaded and the Talker already exists
+        # (but TTS embeds were not initialized because Thinker wasn't
+        # available at Talker creation time), initialize them now.
+        if node_name == "Thinker":
+            talker_sub = self._submodule_cache.get("Talker")
+            if (
+                talker_sub is not None
+                and hasattr(talker_sub, '_tts_pad_embed_cached')
+                and talker_sub._tts_pad_embed_cached is None
+                and hasattr(submodule, 'model')
+            ):
+                try:
+                    talker_sub.init_tts_embeds(submodule.model.embed_tokens)
+                except Exception as e:
+                    logger.warning(
+                        "Deferred TTS embed init failed: %s", e,
+                    )
+
+        return submodule
+
+    def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
+        if node_name == "Thinker":
+            return self._create_thinker_submodule(device)
+        elif node_name == "Talker":
+            return self._create_talker_submodule(device)
+        elif node_name == "Code2Wav":
+            return self._create_code2wav_submodule(device)
+        return None
+
+    def _create_thinker_submodule(self, device: str) -> NodeSubmodule:
+        from mminf.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
+        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
+
+        with torch.device("meta"):
+            thinker_model = Qwen3OmniThinkerModel(self.config)
+
+        load_weights_from_hf_shards(
+            repo_dir=self.local_dir,
+            modules=[
+                ModuleAndPrefix(thinker_model, prefix="thinker"),
+            ],
+            device=device,
+        )
+
+        thinker_model.eval()
+
+        # Return a placeholder -- the actual ThinkerSubmodule class will be
+        # implemented in a separate submodules.py file.
+        from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
+        return ThinkerSubmodule(
+            thinker_model=thinker_model,
+            config=self.config,
+        )
+
+    def _create_talker_submodule(self, device: str) -> NodeSubmodule:
+        from mminf.model.qwen3_omni.components.talker import Qwen3OmniTalkerModel
+        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
+
+        with torch.device("meta"):
+            talker_model = Qwen3OmniTalkerModel(self.config)
+
+        # Talker weights: text_projection, hidden_projection, codec_head,
+        # codec_embedding, and the transformer layers are all under "talker."
+        load_weights_from_hf_shards(
+            repo_dir=self.local_dir,
+            modules=[
+                ModuleAndPrefix(talker_model, prefix="talker"),
+            ],
+            device=device,
+        )
+
+        # Code Predictor is a separate small model loaded under "talker.code_predictor."
+        # It is used inside the TalkerSubmodule for multi-step codec prediction.
+        from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
+
+        with torch.device("meta"):
+            code_predictor = Qwen3OmniCodePredictor(self.config)
+
+        load_weights_from_hf_shards(
+            repo_dir=self.local_dir,
+            modules=[
+                ModuleAndPrefix(code_predictor, prefix="talker.code_predictor"),
+            ],
+            device=device,
+        )
+
+        talker_model.eval()
+        code_predictor.eval()
+
+        from mminf.model.qwen3_omni.submodules import TalkerSubmodule
+        talker_sub = TalkerSubmodule(
+            talker_model=talker_model,
+            code_predictor=code_predictor,
+            config=self.config,
+        )
+
+        # W3: Pre-compute TTS special embeddings using the Thinker's
+        # embedding table.  If the Thinker submodule has already been
+        # loaded on this worker, we can grab its embed_tokens directly.
+        thinker_sub = self._submodule_cache.get("Thinker")
+        if thinker_sub is not None and hasattr(thinker_sub, 'model'):
+            try:
+                talker_sub.init_tts_embeds(thinker_sub.model.embed_tokens)
+            except Exception as e:
+                logger.warning(
+                    "Could not init TTS embeds from Thinker embed_tokens "
+                    "(Thinker and Talker may be on different workers): %s", e,
+                )
+        else:
+            logger.info(
+                "Thinker submodule not yet loaded on this worker; "
+                "TTS special embeds will use fallback (Talker embed_tokens). "
+                "For correct results, ensure both are on the same worker or "
+                "transfer the cached embeddings during model init."
+            )
+
+        return talker_sub
+
+    def _create_code2wav_submodule(self, device: str) -> NodeSubmodule:
+        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
+
+        # Code2Wav is the vocoder that converts codec tokens to audio waveform.
+        # The actual model class will be defined in components.
+        from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
+
+        with torch.device("meta"):
+            code2wav_model = Qwen3OmniCode2Wav(self.config)
+
+        load_weights_from_hf_shards(
+            repo_dir=self.local_dir,
+            modules=[
+                ModuleAndPrefix(code2wav_model, prefix="code2wav"),
+            ],
+            device=device,
+        )
+
+        code2wav_model.eval()
+
+        from mminf.model.qwen3_omni.submodules import Code2WavSubmodule
+        return Code2WavSubmodule(
+            code2wav_model=code2wav_model,
+            config=self.config,
+        )
