@@ -142,16 +142,33 @@ class Qwen3OmniThinkerLayer(nn.Module):
         return hidden_states
 
 
+class Qwen3OmniThinkerTextModel(nn.Module):
+    """Inner text model (maps to ``thinker.model.*`` in HF weights)."""
+
+    def __init__(self, config: Qwen3OmniModelConfig):
+        super().__init__()
+        tc = config.thinker_text
+        self.embed_tokens = nn.Embedding(tc.vocab_size, tc.hidden_size)
+        self.layers = nn.ModuleList(
+            [Qwen3OmniThinkerLayer(config, layer_idx=i) for i in range(tc.num_hidden_layers)]
+        )
+        self.norm = Qwen3OmniRMSNorm(tc.hidden_size, eps=tc.rms_norm_eps)
+
+
 class Qwen3OmniThinkerModel(nn.Module):
     """Thinker: MoE transformer backbone for Qwen3-Omni.
+
+    HF weight layout::
+
+        thinker.model.embed_tokens.weight
+        thinker.model.layers.{i}.*
+        thinker.model.norm.weight
+        thinker.lm_head.weight
 
     Produces:
     - Final hidden states (after all layers + final norm) for text logits
     - Layer-0 embeddings (before any transformer layers) for Talker conditioning
     - Layer-N hidden states (``accept_hidden_layer``) for Talker conditioning
-
-    Args:
-        config: top-level Qwen3-Omni model configuration.
     """
 
     def __init__(self, config: Qwen3OmniModelConfig):
@@ -162,18 +179,11 @@ class Qwen3OmniThinkerModel(nn.Module):
         self.num_layers = tc.num_hidden_layers
         self.accept_hidden_layer = config.accept_hidden_layer
 
-        # Token embeddings
-        self.embed_tokens = nn.Embedding(tc.vocab_size, tc.hidden_size)
+        # Inner text model: embed_tokens + layers + norm
+        # Maps to thinker.model.* in HF weights
+        self.model = Qwen3OmniThinkerTextModel(config)
 
-        # Transformer layers
-        self.layers = nn.ModuleList(
-            [Qwen3OmniThinkerLayer(config, layer_idx=i) for i in range(self.num_layers)]
-        )
-
-        # Final layer norm
-        self.norm = Qwen3OmniRMSNorm(tc.hidden_size, eps=tc.rms_norm_eps)
-
-        # Language model head
+        # Language model head (at top level: thinker.lm_head)
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
 
     def forward(
@@ -205,7 +215,7 @@ class Qwen3OmniThinkerModel(nn.Module):
         layer_0_embed = hidden_states.clone()
         layer_n_hidden = None
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for layer_idx, decoder_layer in enumerate(self.model.layers):
             cache_handle.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
                 hidden_states,
@@ -227,7 +237,7 @@ class Qwen3OmniThinkerModel(nn.Module):
 
         # Final layer norm
         hidden_states = run_rms_norm(
-            hidden_states, self.norm.weight, eps=self.norm.variance_epsilon
+            hidden_states, self.model.norm.weight, eps=self.model.norm.variance_epsilon
         )
 
         return hidden_states, layer_0_embed, layer_n_hidden
