@@ -263,7 +263,13 @@ class Model(ABC):
         ], start=[])
 
     @abstractmethod
-    def get_kv_cache_config(self) -> KVCacheConfig:
+    def get_kv_cache_config(self) -> dict[str, KVCacheConfig]:
+        """Return per-node KV cache configs.
+
+        Maps AR node name -> KVCacheConfig. Nodes not in the dict
+        fall back to the first config (for models where all AR nodes
+        share the same config, e.g., Bagel's LLM / LLM_cfg_text / LLM_cfg_img).
+        """
         pass
 
     @abstractmethod
@@ -368,6 +374,21 @@ class Model(ABC):
             name="default", graph_walks=walks,
             initial_walk=None, producer_partitions=[],
         )]
+
+    def get_consumer_partition_triggers(
+        self,
+        completed_partition: str,
+        completed_walk: str,
+        all_partition_states: dict,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+    ) -> dict[str, "ForwardPassArgs"]:
+        """Return triggers for consumer partitions when a producer completes a step.
+
+        Called by the conductor after _process_done_forward for the completed
+        partition. Returns {partition_name: ForwardPassArgs} for each partition
+        to trigger. Default: empty dict (no cross-partition triggers).
+        """
+        return {}
 
     @abstractmethod
     def get_partition_forward_pass_args(
