@@ -138,7 +138,9 @@ class Qwen3OmniTalkerLanguageModel(nn.Module):
 
     def __init__(self, config: TalkerTextConfig):
         super().__init__()
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # NOTE: No embed_tokens here -- the HF Talker text model does not
+        # have a text embedding table.  The Talker receives pre-computed
+        # embeddings (projected Thinker states + codec embeddings).
         self.layers = nn.ModuleList(
             [
                 Qwen3OmniTalkerLayer(config, layer_idx)
@@ -234,3 +236,124 @@ class Qwen3OmniTalkerModel(nn.Module):
             hidden_states: [total_tokens, hidden_size] after final RMS norm.
         """
         return self.model(input_embeds=input_embeds, cache_handle=cache_handle)
+
+
+# ---------------------------------------------------------------------------
+# Code Predictor (lightweight transformer for residual codebook layers)
+# ---------------------------------------------------------------------------
+
+
+class Qwen3OmniCodePredictorLayer(nn.Module):
+    """Single Code Predictor decoder layer (attention + dense MLP, no MoE).
+
+    Uses QK-norm, standard 1D RoPE (no 3D MRoPE).
+    """
+
+    def __init__(self, hidden_size: int, intermediate_size: int,
+                 num_heads: int, num_kv_heads: int, head_dim: int,
+                 rms_norm_eps: float, rope_theta: float):
+        super().__init__()
+        from mminf.model.qwen3_omni.components.moe import Qwen3OmniMLP
+
+        self.input_layernorm = Qwen3OmniRMSNorm(hidden_size, eps=rms_norm_eps)
+        self.self_attn = Qwen3OmniAttention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            rope_theta=rope_theta,
+            rms_norm_eps=rms_norm_eps,
+            use_mrope=False,
+        )
+        self.post_attention_layernorm = Qwen3OmniRMSNorm(hidden_size, eps=rms_norm_eps)
+        self.mlp = Qwen3OmniMLP(hidden_size=hidden_size, intermediate_size=intermediate_size)
+
+    def forward(self, hidden_states, cache_handle):
+        residual = hidden_states
+        hidden_states = run_rms_norm(
+            hidden_states, self.input_layernorm.weight,
+            eps=self.input_layernorm.variance_epsilon,
+        )
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states, cache_handle=cache_handle,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = run_rms_norm(
+            hidden_states, self.post_attention_layernorm.weight,
+            eps=self.post_attention_layernorm.variance_epsilon,
+        )
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+class Qwen3OmniCodePredictorInnerModel(nn.Module):
+    """Inner model (maps to ``talker.code_predictor.model.*`` in HF weights).
+
+    Contains layers, norm, and per-layer codec embeddings.
+    """
+
+    def __init__(self, config: Qwen3OmniModelConfig):
+        super().__init__()
+        cp = config.code_predictor
+
+        self.layers = nn.ModuleList([
+            Qwen3OmniCodePredictorLayer(
+                hidden_size=cp.hidden_size,
+                intermediate_size=cp.intermediate_size,
+                num_heads=cp.num_attention_heads,
+                num_kv_heads=cp.num_key_value_heads,
+                head_dim=cp.head_dim,
+                rms_norm_eps=cp.rms_norm_eps,
+                rope_theta=cp.rope_theta,
+            )
+            for _ in range(cp.num_hidden_layers)
+        ])
+        self.norm = Qwen3OmniRMSNorm(cp.hidden_size, eps=cp.rms_norm_eps)
+
+        # Per-layer codec embeddings for residual layers 1..(G-1)
+        # codec_embedding.{0} embeds layer-1 codes, ..., codec_embedding.{G-2} embeds layer-(G-1)
+        num_residual = config.num_code_groups - 1
+        self.codec_embedding = nn.ModuleList([
+            nn.Embedding(cp.vocab_size, cp.hidden_size)
+            for _ in range(num_residual)
+        ])
+
+    def get_input_embeddings(self):
+        """Return the codec embedding list (for HF compatibility)."""
+        return self.codec_embedding
+
+
+class Qwen3OmniCodePredictor(nn.Module):
+    """Code Predictor: lightweight transformer for residual codebook layers.
+
+    HF weight layout::
+
+        talker.code_predictor.model.layers.{0-4}.*
+        talker.code_predictor.model.norm.weight
+        talker.code_predictor.model.codec_embedding.{0-30}.weight
+        talker.code_predictor.lm_head.{0-30}.weight
+
+    The Code Predictor runs 31 autoregressive steps (for layers 1-31)
+    with NO persistent KV cache and in float32 for precision.
+    """
+
+    def __init__(self, config: Qwen3OmniModelConfig):
+        super().__init__()
+        cp = config.code_predictor
+
+        self.model = Qwen3OmniCodePredictorInnerModel(config)
+
+        # Per-layer output heads for residual layers 1..(G-1)
+        num_residual = config.num_code_groups - 1
+        self.lm_head = nn.ModuleList([
+            nn.Linear(cp.hidden_size, cp.vocab_size, bias=False)
+            for _ in range(num_residual)
+        ])
+
+    @property
+    def codec_embedding(self):
+        """Alias for submodule access."""
+        return self.model.codec_embedding
