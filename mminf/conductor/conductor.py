@@ -193,26 +193,26 @@ class Conductor:
         self._per_worker_graphs: dict[str, list[WorkerGraph]] = {}
         self._per_worker_engine_configs: dict[str, list[dict]] = {}
 
-        kv_cache_config = self.model.get_kv_cache_config()
+        kv_cache_configs = self.model.get_kv_cache_config()
         # Apply any KV cache overrides from the YAML config
         yaml_kv_overrides = self.model_config.get("kv_cache", {})
         if yaml_kv_overrides:
             from dataclasses import fields
-            for f in fields(kv_cache_config):
-                if f.name in yaml_kv_overrides:
-                    setattr(kv_cache_config, f.name, yaml_kv_overrides[f.name])
-            logger.info("KV cache config after YAML overrides: %s", kv_cache_config)
+            for kv_cfg in kv_cache_configs.values():
+                for f in fields(kv_cfg):
+                    if f.name in yaml_kv_overrides:
+                        setattr(kv_cfg, f.name, yaml_kv_overrides[f.name])
+            logger.info("KV cache configs after YAML overrides: %s", kv_cache_configs)
 
-        engine_model_cfg = {
-            "kv_cache": kv_cache_config,
-            "autocast_dtype": self.model.get_autocast_dtype()
-        }
+        autocast_dtype = self.model.get_autocast_dtype()
+        default_kv_cfg = next(iter(kv_cache_configs.values()))
+
         for rank in self._sorted_ranks:
             worker_id = f"worker_{rank}"
             worker_graphs = rank_to_worker_graphs[rank]
             self._per_worker_graphs[worker_id] = worker_graphs
 
-            # Collect engine configs: group nodes by engine type
+            # Collect nodes by engine type
             engine_type_to_nodes: dict[str, list[str]] = defaultdict(list)
             for wg in worker_graphs:
                 for node_name in wg.section.get_node_names():
@@ -220,13 +220,34 @@ class Conductor:
                     if node_name not in engine_type_to_nodes[etype]:
                         engine_type_to_nodes[etype].append(node_name)
 
-            self._per_worker_engine_configs[worker_id] = [
-                {
-                    "engine_type": etype, "node_names": nodes,
-                    "model_config": engine_model_cfg
-                }
-                for etype, nodes in engine_type_to_nodes.items()
-            ]
+            # Build engine configs. For AR nodes, group by KV cache config
+            # so that nodes sharing the same config share one AREngine
+            # (preserving KV page sharing, e.g., Bagel's CFG labels), while
+            # nodes with different configs get separate AREngines.
+            engine_configs = []
+            for etype, nodes in engine_type_to_nodes.items():
+                if etype == "ar":
+                    # Group AR nodes by their resolved KVCacheConfig
+                    cfg_groups: dict[int, tuple[object, list[str]]] = {}
+                    for node in nodes:
+                        cfg = kv_cache_configs.get(node, default_kv_cfg)
+                        cfg_id = id(cfg)
+                        if cfg_id not in cfg_groups:
+                            cfg_groups[cfg_id] = (cfg, [])
+                        cfg_groups[cfg_id][1].append(node)
+                    for cfg, grouped_nodes in cfg_groups.values():
+                        engine_configs.append({
+                            "engine_type": etype,
+                            "node_names": grouped_nodes,
+                            "model_config": {"kv_cache": cfg, "autocast_dtype": autocast_dtype},
+                        })
+                else:
+                    engine_configs.append({
+                        "engine_type": etype,
+                        "node_names": nodes,
+                        "model_config": {"kv_cache": default_kv_cfg, "autocast_dtype": autocast_dtype},
+                    })
+            self._per_worker_engine_configs[worker_id] = engine_configs
 
         # Global maps needed by all workers
         self._all_worker_graph_ids_to_graph_walks: dict[str, set[str]] = {
@@ -691,6 +712,27 @@ class Conductor:
         self._set_partition_worker_graph_ids(
             request_id, partition_name, fwd_args.full_metadata.graph_walk,
         )
+
+        # Cross-partition triggers: notify consumer partitions when a
+        # producer completes a step (e.g., Thinker triggers Talker prefill).
+        if not fwd_args.request_done:
+            triggers = self.model.get_consumer_partition_triggers(
+                completed_partition=partition_name,
+                completed_walk=prev_walk,
+                all_partition_states=request_data.partition_states,
+                persist_signals=request_data.persist_signals,
+            )
+            for target_partition, trigger_fwd_args in triggers.items():
+                target_pstate = request_data.partition_states[target_partition]
+                # Update metadata if the trigger provides new metadata
+                if trigger_fwd_args.full_metadata is not None:
+                    target_pstate.metadata = trigger_fwd_args.full_metadata
+                self._set_partition_worker_graph_ids(
+                    request_id, target_partition, target_pstate.metadata.graph_walk,
+                )
+                self._send_partition_inputs(
+                    request_id, target_partition, trigger_fwd_args,
+                )
 
         # Request done when ALL partitions are done
         return all(ps.is_done for ps in request_data.partition_states.values())
