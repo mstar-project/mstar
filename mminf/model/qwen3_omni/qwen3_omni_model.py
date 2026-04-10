@@ -392,20 +392,36 @@ class Qwen3OmniModel(Model):
         if "audio" not in talker_metadata.output_modalities:
             return {}
 
+        # Race condition guard (Comment 11): once we've already sent the
+        # "last prefill" trigger, don't send another.  This handles the
+        # case where the Thinker finishes multiple decode steps before the
+        # Talker transitions from prefill to decode.  Without this guard,
+        # each additional thinker_decode completion would fire another
+        # is_last_prefill=True trigger, causing duplicate codec sampling.
+        if talker_metadata.kwargs.get("_last_prefill_sent", False):
+            return {}
+
         # Determine if this is the last prefill trigger.
         # The last prefill trigger is sent when the Thinker's first decode
         # step completes (completed_walk == "thinker_decode").
         is_last_prefill = (completed_walk == "thinker_decode")
+
+        # Persist the "last prefill sent" flag into the Talker's own
+        # metadata so subsequent triggers skip (handled by the conductor,
+        # which updates target_pstate.metadata from trigger_fwd_args).
+        new_talker_kwargs = {
+            **talker_metadata.kwargs,
+            "is_last_prefill": is_last_prefill,
+        }
+        if is_last_prefill:
+            new_talker_kwargs["_last_prefill_sent"] = True
 
         trigger_metadata = CurrentForwardConductorMetadata(
             input_modalities=talker_metadata.input_modalities,
             output_modalities=talker_metadata.output_modalities,
             graph_walk="talker_prefill",
             is_prefill=True,
-            kwargs={
-                **talker_metadata.kwargs,
-                "is_last_prefill": is_last_prefill,
-            },
+            kwargs=new_talker_kwargs,
         )
 
         trigger_edge = GraphEdge(next_node="Talker", name="talker_trigger")
@@ -535,6 +551,9 @@ class Qwen3OmniModel(Model):
                 "is_prefill": True,
                 "temperature": full_metadata.kwargs["temperature"],
                 "top_p": full_metadata.kwargs["top_p"],
+                # Tell the Thinker whether to emit thinker_states.  Text only
+                # requests skip it to save cross-partition bandwidth.
+                "audio_output": audio_output,
             },
         )
 
@@ -704,6 +723,10 @@ class Qwen3OmniModel(Model):
             "is_prefill": metadata.is_prefill,
             "temperature": metadata.kwargs.get("temperature", 0.7),
             "top_p": metadata.kwargs.get("top_p", 0.9),
+            # Persist the audio_output flag across every Thinker step so
+            # the submodule can gate thinker_states emission.  Default True
+            # for backwards compatibility with callers that never set it.
+            "audio_output": metadata.kwargs.get("audio_output", True),
         }
 
         return ForwardPassArgs(
@@ -872,23 +895,28 @@ class Qwen3OmniModel(Model):
     # Model ABC: prompt processing
     # -----------------------------------------------------------------------
 
-    # TODO: Refactor process_prompt to accept pre-processed tensors from
-    # data_worker.py (audio_features, pixel_values from the file_paths loop).
-    # Currently, process_prompt only receives text; multimodal tensors need
-    # to be passed in after the data_worker's modality processing loop.
     def process_prompt(
         self,
         prompt: str | None,
         input_modalities: list[str],
         output_modalities: list[str],
+        tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Tokenize text, extract audio features, process images/videos.
+        """Tokenize text and compute derived multimodal tensors.
 
-        Returns model-specific keys:
-            "text_inputs"     - tokenized text tensor
-            "audio_features"  - pre-extracted audio features (if audio input)
-            "pixel_values"    - pre-processed pixel values (if image/video input)
+        The data worker loads raw modality tensors (``image_inputs``,
+        ``audio_inputs``, ``video_inputs``) from ``file_paths`` and passes
+        them in via the ``tensors`` dict.  This method:
+          1. Tokenizes ``prompt`` to produce ``text_inputs``.
+          2. For each modality present in ``tensors``, computes derived
+             tensors needed by the Thinker's preprocess:
+             - ``image_inputs`` -> ``pixel_values`` + ``image_grid_thw``
+             - ``audio_inputs`` -> ``audio_features`` + ``audio_seqlens``
+             - ``video_inputs`` -> ``pixel_values_videos`` + ``video_grid_thw``
+
+        Returns only the NEW keys to merge into the data worker's tensor
+        dict (the existing ``*_inputs`` keys are preserved).
         """
         result: NameToTensorList = {}
 
@@ -899,27 +927,90 @@ class Qwen3OmniModel(Model):
                 torch.tensor(tokens, dtype=torch.long)
             ]
 
-        # --- Audio input processing ---
-        audio_data = kwargs.get("audio_data")
-        if audio_data is not None:
-            # audio_data is expected to be raw waveform bytes or a pre-processed tensor.
-            # The actual feature extraction (mel spectrogram etc.) is done in the
-            # ThinkerSubmodule's preprocess() -- here we just pass through.
-            if isinstance(audio_data, torch.Tensor):
-                result["audio_features"] = [audio_data]
-            else:
-                # Raw bytes -> float tensor (16-bit PCM assumed)
-                import numpy as np
-                audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-                result["audio_features"] = [torch.from_numpy(audio_np)]
+        if tensors is None:
+            tensors = {}
 
-        # --- Vision input processing ---
-        pixel_values = kwargs.get("pixel_values")
-        if pixel_values is not None:
-            if isinstance(pixel_values, list):
-                result["pixel_values"] = pixel_values
-            elif isinstance(pixel_values, torch.Tensor):
-                result["pixel_values"] = [pixel_values]
+        # --- Image processing: pixel_values + image_grid_thw ---
+        image_inputs = tensors.get("image_inputs", [])
+        if image_inputs:
+            # Use HF AutoImageProcessor if available for correct preprocessing
+            # (resizing, normalization, patch extraction, grid computation).
+            pixel_values_list = []
+            grid_thw_list = []
+            try:
+                processor = getattr(self, "_image_processor", None)
+                if processor is None:
+                    from transformers import AutoImageProcessor
+                    processor = AutoImageProcessor.from_pretrained(
+                        self.local_dir, trust_remote_code=True,
+                    )
+                    self._image_processor = processor
+                for img in image_inputs:
+                    # img: (C, H, W) float in [0, 1] from data_worker
+                    proc_out = processor(images=img, return_tensors="pt")
+                    pixel_values_list.append(proc_out["pixel_values"][0])
+                    if "image_grid_thw" in proc_out:
+                        grid_thw_list.append(proc_out["image_grid_thw"][0])
+            except Exception as e:
+                logger.warning(
+                    "Qwen3-Omni: image processor unavailable (%s); "
+                    "passing raw image_inputs through as pixel_values", e,
+                )
+                pixel_values_list = list(image_inputs)
+            if pixel_values_list:
+                result["pixel_values"] = pixel_values_list
+            if grid_thw_list:
+                result["image_grid_thw"] = grid_thw_list
+
+        # --- Audio processing: audio_features + audio_seqlens ---
+        audio_inputs = tensors.get("audio_inputs", [])
+        if audio_inputs:
+            audio_features_list = []
+            audio_seqlens_list = []
+            try:
+                processor = getattr(self, "_audio_processor", None)
+                if processor is None:
+                    from transformers import AutoFeatureExtractor
+                    processor = AutoFeatureExtractor.from_pretrained(
+                        self.local_dir, trust_remote_code=True,
+                    )
+                    self._audio_processor = processor
+                for waveform in audio_inputs:
+                    # waveform: (channels, time) from data_worker.
+                    # Most processors expect mono (time,) or (1, time).
+                    wave = waveform
+                    if wave.dim() == 2 and wave.shape[0] > 1:
+                        wave = wave.mean(dim=0)  # mix channels to mono
+                    elif wave.dim() == 2:
+                        wave = wave.squeeze(0)
+                    sampling_rate = getattr(processor, "sampling_rate", 16000)
+                    proc_out = processor(
+                        wave.cpu().numpy(),
+                        sampling_rate=sampling_rate,
+                        return_tensors="pt",
+                    )
+                    audio_features_list.append(proc_out["input_features"][0])
+                    audio_seqlens_list.append(
+                        torch.tensor(wave.shape[-1], dtype=torch.long)
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Qwen3-Omni: audio processor unavailable (%s); "
+                    "passing raw audio_inputs through as audio_features", e,
+                )
+                audio_features_list = list(audio_inputs)
+            if audio_features_list:
+                result["audio_features"] = audio_features_list
+            if audio_seqlens_list:
+                result["audio_seqlens"] = audio_seqlens_list
+
+        # --- Video processing: pixel_values_videos + video_grid_thw ---
+        video_inputs = tensors.get("video_inputs", [])
+        if video_inputs:
+            # TODO: proper video frame extraction + grid computation via
+            # AutoVideoProcessor (or AutoImageProcessor on stacked frames).
+            # For now, pass raw video tensors through.
+            result["pixel_values_videos"] = list(video_inputs)
 
         return result
 
