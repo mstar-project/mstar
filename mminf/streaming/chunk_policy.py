@@ -28,6 +28,22 @@ class ChunkPolicy(ABC):
         """
         ...
 
+    def continue_after_producer_done(self) -> bool:
+        """Whether the buffer should keep producing (empty) chunks after the
+        producer signals done and all buffered items have been consumed.
+
+        Default ``False``: the buffer sets ``reached_final_chunk`` after the
+        last item is flushed, which propagates partition-done to the conductor.
+
+        Set to ``True`` for connections where the consumer must keep running
+        after the producer finishes (e.g., Thinker→Talker: the Talker
+        continues generating codec tokens after the Thinker hits text EOS).
+        In this case the buffer produces empty chunks (``_collate([])`` →
+        ``{"data": None}``), and the consumer's partition-done is determined
+        by its own model logic, not by the StreamBuffer.
+        """
+        return False
+
 
 class SlidingWindowChunkPolicy(ChunkPolicy):
     """Fixed-size sliding window that advances by a stride.
@@ -57,10 +73,16 @@ class FixedChunkPolicy(ChunkPolicy):
 
     Each pop_chunk returns exactly `chunk_size` items and advances by
     `chunk_size`. No overlap, no sliding window.
+
+    Args:
+        chunk_size: number of items per chunk.
+        continue_after_done: if True, keep producing empty chunks after
+            the producer finishes and all buffered items are consumed.
     """
 
-    def __init__(self, chunk_size: int):
+    def __init__(self, chunk_size: int, continue_after_done: bool = False):
         self._chunk_size = chunk_size
+        self._continue_after_done = continue_after_done
 
     def is_ready(self, buffer_len: int, items_consumed: int) -> bool:
         return buffer_len >= self._chunk_size
@@ -70,3 +92,6 @@ class FixedChunkPolicy(ChunkPolicy):
 
     def window_size(self) -> int:
         return self._chunk_size
+
+    def continue_after_producer_done(self) -> bool:
+        return self._continue_after_done
