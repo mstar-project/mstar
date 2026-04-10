@@ -332,8 +332,10 @@ class OrpheusModel(Model):
         prompt: str | None,
         input_modalities: list[str],
         output_modalities: list[str],
+        tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
+        # Orpheus is text-only; raw multimodal tensors are unused.
         if prompt is None:
             return {}
 
