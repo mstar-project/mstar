@@ -27,7 +27,9 @@ from mminf.model.base import NodeSubmodule
 from mminf.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
     compute_rope_freqs,
-    get_rope_index,
+    get_rope_index_audio,
+    get_rope_index_text,
+    get_rope_index_vision,
 )
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig
 
@@ -125,9 +127,6 @@ class VisionEncoderSubmodule(NodeSubmodule):
         self.vision_encoder = vision_encoder
         self.config = config
 
-    # TODO: image_grid_thw, video_grid_thw, audio_seqlens are not yet
-    # produced by process_prompt / data_worker. These need to be computed
-    # during prompt processing and passed through as input signals.
     def preprocess(
         self,
         graph_walk: str,
@@ -136,7 +135,12 @@ class VisionEncoderSubmodule(NodeSubmodule):
         request_ids: list[str] | None = None,
         per_request_info: dict[str, CurrentForwardPassInfo] | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Extract pixel_values, grid_thw, and compute cu_seqlens."""
+        """Extract pixel_values, grid_thw, and compute cu_seqlens.
+
+        ``pixel_values`` and ``image_grid_thw`` are produced by
+        ``Qwen3OmniModel.process_prompt`` from the raw ``image_inputs``
+        loaded by the data worker.
+        """
         assert len(per_request_inputs) == 1, (
             "VisionEncoder processes one request at a time"
         )
@@ -305,23 +309,23 @@ class ThinkerSubmodule(NodeSubmodule):
             seq_len = text_ids.shape[0]
             seq_lens.append(seq_len)
 
-            # Compute 3D MRoPE position IDs for text
-            # For text: all 3 components are identical sequential positions
-            position_ids, mrope_delta = get_rope_index(
-                input_ids=text_ids.unsqueeze(0),
-                image_token_id=self.config.thinker.image_token_id,
-                video_token_id=self.config.thinker.video_token_id,
-                audio_token_id=self.config.thinker.audio_token_id,
-                audio_start_token_id=self.config.thinker.audio_start_token_id,
-                position_id_per_seconds=self.config.thinker.position_id_per_seconds,
-                spatial_merge_size=self.config.vision.spatial_merge_size,
-                audio_seqlens=inp.get("audio_seqlens", [None])[0],
-                image_grid_thw=inp.get("image_grid_thw", [None])[0],
-                video_grid_thw=inp.get("video_grid_thw", [None])[0],
+            # Compute 3D MRoPE position IDs for a pure-text span.  Each
+            # prefill graph walk is single-modality so we use the simple
+            # per-modality helper instead of the full HF parser.
+            #
+            # ``start_pos`` for the text prefill is picked up from the
+            # running per-request delta (0 on the very first walk).
+            delta = self._mrope_position_deltas.get(rid, torch.tensor(0.0))
+            start_pos = float(delta.item()) if delta.numel() > 0 else 0.0
+
+            pos_ids = get_rope_index_text(seq_len, start_pos, device)
+            all_pos_ids_3d.append(pos_ids)
+
+            # Advance the per-request position delta so the next walk
+            # (audio / vision / decode) starts at the correct offset.
+            self._mrope_position_deltas[rid] = torch.tensor(
+                start_pos + seq_len, device=device
             )
-            # position_ids: (3, 1, seq_len) -> (3, seq_len)
-            all_pos_ids_3d.append(position_ids[:, 0, :])
-            self._mrope_position_deltas[rid] = mrope_delta.squeeze()
 
         # Concatenate across requests
         input_embeds = torch.cat(all_embeds, dim=0)
@@ -362,30 +366,61 @@ class ThinkerSubmodule(NodeSubmodule):
         all_pos_ids_3d = []
         seq_lens = []
 
+        audio_start_id = self.config.thinker.audio_start_token_id
+        audio_end_id = self.config.thinker.audio_end_token_id
+
         for inp, rid in zip(per_request_inputs, request_ids):
             audio_embeds = inp["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
-            all_embeds.append(audio_embeds)
             audio_len = audio_embeds.shape[0]
-            seq_lens.append(audio_len)
 
-            # Audio 3D position IDs: temporal = absolute time position
-            # (80ms per frame via position_id_per_seconds), h/w = 0
-            # Use the position delta from the text prefill as the starting offset
+            # Wrap the audio span in ``<|audio_bos|>`` / ``<|audio_eos|>``
+            # sentinel token embeddings so the Thinker sees the same
+            # prompt layout the HF processor produces.
+            start_tok = torch.tensor(
+                [audio_start_id], dtype=torch.long, device=device
+            )
+            end_tok = torch.tensor(
+                [audio_end_id], dtype=torch.long, device=device
+            )
+            start_embed = self.model.model.embed_tokens(start_tok)
+            end_embed = self.model.model.embed_tokens(end_tok)
+
+            wrapped_embeds = torch.cat(
+                [start_embed, audio_embeds, end_embed], dim=0
+            )
+            all_embeds.append(wrapped_embeds)
+            total_len = audio_len + 2
+            seq_lens.append(total_len)
+
+            # Use the position delta carried over from the text prefill
+            # as the starting offset.
             delta = self._mrope_position_deltas.get(rid, torch.tensor(0.0))
             start_pos = float(delta.item()) if delta.numel() > 0 else 0.0
 
-            # For audio: temporal increments per frame, h and w are 0
-            temporal = torch.arange(
-                audio_len, dtype=torch.float, device=device
-            ) + start_pos
-            height = torch.zeros(audio_len, dtype=torch.float, device=device)
-            width = torch.zeros(audio_len, dtype=torch.float, device=device)
-            pos_ids = torch.stack([temporal, height, width], dim=0)  # (3, audio_len)
+            # Position IDs:
+            #   - audio_start_token: text-like position at start_pos
+            #   - audio tokens:      temporal increments per frame,
+            #                        h/w = start_pos (handled by helper)
+            #   - audio_end_token:   text-like position right after
+            start_pos_ids = get_rope_index_text(1, start_pos, device)
+            audio_pos_ids = get_rope_index_audio(
+                audio_len,
+                start_pos + 1,
+                device,
+                self.config.thinker.position_id_per_seconds,
+            )
+            end_pos_ids = get_rope_index_text(
+                1, start_pos + 1 + audio_len, device
+            )
+            pos_ids = torch.cat(
+                [start_pos_ids, audio_pos_ids, end_pos_ids], dim=1
+            )
             all_pos_ids_3d.append(pos_ids)
 
-            # Update position delta for subsequent walks
+            # Update position delta for subsequent walks.  We advanced
+            # by ``2 + audio_len`` positions (BOS + frames + EOS).
             self._mrope_position_deltas[rid] = torch.tensor(
-                start_pos + audio_len, device=device
+                start_pos + total_len, device=device
             )
 
         input_embeds = torch.cat(all_embeds, dim=0)
@@ -428,60 +463,69 @@ class ThinkerSubmodule(NodeSubmodule):
         all_pos_ids_3d = []
         seq_lens = []
 
+        vision_start_id = self.config.thinker.vision_start_token_id
+        vision_end_id = self.config.thinker.vision_end_token_id
+        spatial_merge = self.config.vision.spatial_merge_size
+
         for inp, rid in zip(per_request_inputs, request_ids):
             vision_embeds = inp["vision_embeds"][0].to(device)
-            all_embeds.append(vision_embeds)
             vision_len = vision_embeds.shape[0]
-            seq_lens.append(vision_len)
+
+            # Wrap the vision span in ``<|vision_bos|>`` / ``<|vision_eos|>``
+            # sentinel token embeddings.
+            start_tok = torch.tensor(
+                [vision_start_id], dtype=torch.long, device=device
+            )
+            end_tok = torch.tensor(
+                [vision_end_id], dtype=torch.long, device=device
+            )
+            start_embed = self.model.model.embed_tokens(start_tok)
+            end_embed = self.model.model.embed_tokens(end_tok)
+
+            wrapped_embeds = torch.cat(
+                [start_embed, vision_embeds, end_embed], dim=0
+            )
+            all_embeds.append(wrapped_embeds)
+            total_len = vision_len + 2
+            seq_lens.append(total_len)
 
             delta = self._mrope_position_deltas.get(rid, torch.tensor(0.0))
             start_pos = float(delta.item()) if delta.numel() > 0 else 0.0
 
-            # For vision: temporal = constant (single frame), h/w = spatial grid
-            # If grid_thw is available, use it for proper spatial positions
+            # Vision tokens use spatial 3D positions (temporal constant,
+            # h/w from the spatial grid after merging).  If a proper
+            # ``image_grid_thw`` is available, use ``get_rope_index_vision``;
+            # otherwise fall back to a 1-D sequence (test path without
+            # AutoImageProcessor).
             grid_thw = inp.get("image_grid_thw", [None])[0]
             if grid_thw is not None and grid_thw.numel() > 0:
-                from mminf.model.qwen3_omni.components.rope import (
-                    _get_llm_pos_ids_for_vision,
+                vision_pos_ids = get_rope_index_vision(
+                    grid_thw.to(device),
+                    start_pos + 1,  # leave room for the BOS token
+                    device=device,
+                    spatial_merge_size=spatial_merge,
                 )
-                spatial_merge = self.config.vision.spatial_merge_size
-
-                # Build position IDs for all images in this request
-                vision_pos_list = []
-                offset = start_pos
-                for img_idx in range(grid_thw.shape[0]):
-                    t = int(grid_thw[img_idx, 0].item())
-                    h = int(grid_thw[img_idx, 1].item())
-                    w = int(grid_thw[img_idx, 2].item())
-                    t_index = (
-                        torch.arange(t, dtype=torch.float)
-                        * self.config.thinker.position_id_per_seconds
-                    )
-                    pos_ids = _get_llm_pos_ids_for_vision(
-                        offset, t_index, h, w, spatial_merge
-                    )
-                    vision_pos_list.append(pos_ids)
-                    num_tokens = t * h * w // (spatial_merge ** 2)
-                    offset = float(pos_ids.max().item()) + 1
-
-                pos_ids_3d = torch.cat(vision_pos_list, dim=1).to(device)
             else:
-                # Fallback: treat vision tokens like text
-                temporal = torch.full(
-                    (vision_len,), start_pos, dtype=torch.float, device=device
+                # Testing/fallback path: no grid_thw available, so treat
+                # vision tokens as a flat 1-D span with text-like positions.
+                vision_pos_ids = get_rope_index_text(
+                    vision_len, start_pos + 1, device
                 )
-                height = torch.arange(
-                    vision_len, dtype=torch.float, device=device
-                )
-                width = torch.zeros(
-                    vision_len, dtype=torch.float, device=device
-                )
-                pos_ids_3d = torch.stack([temporal, height, width], dim=0)
-                offset = start_pos + vision_len
 
-            all_pos_ids_3d.append(pos_ids_3d)
+            # Sentinel token positions (text-like).
+            start_pos_ids = get_rope_index_text(1, start_pos, device)
+            end_pos_base = float(vision_pos_ids.max().item()) + 1
+            end_pos_ids = get_rope_index_text(1, end_pos_base, device)
+
+            pos_ids = torch.cat(
+                [start_pos_ids, vision_pos_ids, end_pos_ids], dim=1
+            )
+            all_pos_ids_3d.append(pos_ids)
+
+            # Advance the per-request position delta by one past the
+            # EOS token.
             self._mrope_position_deltas[rid] = torch.tensor(
-                offset, device=device
+                end_pos_base + 1, device=device
             )
 
         input_embeds = torch.cat(all_embeds, dim=0)
@@ -587,8 +631,23 @@ class ThinkerSubmodule(NodeSubmodule):
         mrope_section: list[int] | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Run Thinker transformer, produce logits (decode) and thinker_states."""
+        """Run Thinker transformer, produce logits (decode) and thinker_states.
+
+        ``thinker_states`` is only emitted when audio output is requested
+        (checked via ``request_info.step_metadata["audio_output"]``). This
+        saves cross-partition bandwidth for text-only requests. Defaults to
+        ``True`` for backwards compatibility with callers that do not set
+        the flag (e.g. unit tests).
+        """
         cache_handle.set_active_label("main")
+
+        # Default True for backwards-compat (tests, text-only callers that
+        # forgot to set the flag still get the old behaviour).
+        audio_output = True
+        if request_info is not None:
+            audio_output = request_info.step_metadata.get(
+                "audio_output", True,
+            )
 
         hidden, layer_0_embed, layer_n_hidden = self.model(
             input_embeds=input_embeds,
@@ -604,16 +663,23 @@ class ThinkerSubmodule(NodeSubmodule):
             logits = self.model.lm_head(hidden[-1:, :])
             result["logits"] = [logits]
 
-        # Pack thinker_states for Talker conditioning:
-        # Concatenate layer-0 embeddings and layer-N hidden states along last dim
-        # -> (tokens, 2 * hidden_size)
-        if layer_n_hidden is not None:
-            thinker_states = torch.cat([layer_0_embed, layer_n_hidden], dim=-1)
-        else:
-            # Fallback: use layer_0_embed doubled (shouldn't happen in practice)
-            thinker_states = torch.cat([layer_0_embed, layer_0_embed], dim=-1)
-
-        result["thinker_states"] = [thinker_states]
+        # Pack thinker_states for Talker conditioning ONLY when audio output
+        # is requested.  For text-only requests we skip this entirely to
+        # avoid sending hidden states the Talker will never consume.
+        if audio_output:
+            # Concatenate layer-0 embeddings and layer-N hidden states along
+            # last dim -> (tokens, 2 * hidden_size)
+            if layer_n_hidden is not None:
+                thinker_states = torch.cat(
+                    [layer_0_embed, layer_n_hidden], dim=-1,
+                )
+            else:
+                # Fallback: use layer_0_embed doubled (shouldn't happen in
+                # practice)
+                thinker_states = torch.cat(
+                    [layer_0_embed, layer_0_embed], dim=-1,
+                )
+            result["thinker_states"] = [thinker_states]
 
         return result
 
@@ -621,6 +687,17 @@ class ThinkerSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: NodeBatch) -> bool:
         return batch.graph_walk == "thinker_decode"
+
+    def get_cuda_graph_capture_inputs(
+        self, graph_walk: str, device: torch.device,
+    ) -> list[dict[str, list[torch.Tensor]]] | None:
+        """Dummy inputs for CUDA graph capture.
+
+        ThinkerSubmodule._preprocess_decode reads ``text_inputs`` (prev token).
+        """
+        if graph_walk != "thinker_decode":
+            return None
+        return [{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
 
     def forward_batched(
         self,
@@ -631,7 +708,12 @@ class ThinkerSubmodule(NodeSubmodule):
         per_request_info: dict | None = None,
         per_request_metadata: dict | None = None,
     ) -> dict[str, NameToTensorList]:
-        """Batched decode: multiple requests each contribute 1 token."""
+        """Batched decode: multiple requests each contribute 1 token.
+
+        ``thinker_states`` is only included in a request's outputs when
+        that request has ``audio_output=True`` in its step_metadata. Text
+        only requests skip it to save cross-partition bandwidth.
+        """
         assert graph_walk == "thinker_decode"
 
         input_embeds = packed_inputs["input_embeds"]  # (batch, hidden)
@@ -649,20 +731,45 @@ class ThinkerSubmodule(NodeSubmodule):
 
         logits = self.model.lm_head(hidden)  # (batch, vocab)
 
-        # Pack thinker_states per request
-        if layer_n_hidden is not None:
-            thinker_states = torch.cat([layer_0_embed, layer_n_hidden], dim=-1)
-        else:
-            thinker_states = torch.cat([layer_0_embed, layer_0_embed], dim=-1)
-
+        # Determine per-request audio_output flags (default True for
+        # backwards compat).  If ANY request in the batch wants audio
+        # output we still need to compute the packed thinker_states tensor;
+        # we then only include it in the outputs for requests that asked
+        # for it.
         request_ids = cache_manager.request_ids
-        return {
-            rid: {
-                "logits": [logits[i : i + 1]],
-                "thinker_states": [thinker_states[i : i + 1]],
-            }
-            for i, rid in enumerate(request_ids)
-        }
+        per_request_info = per_request_info or {}
+        audio_output_flags: dict[str, bool] = {}
+        for rid in request_ids:
+            info = per_request_info.get(rid)
+            if info is not None:
+                audio_output_flags[rid] = info.step_metadata.get(
+                    "audio_output", True,
+                )
+            else:
+                audio_output_flags[rid] = True
+
+        any_audio = any(audio_output_flags.values())
+
+        if any_audio:
+            # Pack thinker_states once for the whole batch
+            if layer_n_hidden is not None:
+                thinker_states = torch.cat(
+                    [layer_0_embed, layer_n_hidden], dim=-1,
+                )
+            else:
+                thinker_states = torch.cat(
+                    [layer_0_embed, layer_0_embed], dim=-1,
+                )
+        else:
+            thinker_states = None
+
+        outputs: dict[str, NameToTensorList] = {}
+        for i, rid in enumerate(request_ids):
+            req_out: NameToTensorList = {"logits": [logits[i : i + 1]]}
+            if audio_output_flags[rid] and thinker_states is not None:
+                req_out["thinker_states"] = [thinker_states[i : i + 1]]
+            outputs[rid] = req_out
+        return outputs
 
     def get_needed_cache_labels(
         self,
@@ -1162,6 +1269,26 @@ class TalkerSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: NodeBatch) -> bool:
         return batch.graph_walk == "talker_decode"
+
+    def get_cuda_graph_capture_inputs(
+        self, graph_walk: str, device: torch.device,
+    ) -> list[dict[str, list[torch.Tensor]]] | None:
+        """Dummy inputs for CUDA graph capture.
+
+        TalkerSubmodule._preprocess_decode reads ``all_codes`` (32 codec
+        token IDs from the previous decode step) and optionally
+        ``thinker_states`` (projected Thinker hidden states for temporal
+        conditioning).  Thinker states can be empty after Thinker EOS, so
+        we supply an empty list and let the submodule fall back to
+        tts_pad_embed during capture.
+        """
+        if graph_walk != "talker_decode":
+            return None
+        num_groups = self.config.num_code_groups
+        return [{
+            "all_codes": [torch.zeros(num_groups, dtype=torch.long, device=device)],
+            "thinker_states": [],
+        }]
 
     def forward_batched(
         self,
