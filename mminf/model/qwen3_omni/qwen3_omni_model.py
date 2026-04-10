@@ -263,7 +263,7 @@ class Qwen3OmniModel(Model):
         # -- Talker decode: autoregressive codec token generation --
         talker_decode = GraphNode(
             name="Talker",
-            input_ids=["all_codes"],
+            input_ids=["all_codes", "thinker_states"],
             outputs=[
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
@@ -339,7 +339,7 @@ class Qwen3OmniModel(Model):
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_states",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
                 ),
                 Connection(
                     from_partition="Talker",
@@ -768,11 +768,6 @@ class Qwen3OmniModel(Model):
                     step_metadata={
                         "is_prefill": False,
                         "is_last_prefill": False,
-                        # Signal the worker to set passive_drain on the
-                        # thinker_states StreamBuffer so it is no longer
-                        # polled by _poll_stream_buffers; instead the
-                        # TalkerSubmodule drains it via step_metadata.
-                        "_set_passive_drain": ["thinker_states"],
                     },
                 )
             else:
@@ -877,6 +872,10 @@ class Qwen3OmniModel(Model):
     # Model ABC: prompt processing
     # -----------------------------------------------------------------------
 
+    # TODO: Refactor process_prompt to accept pre-processed tensors from
+    # data_worker.py (audio_features, pixel_values from the file_paths loop).
+    # Currently, process_prompt only receives text; multimodal tensors need
+    # to be passed in after the data_worker's modality processing loop.
     def process_prompt(
         self,
         prompt: str | None,
