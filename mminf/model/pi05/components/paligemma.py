@@ -1,0 +1,140 @@
+"""PaliGemma transformer expert for Pi0.5 (prefix processing).
+
+A Gemma-style transformer that integrates with mminf's BatchedCacheManager
+for paged KV cache. Used for the prefill graph walk where it processes the
+prefix tokens (image + language + state) and writes the KV cache that the
+action expert later reads during action generation.
+"""
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from mminf.engine.cache_manager import BatchedCacheManager
+from mminf.model.pi05.config import Pi05Config
+from mminf.utils.flashinfer_utils import run_rms_norm
+
+
+class Pi05GemmaRMSNorm(nn.Module):
+    """RMSNorm with a learned weight; computation is delegated to FlashInfer."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:  # pragma: no cover
+        # Replaced by run_rms_norm at call sites.
+        return run_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+
+class Pi05GemmaMLP(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
+
+
+class Pi05PaliGemmaAttention(nn.Module):
+    """GQA self-attention with RoPE, integrated with the FlashInfer cache_handle."""
+
+    def __init__(self, config: Pi05Config):
+        super().__init__()
+        self.config = config
+        self.num_heads = config.num_qo_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = config.head_dim
+        self.hidden_size = config.hidden_size
+        self.rope_theta = config.rope_theta
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+    def forward(
+        self,
+        query_sequence: torch.Tensor,
+        cache_handle: BatchedCacheManager,
+    ) -> torch.Tensor:
+        q = self.q_proj(query_sequence).view(-1, self.num_heads, self.head_dim)
+        k = self.k_proj(query_sequence).view(-1, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(query_sequence).view(-1, self.num_kv_heads, self.head_dim)
+
+        q, k = cache_handle.apply_rope(q, k, rope_theta=self.rope_theta)
+        attn_output = cache_handle.run_attention(q=q, k=k, v=v)
+        attn_output = attn_output.reshape(-1, self.hidden_size)
+        return self.o_proj(attn_output)
+
+
+class Pi05PaliGemmaLayer(nn.Module):
+    def __init__(self, config: Pi05Config):
+        super().__init__()
+        self.self_attn = Pi05PaliGemmaAttention(config)
+        self.mlp = Pi05GemmaMLP(config.hidden_size, config.pali_intermediate_size)
+        self.input_layernorm = Pi05GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Pi05GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        query_sequence: torch.Tensor,
+        cache_handle: BatchedCacheManager,
+    ) -> torch.Tensor:
+        residual = query_sequence
+        query_sequence = run_rms_norm(
+            query_sequence,
+            self.input_layernorm.weight,
+            eps=self.input_layernorm.variance_epsilon,
+        )
+        query_sequence = self.self_attn(
+            query_sequence=query_sequence, cache_handle=cache_handle
+        )
+        query_sequence = residual + query_sequence
+
+        residual = query_sequence
+        query_sequence = run_rms_norm(
+            query_sequence,
+            self.post_attention_layernorm.weight,
+            eps=self.post_attention_layernorm.variance_epsilon,
+        )
+        query_sequence = self.mlp(query_sequence)
+        return residual + query_sequence
+
+
+class Pi05PaliGemmaExpert(nn.Module):
+    """Stack of PaliGemma transformer layers.
+
+    The submodule's input embeddings (image tokens + language tokens + state
+    tokens) are passed in directly. This module owns only the transformer
+    blocks plus a final RMSNorm; the embedding table is held by the parent
+    submodule and shared with the action expert.
+    """
+
+    def __init__(self, config: Pi05Config):
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList(
+            [Pi05PaliGemmaLayer(config) for _ in range(config.num_layers)]
+        )
+        self.norm = Pi05GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        query_sequence: torch.Tensor,
+        cache_handle: BatchedCacheManager,
+        write_cache: bool = True,
+    ) -> torch.Tensor:
+        for layer_idx, layer in enumerate(self.layers):
+            cache_handle.set_layer_idx(layer_idx)
+            query_sequence = layer(query_sequence=query_sequence, cache_handle=cache_handle)
+
+        if write_cache:
+            cache_handle.advance_seq_lens()
+
+        return run_rms_norm(
+            query_sequence, self.norm.weight, eps=self.norm.variance_epsilon
+        )
