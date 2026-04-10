@@ -1216,24 +1216,64 @@ class Qwen3OmniModel(Model):
         )
 
         # W3: Pre-compute TTS special embeddings using the Thinker's
-        # embedding table.  If the Thinker submodule has already been
-        # loaded on this worker, we can grab its embed_tokens directly.
+        # embedding table.  The HF reference computes:
+        #   tts_pad_embed = talker.text_projection(thinker.embed_tokens(pad_id))
+        #   tts_bos_embed = talker.text_projection(thinker.embed_tokens(bos_id))
+        #   tts_eos_embed = talker.text_projection(thinker.embed_tokens(eos_id))
+        #
+        # Two cases:
+        #
+        # 1. Colocated (Thinker + Talker on same worker): grab the
+        #    Thinker submodule's already-loaded embed_tokens directly.
+        #    Zero extra memory.
+        #
+        # 2. Disaggregated (Talker on a different worker than Thinker):
+        #    load JUST the embed_tokens layer from the checkpoint, use
+        #    it to compute the 3 projected TTS embeds (~12 KB cached on
+        #    the Talker submodule), and immediately discard the
+        #    embedding layer to free its memory.  Peak temp cost is
+        #    vocab_size * hidden_size * 2 bytes (~620 MB for the
+        #    151k-vocab Thinker), held only briefly during init.
         thinker_sub = self._submodule_cache.get("Thinker")
-        if thinker_sub is not None and hasattr(thinker_sub, 'model'):
+        if thinker_sub is not None and hasattr(thinker_sub, "model"):
+            # Colocated: reuse the already-loaded embed_tokens
             try:
-                talker_sub.init_tts_embeds(thinker_sub.model.embed_tokens)
+                embed_tokens = thinker_sub.model.model.embed_tokens
+                talker_sub.init_tts_embeds(embed_tokens)
             except Exception as e:
                 logger.warning(
-                    "Could not init TTS embeds from Thinker embed_tokens "
-                    "(Thinker and Talker may be on different workers): %s", e,
+                    "Could not init TTS embeds from colocated Thinker "
+                    "embed_tokens: %s", e,
                 )
         else:
+            # Disaggregated: load embed_tokens temporarily from the checkpoint
             logger.info(
-                "Thinker submodule not yet loaded on this worker; "
-                "TTS special embeds will use fallback (Talker embed_tokens). "
-                "For correct results, ensure both are on the same worker or "
-                "transfer the cached embeddings during model init."
+                "Thinker submodule not loaded on this worker; loading "
+                "embed_tokens temporarily to compute Talker TTS special embeds."
             )
+            text_config = self.config.thinker_text
+            embed_tokens = torch.nn.Embedding(
+                text_config.vocab_size, text_config.hidden_size,
+            )
+            try:
+                load_weights_from_hf_shards(
+                    repo_dir=self.local_dir,
+                    modules=[ModuleAndPrefix(
+                        embed_tokens, prefix="thinker.model.embed_tokens"
+                    )],
+                    device=device,
+                )
+                talker_sub.init_tts_embeds(embed_tokens)
+            except Exception as e:
+                logger.warning(
+                    "Failed to load Thinker embed_tokens for TTS embeds; "
+                    "Talker will use zero fallback (degraded audio quality): %s",
+                    e,
+                )
+            finally:
+                # Free the temporary embedding layer (~620 MB).  The 12 KB
+                # of cached projected embeds remain on the Talker submodule.
+                del embed_tokens
 
         return talker_sub
 
