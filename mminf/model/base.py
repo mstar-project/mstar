@@ -80,6 +80,18 @@ class NodeSubmodule(torch.nn.Module):
         """
         ...
 
+    def get_cuda_graph_capture_inputs(self, graph_walk: str, device: torch.device) -> list[dict[str, list[torch.Tensor]]] | None:
+        """Return dummy inputs for CUDA graph capture, or None if this walk
+        doesn't support CUDA graphs.
+
+        Default: returns text_inputs for "decode" walks. Override in subclasses
+        for walks with different input names (e.g., Qwen3-Omni Thinker uses
+        "input_embeds" and "cos_sin_3d"; Talker uses "input_embeds").
+        """
+        if "decode" not in graph_walk:
+            return None
+        return [{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
+
     def can_batch(
         self, batch: NodeBatch
     ):
