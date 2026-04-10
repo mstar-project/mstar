@@ -38,6 +38,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import (
     CurrentForwardConductorMetadata,
     PartitionDefinition,
+    PartitionState,
     StreamingConnectionState,
 )
 from mminf.engine.base import EngineType
@@ -358,7 +359,7 @@ class Qwen3OmniModel(Model):
         self,
         completed_partition: str,
         completed_walk: str,
-        all_partition_states: dict,
+        all_partition_states: dict[str, PartitionState],
         persist_signals: dict[str, list[TensorPointerInfo]],
     ) -> dict[str, ForwardPassArgs]:
         """Send talker_trigger to Talker after each Thinker walk completes.
@@ -384,8 +385,8 @@ class Qwen3OmniModel(Model):
             return {}
 
         talker_metadata = talker_state.metadata
-        if not talker_metadata.is_prefill:
-            # Talker has already transitioned to decode -- no more triggers
+        if not talker_metadata.is_prefill or talker_metadata.kwargs.get("is_last_prefill", False):
+            # Talker has already transitioned toeither last prefill decode -- no more triggers
             return {}
 
         # Check if the Talker partition has audio output enabled
