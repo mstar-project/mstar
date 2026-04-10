@@ -92,6 +92,22 @@ class NodeSubmodule(torch.nn.Module):
             return None
         return [{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
 
+    def can_use_cuda_graphs(self, graph_walk: str) -> bool:
+        """Return True if this submodule supports CUDA graphs for ``graph_walk``.
+
+        Default: derives from ``get_cuda_graph_capture_inputs`` — if the
+        submodule provides capture templates for this walk, CUDA graphs
+        are supported.  Override for models with more complex eligibility
+        rules (e.g., excluding specific batch configurations).
+        """
+        try:
+            inputs = self.get_cuda_graph_capture_inputs(
+                graph_walk, device=torch.device("cpu"),
+            )
+        except Exception:
+            return False
+        return inputs is not None
+
     def can_batch(
         self, batch: NodeBatch
     ):
@@ -310,24 +326,33 @@ class Model(ABC):
         prompt: str | None,
         input_modalities: list[str],
         output_modalities: list[str],
+        tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Tokenize prompt and produce initial text tensors.
+        """Tokenize prompt and produce initial tensors for the request.
 
-        Called by the API server data worker to convert raw text input
-        into model-specific tensor format (e.g., tokenization). The
-        output dict keys are model-specific and will be referenced by
-        get_forward_pass_inputs via persist_signals.
+        Called by the API server data worker AFTER it has loaded raw
+        multimodal tensors from file_paths (images, audio, video).
+        The model may inspect the raw tensors dict and compute additional
+        derived tensors (e.g., Qwen3-Omni computes ``pixel_values``,
+        ``image_grid_thw``, ``audio_features``, ``audio_seqlens`` from the
+        raw ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
 
         Args:
             prompt: Raw text input from the user, or None if no text.
             input_modalities: List of input modality types for this request.
             output_modalities: List of desired output modality types.
+            tensors: Raw modality tensors already loaded by the data worker
+                (``image_inputs``, ``audio_inputs``, ``video_inputs``).
+                The model may read these to compute derived tensors.
+                Models that don't need the raw tensors may ignore this.
             **kwargs: Model-specific parameters (e.g., from model_kwargs).
 
         Returns:
-            NameToTensorList with model-specific keys, e.g.:
-            {"text_inputs": [tokenized_tensor], "system_prompt": [sys_tensor]}
+            NameToTensorList with tensors to MERGE into the request's
+            tensor dict.  Typically includes ``text_inputs`` plus any
+            model-specific derived tensors.  The returned dict is merged
+            into the existing ``tensors`` dict via ``dict.update``.
         """
         pass
 
