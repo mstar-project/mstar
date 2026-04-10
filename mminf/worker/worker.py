@@ -168,6 +168,13 @@ class Worker:
                 if any(n in my_node_names for n in self._get_node_names_for_partition(conn.to_partition, model)):
                     self._my_consumer_connections.append(conn)
 
+        # Set of edge names that arrive via streaming (used to distinguish
+        # streaming inputs from conductor-triggered non-streaming inputs
+        # when checking whether a target node is ready for ingestion).
+        self._streaming_edge_names: set[str] = {
+            conn.edge_name for conn in self._my_consumer_connections
+        }
+
         # Build consumer node cache: edge_name -> next_node name
         self._consumer_node_cache: dict[str, str] = {}
         if self._my_consumer_connections and model:
@@ -410,44 +417,108 @@ class Worker:
             stream_buf.put(info.uuid, tensor.clone())
             self.tensor_manager.dereference(request_id, info.uuid)
 
-    def _poll_stream_buffers(self) -> None:
-        """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input.
+    def _find_waiting_node(self, request_id: str, node_name: str) -> "GraphNode | None":
+        """Find the GraphNode with *node_name* in any of this request's worker graph queues.
 
-        Buffers with ``passive_drain=True`` are skipped -- they are read
-        directly by the consuming submodule via ``drain_available()`` from
-        step_metadata during AR engine execution (e.g., Talker reading
-        Thinker hidden states during talker_decode).
+        Searches both the ``waiting`` section and the ``ready`` list so that we
+        can inspect ``input_ids`` and ``ready_inputs`` before deciding whether
+        to ingest streaming data.
         """
+        from mminf.graph.base import GraphNode as _GN
+        req_info = self.worker_graphs_manager.per_request_info.get(request_id)
+        if req_info is None:
+            return None
+        for wg_id in req_info.worker_graph_ids:
+            queue = self.worker_graphs_manager.queues.get(wg_id)
+            if queue is None:
+                continue
+            per_req = queue.per_request_queues.get(request_id)
+            if per_req is None:
+                continue
+            # Check ready list first
+            for node in per_req.ready:
+                if node.name == node_name:
+                    return node
+            # Check waiting section
+            if per_req.waiting is not None:
+                for name in per_req.waiting.get_node_names():
+                    if name == node_name:
+                        # Retrieve the actual GraphNode from the waiting section
+                        # by walking its structure
+                        found = self._extract_node_from_section(per_req.waiting, node_name)
+                        if found is not None:
+                            return found
+        return None
+
+    def _extract_node_from_section(self, section, node_name: str):
+        """Recursively extract a GraphNode by name from a GraphSection tree."""
+        from mminf.graph.base import GraphNode as _GN
+        if isinstance(section, _GN):
+            return section if section.name == node_name else None
+        # Sequential, Parallel, Loop — they all have a `sections` or `section` attr
+        if hasattr(section, 'sections'):
+            for child in section.sections:
+                result = self._extract_node_from_section(child, node_name)
+                if result is not None:
+                    return result
+        if hasattr(section, 'section') and section.section is not None:
+            result = self._extract_node_from_section(section.section, node_name)
+            if result is not None:
+                return result
+        # Loop has curr_iter_section and nxt_iter_section
+        for attr in ('curr_iter_section', 'nxt_iter_section'):
+            child = getattr(section, attr, None)
+            if child is not None:
+                result = self._extract_node_from_section(child, node_name)
+                if result is not None:
+                    return result
+        return None
+
+    def _poll_stream_buffers(self) -> None:
+        """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
         for request_id, req_info in list(self.worker_graphs_manager.per_request_info.items()):
             for edge_name, sbuf in req_info.stream_buffers.items():
-                if sbuf.passive_drain:
-                    continue
-                synthetic_edge = sbuf.pop_waiting_edge()
                 consumer_node = self._consumer_node_cache.get(edge_name, "")
                 partition_name = self.worker_graphs_manager.get_partition_for_node(consumer_node)
-                
+
+                # Only ingest streaming data when the target node's non-streaming
+                # inputs are already satisfied. This prevents the race condition
+                # where streaming data lands in the wrong graph walk during transitions.
+                target_graph_node = self._find_waiting_node(request_id, consumer_node)
+                if target_graph_node is not None:
+                    non_streaming_inputs = target_graph_node.input_ids - self._streaming_edge_names
+                    if non_streaming_inputs and not non_streaming_inputs.issubset(
+                        set(target_graph_node.ready_inputs.keys())
+                    ):
+                        continue  # conductor hasn't activated this node yet
+
+                synthetic_edge = sbuf.pop_waiting_edge()
+
                 if synthetic_edge is None and sbuf.has_chunk_ready():
                     chunk = sbuf.pop_chunk()
                     chunk_tensor = chunk.data.get("data")
                     if chunk_tensor is None:
-                        continue
-
-                    # Store the chunk tensor so _build_node_batch can retrieve it via uuid
-                    tensor_infos = self.tensor_manager.store_and_return_tensor_info(
-                        request_id, {edge_name: [chunk_tensor]},
-                    )
-                    synthetic_edge = GraphEdge(
-                        next_node=consumer_node,
-                        name=edge_name,
-                        tensor_info=tensor_infos.get(edge_name, []),
-                    )
+                        # Empty chunk — producer done, no more data.
+                        # Create edge with empty tensor_info.
+                        synthetic_edge = GraphEdge(
+                            next_node=consumer_node,
+                            name=edge_name,
+                            tensor_info=[],
+                        )
+                    else:
+                        # Normal chunk — store tensor and create edge with tensor_info
+                        tensor_infos = self.tensor_manager.store_and_return_tensor_info(
+                            request_id, {edge_name: [chunk_tensor]},
+                        )
+                        synthetic_edge = GraphEdge(
+                            next_node=consumer_node,
+                            name=edge_name,
+                            tensor_info=tensor_infos.get(edge_name, []),
+                        )
 
                 if synthetic_edge is not None:
-                    # Route to all worker graphs (not just current walk) since
-                    # streaming chunks arrive cross-partition
                     ingested = len(self.worker_graphs_manager.process_new_inputs(
                         request_id=request_id, inputs=[synthetic_edge],
-                        all_walks=True,
                     )) == 0
                     if not ingested:
                         sbuf.store_uningested_edge(synthetic_edge)
@@ -802,28 +873,6 @@ class Worker:
 
                 # 4. Gather input tensors for the batch
                 node_batch = self._build_node_batch(batch)
-
-                # 4b. Inject StreamBuffer references into step_metadata for AR
-                # engines that passively drain streaming buffers (e.g., Talker
-                # reading thinker_states during talker_decode).
-                for rid in node_batch.request_ids:
-                    req_info = self.worker_graphs_manager.per_request_info.get(rid)
-                    if req_info and req_info.stream_buffers:
-                        fwd_info = node_batch.per_request_info.get(rid)
-                        if fwd_info is not None:
-                            fwd_info.step_metadata["_stream_buffers"] = req_info.stream_buffers
-
-                            # Process _set_passive_drain signals: flip the
-                            # passive_drain flag on named StreamBuffers so
-                            # _poll_stream_buffers stops polling them.
-                            drain_edges = fwd_info.step_metadata.pop(
-                                "_set_passive_drain", None
-                            )
-                            if drain_edges:
-                                for edge_name in drain_edges:
-                                    sbuf = req_info.stream_buffers.get(edge_name)
-                                    if sbuf is not None:
-                                        sbuf.passive_drain = True
 
                 # 5. Execute via engine
                 engine = self.engine_manager.get_engine(batch.node_name)
