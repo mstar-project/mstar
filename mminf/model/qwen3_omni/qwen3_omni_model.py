@@ -45,6 +45,7 @@ from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
+from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
 from mminf.model.utils import Operation, WeightConverter
 from mminf.streaming.chunk_policy import FixedChunkPolicy, SlidingWindowChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -1241,19 +1242,20 @@ class Qwen3OmniModel(Model):
 
         # Code2Wav is the vocoder that converts codec tokens to audio waveform.
         # The actual model class will be defined in components.
-        from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeCode2Wav
 
-        with torch.device("meta"):
-            code2wav_model = Qwen3OmniCode2Wav(self.config)
+        hf_cfg = self.config.code2wav.get_hf_config()
+        code2wav_hf = Qwen3OmniMoeCode2Wav._from_config(hf_cfg)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
             modules=[
-                ModuleAndPrefix(code2wav_model._hf_model, prefix="code2wav"),
+                ModuleAndPrefix(code2wav_hf, prefix="code2wav"),
             ],
             device=device,
         )
 
+        code2wav_model = Qwen3OmniCode2Wav(hf_cfg, code2wav_hf)
         code2wav_model.eval()
 
         from mminf.model.qwen3_omni.submodules import Code2WavSubmodule

@@ -271,6 +271,29 @@ class Code2WavConfig:
                 filtered[tup_field] = tuple(filtered[tup_field])
         return cls(**filtered)
 
+    def get_hf_config(self):
+        from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+            Qwen3OmniMoeCode2WavConfig,
+        )
+        return Qwen3OmniMoeCode2WavConfig(
+            codebook_size=self.codebook_size,
+            hidden_size=self.hidden_size,
+            num_hidden_layers=self.num_hidden_layers,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            intermediate_size=self.intermediate_size,
+            max_position_embeddings=self.max_position_embeddings,
+            sliding_window=self.sliding_window,
+            num_quantizers=self.num_quantizers,
+            upsample_rates=list(self.upsample_rates),
+            upsampling_ratios=list(self.upsampling_ratios),
+            decoder_dim=self.decoder_dim,
+            hidden_act=self.hidden_act,
+            rms_norm_eps=self.rms_norm_eps,
+            attention_dropout=self.attention_dropout,
+            layer_scale_initial_scale=self.layer_scale_initial_scale,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Top-level model config
