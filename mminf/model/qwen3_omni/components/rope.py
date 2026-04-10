@@ -192,356 +192,164 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 # -----------------------------------------------------------------------
-# Position-ID construction  (get_rope_index)
+# Position-ID construction  (per-modality helpers)
 # -----------------------------------------------------------------------
+#
+# In the disaggregated pipeline each prefill graph walk (prefill_text,
+# prefill_audio, prefill_vision) is single-modality, so we do not need
+# the full multimodal parser used by HF ``get_rope_index``.  Instead we
+# provide three small helpers that each return a ``(3, seq_len)`` tensor
+# of 3D position IDs (temporal, height, width).
+#
+# The callers (``ThinkerSubmodule._preprocess_prefill_*``) track a
+# per-request ``start_pos`` offset across walks so the position IDs
+# remain monotonic along the full sequence.
 
-def get_rope_index(
-    input_ids: torch.LongTensor,
-    attention_mask: torch.Tensor | None = None,
-    image_grid_thw: torch.LongTensor | None = None,
-    video_grid_thw: torch.LongTensor | None = None,
-    audio_seqlens: torch.LongTensor | None = None,
-    second_per_grids: torch.Tensor | None = None,
-    *,
-    # Token IDs -- passed from config
-    image_token_id: int = 151655,
-    video_token_id: int = 151656,
-    audio_token_id: int = 151646,
-    vision_start_token_id: int = 151652,
-    audio_start_token_id: int = 151647,
-    position_id_per_seconds: int = 25,
-    spatial_merge_size: int = 2,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute 3D MRoPE position IDs from input tokens and grid info.
 
-    This is a **simplified** version of the full HF ``get_rope_index``.
-    It currently supports:
-      - Pure text inputs (all 3 components = sequential position)
-      - Audio-only inputs (temporal = absolute time position, h/w = 0)
+def get_rope_index_text(
+    seq_len: int,
+    start_pos: float,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Build 3D MRoPE position IDs for a pure-text span.
 
-    Full image/video support (spatial grid position computation) is marked
-    with TODOs below and will be implemented in a later phase.
+    All three components (temporal, height, width) are identical
+    sequential positions ``[start_pos, start_pos + 1, ..., start_pos + seq_len - 1]``.
 
     Parameters
     ----------
-    input_ids : torch.LongTensor
-        Shape ``(batch_size, seq_len)``.
-    attention_mask : torch.Tensor, optional
-        Shape ``(batch_size, seq_len)``.  ``1`` = real token, ``0`` = pad.
-    image_grid_thw : torch.LongTensor, optional
-        Shape ``(num_images, 3)`` -- temporal, height, width grid sizes.
-    video_grid_thw : torch.LongTensor, optional
-        Shape ``(num_videos, 3)`` -- temporal, height, width grid sizes.
-    audio_seqlens : torch.LongTensor, optional
-        Shape ``(num_audios,)`` -- raw audio lengths (before feature extraction).
-    second_per_grids : torch.Tensor, optional
-        Shape ``(num_videos,)`` -- time interval per temporal grid for video.
+    seq_len : int
+        Number of text tokens.
+    start_pos : float
+        Starting position offset (absolute position of the first token).
+    device : torch.device, optional
+        Device for the returned tensor.
 
     Returns
     -------
-    position_ids : torch.Tensor
-        Shape ``(3, batch_size, seq_len)`` -- the 3D position IDs.
-    mrope_position_deltas : torch.Tensor
-        Shape ``(batch_size, 1)`` -- offset between max position and seq length
-        (used for incremental decoding).
+    pos_ids_3d : torch.Tensor
+        Shape ``(3, seq_len)``.  ``dtype=torch.float``.
     """
-    batch_size, seq_len = input_ids.shape
-
-    has_vision = image_grid_thw is not None or video_grid_thw is not None
-
-    if has_vision:
-        # ---------------------------------------------------------------
-        # Full multimodal path (vision + audio + text interleaved)
-        # ---------------------------------------------------------------
-        return _get_rope_index_multimodal(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            audio_seqlens=audio_seqlens,
-            second_per_grids=second_per_grids,
-            image_token_id=image_token_id,
-            video_token_id=video_token_id,
-            audio_token_id=audio_token_id,
-            vision_start_token_id=vision_start_token_id,
-            audio_start_token_id=audio_start_token_id,
-            position_id_per_seconds=position_id_per_seconds,
-            spatial_merge_size=spatial_merge_size,
-        )
-    else:
-        # ---------------------------------------------------------------
-        # Text-only (possibly with audio but no images/videos)
-        # ---------------------------------------------------------------
-        # All 3 position components are identical sequential positions.
-        # This matches the HF else-branch.
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-
-        position_ids = attention_mask.float().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 1)
-        # Expand to 3 components: (3, batch, seq_len)
-        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(
-            input_ids.device
-        )
-
-        max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-            -1, keepdim=True
-        )[0]
-        mrope_position_deltas = (
-            max_position_ids + 1 - attention_mask.sum(dim=-1, keepdim=True)
-        )
-
-        return position_ids, mrope_position_deltas
+    positions = torch.arange(seq_len, dtype=torch.float, device=device) + float(
+        start_pos
+    )
+    return positions.unsqueeze(0).expand(3, -1).contiguous()
 
 
-def _get_feat_extract_output_lengths(input_lengths: torch.Tensor) -> torch.Tensor:
-    """Compute audio feature extractor output lengths.
-
-    Mirrors the HF helper that accounts for conv down-sampling and
-    chunk-based processing with 100-sample chunks.
-    """
-    input_lengths_leave = input_lengths % 100
-    feat_lengths = (input_lengths_leave - 1) // 2 + 1
-    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-    return output_lengths
-
-
-def _get_llm_pos_ids_for_vision(
-    start_idx: float,
-    t_index: torch.Tensor,
-    grid_h: int,
-    grid_w: int,
-    spatial_merge_size: int,
+def get_rope_index_audio(
+    num_audio_tokens: int,
+    start_pos: float,
+    device: torch.device | None = None,
+    position_id_per_seconds: int = 25,
 ) -> torch.Tensor:
-    """Build 3D position IDs for a single image or video grid.
+    """Build 3D MRoPE position IDs for an audio-only span.
+
+    For audio the temporal component advances per audio frame and the
+    height/width components are set to ``start_pos`` (i.e. the same
+    base as the temporal component's first position), which matches the
+    HF convention for single-modality audio where h/w track the text
+    position.  The temporal component is time-based via the Qwen3-Omni
+    ``position_id_per_seconds`` constant (default 25 positions/sec).
 
     Parameters
     ----------
-    start_idx : float
+    num_audio_tokens : int
+        Number of audio tokens produced by the audio encoder.
+    start_pos : float
         Starting position offset.
-    t_index : torch.Tensor
-        Temporal indices for each frame, shape ``(num_temporal_patches,)``.
-    grid_h, grid_w : int
-        Full grid height/width from ``grid_thw`` (before spatial merge).
+    device : torch.device, optional
+        Device for the returned tensor.
+    position_id_per_seconds : int
+        Unused here -- kept for API symmetry with the HF implementation
+        where audio timestamps map to integer position IDs.  The audio
+        encoder already outputs one token per quantized frame, so the
+        temporal component simply increments by one per token.
+
+    Returns
+    -------
+    pos_ids_3d : torch.Tensor
+        Shape ``(3, num_audio_tokens)``.  ``dtype=torch.float``.
+    """
+    del position_id_per_seconds  # kept for API compatibility
+    temporal = torch.arange(
+        num_audio_tokens, dtype=torch.float, device=device
+    ) + float(start_pos)
+    height = torch.full(
+        (num_audio_tokens,), float(start_pos), dtype=torch.float, device=device
+    )
+    width = torch.full(
+        (num_audio_tokens,), float(start_pos), dtype=torch.float, device=device
+    )
+    return torch.stack([temporal, height, width], dim=0)
+
+
+def get_rope_index_vision(
+    grid_thw: torch.LongTensor,
+    start_pos: float,
+    device: torch.device | None = None,
+    spatial_merge_size: int = 2,
+) -> torch.Tensor:
+    """Build 3D MRoPE position IDs for a vision-only span.
+
+    Temporal component is set to the constant ``start_pos`` (single
+    image / frame) while the height and width components come from the
+    spatial grid after the spatial merge.  For a grid of shape
+    ``(T, H, W)`` the resulting sequence length is
+    ``T * (H // spatial_merge_size) * (W // spatial_merge_size)`` per
+    image, concatenated across images.
+
+    Parameters
+    ----------
+    grid_thw : torch.LongTensor
+        Shape ``(num_images, 3)`` -- temporal, height, width grid sizes.
+    start_pos : float
+        Starting position offset; applied to all three components.
+    device : torch.device, optional
+        Device for the returned tensor.
     spatial_merge_size : int
         Spatial merge factor (tokens per merged patch).
 
     Returns
     -------
-    pos_ids : torch.Tensor  shape ``(3, num_vision_tokens)``
+    pos_ids_3d : torch.Tensor
+        Shape ``(3, total_vision_tokens)``.  ``dtype=torch.float``.
     """
-    llm_grid_h = grid_h // spatial_merge_size
-    llm_grid_w = grid_w // spatial_merge_size
-    num_t = len(t_index)
+    if grid_thw.dim() == 1:
+        grid_thw = grid_thw.unsqueeze(0)
 
-    h_index = (
-        torch.arange(llm_grid_h)
-        .view(1, -1, 1)
-        .expand(num_t, -1, llm_grid_w)
-        .flatten()
-        .float()
-    )
-    w_index = (
-        torch.arange(llm_grid_w)
-        .view(1, 1, -1)
-        .expand(num_t, llm_grid_h, -1)
-        .flatten()
-        .float()
-    )
-    t_expanded = (
-        t_index.view(-1, 1)
-        .expand(-1, llm_grid_h * llm_grid_w)
-        .flatten()
-        .float()
-    )
+    pos_ids_list: list[torch.Tensor] = []
+    for img_idx in range(grid_thw.shape[0]):
+        grid_t = int(grid_thw[img_idx, 0].item())
+        grid_h = int(grid_thw[img_idx, 1].item())
+        grid_w = int(grid_thw[img_idx, 2].item())
 
-    pos_ids = torch.stack([t_expanded, h_index, w_index])  # (3, N)
-    pos_ids = pos_ids + start_idx
-    return pos_ids
+        llm_grid_h = grid_h // spatial_merge_size
+        llm_grid_w = grid_w // spatial_merge_size
+        num_tokens = grid_t * llm_grid_h * llm_grid_w
 
-
-def _get_rope_index_multimodal(
-    input_ids: torch.LongTensor,
-    attention_mask: torch.Tensor | None,
-    image_grid_thw: torch.LongTensor | None,
-    video_grid_thw: torch.LongTensor | None,
-    audio_seqlens: torch.LongTensor | None,
-    second_per_grids: torch.Tensor | None,
-    *,
-    image_token_id: int,
-    video_token_id: int,
-    audio_token_id: int,
-    vision_start_token_id: int,
-    audio_start_token_id: int,
-    position_id_per_seconds: int,
-    spatial_merge_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Full multimodal get_rope_index mirroring the HF implementation.
-
-    Handles interleaved text, image, video, and audio tokens in a single
-    sequence.  Walks through the token stream, identifies each modality
-    span using sentinel tokens, and constructs appropriate 3D position IDs.
-    """
-    total_input_ids = input_ids
-    if attention_mask is not None:
-        attention_mask_bool = attention_mask == 1
-    else:
-        attention_mask_bool = torch.ones_like(input_ids, dtype=torch.bool)
-
-    position_ids = torch.zeros(
-        3,
-        input_ids.shape[0],
-        input_ids.shape[1],
-        dtype=torch.float,
-        device=input_ids.device,
-    )
-
-    mrope_position_deltas = []
-    image_idx, video_idx, audio_idx = 0, 0, 0
-
-    for i, input_ids_row in enumerate(total_input_ids):
-        if attention_mask is not None:
-            ids = input_ids_row[attention_mask_bool[i]]
-        else:
-            ids = input_ids_row
-
-        image_nums, video_nums, audio_nums = 0, 0, 0
-        vision_start_indices = torch.argwhere(ids == vision_start_token_id).squeeze(1)
-        if len(vision_start_indices) > 0:
-            vision_tokens = ids[vision_start_indices + 1]
-            image_nums = int((vision_tokens == image_token_id).sum().item())
-            video_nums = int((vision_tokens == video_token_id).sum().item())
-        audio_nums = int(torch.sum(ids == audio_start_token_id).item())
-
-        input_tokens = ids.tolist()
-        llm_pos_ids_list: list[torch.Tensor] = []
-        st = 0
-        remain_images, remain_videos, remain_audios = image_nums, video_nums, audio_nums
-        multimodal_nums = image_nums + video_nums + audio_nums
-
-        for _ in range(multimodal_nums):
-            st_idx = (
-                llm_pos_ids_list[-1].max() + 1
-                if len(llm_pos_ids_list) > 0
-                else 0
-            )
-
-            # Find next vision or audio start
-            if (image_token_id in input_tokens or video_token_id in input_tokens) and (
-                remain_videos > 0 or remain_images > 0
-            ):
-                ed_vision_start = input_tokens.index(vision_start_token_id, st)
-            else:
-                ed_vision_start = len(input_tokens) + 1
-
-            if audio_token_id in input_tokens and remain_audios > 0:
-                ed_audio_start = input_tokens.index(audio_start_token_id, st)
-            else:
-                ed_audio_start = len(input_tokens) + 1
-
-            min_ed = min(ed_vision_start, ed_audio_start)
-
-            # Leading text before this multimodal span
-            text_len = min_ed - st
-            if text_len != 0:
-                llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
-                )
-                st_idx += text_len
-
-            # BOS token(s) -- audio-in-video has 2
-            bos_len, eos_len = 1, 1
-            llm_pos_ids_list.append(
-                torch.arange(bos_len).view(1, -1).expand(3, -1) + st_idx
-            )
-            st_idx += bos_len
-
-            if min_ed == ed_audio_start:
-                # ----- Audio only -----
-                audio_len = _get_feat_extract_output_lengths(
-                    audio_seqlens[audio_idx]
-                )
-                llm_pos_ids = (
-                    torch.arange(audio_len).view(1, -1).expand(3, -1) + st_idx
-                )
-                llm_pos_ids_list.append(llm_pos_ids)
-                st += int(text_len + bos_len + audio_len + eos_len)
-                audio_idx += 1
-                remain_audios -= 1
-
-            elif min_ed == ed_vision_start and ids[ed_vision_start + 1] == image_token_id:
-                # ----- Image -----
-                grid_t = int(image_grid_thw[image_idx][0].item())
-                grid_h = int(image_grid_thw[image_idx][1].item())
-                grid_w = int(image_grid_thw[image_idx][2].item())
-                t_index = (
-                    torch.arange(grid_t).float() * 1 * position_id_per_seconds
-                )
-                llm_pos_ids = _get_llm_pos_ids_for_vision(
-                    st_idx, t_index, grid_h, grid_w, spatial_merge_size
-                )
-                image_len = (
-                    image_grid_thw[image_idx].prod() // (spatial_merge_size ** 2)
-                )
-                llm_pos_ids_list.append(llm_pos_ids)
-                st += int(text_len + bos_len + image_len + eos_len)
-                image_idx += 1
-                remain_images -= 1
-
-            elif min_ed == ed_vision_start and ids[ed_vision_start + 1] == video_token_id:
-                # ----- Video -----
-                grid_t = int(video_grid_thw[video_idx][0].item())
-                grid_h = int(video_grid_thw[video_idx][1].item())
-                grid_w = int(video_grid_thw[video_idx][2].item())
-                t_index = (
-                    torch.arange(grid_t).float()
-                    * second_per_grids[video_idx].cpu().float()
-                    * position_id_per_seconds
-                )
-                llm_pos_ids = _get_llm_pos_ids_for_vision(
-                    st_idx, t_index, grid_h, grid_w, spatial_merge_size
-                )
-                video_len = (
-                    video_grid_thw[video_idx].prod() // (spatial_merge_size ** 2)
-                )
-                llm_pos_ids_list.append(llm_pos_ids)
-                st += int(text_len + bos_len + video_len + eos_len)
-                video_idx += 1
-                remain_videos -= 1
-
-            # EOS token(s)
-            st_idx = (
-                llm_pos_ids_list[-1].max() + 1
-                if len(llm_pos_ids_list) > 0
-                else 0
-            )
-            llm_pos_ids_list.append(
-                torch.arange(eos_len).view(1, -1).expand(3, -1) + st_idx
-            )
-
-        # Trailing text
-        if st < len(input_tokens):
-            st_idx = (
-                llm_pos_ids_list[-1].max() + 1
-                if len(llm_pos_ids_list) > 0
-                else 0
-            )
-            text_len = len(input_tokens) - st
-            llm_pos_ids_list.append(
-                torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
-            )
-
-        llm_positions = torch.cat(
-            [item.float() for item in llm_pos_ids_list], dim=1
-        ).reshape(3, -1)
-
-        position_ids[..., i, attention_mask_bool[i]] = llm_positions.to(
-            position_ids.device
+        # Temporal is constant per image (= start_pos).  In the full HF
+        # multimodal parser the temporal component tracks video time via
+        # ``position_id_per_seconds``; for still images (grid_t == 1)
+        # that collapses to a single value per image.
+        temporal = torch.full(
+            (num_tokens,), float(start_pos), dtype=torch.float, device=device
         )
-        mrope_position_deltas.append(llm_positions.max() + 1 - len(ids))
 
-    mrope_position_deltas = torch.tensor(
-        mrope_position_deltas, device=input_ids.device
-    ).unsqueeze(1)
+        h_index = (
+            torch.arange(llm_grid_h, dtype=torch.float, device=device)
+            .view(1, -1, 1)
+            .expand(grid_t, -1, llm_grid_w)
+            .flatten()
+            + float(start_pos)
+        )
+        w_index = (
+            torch.arange(llm_grid_w, dtype=torch.float, device=device)
+            .view(1, 1, -1)
+            .expand(grid_t, llm_grid_h, -1)
+            .flatten()
+            + float(start_pos)
+        )
 
-    return position_ids, mrope_position_deltas
+        pos_ids_list.append(torch.stack([temporal, h_index, w_index], dim=0))
+
+    return torch.cat(pos_ids_list, dim=1)
