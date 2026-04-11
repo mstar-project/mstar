@@ -120,6 +120,23 @@ class Qwen3OmniModel(Model):
             local_dir, cache_dir=cache_dir, trust_remote_code=True,
         )
 
+        # Full multimodal processor: combines tokenizer + image_processor +
+        # video_processor + audio feature_extractor + chat template support.
+        # Used by process_prompt to build the full ChatML prompt with the
+        # correct image_pad / audio_pad / video_pad expansion.
+        try:
+            from transformers import AutoProcessor
+            self._processor = AutoProcessor.from_pretrained(
+                local_dir, cache_dir=cache_dir, trust_remote_code=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not load Qwen3-Omni AutoProcessor (%s); "
+                "process_prompt will fall back to raw tokenizer.encode.",
+                e,
+            )
+            self._processor = None
+
         # Lazy submodule cache -- each worker only loads what it needs
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
@@ -992,40 +1009,159 @@ class Qwen3OmniModel(Model):
         tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Tokenize text and compute derived multimodal tensors.
+        """Build the full ChatML prompt + derived multimodal tensors.
 
-        The data worker loads raw modality tensors (``image_inputs``,
-        ``audio_inputs``, ``video_inputs``) from ``file_paths`` and passes
-        them in via the ``tensors`` dict.  This method:
-          1. Tokenizes ``prompt`` to produce ``text_inputs``.
-          2. For each modality present in ``tensors``, computes derived
-             tensors needed by the Thinker's preprocess:
-             - ``image_inputs`` -> ``pixel_values`` + ``image_grid_thw``
-             - ``audio_inputs`` -> ``audio_features`` + ``audio_seqlens``
-             - ``video_inputs`` -> ``pixel_values_videos`` + ``video_grid_thw``
+        Uses HF's full ``AutoProcessor`` (combines tokenizer + image_processor
+        + video_processor + feature_extractor + chat template) to:
 
-        Returns only the NEW keys to merge into the data worker's tensor
-        dict (the existing ``*_inputs`` keys are preserved).
+        1. Build a ChatML-formatted prompt from ``prompt`` and any
+           multimodal inputs in ``tensors``.
+        2. Apply ``add_generation_prompt=True`` so the model receives the
+           ``<|im_start|>assistant\\n`` suffix and knows to start the
+           assistant response.
+        3. Run the image_processor / feature_extractor on the raw modality
+           tensors to produce ``pixel_values`` / ``image_grid_thw`` /
+           ``audio_features`` / ``audio_seqlens``.
+        4. Expand the single ``<|image_pad|>`` / ``<|audio_pad|>`` /
+           ``<|video_pad|>`` placeholder in the tokenized text to N copies
+           where N = number of patches after spatial merge (this is what
+           ``Qwen3OmniMoeProcessor.replace_multimodal_special_tokens`` does
+           internally).
+
+        The result has ``text_inputs`` containing the FULL templated +
+        expanded token IDs, plus the per-modality tensor outputs needed by
+        the Thinker's prefill walks.
         """
         result: NameToTensorList = {}
-
-        # --- Text tokenization ---
-        if prompt is not None:
-            tokens = self.tokenizer.encode(prompt)
-            result["text_inputs"] = [
-                torch.tensor(tokens, dtype=torch.long)
-            ]
 
         if tensors is None:
             tensors = {}
 
-        # --- Image processing: pixel_values + image_grid_thw ---
-        image_inputs = tensors.get("image_inputs", [])
-        if image_inputs:
-            # Use HF AutoImageProcessor if available for correct preprocessing
-            # (resizing, normalization, patch extraction, grid computation).
-            pixel_values_list = []
-            grid_thw_list = []
+        # ----- Convert raw modality tensors to PIL/numpy form for HF -----
+        raw_image_inputs = tensors.get("image_inputs", [])
+        raw_audio_inputs = tensors.get("audio_inputs", [])
+        raw_video_inputs = tensors.get("video_inputs", [])
+
+        pil_images: list = []
+        for img in raw_image_inputs:
+            # data_worker.py provides images as (C, H, W) float32 in [0, 1]
+            # on the GPU.  HF processors expect PIL/numpy uint8 (H, W, C)
+            # in [0, 255] -- otherwise the default do_rescale=True double-
+            # rescales and the model sees a near-zero (essentially black)
+            # tensor regardless of the actual image content.
+            if img.dtype.is_floating_point:
+                img_u8 = (img * 255.0).clamp(0, 255).to(torch.uint8)
+            else:
+                img_u8 = img
+            if img_u8.dim() == 3 and img_u8.shape[0] in (1, 3):
+                img_u8 = img_u8.permute(1, 2, 0)  # CHW -> HWC
+            pil_images.append(img_u8.cpu().contiguous().numpy())
+
+        np_audios: list = []
+        for waveform in raw_audio_inputs:
+            wave = waveform
+            if wave.dim() == 2 and wave.shape[0] > 1:
+                wave = wave.mean(dim=0)  # mix channels to mono
+            elif wave.dim() == 2:
+                wave = wave.squeeze(0)
+            np_audios.append(wave.cpu().numpy())
+
+        # ----- Try the full AutoProcessor path (preferred) -----
+        if self._processor is not None and prompt is not None:
+            try:
+                # Build the messages list for apply_chat_template.  The user
+                # turn contains all multimodal placeholders followed by the
+                # text prompt; the system turn provides the default Qwen
+                # assistant persona.
+                user_content: list[dict] = []
+                for _ in pil_images:
+                    user_content.append({"type": "image"})
+                for _ in np_audios:
+                    user_content.append({"type": "audio"})
+                for _ in raw_video_inputs:
+                    user_content.append({"type": "video"})
+                user_content.append({"type": "text", "text": prompt})
+
+                messages = [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "You are Qwen, a virtual human developed "
+                                    "by the Qwen team, Alibaba Group, capable "
+                                    "of perceiving auditory and visual inputs, "
+                                    "as well as generating text and speech."
+                                ),
+                            }
+                        ],
+                    },
+                    {"role": "user", "content": user_content},
+                ]
+
+                text = self._processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+
+                proc_out = self._processor(
+                    text=[text],
+                    images=pil_images if pil_images else None,
+                    audio=np_audios if np_audios else None,
+                    return_tensors="pt",
+                    padding=False,
+                )
+
+                # text_inputs comes from the processor's tokenizer call.
+                # Squeeze the batch dim (we only sent one prompt).
+                input_ids = proc_out["input_ids"][0]
+                result["text_inputs"] = [input_ids]
+
+                if "pixel_values" in proc_out:
+                    pv = proc_out["pixel_values"]
+                    # The HF Qwen image processor returns pixel_values as a
+                    # single fused (total_patches, ...) tensor for all images.
+                    # We pass it through as a single entry per image; the
+                    # Thinker prefill_vision walk handles per-image splitting.
+                    result["pixel_values"] = [pv]
+
+                if "image_grid_thw" in proc_out:
+                    # Shape (num_images, 3).  Pair with pixel_values entry.
+                    result["image_grid_thw"] = [proc_out["image_grid_thw"]]
+
+                if "input_features" in proc_out:
+                    # Audio features per request: list[(num_features, ...)]
+                    feats = proc_out["input_features"]
+                    result["audio_features"] = [feats]
+
+                if "feature_attention_mask" in proc_out:
+                    # Encode the original audio length per clip
+                    result["audio_seqlens"] = [
+                        proc_out["feature_attention_mask"].sum(-1).to(torch.long)
+                    ]
+
+                if "pixel_values_videos" in proc_out:
+                    result["pixel_values_videos"] = [proc_out["pixel_values_videos"]]
+                if "video_grid_thw" in proc_out:
+                    result["video_grid_thw"] = [proc_out["video_grid_thw"]]
+
+                return result
+            except Exception as e:
+                logger.warning(
+                    "Qwen3-Omni AutoProcessor failed (%s); falling back "
+                    "to per-modality processing without chat template.",
+                    e,
+                )
+
+        # ----- Fallback path: per-modality processing without chat template -----
+        # (Used when AutoProcessor fails to load or prompt is None.)
+        if prompt is not None:
+            tokens = self.tokenizer.encode(prompt)
+            result["text_inputs"] = [torch.tensor(tokens, dtype=torch.long)]
+
+        if pil_images:
             try:
                 processor = getattr(self, "_image_processor", None)
                 if processor is None:
@@ -1034,46 +1170,22 @@ class Qwen3OmniModel(Model):
                         self.local_dir, trust_remote_code=True,
                     )
                     self._image_processor = processor
-                for img in image_inputs:
-                    # data_worker.py provides images as (C, H, W) float32 in
-                    # [0, 1] on the GPU.  HF's Qwen2VLImageProcessor (which
-                    # Qwen3-Omni inherits) defaults to do_rescale=True with
-                    # rescale_factor=1/255, so passing already-normalized
-                    # [0, 1] floats causes a SECOND rescale (→[0, 0.004]) and
-                    # the model ends up seeing a uniform near-zero tensor —
-                    # i.e., "a completely black square".  Convert back to
-                    # uint8 [0, 255] HWC numpy (the PIL-equivalent format)
-                    # so the processor's full normalization pipeline runs
-                    # correctly.
-                    if img.dtype.is_floating_point:
-                        img_proc = (img * 255.0).clamp(0, 255).to(torch.uint8)
-                    else:
-                        img_proc = img
-                    if img_proc.dim() == 3 and img_proc.shape[0] in (1, 3):
-                        # CHW -> HWC for HF processor
-                        img_proc = img_proc.permute(1, 2, 0)
-                    img_proc = img_proc.cpu().contiguous().numpy()
-
-                    proc_out = processor(images=img_proc, return_tensors="pt")
+                pixel_values_list = []
+                grid_thw_list = []
+                for img_np in pil_images:
+                    proc_out = processor(images=img_np, return_tensors="pt")
                     pixel_values_list.append(proc_out["pixel_values"][0])
                     if "image_grid_thw" in proc_out:
                         grid_thw_list.append(proc_out["image_grid_thw"][0])
+                if pixel_values_list:
+                    result["pixel_values"] = pixel_values_list
+                if grid_thw_list:
+                    result["image_grid_thw"] = grid_thw_list
             except Exception as e:
-                logger.warning(
-                    "Qwen3-Omni: image processor unavailable (%s); "
-                    "passing raw image_inputs through as pixel_values", e,
-                )
-                pixel_values_list = list(image_inputs)
-            if pixel_values_list:
-                result["pixel_values"] = pixel_values_list
-            if grid_thw_list:
-                result["image_grid_thw"] = grid_thw_list
+                logger.warning("Image processor failed: %s", e)
+                result["pixel_values"] = list(raw_image_inputs)
 
-        # --- Audio processing: audio_features + audio_seqlens ---
-        audio_inputs = tensors.get("audio_inputs", [])
-        if audio_inputs:
-            audio_features_list = []
-            audio_seqlens_list = []
+        if np_audios:
             try:
                 processor = getattr(self, "_audio_processor", None)
                 if processor is None:
@@ -1082,42 +1194,25 @@ class Qwen3OmniModel(Model):
                         self.local_dir, trust_remote_code=True,
                     )
                     self._audio_processor = processor
-                for waveform in audio_inputs:
-                    # waveform: (channels, time) from data_worker.
-                    # Most processors expect mono (time,) or (1, time).
-                    wave = waveform
-                    if wave.dim() == 2 and wave.shape[0] > 1:
-                        wave = wave.mean(dim=0)  # mix channels to mono
-                    elif wave.dim() == 2:
-                        wave = wave.squeeze(0)
-                    sampling_rate = getattr(processor, "sampling_rate", 16000)
+                feats = []
+                seqlens = []
+                for wave_np in np_audios:
+                    sr = getattr(processor, "sampling_rate", 16000)
                     proc_out = processor(
-                        wave.cpu().numpy(),
-                        sampling_rate=sampling_rate,
-                        return_tensors="pt",
+                        wave_np, sampling_rate=sr, return_tensors="pt",
                     )
-                    audio_features_list.append(proc_out["input_features"][0])
-                    audio_seqlens_list.append(
-                        torch.tensor(wave.shape[-1], dtype=torch.long)
-                    )
+                    feats.append(proc_out["input_features"][0])
+                    seqlens.append(torch.tensor(wave_np.shape[-1], dtype=torch.long))
+                if feats:
+                    result["audio_features"] = feats
+                    result["audio_seqlens"] = seqlens
             except Exception as e:
-                logger.warning(
-                    "Qwen3-Omni: audio processor unavailable (%s); "
-                    "passing raw audio_inputs through as audio_features", e,
-                )
-                audio_features_list = list(audio_inputs)
-            if audio_features_list:
-                result["audio_features"] = audio_features_list
-            if audio_seqlens_list:
-                result["audio_seqlens"] = audio_seqlens_list
+                logger.warning("Audio processor failed: %s", e)
+                result["audio_features"] = list(raw_audio_inputs)
 
-        # --- Video processing: pixel_values_videos + video_grid_thw ---
-        video_inputs = tensors.get("video_inputs", [])
-        if video_inputs:
-            # TODO: proper video frame extraction + grid computation via
-            # AutoVideoProcessor (or AutoImageProcessor on stacked frames).
-            # For now, pass raw video tensors through.
-            result["pixel_values_videos"] = list(video_inputs)
+        if raw_video_inputs:
+            # TODO: proper video frame extraction + grid via AutoVideoProcessor.
+            result["pixel_values_videos"] = list(raw_video_inputs)
 
         return result
 
