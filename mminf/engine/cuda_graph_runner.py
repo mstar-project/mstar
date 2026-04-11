@@ -37,6 +37,7 @@ class CudaGraphConfig:
     dummy_capture_inputs: list[dict[str, list[torch.Tensor]]] # [{tensor_name: [tensor(s)]}]
     requires_cfg: bool  = False# whether CFG is active
     labels: list[str]  = field(default_factory=lambda: ["main"]) # cache labels used: ["main"] or ["main", "cfg_img"]
+    compile: bool = True
 
 
 @dataclass
@@ -275,12 +276,15 @@ class CudaGraphRunner:
                 if isinstance(v, torch.Tensor)
             ]
 
-            forward = torch.compile(
-                submodule.forward_batched,
-                mode="max-autotune-no-cudagraphs",
-                fullgraph=False,
-                dynamic=False,
-            )
+            if config.compile:
+                forward = torch.compile(
+                    submodule.forward_batched,
+                    mode="max-autotune-no-cudagraphs",
+                    fullgraph=False,
+                    dynamic=False,
+                )
+            else:
+                forward = submodule.forward_batched
 
             def run_forward():
                 return forward(

@@ -19,7 +19,7 @@ class ChunkPolicy(ABC):
         ...
 
     @abstractmethod
-    def window_size(self) -> int:
+    def window_size(self, items_consumed: int) -> int:
         """Return the full window of items to include in the chunk.
 
         For non-overlapping policies, equals next_chunk_size.
@@ -64,7 +64,35 @@ class SlidingWindowChunkPolicy(ChunkPolicy):
     def next_chunk_size(self, buffer_len: int, items_consumed: int) -> int:
         return self._stride
 
-    def window_size(self) -> int:
+    def window_size(self, items_consumed: int) -> int:
+        return self._window
+
+
+class LeftContextChunkPolicy(ChunkPolicy):
+    """Fixed-size sliding window that advances by a stride.
+
+    Each pop_chunk returns `window` items and advances the consumed
+    pointer by `stride`. Old items before the window are discarded.
+
+    Example (Orpheus SNAC): window=28 tokens (4 frames), stride=7 (1 frame).
+    """
+
+    def __init__(self, chunk: int, left_context: int):
+        self._chunk = chunk
+        self._left_context = left_context
+        self._window = chunk + left_context
+
+    def is_ready(self, buffer_len: int, items_consumed: int) -> bool:
+        if items_consumed == 0:
+            return buffer_len >= self._chunk
+        return buffer_len >= self._window
+
+    def next_chunk_size(self, buffer_len: int, items_consumed: int) -> int:
+        return self._chunk
+
+    def window_size(self, items_consumed: int) -> int:
+        if items_consumed == 0:
+            return self._chunk
         return self._window
 
 
@@ -90,7 +118,7 @@ class FixedChunkPolicy(ChunkPolicy):
     def next_chunk_size(self, buffer_len: int, items_consumed: int) -> int:
         return self._chunk_size
 
-    def window_size(self) -> int:
+    def window_size(self, items_consumed: int) -> int:
         return self._chunk_size
 
     def continue_after_producer_done(self) -> bool:

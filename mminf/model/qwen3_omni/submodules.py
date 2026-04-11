@@ -719,10 +719,11 @@ class ThinkerSubmodule(NodeSubmodule):
         "input_embeds" and "cos_sin_3d"; Talker uses "input_embeds").
         """
         return [
-            CudaGraphConfig(
-                graph_walk="thinker_decode", requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=[{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
-            ),
+            # CudaGraphConfig(
+            #     graph_walk="thinker_decode", requires_cfg=False, labels=["main"],
+            #     dummy_capture_inputs=[{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}],
+            #     compile=False
+            # ),
         ]
 
     def forward_batched(
@@ -1423,7 +1424,7 @@ class TalkerSubmodule(NodeSubmodule):
 
         # Record the sampled token so the next step's repetition penalty
         # biases against it.
-        self._mark_seen(rid, int(layer0_code.item()))
+        self._mark_seen(rid, layer0_code)
 
         # Run Code Predictor for residual codebook layers (float32 precision)
         all_codes = self._run_code_predictor(last_hidden, layer0_code)
@@ -1462,7 +1463,7 @@ class TalkerSubmodule(NodeSubmodule):
         num_groups = self.config.num_code_groups
         device = last_hidden.device
         all_codes = torch.zeros(num_groups, dtype=torch.long, device=device)
-        all_codes[0] = layer0_code.item()
+        all_codes[0] = layer0_code
 
         if num_groups <= 1:
             return all_codes
@@ -1578,13 +1579,14 @@ class TalkerSubmodule(NodeSubmodule):
         """
         num_groups = self.config.num_code_groups
         return [
-            CudaGraphConfig(
-                graph_walk="talker_decode", requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=[{
-                    "all_codes": [torch.zeros(num_groups, dtype=torch.long, device=device)],
-                    "thinker_states": [],
-                }]
-            ),
+            # CudaGraphConfig(
+            #     graph_walk="talker_decode", requires_cfg=False, labels=["main"],
+            #     dummy_capture_inputs=[{
+            #         "all_codes": [torch.zeros(num_groups, dtype=torch.long, device=device)],
+            #         "thinker_states": [],
+            #     }],
+            #     compile=False
+            # ),
         ]
 
     def forward_batched(
@@ -1639,7 +1641,8 @@ class TalkerSubmodule(NodeSubmodule):
                 repetition_penalty=self._talker_repetition_penalty,
                 seen_token_mask=seen_mask,
             )  # (1,)
-            self._mark_seen(rid, int(layer0_code.item()))
+            self._mark_seen(rid, layer0_code)
+            
             all_codes = self._run_code_predictor(last_hidden_i, layer0_code)
 
             result[rid] = {

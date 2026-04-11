@@ -47,7 +47,7 @@ from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
 from mminf.model.utils import Operation, WeightConverter
-from mminf.streaming.chunk_policy import FixedChunkPolicy, SlidingWindowChunkPolicy
+from mminf.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy, SlidingWindowChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
@@ -415,9 +415,9 @@ class Qwen3OmniModel(Model):
                     from_partition="Talker",
                     to_partition="Code2Wav",
                     edge_name="codec_tokens",
-                    chunk_policy_factory=lambda: SlidingWindowChunkPolicy(
-                        window=self.config.code2wav.chunk_size + self.config.code2wav.left_context_size,
-                        stride=self.config.code2wav.chunk_size
+                    chunk_policy_factory=lambda: LeftContextChunkPolicy(
+                        chunk=self.config.code2wav.chunk_size,
+                        left_context=self.config.code2wav.left_context_size
                     ),
                 ),
             ],

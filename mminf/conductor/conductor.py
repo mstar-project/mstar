@@ -480,6 +480,7 @@ class Conductor:
             pstate.is_done = fwd_args.request_done
 
             pstate.metadata = fwd_args.full_metadata
+            pstate.metadata.kwargs.update(fwd_args.step_metadata)
             self._set_partition_worker_graph_ids(
                 body.request_id, p.name, fwd_args.full_metadata.graph_walk,
             )
@@ -675,6 +676,7 @@ class Conductor:
 
         prev_walk = pstate.metadata.graph_walk
         pstate.metadata = fwd_args.full_metadata
+        pstate.metadata.kwargs.update(fwd_args.step_metadata)
 
         # Check max output tokens for partitions that produce tokens
         if pstate.num_output_tokens >= request_data.max_output_tokens:

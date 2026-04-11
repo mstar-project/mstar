@@ -98,7 +98,7 @@ class StreamBuffer:
         """
         self._update_buffer()
         buf_len = len(self._buffer)
-        window = self.policy.window_size()
+        window = self.policy.window_size(self._consumed)
         offset = self._consumed  # global position of buffer[0]
 
         if self._producer_done_and_all_read() and not self.policy.is_ready(buf_len, self._consumed):

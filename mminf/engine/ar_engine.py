@@ -148,7 +148,6 @@ class AREngine(BaseEngine):
     def warmup(self) -> None:
         """Compile submodules and capture CUDA graphs."""
         from mminf.engine.cuda_graph_runner import CudaGraphRunner
-        return # TODO DEBUG REMOVE
 
         if self.kv_cache is None or self.device is None:
             logger.info("AREngine: skipping warmup (no KV cache or device)")
@@ -284,7 +283,6 @@ class AREngine(BaseEngine):
         implementation on NodeSubmodule derives this from
         ``get_cuda_graph_capture_inputs(graph_walk) is not None``.
         """
-        return False # TODO DEBUG REMOVE
         submodule = self.submodules.get(batch.node_name)
         if submodule is None:
             return False
