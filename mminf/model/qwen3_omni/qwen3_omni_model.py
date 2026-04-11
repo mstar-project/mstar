@@ -1066,92 +1066,93 @@ class Qwen3OmniModel(Model):
                 wave = wave.squeeze(0)
             np_audios.append(wave.cpu().numpy())
 
-        # ----- Try the full AutoProcessor path (preferred) -----
+        # ----- Preferred path: text-only chat template + separate modality processors -----
+        #
+        # We deliberately DO NOT include image/audio/video content blocks in
+        # the messages list passed to apply_chat_template.  HF's chat template
+        # would otherwise insert ``<|vision_start|><|image_pad|>...<|vision_end|>``
+        # placeholders into text_inputs, which we don't want because:
+        #
+        #   1. Our prefill_vision / prefill_audio walks already wrap the
+        #      modality content in their own start/end tokens before pushing
+        #      it into the Thinker's KV cache.  Having the same wrapping in
+        #      text_inputs would make the model see each modality twice
+        #      (once as actual encoder embeddings via the modality walks,
+        #      once as generic token embeddings via prefill_text), which is
+        #      noise.
+        #
+        #   2. Unlike HF's single-shot prefill (which masked-scatter's the
+        #      vision embeds INTO the placeholder positions in input_embeds),
+        #      our multi-walk prefill builds up the same final KV cache via
+        #      sequential walks.  The modality placeholders in text_inputs
+        #      would never be replaced by real content in our flow.
+        #
+        # Functionally, both approaches end up with the same set of
+        # embeddings in the KV cache (text + modality content).  Stripping
+        # the placeholders avoids noise from the unfilled embeddings.
         if self._processor is not None and prompt is not None:
             try:
-                # Build the messages list for apply_chat_template.  The user
-                # turn contains all multimodal placeholders followed by the
-                # text prompt; the system turn provides the default Qwen
-                # assistant persona.
-                user_content: list[dict] = []
-                for _ in pil_images:
-                    user_content.append({"type": "image"})
-                for _ in np_audios:
-                    user_content.append({"type": "audio"})
-                for _ in raw_video_inputs:
-                    user_content.append({"type": "video"})
-                user_content.append({"type": "text", "text": prompt})
-
                 messages = [
                     {
                         "role": "system",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "You are Qwen, a virtual human developed "
-                                    "by the Qwen team, Alibaba Group, capable "
-                                    "of perceiving auditory and visual inputs, "
-                                    "as well as generating text and speech."
-                                ),
-                            }
-                        ],
+                        "content": (
+                            "You are Qwen, a virtual human developed by the "
+                            "Qwen team, Alibaba Group, capable of perceiving "
+                            "auditory and visual inputs, as well as generating "
+                            "text and speech."
+                        ),
                     },
-                    {"role": "user", "content": user_content},
+                    {"role": "user", "content": prompt},
                 ]
 
-                text = self._processor.apply_chat_template(
+                # apply_chat_template with TEXT-ONLY content -> no modality
+                # placeholders are inserted.  add_generation_prompt=True
+                # appends the trailing ``<|im_start|>assistant\n`` so the
+                # model knows to start the assistant response.
+                text = self.tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-
-                proc_out = self._processor(
-                    text=[text],
-                    images=pil_images if pil_images else None,
-                    audio=np_audios if np_audios else None,
-                    return_tensors="pt",
-                    padding=False,
-                )
-
-                # text_inputs comes from the processor's tokenizer call.
-                # Squeeze the batch dim (we only sent one prompt).
-                input_ids = proc_out["input_ids"][0]
+                input_ids = self.tokenizer(
+                    text, return_tensors="pt"
+                )["input_ids"][0]
                 result["text_inputs"] = [input_ids]
 
-                if "pixel_values" in proc_out:
-                    pv = proc_out["pixel_values"]
-                    # The HF Qwen image processor returns pixel_values as a
-                    # single fused (total_patches, ...) tensor for all images.
-                    # We pass it through as a single entry per image; the
-                    # Thinker prefill_vision walk handles per-image splitting.
-                    result["pixel_values"] = [pv]
+                # Run image_processor / feature_extractor SEPARATELY for the
+                # modality outputs.  These don't touch text_inputs.
+                if pil_images:
+                    img_proc = self._processor.image_processor
+                    img_out = img_proc(images=pil_images, return_tensors="pt")
+                    if "pixel_values" in img_out:
+                        result["pixel_values"] = [img_out["pixel_values"]]
+                    if "image_grid_thw" in img_out:
+                        result["image_grid_thw"] = [img_out["image_grid_thw"]]
 
-                if "image_grid_thw" in proc_out:
-                    # Shape (num_images, 3).  Pair with pixel_values entry.
-                    result["image_grid_thw"] = [proc_out["image_grid_thw"]]
+                if np_audios:
+                    feat_extractor = self._processor.feature_extractor
+                    sr = getattr(feat_extractor, "sampling_rate", 16000)
+                    aud_out = feat_extractor(
+                        np_audios, sampling_rate=sr, return_tensors="pt",
+                    )
+                    if "input_features" in aud_out:
+                        result["audio_features"] = [aud_out["input_features"]]
+                    if "attention_mask" in aud_out:
+                        result["audio_seqlens"] = [
+                            aud_out["attention_mask"].sum(-1).to(torch.long)
+                        ]
 
-                if "input_features" in proc_out:
-                    # Audio features per request: list[(num_features, ...)]
-                    feats = proc_out["input_features"]
-                    result["audio_features"] = [feats]
-
-                if "feature_attention_mask" in proc_out:
-                    # Encode the original audio length per clip
-                    result["audio_seqlens"] = [
-                        proc_out["feature_attention_mask"].sum(-1).to(torch.long)
-                    ]
-
-                if "pixel_values_videos" in proc_out:
-                    result["pixel_values_videos"] = [proc_out["pixel_values_videos"]]
-                if "video_grid_thw" in proc_out:
-                    result["video_grid_thw"] = [proc_out["video_grid_thw"]]
+                # Video uses the video_processor; left as TODO since our
+                # prefill_vision walk doesn't yet handle video frame stacks.
+                if raw_video_inputs:
+                    result["pixel_values_videos"] = list(raw_video_inputs)
 
                 return result
             except Exception as e:
                 logger.warning(
-                    "Qwen3-Omni AutoProcessor failed (%s); falling back "
-                    "to per-modality processing without chat template.",
+                    "Qwen3-Omni text-only chat template path failed (%s); "
+                    "falling back to per-modality processing without chat "
+                    "template.",
                     e,
                 )
 
