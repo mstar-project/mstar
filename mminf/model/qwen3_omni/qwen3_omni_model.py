@@ -332,8 +332,13 @@ class Qwen3OmniModel(Model):
             outputs=[
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
-                    name="all_codes",
+                    name="new_token",
                     is_new_token=True,
+                    persist=True,
+                ),
+                GraphEdge(
+                    next_node=EMPTY_DESTINATION,
+                    name="all_codes",
                     persist=True,
                 ),
                 StreamingGraphEdge(
