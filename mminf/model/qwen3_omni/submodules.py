@@ -1198,7 +1198,7 @@ class TalkerSubmodule(NodeSubmodule):
         all_codes = self._run_code_predictor(last_hidden, layer0_code)
 
         return {
-            "logits": [logits.squeeze(0)],    # Sampled by AR engine -> "new_token"
+            "logits": [logits],    # Sampled by AR engine -> "new_token"
             "all_codes": [all_codes],          # 32 code IDs, persisted for next step
             "codec_tokens": [all_codes],       # Streamed to Code2Wav
         }
@@ -1363,7 +1363,7 @@ class TalkerSubmodule(NodeSubmodule):
             all_codes = self._run_code_predictor(last_hidden_i, layer0_code)
 
             result[rid] = {
-                "logits": [logits_i.squeeze(0)],
+                "logits": [logits_i],
                 "all_codes": [all_codes],
                 "codec_tokens": [all_codes],
             }
