@@ -5,12 +5,16 @@ tokens during the flow-matching loop. It shares KV-cache dimensions with the
 PaliGemma expert (same num_kv_heads and head_dim) so it can attend to the
 prefix KV cache that PaliGemma wrote during the prefill walk.
 
-adaRMS conditioning: each layer takes per-iteration ``(scale, shift, gate)``
-parameters derived from a sinusoidal timestep embedding + MLP. The norm output
-is modulated as ``norm(x) * (1 + scale) + shift`` and the residual is gated by
-``gate``. The same condition vector is shared across all action tokens within
-one denoising step.
+adaRMS conditioning (matches openpi's modeling_gemma.GemmaRMSNorm with
+``cond_dim`` set): each RMSNorm contains an ``nn.Linear(cond_dim, dim*3)``
+that maps the shared ``adarms_cond`` vector to ``(scale, shift, gate)``. The
+normalization becomes ``rmsnorm(x) * (1 + scale) + shift`` and the residual
+connection becomes ``x + gate * y`` via :func:`_gated_residual`. The same
+``adarms_cond`` is fed into all norms within the action expert for a given
+Euler step.
 """
+
+from __future__ import annotations
 
 import torch
 from torch import nn
@@ -18,38 +22,82 @@ from torch import nn
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.model.pi05.components.paligemma import (
     Pi05GemmaMLP,
-    Pi05GemmaRMSNorm,
     Pi05PaliGemmaAttention,
 )
 from mminf.model.pi05.config import Pi05Config
-from mminf.utils.flashinfer_utils import run_rms_norm
 
 
-class Pi05AdaLNMLP(nn.Module):
-    """Maps a timestep embedding to per-layer adaRMS modulation parameters.
+class Pi05AdaRMSNorm(nn.Module):
+    """RMSNorm with adaRMS conditioning.
 
-    Output is a tensor of shape ``(num_layers, 6, hidden_size)`` containing
-    ``(scale_pre, shift_pre, gate_attn, scale_post, shift_post, gate_mlp)`` for
-    every transformer layer in the action expert.
+    When ``cond`` is provided, a per-norm ``nn.Linear(cond_dim, dim*3)`` maps
+    it to ``(scale, shift, gate)``. This mirrors the openpi reference norm
+    exactly: in the conditional path, the learned ``weight`` parameter is
+    intentionally unused — the modulation fully replaces it. The weight is
+    kept as a parameter only for checkpoint compatibility with the reference.
     """
 
-    def __init__(self, hidden_size: int, num_layers: int):
+    def __init__(self, hidden_size: int, cond_dim: int, eps: float = 1e-6):
         super().__init__()
-        self.num_layers = num_layers
         self.hidden_size = hidden_size
-        self.proj = nn.Linear(hidden_size, num_layers * 6 * hidden_size, bias=True)
+        self.cond_dim = cond_dim
+        self.variance_epsilon = eps
+        # Kept for checkpoint compatibility; not used in the cond forward path.
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.dense = nn.Linear(cond_dim, hidden_size * 3, bias=True)
+        # Zero-init so the norm starts as the identity (matches openpi).
+        nn.init.zeros_(self.dense.weight)
+        nn.init.zeros_(self.dense.bias)
+
+    def _rms_normalize(self, x: torch.Tensor) -> torch.Tensor:
+        # Compute RMS normalization in float32 (matches openpi's _norm).
+        orig_dtype = x.dtype
+        var = torch.mean(x.to(torch.float32).square(), dim=-1, keepdim=True)
+        normed = x.to(torch.float32) * torch.rsqrt(var + self.variance_epsilon)
+        return normed.to(orig_dtype)
+
+    def forward(
+        self, x: torch.Tensor, cond: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        normed = self._rms_normalize(x)
+        modulation = self.dense(cond)
+        if modulation.dim() == 1:
+            # cond was a single vector (e.g., [hidden]); broadcast to the seq.
+            scale, shift, gate = modulation.chunk(3, dim=-1)
+        else:
+            # cond was [B, hidden] -> modulation [B, 3*hidden]; add seq dim.
+            modulation = modulation.unsqueeze(-2)  # [B, 1, 3*hidden]
+            scale, shift, gate = modulation.chunk(3, dim=-1)
+        normed = normed * (1.0 + scale) + shift
+        return normed, gate
+
+
+def _gated_residual(
+    x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor | None
+) -> torch.Tensor:
+    """``x + gate * y`` with a None-gate fallback to plain addition."""
+    if gate is None:
+        return x + y
+    return x + y * gate
+
+
+class Pi05TimeMLP(nn.Module):
+    """Two-layer SiLU MLP applied to the sincos timestep embedding.
+
+    The openpi reference uses ``silu(Linear(silu(Linear(sincos(t)))))`` to
+    produce the ``adarms_cond`` vector that feeds every norm in the action
+    expert.
+    """
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.linear_in = nn.Linear(hidden_size, hidden_size)
+        self.linear_out = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, time_emb: torch.Tensor) -> torch.Tensor:
-        # time_emb: [hidden_size] or [B, hidden_size]
-        h = nn.functional.silu(time_emb)
-        out = self.proj(h)
-        return out.view(*out.shape[:-1], self.num_layers, 6, self.hidden_size)
-
-
-def _modulate(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
-    """Apply adaRMS modulation: ``x * (1 + scale) + shift`` (broadcasting on tokens)."""
-    # x: [seq, hidden]; scale/shift: [hidden]
-    return x * (1.0 + scale) + shift
+        h = nn.functional.silu(self.linear_in(time_emb))
+        h = self.linear_out(h)
+        return nn.functional.silu(h)
 
 
 class Pi05ActionExpertLayer(nn.Module):
@@ -57,49 +105,32 @@ class Pi05ActionExpertLayer(nn.Module):
         super().__init__()
         self.self_attn = Pi05PaliGemmaAttention(config)
         self.mlp = Pi05GemmaMLP(config.hidden_size, config.action_intermediate_size)
-        self.input_layernorm = Pi05GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Pi05GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Pi05AdaRMSNorm(
+            config.hidden_size, cond_dim=config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = Pi05AdaRMSNorm(
+            config.hidden_size, cond_dim=config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
         query_sequence: torch.Tensor,
         cache_handle: BatchedCacheManager,
-        adaln_params: torch.Tensor,
+        adarms_cond: torch.Tensor,
     ) -> torch.Tensor:
-        # adaln_params: [6, hidden_size] for this layer
-        scale_pre, shift_pre, gate_attn, scale_post, shift_post, gate_mlp = adaln_params.unbind(0)
-
-        # Pre-attention norm + modulation.
         residual = query_sequence
-        normed = run_rms_norm(
-            query_sequence,
-            self.input_layernorm.weight,
-            eps=self.input_layernorm.variance_epsilon,
-        )
-        normed = _modulate(normed, scale_pre, shift_pre)
+        normed, gate = self.input_layernorm(query_sequence, adarms_cond)
         attn_out = self.self_attn(query_sequence=normed, cache_handle=cache_handle)
-        query_sequence = residual + gate_attn * attn_out
+        query_sequence = _gated_residual(residual, attn_out, gate)
 
-        # Post-attention norm + modulation.
         residual = query_sequence
-        normed = run_rms_norm(
-            query_sequence,
-            self.post_attention_layernorm.weight,
-            eps=self.post_attention_layernorm.variance_epsilon,
-        )
-        normed = _modulate(normed, scale_post, shift_post)
+        normed, gate = self.post_attention_layernorm(query_sequence, adarms_cond)
         mlp_out = self.mlp(normed)
-        return residual + gate_mlp * mlp_out
+        return _gated_residual(residual, mlp_out, gate)
 
 
 class Pi05ActionExpert(nn.Module):
-    """Action expert transformer with adaRMS conditioning.
-
-    Forward signature takes the precomputed adaln parameters for the current
-    Euler step. The cache_handle is expected to be in read-only mode
-    (``write_cache=False``) so the action expert attends to the frozen PaliGemma
-    prefix without mutating it.
-    """
+    """Stack of action expert layers plus a final adaRMS norm."""
 
     def __init__(self, config: Pi05Config):
         super().__init__()
@@ -107,22 +138,22 @@ class Pi05ActionExpert(nn.Module):
         self.layers = nn.ModuleList(
             [Pi05ActionExpertLayer(config) for _ in range(config.num_layers)]
         )
-        self.norm = Pi05GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Pi05AdaRMSNorm(
+            config.hidden_size, cond_dim=config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
         query_sequence: torch.Tensor,
         cache_handle: BatchedCacheManager,
-        adaln_params: torch.Tensor,
+        adarms_cond: torch.Tensor,
     ) -> torch.Tensor:
-        # adaln_params: [num_layers, 6, hidden_size]
         for layer_idx, layer in enumerate(self.layers):
             cache_handle.set_layer_idx(layer_idx)
             query_sequence = layer(
                 query_sequence=query_sequence,
                 cache_handle=cache_handle,
-                adaln_params=adaln_params[layer_idx],
+                adarms_cond=adarms_cond,
             )
-        return run_rms_norm(
-            query_sequence, self.norm.weight, eps=self.norm.variance_epsilon
-        )
+        out, _ = self.norm(query_sequence, adarms_cond)
+        return out

@@ -46,7 +46,7 @@ from mminf.graph.base import (
 )
 from mminf.graph.special_destinations import EMIT_TO_CLIENT
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
-from mminf.model.pi05.components.action_expert import Pi05ActionExpert, Pi05AdaLNMLP
+from mminf.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mminf.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mminf.model.pi05.components.siglip import Pi05SiglipEncoder
 from mminf.model.pi05.components.tokenization import Pi05Tokenizer
@@ -85,7 +85,7 @@ class Pi05Model(Model):
         self.action_expert: Pi05ActionExpert | None = None
         self.action_in_proj: nn.Linear | None = None
         self.action_out_proj: nn.Linear | None = None
-        self.adaln_mlp: Pi05AdaLNMLP | None = None
+        self.time_mlp: Pi05TimeMLP | None = None
         self.siglip: Pi05SiglipEncoder | None = None
 
     # ------------------------------------------------------------------
@@ -348,7 +348,7 @@ class Pi05Model(Model):
                 action_expert=self.action_expert,
                 action_in_proj=self.action_in_proj,
                 action_out_proj=self.action_out_proj,
-                adaln_mlp=self.adaln_mlp,
+                time_mlp=self.time_mlp,
                 config=self.config,
             )
         return None
@@ -385,10 +385,7 @@ class Pi05Model(Model):
             self.action_out_proj = nn.Linear(
                 self.config.hidden_size, self.config.action_dim, bias=True
             )
-            self.adaln_mlp = Pi05AdaLNMLP(
-                hidden_size=self.config.hidden_size,
-                num_layers=self.config.num_layers,
-            )
+            self.time_mlp = Pi05TimeMLP(hidden_size=self.config.hidden_size)
 
         if self.skip_weight_loading:
             for mod in (
@@ -397,7 +394,7 @@ class Pi05Model(Model):
                 self.action_expert,
                 self.action_in_proj,
                 self.action_out_proj,
-                self.adaln_mlp,
+                self.time_mlp,
             ):
                 mod.to_empty(device=device)
             return
@@ -413,7 +410,7 @@ class Pi05Model(Model):
                 ModuleAndPrefix(self.action_expert, prefix="action_expert"),
                 ModuleAndPrefix(self.action_in_proj, prefix="action_in_proj"),
                 ModuleAndPrefix(self.action_out_proj, prefix="action_out_proj"),
-                ModuleAndPrefix(self.adaln_mlp, prefix="adaln_mlp"),
+                ModuleAndPrefix(self.time_mlp, prefix="time_mlp"),
             ],
             device=device,
         )

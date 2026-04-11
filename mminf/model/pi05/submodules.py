@@ -19,7 +19,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.model.base import NodeSubmodule
-from mminf.model.pi05.components.action_expert import Pi05ActionExpert, Pi05AdaLNMLP
+from mminf.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mminf.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mminf.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mminf.model.pi05.components.siglip import Pi05SiglipEncoder
@@ -123,7 +123,7 @@ class Pi05LLMSubmodule(NodeSubmodule):
         action_expert: Pi05ActionExpert,
         action_in_proj: nn.Linear,
         action_out_proj: nn.Linear,
-        adaln_mlp: Pi05AdaLNMLP,
+        time_mlp: Pi05TimeMLP,
         config: Pi05Config,
     ):
         super().__init__()
@@ -132,7 +132,7 @@ class Pi05LLMSubmodule(NodeSubmodule):
         self.action_expert = action_expert
         self.action_in_proj = action_in_proj
         self.action_out_proj = action_out_proj
-        self.adaln_mlp = adaln_mlp
+        self.time_mlp = time_mlp
         self.config = config
         self._embed_scale = math.sqrt(config.hidden_size)
 
@@ -297,7 +297,7 @@ class Pi05LLMSubmodule(NodeSubmodule):
             min_period=config.timestep_min_period,
             max_period=config.timestep_max_period,
         ).squeeze(0)
-        adaln_params = self.adaln_mlp(time_emb)  # [num_layers, 6, hidden]
+        adarms_cond = self.time_mlp(time_emb)  # [hidden]
 
         suffix = self.action_in_proj(noisy_actions)  # [horizon, hidden]
 
@@ -306,7 +306,7 @@ class Pi05LLMSubmodule(NodeSubmodule):
         suffix_out = self.action_expert(
             query_sequence=suffix,
             cache_handle=cache_handle,
-            adaln_params=adaln_params,
+            adarms_cond=adarms_cond,
         )
 
         velocity = self.action_out_proj(suffix_out)  # [horizon, action_dim]
