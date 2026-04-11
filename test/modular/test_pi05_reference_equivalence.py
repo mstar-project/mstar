@@ -775,3 +775,91 @@ def test_pi05_siglip_encoder_matches_hf_reference():
     # Connector output shape: [batch, num_patches, llm_hidden_size]
     n_patches = (config.vit_image_size // config.vit_patch_size) ** 2
     assert ours_full.shape == (2, n_patches, config.hidden_size)
+
+
+# ----------------------------------------------------------------------
+# Image preprocessing (resize-with-pad letterbox)
+# ----------------------------------------------------------------------
+
+
+def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """Reference port of ``image_tools.resize_with_pad_torch`` (channels-first
+    float32 path). Used to verify ``Pi05ViTEncoderSubmodule._preprocess_one``.
+    """
+    assert images.dim() == 4 and images.dtype == torch.float32
+    _, _, cur_h, cur_w = images.shape
+    ratio = max(cur_w / target_w, cur_h / target_h)
+    resized_h = int(cur_h / ratio)
+    resized_w = int(cur_w / ratio)
+    resized = torch.nn.functional.interpolate(
+        images, size=(resized_h, resized_w), mode="bilinear", align_corners=False
+    ).clamp(-1.0, 1.0)
+    pad_h0, rem_h = divmod(target_h - resized_h, 2)
+    pad_h1 = pad_h0 + rem_h
+    pad_w0, rem_w = divmod(target_w - resized_w, 2)
+    pad_w1 = pad_w0 + rem_w
+    return torch.nn.functional.pad(
+        resized, (pad_w0, pad_w1, pad_h0, pad_h1), mode="constant", value=-1.0
+    )
+
+
+def test_pi05_image_preprocessing_matches_resize_with_pad_letterbox():
+    """``Pi05ViTEncoderSubmodule._preprocess_one`` vs openpi's resize_with_pad_torch.
+
+    Tests three cases that exercise the letterbox path:
+      * already-target square (no resize / no pad — identity-ish)
+      * landscape (wider than tall) — pads top/bottom
+      * portrait (taller than wide) — pads left/right
+      * non-divisible odd dims — exercises the asymmetric pad calculation
+    """
+    from mminf.model.pi05.components.siglip import Pi05SiglipEncoder
+    from mminf.model.pi05.submodules import Pi05ViTEncoderSubmodule
+
+    cfg = Pi05Config(
+        vit_hidden_size=64,
+        vit_intermediate_size=128,
+        vit_num_layers=2,
+        vit_num_heads=4,
+        vit_patch_size=14,
+        vit_image_size=224,
+        hidden_size=128,
+        num_cameras=1,
+    )
+    encoder = Pi05SiglipEncoder(cfg)
+    submodule = Pi05ViTEncoderSubmodule(encoder=encoder, config=cfg)
+
+    cases = [
+        ("square_target", (1, 3, 224, 224)),
+        ("landscape", (1, 3, 100, 320)),
+        ("portrait", (1, 3, 480, 200)),
+        ("odd_dims", (1, 3, 137, 281)),
+    ]
+    for name, shape in cases:
+        torch.manual_seed(hash(name) & 0xFFFF)
+        images = torch.rand(*shape) * 2.0 - 1.0  # [-1, 1] float32
+        ours = submodule._preprocess_one(images)
+        ref = _ref_resize_with_pad(images, cfg.vit_image_size, cfg.vit_image_size)
+        assert ours.shape == ref.shape == (1, 3, 224, 224), f"{name}: shape mismatch"
+        # Padding regions are exactly -1, content region matches the resized
+        # image bit-exactly. Both go through the same interpolate kernel.
+        assert torch.equal(ours, ref), (
+            f"{name}: max delta {(ours - ref).abs().max().item():.4e}"
+        )
+
+
+def test_pi05_image_preprocessing_uint8_to_float():
+    """uint8 inputs in [0, 255] are auto-converted to float32 [-1, 1]."""
+    from mminf.model.pi05.components.siglip import Pi05SiglipEncoder
+    from mminf.model.pi05.submodules import Pi05ViTEncoderSubmodule
+
+    cfg = Pi05Config(vit_image_size=224, num_cameras=1, vit_hidden_size=64,
+                     vit_intermediate_size=128, vit_num_layers=2, vit_num_heads=4,
+                     vit_patch_size=14, hidden_size=128)
+    submodule = Pi05ViTEncoderSubmodule(Pi05SiglipEncoder(cfg), cfg)
+    images_u8 = torch.zeros(1, 3, 224, 224, dtype=torch.uint8)
+    images_u8[..., 100:200, 100:200] = 255
+    out = submodule._preprocess_one(images_u8)
+    assert out.dtype == torch.float32
+    # Background pixels (0) -> -1, foreground pixels (255) -> +1.
+    assert out[0, 0, 0, 0].item() == pytest.approx(-1.0, abs=1e-6)
+    assert out[0, 0, 150, 150].item() == pytest.approx(1.0, abs=1e-6)

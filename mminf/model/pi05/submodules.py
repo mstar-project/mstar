@@ -43,12 +43,16 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         self.config = config
 
     def _preprocess_one(self, images: torch.Tensor) -> torch.Tensor:
-        """Resize / normalize one request's stack of camera images.
+        """Resize one request's stack of camera images with aspect-preserving
+        letterbox padding.
 
-        Pi0.5 expects 224x224 images normalized to [-1, 1]. We do a simple
-        resize without aspect-ratio preservation; the openpi reference uses
-        zero-padding letterboxing, but for inference both work as long as the
-        client preprocesses consistently.
+        Matches openpi's ``image_tools.resize_with_pad_torch`` exactly:
+        the longer dimension is scaled to the target size, the shorter
+        dimension is scaled proportionally, and the result is padded with
+        ``-1`` (the float32 normalized "black" value) to reach the target
+        resolution. The contract is that callers provide images already
+        normalized to ``[-1, 1]`` in float32 (matching the lerobot
+        preprocessor); uint8 inputs in ``[0, 255]`` are auto-converted.
         """
         if images.dim() == 3:
             # [C, H, W] -- single camera; add a leading camera dim.
@@ -57,19 +61,35 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
             raise ValueError(
                 f"Expected images shape [num_cameras, C, H, W], got {tuple(images.shape)}"
             )
-        target = self.config.vit_image_size
-        if images.shape[-2] != target or images.shape[-1] != target:
-            images = nn.functional.interpolate(
-                images.float(), size=(target, target), mode="bilinear", align_corners=False
-            )
+
+        if images.dtype == torch.uint8:
+            # uint8 [0, 255] → float32 [-1, 1]
+            images = images.to(torch.float32) / 127.5 - 1.0
         else:
-            images = images.float()
-        # Normalize uint8/[0,255] or [0,1] to [-1, 1]. Detect range heuristically.
-        if images.max() > 1.5:
-            images = images / 127.5 - 1.0
-        else:
-            images = images * 2.0 - 1.0
-        return images
+            images = images.to(torch.float32)
+
+        target_h = target_w = self.config.vit_image_size
+        _, _, cur_h, cur_w = images.shape
+
+        if (cur_h, cur_w) == (target_h, target_w):
+            return images.clamp(-1.0, 1.0)
+
+        # Aspect-preserving resize: scale by max(cur/target).
+        ratio = max(cur_w / target_w, cur_h / target_h)
+        resized_h = int(cur_h / ratio)
+        resized_w = int(cur_w / ratio)
+        resized = nn.functional.interpolate(
+            images, size=(resized_h, resized_w), mode="bilinear", align_corners=False
+        ).clamp(-1.0, 1.0)
+
+        # Symmetric pad with -1.0 (float32 "black" in the [-1, 1] convention).
+        pad_h0, rem_h = divmod(target_h - resized_h, 2)
+        pad_h1 = pad_h0 + rem_h
+        pad_w0, rem_w = divmod(target_w - resized_w, 2)
+        pad_w1 = pad_w0 + rem_w
+        return nn.functional.pad(
+            resized, (pad_w0, pad_w1, pad_h0, pad_h1), mode="constant", value=-1.0
+        )
 
     def preprocess(
         self,
@@ -180,14 +200,18 @@ class Pi05LLMSubmodule(NodeSubmodule):
         request_ids: list[str],
         cache_manager: BatchedCacheManager,
     ) -> dict[str, torch.Tensor]:
+        # Pi0.5 prefix layout (matches lerobot's embed_prefix):
+        #   [image_tokens, language_tokens]
+        # The robot state is *not* a separate token stream — it has already
+        # been formatted as a decimal-string suffix on the language prompt
+        # by ``Pi05Model.process_prompt``, then tokenized by the PaliGemma
+        # tokenizer. So the LLM only consumes ``img_emb`` + ``text_inputs``.
         per_request_seqs = []
         for inp in per_request_inputs:
             img_emb = inp["img_emb"][0]
             text_ids = inp["text_inputs"][0]
-            state_ids = inp["state_inputs"][0]
             text_emb = self._embed_tokens_scaled(text_ids)
-            state_emb = self._embed_tokens_scaled(state_ids)
-            per_request_seqs.append(torch.cat([img_emb, text_emb, state_emb], dim=0))
+            per_request_seqs.append(torch.cat([img_emb, text_emb], dim=0))
 
         seq_lens = [seq.shape[0] for seq in per_request_seqs]
         prefix_embs = torch.cat(per_request_seqs, dim=0)

@@ -159,6 +159,12 @@ class Pi05Model(Model):
         }
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
+        # Pi0.5 encodes the robot state as a decimal-string suffix on the
+        # language prompt (e.g. "Task: pick up the block, State: 12 87 ...;
+        # \nAction: ") and tokenizes the whole thing with the PaliGemma
+        # tokenizer. So the model only ever sees a single "text_inputs"
+        # stream — there are no separate state-bin tokens. This matches
+        # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
         prefill = Sequential(
             [
                 GraphNode(
@@ -168,7 +174,7 @@ class Pi05Model(Model):
                 ),
                 GraphNode(
                     name="LLM",
-                    input_ids=["img_emb", "text_inputs", "state_inputs"],
+                    input_ids=["img_emb", "text_inputs"],
                     outputs=[],
                 ),
             ]
@@ -210,32 +216,49 @@ class Pi05Model(Model):
         output_modalities: list[str],
         **kwargs,
     ) -> NameToTensorList:
-        result: NameToTensorList = {}
+        """Tokenize the Pi0.5 prompt + robot state into a single token stream.
 
-        if prompt is not None and self.tokenizer is not None:
-            text_ids = self.tokenizer.encode_prompt(prompt)
-            result["text_inputs"] = [text_ids]
-        elif prompt is not None:
-            result["text_inputs"] = [
-                torch.tensor(list(prompt.encode("utf-8")), dtype=torch.long)
-            ]
+        Pi0.5's production preprocessor (lerobot's
+        ``Pi05PrepareStateTokenizerProcessorStep``) builds a prompt of the
+        form::
+
+            "Task: <text>, State: <bin0> <bin1> ... <bin31>;\\nAction: "
+
+        where each ``<bin_i>`` is the integer index (0–255) obtained by
+        digitizing the normalized state into 256 bins. The PaliGemma
+        tokenizer then encodes the whole string. We mirror that exactly
+        here so the resulting ``text_inputs`` stream matches the production
+        format.
+        """
+        if self.tokenizer is None:
+            # Tokenizer-less fallback used by structural unit tests.
+            if prompt is not None:
+                return {
+                    "text_inputs": [
+                        torch.tensor(list(prompt.encode("utf-8")), dtype=torch.long)
+                    ]
+                }
+            return {}
+
+        cleaned = (prompt or "").strip().replace("_", " ").replace("\n", " ")
 
         robot_state = kwargs.get("robot_state")
         if robot_state is not None:
             if not isinstance(robot_state, torch.Tensor):
                 robot_state = torch.tensor(robot_state, dtype=torch.float32)
-            if self.tokenizer is not None:
-                state_ids = self.tokenizer.encode_state(robot_state)
-            else:
-                from mminf.model.pi05.components.flow_matching import discretize_state
+            from mminf.model.pi05.components.flow_matching import discretize_state
 
-                state_ids = discretize_state(
-                    robot_state.to(torch.float32),
-                    num_bins=self.config.state_token_bins,
-                ) + self.config.state_token_offset
-            result["state_inputs"] = [state_ids]
+            bins = discretize_state(
+                robot_state.to(torch.float32),
+                num_bins=self.config.state_token_bins,
+            ).tolist()
+            state_str = " ".join(str(b) for b in bins)
+            full_prompt = f"Task: {cleaned}, State: {state_str};\nAction: "
+        else:
+            full_prompt = cleaned
 
-        return result
+        text_ids = self.tokenizer.encode_prompt(full_prompt)
+        return {"text_inputs": [text_ids]}
 
     def postprocess(self, output: torch.Tensor, modality: str) -> bytes:
         if modality == "action":
@@ -270,10 +293,6 @@ class Pi05Model(Model):
         if "text_inputs" in input_signals:
             edge = GraphEdge(next_node="LLM", name="text_inputs")
             edge.tensor_info = input_signals["text_inputs"]
-            inputs.append(edge)
-        if "state_inputs" in input_signals:
-            edge = GraphEdge(next_node="LLM", name="state_inputs")
-            edge.tensor_info = input_signals["state_inputs"]
             inputs.append(edge)
 
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])

@@ -76,8 +76,9 @@ def test_pi05_prefill_is_sequential_vit_then_llm():
         edge.next_node == "LLM" and edge.name == "img_emb"
         for edge in first.outputs
     )
-    # LLM consumes img_emb + text_inputs + state_inputs.
-    assert set(second.input_ids) == {"img_emb", "text_inputs", "state_inputs"}
+    # LLM consumes img_emb + text_inputs (state is encoded in text_inputs
+    # as a decimal-string suffix per Pi0.5's prompt format).
+    assert set(second.input_ids) == {"img_emb", "text_inputs"}
 
 
 def test_pi05_action_gen_is_loop_with_action_output_emission():
@@ -147,7 +148,6 @@ def test_pi05_initial_forward_pass_args_starts_in_prefill():
         input_signals={
             "image_inputs": [],
             "text_inputs": [],
-            "state_inputs": [],
         },
     )
     assert args.full_metadata.graph_walk == Pi05Model.PREFILL_WALK
@@ -155,7 +155,8 @@ def test_pi05_initial_forward_pass_args_starts_in_prefill():
     edge_targets = {(e.next_node, e.name) for e in args.inputs}
     assert ("vit_encoder", "image_inputs") in edge_targets
     assert ("LLM", "text_inputs") in edge_targets
-    assert ("LLM", "state_inputs") in edge_targets
+    # Pi0.5 has no separate state_inputs edge — state is part of text_inputs.
+    assert not any(e.name == "state_inputs" for e in args.inputs)
 
 
 def test_pi05_prefill_transitions_to_action_gen():
@@ -241,3 +242,65 @@ def test_discretize_state_round_trip_within_bin():
     # Endpoints should map to the extreme bins.
     assert indices[0].item() == 0
     assert indices[-1].item() == 255
+
+
+# ----------------------------------------------------------------------
+# Prompt formatting (matches lerobot's Pi05PrepareStateTokenizerProcessorStep)
+# ----------------------------------------------------------------------
+
+
+class _StubTokenizer:
+    """Captures the prompt string passed to encode_prompt for assertion."""
+
+    def __init__(self):
+        self.last_prompt: str | None = None
+
+    def encode_prompt(self, prompt: str) -> torch.Tensor:
+        self.last_prompt = prompt
+        # Return a deterministic tensor of length 1; the test only inspects
+        # last_prompt.
+        return torch.tensor([0], dtype=torch.long)
+
+
+def test_pi05_process_prompt_formats_state_into_text():
+    """Pi05Model.process_prompt should produce the openpi-style template
+    ``"Task: <text>, State: <bin0> <bin1> ... <bin31>;\\nAction: "`` and
+    pass it as a SINGLE call to the tokenizer's encode_prompt. This matches
+    ``lerobot/policies/pi05/processor_pi05.py::Pi05PrepareStateTokenizerProcessorStep``.
+    """
+    model = _make_model()
+    stub = _StubTokenizer()
+    model.tokenizer = stub
+
+    state = torch.linspace(-1.0, 1.0, steps=4)  # 4 dims for the test
+    result = model.process_prompt(
+        prompt="pick up the\nblock",
+        input_modalities=["image", "text"],
+        output_modalities=["action"],
+        robot_state=state,
+    )
+
+    # Result is a single text_inputs entry — no separate state_inputs.
+    assert set(result.keys()) == {"text_inputs"}
+    assert stub.last_prompt is not None
+    # Underscores in the task aren't expected here, but newlines are stripped.
+    assert "pick up the block" in stub.last_prompt
+    # State bins are integers in [0, 255]; check the format prefix/suffix.
+    assert stub.last_prompt.startswith("Task: pick up the block, State: ")
+    assert stub.last_prompt.endswith(";\nAction: ")
+    # 4 state values -> 4 bin numbers, the first should be 0 and last 255.
+    assert " 0 " in stub.last_prompt or stub.last_prompt.split("State: ", 1)[1].startswith("0 ")
+    assert "255" in stub.last_prompt
+
+
+def test_pi05_process_prompt_without_state_uses_plain_text():
+    model = _make_model()
+    stub = _StubTokenizer()
+    model.tokenizer = stub
+    result = model.process_prompt(
+        prompt="hello world",
+        input_modalities=["text"],
+        output_modalities=["action"],
+    )
+    assert "text_inputs" in result
+    assert stub.last_prompt == "hello world"

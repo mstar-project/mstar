@@ -498,3 +498,161 @@ def test_pi05_paligemma_expert_matches_lerobot_real_weights():
     print(f"PaliGemma per-layer K,V: worst rel err = {worst_layer_rel:.4e}")
     # Same precision-accumulation reasoning as for the hidden state.
     assert worst_layer_rel < 1e-2, f"layer KV rel err {worst_layer_rel:.4e} too large"
+
+
+def test_pi05_full_stack_matches_lerobot_real_weights():
+    """End-to-end mminf vs lerobot using **only** mminf code for the math.
+
+    Unlike the action-expert e2e test (which feeds lerobot's prefix KV cache
+    into mminf's action expert), this test runs the entire pipeline through
+    mminf:
+
+      1. Pi05PaliGemmaExpert.forward over the prefix embeddings produces the
+         per-layer K, V (captured by a mock cache handle).
+      2. Pi05ActionExpert runs the 10-step Euler flow-matching loop, reading
+         the prefix KV cache that mminf itself just wrote (not lerobot's).
+      3. Final action trajectory is compared to lerobot's sample_actions
+         output.
+
+    This is the strictest validation: the only place lerobot is used is to
+    embed images via SigLIP/PaliGemma's get_image_features (we share that)
+    and to compute the reference action trajectory. Every transformer layer
+    on the mminf side runs through mminf code with copied weights.
+    """
+    from lerobot.policies.pi05 import PI05Policy
+
+    device = torch.device("cuda")
+    dtype = torch.float32
+    seed = 0
+    torch.manual_seed(seed)
+
+    policy = PI05Policy.from_pretrained(PI05_REPO).to(device).eval()
+    model = policy.model
+    config = policy.config
+    paligemma = model.paligemma_with_expert.paligemma
+    gemma_expert = model.paligemma_with_expert.gemma_expert
+    lm = paligemma.model.language_model
+
+    action_hidden = model.action_in_proj.out_features
+    head_dim = lm.layers[0].self_attn.head_dim
+    num_qo_heads = lm.layers[0].self_attn.config.num_attention_heads
+    num_kv_heads = lm.layers[0].self_attn.config.num_key_value_heads
+    pali_hidden = lm.layers[0].self_attn.config.hidden_size
+    pali_intermediate = lm.layers[0].mlp.gate_proj.out_features
+    rms_eps = lm.layers[0].input_layernorm.eps
+
+    # Deterministic input
+    bsize = 1
+    horizon = config.chunk_size
+    action_dim = config.max_action_dim
+    g = torch.Generator(device=device).manual_seed(seed)
+    images = [
+        torch.rand(bsize, 3, 224, 224, device=device, generator=g) * 2 - 1
+        for _ in range(3)
+    ]
+    img_masks = [torch.ones(bsize, dtype=torch.bool, device=device) for _ in range(3)]
+    tokens = torch.randint(0, 200, (bsize, 4), device=device, generator=g)
+    masks = torch.ones(bsize, 4, dtype=torch.bool, device=device)
+    noise = torch.randn(bsize, horizon, action_dim, device=device, generator=g, dtype=torch.float32)
+
+    # ----- Reference: lerobot end-to-end -----
+    ref_actions = model.sample_actions(
+        images=[i.to(dtype) for i in images],
+        img_masks=img_masks,
+        tokens=tokens,
+        masks=masks,
+        noise=noise,
+        num_steps=config.num_inference_steps,
+    )
+
+    # ----- Build mminf PaliGemma expert and copy weights -----
+    pali_cfg = Pi05Config(
+        hidden_size=pali_hidden,
+        num_layers=len(lm.layers),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        pali_intermediate_size=pali_intermediate,
+        rms_norm_eps=rms_eps,
+    )
+    ours_pali = Pi05PaliGemmaExpert(pali_cfg).to(device, dtype=dtype)
+    _copy_paligemma_expert(ours_pali, lm.layers, lm.norm)
+
+    # ----- Build mminf action expert with matching dims -----
+    ae_cfg = Pi05Config(
+        hidden_size=pali_hidden,
+        action_hidden_size=action_hidden,
+        num_layers=len(gemma_expert.model.layers),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        action_intermediate_size=gemma_expert.model.layers[0].mlp.gate_proj.out_features,
+        rms_norm_eps=gemma_expert.model.layers[0].input_layernorm.eps,
+    )
+    ours_action = Pi05ActionExpert(ae_cfg).to(device, dtype=dtype)
+    _copy_action_expert(ours_action, gemma_expert.model.layers, gemma_expert.model.norm)
+
+    ours_time_mlp = Pi05TimeMLP(action_hidden).to(device, dtype=dtype)
+    with torch.no_grad():
+        ours_time_mlp.linear_in.weight.copy_(model.time_mlp_in.weight)
+        ours_time_mlp.linear_in.bias.copy_(model.time_mlp_in.bias)
+        ours_time_mlp.linear_out.weight.copy_(model.time_mlp_out.weight)
+        ours_time_mlp.linear_out.bias.copy_(model.time_mlp_out.bias)
+
+    # ----- Embed prefix via lerobot's embed_prefix (SigLIP + lang embeddings) -----
+    prefix_embs, prefix_pad_masks, _ = model.embed_prefix(
+        [i.to(dtype) for i in images], img_masks, tokens, masks
+    )
+    prefix_len = int(prefix_pad_masks.sum(dim=-1).item())
+
+    # ----- Step 1: run mminf PaliGemma to populate the per-layer KV cache -----
+    prefill_handle = _PrefixCacheCapture(head_dim=head_dim, prefix_len=prefix_len)
+    ours_pali(
+        query_sequence=prefix_embs[0],
+        cache_handle=prefill_handle,
+        write_cache=False,
+    )
+
+    # ----- Step 2: feed mminf's captured KV cache into the action expert handle -----
+    suffix_positions = torch.arange(horizon, device=device, dtype=torch.long) + prefix_len
+    action_handle = _MockCacheHandle(head_dim=head_dim, suffix_positions=suffix_positions)
+    for layer_idx in range(ae_cfg.num_layers):
+        action_handle._prefix_kv[layer_idx] = prefill_handle.captured_kv[layer_idx]
+
+    # ----- Step 3: run mminf 10-step Euler flow-matching loop -----
+    num_steps = config.num_inference_steps
+    dt = -1.0 / num_steps
+    x_t = noise.clone()
+    time = torch.tensor(1.0, device=device, dtype=dtype)
+    for _ in range(num_steps):
+        time_emb = sincos_timestep_embedding(
+            time.unsqueeze(0),
+            dim=action_hidden,
+            min_period=config.min_period,
+            max_period=config.max_period,
+        ).squeeze(0)
+        adarms_cond = ours_time_mlp(time_emb.to(dtype))
+        suffix = model.action_in_proj(x_t[0])
+        suffix_out = ours_action(query_sequence=suffix, cache_handle=action_handle, adarms_cond=adarms_cond)
+        v_t = model.action_out_proj(suffix_out)
+        x_t = x_t + dt * v_t.unsqueeze(0)
+        time = time + dt
+    ours_actions = x_t
+
+    max_delta = (ours_actions - ref_actions).abs().max().item()
+    mean_delta = (ours_actions - ref_actions).abs().mean().item()
+    mean_rel = ((ours_actions - ref_actions).abs() / (ref_actions.abs() + 1e-6)).mean().item()
+    print(
+        f"\nPi0.5 FULL STACK e2e (lerobot/pi05_base): max abs delta = {max_delta:.4e}, "
+        f"mean abs delta = {mean_delta:.4e}, mean rel err = {mean_rel:.4e}"
+    )
+    print(f"  ref abs max: {ref_actions.abs().max().item():.4f}")
+    print(f"  first 4 ref:  {ref_actions[0, 0, :4].cpu().tolist()}")
+    print(f"  first 4 ours: {ours_actions[0, 0, :4].cpu().tolist()}")
+    # mminf's PaliGemma diverges from lerobot's by ~3e-3 in K/V (float32
+    # accumulation). That error feeds into the action expert's attention,
+    # so the final action trajectory shows somewhat larger drift than the
+    # action-expert-only test (~2e-4). Allow up to 1e-2 max abs delta and
+    # 5e-2 mean relative.
+    assert max_delta < 1e-2, f"full-stack max delta {max_delta:.4e} too large"
+    assert mean_rel < 5e-2, f"full-stack mean rel err {mean_rel:.4e} too large"
