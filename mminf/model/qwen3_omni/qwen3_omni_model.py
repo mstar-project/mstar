@@ -1109,7 +1109,7 @@ class Qwen3OmniModel(Model):
                 # placeholders are inserted.  add_generation_prompt=True
                 # appends the trailing ``<|im_start|>assistant\n`` so the
                 # model knows to start the assistant response.
-                text = self.tokenizer.apply_chat_template(
+                text = self._processor.apply_chat_template(
                     messages,
                     tokenize=False,
                     add_generation_prompt=True,
