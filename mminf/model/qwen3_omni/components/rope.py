@@ -53,6 +53,7 @@ def compute_3d_cos_sin(
     inv_freq: torch.Tensor,
     mrope_section: list[int] | tuple[int, ...] = (24, 20, 20),
     attention_scaling: float = 1.0,
+    target_dtype: torch.dtype | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute cos/sin embeddings from 3D position IDs.
 
@@ -96,6 +97,15 @@ def compute_3d_cos_sin(
     emb = torch.cat((freqs, freqs), dim=-1)
     cos = (emb.cos() * attention_scaling).squeeze(0)  # (seq_len, head_dim)
     sin = (emb.sin() * attention_scaling).squeeze(0)  # (seq_len, head_dim)
+
+    # Cast back to the model dtype (e.g. bfloat16) so that the subsequent
+    # ``q * cos`` / ``k * cos`` multiplications inside apply_interleaved_mrope
+    # don't promote q/k to fp32 -- which would mismatch the paged KV cache
+    # dtype that FlashInfer's attention call expects.  HF does the same
+    # (modeling_qwen3_omni_moe.py:1329).
+    if target_dtype is not None:
+        cos = cos.to(target_dtype)
+        sin = sin.to(target_dtype)
 
     return cos, sin
 
