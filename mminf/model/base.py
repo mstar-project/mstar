@@ -17,6 +17,7 @@ from mminf.conductor.request_info import (
 )
 from mminf.engine.base import EngineType, NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
+from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 
@@ -80,7 +81,7 @@ class NodeSubmodule(torch.nn.Module):
         """
         ...
 
-    def get_cuda_graph_capture_inputs(self, graph_walk: str, device: torch.device) -> list[dict[str, list[torch.Tensor]]] | None:
+    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         """Return dummy inputs for CUDA graph capture, or None if this walk
         doesn't support CUDA graphs.
 
@@ -88,9 +89,16 @@ class NodeSubmodule(torch.nn.Module):
         for walks with different input names (e.g., Qwen3-Omni Thinker uses
         "input_embeds" and "cos_sin_3d"; Talker uses "input_embeds").
         """
-        if "decode" not in graph_walk:
-            return None
-        return [{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
+        return [
+            CudaGraphConfig(
+                graph_walk="decode", requires_cfg=False, labels=["main"],
+                dummy_capture_inputs=[{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
+            ),
+            CudaGraphConfig(
+                graph_walk="decode", requires_cfg=True, labels=["main"],
+                dummy_capture_inputs=[{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
+            )
+        ]
 
     def can_use_cuda_graphs(self, graph_walk: str) -> bool:
         """Return True if this submodule supports CUDA graphs for ``graph_walk``.
@@ -100,13 +108,11 @@ class NodeSubmodule(torch.nn.Module):
         are supported.  Override for models with more complex eligibility
         rules (e.g., excluding specific batch configurations).
         """
-        try:
-            inputs = self.get_cuda_graph_capture_inputs(
-                graph_walk, device=torch.device("cpu"),
-            )
-        except Exception:
-            return False
-        return inputs is not None
+        if not hasattr(self, "_cached_cuda_graph_walks"):
+            self._cached_cuda_graph_walks = set([
+                cfg.graph_walk for cfg in self.get_cuda_graph_configs(device=torch.device("cpu"))
+            ])
+        return graph_walk in self._cached_cuda_graph_walks
 
     def can_batch(
         self, batch: NodeBatch

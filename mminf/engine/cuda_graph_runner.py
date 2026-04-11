@@ -16,7 +16,7 @@ Also provides EncDecCudaGraphWrapper for stateless encoder/decoder submodules.
 
 import bisect
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -34,8 +34,9 @@ logger = logging.getLogger(__name__)
 class CudaGraphConfig:
     """Defines what computation a captured graph represents."""
     graph_walk: str  # "decode"
-    requires_cfg: bool  # whether CFG is active
-    labels: list[str]  # cache labels used: ["main"] or ["main", "cfg_img"]
+    dummy_capture_inputs: list[dict[str, list[torch.Tensor]]] # [{tensor_name: [tensor(s)]}]
+    requires_cfg: bool  = False# whether CFG is active
+    labels: list[str]  = field(default_factory=lambda: ["main"]) # cache labels used: ["main"] or ["main", "cfg_img"]
 
 
 @dataclass
@@ -46,19 +47,6 @@ class CudaGraphData:
     static_cache_manager: BatchedCacheManager
     config: CudaGraphConfig
     bs: int
-
-
-# Pre-defined configs for Option A
-# TODO: have the model declare this itself
-DECODE_NO_CFG = CudaGraphConfig(
-    graph_walk="decode", requires_cfg=False, labels=["main"]
-)
-DECODE_WITH_CFG = CudaGraphConfig(
-    graph_walk="decode", requires_cfg=True, labels=["main", "cfg_img"]
-)
-
-# All configs to capture during warmup
-CAPTURE_CONFIGS = [DECODE_NO_CFG, DECODE_WITH_CFG]
 
 
 class CudaGraphRunner:
@@ -99,6 +87,7 @@ class CudaGraphRunner:
     ):
         self.submodule_name = submodule_name
         self.submodule = submodule
+        self.capture_configs: list[CudaGraphConfig] = submodule.get_cuda_graph_configs(device)
         self.kv_cache_config = kv_cache_config
         self.alloc_manager = alloc_manager
         self.sampler = sampler
@@ -125,7 +114,7 @@ class CudaGraphRunner:
 
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
 
-        for config in CAPTURE_CONFIGS:
+        for config in self.capture_configs:
             for bs in reversed(self.CAPTURE_BATCH_SIZES):
                 key = (config.graph_walk, config.requires_cfg, bs)
                 try:
@@ -235,11 +224,10 @@ class CudaGraphRunner:
             # capture-input generator. This lets each submodule declare what
             # dummy tensors its preprocess() needs (e.g., Thinker decode needs
             # a dummy token, Talker decode needs dummy all_codes).
-            capture_templates = submodule.get_cuda_graph_capture_inputs(
-                graph_walk=config.graph_walk, device=self.device,
-            )
+            capture_templates = config.dummy_capture_inputs
             if capture_templates is None:
                 # Submodule opts out of CUDA graphs for this walk.
+                logger.info("%s.get_cuda_graph_capture_inputs returned None, skipping...", self.submodule_name)
                 return
 
             def _clone_template(tpl):

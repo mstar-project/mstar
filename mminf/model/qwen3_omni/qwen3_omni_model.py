@@ -187,6 +187,13 @@ class Qwen3OmniModel(Model):
             name="Thinker",
             input_ids=["text_inputs"],
             outputs=[
+                GraphEdge( # last prefill samples a token
+                    next_node=EMIT_TO_CLIENT,
+                    name="new_token",
+                    output_modality="text",
+                    is_new_token=True,
+                    persist=True,
+                ),
                 StreamingGraphEdge(
                     next_node="Talker",
                     name="thinker_states",
@@ -208,6 +215,13 @@ class Qwen3OmniModel(Model):
                 name="Thinker",
                 input_ids=["audio_embeds"],
                 outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="new_token",
+                        output_modality="text",
+                        is_new_token=True,
+                        persist=True,
+                    ),
                     StreamingGraphEdge(
                         next_node="Talker",
                         name="thinker_states",
@@ -230,6 +244,13 @@ class Qwen3OmniModel(Model):
                 name="Thinker",
                 input_ids=["vision_embeds"],
                 outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="new_token",
+                        output_modality="text",
+                        is_new_token=True,
+                        persist=True,
+                    ),
                     StreamingGraphEdge(
                         next_node="Talker",
                         name="thinker_states",
@@ -373,7 +394,7 @@ class Qwen3OmniModel(Model):
                     to_partition="Code2Wav",
                     edge_name="codec_tokens",
                     chunk_policy_factory=lambda: SlidingWindowChunkPolicy(
-                        chunk_size=self.config.code2wav.chunk_size + self.config.code2wav.left_context_size,
+                        window=self.config.code2wav.chunk_size + self.config.code2wav.left_context_size,
                         stride=self.config.code2wav.chunk_size
                     ),
                 ),
@@ -584,6 +605,7 @@ class Qwen3OmniModel(Model):
                 # Tell the Thinker whether to emit thinker_states.  Text only
                 # requests skip it to save cross-partition bandwidth.
                 "audio_output": audio_output,
+                "is_last_prefill": len(schedule) == 1
             },
         )
 
@@ -762,11 +784,13 @@ class Qwen3OmniModel(Model):
                 request_done=True,
             )
 
+        is_last_prefill = True
         if metadata.is_prefill:
             # Still in prefill -- use schedule to determine inputs
             schedule = metadata.kwargs["prefill_schedule"]
             step = metadata.kwargs["prefill_step"]
             walk_name, tensor_info = schedule[step]
+            is_last_prefill = (step == len(schedule) - 1)
 
             if walk_name == "prefill_text":
                 edge = GraphEdge(next_node="Thinker", name="text_inputs")
@@ -793,6 +817,7 @@ class Qwen3OmniModel(Model):
             "is_prefill": metadata.is_prefill,
             "temperature": metadata.kwargs.get("temperature", 0.7),
             "top_p": metadata.kwargs.get("top_p", 0.9),
+            "is_last_prefill": is_last_prefill,
             # Persist the audio_output flag across every Thinker step so
             # the submodule can gate thinker_states emission.  Default True
             # for backwards compatibility with callers that never set it.

@@ -23,6 +23,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
+from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.model.base import NodeSubmodule
 from mminf.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
@@ -659,7 +660,7 @@ class ThinkerSubmodule(NodeSubmodule):
         result: NameToTensorList = {}
 
         # Decode: produce logits for text token sampling
-        if graph_walk == "thinker_decode":
+        if graph_walk == "thinker_decode" or request_info.step_metadata.get("is_last_prefill", False):
             logits = self.model.lm_head(hidden[-1:, :])
             result["logits"] = [logits]
 
@@ -687,17 +688,21 @@ class ThinkerSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: NodeBatch) -> bool:
         return batch.graph_walk == "thinker_decode"
+    
+    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+        """Return dummy inputs for CUDA graph capture, or None if this walk
+        doesn't support CUDA graphs.
 
-    def get_cuda_graph_capture_inputs(
-        self, graph_walk: str, device: torch.device,
-    ) -> list[dict[str, list[torch.Tensor]]] | None:
-        """Dummy inputs for CUDA graph capture.
-
-        ThinkerSubmodule._preprocess_decode reads ``text_inputs`` (prev token).
+        Default: returns text_inputs for "decode" walks. Override in subclasses
+        for walks with different input names (e.g., Qwen3-Omni Thinker uses
+        "input_embeds" and "cos_sin_3d"; Talker uses "input_embeds").
         """
-        if graph_walk != "thinker_decode":
-            return None
-        return [{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
+        return [
+            CudaGraphConfig(
+                graph_walk="thinker_decode", requires_cfg=False, labels=["main"],
+                dummy_capture_inputs=[{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
+            ),
+        ]
 
     def forward_batched(
         self,
@@ -1269,26 +1274,25 @@ class TalkerSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: NodeBatch) -> bool:
         return batch.graph_walk == "talker_decode"
+    
+    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+        """Return dummy inputs for CUDA graph capture, or None if this walk
+        doesn't support CUDA graphs.
 
-    def get_cuda_graph_capture_inputs(
-        self, graph_walk: str, device: torch.device,
-    ) -> list[dict[str, list[torch.Tensor]]] | None:
-        """Dummy inputs for CUDA graph capture.
-
-        TalkerSubmodule._preprocess_decode reads ``all_codes`` (32 codec
-        token IDs from the previous decode step) and optionally
-        ``thinker_states`` (projected Thinker hidden states for temporal
-        conditioning).  Thinker states can be empty after Thinker EOS, so
-        we supply an empty list and let the submodule fall back to
-        tts_pad_embed during capture.
+        Default: returns text_inputs for "decode" walks. Override in subclasses
+        for walks with different input names (e.g., Qwen3-Omni Thinker uses
+        "input_embeds" and "cos_sin_3d"; Talker uses "input_embeds").
         """
-        if graph_walk != "talker_decode":
-            return None
         num_groups = self.config.num_code_groups
-        return [{
-            "all_codes": [torch.zeros(num_groups, dtype=torch.long, device=device)],
-            "thinker_states": [],
-        }]
+        return [
+            CudaGraphConfig(
+                graph_walk="talker_decode", requires_cfg=False, labels=["main"],
+                dummy_capture_inputs=[{
+                    "all_codes": [torch.zeros(num_groups, dtype=torch.long, device=device)],
+                    "thinker_states": [],
+                }]
+            ),
+        ]
 
     def forward_batched(
         self,

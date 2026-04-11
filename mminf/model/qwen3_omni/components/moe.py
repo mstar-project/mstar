@@ -194,7 +194,7 @@ def _dispatch_experts_fused(
         )
 
     for expert_idx_t in expert_hit:
-        expert_idx = expert_idx_t[0].item()
+        expert_idx = expert_idx_t[0]
         # top_k_pos: which top-k slot, token_idx: which tokens
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         current_state = hidden_states[token_idx]
