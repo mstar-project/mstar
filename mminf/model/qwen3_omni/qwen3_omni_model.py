@@ -788,23 +788,15 @@ class Qwen3OmniModel(Model):
 
         is_last_prefill = True
         if metadata.is_prefill:
-            # Still in prefill -- use schedule to determine inputs
+            # Still in prefill -- delegate to _get_thinker_prefill_inputs
+            # which handles the (walk_name, {input_name: tensor_info}) schedule
+            # entry format and emits one GraphEdge per input (so auxiliary
+            # tensors like image_grid_thw / audio_seqlens reach the encoder
+            # alongside the primary feature tensor).
             schedule = metadata.kwargs["prefill_schedule"]
             step = metadata.kwargs["prefill_step"]
-            walk_name, tensor_info = schedule[step]
             is_last_prefill = (step == len(schedule) - 1)
-
-            if walk_name == "prefill_text":
-                edge = GraphEdge(next_node="Thinker", name="text_inputs")
-            elif walk_name == "prefill_audio":
-                edge = GraphEdge(next_node="Thinker", name="audio_features")
-            elif walk_name == "prefill_vision":
-                edge = GraphEdge(next_node="Thinker", name="pixel_values")
-            else:
-                raise ValueError(f"Unrecognized prefill walk: {walk_name}")
-
-            edge.tensor_info = [tensor_info]
-            inputs = [edge]
+            inputs = self._get_thinker_prefill_inputs(metadata, persist_signals)
         else:
             # Decode: previous token feeds back as text_inputs
             edge = GraphEdge(next_node="Thinker", name="text_inputs")
