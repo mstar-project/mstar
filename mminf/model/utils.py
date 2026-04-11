@@ -157,16 +157,36 @@ def _apply_operations(
 
         matched: list[tuple[int, torch.Tensor]] = []
 
+        # Build a regex that captures the integer at the position of the "*"
+        # in the source pattern.  This ensures we extract the EXPERT index
+        # (e.g. ``42`` in ``...layers.5.mlp.experts.42.gate_proj.weight``),
+        # not the layer index.  Without this anchor, ``re.search(r"\.(\d+)\.")``
+        # returns the first integer in the key (the layer index), and all 128
+        # experts in a given layer end up sharing the same index — they then
+        # stack in arbitrary hash order, so expert N's weights land in some
+        # other slot and the router selects the wrong expert at inference,
+        # producing gibberish output.
+        if "*" not in pattern:
+            raise ValueError(
+                f"Source pattern {pattern!r} has no '*' wildcard; cannot "
+                "extract per-expert index for MergeModulelist."
+            )
+        # Replace the literal "*" with a numeric capture group; escape the rest.
+        index_regex = re.compile(
+            ".*" + re.escape(pattern).replace(r"\*", r"(\d+)") + ".*"
+        )
+
         for k in key_to_tensor.keys():
             m = regex.match(k)
             if not m:
                 continue
 
-            # extract expert index (the "*" part)
-            # assume it's the first integer in the key
-            idx_match = re.search(r"\.(\d+)\.", k)
+            idx_match = index_regex.match(k)
             if idx_match is None:
-                raise ValueError(f"Could not extract expert index from key: {k}")
+                raise ValueError(
+                    f"Could not extract expert index from key: {k} "
+                    f"(pattern: {pattern})"
+                )
 
             idx = int(idx_match.group(1))
             matched.append((idx, key_to_tensor[k]))
