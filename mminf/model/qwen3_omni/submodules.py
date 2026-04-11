@@ -337,6 +337,7 @@ class ThinkerSubmodule(NodeSubmodule):
         inv_freq = self._get_inv_freq(device)
         cos_sin_3d = compute_3d_cos_sin(
             position_ids_3d, inv_freq, mrope_section=self.MROPE_SECTION,
+            target_dtype=input_embeds.dtype,
         )
 
         # Plan FlashInfer attention and rope for the main cache label
@@ -431,6 +432,7 @@ class ThinkerSubmodule(NodeSubmodule):
         inv_freq = self._get_inv_freq(device)
         cos_sin_3d = compute_3d_cos_sin(
             position_ids_3d, inv_freq, mrope_section=self.MROPE_SECTION,
+            target_dtype=input_embeds.dtype,
         )
 
         cache_manager.plan_attention(
@@ -536,6 +538,7 @@ class ThinkerSubmodule(NodeSubmodule):
         inv_freq = self._get_inv_freq(device)
         cos_sin_3d = compute_3d_cos_sin(
             position_ids_3d, inv_freq, mrope_section=self.MROPE_SECTION,
+            target_dtype=input_embeds.dtype,
         )
 
         cache_manager.plan_attention(
@@ -607,6 +610,7 @@ class ThinkerSubmodule(NodeSubmodule):
         inv_freq = self._get_inv_freq(device)
         cos_sin_3d = compute_3d_cos_sin(
             position_ids_3d, inv_freq, mrope_section=self.MROPE_SECTION,
+            target_dtype=input_embeds.dtype,
         )
 
         cache_manager.plan_attention(
