@@ -2,10 +2,13 @@
 the openpi PyTorch reference.
 
 Running openpi's PI0Pytorch end-to-end requires installing a patched
-``transformers_replace``, downloading PaliGemma weights, and wiring up HF's
-GemmaForCausalLM — too heavy to stand up inside a unit test. Instead, this
-file re-implements the openpi reference math inline as small vanilla-torch
-modules that mirror ``src/openpi/models_pytorch/gemma_pytorch.py`` and
+``transformers_replace``, converting JAX checkpoints to PyTorch, and wiring
+up HF's GemmaForCausalLM — too heavy to stand up inside a unit test. Pi0.5
+weights are also distributed only as JAX/Flax checkpoints
+(``gs://openpi-assets/checkpoints/pi05_base``), not HF safetensors. This
+file therefore re-implements the openpi reference math inline as small
+vanilla-torch modules that mirror
+``src/openpi/models_pytorch/{gemma_pytorch.py,pi0_pytorch.py}`` and
 ``transformers_replace/models/gemma/modeling_gemma.py``, then checks that
 the mminf Pi0.5 components produce numerically matching outputs when the
 two are initialized with identical weights.
@@ -15,13 +18,20 @@ Coverage:
   * two-layer time MLP producing adarms_cond
   * adaRMS norm (cond path): scale/shift/gate modulation
   * a full Pi0.5 action-expert layer (attention + MLP + adaRMS)
-  * a 2-step flow-matching denoising loop over a 1-layer action expert
-    exercising PaliGemma prefill + action-expert suffix attention against
-    a frozen prefix KV cache
+  * a 2-layer action-expert stack with a pre-populated prefix KV cache
+  * the Euler flow-matching update formula
+  * RoPE: ``flashinfer.rope.apply_rope_pos_ids_inplace`` vs HF Gemma
+    ``apply_rotary_pos_emb`` formula
+  * FlashInfer paged prefill attention with a real
+    ``BatchPrefillWithPagedKVCacheWrapper`` against vanilla SDPA, both for
+    the bidirectional prefill and the suffix-attends-to-prefix flow used
+    during the action_gen denoising loop
+  * Pi05SiglipEncoder produces bit-identical features to a freshly-built
+    HF SiglipVisionModel with matched weights
 
-The attention used inside both sides is a small vanilla-SDPA implementation
-shared by the mock cache handle and the reference code, which is the same
-computation FlashInfer runs on the mminf side up to numerical tolerance.
+The attention used inside the action-expert tests is a small vanilla-SDPA
+implementation shared by the mock cache handle and the reference code; the
+dedicated paged-attention test below exercises the real FlashInfer wrapper.
 """
 
 from __future__ import annotations
@@ -538,3 +548,229 @@ def test_euler_flow_matching_step_matches_reference():
     # mminf submodule does next_actions = noisy_actions + dt * velocity
     ours_next = x_t + dt * v_t
     assert torch.allclose(ours_next, ref_next, atol=1e-7)
+
+
+# ----------------------------------------------------------------------
+# RoPE: FlashInfer vs HF Gemma rotary embedding formula
+# ----------------------------------------------------------------------
+
+
+def _hf_gemma_apply_rotary(
+    q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor, head_dim: int, theta: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference RoPE matching ``transformers.models.gemma.modeling_gemma``.
+
+    Same formula as Llama RoPE: half/half split, ``q' = q*cos +
+    rotate_half(q)*sin``. The cos/sin tables are derived from
+    ``inv_freq = 1 / theta^(2i/head_dim)`` and broadcast over the head dim.
+    """
+    inv_freq = 1.0 / (
+        theta
+        ** (torch.arange(0, head_dim, 2, device=q.device, dtype=torch.float32) / head_dim)
+    )
+    freqs = pos_ids.to(torch.float32)[:, None] * inv_freq[None, :]
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos = emb.cos().to(torch.float32)
+    sin = emb.sin().to(torch.float32)
+
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : head_dim // 2]
+        x2 = x[..., head_dim // 2 :]
+        return torch.cat([-x2, x1], dim=-1)
+
+    cos_b = cos[:, None, :]
+    sin_b = sin[:, None, :]
+    q_f = q.to(torch.float32)
+    k_f = k.to(torch.float32)
+    q_out = q_f * cos_b + rotate_half(q_f) * sin_b
+    k_out = k_f * cos_b + rotate_half(k_f) * sin_b
+    return q_out.to(q.dtype), k_out.to(k.dtype)
+
+
+@requires_cuda
+def test_flashinfer_rope_matches_hf_gemma_formula():
+    """``flashinfer.rope.apply_rope_pos_ids_inplace`` vs HF apply_rotary_pos_emb."""
+    import flashinfer
+
+    torch.manual_seed(0)
+    seq_len = 8
+    num_qo_heads = 8
+    num_kv_heads = 1
+    head_dim = 256  # Pi0.5 dimension; flashinfer requires head_dim >= 64
+    rope_theta = 10000.0
+
+    q = torch.randn(seq_len, num_qo_heads, head_dim, device=DEVICE, dtype=MMINF_DTYPE)
+    k = torch.randn(seq_len, num_kv_heads, head_dim, device=DEVICE, dtype=MMINF_DTYPE)
+    pos_ids = torch.arange(seq_len, device=DEVICE, dtype=torch.int32)
+
+    q_hf, k_hf = _hf_gemma_apply_rotary(q.clone(), k.clone(), pos_ids, head_dim, rope_theta)
+
+    q_fi = q.clone()
+    k_fi = k.clone()
+    flashinfer.rope.apply_rope_pos_ids_inplace(q_fi, k_fi, pos_ids, rope_theta=rope_theta)
+
+    q_delta = (q_fi.float() - q_hf.float()).abs().max().item()
+    k_delta = (k_fi.float() - k_hf.float()).abs().max().item()
+    # Observed: q delta = 0.0, k delta ~5e-4 on max ~3.5 (bf16 precision).
+    assert q_delta < 1e-2, f"q max delta = {q_delta:.4e}"
+    assert k_delta < 1e-2, f"k max delta = {k_delta:.4e}"
+
+
+# ----------------------------------------------------------------------
+# FlashInfer paged attention vs vanilla SDPA
+# ----------------------------------------------------------------------
+
+
+def _vanilla_sdpa(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Bidirectional GQA scaled dot-product attention used as the reference."""
+    nh = q.shape[1]
+    nkv = k.shape[1]
+    if nh != nkv:
+        rep = nh // nkv
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+    qt = q.transpose(0, 1).float()
+    kt = k.transpose(0, 1).float()
+    vt = v.transpose(0, 1).float()
+    s = torch.einsum("hqd,hkd->hqk", qt, kt) * scale
+    a = s.softmax(-1)
+    out = torch.einsum("hqk,hkd->hqd", a, vt)
+    return out.transpose(0, 1).to(q.dtype)
+
+
+@requires_cuda
+def test_flashinfer_paged_prefill_attention_matches_sdpa():
+    """``FlashInferPrefillWrapper`` (real paged KV cache, no Mooncake) vs SDPA.
+
+    Two scenarios mirror Pi0.5's pipeline:
+      1. Bidirectional prefill: 1 request, ``prefix_len`` tokens, ``causal=False``.
+         Verifies the same forward path PaliGemma uses during the prefill walk.
+      2. Suffix attends to prefix+suffix: append ``suffix_len`` new tokens that
+         attend to the entire concatenated KV. This is the action_gen denoise
+         step (``write_store=False`` in the real cache manager; here we just
+         issue a fresh plan() since the wrapper doesn't enforce that flag).
+
+    Both scenarios are compared against torch SDPA on the same Q,K,V values.
+    """
+    from mminf.utils.flashinfer_utils import FlashInferPrefillWrapper
+
+    torch.manual_seed(0)
+    num_qo_heads = 8
+    num_kv_heads = 1
+    head_dim = 256
+    page_size = 16
+    max_pages = 32
+    prefix_len = 24
+    suffix_len = 4
+
+    kv_cache_layer = torch.zeros(
+        max_pages, 2, page_size, num_kv_heads, head_dim, device=DEVICE, dtype=MMINF_DTYPE
+    )
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    wrapper = FlashInferPrefillWrapper(
+        workspace, num_qo_heads, num_kv_heads, head_dim, page_size, device=DEVICE
+    )
+
+    qp = torch.randn(prefix_len, num_qo_heads, head_dim, device=DEVICE, dtype=MMINF_DTYPE)
+    kp = torch.randn(prefix_len, num_kv_heads, head_dim, device=DEVICE, dtype=MMINF_DTYPE)
+    vp = torch.randn(prefix_len, num_kv_heads, head_dim, device=DEVICE, dtype=MMINF_DTYPE)
+
+    # --- Bidirectional prefill ---
+    n_prefix_pages = (prefix_len + page_size - 1) // page_size
+    last_page_len = prefix_len - (n_prefix_pages - 1) * page_size
+    qo = torch.tensor([0, prefix_len], dtype=torch.int32, device=DEVICE)
+    ki = torch.tensor([0, n_prefix_pages], dtype=torch.int32, device=DEVICE)
+    ind = torch.tensor(list(range(n_prefix_pages)), dtype=torch.int32, device=DEVICE)
+    last = torch.tensor([last_page_len], dtype=torch.int32, device=DEVICE)
+    wrapper.plan(qo, ki, ind, last, causal=False, dtype=MMINF_DTYPE)
+    wrapper.set_kv_cache(kv_cache_layer, kp, vp)
+    prefill_out = wrapper.run(qp, kv_cache_layer)
+
+    scale = head_dim ** -0.5
+    ref_prefill = _vanilla_sdpa(qp, kp, vp, scale)
+    delta = (prefill_out.float() - ref_prefill.float()).abs().max().item()
+    # Observed: ~7.8e-3 on ref abs max ~1.6 (~0.5% relative, within bf16).
+    assert delta < 5e-2, f"prefill max delta = {delta:.4e}"
+
+    # --- Suffix attends to prefix + suffix ---
+    qs = torch.randn(suffix_len, num_qo_heads, head_dim, device=DEVICE, dtype=MMINF_DTYPE)
+    ks = torch.randn(suffix_len, num_kv_heads, head_dim, device=DEVICE, dtype=MMINF_DTYPE)
+    vs = torch.randn(suffix_len, num_kv_heads, head_dim, device=DEVICE, dtype=MMINF_DTYPE)
+
+    total_after = prefix_len + suffix_len
+    n_pages_after = (total_after + page_size - 1) // page_size
+    last_page_len_after = total_after - (n_pages_after - 1) * page_size
+    qo2 = torch.tensor([0, suffix_len], dtype=torch.int32, device=DEVICE)
+    ki2 = torch.tensor([0, n_pages_after], dtype=torch.int32, device=DEVICE)
+    ind2 = torch.tensor(list(range(n_pages_after)), dtype=torch.int32, device=DEVICE)
+    last2 = torch.tensor([last_page_len_after], dtype=torch.int32, device=DEVICE)
+    wrapper.plan(qo2, ki2, ind2, last2, causal=False, dtype=MMINF_DTYPE)
+    wrapper.set_kv_cache(kv_cache_layer, ks, vs)
+    suffix_out = wrapper.run(qs, kv_cache_layer)
+
+    k_full = torch.cat([kp, ks], dim=0)
+    v_full = torch.cat([vp, vs], dim=0)
+    ref_suffix = _vanilla_sdpa(qs, k_full, v_full, scale)
+    delta = (suffix_out.float() - ref_suffix.float()).abs().max().item()
+    # Observed: ~3.9e-3 on ref abs max ~1.1 (~0.3% relative, within bf16).
+    assert delta < 5e-2, f"suffix max delta = {delta:.4e}"
+
+
+# ----------------------------------------------------------------------
+# SigLIP encoder vs HF reference
+# ----------------------------------------------------------------------
+
+
+def test_pi05_siglip_encoder_matches_hf_reference():
+    """``Pi05SiglipEncoder`` produces bit-identical features to HF SiglipVisionModel.
+
+    Both wrap the same HF class; the only difference is mminf adds a
+    ``nn.Linear`` connector to project to the LLM hidden size. The reference
+    PaliGemma uses an analogous ``multi_modal_projector``. We verify the
+    pre-connector features match exactly and the connector preserves the
+    expected output shape.
+    """
+    from transformers import SiglipVisionConfig, SiglipVisionModel
+
+    from mminf.model.pi05.components.siglip import Pi05SiglipEncoder
+
+    torch.manual_seed(0)
+    config = Pi05Config(
+        vit_hidden_size=64,
+        vit_intermediate_size=128,
+        vit_num_layers=2,
+        vit_num_heads=4,
+        vit_patch_size=14,
+        vit_image_size=224,
+        hidden_size=128,
+    )
+
+    ours = Pi05SiglipEncoder(config).to(DEVICE).eval()
+
+    siglip_cfg = SiglipVisionConfig(
+        hidden_size=config.vit_hidden_size,
+        intermediate_size=config.vit_intermediate_size,
+        num_hidden_layers=config.vit_num_layers,
+        num_attention_heads=config.vit_num_heads,
+        num_channels=3,
+        image_size=config.vit_image_size,
+        patch_size=config.vit_patch_size,
+    )
+    ref_vision = SiglipVisionModel(siglip_cfg).to(DEVICE).eval()
+    ref_vision.load_state_dict(ours.vision_model.state_dict())
+
+    images = torch.randn(2, 3, config.vit_image_size, config.vit_image_size, device=DEVICE)
+    with torch.no_grad():
+        ref_features = ref_vision(pixel_values=images).last_hidden_state
+        ours_inner = ours.vision_model(pixel_values=images).last_hidden_state
+        ours_full = ours(images)
+
+    # Pre-connector features should be exactly bit-identical (same HF class,
+    # same weights, same input).
+    assert torch.equal(ref_features, ours_inner)
+
+    # Connector output shape: [batch, num_patches, llm_hidden_size]
+    n_patches = (config.vit_image_size // config.vit_patch_size) ** 2
+    assert ours_full.shape == (2, n_patches, config.hidden_size)
