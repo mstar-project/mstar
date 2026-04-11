@@ -861,9 +861,18 @@ class TalkerSubmodule(NodeSubmodule):
         self._talker_temperature: float = 0.9
         self._talker_top_k: int = 50
         self._talker_top_p: float = 1.0
+        # HF uses ``repetition_penalty=1.05`` for the Talker.  Without it the
+        # codec LM tends to loop in a subspace of recently-sampled tokens and
+        # never picks ``codec_eos``, so the utterance "goes off the rails"
+        # past the intended speech and keeps generating random words until
+        # the outer ``max_output_tokens`` cap fires.  The penalty divides the
+        # logit of any previously-seen token (positive logits) or multiplies
+        # it (negative logits), biasing the distribution AWAY from repeats.
+        self._talker_repetition_penalty: float = 1.05
 
         # Code Predictor residual sampling — HF uses top_k=50, top_p=0.8,
-        # temperature=1.0 (the HF generate() default).
+        # temperature=1.0 (the HF generate() default).  The CP does not
+        # use repetition_penalty (HF's CP.generate call omits it).
         self._cp_temperature: float = 1.0
         self._cp_top_k: int = 50
         self._cp_top_p: float = 0.8
@@ -872,7 +881,40 @@ class TalkerSubmodule(NodeSubmodule):
         # with True at positions to suppress.  Cached on first forward.
         self._suppress_mask: torch.Tensor | None = None
 
+        # Per-request seen-token mask for repetition penalty.  Indexed by
+        # request_id -> bool tensor of shape (vocab_size,) where True means
+        # "this layer-0 codec token has been sampled at least once for this
+        # request".  Initialized lazily on the first layer-0 sample.  The
+        # mask is cleared when the request completes (via ``cleanup_request``).
+        self._seen_layer0_mask: dict[str, torch.Tensor] = {}
+
     # ---- Stochastic sampling helpers -------------------------------------
+
+    def _get_seen_mask(
+        self, request_id: str, vocab_size: int, device: torch.device
+    ) -> torch.Tensor:
+        """Return the per-request layer-0 seen-token mask, initializing if needed."""
+        mask = self._seen_layer0_mask.get(request_id)
+        if (
+            mask is None
+            or mask.shape[0] != vocab_size
+            or mask.device != device
+        ):
+            mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+            self._seen_layer0_mask[request_id] = mask
+        return mask
+
+    def _mark_seen(self, request_id: str, token_id: int) -> None:
+        """Record that ``token_id`` has been sampled for this request.
+
+        The token stays marked for the lifetime of the request so the
+        repetition penalty persistently biases the distribution against it.
+        HF's ``RepetitionPenaltyLogitsProcessor`` works the same way -- it
+        penalizes ALL previously-seen tokens, not just recent ones.
+        """
+        mask = self._seen_layer0_mask.get(request_id)
+        if mask is not None and 0 <= token_id < mask.shape[0]:
+            mask[token_id] = True
 
     def _get_suppress_mask(self, vocab_size: int, device: torch.device) -> torch.Tensor:
         """Return the bool mask of layer-0 logits to set to -inf.
@@ -904,6 +946,8 @@ class TalkerSubmodule(NodeSubmodule):
         temperature: float,
         top_k: int,
         top_p: float,
+        repetition_penalty: float = 1.0,
+        seen_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Pure-PyTorch stochastic sampler with top-k + top-p filtering.
 
@@ -913,6 +957,15 @@ class TalkerSubmodule(NodeSubmodule):
             top_k: keep only the top-k highest-logit tokens (0 = disabled).
             top_p: keep the smallest set whose cumulative probability is
                 >= top_p (1.0 = disabled).
+            repetition_penalty: HuggingFace-style sign-aware penalty applied
+                BEFORE temperature scaling.  For each token flagged in
+                ``seen_token_mask``, the logit is divided by ``penalty`` if
+                positive or multiplied by ``penalty`` if negative, matching
+                the ``transformers`` ``RepetitionPenaltyLogitsProcessor``
+                convention.  Ignored when ``seen_token_mask`` is None or
+                when ``repetition_penalty == 1.0``.
+            seen_token_mask: bool tensor of shape ``(vocab_size,)`` marking
+                tokens the current request has already sampled.
 
         Returns:
             ``torch.LongTensor`` of shape ``(1,)`` — the sampled token ID.
@@ -920,6 +973,21 @@ class TalkerSubmodule(NodeSubmodule):
         # Work in float32 for numerical stability (logits from a bf16/fp16
         # codec_head would otherwise produce unstable softmax/topk results).
         logits = logits.float()
+
+        # Repetition penalty (applied BEFORE temperature to match HF order).
+        if (
+            repetition_penalty != 1.0
+            and seen_token_mask is not None
+            and seen_token_mask.any()
+        ):
+            mask = seen_token_mask.to(logits.device)
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)  # broadcast over batch dim
+            penalized = torch.where(
+                logits > 0, logits / repetition_penalty, logits * repetition_penalty
+            )
+            logits = torch.where(mask, penalized, logits)
+
         if temperature != 1.0:
             logits = logits / max(temperature, 1e-5)
 
@@ -1331,18 +1399,31 @@ class TalkerSubmodule(NodeSubmodule):
         suppress_mask = self._get_suppress_mask(logits.shape[-1], logits.device)
         logits = logits.masked_fill(suppress_mask.unsqueeze(0), float("-inf"))
 
-        # Stochastic layer-0 sampling (HF defaults: temperature=0.9, top_k=50).
-        # Argmax produces flat/garbled audio — speech codec LMs require
-        # stochastic decoding for natural output. We sample INSIDE the
-        # submodule and return ``new_token`` directly so the AR engine's
-        # generic sampler does NOT re-sample from logits (which would give a
-        # different token than the one the Code Predictor was conditioned on).
+        # Per-request seen-token mask for HF-style repetition penalty.
+        # Sequential forward path has exactly one request in the batch.
+        rid = cache_handle.request_ids[0] if cache_handle.request_ids else ""
+        seen_mask = self._get_seen_mask(rid, logits.shape[-1], logits.device)
+
+        # Stochastic layer-0 sampling (HF defaults: temperature=0.9, top_k=50,
+        # top_p=1.0, repetition_penalty=1.05).  Argmax produces flat/garbled
+        # audio — speech codec LMs require stochastic decoding for natural
+        # output.  We sample INSIDE the submodule and return ``new_token``
+        # directly so the AR engine's generic sampler does NOT re-sample from
+        # logits (which would give a different token than the one the Code
+        # Predictor was conditioned on).  Without repetition_penalty the
+        # Talker drifts into loops and never emits codec_eos.
         layer0_code = self._top_k_top_p_sample(
             logits,
             temperature=self._talker_temperature,
             top_k=self._talker_top_k,
             top_p=self._talker_top_p,
+            repetition_penalty=self._talker_repetition_penalty,
+            seen_token_mask=seen_mask,
         )  # (1,)
+
+        # Record the sampled token so the next step's repetition penalty
+        # biases against it.
+        self._mark_seen(rid, int(layer0_code.item()))
 
         # Run Code Predictor for residual codebook layers (float32 precision)
         all_codes = self._run_code_predictor(last_hidden, layer0_code)
@@ -1549,12 +1630,16 @@ class TalkerSubmodule(NodeSubmodule):
             logits_i = logits_i.masked_fill(
                 suppress_mask.unsqueeze(0), float("-inf")
             )
+            seen_mask = self._get_seen_mask(rid, logits_i.shape[-1], logits_i.device)
             layer0_code = self._top_k_top_p_sample(
                 logits_i,
                 temperature=self._talker_temperature,
                 top_k=self._talker_top_k,
                 top_p=self._talker_top_p,
+                repetition_penalty=self._talker_repetition_penalty,
+                seen_token_mask=seen_mask,
             )  # (1,)
+            self._mark_seen(rid, int(layer0_code.item()))
             all_codes = self._run_code_predictor(last_hidden_i, layer0_code)
 
             result[rid] = {
@@ -1576,7 +1661,7 @@ class TalkerSubmodule(NodeSubmodule):
 
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
-        pass
+        self._seen_layer0_mask.pop(request_id, None)
 
 
 # ===================================================================
