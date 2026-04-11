@@ -846,6 +846,115 @@ class TalkerSubmodule(NodeSubmodule):
         self._tts_bos_embed_cached: torch.Tensor | None = None
         self._tts_eos_embed_cached: torch.Tensor | None = None
 
+        # ---- Layer-0 codec sampling ------------------------------------
+        # HF's reference Talker.generate call uses:
+        #   do_sample=True, top_k=50, top_p=1.0, temperature=0.9,
+        #   repetition_penalty=1.05, suppress_tokens=[...]
+        # where ``suppress_tokens`` masks out the "special token" region of
+        # the Talker's codec vocab — namely [vocab_size - 1024, vocab_size)
+        # (i.e. IDs 2048..3071 for vocab_size=3072) EXCEPT codec_eos_token_id.
+        # Those IDs live in the Talker vocab but are NOT valid acoustic codes
+        # for Code2Wav (Code2Wav's codebook is only 2048 per layer), so if
+        # they're ever sampled as layer-0 they land in the wrong region of
+        # Code2Wav's code_embedding table and produce garbled audio.
+        # codec_eos is kept because it's the valid stop signal.
+        self._talker_temperature: float = 0.9
+        self._talker_top_k: int = 50
+        self._talker_top_p: float = 1.0
+
+        # Code Predictor residual sampling — HF uses top_k=50, top_p=0.8,
+        # temperature=1.0 (the HF generate() default).
+        self._cp_temperature: float = 1.0
+        self._cp_top_k: int = 50
+        self._cp_top_p: float = 0.8
+
+        # Lazy-built suppress mask for layer-0 logits.  Shape (vocab_size,)
+        # with True at positions to suppress.  Cached on first forward.
+        self._suppress_mask: torch.Tensor | None = None
+
+    # ---- Stochastic sampling helpers -------------------------------------
+
+    def _get_suppress_mask(self, vocab_size: int, device: torch.device) -> torch.Tensor:
+        """Return the bool mask of layer-0 logits to set to -inf.
+
+        Matches HF's ``talker_supppressed_tokens`` list: suppress the top
+        1024 IDs of the Talker vocab (the "special token" region) EXCEPT
+        ``codec_eos_token_id``, which is the valid stop signal.
+        """
+        if (
+            self._suppress_mask is None
+            or self._suppress_mask.shape[0] != vocab_size
+            or self._suppress_mask.device != device
+        ):
+            mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+            start = vocab_size - 1024
+            if start < 0:
+                start = 0
+            mask[start:vocab_size] = True
+            # Do not suppress codec_eos (the valid stop signal).
+            eos = self.config.talker.codec_eos_token_id
+            if 0 <= eos < vocab_size:
+                mask[eos] = False
+            self._suppress_mask = mask
+        return self._suppress_mask
+
+    @staticmethod
+    def _top_k_top_p_sample(
+        logits: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        """Pure-PyTorch stochastic sampler with top-k + top-p filtering.
+
+        Args:
+            logits: shape ``(1, vocab_size)`` — logits for a single token.
+            temperature: scaling factor applied before softmax.
+            top_k: keep only the top-k highest-logit tokens (0 = disabled).
+            top_p: keep the smallest set whose cumulative probability is
+                >= top_p (1.0 = disabled).
+
+        Returns:
+            ``torch.LongTensor`` of shape ``(1,)`` — the sampled token ID.
+        """
+        # Work in float32 for numerical stability (logits from a bf16/fp16
+        # codec_head would otherwise produce unstable softmax/topk results).
+        logits = logits.float()
+        if temperature != 1.0:
+            logits = logits / max(temperature, 1e-5)
+
+        # top-k: mask everything outside the top-k logits
+        if top_k > 0 and top_k < logits.shape[-1]:
+            topk_vals, _ = torch.topk(logits, k=top_k, dim=-1)
+            min_topk = topk_vals[..., -1, None]
+            logits = torch.where(
+                logits < min_topk, torch.full_like(logits, float("-inf")), logits
+            )
+
+        # top-p (nucleus): mask tokens past cumulative probability threshold
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumprobs = sorted_probs.cumsum(dim=-1)
+            # Mark tokens to remove: those whose cumulative prob > top_p.
+            # Shift right so the first token whose cumprob exceeds top_p
+            # is still kept (the smallest set reaching >= top_p).
+            remove = cumprobs > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            # Scatter back to original vocab order
+            remove_mask = torch.zeros_like(remove)
+            remove_mask.scatter_(-1, sorted_idx, remove)
+            logits = logits.masked_fill(remove_mask, float("-inf"))
+
+        probs = torch.softmax(logits, dim=-1)
+        # Guard against rare all-(-inf) rows (shouldn't happen post-topk).
+        probs = torch.nan_to_num(probs, nan=0.0)
+        if probs.sum(dim=-1).min() <= 0:
+            # Fall back to argmax on (pre-filter) logits
+            return logits.argmax(dim=-1).to(torch.long)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1).to(torch.long)
+
     # ---- W3: TTS special-token embeddings --------------------------------
 
     def init_tts_embeds(self, thinker_embed_tokens: nn.Embedding) -> None:
@@ -1098,7 +1207,21 @@ class TalkerSubmodule(NodeSubmodule):
     def _preprocess_decode(self, cache_manager, per_request_inputs, request_ids, per_request_info):
         """Build next decode step: re-embed all_codes + thinker_states.
 
-        1. Re-embed all_codes (32 code IDs) -> codec_embed_sum
+        Matches HF's ``Qwen3OmniMoeTalkerForConditionalGeneration.prepare_inputs_for_generation``
+        autoregressive path (see modeling_qwen3_omni_moe.py ~line 3270):
+
+            codec_hiddens = [last_id_hidden] + mid_residual_hiddens + [last_residual_hidden]
+            inputs_embeds = codec_hiddens.sum(1, keepdim=True)
+            inputs_embeds = inputs_embeds + trailing_text_hidden[generation_step]
+
+        i.e. the next Talker step's input is the SUM of all ``num_code_groups``
+        codec-layer embeddings (layer-0 via the Talker's own codec_embedding;
+        layers 1..num_code_groups-1 via the Code Predictor's per-layer
+        codec_embedding ModuleList), with the thinker's projected text hidden
+        added on top.  Both sglang-omni and vllm-omni follow the same pattern.
+
+        Steps:
+        1. Re-embed all_codes into codec_embed_sum (layer-0 + 15 residuals)
         2. Get thinker_states from normal graph input (may be empty after Thinker EOS)
         3. Project thinker_states via text_projection, or use tts_pad_embed if empty
         4. input_embed = codec_embed_sum + text_hidden
@@ -1107,19 +1230,33 @@ class TalkerSubmodule(NodeSubmodule):
         all_embeds = []
         seq_lens = []
 
+        # Code Predictor's residual embedding ModuleList is at
+        # ``code_predictor.model.codec_embedding`` -- NOT
+        # ``code_predictor.codec_embedding`` (which does not exist).  The
+        # previous code used the wrong path guarded by ``hasattr``, which
+        # silently skipped the residual summing entirely and caused the
+        # Talker to drift into garbled output after a few decode steps.
+        cp_residual_embeddings = self.code_predictor.model.codec_embedding
+
         for inp, rid in zip(per_request_inputs, request_ids):
             # 1. Re-embed all_codes
             all_codes = inp["all_codes"][0].to(device)
             if all_codes.dim() == 2:
                 all_codes = all_codes.squeeze(0)
+
+            # Layer-0 via the Talker's own codec_embedding (vocab=3072).
             layer0_code = all_codes[0:1]
             codec_embed_sum = self.model.model.codec_embedding(layer0_code)
-            # Sum layers 1-31 from Code Predictor embeddings
-            if hasattr(self.code_predictor, 'codec_embedding') and all_codes.shape[0] > 1:
-                for i in range(1, min(all_codes.shape[0], self.config.num_code_groups)):
-                    code_i = all_codes[i:i+1]
-                    emb_i = self.code_predictor.codec_embedding[i - 1](code_i)
-                    codec_embed_sum = codec_embed_sum + emb_i
+
+            # Layers 1..num_code_groups-1 via the Code Predictor's per-layer
+            # embedding ModuleList (each vocab=2048).  Residual layer ``i``
+            # uses ``cp_residual_embeddings[i - 1]`` (layer 1 -> index 0,
+            # layer 2 -> index 1, ..., layer 15 -> index 14).
+            num_groups = min(all_codes.shape[0], self.config.num_code_groups)
+            for i in range(1, num_groups):
+                code_i = all_codes[i:i+1]
+                emb_i = cp_residual_embeddings[i - 1](code_i).to(codec_embed_sum.dtype)
+                codec_embed_sum = codec_embed_sum + emb_i
 
             # 2. Get thinker_states from normal graph input
             thinker_states_list = inp.get("thinker_states", [])
@@ -1186,20 +1323,36 @@ class TalkerSubmodule(NodeSubmodule):
         )
         last_hidden = hidden[-1:, :]  # (1, hidden_size)
 
-        # Layer-0 codec logits
-        logits = self.model.codec_head(last_hidden)  # (1, codec_vocab)
+        # Layer-0 codec logits: (1, codec_vocab=3072)
+        logits = self.model.codec_head(last_hidden)
 
-        # NOTE: Using argmax as approximation. The AR engine samples separately
-        # for new_token routing. For exact correctness, the Code Predictor should
-        # use the sampled token, but that requires post-sampling execution.
-        layer0_code = logits.argmax(dim=-1)  # (1,)
+        # Suppress the top-1024 ID region of the Talker vocab (reserved for
+        # special tokens; invalid as Code2Wav inputs) except codec_eos.
+        suppress_mask = self._get_suppress_mask(logits.shape[-1], logits.device)
+        logits = logits.masked_fill(suppress_mask.unsqueeze(0), float("-inf"))
+
+        # Stochastic layer-0 sampling (HF defaults: temperature=0.9, top_k=50).
+        # Argmax produces flat/garbled audio — speech codec LMs require
+        # stochastic decoding for natural output. We sample INSIDE the
+        # submodule and return ``new_token`` directly so the AR engine's
+        # generic sampler does NOT re-sample from logits (which would give a
+        # different token than the one the Code Predictor was conditioned on).
+        layer0_code = self._top_k_top_p_sample(
+            logits,
+            temperature=self._talker_temperature,
+            top_k=self._talker_top_k,
+            top_p=self._talker_top_p,
+        )  # (1,)
 
         # Run Code Predictor for residual codebook layers (float32 precision)
         all_codes = self._run_code_predictor(last_hidden, layer0_code)
 
         return {
-            "logits": [logits],    # Sampled by AR engine -> "new_token"
-            "all_codes": [all_codes],          # 32 code IDs, persisted for next step
+            # Return ``new_token`` directly — the AR engine routes this to the
+            # next Talker step's input_ids. No ``logits`` key so ar_engine's
+            # _sample_decode_outputs skips re-sampling.
+            "new_token": [layer0_code],
+            "all_codes": [all_codes],          # 16 code IDs, persisted for next step
             "codec_tokens": [all_codes],       # Streamed to Code2Wav
         }
 
@@ -1208,7 +1361,10 @@ class TalkerSubmodule(NodeSubmodule):
         last_hidden: torch.Tensor,
         layer0_code: torch.Tensor,
     ) -> torch.Tensor:
-        """Run Code Predictor for residual codebook layers 1-31.
+        """Run Code Predictor for residual codebook layers 1..(num_code_groups-1).
+
+        For Qwen3-Omni that's layers 1..15 (15 residual layers) since
+        ``num_code_groups = 16``.
 
         Uses float32 precision for numerical correctness (the Code Predictor
         is a small 5-layer transformer that is sensitive to precision).
@@ -1219,7 +1375,8 @@ class TalkerSubmodule(NodeSubmodule):
             layer0_code: Sampled layer-0 codec token ID, shape (1,).
 
         Returns:
-            all_codes: tensor of shape (num_code_groups,) with all 32 codec IDs.
+            all_codes: tensor of shape (num_code_groups,) with all codec IDs
+            (layer-0 + residual layers).
         """
         num_groups = self.config.num_code_groups
         device = last_hidden.device
@@ -1243,10 +1400,10 @@ class TalkerSubmodule(NodeSubmodule):
             #      Talker's ``codec_head`` sampled (in [0, 3072)).
             #
             #   2. The CODE PREDICTOR's ``codec_embedding`` is an
-            #      ``nn.ModuleList`` of (num_code_groups - 1) = 31
+            #      ``nn.ModuleList`` of (num_code_groups - 1) = 15
             #      ``nn.Embedding`` instances, each with
             #      ``vocab_size = code_predictor.vocab_size = 2048``.
-            #      These embed the RESIDUAL codes for layers 1..31, which
+            #      These embed the RESIDUAL codes for layers 1..15, which
             #      the Code Predictor AR-samples from its per-layer
             #      ``lm_head[k]`` (each with vocab=2048).
             #
@@ -1300,7 +1457,18 @@ class TalkerSubmodule(NodeSubmodule):
                 cp_logits = lm_heads[group_idx - 1](
                     hidden_states[:, -1:, :]
                 )  # (1, 1, vocab=2048)
-                code_i = cp_logits.argmax(dim=-1).squeeze()  # scalar in [0, 2048)
+
+                # Stochastic sampling — HF uses do_sample=True, top_k=50,
+                # top_p=0.8.  Argmax residuals cause mode collapse (each
+                # residual layer picks the "most probable" code, which biases
+                # toward silence/DC and produces garbled/buzzing output).
+                cp_logits_2d = cp_logits.squeeze(1)  # (1, vocab)
+                code_i = self._top_k_top_p_sample(
+                    cp_logits_2d.float(),
+                    temperature=self._cp_temperature,
+                    top_k=self._cp_top_k,
+                    top_p=self._cp_top_p,
+                ).squeeze()  # scalar in [0, 2048)
                 all_codes[group_idx] = code_i
 
                 # Embed the sampled residual code for the next iteration.
@@ -1368,7 +1536,9 @@ class TalkerSubmodule(NodeSubmodule):
         # Batched layer-0 codec logits
         logits = self.model.codec_head(hidden)  # (batch, codec_vocab)
 
-        # Per-request: Code Predictor + pack outputs
+        # Per-request: suppress special-token region, stochastic sample,
+        # then run Code Predictor with the sampled layer-0 token.
+        suppress_mask = self._get_suppress_mask(logits.shape[-1], logits.device)
         request_ids = cache_manager.request_ids
         result: dict[str, NameToTensorList] = {}
 
@@ -1376,11 +1546,19 @@ class TalkerSubmodule(NodeSubmodule):
             last_hidden_i = hidden[i : i + 1]  # (1, hidden)
             logits_i = logits[i : i + 1]        # (1, codec_vocab)
 
-            layer0_code = logits_i.argmax(dim=-1)  # (1,)
+            logits_i = logits_i.masked_fill(
+                suppress_mask.unsqueeze(0), float("-inf")
+            )
+            layer0_code = self._top_k_top_p_sample(
+                logits_i,
+                temperature=self._talker_temperature,
+                top_k=self._talker_top_k,
+                top_p=self._talker_top_p,
+            )  # (1,)
             all_codes = self._run_code_predictor(last_hidden_i, layer0_code)
 
             result[rid] = {
-                "logits": [logits_i],
+                "new_token": [layer0_code],
                 "all_codes": [all_codes],
                 "codec_tokens": [all_codes],
             }
@@ -1466,7 +1644,7 @@ class Code2WavSubmodule(NodeSubmodule):
 
         # Reshape to (num_frames, num_code_groups) if flat
         if codec_tokens.dim() == 1:
-            num_groups = self.config.num_code_groups  # 32
+            num_groups = self.config.num_code_groups  # 16 (Qwen3-Omni)
             if codec_tokens.shape[0] % num_groups == 0:
                 codec_tokens = codec_tokens.view(-1, num_groups)
             else:
