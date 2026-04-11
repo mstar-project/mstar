@@ -1035,8 +1035,26 @@ class Qwen3OmniModel(Model):
                     )
                     self._image_processor = processor
                 for img in image_inputs:
-                    # img: (C, H, W) float in [0, 1] from data_worker
-                    proc_out = processor(images=img, return_tensors="pt")
+                    # data_worker.py provides images as (C, H, W) float32 in
+                    # [0, 1] on the GPU.  HF's Qwen2VLImageProcessor (which
+                    # Qwen3-Omni inherits) defaults to do_rescale=True with
+                    # rescale_factor=1/255, so passing already-normalized
+                    # [0, 1] floats causes a SECOND rescale (→[0, 0.004]) and
+                    # the model ends up seeing a uniform near-zero tensor —
+                    # i.e., "a completely black square".  Convert back to
+                    # uint8 [0, 255] HWC numpy (the PIL-equivalent format)
+                    # so the processor's full normalization pipeline runs
+                    # correctly.
+                    if img.dtype.is_floating_point:
+                        img_proc = (img * 255.0).clamp(0, 255).to(torch.uint8)
+                    else:
+                        img_proc = img
+                    if img_proc.dim() == 3 and img_proc.shape[0] in (1, 3):
+                        # CHW -> HWC for HF processor
+                        img_proc = img_proc.permute(1, 2, 0)
+                    img_proc = img_proc.cpu().contiguous().numpy()
+
+                    proc_out = processor(images=img_proc, return_tensors="pt")
                     pixel_values_list.append(proc_out["pixel_values"][0])
                     if "image_grid_thw" in proc_out:
                         grid_thw_list.append(proc_out["image_grid_thw"][0])
