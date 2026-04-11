@@ -65,48 +65,51 @@ def main():
     pcm_buffer = io.BytesIO()
     chunk_count = 0
 
-    with requests.post(
-        args.url,
-        data={
-            "text": args.text,
-            "output_modalities": "audio",
-            "model_kwargs": json.dumps({"voice": args.voice}),
-        },
-        stream=True,
-    ) as resp:
-        resp.raise_for_status()
+    try:
+        with requests.post(
+            args.url,
+            data={
+                "text": args.text,
+                "output_modalities": "audio",
+                "model_kwargs": json.dumps({"voice": args.voice}),
+            },
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
 
-        for line in resp.iter_lines():
-            if not line:
-                continue
+            for line in resp.iter_lines():
+                if not line:
+                    continue
 
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-            if msg.get("modality") == "text":
+                if msg.get("modality") == "text":
+                    data_b64 = msg.get("data", "")
+                    decoded = base64.b64decode(data_b64)
+
+                    sys.stdout.write(decoded.decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+
+                if msg.get("modality") != "audio":
+                    continue
+
                 data_b64 = msg.get("data", "")
+                if not data_b64:
+                    continue
+
                 decoded = base64.b64decode(data_b64)
+                if len(decoded) == 0:
+                    continue
 
-                sys.stdout.write(decoded.decode("utf-8", errors="replace"))
+                pcm_buffer.write(decoded)
+                chunk_count += 1
+                sys.stdout.write(f"\rReceived {chunk_count} audio chunks ({pcm_buffer.tell()} bytes)")
                 sys.stdout.flush()
-
-            if msg.get("modality") != "audio":
-                continue
-
-            data_b64 = msg.get("data", "")
-            if not data_b64:
-                continue
-
-            decoded = base64.b64decode(data_b64)
-            if len(decoded) == 0:
-                continue
-
-            pcm_buffer.write(decoded)
-            chunk_count += 1
-            sys.stdout.write(f"\rReceived {chunk_count} audio chunks ({pcm_buffer.tell()} bytes)")
-            sys.stdout.flush()
+    except BaseException as e:
+        print("Exception: ", e)
 
     pcm_data = pcm_buffer.getvalue()
     print()
