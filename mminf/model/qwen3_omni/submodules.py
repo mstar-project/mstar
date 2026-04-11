@@ -1479,8 +1479,6 @@ class Code2WavSubmodule(NodeSubmodule):
 
     def forward(
         self,
-        request_info: CurrentForwardPassInfo,
-        request_id: str = "",
         codec_tokens: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
@@ -1490,15 +1488,7 @@ class Code2WavSubmodule(NodeSubmodule):
             {"audio_chunk": [int16 PCM tensor]} or {} if input too short.
         """
         if codec_tokens is None or codec_tokens.numel() == 0:
-            logger.warning(
-                "Code2Wav: empty codec_tokens for request %s", request_id
-            )
             return {}
-
-        logger.debug(
-            "Running Code2Wav with codec_tokens shape=%s for request %s",
-            codec_tokens.shape, request_id,
-        )
 
         # Run the ConvNet vocoder
         wav = self.code2wav(codec_tokens)
