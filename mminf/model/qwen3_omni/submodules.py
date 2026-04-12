@@ -894,17 +894,14 @@ class TalkerSubmodule(NodeSubmodule):
         # text_hidden positions in the last prefill step.
         self._prefill_conv_tail: dict[str, torch.Tensor] = {}
 
-        # Per-request: the raw thinker_state consumed by the last prefill
-        # step.  In our 2-step prefill flow, the last prefill trigger
-        # fires on thinker_decode step 0's completion, so it consumes
-        # thinker_decode_0's state from the stream.  But in HF, that
-        # state is trailing_text_hidden[0] — the FIRST Talker decode
-        # step's conditioning.  If we don't save+replay it, the first
-        # Talker decode step gets thinker_decode_1's state instead,
-        # creating an off-by-one in thinker-state alignment that causes
-        # periodic audio artifacts wherever the hidden state changes
-        # abruptly (sentence boundaries, markdown, etc.).
-        self._prefill_consumed_state: dict[str, torch.Tensor] = {}
+        # NOTE: no delay buffer needed for thinker_states alignment.
+        # In vllm-omni, trailing_text_hidden starts at assistant_hidden[4:]
+        # (= second generated token), NOT assistant_hidden[3:] (first).
+        # The first generated token goes into prefix position 8.  So our
+        # stream naturally aligns: last prefill consumes thinker_decode_0
+        # (first generated token) for the prefix, and decode step 0 gets
+        # thinker_decode_1 (second generated token) from the stream —
+        # matching vllm's trailing_text_hidden[0].
 
     # ---- Stochastic sampling helpers -------------------------------------
 
@@ -1193,15 +1190,29 @@ class TalkerSubmodule(NodeSubmodule):
 
         if not is_last_prefill:
             # ---- Non-last prefill: KV-cache-only step ----
-            # Save the last 4 projected tokens.  In HF, the assistant
-            # prefix uses ``assistant_hidden[:4]`` — the projected tokens
-            # from the assistant role header (``<|im_start|>assistant\n``).
-            # In our 2-step prefill, those tokens are at the END of the
-            # non-last step's projection.  We save them here because
-            # they'll be gone by the last step (consumed into KV cache).
-            if projected.shape[0] > 0:
-                self._prefill_conv_tail[rid] = projected[-4:].detach().clone()
-            seq_len = projected.shape[0]
+            #
+            # Matching vllm-omni's _get_talker_assistant_parts: the Talker
+            # should NOT see the assistant header tokens (<|im_start|>
+            # assistant \n) as raw projected states — those tokens appear
+            # ONLY inside the 9-token prefix (positions 0-2, summed with
+            # codec_hidden).  If we feed them here AND in the prefix, they
+            # end up in the KV cache twice with different embeddings.
+            #
+            # Strip the last 3 tokens (assistant header) from the KV-cache
+            # input and save them for the prefix in the last prefill step.
+            #
+            # NOTE: vllm-omni also skips the system section entirely
+            # (``if role_token == system_token_id: continue``).  We
+            # currently still include it.  This is a known mismatch that
+            # can be addressed by passing the system section boundary via
+            # step_metadata in a follow-up.
+            if projected.shape[0] >= 3:
+                self._prefill_conv_tail[rid] = projected[-3:].detach().clone()
+
+            # Strip assistant header — only user/system tokens go to KV cache
+            projected_for_cache = projected[:-3]
+
+            seq_len = projected_for_cache.shape[0]
             cache_manager.plan_attention(
                 seq_lens=[seq_len], is_causal=True, label="main"
             )
@@ -1210,7 +1221,7 @@ class TalkerSubmodule(NodeSubmodule):
             )
 
             return {
-                "input_embeds": projected,
+                "input_embeds": projected_for_cache,
                 "is_last_prefill": False,
                 "seq_lens": [seq_len],
             }
@@ -1243,29 +1254,27 @@ class TalkerSubmodule(NodeSubmodule):
         # parse the ChatML structure and pass ``assistant_start_idx`` in
         # step_metadata, but that requires forwarding input_ids to the
         # Talker partition.
-        # HF builds proj[0..3] from the projected assistant role header
-        # tokens (``text_projection(thinker_embed[im_start:segment_end])``).
-        # In our 2-step flow, conv_projected is empty in the last step
-        # because those tokens are already in KV cache.  Retrieve the
-        # saved tail from the non-last step instead.
+        # Verified against vllm-omni's _get_talker_assistant_parts():
+        #   Positions 0-2: assistant_hidden[:3] = text_projection(<|im_start|>assistant\n)
+        #   Position  8:   assistant_hidden[3:4] = text_projection(first generated token)
+        #
+        # In our 2-step flow:
+        #   saved_tail = projected[-3:] from non-last step = <|im_start|>assistant\n
+        #   first_decode_projected = thinker_decode_0's projection = first generated token
         saved_tail = self._prefill_conv_tail.pop(rid, None)
-        prefix_source = conv_projected if conv_projected.shape[0] >= 4 else (
-            saved_tail.to(device) if saved_tail is not None and saved_tail.shape[0] > 0
-            else first_decode_projected  # last-resort fallback
-        )
 
-        n_proj = min(4, prefix_source.shape[0])
-        if n_proj >= 4:
-            prefix_proj = prefix_source[-4:]
-            prefix_proj_start = prefix_proj[:3]  # proj[0:3]
-            prefix_proj_end = prefix_proj[3:]    # proj[3:4]
-        elif n_proj >= 1:
-            prefix_proj_start = prefix_source[-1:].expand(3, -1)
-            prefix_proj_end = prefix_source[-1:]
+        # Positions 0-2: the assistant section header tokens
+        if saved_tail is not None and saved_tail.shape[0] >= 3:
+            prefix_proj_start = saved_tail[-3:].to(device)
+        elif saved_tail is not None and saved_tail.shape[0] >= 1:
+            prefix_proj_start = saved_tail[-1:].to(device).expand(3, -1)
         else:
-            # Should never happen — first_decode_projected always has 1 token
+            # Fallback: use first_decode_projected repeated
             prefix_proj_start = first_decode_projected.expand(3, -1)
-            prefix_proj_end = first_decode_projected
+
+        # Position 8: the first generated text token (matches vllm's
+        # assistant_hidden[3:4], which is the token AFTER the 3-token header).
+        prefix_proj_end = first_decode_projected
 
         text_hidden = torch.cat([
             prefix_proj_start,  # proj[0:3] (3 tokens)
@@ -1373,38 +1382,17 @@ class TalkerSubmodule(NodeSubmodule):
                 emb_i = cp_residual_embeddings[i - 1](code_i).to(codec_embed_sum.dtype)
                 codec_embed_sum = codec_embed_sum + emb_i
 
-            # 2. Get thinker_states — with off-by-one correction.
+            # 2. Get thinker_states from normal graph input (stream).
             #
-            # In our streaming model the Talker's last prefill consumes
-            # thinker_decode_0's state from the stream (because the last
-            # prefill trigger fires on thinker_decode_0's completion).
-            # But in HF/sglang/vllm, trailing_text_hidden[0] (=
-            # thinker_decode_0) feeds the FIRST decode step, not prefill.
-            #
-            # To correct this, we maintain a 1-step delay buffer: each
-            # decode step uses the PREVIOUS step's buffered state and
-            # saves the current stream state for the next step.
-            #   Step 0: use saved thinker_decode_0, buffer thinker_decode_1
-            #   Step 1: use buffered thinker_decode_1, buffer thinker_decode_2
-            #   Step N: use buffered thinker_decode_N, buffer thinker_decode_{N+1}
-            # This exactly matches HF's trailing_text_hidden[N] at every step.
-            buffered_state = self._prefill_consumed_state.pop(rid, None)
+            # Alignment with vllm-omni: the last prefill consumed
+            # thinker_decode_0 (first generated token) for prefix position 8.
+            # trailing_text_hidden in vllm starts at assistant_hidden[4:] =
+            # second generated token.  Our stream delivers thinker_decode_1
+            # (second generated token) here — matching vllm's
+            # trailing_text_hidden[0].  No delay buffer needed.
             thinker_states_list = inp.get("thinker_states", [])
-            stream_state = (
-                thinker_states_list[0] if thinker_states_list and thinker_states_list[0] is not None
-                else None
-            )
-
-            if buffered_state is not None:
-                # Use the buffered state for THIS step's conditioning.
-                thinker_state = buffered_state.to(device)
-                # Save the stream state for the NEXT step's conditioning.
-                if stream_state is not None:
-                    self._prefill_consumed_state[rid] = stream_state.detach().clone()
-                # else: stream empty (Thinker finished) — next step will
-                # see no buffered_state and fall through to the tts_pad path.
-            elif stream_state is not None:
-                thinker_state = stream_state.to(device)
+            if thinker_states_list and thinker_states_list[0] is not None:
+                thinker_state = thinker_states_list[0].to(device)
             else:
                 thinker_state = None
 
@@ -1743,7 +1731,6 @@ class TalkerSubmodule(NodeSubmodule):
         """Remove per-request state when a request completes."""
         self._seen_layer0_mask.pop(request_id, None)
         self._prefill_conv_tail.pop(request_id, None)
-        self._prefill_consumed_state.pop(request_id, None)
 
 
 # ===================================================================
