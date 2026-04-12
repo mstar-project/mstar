@@ -777,9 +777,9 @@ class Qwen3OmniModel(Model):
         if metadata.is_prefill:
             # Talker is in prefill mode, waiting for conductor triggers.
 
-            metadata.kwargs["prefill_chunks_processed"] += 1           
+            metadata.kwargs["prefill_chunks_processed"] += 1
             if persist_signals.get("all_codes", []):
-                # Produced all_codes, so can trasition to decode
+                # Produced all_codes, so can transition to decode
                 metadata.is_prefill = False
                 metadata.graph_walk = "talker_decode"
                 metadata.kwargs["talker_prefill_done"] = True

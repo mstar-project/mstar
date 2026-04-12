@@ -418,21 +418,6 @@ class Model(ABC):
             initial_walk=None, producer_partitions=[],
         )]
 
-    def get_consumer_partition_triggers(
-        self,
-        completed_partition: str,
-        completed_walk: str,
-        all_partition_states: dict,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> dict[str, "ForwardPassArgs"]:
-        """Return triggers for consumer partitions when a producer completes a step.
-
-        Called by the conductor after _process_done_forward for the completed
-        partition. Returns {partition_name: ForwardPassArgs} for each partition
-        to trigger. Default: empty dict (no cross-partition triggers).
-        """
-        return {}
-
     @abstractmethod
     def get_partition_forward_pass_args(
         self,
