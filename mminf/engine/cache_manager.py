@@ -118,7 +118,7 @@ class BatchedCacheManager:
     def plan_attention(
         self,
         seq_lens: list[int] | None = None,
-        dtype=torch.bfloat16,
+        dtype: torch.dtype | None = None,
         is_causal=True,
         write_store: bool=True,
         label: str | None = None,
@@ -141,6 +141,14 @@ class BatchedCacheManager:
             label: cache label to plan for. If None, uses the current active label.
         """
         assert self.kv_cache is not None
+
+        # Default the FlashInfer wrapper's dtype to whatever dtype the KV
+        # cache tensor was actually allocated in. Hardcoding bf16 here breaks
+        # any model that runs in fp32 (the wrapper would try to write
+        # bf16-cast K/V into an fp32 cache and torch raises a dtype mismatch
+        # in flashinfer_utils.set_kv_cache).
+        if dtype is None:
+            dtype = self.kv_cache.dtype
 
         effective_label = label
         if effective_label is None:

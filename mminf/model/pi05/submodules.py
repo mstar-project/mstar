@@ -50,9 +50,16 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         the longer dimension is scaled to the target size, the shorter
         dimension is scaled proportionally, and the result is padded with
         ``-1`` (the float32 normalized "black" value) to reach the target
-        resolution. The contract is that callers provide images already
-        normalized to ``[-1, 1]`` in float32 (matching the lerobot
-        preprocessor); uint8 inputs in ``[0, 255]`` are auto-converted.
+        resolution.
+
+        Accepted input encodings (auto-detected by dtype + value range):
+          * ``uint8`` in ``[0, 255]`` — typical raw decoded image
+          * ``float`` in ``[0, 1]`` — what mminf's ``data_worker`` hands over
+            after dividing decoded uint8 frames by 255
+          * ``float`` in ``[-1, 1]`` — already-normalized form used by the
+            unit/integration tests that bypass the data_worker
+        Anything else falls back to a simple float32 cast and assumes the
+        caller knows what they're doing.
         """
         if images.dim() == 3:
             # [C, H, W] -- single camera; add a leading camera dim.
@@ -67,6 +74,17 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
             images = images.to(torch.float32) / 127.5 - 1.0
         else:
             images = images.to(torch.float32)
+            # The data_worker passes images as float32 in [0, 1] (after
+            # dividing decoded uint8 frames by 255). Detect that case and
+            # remap to [-1, 1] so SigLIP sees the openpi-normalized range.
+            # If the image is already in [-1, 1] (e.g. when test code feeds
+            # the submodule directly), the min will be < 0 and we leave it
+            # alone.
+            if images.numel() > 0:
+                img_min = float(images.min())
+                img_max = float(images.max())
+                if img_min >= -1e-4 and img_max <= 1.0 + 1e-4:
+                    images = images * 2.0 - 1.0
 
         target_h = target_w = self.config.vit_image_size
         _, _, cur_h, cur_w = images.shape
@@ -154,7 +172,27 @@ class Pi05LLMSubmodule(NodeSubmodule):
         self.action_out_proj = action_out_proj
         self.time_mlp = time_mlp
         self.config = config
-        self._embed_scale = math.sqrt(config.hidden_size)
+        # Image features and language token embeddings use DIFFERENT scaling
+        # factors in lerobot's reference, even though both end up calling it
+        # ``sqrt(hidden_size)``:
+        #
+        #   * Images: ``embed_image`` returns
+        #     ``connector(siglip_features) * sqrt(hidden_size)``  -> scale = sqrt(H).
+        #
+        #   * Text: lerobot's ``lang_embed_func`` does
+        #     ``embed_language_tokens(tokens) * sqrt(hidden_size)``, but
+        #     ``embed_language_tokens`` calls HF Gemma's
+        #     ``GemmaTextScaledWordEmbedding`` whose ``forward`` already
+        #     multiplies the raw lookup by an internal ``embed_scale =
+        #     sqrt(hidden_size)``. So the EFFECTIVE text scale is
+        #     ``sqrt(H) * sqrt(H) = H``, not ``sqrt(H)``.
+        #
+        # We use a plain ``nn.Embedding`` for ``embed_tokens`` (no internal
+        # scale), so we have to apply the full ``H`` factor manually here.
+        # Mismatching this produces a ~45x undersized text prefix and the
+        # action expert sees a wildly wrong context.
+        self._image_embed_scale = math.sqrt(config.hidden_size)
+        self._text_embed_scale = float(config.hidden_size)
 
     def get_needed_cache_labels(
         self,
@@ -192,7 +230,7 @@ class Pi05LLMSubmodule(NodeSubmodule):
 
     def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
         emb = self.embed_tokens(ids)
-        return emb * self._embed_scale
+        return emb * self._text_embed_scale
 
     def _preprocess_prefill(
         self,
@@ -206,9 +244,19 @@ class Pi05LLMSubmodule(NodeSubmodule):
         # been formatted as a decimal-string suffix on the language prompt
         # by ``Pi05Model.process_prompt``, then tokenized by the PaliGemma
         # tokenizer. So the LLM only consumes ``img_emb`` + ``text_inputs``.
+        #
+        # IMPORTANT: lerobot's ``embed_prefix`` scales BOTH the image features
+        # (after the multi_modal_projector) and the language token embeddings
+        # by ``sqrt(hidden_size)``. We mirror that here. Without the image
+        # scaling the SigLIP tokens come in ~sqrt(2048)≈45x too small relative
+        # to the language tokens and the action expert sees a wildly wrong
+        # prefix. (The standalone test_pi05_model_loaded_via_remapper_matches_
+        # lerobot integration test missed this because it bypasses
+        # _preprocess_prefill and feeds in lerobot's pre-scaled embed_prefix
+        # output directly.)
         per_request_seqs = []
         for inp in per_request_inputs:
-            img_emb = inp["img_emb"][0]
+            img_emb = inp["img_emb"][0] * self._image_embed_scale
             text_ids = inp["text_inputs"][0]
             text_emb = self._embed_tokens_scaled(text_ids)
             per_request_seqs.append(torch.cat([img_emb, text_emb], dim=0))

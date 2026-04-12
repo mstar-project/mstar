@@ -1,4 +1,5 @@
 import atexit
+import hashlib
 import logging
 import multiprocessing as mp
 import os
@@ -37,7 +38,18 @@ logger = logging.getLogger(__name__)
 
 
 def _req_id_to_seed(req_id: str):
-    return abs(hash(req_id)) % 2**32
+    """Map a request id to a 32-bit seed.
+
+    Uses ``hashlib.md5`` rather than Python's builtin ``hash`` so the result
+    is **stable across processes**: Python salts ``hash`` per-interpreter via
+    ``PYTHONHASHSEED``, which would otherwise make the conductor's per-request
+    seed unpredictable from a client process. A deterministic mapping lets a
+    client pin ``request_id`` and reproduce the exact noise the server's
+    sampler will use, which is essential for noise-controlled debugging
+    (e.g. comparing Pi0.5 server output against a reference implementation).
+    """
+    digest = hashlib.md5(req_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "little")
 
 
 def _worker_process_target(
