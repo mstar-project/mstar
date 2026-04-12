@@ -69,12 +69,25 @@ class SlidingWindowChunkPolicy(ChunkPolicy):
 
 
 class LeftContextChunkPolicy(ChunkPolicy):
-    """Fixed-size sliding window that advances by a stride.
+    """Chunk policy for streaming vocoders with left-context overlap.
 
-    Each pop_chunk returns `window` items and advances the consumed
-    pointer by `stride`. Old items before the window are discarded.
+    Matches HuggingFace's ``Qwen3OmniMoeCode2Wav.chunked_decode`` pattern:
 
-    Example (Orpheus SNAC): window=28 tokens (4 frames), stride=7 (1 frame).
+        Iter 0: codes[0 : chunk]                → emit all (no context)
+        Iter 1: codes[chunk-ctx : 2*chunk]       → trim first ctx, emit rest
+        Iter 2: codes[2*chunk-ctx : 3*chunk]     → trim first ctx, emit rest
+
+    The first pop returns ``chunk`` items (no context).  Subsequent pops
+    return ``chunk + left_context`` items, where the leading ``left_context``
+    items OVERLAP with the tail of the previous chunk.  This overlap allows
+    the causal ConvNet vocoder to "warm up" its internal state on frames
+    it has already processed, ensuring a smooth transition at chunk
+    boundaries.
+
+    The key invariant: the first pop advances by ``chunk - left_context``
+    (not ``chunk``), so the last ``left_context`` items of the first chunk
+    remain in the buffer as overlap for the second pop.  All subsequent
+    pops advance by ``chunk``.
     """
 
     def __init__(self, chunk: int, left_context: int):
@@ -88,6 +101,10 @@ class LeftContextChunkPolicy(ChunkPolicy):
         return buffer_len >= self._window
 
     def next_chunk_size(self, buffer_len: int, items_consumed: int) -> int:
+        # First pop: advance by (chunk - left_context) so the tail of the
+        # first chunk stays in the buffer as overlap for the next pop.
+        if items_consumed == 0:
+            return self._chunk - self._left_context
         return self._chunk
 
     def window_size(self, items_consumed: int) -> int:
