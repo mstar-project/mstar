@@ -1174,6 +1174,14 @@ class TalkerSubmodule(NodeSubmodule):
 
         if not is_last_prefill:
             # ---- Non-last prefill: KV-cache-only step ----
+            # Save the last 4 projected tokens.  In HF, the assistant
+            # prefix uses ``assistant_hidden[:4]`` — the projected tokens
+            # from the assistant role header (``<|im_start|>assistant\n``).
+            # In our 2-step prefill, those tokens are at the END of the
+            # non-last step's projection.  We save them here because
+            # they'll be gone by the last step (consumed into KV cache).
+            if projected.shape[0] > 0:
+                self._prefill_conv_tail[rid] = projected[-4:].detach().clone()
             seq_len = projected.shape[0]
             cache_manager.plan_attention(
                 seq_lens=[seq_len], is_causal=True, label="main"
@@ -1216,15 +1224,29 @@ class TalkerSubmodule(NodeSubmodule):
         # parse the ChatML structure and pass ``assistant_start_idx`` in
         # step_metadata, but that requires forwarding input_ids to the
         # Talker partition.
-        n_proj = min(4, conv_projected.shape[0])
+        # HF builds proj[0..3] from the projected assistant role header
+        # tokens (``text_projection(thinker_embed[im_start:segment_end])``).
+        # In our 2-step flow, conv_projected is empty in the last step
+        # because those tokens are already in KV cache.  Retrieve the
+        # saved tail from the non-last step instead.
+        saved_tail = self._prefill_conv_tail.pop(rid, None)
+        prefix_source = conv_projected if conv_projected.shape[0] >= 4 else (
+            saved_tail.to(device) if saved_tail is not None and saved_tail.shape[0] > 0
+            else first_decode_projected  # last-resort fallback
+        )
+
+        n_proj = min(4, prefix_source.shape[0])
         if n_proj >= 4:
-            prefix_proj = conv_projected[-4:]  # last 4 projected states
+            prefix_proj = prefix_source[-4:]
             prefix_proj_start = prefix_proj[:3]  # proj[0:3]
             prefix_proj_end = prefix_proj[3:]    # proj[3:4]
+        elif n_proj >= 1:
+            prefix_proj_start = prefix_source[-1:].expand(3, -1)
+            prefix_proj_end = prefix_source[-1:]
         else:
-            # Fallback: repeat last state
-            prefix_proj_start = conv_projected[-1:].expand(3, -1)
-            prefix_proj_end = conv_projected[-1:]
+            # Should never happen — first_decode_projected always has 1 token
+            prefix_proj_start = first_decode_projected.expand(3, -1)
+            prefix_proj_end = first_decode_projected
 
         text_hidden = torch.cat([
             prefix_proj_start,  # proj[0:3] (3 tokens)
