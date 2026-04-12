@@ -889,6 +889,14 @@ class TalkerSubmodule(NodeSubmodule):
         # mask is cleared when the request completes (via ``cleanup_request``).
         self._seen_layer0_mask: dict[str, torch.Tensor] = {}
 
+        # Per-request saved tail of projected conversation tokens from
+        # non-last prefill step(s).  The assistant prefix in the LAST
+        # prefill step needs the final ~4 projected conversation tokens
+        # to fill its text-hidden positions (proj[0..2] + proj[3]).
+        # But the non-last prefill step consumes the projections into the
+        # KV cache and doesn't store them.  We save the tail here.
+        self._prefill_conv_tail: dict[str, torch.Tensor] = {}
+
     # ---- Stochastic sampling helpers -------------------------------------
 
     def _get_seen_mask(
@@ -1169,6 +1177,16 @@ class TalkerSubmodule(NodeSubmodule):
 
         if not is_last_prefill:
             # ---- Non-last prefill: KV-cache-only step ----
+            # Save the last 4 projected tokens for the assistant prefix in
+            # the upcoming last-prefill step.  The last prefill receives only
+            # the single thinker_decode token, so it has no conversation
+            # context of its own — it needs these saved tokens to build the
+            # 9-token assistant prefix.  Without this, the prefix positions
+            # would be zeros/garbage and the first ~1 second of audio would
+            # have a random artifact.
+            if projected.shape[0] > 0:
+                self._prefill_conv_tail[rid] = projected[-4:].detach().clone()
+
             seq_len = projected.shape[0]
             cache_manager.plan_attention(
                 seq_lens=[seq_len], is_causal=True, label="main"
@@ -1187,9 +1205,20 @@ class TalkerSubmodule(NodeSubmodule):
         tc = self.config.talker
         talker_hidden = self.config.talker_hidden_size
 
-        # Split projected into conversation body vs first decode state
-        # The last token in thinker_states is from thinker_decode step 1
-        conv_projected = projected[:-1]  # user conversation states
+        # ``projected`` here is typically a SINGLE token (from the first
+        # thinker_decode step).  The conversation tokens were consumed by
+        # the KV cache in earlier non-last prefill step(s) and are gone
+        # from the current input.  We DON'T concatenate them back into
+        # ``projected`` (they're already in KV cache — re-feeding would
+        # create duplicate entries).  Instead, we use the saved tail ONLY
+        # to fill the assistant prefix's text_hidden positions below.
+        saved_tail = self._prefill_conv_tail.pop(rid, None)
+
+        # The first (and typically only) token in projected is the
+        # thinker_decode step 0 state.  It becomes first_decode_projected
+        # and is used in the assistant prefix's proj[3] slot.  There's no
+        # conv_projected to feed to the transformer — those tokens are
+        # already in KV cache.
         first_decode_projected = projected[-1:]  # first Thinker decode token
 
         # Build assistant prefix (matching HF/sglang-omni/vllm-omni pattern):
@@ -1203,23 +1232,27 @@ class TalkerSubmodule(NodeSubmodule):
         pad_embed = self._get_tts_pad_embed(device).expand(4, -1)  # 4 pad tokens
         bos_text_embed = self._get_tts_bos_embed(device)           # 1 bos token
 
-        # W4 (known limitation): The assistant prefix positions use the
-        # last 4 projected Thinker states (conv_projected[-4:]).  This
-        # heuristic is correct for standard ChatML templates where the
-        # assistant role header ``<|im_start|>assistant\n`` occupies the
-        # last 3-4 text tokens before decode starts.  A proper fix would
-        # parse the ChatML structure and pass ``assistant_start_idx`` in
-        # step_metadata, but that requires forwarding input_ids to the
-        # Talker partition.
-        n_proj = min(4, conv_projected.shape[0])
+        # W4: The assistant prefix positions use the last ~4 projected
+        # Thinker conversation states.  In the multi-step prefill flow
+        # these were consumed by KV cache in the non-last step; we
+        # retrieve the saved tail instead.  When ``saved_tail`` is None
+        # (shouldn't happen in the normal 2-step flow) we fall back to
+        # first_decode_projected repeated, which produces a valid but
+        # suboptimal prefix.
+        conv_tail = saved_tail.to(device) if saved_tail is not None else first_decode_projected
+        n_proj = min(4, conv_tail.shape[0])
         if n_proj >= 4:
-            prefix_proj = conv_projected[-4:]  # last 4 projected states
+            prefix_proj = conv_tail[-4:]  # last 4 projected states
             prefix_proj_start = prefix_proj[:3]  # proj[0:3]
             prefix_proj_end = prefix_proj[3:]    # proj[3:4]
+        elif n_proj >= 1:
+            # Not enough saved states — repeat the last one
+            prefix_proj_start = conv_tail[-1:].expand(3, -1)
+            prefix_proj_end = conv_tail[-1:]
         else:
-            # Fallback: repeat last state
-            prefix_proj_start = conv_projected[-1:].expand(3, -1)
-            prefix_proj_end = conv_projected[-1:]
+            # No saved states at all — use first_decode_projected
+            prefix_proj_start = first_decode_projected.expand(3, -1)
+            prefix_proj_end = first_decode_projected
 
         text_hidden = torch.cat([
             prefix_proj_start,  # proj[0:3] (3 tokens)
@@ -1250,12 +1283,10 @@ class TalkerSubmodule(NodeSubmodule):
         # Combine text and codec parts
         assistant_prefix = text_hidden + codec_hidden  # (9, talker_hidden)
 
-        # Full input: conversation body + assistant prefix
-        # (conv_projected was already projected; assistant_prefix includes both)
-        input_embeds = torch.cat([
-            conv_projected,     # user conversation states
-            assistant_prefix,   # 9-token assistant prefix
-        ], dim=0)
+        # Full input: just the assistant prefix.  The conversation tokens
+        # are ALREADY in KV cache from the non-last prefill step(s) — do
+        # NOT re-feed them or they'll appear twice in the attention.
+        input_embeds = assistant_prefix  # (9, talker_hidden)
 
         seq_len = input_embeds.shape[0]
         cache_manager.plan_attention(
@@ -1665,6 +1696,7 @@ class TalkerSubmodule(NodeSubmodule):
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
         self._seen_layer0_mask.pop(request_id, None)
+        self._prefill_conv_tail.pop(request_id, None)
 
 
 # ===================================================================
