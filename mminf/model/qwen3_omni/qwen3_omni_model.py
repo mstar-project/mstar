@@ -45,7 +45,9 @@ from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
-from mminf.streaming.chunk_policy import FixedChunkPolicy
+from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
+from mminf.model.utils import Operation, WeightConverter
+from mminf.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy, SlidingWindowChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
@@ -87,6 +89,25 @@ class Qwen3OmniModel(Model):
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
 
+        self.CONVERTER = [
+            WeightConverter(
+                source_patterns=[
+                    "mlp.experts.*.gate_proj.weight",
+                    "mlp.experts.*.up_proj.weight",
+                ],
+                target_patterns="mlp.experts.gate_up_proj",
+                operations=[
+                    Operation("MergeModulelist",  dim=0),
+                    Operation("Concatenate", dim=1)
+                ]        
+            ),
+            WeightConverter(
+                source_patterns=["mlp.experts.*.down_proj.weight"],
+                target_patterns="mlp.experts.down_proj",
+                operations=[Operation("MergeModulelist",  dim=0)],
+            ),
+        ]
+
         # Load config from pretrained checkpoint
         from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig
 
@@ -98,6 +119,23 @@ class Qwen3OmniModel(Model):
         self.tokenizer = AutoTokenizer.from_pretrained(
             local_dir, cache_dir=cache_dir, trust_remote_code=True,
         )
+
+        # Full multimodal processor: combines tokenizer + image_processor +
+        # video_processor + audio feature_extractor + chat template support.
+        # Used by process_prompt to build the full ChatML prompt with the
+        # correct image_pad / audio_pad / video_pad expansion.
+        try:
+            from transformers import AutoProcessor
+            self._processor = AutoProcessor.from_pretrained(
+                local_dir, cache_dir=cache_dir, trust_remote_code=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not load Qwen3-Omni AutoProcessor (%s); "
+                "process_prompt will fall back to raw tokenizer.encode.",
+                e,
+            )
+            self._processor = None
 
         # Lazy submodule cache -- each worker only loads what it needs
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -166,6 +204,13 @@ class Qwen3OmniModel(Model):
             name="Thinker",
             input_ids=["text_inputs"],
             outputs=[
+                GraphEdge( # last prefill samples a token
+                    next_node=EMIT_TO_CLIENT,
+                    name="new_token",
+                    output_modality="text",
+                    is_new_token=True,
+                    persist=True,
+                ),
                 StreamingGraphEdge(
                     next_node="Talker",
                     name="thinker_states",
@@ -187,6 +232,13 @@ class Qwen3OmniModel(Model):
                 name="Thinker",
                 input_ids=["audio_embeds"],
                 outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="new_token",
+                        output_modality="text",
+                        is_new_token=True,
+                        persist=True,
+                    ),
                     StreamingGraphEdge(
                         next_node="Talker",
                         name="thinker_states",
@@ -209,6 +261,13 @@ class Qwen3OmniModel(Model):
                 name="Thinker",
                 input_ids=["vision_embeds"],
                 outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="new_token",
+                        output_modality="text",
+                        is_new_token=True,
+                        persist=True,
+                    ),
                     StreamingGraphEdge(
                         next_node="Talker",
                         name="thinker_states",
@@ -273,8 +332,13 @@ class Qwen3OmniModel(Model):
             outputs=[
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
-                    name="all_codes",
+                    name="new_token",
                     is_new_token=True,
+                    persist=True,
+                ),
+                GraphEdge(
+                    next_node=EMPTY_DESTINATION,
+                    name="all_codes",
                     persist=True,
                 ),
                 StreamingGraphEdge(
@@ -351,7 +415,10 @@ class Qwen3OmniModel(Model):
                     from_partition="Talker",
                     to_partition="Code2Wav",
                     edge_name="codec_tokens",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=25),
+                    chunk_policy_factory=lambda: LeftContextChunkPolicy(
+                        chunk=self.config.code2wav.chunk_size,
+                        left_context=self.config.code2wav.left_context_size
+                    ),
                 ),
             ],
         )
@@ -451,6 +518,11 @@ class Qwen3OmniModel(Model):
                     "is_last_prefill": is_last_prefill,
                     "sample_token": is_last_prefill,
                     "walk_name": projection_walk_name,
+                    # Pass system section boundary so the Talker can
+                    # skip system tokens (matching vllm-omni behavior).
+                    "_talker_user_start": getattr(
+                        self, "_talker_user_start", 0
+                    ),
                 },
             ),
         }
@@ -491,6 +563,7 @@ class Qwen3OmniModel(Model):
                 full_metadata=full_metadata,
                 inputs=[],
                 unpersist_tensors=[],
+                request_done="audio" not in output_modalities,
             )
         elif partition_name == "Code2Wav":
             # Code2Wav starts with code2wav_chunk walk but no inputs --
@@ -505,6 +578,7 @@ class Qwen3OmniModel(Model):
                 full_metadata=full_metadata,
                 inputs=[],
                 unpersist_tensors=[],
+                request_done="audio" not in output_modalities,
             )
         raise ValueError(f"Unknown partition: {partition_name!r}")
 
@@ -560,6 +634,7 @@ class Qwen3OmniModel(Model):
                 # Tell the Thinker whether to emit thinker_states.  Text only
                 # requests skip it to save cross-partition bandwidth.
                 "audio_output": audio_output,
+                "is_last_prefill": len(schedule) == 1
             },
         )
 
@@ -738,23 +813,17 @@ class Qwen3OmniModel(Model):
                 request_done=True,
             )
 
+        is_last_prefill = True
         if metadata.is_prefill:
-            # Still in prefill -- use schedule to determine inputs
+            # Still in prefill -- delegate to _get_thinker_prefill_inputs
+            # which handles the (walk_name, {input_name: tensor_info}) schedule
+            # entry format and emits one GraphEdge per input (so auxiliary
+            # tensors like image_grid_thw / audio_seqlens reach the encoder
+            # alongside the primary feature tensor).
             schedule = metadata.kwargs["prefill_schedule"]
             step = metadata.kwargs["prefill_step"]
-            walk_name, tensor_info = schedule[step]
-
-            if walk_name == "prefill_text":
-                edge = GraphEdge(next_node="Thinker", name="text_inputs")
-            elif walk_name == "prefill_audio":
-                edge = GraphEdge(next_node="Thinker", name="audio_features")
-            elif walk_name == "prefill_vision":
-                edge = GraphEdge(next_node="Thinker", name="pixel_values")
-            else:
-                raise ValueError(f"Unrecognized prefill walk: {walk_name}")
-
-            edge.tensor_info = [tensor_info]
-            inputs = [edge]
+            is_last_prefill = (step == len(schedule) - 1)
+            inputs = self._get_thinker_prefill_inputs(metadata, persist_signals)
         else:
             # Decode: previous token feeds back as text_inputs
             edge = GraphEdge(next_node="Thinker", name="text_inputs")
@@ -769,6 +838,7 @@ class Qwen3OmniModel(Model):
             "is_prefill": metadata.is_prefill,
             "temperature": metadata.kwargs.get("temperature", 0.7),
             "top_p": metadata.kwargs.get("top_p", 0.9),
+            "is_last_prefill": is_last_prefill,
             # Persist the audio_output flag across every Thinker step so
             # the submodule can gate thinker_states emission.  Default True
             # for backwards compatibility with callers that never set it.
@@ -814,10 +884,9 @@ class Qwen3OmniModel(Model):
             # last prefill has been completed (the trigger sets this flag).
             is_last_prefill = metadata.kwargs.get("is_last_prefill", False)
 
-            if is_last_prefill:
-                # Last prefill done -- transition to talker_decode.
-                # The talker_prefill walk should have produced all_codes
-                # as its first codec token output.
+            if is_last_prefill and persist_signals.get("all_codes", []):
+                # Last prefill done AND all_codes has been produced.
+                # Transition to talker_decode.
                 metadata.is_prefill = False
                 metadata.graph_walk = "talker_decode"
                 metadata.kwargs["talker_prefill_done"] = True
@@ -839,6 +908,21 @@ class Qwen3OmniModel(Model):
                         "is_last_prefill": False,
                     },
                 )
+            elif is_last_prefill:
+                # Race condition: the last-prefill trigger has already
+                # overwritten our metadata with is_last_prefill=True, but
+                # the actual last prefill hasn't run yet (the NON-last
+                # prefill just completed).  Wait — the queued trigger will
+                # drive the last prefill forward.
+                return ForwardPassArgs(
+                    full_metadata=metadata,
+                    inputs=[],
+                    unpersist_tensors=[],
+                    step_metadata={
+                        "is_prefill": True,
+                        "is_last_prefill": True,
+                    },
+                )
             else:
                 # Not the last prefill -- just extend KV cache.
                 # Return empty inputs; the trigger ForwardPassArgs from
@@ -857,7 +941,7 @@ class Qwen3OmniModel(Model):
             # Decode loop: check only the layer-0 code (first element) for
             # codec EOS.  Higher codebook layers (1-31) are residual codes
             # and should not be compared against the EOS token ID.
-            tokens = new_tokens.get("all_codes", [])
+            tokens = new_tokens["new_token"]
             codec_eos = self.config.talker.codec_eos_token_id
             if tokens and tokens[0] == codec_eos:
                 request_done = True
@@ -904,7 +988,7 @@ class Qwen3OmniModel(Model):
         Same pattern as Orpheus SNAC -- the conductor just tracks whether
         there are more codec tokens to process.
         """
-        chunk_size = 25
+        chunk_size = self.config.code2wav.chunk_size
         token_count = conn.token_count if conn else 0
         consumed = conn.consumed_count if conn else 0
         producer_done = conn.producer_done if conn else False
@@ -949,40 +1033,174 @@ class Qwen3OmniModel(Model):
         tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Tokenize text and compute derived multimodal tensors.
+        """Build the full ChatML prompt + derived multimodal tensors.
 
-        The data worker loads raw modality tensors (``image_inputs``,
-        ``audio_inputs``, ``video_inputs``) from ``file_paths`` and passes
-        them in via the ``tensors`` dict.  This method:
-          1. Tokenizes ``prompt`` to produce ``text_inputs``.
-          2. For each modality present in ``tensors``, computes derived
-             tensors needed by the Thinker's preprocess:
-             - ``image_inputs`` -> ``pixel_values`` + ``image_grid_thw``
-             - ``audio_inputs`` -> ``audio_features`` + ``audio_seqlens``
-             - ``video_inputs`` -> ``pixel_values_videos`` + ``video_grid_thw``
+        Uses HF's full ``AutoProcessor`` (combines tokenizer + image_processor
+        + video_processor + feature_extractor + chat template) to:
 
-        Returns only the NEW keys to merge into the data worker's tensor
-        dict (the existing ``*_inputs`` keys are preserved).
+        1. Build a ChatML-formatted prompt from ``prompt`` and any
+           multimodal inputs in ``tensors``.
+        2. Apply ``add_generation_prompt=True`` so the model receives the
+           ``<|im_start|>assistant\\n`` suffix and knows to start the
+           assistant response.
+        3. Run the image_processor / feature_extractor on the raw modality
+           tensors to produce ``pixel_values`` / ``image_grid_thw`` /
+           ``audio_features`` / ``audio_seqlens``.
+        4. Expand the single ``<|image_pad|>`` / ``<|audio_pad|>`` /
+           ``<|video_pad|>`` placeholder in the tokenized text to N copies
+           where N = number of patches after spatial merge (this is what
+           ``Qwen3OmniMoeProcessor.replace_multimodal_special_tokens`` does
+           internally).
+
+        The result has ``text_inputs`` containing the FULL templated +
+        expanded token IDs, plus the per-modality tensor outputs needed by
+        the Thinker's prefill walks.
         """
         result: NameToTensorList = {}
-
-        # --- Text tokenization ---
-        if prompt is not None:
-            tokens = self.tokenizer.encode(prompt)
-            result["text_inputs"] = [
-                torch.tensor(tokens, dtype=torch.long)
-            ]
 
         if tensors is None:
             tensors = {}
 
-        # --- Image processing: pixel_values + image_grid_thw ---
-        image_inputs = tensors.get("image_inputs", [])
-        if image_inputs:
-            # Use HF AutoImageProcessor if available for correct preprocessing
-            # (resizing, normalization, patch extraction, grid computation).
-            pixel_values_list = []
-            grid_thw_list = []
+        # ----- Convert raw modality tensors to PIL/numpy form for HF -----
+        raw_image_inputs = tensors.get("image_inputs", [])
+        raw_audio_inputs = tensors.get("audio_inputs", [])
+        raw_video_inputs = tensors.get("video_inputs", [])
+
+        pil_images: list = []
+        for img in raw_image_inputs:
+            # data_worker.py provides images as (C, H, W) float32 in [0, 1]
+            # on the GPU.  HF processors expect PIL/numpy uint8 (H, W, C)
+            # in [0, 255] -- otherwise the default do_rescale=True double-
+            # rescales and the model sees a near-zero (essentially black)
+            # tensor regardless of the actual image content.
+            if img.dtype.is_floating_point:
+                img_u8 = (img * 255.0).clamp(0, 255).to(torch.uint8)
+            else:
+                img_u8 = img
+            if img_u8.dim() == 3 and img_u8.shape[0] in (1, 3):
+                img_u8 = img_u8.permute(1, 2, 0)  # CHW -> HWC
+            pil_images.append(img_u8.cpu().contiguous().numpy())
+
+        np_audios: list = []
+        for waveform in raw_audio_inputs:
+            wave = waveform
+            if wave.dim() == 2 and wave.shape[0] > 1:
+                wave = wave.mean(dim=0)  # mix channels to mono
+            elif wave.dim() == 2:
+                wave = wave.squeeze(0)
+            np_audios.append(wave.cpu().numpy())
+
+        # ----- Preferred path: text-only chat template + separate modality processors -----
+        #
+        # We deliberately DO NOT include image/audio/video content blocks in
+        # the messages list passed to apply_chat_template.  HF's chat template
+        # would otherwise insert ``<|vision_start|><|image_pad|>...<|vision_end|>``
+        # placeholders into text_inputs, which we don't want because:
+        #
+        #   1. Our prefill_vision / prefill_audio walks already wrap the
+        #      modality content in their own start/end tokens before pushing
+        #      it into the Thinker's KV cache.  Having the same wrapping in
+        #      text_inputs would make the model see each modality twice
+        #      (once as actual encoder embeddings via the modality walks,
+        #      once as generic token embeddings via prefill_text), which is
+        #      noise.
+        #
+        #   2. Unlike HF's single-shot prefill (which masked-scatter's the
+        #      vision embeds INTO the placeholder positions in input_embeds),
+        #      our multi-walk prefill builds up the same final KV cache via
+        #      sequential walks.  The modality placeholders in text_inputs
+        #      would never be replaced by real content in our flow.
+        #
+        # Functionally, both approaches end up with the same set of
+        # embeddings in the KV cache (text + modality content).  Stripping
+        # the placeholders avoids noise from the unfilled embeddings.
+        if self._processor is not None and prompt is not None:
+            try:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Qwen, a virtual human developed by the "
+                            "Qwen team, Alibaba Group, capable of perceiving "
+                            "auditory and visual inputs, as well as generating "
+                            "text and speech."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+
+                # apply_chat_template with TEXT-ONLY content -> no modality
+                # placeholders are inserted.  add_generation_prompt=True
+                # appends the trailing ``<|im_start|>assistant\n`` so the
+                # model knows to start the assistant response.
+                text = self._processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                input_ids = self.tokenizer(
+                    text, return_tensors="pt"
+                )["input_ids"][0]
+                result["text_inputs"] = [input_ids]
+
+                # Compute where the user section starts in the tokenized
+                # prompt.  vllm-omni skips the system section entirely
+                # when building the Talker's KV cache (``if role_token ==
+                # system_token_id: continue``).  We pass this boundary
+                # so the Talker can replicate that behavior.
+                im_starts = (
+                    input_ids == self.config.im_start_token_id
+                ).nonzero(as_tuple=True)[0]
+                # Second <|im_start|> marks start of user section
+                # (first is system).
+                self._talker_user_start = (
+                    im_starts[1].item() if len(im_starts) >= 2 else 0
+                )
+
+                # Run image_processor / feature_extractor SEPARATELY for the
+                # modality outputs.  These don't touch text_inputs.
+                if pil_images:
+                    img_proc = self._processor.image_processor
+                    img_out = img_proc(images=pil_images, return_tensors="pt")
+                    if "pixel_values" in img_out:
+                        result["pixel_values"] = [img_out["pixel_values"]]
+                    if "image_grid_thw" in img_out:
+                        result["image_grid_thw"] = [img_out["image_grid_thw"]]
+
+                if np_audios:
+                    feat_extractor = self._processor.feature_extractor
+                    sr = getattr(feat_extractor, "sampling_rate", 16000)
+                    aud_out = feat_extractor(
+                        np_audios, sampling_rate=sr, return_tensors="pt",
+                    )
+                    if "input_features" in aud_out:
+                        result["audio_features"] = [aud_out["input_features"]]
+                    if "attention_mask" in aud_out:
+                        result["audio_seqlens"] = [
+                            aud_out["attention_mask"].sum(-1).to(torch.long)
+                        ]
+
+                # Video uses the video_processor; left as TODO since our
+                # prefill_vision walk doesn't yet handle video frame stacks.
+                if raw_video_inputs:
+                    result["pixel_values_videos"] = list(raw_video_inputs)
+
+                return result
+            except Exception as e:
+                logger.warning(
+                    "Qwen3-Omni text-only chat template path failed (%s); "
+                    "falling back to per-modality processing without chat "
+                    "template.",
+                    e,
+                )
+
+        # ----- Fallback path: per-modality processing without chat template -----
+        # (Used when AutoProcessor fails to load or prompt is None.)
+        if prompt is not None:
+            tokens = self.tokenizer.encode(prompt)
+            result["text_inputs"] = [torch.tensor(tokens, dtype=torch.long)]
+
+        if pil_images:
             try:
                 processor = getattr(self, "_image_processor", None)
                 if processor is None:
@@ -991,28 +1209,22 @@ class Qwen3OmniModel(Model):
                         self.local_dir, trust_remote_code=True,
                     )
                     self._image_processor = processor
-                for img in image_inputs:
-                    # img: (C, H, W) float in [0, 1] from data_worker
-                    proc_out = processor(images=img, return_tensors="pt")
+                pixel_values_list = []
+                grid_thw_list = []
+                for img_np in pil_images:
+                    proc_out = processor(images=img_np, return_tensors="pt")
                     pixel_values_list.append(proc_out["pixel_values"][0])
                     if "image_grid_thw" in proc_out:
                         grid_thw_list.append(proc_out["image_grid_thw"][0])
+                if pixel_values_list:
+                    result["pixel_values"] = pixel_values_list
+                if grid_thw_list:
+                    result["image_grid_thw"] = grid_thw_list
             except Exception as e:
-                logger.warning(
-                    "Qwen3-Omni: image processor unavailable (%s); "
-                    "passing raw image_inputs through as pixel_values", e,
-                )
-                pixel_values_list = list(image_inputs)
-            if pixel_values_list:
-                result["pixel_values"] = pixel_values_list
-            if grid_thw_list:
-                result["image_grid_thw"] = grid_thw_list
+                logger.warning("Image processor failed: %s", e)
+                result["pixel_values"] = list(raw_image_inputs)
 
-        # --- Audio processing: audio_features + audio_seqlens ---
-        audio_inputs = tensors.get("audio_inputs", [])
-        if audio_inputs:
-            audio_features_list = []
-            audio_seqlens_list = []
+        if np_audios:
             try:
                 processor = getattr(self, "_audio_processor", None)
                 if processor is None:
@@ -1021,42 +1233,25 @@ class Qwen3OmniModel(Model):
                         self.local_dir, trust_remote_code=True,
                     )
                     self._audio_processor = processor
-                for waveform in audio_inputs:
-                    # waveform: (channels, time) from data_worker.
-                    # Most processors expect mono (time,) or (1, time).
-                    wave = waveform
-                    if wave.dim() == 2 and wave.shape[0] > 1:
-                        wave = wave.mean(dim=0)  # mix channels to mono
-                    elif wave.dim() == 2:
-                        wave = wave.squeeze(0)
-                    sampling_rate = getattr(processor, "sampling_rate", 16000)
+                feats = []
+                seqlens = []
+                for wave_np in np_audios:
+                    sr = getattr(processor, "sampling_rate", 16000)
                     proc_out = processor(
-                        wave.cpu().numpy(),
-                        sampling_rate=sampling_rate,
-                        return_tensors="pt",
+                        wave_np, sampling_rate=sr, return_tensors="pt",
                     )
-                    audio_features_list.append(proc_out["input_features"][0])
-                    audio_seqlens_list.append(
-                        torch.tensor(wave.shape[-1], dtype=torch.long)
-                    )
+                    feats.append(proc_out["input_features"][0])
+                    seqlens.append(torch.tensor(wave_np.shape[-1], dtype=torch.long))
+                if feats:
+                    result["audio_features"] = feats
+                    result["audio_seqlens"] = seqlens
             except Exception as e:
-                logger.warning(
-                    "Qwen3-Omni: audio processor unavailable (%s); "
-                    "passing raw audio_inputs through as audio_features", e,
-                )
-                audio_features_list = list(audio_inputs)
-            if audio_features_list:
-                result["audio_features"] = audio_features_list
-            if audio_seqlens_list:
-                result["audio_seqlens"] = audio_seqlens_list
+                logger.warning("Audio processor failed: %s", e)
+                result["audio_features"] = list(raw_audio_inputs)
 
-        # --- Video processing: pixel_values_videos + video_grid_thw ---
-        video_inputs = tensors.get("video_inputs", [])
-        if video_inputs:
-            # TODO: proper video frame extraction + grid computation via
-            # AutoVideoProcessor (or AutoImageProcessor on stacked frames).
-            # For now, pass raw video tensors through.
-            result["pixel_values_videos"] = list(video_inputs)
+        if raw_video_inputs:
+            # TODO: proper video frame extraction + grid via AutoVideoProcessor.
+            result["pixel_values_videos"] = list(raw_video_inputs)
 
         return result
 
@@ -1135,6 +1330,7 @@ class Qwen3OmniModel(Model):
                 ModuleAndPrefix(thinker_model, prefix="thinker"),
             ],
             device=device,
+            conv=self.CONVERTER
         )
 
         thinker_model.eval()
@@ -1162,15 +1358,42 @@ class Qwen3OmniModel(Model):
                 ModuleAndPrefix(talker_model, prefix="talker"),
             ],
             device=device,
+            conv=self.CONVERTER
         )
 
-        # Code Predictor is a separate small model loaded under "talker.code_predictor."
-        # It is used inside the TalkerSubmodule for multi-step codec prediction.
-        from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
+        # Code Predictor: small (5-layer) transformer that runs inline in
+        # the Talker's forward to predict residual RVQ codebook layers.
+        #
+        # We REUSE HF's `Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration`
+        # directly (matching sglang-omni's approach for Code2Wav).  Our
+        # earlier wrapper (`Qwen3OmniCodePredictor` in components/talker.py)
+        # was a structural skeleton mirroring HF's weight layout but with
+        # no functional forward path -- the inner decoder layers required
+        # a FlashInfer cache_handle and could not be called standalone.
+        #
+        # The HF model has a working `.forward(inputs_embeds, generation_steps=...)`
+        # that handles the AR loop correctly, plus the right
+        # `codec_embedding` (ModuleList of Embeddings) and `lm_head`
+        # (ModuleList of Linears) accessible at the canonical paths.
+        #
+        # Init on CPU (NOT meta device) to populate non-persistent buffers
+        # like RoPE inv_freq -- same reasoning as Code2Wav.  Then load
+        # weights and move to the target device.
+        from transformers import AutoConfig
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration,
+        )
 
-        with torch.device("meta"):
-            code_predictor = Qwen3OmniCodePredictor(self.config)
-
+        hf_full_config = AutoConfig.from_pretrained(
+            self.local_dir, trust_remote_code=True,
+        )
+        cp_hf_config = (
+            hf_full_config.talker_config.code_predictor_config
+        )
+        code_predictor = (
+            Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration
+            ._from_config(cp_hf_config)
+        )
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
             modules=[
@@ -1190,24 +1413,64 @@ class Qwen3OmniModel(Model):
         )
 
         # W3: Pre-compute TTS special embeddings using the Thinker's
-        # embedding table.  If the Thinker submodule has already been
-        # loaded on this worker, we can grab its embed_tokens directly.
+        # embedding table.  The HF reference computes:
+        #   tts_pad_embed = talker.text_projection(thinker.embed_tokens(pad_id))
+        #   tts_bos_embed = talker.text_projection(thinker.embed_tokens(bos_id))
+        #   tts_eos_embed = talker.text_projection(thinker.embed_tokens(eos_id))
+        #
+        # Two cases:
+        #
+        # 1. Colocated (Thinker + Talker on same worker): grab the
+        #    Thinker submodule's already-loaded embed_tokens directly.
+        #    Zero extra memory.
+        #
+        # 2. Disaggregated (Talker on a different worker than Thinker):
+        #    load JUST the embed_tokens layer from the checkpoint, use
+        #    it to compute the 3 projected TTS embeds (~12 KB cached on
+        #    the Talker submodule), and immediately discard the
+        #    embedding layer to free its memory.  Peak temp cost is
+        #    vocab_size * hidden_size * 2 bytes (~620 MB for the
+        #    151k-vocab Thinker), held only briefly during init.
         thinker_sub = self._submodule_cache.get("Thinker")
-        if thinker_sub is not None and hasattr(thinker_sub, 'model'):
+        if thinker_sub is not None and hasattr(thinker_sub, "model"):
+            # Colocated: reuse the already-loaded embed_tokens
             try:
-                talker_sub.init_tts_embeds(thinker_sub.model.embed_tokens)
+                embed_tokens = thinker_sub.model.model.embed_tokens
+                talker_sub.init_tts_embeds(embed_tokens)
             except Exception as e:
                 logger.warning(
-                    "Could not init TTS embeds from Thinker embed_tokens "
-                    "(Thinker and Talker may be on different workers): %s", e,
+                    "Could not init TTS embeds from colocated Thinker "
+                    "embed_tokens: %s", e,
                 )
         else:
+            # Disaggregated: load embed_tokens temporarily from the checkpoint
             logger.info(
-                "Thinker submodule not yet loaded on this worker; "
-                "TTS special embeds will use fallback (Talker embed_tokens). "
-                "For correct results, ensure both are on the same worker or "
-                "transfer the cached embeddings during model init."
+                "Thinker submodule not loaded on this worker; loading "
+                "embed_tokens temporarily to compute Talker TTS special embeds."
             )
+            text_config = self.config.thinker_text
+            embed_tokens = torch.nn.Embedding(
+                text_config.vocab_size, text_config.hidden_size,
+            )
+            try:
+                load_weights_from_hf_shards(
+                    repo_dir=self.local_dir,
+                    modules=[ModuleAndPrefix(
+                        embed_tokens, prefix="thinker.model.embed_tokens"
+                    )],
+                    device=device,
+                )
+                talker_sub.init_tts_embeds(embed_tokens)
+            except Exception as e:
+                logger.warning(
+                    "Failed to load Thinker embed_tokens for TTS embeds; "
+                    "Talker will use zero fallback (degraded audio quality): %s",
+                    e,
+                )
+            finally:
+                # Free the temporary embedding layer (~620 MB).  The 12 KB
+                # of cached projected embeds remain on the Talker submodule.
+                del embed_tokens
 
         return talker_sub
 
@@ -1216,19 +1479,20 @@ class Qwen3OmniModel(Model):
 
         # Code2Wav is the vocoder that converts codec tokens to audio waveform.
         # The actual model class will be defined in components.
-        from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeCode2Wav
 
-        with torch.device("meta"):
-            code2wav_model = Qwen3OmniCode2Wav(self.config)
+        hf_cfg = self.config.code2wav.get_hf_config()
+        code2wav_hf = Qwen3OmniMoeCode2Wav._from_config(hf_cfg)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
             modules=[
-                ModuleAndPrefix(code2wav_model, prefix="code2wav"),
+                ModuleAndPrefix(code2wav_hf, prefix="code2wav"),
             ],
             device=device,
         )
 
+        code2wav_model = Qwen3OmniCode2Wav(hf_cfg, code2wav_hf)
         code2wav_model.eval()
 
         from mminf.model.qwen3_omni.submodules import Code2WavSubmodule
@@ -1242,17 +1506,22 @@ class Qwen3OmniModel(Model):
         from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         # Reuse HF audio encoder directly (Whisper-style, not perf-critical)
-        try:
-            from transformers import AutoModel
-            hf_config = AutoModel.from_pretrained(
-                self.local_dir, trust_remote_code=True
-            ).thinker.audio_tower
-            audio_encoder = hf_config
-        except Exception:
-            # Fallback: create a placeholder that loads weights via prefix
-            import importlib
-            logger.warning("Could not load HF audio encoder; using weight-loaded placeholder")
-            audio_encoder = torch.nn.Module()
+        from transformers import AutoConfig
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            Qwen3OmniMoeAudioEncoder,
+        )
+
+        # Load config only (no weights)
+        config = AutoConfig.from_pretrained(
+            self.local_dir,
+            trust_remote_code=True,
+        )
+
+        # This should be a Qwen3OmniMoeConfig
+        audio_config = config.thinker_config.audio_config
+
+        # Build the audio encoder from config
+        audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(audio_config)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
@@ -1269,15 +1538,22 @@ class Qwen3OmniModel(Model):
         from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         # Reuse HF vision encoder directly
-        try:
-            from transformers import AutoModel
-            hf_model = AutoModel.from_pretrained(
-                self.local_dir, trust_remote_code=True
-            )
-            vision_encoder = hf_model.thinker.visual
-        except Exception:
-            logger.warning("Could not load HF vision encoder; using weight-loaded placeholder")
-            vision_encoder = torch.nn.Module()
+        from transformers import AutoConfig
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            Qwen3OmniMoeVisionEncoder,
+        )
+
+        # Load full config (no weights)
+        config = AutoConfig.from_pretrained(
+            self.local_dir,
+            trust_remote_code=True,
+        )
+
+        # Extract the vision sub-config
+        vision_config = config.thinker_config.vision_config
+
+        # Build the vision encoder
+        vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(vision_config)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,

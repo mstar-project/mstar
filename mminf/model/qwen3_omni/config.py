@@ -13,7 +13,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +39,7 @@ class ThinkerTextConfig:
     norm_topk_prob: bool = True
     mlp_only_layers: list[int] = field(default_factory=list)
     decoder_sparse_step: int = 1
+    rope_parameters: dict = field(default_factory=dict)
 
     # Computed -- not stored in HF config
     head_dim: int | None = None
@@ -46,6 +47,22 @@ class ThinkerTextConfig:
     def __post_init__(self) -> None:
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
+        # Sanity check: the published Qwen3-Omni Thinker uses head_dim=128.
+        # The fallback ``hidden_size // num_attention_heads = 2048 // 28 = 73``
+        # is wrong and would silently break the MRoPE interleave layout
+        # (which assumes head_dim // 2 == sum(mrope_section) == 64).
+        # Fail loudly if this happens so we don't waste time chasing
+        # downstream gibberish.
+        if self.head_dim * self.num_attention_heads != self.hidden_size and self.head_dim != 128:
+            import logging
+            logging.getLogger(__name__).warning(
+                "ThinkerTextConfig: unusual head_dim=%d "
+                "(hidden_size=%d, num_attention_heads=%d). "
+                "Expected head_dim=128 for Qwen3-Omni. "
+                "Verify the checkpoint config.json contains 'head_dim': 128 "
+                "under thinker_config.text_config.",
+                self.head_dim, self.hidden_size, self.num_attention_heads,
+            )
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ThinkerTextConfig:
@@ -168,16 +185,31 @@ class TalkerTextConfig:
 @dataclass
 class TalkerConfig:
     accept_hidden_layer: int = 18
-    num_code_groups: int = 32
+    # Qwen3-Omni-30B-A3B-Instruct has 16 code groups (verified against the
+    # published config.json on HF Hub).  The HF class-level default was 32
+    # but that's not what the published checkpoint uses.
+    num_code_groups: int = 16
     thinker_hidden_size: int = 2048
 
-    # Codec special token IDs
-    codec_eos_token_id: int = 4198
-    codec_nothink_id: int = 4203
-    codec_think_bos_id: int = 4204
-    codec_think_eos_id: int = 4205
-    codec_pad_id: int = 4196
-    codec_bos_id: int = 4197
+    # Codec special token IDs.
+    #
+    # IMPORTANT: HF's ``Qwen3OmniMoeTalkerConfig`` class declares the
+    # defaults for these fields in the 4196-4205 range, but those are
+    # placeholders — the Talker's ``codec_embedding`` is an
+    # ``nn.Embedding`` sized by the talker text vocab (``vocab_size=3072``
+    # in HF defaults), so IDs ≥ 3072 are out-of-range and cause a
+    # CUDA device-side assert when the assistant-prefix builder tries
+    # to embed them.  The ACTUAL published Qwen3-Omni checkpoint uses
+    # the 2148-2157 range (matching sglang-omni's values and the
+    # model's tokenizer).  We use those as our defaults here and also
+    # load from the checkpoint's ``config.json`` via ``from_dict`` if
+    # the keys are present.
+    codec_eos_token_id: int = 2150
+    codec_nothink_id: int = 2155
+    codec_think_bos_id: int = 2156
+    codec_think_eos_id: int = 2157
+    codec_pad_id: int = 2148
+    codec_bos_id: int = 2149
 
     audio_start_token_id: int = 151669
 
@@ -193,6 +225,7 @@ class TalkerConfig:
 
 @dataclass
 class CodePredictorConfig:
+    # === Existing fields ===
     vocab_size: int = 2048
     hidden_size: int = 1024
     intermediate_size: int = 3072
@@ -200,7 +233,28 @@ class CodePredictorConfig:
     num_attention_heads: int = 16
     num_key_value_heads: int = 8
     head_dim: int = 128
-    num_code_groups: int = 32
+    # Qwen3-Omni uses 16 code groups (verified against the published HF
+    # config.json — code_predictor_config.num_code_groups = 16).
+    num_code_groups: int = 16
+
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
+    codebook_dim: int = 512
+    codebook_size: int = 2048
+    decoder_dim: int = 1536
+    hidden_act: str = "silu"
+    layer_scale_initial_scale: float = 0.01
+    max_position_embeddings: int = 8000
+    model_type: str = ""
+    num_quantizers: int = 16
+    num_semantic_quantizers: int = 1
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
+    semantic_codebook_size: int = 4096
+    sliding_window: int = 72
+    upsample_rates: Tuple[int, ...] = (8, 5, 4, 3)
+    upsampling_ratios: Tuple[int, ...] = (2, 2)
+    vector_quantization_hidden_dimension: int = 512
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> CodePredictorConfig:
@@ -214,13 +268,32 @@ class CodePredictorConfig:
 
 @dataclass
 class Code2WavConfig:
+    # === Existing fields ===
     codebook_size: int = 2048
     num_quantizers: int = 16
     sliding_window: int = 72
     hidden_size: int = 1024
     num_hidden_layers: int = 8
-    upsample_rates: tuple[int, ...] = (8, 5, 4, 3)
-    upsampling_ratios: tuple[int, ...] = (2, 2)
+    upsample_rates: Tuple[int, ...] = (8, 5, 4, 3)
+    upsampling_ratios: Tuple[int, ...] = (2, 2)
+    chunk_size: int = 300
+    left_context_size: int = 25
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
+    codebook_dim: int = 512
+    decoder_dim: int = 1536
+    hidden_act: str = "silu"
+    intermediate_size: int = 3072
+    layer_scale_initial_scale: float = 0.01
+    max_position_embeddings: int = 8000
+    model_type: str = ""
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 16
+    num_semantic_quantizers: int = 1
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
+    semantic_codebook_size: int = 4096
+    vector_quantization_hidden_dimension: int = 512
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Code2WavConfig:
@@ -230,6 +303,29 @@ class Code2WavConfig:
             if tup_field in filtered and isinstance(filtered[tup_field], list):
                 filtered[tup_field] = tuple(filtered[tup_field])
         return cls(**filtered)
+
+    def get_hf_config(self):
+        from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+            Qwen3OmniMoeCode2WavConfig,
+        )
+        return Qwen3OmniMoeCode2WavConfig(
+            codebook_size=self.codebook_size,
+            hidden_size=self.hidden_size,
+            num_hidden_layers=self.num_hidden_layers,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            intermediate_size=self.intermediate_size,
+            max_position_embeddings=self.max_position_embeddings,
+            sliding_window=self.sliding_window,
+            num_quantizers=self.num_quantizers,
+            upsample_rates=list(self.upsample_rates),
+            upsampling_ratios=list(self.upsampling_ratios),
+            decoder_dim=self.decoder_dim,
+            hidden_act=self.hidden_act,
+            rms_norm_eps=self.rms_norm_eps,
+            attention_dropout=self.attention_dropout,
+            layer_scale_initial_scale=self.layer_scale_initial_scale,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +358,41 @@ class Qwen3OmniModelConfig:
     talker: TalkerConfig = field(default_factory=TalkerConfig)
     code_predictor: CodePredictorConfig = field(default_factory=CodePredictorConfig)
     code2wav: Code2WavConfig = field(default_factory=Code2WavConfig)
+
+    def __post_init__(self) -> None:
+        # Sanity check: all codec special token IDs must be < the Talker's
+        # codec_embedding vocab size (talker_text.vocab_size, typically 3072).
+        # HF's class-level defaults for Qwen3OmniMoeTalkerConfig put these
+        # in the 4196-4205 range, but the actual published checkpoint uses
+        # the 2148-2157 range.  If the loaded values are out-of-range, the
+        # Talker's codec_embedding lookups would trigger a CUDA device-side
+        # assert — fail loudly here instead.
+        vocab = self.talker_text.vocab_size
+        ids = {
+            "codec_pad_id": self.talker.codec_pad_id,
+            "codec_bos_id": self.talker.codec_bos_id,
+            "codec_eos_token_id": self.talker.codec_eos_token_id,
+            "codec_nothink_id": self.talker.codec_nothink_id,
+            "codec_think_bos_id": self.talker.codec_think_bos_id,
+            "codec_think_eos_id": self.talker.codec_think_eos_id,
+        }
+        bad = [(k, v) for k, v in ids.items() if v < 0 or v >= vocab]
+        if bad:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(
+                "Qwen3OmniModelConfig: codec special token IDs are out of "
+                "range for talker_text.vocab_size=%d. Bad IDs: %s. "
+                "This will cause CUDA device-side asserts when the Talker "
+                "assistant-prefix builder calls codec_embedding() on these "
+                "IDs. Check that your checkpoint's config.json provides the "
+                "correct codec_*_id fields under talker_config, or that the "
+                "TalkerConfig defaults match the actual model.",
+                vocab, bad,
+            )
+            raise ValueError(
+                f"Codec special token IDs out of range for vocab_size={vocab}: {bad}"
+            )
 
     # ------------------------------------------------------------------
     # Convenience properties

@@ -189,12 +189,10 @@ def _dispatch_experts_fused(
         )  # (tokens, top_k, num_experts)
         expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, tokens)
         # Identify which experts are actually used
-        expert_hit = (
-            expert_mask.sum(dim=(-1, -2)).gt(0).nonzero(as_tuple=False)
-        )
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
     for expert_idx_t in expert_hit:
-        expert_idx = expert_idx_t[0].item()
+        expert_idx = expert_idx_t[0]
         # top_k_pos: which top-k slot, token_idx: which tokens
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         current_state = hidden_states[token_idx]

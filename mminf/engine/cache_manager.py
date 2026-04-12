@@ -212,6 +212,7 @@ class BatchedCacheManager:
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
                 page_size=page_size,
+                device=self.device
             )
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[effective_label] = ps
@@ -222,6 +223,7 @@ class BatchedCacheManager:
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
                 page_size=page_size,
+                device=self.device
             )
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[effective_label] = ps

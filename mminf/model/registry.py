@@ -14,7 +14,7 @@ MODEL_REGISTRY: dict[str, type[Model]] = {
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
-    "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni"},
+    "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
 }
 
 

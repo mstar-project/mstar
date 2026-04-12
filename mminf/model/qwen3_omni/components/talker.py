@@ -320,6 +320,10 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
             nn.Embedding(cp.vocab_size, cp.hidden_size)
             for _ in range(num_residual)
         ])
+    
+    def forward(self, *args):
+        # This is never called; keeping for compatibility with nn.Module
+        return
 
     def get_input_embeddings(self):
         """Return the codec embedding list (for HF compatibility)."""
@@ -352,6 +356,10 @@ class Qwen3OmniCodePredictor(nn.Module):
             nn.Linear(cp.hidden_size, cp.vocab_size, bias=False)
             for _ in range(num_residual)
         ])
+    
+    def forward(self, *args):
+        # This is never called; keeping for compatibility with nn.Module
+        return
 
     @property
     def codec_embedding(self):

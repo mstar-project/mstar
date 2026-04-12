@@ -89,39 +89,9 @@ class Qwen3OmniCode2Wav(torch.nn.Module):
     which handles config extraction and weight loading in one call.
     """
 
-    def __init__(self, config: Qwen3OmniModelConfig):
+    def __init__(self, hf_cfg, hf_model):
         super().__init__()
-        from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-            Qwen3OmniMoeCode2WavConfig,
-        )
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-            Qwen3OmniMoeCode2Wav as HFQwen3OmniMoeCode2Wav,
-        )
-
-        # Map our mminf Code2WavConfig to HF's Qwen3OmniMoeCode2WavConfig
-        cw = config.code2wav
-        hf_cfg = Qwen3OmniMoeCode2WavConfig(
-            codebook_size=cw.codebook_size,
-            hidden_size=cw.hidden_size,
-            num_hidden_layers=cw.num_hidden_layers,
-            num_attention_heads=cw.num_attention_heads,
-            num_key_value_heads=cw.num_key_value_heads,
-            intermediate_size=cw.intermediate_size,
-            max_position_embeddings=cw.max_position_embeddings,
-            sliding_window=cw.sliding_window,
-            num_quantizers=cw.num_quantizers,
-            upsample_rates=list(cw.upsample_rates),
-            upsampling_ratios=list(cw.upsampling_ratios),
-            decoder_dim=cw.decoder_dim,
-            hidden_act=cw.hidden_act,
-            rms_norm_eps=cw.rms_norm_eps,
-            attention_dropout=cw.attention_dropout,
-            layer_scale_initial_scale=cw.layer_scale_initial_scale,
-        )
-        self._hf_model = HFQwen3OmniMoeCode2Wav._from_config(hf_cfg)
-
-        # Expose attributes the submodule reads directly
-        self.total_upsample = self._hf_model.total_upsample
+        self._hf_model = hf_model
         self.config = hf_cfg
 
     def forward(self, codes: torch.Tensor, **kwargs) -> torch.Tensor:

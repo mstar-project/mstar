@@ -5,6 +5,7 @@ from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.engine.ar_engine import BatchedCacheManager
+from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.model.base import NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
 from mminf.utils.sampling import Sampler
@@ -149,6 +150,21 @@ class OrpheusLLMSubmodule(NodeSubmodule):
             rid: {"logits": [logits[i : i + 1]]}
             for i, rid in enumerate(request_ids)
         }
+    
+    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+        """Return dummy inputs for CUDA graph capture, or None if this walk
+        doesn't support CUDA graphs.
+
+        Default: returns text_inputs for "decode" walks. Override in subclasses
+        for walks with different input names (e.g., Qwen3-Omni Thinker uses
+        "input_embeds" and "cos_sin_3d"; Talker uses "input_embeds").
+        """
+        return [
+            CudaGraphConfig(
+                graph_walk="decode", requires_cfg=False, labels=["main"],
+                dummy_capture_inputs=[{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
+            ),
+        ]
 
 
 class SNACDecoderSubmodule(NodeSubmodule):

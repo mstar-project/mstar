@@ -417,8 +417,21 @@ class Worker:
             stream_buf.put(info.uuid, tensor.clone())
             self.tensor_manager.dereference(request_id, info.uuid)
 
-    def _find_waiting_node(self, request_id: str, node_name: str) -> "GraphNode | None":
-        """Find the GraphNode with *node_name* in any of this request's worker graph queues.
+    def _find_waiting_node(
+        self,
+        request_id: str,
+        node_name: str,
+        partition_name: str | None = None,
+    ) -> "GraphNode | None":
+        """Find the GraphNode with *node_name* in this request's ACTIVE worker graph queues.
+
+        If ``partition_name`` is given, only worker graphs that are active
+        for that partition's currently-running walk are searched.  This is
+        critical for partitions with multiple walks sharing a node name
+        (e.g., the Talker has ``talker_prefill`` AND ``talker_decode``, both
+        with ``name="Talker"`` but different ``input_ids``).  Without this
+        filter, an inactive walk's stale queue could be returned, and the
+        non-streaming gating logic would check the wrong node's input_ids.
 
         Searches both the ``waiting`` section and the ``ready`` list so that we
         can inspect ``input_ids`` and ``ready_inputs`` before deciding whether
@@ -428,7 +441,19 @@ class Worker:
         req_info = self.worker_graphs_manager.per_request_info.get(request_id)
         if req_info is None:
             return None
-        for wg_id in req_info.worker_graph_ids:
+
+        # Narrow the search to only the active worker graphs for the
+        # consumer partition if one was provided.  Otherwise fall back to
+        # all worker graphs for the request (backwards-compatible).
+        if partition_name is not None:
+            part_info = req_info.per_partition_info.get(partition_name)
+            if part_info is None:
+                return None
+            candidate_wg_ids = part_info.graph_walk_worker_graph_ids
+        else:
+            candidate_wg_ids = req_info.worker_graph_ids
+
+        for wg_id in candidate_wg_ids:
             queue = self.worker_graphs_manager.queues.get(wg_id)
             if queue is None:
                 continue
@@ -483,8 +508,17 @@ class Worker:
 
                 # Only ingest streaming data when the target node's non-streaming
                 # inputs are already satisfied. This prevents the race condition
-                # where streaming data lands in the wrong graph walk during transitions.
-                target_graph_node = self._find_waiting_node(request_id, consumer_node)
+                # where streaming data lands in the wrong graph walk during
+                # transitions.  We must pass ``partition_name`` so that
+                # _find_waiting_node only searches the CURRENTLY ACTIVE walk's
+                # worker graphs -- otherwise, for partitions with multiple walks
+                # that share a node name (e.g., Talker: talker_prefill AND
+                # talker_decode both have name="Talker" but different input_ids),
+                # we might inspect the stale inactive walk's node and get
+                # incorrect non-streaming gate decisions.
+                target_graph_node = self._find_waiting_node(
+                    request_id, consumer_node, partition_name=partition_name,
+                )
                 if target_graph_node is not None:
                     non_streaming_inputs = target_graph_node.input_ids - self._streaming_edge_names
                     if non_streaming_inputs and not non_streaming_inputs.issubset(
@@ -877,7 +911,7 @@ class Worker:
                 # 3. Pick next batch via MicroScheduler
                 batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
                 if batch is None:
-                    sleep(0.001)
+                    sleep(0.01)
                     continue
 
                 # 4. Gather input tensors for the batch

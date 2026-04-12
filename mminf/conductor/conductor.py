@@ -476,7 +476,11 @@ class Conductor:
                 model_kwargs=body.model_kwargs,
             )
             pstate = partition_states[p.name]
+            # if a partition is not active at all in the request, register that here
+            pstate.is_done = fwd_args.request_done
+
             pstate.metadata = fwd_args.full_metadata
+            pstate.metadata.kwargs.update(fwd_args.step_metadata)
             self._set_partition_worker_graph_ids(
                 body.request_id, p.name, fwd_args.full_metadata.graph_walk,
             )
@@ -662,6 +666,14 @@ class Conductor:
         if incoming_connections and partition_done_from_worker:
             pstate.is_done = True
 
+        # Capture the CURRENT walk BEFORE get_partition_forward_pass_args,
+        # which may mutate pstate.metadata.graph_walk (e.g., Thinker
+        # transitioning from prefill_text to thinker_decode).  The old code
+        # captured prev_walk AFTER the call, so completed_walk passed to
+        # get_consumer_partition_triggers was the NEW walk, not the one that
+        # just completed — causing is_last_prefill to trigger one step early.
+        prev_walk = pstate.metadata.graph_walk
+
         fwd_args = self.model.get_partition_forward_pass_args(
             partition_name=partition_name,
             partition_metadata=pstate.metadata,
@@ -669,9 +681,8 @@ class Conductor:
             new_tokens=pstate.new_tokens,
             incoming_connections=incoming_connections,
         )
-
-        prev_walk = pstate.metadata.graph_walk
         pstate.metadata = fwd_args.full_metadata
+        pstate.metadata.kwargs.update(fwd_args.step_metadata)
 
         # Check max output tokens for partitions that produce tokens
         if pstate.num_output_tokens >= request_data.max_output_tokens:
