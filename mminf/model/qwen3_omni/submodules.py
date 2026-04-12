@@ -894,6 +894,16 @@ class TalkerSubmodule(NodeSubmodule):
         # text_hidden positions in the last prefill step.
         self._prefill_conv_tail: dict[str, torch.Tensor] = {}
 
+        # Per-request flag: whether we've already sent tts_eos_embed as
+        # the text conditioning for this request.  In HF/vllm/sglang,
+        # trailing_text_hidden ends with tts_eos_embed appended:
+        #   trailing_text_hidden = cat(assistant_hidden[4:], tts_eos_embed)
+        # This gives the Talker a "text is done" signal before switching
+        # to tts_pad_embed.  In our streaming model, when the Thinker
+        # finishes the stream returns empty chunks.  We use this flag to
+        # inject tts_eos_embed for ONE step before falling back to pad.
+        self._eos_embed_sent: set[str] = set()
+
         # No delay buffer needed for thinker_states alignment — verified
         # against vllm-omni.  trailing_text_hidden = assistant_hidden[4:]
         # starts at the second generated token.  Our stream naturally
@@ -1081,6 +1091,15 @@ class TalkerSubmodule(NodeSubmodule):
             return self._tts_pad_embed_cached.to(device).unsqueeze(0)
         # Fallback: zeros (matches old behaviour before W3 fix)
         return torch.zeros(1, self.config.talker_hidden_size, device=device)
+
+    def _get_tts_eos_embed(self, device: torch.device) -> torch.Tensor:
+        """Return the TTS eos embedding (Thinker embed -> text_projection).
+
+        Falls back to tts_pad_embed if init_tts_embeds() has not been called.
+        """
+        if self._tts_eos_embed_cached is not None:
+            return self._tts_eos_embed_cached.to(device).unsqueeze(0)
+        return self._get_tts_pad_embed(device)
 
     def _get_tts_bos_embed(self, device: torch.device) -> torch.Tensor:
         """Return the TTS bos embedding (Thinker embed -> text_projection).
@@ -1402,8 +1421,17 @@ class TalkerSubmodule(NodeSubmodule):
                 else:
                     text_hidden = self._get_tts_pad_embed(device)
             else:
-                # Empty thinker_states (Thinker has finished, or no data yet)
-                text_hidden = self._get_tts_pad_embed(device)
+                # Empty thinker_states — Thinker has finished.
+                # HF/vllm/sglang append tts_eos_embed at the end of
+                # trailing_text_hidden so the Talker gets a "text done"
+                # signal before switching to tts_pad_embed.  We replicate
+                # that by using tts_eos_embed for the FIRST empty step,
+                # then tts_pad_embed for all subsequent steps.
+                if rid not in self._eos_embed_sent:
+                    text_hidden = self._get_tts_eos_embed(device)
+                    self._eos_embed_sent.add(rid)
+                else:
+                    text_hidden = self._get_tts_pad_embed(device)
 
             # Ensure text_hidden is (1, hidden)
             if text_hidden.dim() == 1:
@@ -1724,6 +1752,7 @@ class TalkerSubmodule(NodeSubmodule):
         """Remove per-request state when a request completes."""
         self._seen_layer0_mask.pop(request_id, None)
         self._prefill_conv_tail.pop(request_id, None)
+        self._eos_embed_sent.discard(request_id)
 
 
 # ===================================================================
