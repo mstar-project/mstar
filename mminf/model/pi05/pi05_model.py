@@ -77,6 +77,7 @@ class Pi05Model(Model):
         self.tokenizer: Pi05Tokenizer | None = self._load_tokenizer()
 
         self._repo_dir: Path | None = None
+        self._lerobot_buckets: dict[str, dict[str, torch.Tensor]] | None = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
         # Components, materialized lazily by get_submodule().
@@ -114,19 +115,37 @@ class Pi05Model(Model):
     def _load_tokenizer(self) -> Pi05Tokenizer | None:
         if self.skip_weight_loading:
             return None
-        try:
-            from transformers import AutoTokenizer
+        from transformers import AutoTokenizer
 
-            hf_tok = AutoTokenizer.from_pretrained(
-                self.model_path_hf, cache_dir=self.cache_dir
-            )
-            return Pi05Tokenizer(hf_tok, self.config)
-        except Exception as exc:
-            logger.warning(
-                "Could not load Pi0.5 tokenizer from HF (%s); proceeding without one.",
-                exc,
-            )
-            return None
+        # Pi0.5 production code (lerobot's processor_pi05.py) uses the
+        # PaliGemma tokenizer at "google/paligemma-3b-pt-224". The
+        # lerobot/pi05_base repo itself does NOT ship tokenizer files, so
+        # AutoTokenizer.from_pretrained(self.model_path_hf) returns 404 on
+        # tokenizer.json/tokenizer.model. We try the model repo first (in
+        # case a future release adds them) and fall back to the canonical
+        # PaliGemma repo. ``use_fast=True`` is required so we don't need
+        # the slow sentencepiece+protobuf path.
+        for repo in (self.model_path_hf, "google/paligemma-3b-pt-224"):
+            try:
+                hf_tok = AutoTokenizer.from_pretrained(
+                    repo, cache_dir=self.cache_dir, use_fast=True
+                )
+                if repo != self.model_path_hf:
+                    logger.info(
+                        "Pi0.5 tokenizer loaded from fallback repo %s "
+                        "(model repo %s has no tokenizer files)",
+                        repo,
+                        self.model_path_hf,
+                    )
+                return Pi05Tokenizer(hf_tok, self.config)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not load Pi0.5 tokenizer from %s (%s); trying next.",
+                    repo,
+                    exc,
+                )
+        logger.warning("All Pi0.5 tokenizer sources failed; proceeding without one.")
+        return None
 
     def _ensure_repo(self) -> Path:
         if self._repo_dir is not None:
@@ -138,6 +157,34 @@ class Pi05Model(Model):
         )
         self._repo_dir = Path(local)
         return self._repo_dir
+
+    def _ensure_lerobot_buckets(self) -> dict[str, dict[str, torch.Tensor]]:
+        """Lazily load ``model.safetensors`` from the lerobot snapshot and
+        bucket its keys by mminf submodule via :func:`remap_lerobot_state_dict`.
+
+        Pi0.5 (lerobot/pi05_base) ships as a single ~14 GB safetensors blob,
+        not a sharded HF index, so we can't use ``load_weights_from_hf_shards``
+        here. Instead, we load the file once into CPU memory, run the
+        lerobot→mminf key remap, and cache the buckets so subsequent
+        ``get_submodule`` calls (vit_encoder + LLM) reuse them.
+        """
+        if self._lerobot_buckets is not None:
+            return self._lerobot_buckets
+        from safetensors.torch import load_file
+
+        from mminf.model.pi05.weight_loader import remap_lerobot_state_dict
+
+        repo_dir = self._ensure_repo()
+        safetensors_path = repo_dir / "model.safetensors"
+        if not safetensors_path.exists():
+            raise FileNotFoundError(
+                f"Pi0.5 checkpoint missing: {safetensors_path}. Expected a single "
+                "safetensors blob in the lerobot/pi05_base snapshot."
+            )
+        logger.info("Loading Pi0.5 weights from %s", safetensors_path)
+        flat = load_file(str(safetensors_path), device="cpu")
+        self._lerobot_buckets = remap_lerobot_state_dict(flat)
+        return self._lerobot_buckets
 
     # ------------------------------------------------------------------
     # Model ABC: structure
@@ -180,6 +227,16 @@ class Pi05Model(Model):
             ]
         )
 
+        # NOTE: The Loop's terminal ``outputs`` are matched into the section's
+        # node outputs by **name** (see Loop._replace_outputs_for_final_iter
+        # in mminf/graph/base.py): on the final iteration, any section-output
+        # edge whose name matches a terminal output's name is replaced with
+        # the terminal version. This is the same convention BAGEL's image_gen
+        # uses (section returns ``latents`` looping back to LLM, terminal
+        # output is ``name="latents" → vae_decoder``). So our terminal output
+        # MUST be named ``noisy_actions`` to match the section's loop-back
+        # edge — the name is just a graph-internal key, while the actual
+        # client-facing modality bucket is determined by ``output_modality``.
         action_gen = Loop(
             section=GraphNode(
                 name="LLM",
@@ -193,7 +250,7 @@ class Pi05Model(Model):
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
-                    name="action_output",
+                    name="noisy_actions",
                     output_modality="action",
                     persist=True,
                 ),
@@ -375,20 +432,34 @@ class Pi05Model(Model):
     def _init_vit_components(self, device: str):
         if self.siglip is not None:
             return
+        # Construct on the "meta" device — a special PyTorch device that
+        # tracks shape/dtype but allocates no real storage. This lets us
+        # build the module structure with the correct parameter shapes
+        # without paying for ~ViT-bytes of CUDA memory + a throwaway random
+        # init that we'd immediately overwrite with the lerobot weights.
+        # ``mod.to_empty(device=device)`` then materializes uninitialized
+        # tensors on the target device, and ``load_state_dict`` overwrites
+        # them with the real weights. Same pattern HuggingFace
+        # ``from_pretrained`` uses under the hood.
         with torch.device("meta" if not self.skip_weight_loading else "cpu"):
             self.siglip = Pi05SiglipEncoder(self.config)
         if self.skip_weight_loading:
             self.siglip = self.siglip.to_empty(device=device)
             return
-        self._load_weights_into(
-            self.siglip,
-            prefix="vit",
-            device=device,
-        )
+
+        buckets = self._ensure_lerobot_buckets()
+        self.siglip.to_empty(device=device)
+        # strict=False: the lerobot bucket may contain stray pooling-head keys
+        # that Pi05SiglipEncoder doesn't model (vision_use_head=False).
+        self.siglip.load_state_dict(buckets["siglip"], strict=False)
 
     def _init_llm_components(self, device: str):
         if self.embed_tokens is not None:
             return
+        # See ``_init_vit_components`` for why we build on the meta device:
+        # it lets us instantiate ~14 GB worth of Pi0.5 LLM parameters with
+        # zero real memory and zero random init, then materialize them on
+        # ``device`` via ``to_empty`` and overwrite with lerobot weights.
         meta = torch.device("meta" if not self.skip_weight_loading else "cpu")
         with meta:
             self.embed_tokens = nn.Embedding(
@@ -418,30 +489,19 @@ class Pi05Model(Model):
                 mod.to_empty(device=device)
             return
 
-        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
-
-        repo_dir = self._ensure_repo()
-        load_weights_from_hf_shards(
-            repo_dir=repo_dir,
-            modules=[
-                ModuleAndPrefix(self.embed_tokens, prefix="embed_tokens"),
-                ModuleAndPrefix(self.paligemma, prefix="paligemma"),
-                ModuleAndPrefix(self.action_expert, prefix="action_expert"),
-                ModuleAndPrefix(self.action_in_proj, prefix="action_in_proj"),
-                ModuleAndPrefix(self.action_out_proj, prefix="action_out_proj"),
-                ModuleAndPrefix(self.time_mlp, prefix="time_mlp"),
-            ],
-            device=device,
-        )
-
-    def _load_weights_into(
-        self, module: nn.Module, prefix: str, device: str
-    ):
-        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
-
-        repo_dir = self._ensure_repo()
-        load_weights_from_hf_shards(
-            repo_dir=repo_dir,
-            modules=[ModuleAndPrefix(module, prefix=prefix)],
-            device=device,
-        )
+        buckets = self._ensure_lerobot_buckets()
+        # Materialize each module on `device`, then copy in its bucket. We
+        # use strict=False because the lerobot paligemma bucket carries an
+        # extra ``embed_tokens.weight`` key (loaded separately into
+        # self.embed_tokens) and possibly other tied/aux tensors that
+        # Pi05PaliGemmaExpert doesn't model.
+        for mod, name in (
+            (self.embed_tokens, "embed_tokens"),
+            (self.paligemma, "paligemma"),
+            (self.action_expert, "action_expert"),
+            (self.action_in_proj, "action_in_proj"),
+            (self.action_out_proj, "action_out_proj"),
+            (self.time_mlp, "time_mlp"),
+        ):
+            mod.to_empty(device=device)
+            mod.load_state_dict(buckets[name], strict=False)

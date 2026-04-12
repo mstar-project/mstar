@@ -88,10 +88,13 @@ def test_pi05_action_gen_is_loop_with_action_output_emission():
     assert isinstance(action_gen, Loop)
     assert action_gen.n_iters == model.config.num_flow_steps == 10
     # The terminal output emits to the client with the action modality.
+    # Its ``name`` must match one of the section's loop-back edge names so
+    # that Loop._replace_outputs_for_final_iter can swap it in on the final
+    # iteration (see the comment in Pi05Model.get_graph_walk_graphs).
     assert len(action_gen.outputs) == 1
     terminal = action_gen.outputs[0]
     assert terminal.next_node == EMIT_TO_CLIENT
-    assert terminal.name == "action_output"
+    assert terminal.name == "noisy_actions"
     assert terminal.output_modality == "action"
     # Loop body is a single LLM node with two loop-back edges.
     body = action_gen.section

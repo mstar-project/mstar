@@ -16,8 +16,11 @@ MODEL_REGISTRY: dict[str, type[Model]] = {
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
+    # Pi0.5 PyTorch port published by lerobot — single safetensors blob
+    # (~14 GB). mminf/model/pi05/weight_loader.py handles the lerobot->mminf
+    # state-dict remap inside Pi05Model.get_submodule().
+    "pi05": {"model_path_hf": "lerobot/pi05_base"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
-    "pi05": {"model_path_hf": "physical-intelligence/pi05_base"},
 }
 
 

@@ -43,4 +43,4 @@ CUDA_VISIBLE_DEVICES="${DEVICES}" python mminf/api_server/entrypoint.py \
     --socket-path-prefix "/tmp/mminf_${USERNAME}/" \
     --upload-dir "/tmp/mminf_uploads_${USERNAME}/" \
     --tensor-comm-protocol TCP \
-    --tcp-transfer-device "0.0.0.0:0"
+    --tcp-transfer-device "0.0.0.0:0" --log-level DEBUG

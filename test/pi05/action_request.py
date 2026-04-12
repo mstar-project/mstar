@@ -126,7 +126,16 @@ def main():
 
 def _post_blocking(url, data, files) -> np.ndarray | None:
     resp = requests.post(url, data=data, files=files)
-    resp.raise_for_status()
+    if not resp.ok:
+        # FastAPI puts the server-side exception message in the response body's
+        # ``detail`` field via ``HTTPException(detail=str(e))``; print it so we
+        # can see what went wrong without having to grep server logs.
+        print(f"server returned {resp.status_code}:", file=sys.stderr)
+        try:
+            print(json.dumps(resp.json(), indent=2), file=sys.stderr)
+        except Exception:
+            print(resp.text, file=sys.stderr)
+        resp.raise_for_status()
     payload = resp.json()
     chunks = payload.get("outputs", {}).get("action", [])
     if not chunks:

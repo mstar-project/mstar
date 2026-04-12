@@ -338,8 +338,13 @@ class Pi05LLMSubmodule(NodeSubmodule):
         next_actions = noisy_actions + dt * velocity
         next_index = timestep_index + 1
 
-        if int(next_index.item()) >= num_steps:
-            return {"action_output": [next_actions]}
+        # We ALWAYS return both loop-back edges, even on the final iteration.
+        # The Loop primitive (mminf/graph/base.py:Loop) handles the final-iter
+        # swap automatically: it matches the section's output ``noisy_actions``
+        # to the Loop's terminal output (also named ``noisy_actions``, but
+        # routed to EMIT_TO_CLIENT with ``output_modality="action"``) and
+        # filters out the ``timestep_index`` loop-back edge. Same convention
+        # BAGEL's image_gen uses for ``latents`` / ``time_index``.
         return {
             "noisy_actions": [next_actions],
             "timestep_index": [next_index],
