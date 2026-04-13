@@ -493,7 +493,7 @@ class Qwen3OmniModel(Model):
             )
             return ForwardPassArgs(
                 full_metadata=full_metadata,
-                inputs=[GraphEdge(next_node="Talker", name="talker_trigger")],
+                inputs=[GraphEdge(next_node="Talker", name="talker_trigger")] if audio_output else [],
                 unpersist_tensors=[],
                 request_done="audio" not in output_modalities,
                 step_metadata={
