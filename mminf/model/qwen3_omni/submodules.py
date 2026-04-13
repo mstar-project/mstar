@@ -756,10 +756,7 @@ class ThinkerSubmodule(NodeSubmodule):
             visual_pos_masks=visual_pos_masks
         )
 
-        result: NameToTensorList = {
-            "thinker_mask": [next(iter(masks_for_talker.values()))] \
-                if masks_for_talker else []
-        }
+        result: NameToTensorList = {}
 
         # Decode: produce logits for text token sampling
         if graph_walk == "thinker_decode" or request_info.step_metadata.get("is_last_prefill", False):
@@ -783,6 +780,8 @@ class ThinkerSubmodule(NodeSubmodule):
                     [layer_0_embed, layer_0_embed], dim=-1,
                 )
             result["thinker_states"] = [thinker_states]
+            result["thinker_mask"] = [next(iter(masks_for_talker.values()))] \
+                if masks_for_talker else []
 
         return result
 
@@ -877,8 +876,8 @@ class ThinkerSubmodule(NodeSubmodule):
             req_out: NameToTensorList = {"logits": [logits[i : i + 1]]}
             if audio_output_flags[rid] and thinker_states is not None:
                 req_out["thinker_states"] = [thinker_states[i : i + 1]]
-            if rid in masks_for_talker:
-                req_out["thinker_mask"] = [masks_for_talker[rid]]
+                if rid in masks_for_talker:
+                    req_out["thinker_mask"] = [masks_for_talker[rid]]
             outputs[rid] = req_out
         return outputs
 
