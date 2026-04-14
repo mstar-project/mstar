@@ -587,7 +587,7 @@ def main():
     parser.add_argument(
         "--tensor-comm-protocol",
         type=str, default="RDMA",
-        help="RDMA or TCP"
+        help="Tensor transfer protocol: RDMA, TCP, or SHM (shared memory)"
     )
     parser.add_argument(
         "--tcp-transfer-device",
