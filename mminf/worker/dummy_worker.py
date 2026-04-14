@@ -1,7 +1,7 @@
 import time
 
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
-from mminf.communication.tensors import MooncakeCommunicationManager
+from mminf.communication.tensors import create_tensor_communication_manager
 from mminf.model.base import WorkerGraph
 from mminf.utils.ipc_format import (
     ConductorMessage,
@@ -58,12 +58,12 @@ class DummyWorker:
             push_ids=worker_ids + ["conductor", "api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix
         )
-        self.tensor_manager = MooncakeCommunicationManager(
+        self.tensor_manager = create_tensor_communication_manager(
+            protocol=tensor_comm_protocol,
             my_entity_id=worker_id,
             hostname=hostname,
+            device="cpu",
             communicator=self.communicator,
-            protocol=tensor_comm_protocol,
-            device="cpu"
         )
 
     def _add_new_request(
