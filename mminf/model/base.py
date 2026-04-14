@@ -1,7 +1,7 @@
 
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Type
 from uuid import uuid4
 
@@ -22,9 +22,13 @@ from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 
 DECODE = "decode"
-
-
 MAX_OUTPUT_TOKENS = 2048
+
+
+@dataclass
+class TensorAndMetadata:
+    data: torch.Tensor
+    metadata: dict = field(default_factory=dict)
 
 
 class NodeSubmodule(torch.nn.Module):
@@ -381,6 +385,40 @@ class Model(ABC):
             into the existing ``tensors`` dict via ``dict.update``.
         """
         pass
+
+    def load_image(
+        self, filepath: str, device: str
+    ) -> TensorAndMetadata:
+        import torchvision
+        img = torchvision.io.decode_image(filepath).to(device)  # uint8 CxHxW
+        img = img.float() / 255.0
+
+        return TensorAndMetadata(img)
+    
+    def load_audio(
+        self, filepath: str, device: str
+    ) -> TensorAndMetadata:
+        from torchcodec.decoders import AudioDecoder
+        decoder = AudioDecoder(filepath, sample_rate=16000, num_channels=1)
+        audio = decoder.get_all_samples().data[0]
+        return TensorAndMetadata(
+            data=audio,
+            metadata=dict(
+                sample_rate=16000,
+                num_channels=1
+            )
+        )
+
+    def load_video(
+        self, filepath: str, device: str
+    ) :
+        from torchcodec.decoders import VideoDecoder
+        decoder = VideoDecoder(filepath, device=self.device)
+        video = torch.stack([frame for frame in decoder]).float() / 255.0
+        return TensorAndMetadata(
+            data=video,
+            metadata=asdict(decoder.metadata)
+        )   
 
     @abstractmethod
     def postprocess(

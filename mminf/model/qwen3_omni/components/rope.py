@@ -296,8 +296,10 @@ def get_rope_index_audio(
 def get_rope_index_vision(
     grid_thw: torch.LongTensor,
     start_pos: float,
+    position_id_per_seconds: float,
     device: torch.device | None = None,
     spatial_merge_size: int = 2,
+    seconds_per_grid: float | None = None,
 ) -> torch.Tensor:
     """Build 3D MRoPE position IDs for a vision-only span.
 
@@ -341,9 +343,14 @@ def get_rope_index_vision(
         # multimodal parser the temporal component tracks video time via
         # ``position_id_per_seconds``; for still images (grid_t == 1)
         # that collapses to a single value per image.
-        temporal = torch.full(
-            (num_tokens,), float(start_pos), dtype=torch.float, device=device
-        )
+        if seconds_per_grid is None:
+            temporal = torch.full(
+                (num_tokens,), float(start_pos), dtype=torch.float, device=device
+            )
+        else:
+            temporal = (
+                torch.arange(grid_t, dtype=torch.float, device=device) * seconds_per_grid * position_id_per_seconds
+            ).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten().float()
 
         h_index = (
             torch.arange(llm_grid_h, dtype=torch.float, device=device)

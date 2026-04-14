@@ -578,12 +578,17 @@ class ThinkerSubmodule(NodeSubmodule):
             # otherwise fall back to a 1-D sequence (test path without
             # AutoImageProcessor).
             grid_thw = inp.get("image_grid_thw", [None])[0]
+            seconds_per_grid = inp.get("video_second_per_grid", [])
+            seconds_per_grid = seconds_per_grid[0].item() if seconds_per_grid else None
             if grid_thw is not None and grid_thw.numel() > 0:
                 vision_pos_ids = get_rope_index_vision(
                     grid_thw.to(device),
                     start_pos + 1,  # leave room for the BOS token
+                    position_id_per_seconds=self.config.thinker.position_id_per_seconds,
                     device=device,
                     spatial_merge_size=spatial_merge,
+                    seconds_per_grid=seconds_per_grid
+                    
                 )
             else:
                 # Testing/fallback path: no grid_thw available, so treat

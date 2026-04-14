@@ -198,7 +198,7 @@ class AREngine(BaseEngine):
                 logger.info("AREngine: CUDA graphs captured for %s (%d configs)",
                             node_name, len(runner.graphs))
         # Step 1: torch.compile (before CUDA graph capture)
-        self._compile_submodules()
+        # self._compile_submodules() TODO DEBUG UNCOMMENT
 
     def _sample_decode_outputs(
         self,

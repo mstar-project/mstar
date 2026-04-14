@@ -44,7 +44,7 @@ from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
+from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule, TensorAndMetadata
 from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
 from mminf.model.utils import Operation, WeightConverter
 from mminf.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy, SlidingWindowChunkPolicy
@@ -274,7 +274,7 @@ class Qwen3OmniModel(Model):
             ),
             GraphNode(
                 name="Thinker",
-                input_ids=["vision_embeds", "deepstack"],
+                input_ids=["vision_embeds", "deepstack", "video_second_per_grid"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -536,6 +536,8 @@ class Qwen3OmniModel(Model):
             input_modalities, input_signals,
         )
 
+        print("PREFILL SCHEDULE", schedule)
+
         first_walk = schedule[0][0] if schedule else "thinker_decode"
 
         full_metadata = CurrentForwardConductorMetadata(
@@ -598,6 +600,7 @@ class Qwen3OmniModel(Model):
         # video uses pixel_values_videos in HF; we accept both keys here
         pixel_values_videos = input_signals.get("pixel_values_videos", [])
         video_grid_thws = input_signals.get("video_grid_thw", [])
+        video_second_per_grid = input_signals.get("video_second_per_grid", [])
 
         text_idx = audio_idx = vision_idx = video_idx = 0
         for mod in input_modalities:
@@ -632,6 +635,8 @@ class Qwen3OmniModel(Model):
                     entry = {"pixel_values": pixel_values_videos[video_idx]}
                     if video_idx < len(video_grid_thws):
                         entry["image_grid_thw"] = video_grid_thws[video_idx]
+                    if video_idx < len(video_grid_thws):
+                        entry["video_second_per_grid"] = video_second_per_grid[video_idx]
                     schedule.append(("prefill_vision", entry))
                     video_idx += 1
 
@@ -666,8 +671,16 @@ class Qwen3OmniModel(Model):
 
         edges: list[GraphEdge] = []
         for input_name, tensor_info in tensor_dict.items():
+            if input_name == "video_second_per_grid":
+                continue # goes directly to Thinker
             edge = GraphEdge(next_node=target_node, name=input_name)
             edge.tensor_info = [tensor_info]
+            edges.append(edge)
+        
+        if walk_name == "prefill_vision":
+            edge = GraphEdge(next_node="Thinker", name="video_second_per_grid")
+            if "video_second_per_grid" in tensor_dict:
+                edge.tensor_info = [tensor_dict["video_second_per_grid"]]
             edges.append(edge)
         return edges
 
@@ -942,12 +955,31 @@ class Qwen3OmniModel(Model):
     # Model ABC: prompt processing
     # -----------------------------------------------------------------------
 
+    def load_video(
+        self, filepath: str, device: str
+    ) -> TensorAndMetadata:
+        # TODO: support audio in video
+        from qwen_omni_utils.v2_5.vision_process import fetch_video
+        video_input, video_sample_fps = fetch_video(
+            {"video": filepath},
+            return_video_sample_fps=True,
+            image_patch_size=14,
+            return_video_metadata=False
+        )
+        return TensorAndMetadata(
+            data=video_input.to(device),
+            metadata=dict(
+                video_sample_fps=video_sample_fps
+            )
+        )
+
     def process_prompt(
         self,
         prompt: str | None,
         input_modalities: list[str],
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
+        input_metadata: dict[str, dict] = {},
         **kwargs,
     ) -> NameToTensorList:
         """Build the full ChatML prompt + derived multimodal tensors.
@@ -1058,107 +1090,58 @@ class Qwen3OmniModel(Model):
         )["input_ids"][0]
         result["text_inputs"] = [input_ids]
 
+        result["pixel_values"] = []
+        result["image_grid_thw"] = []
+        result["audio_seqlens"] = []
+        result["audio_features"] = []
+        result["video_second_per_grid"] = []
+        result["video_grid_thw"] = []
+        result["pixel_values_videos"] = []
+
         # Run image_processor / feature_extractor SEPARATELY for the
         # modality outputs.  These don't touch text_inputs.
-        if pil_images:
+        for img in pil_images:
             img_proc = self._processor.image_processor
-            img_out = img_proc(images=pil_images, return_tensors="pt")
-            if "pixel_values" in img_out:
-                result["pixel_values"] = [img_out["pixel_values"]]
-            if "image_grid_thw" in img_out:
-                result["image_grid_thw"] = [img_out["image_grid_thw"]]
+            img_out = img_proc(images=[img], return_tensors="pt")
+            result["pixel_values"].append(img_out["pixel_values"])
+            result["image_grid_thw"] += img_out["image_grid_thw"]
 
-        if np_audios:
+        for audio in np_audios:
             feat_extractor = self._processor.feature_extractor
             sr = getattr(feat_extractor, "sampling_rate", 16000)
             aud_out = feat_extractor(
-                np_audios, sampling_rate=sr,
+                audio, sampling_rate=sr,
                 padding=True,
                 truncation=False,
                 return_attention_mask=True,
                 return_tensors="pt"
             )
-            if "attention_mask" in aud_out  and "input_features" in aud_out:
-                aud_out["input_features"] = aud_out["input_features"].permute(0, 2, 1)[aud_out["attention_mask"].bool()].permute(1, 0)
-                result["audio_seqlens"] = [
-                    aud_out["attention_mask"].sum(-1).to(torch.long)
-                ]
-            if "input_features" in aud_out:
-                result["audio_features"] = [aud_out["input_features"]]
+            aud_out["input_features"] = aud_out["input_features"].permute(0, 2, 1)[aud_out["attention_mask"].bool()].permute(1, 0)
+            result["audio_seqlens"].append(
+                aud_out["attention_mask"].sum(-1).to(torch.long)
+            )
+            result["audio_features"].append(
+                aud_out["input_features"]
+            )
 
         # Video uses the video_processor; left as TODO since our
         # prefill_vision walk doesn't yet handle video frame stacks.
-        if raw_video_inputs:
-            result["pixel_values_videos"] = list(raw_video_inputs)
-
-        return result
-            # except Exception as e:
-            #     logger.warning(
-            #         "Qwen3-Omni text-only chat template path failed (%s); "
-            #         "falling back to per-modality processing without chat "
-            #         "template.",
-            #         e,
-            #     )
-
-        # Fallback in its current state will crash the system downstream, so commenting it out
-        # # ----- Fallback path: per-modality processing without chat template -----
-        # # (Used when AutoProcessor fails to load or prompt is None.)
-        # if prompt is not None:
-        #     tokens = self.tokenizer.encode(prompt)
-        #     result["text_inputs"] = [torch.tensor(tokens, dtype=torch.long)]
-
-        # if pil_images:
-        #     try:
-        #         processor = getattr(self, "_image_processor", None)
-        #         if processor is None:
-        #             from transformers import AutoImageProcessor
-        #             processor = AutoImageProcessor.from_pretrained(
-        #                 self.local_dir, trust_remote_code=True,
-        #             )
-        #             self._image_processor = processor
-        #         pixel_values_list = []
-        #         grid_thw_list = []
-        #         for img_np in pil_images:
-        #             proc_out = processor(images=img_np, return_tensors="pt")
-        #             pixel_values_list.append(proc_out["pixel_values"][0])
-        #             if "image_grid_thw" in proc_out:
-        #                 grid_thw_list.append(proc_out["image_grid_thw"][0])
-        #         if pixel_values_list:
-        #             result["pixel_values"] = pixel_values_list
-        #         if grid_thw_list:
-        #             result["image_grid_thw"] = grid_thw_list
-        #     except Exception as e:
-        #         logger.warning("Image processor failed: %s", e)
-        #         result["pixel_values"] = list(raw_image_inputs)
-
-        # if np_audios:
-        #     try:
-        #         processor = getattr(self, "_audio_processor", None)
-        #         if processor is None:
-        #             from transformers import AutoFeatureExtractor
-        #             processor = AutoFeatureExtractor.from_pretrained(
-        #                 self.local_dir, trust_remote_code=True,
-        #             )
-        #             self._audio_processor = processor
-        #         feats = []
-        #         seqlens = []
-        #         for wave_np in np_audios:
-        #             sr = getattr(processor, "sampling_rate", 16000)
-        #             proc_out = processor(
-        #                 wave_np, sampling_rate=sr, return_tensors="pt",
-        #             )
-        #             feats.append(proc_out["input_features"][0])
-        #             seqlens.append(torch.tensor(wave_np.shape[-1], dtype=torch.long))
-        #         if feats:
-        #             result["audio_features"] = feats
-        #             result["audio_seqlens"] = seqlens
-        #     except Exception as e:
-        #         logger.warning("Audio processor failed: %s", e)
-        #         result["audio_features"] = list(raw_audio_inputs)
-
-        # if raw_video_inputs:
-        #     # TODO: proper video frame extraction + grid via AutoVideoProcessor.
-        #     result["pixel_values_videos"] = list(raw_video_inputs)
+        for video, meta in zip(raw_video_inputs, input_metadata.get("video_inputs", []), strict=True):
+            fps = meta.get(
+                "video_sample_fps", 2.0
+            )
+            vid_out = self._processor.video_processor(
+                videos=video,
+                size={
+                    "shortest_edge": 128 * 32 * 32,
+                    "longest_edge": 768 * 32 * 32,
+                }
+            )
+            result["video_second_per_grid"].append(
+                torch.tensor([self._processor.video_processor.temporal_patch_size / fps])
+            )
+            result["video_grid_thw"] += vid_out["video_grid_thw"]
+            result["pixel_values_videos"].append(vid_out["pixel_values_videos"])
 
         return result
 

@@ -190,26 +190,22 @@ class PreprocessWorkerThread:
                 for filepath in input.file_paths[modality]:
                     # ---- Image ----
                     if modality == "image":
-                        img = torchvision.io.decode_image(filepath).to(self.device)  # uint8 CxHxW
-                        img = img.float() / 255.0
-                        tensors[key].append(img)
-                        input_metadata[key].append({}) # cleanest, no metadata
-
+                        out = self.model.load_image(filepath, self.device)
+                        tensors[key].append(out.data)
+                        input_metadata[key].append(out.metadata)
+    
                     # ---- Audio ----
                     elif modality == "audio":
-                        from torchcodec.decoders import AudioDecoder
-                        # Set `num_channels` to `1` which is what most models expects and the default in librosa
-                        # TODO: make sample rate configurable
-                        decoder = AudioDecoder(filepath, sample_rate=16000, num_channels=1)
-                        audio = decoder.get_all_samples().data[0]
-                        tensors[key].append(audio)
+                        out = self.model.load_audio(filepath, self.device)
+                        tensors[key].append(out.data)
+                        input_metadata[key].append(out.metadata)
 
                     # ---- Video ----
                     elif modality == "video":
-                        decoder = VideoDecoder(filepath, device=self.device)
-                        video = torch.stack([frame for frame in decoder]).float() / 255.0
-                        tensors[key].append(video)
-                        input_metadata[key].append(asdict(decoder.metadata))
+                        out = self.model.load_video(filepath, self.device)
+                        tensors[key].append(out.data)
+                        input_metadata[key].append(out.metadata)
+                        
 
         # Then, tokenize the prompt and let the model augment/transform the
         # tensors dict (e.g., Qwen3-Omni needs to compute pixel_values,
@@ -222,6 +218,7 @@ class PreprocessWorkerThread:
                 input.input_modalities,
                 input.output_modalities,
                 tensors=tensors,
+                input_metadata=input_metadata,
                 **(input.model_kwargs or {}),
             )
             if prompt_tensors:
