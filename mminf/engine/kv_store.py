@@ -271,11 +271,6 @@ class PagedAllocationManager:
     def start_async_retrieve(
         self, request_id: str, label: str, seq_info: SequenceInfo
     ):
-        if self.engine is None:
-            raise RuntimeError(
-                "KV cache retrieval requires Mooncake TransferEngine. "
-                "SHM protocol does not support disaggregated KV cache transfers."
-            )
         seq_len = seq_info.seq_len
         state = self.get_state(request_id, label)
         if state.seq_len >= seq_len:
@@ -286,35 +281,37 @@ class PagedAllocationManager:
 
         self.alloc(request_id, label, seq_len)
 
-        read_info = []
+        if self.engine is not None:
+            read_info = []
 
-        for page_pos in range(first_page, last_page + 1):
-            token_start = 0 if page_pos > first_page else (state.seq_len % self.config.page_size)
-            token_end = self.config.page_size if page_pos != last_page else (
-                seq_len % self.config.page_size or self.config.page_size
-            )
-
-            local_page_idx = state.page_indices[page_pos]
-            remote_page_idx = seq_info.page_indices[page_pos]
-
-            for layer in range(self.config.num_layers):
-                local_ptrs, nbytes = self._get_ptr_nbytes(
-                    layer, local_page_idx, token_start, token_end
-                )
-                remote_ptrs, _ = self._get_ptr_nbytes(
-                    layer, remote_page_idx, token_start, token_end,
-                    base_ptr=seq_info.kv_cache_addr
+            for page_pos in range(first_page, last_page + 1):
+                token_start = 0 if page_pos > first_page else (state.seq_len % self.config.page_size)
+                token_end = self.config.page_size if page_pos != last_page else (
+                    seq_len % self.config.page_size or self.config.page_size
                 )
 
-                read_info.extend([
-                    TransferReadInfo(
-                        seq_info.latest_session_id,
-                        local_ptr, remote_ptr, nbytes
-                    ) for local_ptr, remote_ptr in zip(local_ptrs, remote_ptrs, strict=True)
-                ])
-        future = self._async_reader.submit(read_info)
-        if future is not None:
-            self.pending_reads[request_id].setdefault(label, []).append(future)
+                local_page_idx = state.page_indices[page_pos]
+                remote_page_idx = seq_info.page_indices[page_pos]
+
+                for layer in range(self.config.num_layers):
+                    local_ptrs, nbytes = self._get_ptr_nbytes(
+                        layer, local_page_idx, token_start, token_end
+                    )
+                    remote_ptrs, _ = self._get_ptr_nbytes(
+                        layer, remote_page_idx, token_start, token_end,
+                        base_ptr=seq_info.kv_cache_addr
+                    )
+
+                    read_info.extend([
+                        TransferReadInfo(
+                            seq_info.latest_session_id,
+                            local_ptr, remote_ptr, nbytes
+                        ) for local_ptr, remote_ptr in zip(local_ptrs, remote_ptrs, strict=True)
+                    ])
+            future = self._async_reader.submit(read_info)
+            if future is not None:
+                self.pending_reads[request_id].setdefault(label, []).append(future)
+
         state.seq_len = seq_len
         state.position_id_start = seq_info.pos_id
         state.read_in_progress = True
