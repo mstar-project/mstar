@@ -5,13 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import torch
-try:
-    from mooncake.engine import TransferEngine
-except Exception:
-    TransferEngine = None
 
-from mminf.communication.communicator import CommProtocol
-from mminf.communication.tensors import AsyncMooncakeReader, TransferReadInfo
+from mminf.communication.tensors import TensorTransferEngine, TransferReadInfo
 from mminf.conductor.request_info import SequenceInfo
 
 logger = logging.getLogger(__name__)
@@ -113,7 +108,7 @@ class StoreAllocInfo:
 class TransferEngineInfo:
     my_entity_id: str
     my_session_id: str
-    transfer_engine: "TransferEngine | None"
+    transfer_engine: TensorTransferEngine
 
 
 class StoreWritePolicy(Enum):
@@ -134,16 +129,11 @@ class PagedAllocationManager:
         self.kv_cache = kv_cache
         self.write_policy = StoreWritePolicy.ALWAYS
 
-        self.engine = transfer_engine_info.transfer_engine
-        if self.engine is not None:
-            self._async_reader = AsyncMooncakeReader(
-                engine=self.engine, device=kv_cache.device
-            )
-            self.engine.register_memory(
-                self.kv_cache.data_ptr(), self.kv_cache.nbytes
-            )
-        else:
-            self._async_reader = None
+        self._transfer_engine = transfer_engine_info.transfer_engine
+        self._async_reader = self._transfer_engine.get_async_reader(kv_cache.device)
+        self._transfer_engine.register_memory(
+            self.kv_cache.data_ptr(), self.kv_cache.nbytes
+        )
         self.my_entity_id = transfer_engine_info.my_entity_id
         self.my_session_id = transfer_engine_info.my_session_id
 
@@ -281,7 +271,9 @@ class PagedAllocationManager:
 
         self.alloc(request_id, label, seq_len)
 
-        if self.engine is not None:
+        # When _async_reader is None (e.g., SHM / single-node), KV cache data
+        # is already in local GPU memory — no cross-worker transfer needed.
+        if self._async_reader is not None:
             read_info = []
 
             for page_pos in range(first_page, last_page + 1):
@@ -342,10 +334,9 @@ class PagedAllocationManager:
     def cleanup(self):
         if self._async_reader is not None:
             self._async_reader.shutdown()
-        if self.engine is not None:
-            self.engine.unregister_memory(
-                self.kv_cache.data_ptr()
-            )
+        self._transfer_engine.unregister_memory(
+            self.kv_cache.data_ptr()
+        )
 
     def add_request(self, request_id: str, labels: list[str]=None):
         if labels is None:
