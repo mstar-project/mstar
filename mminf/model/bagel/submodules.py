@@ -397,8 +397,7 @@ class LLMSubmodule(NodeSubmodule):
                 dummy_capture_inputs=dummy,
             ),
             CudaGraphConfig(
-                graph_walk="decode", requires_cfg=True,
-                labels=["main", "cfg_text", "cfg_img"],
+                graph_walk="decode", requires_cfg=True, labels=["main", "cfg_img"],
                 dummy_capture_inputs=dummy,
             ),
         ]
