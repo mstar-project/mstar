@@ -12,6 +12,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
+from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -387,6 +388,20 @@ class LLMSubmodule(NodeSubmodule):
             text_mask[-1] = True
             result["text_mask"].append(text_mask)
         return result
+
+    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+        dummy = [{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
+        return [
+            CudaGraphConfig(
+                graph_walk="decode", requires_cfg=False, labels=["main"],
+                dummy_capture_inputs=dummy,
+            ),
+            CudaGraphConfig(
+                graph_walk="decode", requires_cfg=True,
+                labels=["main", "cfg_text", "cfg_img"],
+                dummy_capture_inputs=dummy,
+            ),
+        ]
 
     def get_needed_cache_labels(
         self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
