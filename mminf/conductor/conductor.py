@@ -58,7 +58,7 @@ def _worker_process_target(
     my_worker_graphs: list[WorkerGraph],
     kv_config: list[KVCacheConfig],
     all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-    all_worker_graph_ids_to_nodes: dict[str, list[str]],
+    all_worker_graph_ids_to_nodes: dict[str, set[str]],
     hostname: str,
     socket_path_prefix: str,
     enable_nvtx: bool = False,
@@ -228,7 +228,7 @@ class Conductor:
         self._all_worker_graph_ids_to_graph_walks: dict[str, set[str]] = {
             worker_graph_id: worker_graph.graph_walks for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        self._all_worker_graph_ids_to_nodes: dict[str, list[str]] = {
+        self._all_worker_graph_ids_to_nodes: dict[str, set[str]] = {
             worker_graph_id: worker_graph.section.get_node_names()
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }

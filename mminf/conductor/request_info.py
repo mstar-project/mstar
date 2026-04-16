@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 
+from mminf.graph.loop_index import IterIndexTree
+
 
 @dataclass
 class CurrentForwardConductorMetadata:
@@ -68,15 +70,14 @@ class CurrentForwardPassInfo:
 
     # set of names of loops to stop
     dynamic_loop_stop_signals: set[str] = field(default_factory=set)
-    dynamic_loop_iter_counts: dict[str, int] = field(default_factory=dict)
+    loop_stop_times: dict[str, IterIndexTree] = field(default_factory=dict)
 
     def register_loop_stop(self, loop_name: str):
         self.dynamic_loop_stop_signals.add(loop_name)
     
-    def reset_dyn_loop_info(self):
+    def clear_loop_stop_info(self):
+        self.loop_stop_times.clear()
         self.dynamic_loop_stop_signals.clear()
-        self.dynamic_loop_iter_counts.clear()
-
 
 # ---------------------------------------------------------------------------
 # Partition types for async graph partitions

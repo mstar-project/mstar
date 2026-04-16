@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from mminf.communication.tensors import TensorCommunicationManager
 from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
 from mminf.graph.base import DynamicLoop, FilteredEdges, GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
+from mminf.graph.loop_index import IterIndexTree, build_loop_index_tree, update_loop_index_tree
 from mminf.graph.request_queues import (
     PerRequestNodeQueues,
     ProcessedInputs,
@@ -214,7 +215,7 @@ class WorkerGraphsManager:
 
     # The following two are for routing purposes:
     all_worker_graph_ids_to_graph_walks: dict[str, set[str]] # for worker graphs on different workers too
-    all_worker_graph_ids_to_nodes: dict[str, str] # for worker graphs on different workers too
+    all_worker_graph_ids_to_nodes: dict[str, set[str]] # for worker graphs on different workers too
 
     # Maps node_name -> partition_name. Populated from the model's partitions
     # and graph walk definitions. Used to look up which partition a node belongs
@@ -454,27 +455,31 @@ class WorkerGraphsManager:
     def stop_loops(
         self, request_id: str,
         partition: str,
-        loop_names: set[str]
+        loop_names: set[str],
+        req_info: CurrentForwardPassInfo | None = None,
+        last_node_run: str | None = None
     ):
         part_info = self.per_request_info[request_id].per_partition_info[partition]
         worker_graph_ids = part_info.graph_walk_worker_graph_ids
         for worker_graph_id in worker_graph_ids:
             self.queues[worker_graph_id].stop_loops(request_id, loop_names)
-    
+            waiting = self.queues[worker_graph_id].per_request_queues[request_id].waiting
 
-    def get_dynamic_loop_iters(
-        self, request_id: str,
-        partition: str,
-    ) -> dict[str, int]:
-        part_info = self.per_request_info[request_id].per_partition_info[partition]
-        worker_graph_ids = part_info.graph_walk_worker_graph_ids
-
-        iter_counts: dict[str, int] = {}
-        for worker_graph_id in worker_graph_ids:
-            iter_counts.update(
-                self.queues[worker_graph_id].get_dynamic_loop_iters(request_id)
-            )
-        return iter_counts
+            if req_info is not None and (
+                last_node_run in self.all_worker_graph_ids_to_nodes[worker_graph_id]
+            ):
+                for name in loop_names:
+                    if name in req_info.loop_stop_times:
+                        req_info.loop_stop_times[name] = update_loop_index_tree(
+                            index_tree=req_info.loop_stop_times[name],
+                            graph=waiting,
+                            fwd_idx=req_info.fwd_index
+                        )
+                    else:
+                        req_info.loop_stop_times[name] = build_loop_index_tree(
+                            graph=waiting,
+                            fwd_idx=req_info.fwd_index
+                        )
 
     def add_request(
         self, request_id: str,
@@ -516,7 +521,7 @@ class WorkerGraphsManager:
                             graph_id for graph_id in my_worker_graph_ids
                             if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
                         ],
-                        current_fwd_info=current_fwd_info
+                        current_fwd_info=current_fwd_info,
                     )
                 }
             )

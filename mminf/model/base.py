@@ -260,7 +260,8 @@ def _divide_into_worker_graphs(
                     curr_iter=graph.curr_iter,
                     _external_inputs=graph._external_inputs,
                     _loop_back_signals=graph._loop_back_signals,
-                    outputs=graph.outputs
+                    outputs=graph.outputs,
+                    _uuid_label=graph._uuid_label
                 )
             else:
                 s.section = Loop(
@@ -269,7 +270,8 @@ def _divide_into_worker_graphs(
                     curr_iter=graph.curr_iter,
                     _external_inputs=graph._external_inputs,
                     _loop_back_signals=graph._loop_back_signals,
-                    outputs=graph.outputs
+                    outputs=graph.outputs,
+                    _uuid_label=graph._uuid_label
                 )
         return loop_section_worker_graphs
 

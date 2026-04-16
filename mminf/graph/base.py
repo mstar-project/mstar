@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ def get_node_to_inputs_mapping(
 @dataclass
 class GraphSection(ABC):
     @abstractmethod
-    def get_node_names(self) -> list[str]:
+    def get_node_names(self) -> set[str]:
         pass
 
     @abstractmethod
@@ -159,8 +160,8 @@ class GraphNode(GraphSection):
     def is_ready_including_streaming(self):
         return self.input_ids.issubset(set(self.ready_inputs.keys()))
 
-    def get_node_names(self) -> list[str]:
-        return [self.name]
+    def get_node_names(self) -> set[str]:
+        return {self.name}
 
     def get_inputs(self) -> list[GraphEdge]:
         return [
@@ -216,10 +217,11 @@ class GraphNode(GraphSection):
 class Sequential(GraphSection):
     sections: list[GraphSection]
 
-    def get_node_names(self) -> list[str]:
-        return sum([
-            s.get_node_names() for s in self.sections
-        ], start=[])
+    def get_node_names(self) -> set[str]:
+        res = set()
+        for s in self.sections:
+            res.update(s.get_node_names())
+        return res
 
     def _get_inputs_outputs(self):
         # In the case that this section is part of a loop, "loop-back"
@@ -300,9 +302,10 @@ class Parallel(GraphSection):
     sections: list[GraphSection]
 
     def get_node_names(self) -> list[str]:
-        return sum([
-            s.get_node_names() for s in self.sections
-        ], start=[])
+        res = set()
+        for s in self.sections:
+            res.update(s.get_node_names())
+        return res
 
     def get_inputs(self):
         return sum(
@@ -385,6 +388,7 @@ class Loop(GraphSection):
     _nxt_iter_section: GraphSection = field(default=None)
     _cached_outputs: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     _output_names: set[str] = field(default_factory=set)
+    _uuid_label: str = field(default_factory=lambda: str(uuid4()))
 
     # For handling tensor reference counting of loop outputs
     _tensor_manager: Any | None = field(default=None) # no type annotation because 
@@ -521,6 +525,7 @@ class Loop(GraphSection):
             _loop_back_signals=self._loop_back_signals,
             _tensor_manager=self._tensor_manager,
             _request_id=self._request_id,
+            _uuid_label=self._uuid_label
         )
 
     def _advance_one_iter(self) -> "Loop":

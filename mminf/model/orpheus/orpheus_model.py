@@ -30,7 +30,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
-from mminf.graph.base import GraphEdge, GraphNode, GraphSection, TensorPointerInfo
+from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, GraphSection, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
@@ -125,22 +125,30 @@ class OrpheusModel(Model):
             ],
         )
 
-        decode = GraphNode(
-            name="LLM",
-            input_ids=["text_inputs"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMPTY_DESTINATION,
-                    name="new_token",
-                    conductor_new_token=True,
-                    persist=True,
-                ),
-                StreamingGraphEdge(
-                    next_node="snac_decoder",
-                    name="new_token",
-                    target_partition="SNAC",
-                ),
-            ],
+        decode = DynamicLoop(
+            name="decode_loop",
+            section=GraphNode(
+                name="LLM",
+                input_ids=["text_inputs"],
+                outputs=[
+                    GraphEdge(
+                        next_node="LLM",
+                        name="text_inputs",
+                    ),
+                    StreamingGraphEdge(
+                        next_node="snac_decoder",
+                        name="new_token",
+                        target_partition="SNAC",
+                    ),
+                    GraphEdge(
+                        next_node=EMPTY_DESTINATION,
+                        name="new_token",
+                        conductor_new_token=True,
+                    ),
+                ],
+            ),
+            max_iters=self.get_max_output_tokens(),
+            outputs=[],
         )
 
         snac_chunk = GraphNode(
@@ -232,18 +240,9 @@ class OrpheusModel(Model):
         if metadata.is_prefill:
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
-            metadata.kwargs["audio_token_count"] = 0
-            metadata.kwargs["decode_finished"] = False
         elif metadata.graph_walk == "decode":
-            tokens = new_tokens.get("new_token", [])
-            count = metadata.kwargs["audio_token_count"]
-            for t in tokens:
-                if t == self.config.stop_token_id:
-                    request_done = True
-                    metadata.kwargs["decode_finished"] = True
-                    break
-                count += 1
-            metadata.kwargs["audio_token_count"] = count
+            request_done = True
+            metadata.kwargs["decode_finished"] = True
 
         if request_done:
             return ForwardPassArgs(

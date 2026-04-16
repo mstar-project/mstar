@@ -3,6 +3,7 @@ from enum import Enum
 
 from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo, SequenceInfo
 from mminf.graph.base import GraphEdge, TensorPointerInfo
+from mminf.graph.loop_index import IterIndexTree
 
 
 class Status(Enum):
@@ -73,7 +74,7 @@ class UnpersistTensors(MessageBody):
 class StopLoops(MessageBody):
     request_id: str
     loop_names: set[str]
-    fwd_index: int
+    loop_stop_times: dict[str, IterIndexTree] = field(default_factory=dict)
     partition_name: str
 
 @dataclass

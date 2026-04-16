@@ -2,6 +2,7 @@ import logging
 import time as _time
 from enum import Enum
 from time import sleep
+import time
 
 import torch
 
@@ -12,6 +13,7 @@ from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
 from mminf.engine.kv_store import KVCacheConfig, StoreWritePolicy, TransferEngineInfo
 from mminf.graph.base import FilteredEdges, GraphEdge
+from mminf.graph.loop_index import build_loop_index_tree
 from mminf.graph.request_queues import format_graph_edge_list
 from mminf.model.base import Model, WorkerGraph
 from mminf.streaming.stream_buffer import StreamBuffer
@@ -60,7 +62,7 @@ class Worker:
         my_worker_graphs: list[WorkerGraph],
         kv_config: dict[str, KVCacheConfig],
         all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-        all_worker_graph_ids_to_nodes: dict[str, list[str]],
+        all_worker_graph_ids_to_nodes: dict[str, set[str]],
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
@@ -208,7 +210,7 @@ class Worker:
         self,
         my_worker_graphs: list[WorkerGraph],
         all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-        all_worker_graph_ids_to_nodes: dict[str, list[str]],
+        all_worker_graph_ids_to_nodes: dict[str, set[str]],
         node_engine_types: dict[str, EngineType] | None = None,
     ) -> StoreWritePolicy:
         """Determine whether this worker needs to write KV to the mooncake store.
@@ -236,7 +238,7 @@ class Worker:
 
         # Collect all workers' AR graph walks
         for wg_id, walks in all_worker_graph_ids_to_graph_walks.items():
-            nodes = all_worker_graph_ids_to_nodes.get(wg_id, [])
+            nodes = all_worker_graph_ids_to_nodes.get(wg_id, set())
             for node_name in nodes:
                 if _is_ar(node_name):
                     all_ar_walks_nodes.update([(walk, node_name) for walk in walks])
@@ -326,6 +328,13 @@ class Worker:
         )
         req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
 
+        self._stop_loops(StopLoops(
+            request_id=body.request_id,
+            loop_names=set(body.request_info.loop_stop_times.keys()),
+            loop_stop_times=body.request_info.loop_stop_times,
+            partition_name=body.partition_name
+        ))
+
         # Handle producer_done signal: mark all StreamBuffers for this request as done
         if body.producer_done:
             if req_info:
@@ -384,10 +393,18 @@ class Worker:
     def _stop_loops(self, body: StopLoops):
         fwd_info = self.worker_graphs_manager.get_fwd_info(
             body.request_id, body.partition_name
-        ) 
-        if fwd_info.fwd_index != body.fwd_index:
-            # new forward pass has started already
-            return
+        )
+        loop_names = set()
+        for name, stop_time in body.loop_stop_times.items():
+            if name not in fwd_info.loop_stop_times or stop_time.label_context_gt(
+                fwd_info.loop_stop_times[name], name
+            ):
+                loop_names.add(name)
+            fwd_info.loop_stop_times[name] = stop_time
+        if loop_names:
+            self.worker_graphs_manager.stop_loops(
+                body.request_id, body.partition_name, loop_names
+            )
 
     def _process_message_list(self, messages: list[WorkerMessage]):
         msg_types_needing_active_request = [
@@ -813,7 +830,6 @@ class Worker:
                 ),
             )
             self.communicator.send(worker_id, message)
-
         if outputs.completed_worker_graph_ids:
             fwd_info = self.worker_graphs_manager.get_fwd_info(request_id, partition_name)
             if partition_name is None:
@@ -873,13 +889,6 @@ class Worker:
                 # 4. Gather input tensors for the batch
                 node_batch = self._build_node_batch(batch)
                 batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
-
-                for request_id, req_info in node_batch.per_request_info.items():
-                    req_info.dynamic_loop_iter_counts.update(
-                        self.worker_graphs_manager.get_dynamic_loop_iters(
-                            request_id, partition=batch_partition,
-                        )
-                    )
 
                 # 5. Execute via engine
                 engine = self.engine_manager.get_engine(batch.node_name)
