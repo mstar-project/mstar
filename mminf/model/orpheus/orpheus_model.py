@@ -140,11 +140,11 @@ class OrpheusModel(Model):
                         name="new_token",
                         target_partition="SNAC",
                     ),
-                    GraphEdge(
-                        next_node=EMPTY_DESTINATION,
-                        name="new_token",
-                        conductor_new_token=True,
-                    ),
+                    # GraphEdge(
+                    #     next_node=EMPTY_DESTINATION,
+                    #     name="new_token",
+                    #     conductor_new_token=True,
+                    # ),
                 ],
             ),
             max_iters=self.get_max_output_tokens(),

@@ -268,6 +268,9 @@ class WorkerGraphsManager:
 
     def get_fwd_number(self, request_id: str, partition_name: str):
         return self.get_fwd_info(request_id, partition_name).fwd_index
+    
+    def has_partition(self,  request_id: str, partition_name: str):
+        return partition_name in self.per_request_info[request_id].per_partition_info
 
     def get_fwd_info(self, request_id: str, partition_name: str):
         part_info = self.per_request_info[request_id].per_partition_info[partition_name]

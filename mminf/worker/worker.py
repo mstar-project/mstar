@@ -391,6 +391,10 @@ class Worker:
             )
     
     def _stop_loops(self, body: StopLoops):
+        if not self.worker_graphs_manager.has_partition(
+            body.request_id, body.partition_name
+        ):
+            return
         fwd_info = self.worker_graphs_manager.get_fwd_info(
             body.request_id, body.partition_name
         )
