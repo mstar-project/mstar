@@ -877,21 +877,39 @@ class Worker:
             from mminf.utils.profiler import range_pop, range_push
             try:
                 # 1. Process ZMQ messages (new requests, input signals, removals)
+                if self.enable_nvtx:
+                    range_push("worker.process_messages", synchronize=True)
                 self._process_messages()
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
 
                 # 2. Check for ready RDMA tensors, feed to worker graph queues
+                if self.enable_nvtx:
+                    range_push("worker.check_ready_tensors", synchronize=True)
                 self._check_ready_tensors()
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
 
                 # 2b. Poll StreamBuffers — pop chunks when ready, feed as normal inputs
+                if self.enable_nvtx:
+                    range_push("worker.poll_stream_buffers", synchronize=True)
                 self._poll_stream_buffers()
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
 
                 # 3. Pick next batch via MicroScheduler
+                if self.enable_nvtx:
+                    range_push("worker.schedule", synchronize=True)
                 batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
                 if batch is None:
                     sleep(0.001)
                     continue
 
                 # 4. Gather input tensors for the batch
+                if self.enable_nvtx:
+                    range_push("worker.build_node_batch", synchronize=True)
                 node_batch = self._build_node_batch(batch)
                 batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
@@ -902,6 +920,8 @@ class Worker:
                         )
                     )
                     batch.node_objects[request_id].clear_outputs()
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
 
                 # 5. Execute via engine
                 engine = self.engine_manager.get_engine(batch.node_name)
@@ -909,13 +929,13 @@ class Worker:
                 if self.enable_nvtx:
                     range_push(
                         f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
-                        synchronize=False,
+                        synchronize=True,
                     )
                 try:
                     output = engine.execute_batch(node_batch)
                 finally:
                     if self.enable_nvtx:
-                        range_pop(synchronize=False)
+                        range_pop(synchronize=True)
 
                 # 5a. Handle allocation failure: offload a victim, retry the rest
                 if output.allocation_failed:
@@ -949,6 +969,8 @@ class Worker:
                     continue
 
                 # Update LRU timestamps for successfully executed requests
+                if self.enable_nvtx:
+                    range_push("worker.update_request_info", synchronize=True)
                 now = _time.monotonic()
                 for rid in batch.node_objects:
                     self._last_active[(rid, batch.node_name)] = now
@@ -968,10 +990,15 @@ class Worker:
                         per_label_seq_info=req_info.per_label_seq_info,
                         partition_name=batch_partition,
                     )
-                    
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
 
                 # 5b. Free consumed input tensors
+                if self.enable_nvtx:
+                    range_push("worker.cleanup_inputs", synchronize=True)
                 self._cleanup_consumed_inputs(batch)
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
 
                 # 6. Route outputs through WorkerGraphsManager first to determine routing.
                 # Filter each node's output edges to only those the submodule actually
@@ -979,6 +1006,8 @@ class Worker:
                 # returns {} -> no edges routed) or Thinker with audio_output=False
                 # (which omits thinker_states). Without filtering, edges whose names are
                 # absent from the output dict would be routed with empty tensor_info.
+                if self.enable_nvtx:
+                    range_push("worker.route_outputs", synchronize=True)
                 filtered_outputs_per_request: dict[str, list[GraphEdge]] = {}
                 for request_id, node in batch.node_objects.items():
                     request_output_tensors = output.per_request_output_tensors.get(
@@ -1000,6 +1029,8 @@ class Worker:
                         request_id, node_outputs[request_id].kept, graph_walk=batch.graph_walk
                     )
                     routing_per_request[request_id] = routing
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
 
                     # 6b. send "loop done" messages to the corresponding workers
                     stop_loop_workers = {}
@@ -1025,18 +1056,26 @@ class Worker:
                         )
 
                 # 7. Store output tensors, register RDMA if needed
+                if self.enable_nvtx:
+                    range_push("worker.store_outputs", synchronize=True)
                 self._register_outputs(batch, routing_per_request)
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
 
                 # 8. Send outputs to other workers / conductor
+                if self.enable_nvtx:
+                    range_push("worker.send_outputs", synchronize=True)
                 for request_id in batch.node_objects.keys():
                     self._send_outputs(
                         request_id, routing_per_request[request_id],
                         graph_walk=batch.graph_walk,
                         partition_name=batch_partition,
                     )
-                
+
                 for rid, req_info in node_batch.per_request_info.items():
                     req_info.dynamic_loop_stop_signals.clear()
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
             except Exception:
                 logger.exception("Worker %s error in main loop", self.worker_id)
                 sleep(0.01)
