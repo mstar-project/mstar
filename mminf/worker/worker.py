@@ -466,23 +466,18 @@ class Worker:
     def _check_ready_tensors(self) -> None:
         """Poll for completed RDMA transfers, feed ready graph edges to worker graph queues."""
         ready = self.tensor_manager.get_ready_tensors()
-        if ready:
-            logger.debug("_check_ready_tensors: got %d request(s) ready", len(ready))
         for request_id, edges in ready.items():
             # Separate streaming edges from normal edges
             streaming = [e for e in edges if e.is_streaming]
             normal = [e for e in edges if not e.is_streaming]
-            logger.debug("_check_ready_tensors: req=%s streaming=%d normal=%d", request_id, len(streaming), len(normal))
 
             for edge in streaming:
                 self._route_streaming_tensor(request_id, edge)
 
             if normal:
-                logger.debug("_check_ready_tensors: calling process_new_inputs for %s", request_id)
                 self.worker_graphs_manager.process_new_inputs(
                     request_id=request_id, inputs=normal,
                 )
-                logger.debug("_check_ready_tensors: process_new_inputs done for %s", request_id)
 
     # ------------------------------------------------------------------
     # CPU offloading
