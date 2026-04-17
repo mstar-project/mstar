@@ -674,8 +674,18 @@ class Worker:
         audio_output=False which omits thinker_states) are excluded so that
         empty-tensor_info edges are not routed downstream.
         """
-        
         output_edges: dict[str, FilteredEdges] = {}
+
+        # tensor_manager.register_for_send would issue
+        # `torch.cuda.default_stream().synchronize()` per rid — at bs=8 that
+        # was 8 serialized syncs (+ their implicit API overhead). One sync
+        # before the rid loop is enough: we only need the preceding forward's
+        # writes to be visible on the source stream before we hand tensor
+        # addresses to peers.
+        if torch.cuda.is_available() and batch.node_objects:
+            torch.cuda.default_stream().synchronize()
+
+
         for request_id, node in batch.node_objects.items():
             # output name to list of tensors
             request_output_tensors = output.per_request_output_tensors.get(
@@ -739,7 +749,8 @@ class Worker:
                     info.uuid for info in edge.tensor_info
                 ])
             self.tensor_manager.register_for_send(
-                request_id=request_id, uuids=uuids
+                request_id=request_id, uuids=uuids,
+                skip_cuda_sync=True,
             )
 
             for edge in routing.persist:
@@ -753,11 +764,20 @@ class Worker:
         self, request_id: str, outputs: NodeOutputRouting,
         graph_walk: str | None = None,
         partition_name: str | None = None,
+        prematerialized_new_tokens: dict[str, list[int]] | None = None,
     ) -> None:
         """
         Send outputs to other workers and to the conductor.
         Persist signals are buffered and sent together with the
         WORKER_GRAPHS_DONE message to avoid race conditions.
+
+        ``prematerialized_new_tokens`` (optional): `{signal_name: [int, ...]}`
+        for this request, where the caller has already done the D→H copy
+        for the new-token tensors. When provided, this function skips the
+        per-tensor ``.cpu()`` call — meaningful when the caller batched
+        multiple requests' new-token transfers into a single D→H to avoid
+        N serialized ``cudaMemcpyAsync`` + ``cudaStreamSynchronize`` per
+        step.
         """
         if graph_walk is None:
             graph_walk = self.worker_graphs_manager.get_graph_walk(request_id, partition_name)
@@ -784,13 +804,19 @@ class Worker:
             for signal in outputs.new_token_outputs:
                 if signal.name in name_to_new_token:
                     continue # don't double-count new tokens
-                new_tokens = [] # list[int]
-                for tensor_info in signal.tensor_info:
-                    tensor = self.tensor_manager.get_tensor(
-                        request_id=request_id,
-                        uuid=tensor_info.uuid
-                    )
-                    new_tokens.extend(tensor.cpu().numpy().tolist())
+                if (
+                    prematerialized_new_tokens is not None
+                    and signal.name in prematerialized_new_tokens
+                ):
+                    new_tokens = prematerialized_new_tokens[signal.name]
+                else:
+                    new_tokens = []  # list[int]
+                    for tensor_info in signal.tensor_info:
+                        tensor = self.tensor_manager.get_tensor(
+                            request_id=request_id,
+                            uuid=tensor_info.uuid
+                        )
+                        new_tokens.extend(tensor.cpu().numpy().tolist())
                 name_to_new_token[signal.name] = new_tokens
 
                 self.worker_graphs_manager.buffer_new_tokens(
@@ -1062,14 +1088,52 @@ class Worker:
                 if self.enable_nvtx:
                     range_pop(synchronize=True)
 
-                # 8. Send outputs to other workers / conductor
+                # 8. Send outputs to other workers / conductor.
+                # Pre-materialize new-token tensors across all rids in a single
+                # batched D→H: the old per-rid `.cpu().numpy().tolist()` inside
+                # _send_outputs would fire N `cudaMemcpyAsync` + N implicit
+                # `cudaStreamSynchronize` per decode step (~300 µs at bs=8).
+                # Collecting tensors first and issuing one concat + cpu() cuts
+                # that to a single D→H with one sync.
                 if self.enable_nvtx:
                     range_push("worker.send_outputs", synchronize=True)
+
+                prematerialized_per_rid: dict[str, dict[str, list[int]]] = {}
+                collected: list[tuple[str, str, torch.Tensor]] = []
+                for rid in batch.node_objects.keys():
+                    routing = routing_per_request[rid]
+                    if not routing.new_token_outputs:
+                        continue
+                    seen_names: set[str] = set()
+                    for signal in routing.new_token_outputs:
+                        if signal.name in seen_names:
+                            continue
+                        seen_names.add(signal.name)
+                        for tinfo in signal.tensor_info:
+                            tensor = self.tensor_manager.get_tensor(
+                                request_id=rid, uuid=tinfo.uuid,
+                            )
+                            collected.append((rid, signal.name, tensor))
+
+                if collected:
+                    lengths = [t.numel() for t in (tr for _, _, tr in collected)]
+                    flat = torch.cat(
+                        [t.flatten() for _, _, t in collected]
+                    ).cpu().tolist()
+                    off = 0
+                    for (rid, sig_name, _), n in zip(collected, lengths):
+                        rid_map = prematerialized_per_rid.setdefault(rid, {})
+                        rid_map.setdefault(sig_name, []).extend(flat[off:off + n])
+                        off += n
+
                 for request_id in batch.node_objects.keys():
                     self._send_outputs(
                         request_id, routing_per_request[request_id],
                         graph_walk=batch.graph_walk,
                         partition_name=batch_partition,
+                        prematerialized_new_tokens=prematerialized_per_rid.get(
+                            request_id
+                        ),
                     )
 
                 for rid, req_info in node_batch.per_request_info.items():

@@ -377,7 +377,18 @@ class TensorCommunicationManager(ABC):
     # ---- abstract: transport-specific ----
 
     @abstractmethod
-    def register_for_send(self, request_id: str, uuids: list[str]):
+    def register_for_send(
+        self, request_id: str, uuids: list[str],
+        skip_cuda_sync: bool = False,
+    ):
+        """Mark these uuids ready for remote consumers to RDMA-read.
+
+        ``skip_cuda_sync=True`` skips the default-stream sync this call normally
+        issues to ensure the source tensors' writes are visible before their
+        addresses are shared with peers. Callers must have already synced on
+        their own (e.g. before a batched loop) — meant to cut N serialized
+        syncs to 1 when registering many uuids in a row.
+        """
         ...
 
     @abstractmethod
@@ -508,8 +519,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             engine._engine, device=device
         )
 
-    def register_for_send(self, request_id, uuids):
-        torch.cuda.default_stream().synchronize()
+    def register_for_send(self, request_id, uuids, skip_cuda_sync=False):
+        if not skip_cuda_sync:
+            torch.cuda.default_stream().synchronize()
         for uuid in uuids:
             if self.protocol == CommProtocol.RDMA:
                 if self.tensor_store.is_registered(request_id, uuid):
@@ -710,8 +722,11 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
     def _shm_path(self, entity_id: str, uuid: str) -> str:
         return os.path.join(self.shm_dir, f"mminf_{entity_id}_{uuid}")
 
-    def register_for_send(self, request_id: str, uuids: list[str]):
-        if torch.cuda.is_available():
+    def register_for_send(
+        self, request_id: str, uuids: list[str],
+        skip_cuda_sync: bool = False,
+    ):
+        if not skip_cuda_sync and torch.cuda.is_available():
             torch.cuda.default_stream().synchronize()
         for uuid in uuids:
             if self.tensor_store.is_registered(request_id, uuid):
