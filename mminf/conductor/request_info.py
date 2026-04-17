@@ -75,7 +75,7 @@ class CurrentForwardPassInfo:
 
     def register_loop_stop(self, loop_name: str):
         self.dynamic_loop_stop_signals.add(loop_name)
-    
+
     def clear_loop_stop_info(self):
         self.loop_stop_times.clear()
         self.dynamic_loop_stop_signals.clear()

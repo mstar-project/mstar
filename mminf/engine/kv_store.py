@@ -59,7 +59,7 @@ class KVCacheConfig:
     def __post_init__(self):
         if self.num_qo_heads is None:
             self.num_qo_heads = self.num_kv_heads
-    
+
     def get_node_str(self):
         if self.nodes is None:
             return "ALL_NODES"

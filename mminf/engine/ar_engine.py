@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
 import logging
+from dataclasses import dataclass, field
 
 import torch
 
@@ -50,7 +50,7 @@ class AREngine(BaseEngine):
         enable_nvtx: bool = False,
     ):
         super().__init__(enable_nvtx=enable_nvtx)
-        
+
         self.kv_management: dict[str, KVManagement] = {}
         self.submodule_management: dict[str, SubmoduleManagement] = {}
 
@@ -69,6 +69,8 @@ class AREngine(BaseEngine):
         kv_cache_type=None,
     ) -> None:
         self.device = device
+        if kv_cache_type is None:
+            kv_cache_type = self.autocast_dtype
 
         node_to_kv_mgmt = {}
         for cfg in kv_cache_config:
@@ -192,6 +194,7 @@ class AREngine(BaseEngine):
                 device=self.device,
                 autocast_dtype=self.autocast_dtype
             )
+            runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()
             if runner.graphs:
                 submodule_mgmt.cuda_graph_runner = runner
@@ -212,13 +215,18 @@ class AREngine(BaseEngine):
         """
 
         for rid, tensors in output.per_request_output_tensors.items():
-            if "logits" not in tensors:
+            # Guard against non-per-rid keys (e.g. the __batched_logits__
+            # sentinel used as a CUDA-graph fast-path hint): their value is
+            # a torch.Tensor, not a dict, so the `"logits" not in tensors`
+            # check below would raise TypeError (Tensor.__contains__ calls
+            # torch.eq on strings).
+            if not isinstance(tensors, dict) or "logits" not in tensors:
                 continue
             logits = tensors["logits"][0]  # [1, vocab_size]
             tensors["new_token"] = [
                 self.submodule_management[node_name].sampler.sample(
                     request_ids=[rid], logits=logits
-                )[rid]
+                )
             ]
             del tensors["logits"]
 
@@ -239,6 +247,8 @@ class AREngine(BaseEngine):
         input_tensors = [
             batch.per_request_input_tensors[rid] for rid in rids
         ]
+        if self.enable_nvtx:
+            range_push("ar.batched.preprocess", synchronize=True)
         preprocessed = submodule.preprocess(
             graph_walk=batch.graph_walk,
             cache_manager=cache_manager,
@@ -246,7 +256,11 @@ class AREngine(BaseEngine):
             request_ids=rids,
             per_request_info=batch.per_request_info,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=True)
 
+        if self.enable_nvtx:
+            range_push("ar.batched.forward")
         batched_output = submodule.forward_batched(
             graph_walk=batch.graph_walk,
             cache_manager=cache_manager,
@@ -254,12 +268,32 @@ class AREngine(BaseEngine):
             request_ids=rids,
             per_request_info=batch.per_request_info,
         )
+        if self.enable_nvtx:
+            range_pop()
+
         cache_manager.flush_to_store()
 
-        output = NodeOutput(per_request_output_tensors=batched_output)
-        output = self._sample_decode_outputs(
-            batch.node_name, output
-        )
+        # `__batched_logits__` is the stacked [B, V] logits the submodule
+        # already produced for the batch. When present, sample once across
+        # the whole batch instead of looping per-rid (matches the CUDA-graph
+        # fast path in cuda_graph_runner.sample_and_remap).
+        batched_logits = batched_output.pop("__batched_logits__", None)
+
+        if self.enable_nvtx:
+            range_push("ar.batched.sample", synchronize=True)
+        if batched_logits is not None:
+            sampler = self.submodule_management[batch.node_name].sampler
+            sampled = sampler.sample(rids, batched_logits)
+            for rid, view in zip(rids, sampled.split(1), strict=True):
+                rid_out = batched_output[rid]
+                rid_out["new_token"] = [view]
+                del rid_out["logits"]
+            output = NodeOutput(per_request_output_tensors=batched_output)
+        else:
+            output = NodeOutput(per_request_output_tensors=batched_output)
+            output = self._sample_decode_outputs(batch.node_name, output)
+        if self.enable_nvtx:
+            range_pop(synchronize=True)
         return output
 
     def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
@@ -278,6 +312,8 @@ class AREngine(BaseEngine):
             }
             logger.debug(f"Execute sequential {seq_lens}")
 
+            if self.enable_nvtx:
+                range_push("ar.seq.preprocess", synchronize=True)
             preprocessed = submodule.preprocess(
                 batch.graph_walk,
                 cache_manager=cache_manager,
@@ -285,19 +321,31 @@ class AREngine(BaseEngine):
                 request_ids=[rid],
                 per_request_info=metadata,
             )
+            if self.enable_nvtx:
+                range_pop(synchronize=True)
+
+            if self.enable_nvtx:
+                range_push("ar.seq.forward")
             output = submodule(
                 graph_walk=batch.graph_walk,
                 cache_handle=cache_manager,
                 request_info=metadata[rid],
                 **preprocessed,
             )
+            if self.enable_nvtx:
+                range_pop()
+
             cache_manager.flush_to_store()
             per_request_outputs[rid] = output
 
+        if self.enable_nvtx:
+            range_push("ar.seq.sample", synchronize=True)
         output = NodeOutput(per_request_output_tensors=per_request_outputs)
         output = self._sample_decode_outputs(
             batch.node_name, output
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=True)
         return output
 
     def _can_use_cuda_graph(self, batch: NodeBatch) -> bool:
@@ -363,7 +411,7 @@ class AREngine(BaseEngine):
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         if self.enable_nvtx:
-            range_push(f"engine.ar.{batch.node_name}.{batch.graph_walk}")
+            range_push(f"engine.ar.{batch.node_name}.{batch.graph_walk}.bs{len(batch.request_ids)}")
 
         submod_mgmt = self.submodule_management[batch.node_name]
         cache_mgmt = submod_mgmt.kv_management
@@ -375,6 +423,8 @@ class AREngine(BaseEngine):
             )
             cache_mgmt.alloc_manager.alloc_status.reset()
             try:
+                if self.enable_nvtx:
+                    range_push("ar.kv_sync_retrieve", synchronize=True)
                 for req_id, info in batch.per_request_info.items():
                     for label, seq_info in info.per_label_seq_info.get(kv_cache_string).items():
                         if needed_labels is not None and label not in needed_labels:
@@ -382,19 +432,43 @@ class AREngine(BaseEngine):
                         cache_mgmt.alloc_manager.sync_retrieve(
                             req_id, label, seq_info
                         )
-                
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
+
+                if self.enable_nvtx:
+                    range_push("ar.sampler_config", synchronize=True)
                 for rid, info in batch.per_request_info.items():
                     submod_mgmt.sampler.set_config(rid, **info.step_metadata)
+                if self.enable_nvtx:
+                    range_pop(synchronize=True)
 
                 with torch.no_grad():
                     with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
                         # Priority: CUDA graph > batched > sequential
                         if self._can_use_cuda_graph(batch):
-                            output = self._execute_with_cuda_graph(batch, submodule)
+                            if self.enable_nvtx:
+                                range_push("ar.cuda_graph_path", synchronize=True)
+                            try:
+                                output = self._execute_with_cuda_graph(batch, submodule)
+                            finally:
+                                if self.enable_nvtx:
+                                    range_pop(synchronize=True)
                         elif submodule.can_batch(batch):
-                            output = self._execute_batched(batch, submodule)
+                            if self.enable_nvtx:
+                                range_push("ar.batched_path", synchronize=True)
+                            try:
+                                output = self._execute_batched(batch, submodule)
+                            finally:
+                                if self.enable_nvtx:
+                                    range_pop(synchronize=True)
                         else:
-                            output = self._execute_sequential(batch, submodule)
+                            if self.enable_nvtx:
+                                range_push("ar.sequential_path", synchronize=True)
+                            try:
+                                output = self._execute_sequential(batch, submodule)
+                            finally:
+                                if self.enable_nvtx:
+                                    range_pop(synchronize=True)
                         for rid, info in batch.per_request_info.items():
                             submodule.postprocess(
                                 request_info=info,

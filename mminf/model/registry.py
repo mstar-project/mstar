@@ -2,15 +2,15 @@ from mminf.model.bagel.bagel_model import BagelModel
 from mminf.model.base import Model
 from mminf.model.dummy_model import DummyModel
 from mminf.model.orpheus.orpheus_model import OrpheusModel
-from mminf.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mminf.model.pi05.pi05_model import Pi05Model
+from mminf.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
 MODEL_REGISTRY: dict[str, type[Model]] = {
     "dummy": DummyModel,
     "bagel": BagelModel,
     "orpheus": OrpheusModel,
-    "qwen3_omni": Qwen3OmniModel,
     "pi05": Pi05Model,
+    "qwen3_omni": Qwen3OmniModel,
 }
 
 HF_MODELS: dict[str, dict] = {

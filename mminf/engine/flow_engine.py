@@ -64,7 +64,7 @@ class FlowEngine(BaseEngine):
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         if self.enable_nvtx:
-            range_push(f"engine.flow.{batch.node_name}.{batch.graph_walk}")
+            range_push(f"engine.flow.{batch.node_name}.{batch.graph_walk}.bs{len(batch.request_ids)}")
 
         submodule = self.submodules.get(batch.node_name)
         if submodule is None:

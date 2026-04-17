@@ -25,9 +25,8 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import nn
 
 # -----------------------------------------------------------------------
 # SwiGLU MLP  (used as individual experts AND as dense MLP)

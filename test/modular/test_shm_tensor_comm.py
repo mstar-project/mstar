@@ -3,19 +3,18 @@
 import os
 import tempfile
 
-import torch
 import pytest
+import torch
 
 from mminf.communication.communicator import BaseCommunicator, CommProtocol
 from mminf.communication.tensors import (
-    SharedMemoryCommunicationManager,
-    _serialize_tensor,
-    _deserialize_tensor,
-    create_tensor_communication_manager,
     MooncakeCommunicationManager,
+    SharedMemoryCommunicationManager,
+    _deserialize_tensor,
+    _serialize_tensor,
+    create_tensor_communication_manager,
 )
-from mminf.graph.base import GraphEdge, TensorPointerInfo
-
+from mminf.graph.base import GraphEdge
 
 # ---------------------------------------------------------------------------
 # Helpers

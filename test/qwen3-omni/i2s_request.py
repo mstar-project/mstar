@@ -11,9 +11,9 @@ import argparse
 import base64
 import io
 import json
-from pathlib import Path
 import struct
 import sys
+from pathlib import Path
 
 import requests
 

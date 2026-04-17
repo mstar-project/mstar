@@ -6,7 +6,6 @@ import sys
 
 import requests
 
-
 URL = "http://localhost:20001/generate"
 
 

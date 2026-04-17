@@ -1,7 +1,7 @@
 
 from dataclasses import dataclass, field
 
-from mminf.graph.base import DynamicLoop, GraphNode, GraphSection, Loop, Parallel, Sequential
+from mminf.graph.base import DynamicLoop, GraphNode, GraphSection, Parallel, Sequential
 
 
 @dataclass
@@ -15,7 +15,7 @@ class IterIndexTree:
         for child in self.children.values():
             self.descendent_labels.add(child.label)
             self.descendent_labels.update(child.descendent_labels)
-    
+
     def label_context_gt(self, other: "IterIndexTree", target_label: str) -> bool:
         """
         Whether the iter indices of "self" are greater than the indices of
@@ -48,7 +48,7 @@ def build_loop_index_tree(
     graph: GraphSection, fwd_idx: str
 ) -> IterIndexTree:
     root = IterIndexTree(label="_fwd_idx", iter_index=fwd_idx)
-    
+
     def _build(graph: GraphSection) -> dict[str, IterIndexTree]:
         if isinstance(graph, GraphNode) or graph is None:
             return {}
@@ -57,7 +57,7 @@ def build_loop_index_tree(
             for sec in graph.sections:
                 res.update(_build(sec))
             return res
-        
+
         # otherwise, this is a loop
         label = graph.name if isinstance(graph, DynamicLoop) else graph._uuid_label
         base_node = IterIndexTree(
@@ -74,7 +74,7 @@ def update_loop_index_tree(
     index_tree: IterIndexTree, graph: GraphSection, fwd_idx: str
 ):
     index_tree.iter_index = fwd_idx
-    
+
     def _update(tree: IterIndexTree, graph: GraphSection) -> dict[str, IterIndexTree]:
         if isinstance(graph, GraphNode) or graph is None:
             return

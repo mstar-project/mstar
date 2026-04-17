@@ -19,7 +19,16 @@ from mminf.engine.base import EngineType, NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.engine.kv_store import KVCacheConfig
-from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
+from mminf.graph.base import (
+    DynamicLoop,
+    GraphEdge,
+    GraphNode,
+    GraphSection,
+    Loop,
+    Parallel,
+    Sequential,
+    TensorPointerInfo,
+)
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -161,7 +170,7 @@ def _divide_into_worker_graphs(
         graph._streaming_inputs = input_streams.intersection(graph.input_ids)
         if len(graph._streaming_inputs) > 0:
             graph.consumes_stream = True
-            
+
         return [WorkerGraph(
             section=graph,
             graph_walks=set([graph_walk]),
@@ -400,7 +409,7 @@ class Model(ABC):
         img = img.float() / 255.0
 
         return TensorAndMetadata(img)
-    
+
     def load_audio(
         self, filepath: str, device: str
     ) -> TensorAndMetadata:
@@ -424,7 +433,7 @@ class Model(ABC):
         return TensorAndMetadata(
             data=video,
             metadata=asdict(decoder.metadata)
-        )   
+        )
 
     @abstractmethod
     def postprocess(

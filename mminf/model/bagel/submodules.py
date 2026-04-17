@@ -1045,9 +1045,13 @@ class LLMSubmodule(NodeSubmodule):
         # 4. Per-request lm_head -> logits (no sampling — done post-forward)
         logits = self.lm_head(hidden)
 
-        return {
+        # Expose the stacked [B, V] tensor under a sentinel key so the CUDA
+        # graph runner can sample directly without concatenating per-rid slices.
+        out: dict = {
             rid: {"logits": [logits[i:i+1]]} for i, rid in enumerate(request_ids)
         }
+        out["__batched_logits__"] = logits
+        return out
 
     @torch.compiler.disable
     def _batch_get_sampling_param(
@@ -1085,7 +1089,7 @@ class LLMSubmodule(NodeSubmodule):
         self, batch: NodeBatch
     ):
         return batch.graph_walk in ["decode", "prefill_text"]
-    
+
     def postprocess(
         self, request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]]

@@ -47,7 +47,7 @@ from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule, TensorAndMetadata
 from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
 from mminf.model.utils import Operation, WeightConverter
-from mminf.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy, SlidingWindowChunkPolicy
+from mminf.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
@@ -99,7 +99,7 @@ class Qwen3OmniModel(Model):
                 operations=[
                     Operation("MergeModulelist",  dim=0),
                     Operation("Concatenate", dim=1)
-                ]        
+                ]
             ),
             WeightConverter(
                 source_patterns=["mlp.experts.*.down_proj.weight"],
@@ -671,7 +671,7 @@ class Qwen3OmniModel(Model):
             edge = GraphEdge(next_node=target_node, name=input_name)
             edge.tensor_info = [tensor_info]
             edges.append(edge)
-        
+
         if walk_name == "prefill_vision":
             for key in ["image_grid_thw", "video_second_per_grid"]:
                 edge = GraphEdge(next_node="Thinker", name=key)
@@ -1077,7 +1077,11 @@ class Qwen3OmniModel(Model):
                 return_attention_mask=True,
                 return_tensors="pt"
             )
-            aud_out["input_features"] = aud_out["input_features"].permute(0, 2, 1)[aud_out["attention_mask"].bool()].permute(1, 0)
+            aud_out["input_features"] = (
+                aud_out["input_features"]
+                .permute(0, 2, 1)[aud_out["attention_mask"].bool()]
+                .permute(1, 0)
+            )
             result["audio_seqlens"].append(
                 aud_out["attention_mask"].sum(-1).to(torch.long)
             )
@@ -1326,11 +1330,11 @@ class Qwen3OmniModel(Model):
         return talker_sub
 
     def _create_code2wav_submodule(self, device: str) -> NodeSubmodule:
-        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
-
         # Code2Wav is the vocoder that converts codec tokens to audio waveform.
         # The actual model class will be defined in components.
         from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeCode2Wav
+
+        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         hf_cfg = self.config.code2wav.get_hf_config()
         code2wav_hf = Qwen3OmniMoeCode2Wav._from_config(hf_cfg)
@@ -1354,13 +1358,13 @@ class Qwen3OmniModel(Model):
 
     def _create_audio_encoder_submodule(self, device: str) -> NodeSubmodule:
         """Load the audio encoder (AuT) from HF weights."""
-        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
-
         # Reuse HF audio encoder directly (Whisper-style, not perf-critical)
         from transformers import AutoConfig
         from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
             Qwen3OmniMoeAudioEncoder,
         )
+
+        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         # Load config only (no weights)
         config = AutoConfig.from_pretrained(
@@ -1386,13 +1390,13 @@ class Qwen3OmniModel(Model):
 
     def _create_vision_encoder_submodule(self, device: str) -> NodeSubmodule:
         """Load the vision encoder (SigLIP2 ViT) from HF weights."""
-        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
-
         # Reuse HF vision encoder directly
         from transformers import AutoConfig
         from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
             Qwen3OmniMoeVisionEncoder,
         )
+
+        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         # Load full config (no weights)
         config = AutoConfig.from_pretrained(

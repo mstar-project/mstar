@@ -78,7 +78,6 @@ def _worker_process_target(
         format=f"%(asctime)s %(levelname)s [{worker_id}] %(name)s: %(message)s",
         force=True,
     )
-    import torch
 
     from mminf.worker.worker import Worker
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
@@ -193,7 +192,7 @@ class Conductor:
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
         )
-    
+
     def _get_kv_config(self):
         kv_cache_config = self.model.get_kv_cache_config()
         # Apply any KV cache overrides from the YAML config
@@ -206,7 +205,7 @@ class Conductor:
                         setattr(kv_cfg, f.name, yaml_kv_overrides[f.name])
                 logger.info("KV cache config after YAML overrides: %s", kv_cfg)
         return kv_cache_config
-        
+
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from worker graphs and model engine types."""

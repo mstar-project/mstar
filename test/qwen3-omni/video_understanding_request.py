@@ -7,7 +7,6 @@ from pathlib import Path
 
 import requests
 
-
 URL = "http://localhost:20001/generate"
 IMAGE_PATH = "test/qwen3-omni/video.webm"
 

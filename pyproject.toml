@@ -65,7 +65,7 @@ include = ["mminf*"]
 exclude = ["tests*", "benchmark*", "examples*"]
 
 [tool.ruff]
-exclude = [".git", ".ruff_cache", ".venv"] 
+exclude = [".git", ".ruff_cache", ".venv", "ref"]
 line-length = 120
 target-version = "py312"
 

@@ -4,13 +4,11 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import asdict
 
 import torch
-import torchvision
 
 try:
-    import torchaudio
+    import torchaudio  # noqa: F401 — probes availability; real usage in callers
     from torchcodec.decoders import VideoDecoder
 except (ImportError, RuntimeError, OSError):
     VideoDecoder = None
@@ -193,7 +191,7 @@ class PreprocessWorkerThread:
                         out = self.model.load_image(filepath, self.device)
                         tensors[key].append(out.data)
                         input_metadata[key].append(out.metadata)
-    
+
                     # ---- Audio ----
                     elif modality == "audio":
                         out = self.model.load_audio(filepath, self.device)
@@ -205,7 +203,7 @@ class PreprocessWorkerThread:
                         out = self.model.load_video(filepath, self.device)
                         tensors[key].append(out.data)
                         input_metadata[key].append(out.metadata)
-                        
+
 
         # Then, tokenize the prompt and let the model augment/transform the
         # tensors dict (e.g., Qwen3-Omni needs to compute pixel_values,

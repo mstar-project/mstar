@@ -19,10 +19,6 @@ class _PlanState:
     calls wrapper.plan() which updates static buffers via .copy_().
     """
     wrapper: FlashInferPrefillWrapper | FlashInferDecodeWrapper | None = None
-    page_indices: torch.Tensor | None = None
-    per_req_page_indices: dict[str, torch.Tensor] | None = None
-    page_offsets: torch.Tensor | None = None
-    token_offsets: torch.Tensor | None = None
     pos_ids: torch.Tensor | None = None
     seq_lens: list[int] | None = None
     write_store: bool = True
@@ -163,15 +159,18 @@ class BatchedCacheManager:
         num_qo_heads = cfg.num_qo_heads
         device = self.device
 
+        # CPU-side accumulation. The old implementation launched 4-5 tiny GPU
+        # kernels per request (arange, tensor(state.page_indices), indexing,
+        # mod) to build page_indices/page_offsets/token_offsets — all of which
+        # turn out to be unused bookkeeping (grep: no reader in the codebase).
+        # We only need the four int32 tensors the FlashInfer wrapper consumes,
+        # so do the arithmetic in pure Python and send them over in one H2D
+        # each.
         qo_indptr_list = [0]
         kv_indptr_list = [0]
         all_page_indices = []
         kv_last_page_lens = []
 
-        page_indices_all = []
-        page_offsets_all = []
-
-        per_req_page_indices = {}
         for i, rid in enumerate(self.request_ids):
             state = self._get_state(rid, effective_label)
             sl = seq_lens[i]
@@ -180,17 +179,7 @@ class BatchedCacheManager:
             self.alloc_manager.alloc(
                 rid, label=effective_label, seq_len=total_len
             )
-            # Compute positions for this request
-            pos = torch.arange(state.seq_len, state.seq_len + sl, device=self.device)
 
-            page_idx = torch.tensor(state.page_indices, device=self.device)[pos // page_size]
-            page_offset = pos % page_size
-
-            page_indices_all.append(page_idx)
-            per_req_page_indices[rid] = page_idx
-            page_offsets_all.append(page_offset)
-
-            # Build indptr entries
             qo_indptr_list.append(qo_indptr_list[-1] + sl)
             all_page_indices.extend(state.page_indices)
             kv_indptr_list.append(kv_indptr_list[-1] + len(state.page_indices))
@@ -198,11 +187,7 @@ class BatchedCacheManager:
             last_page_len = total_len % page_size or page_size
             kv_last_page_lens.append(last_page_len)
 
-        page_indices = torch.cat(page_indices_all)
-        page_offsets = torch.cat(page_offsets_all)
-        token_offsets = torch.arange(page_indices.numel(), device=self.device)
-
-        # Build batched FlashInfer index tensors
+        # Build batched FlashInfer index tensors (one H2D per tensor).
         qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32, device=device)
         paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32, device=device)
         paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32, device=device)
@@ -236,6 +221,44 @@ class BatchedCacheManager:
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[effective_label] = ps
 
+        # TODO(perf): overlap wrapper.plan(step N+1) with the previous step's
+        # replay+sample to hide its ~750 µs critical-path cost.
+        #
+        # plan() only depends on the next KV state (seq_lens + page indices),
+        # not on the token sampled by the previous step, so it can be issued
+        # as soon as advance_seq_lens(N) runs — well before sample(N) returns.
+        # At bs=8 on H200, sample_and_remap is ~0.9 ms vs plan ~0.75 ms, so
+        # the whole plan could in principle be hidden.
+        #
+        # Design sketch (double-buffered wrappers):
+        #   * Keep two FlashInferDecodeWrappers, wrapper[0] and wrapper[1],
+        #     each with its own persistent workspace + static plan buffers.
+        #   * Step N's run() uses wrapper[N % 2]; a background worker thread
+        #     calls plan(N+1) on wrapper[(N+1) % 2] concurrently.
+        #   * Main thread join()s the plan future just before replay(N+1).
+        #
+        # Why a worker *thread* and not just a side CUDA stream:
+        #   plan()'s wall-clock is dominated by CPU-side work — Python
+        #   bookkeeping, a dozen cudaMemcpyAsync API calls (~13 µs host-side
+        #   each), and two internal D→H reads (CUB scan result) that block
+        #   the calling thread. A side stream only hides plan's ~50 µs of
+        #   actual GPU kernel time; the thread still stalls on the D→H waits.
+        #   PyTorch releases the GIL inside CUDA ops, so a Python thread can
+        #   issue plan() while the main thread submits sample(N).
+        #
+        # Risks / prerequisites:
+        #   * PagedAllocationManager mutation (.alloc, .reset_label) is not
+        #     currently thread-safe — needs a per-manager mutex, or the
+        #     worker must operate on a snapshot captured at "end of step N".
+        #   * advance_seq_lens() inside a captured CUDA graph updates state
+        #     via .copy_(); the worker must wait on a real cudaEvent, not a
+        #     torch stream sync, before reading page indices.
+        #   * wrapper[(N+1) % 2]'s static buffers are read by the main
+        #     thread's next replay — need a handshake (Event/Condition) so
+        #     replay doesn't start before the worker finishes plan().
+        #   * If sample(N) ever runs shorter than plan(N+1) (short prefill,
+        #     very small batch), the main thread waits. Still no worse than
+        #     today.
         if isinstance(wrapper, FlashInferDecodeWrapper):
             wrapper.plan(
                 paged_kv_indptr=paged_kv_indptr,
@@ -252,16 +275,11 @@ class BatchedCacheManager:
                 causal=is_causal,
                 dtype=dtype,
             )
-        # Note: plain assignment (not .copy_()) is intentional here.
-        # These fields are NOT read inside the CUDA graph — run_attention()
-        # uses wrapper.set_kv_cache()/run() which rely on the wrapper's own
-        # internal static tensors (updated via .copy_() inside wrapper.plan()).
-        # These are stored on _PlanState only for bookkeeping/debugging.
-        ps.page_indices = page_indices
-        ps.page_offsets = page_offsets
-        ps.token_offsets = token_offsets
+        # seq_lens is read by the flush_to_store path; write_store by
+        # run_attention. The page_indices / page_offsets / token_offsets /
+        # per_req_page_indices fields were legacy bookkeeping and had no
+        # reader — dropped along with their per-rid GPU construction above.
         ps.seq_lens = seq_lens
-        ps.per_req_page_indices = per_req_page_indices
         ps.write_store = write_store
 
     def plan_rope(
@@ -292,11 +310,16 @@ class BatchedCacheManager:
 
         computed_pos_ids = pos_ids
         if computed_pos_ids is None:
-            computed_pos_ids = torch.cat([
-                torch.arange(sl, device=self.device, dtype=torch.long)
-                + self._get_state(rid, effective_label).position_id_start
-                for rid, sl in zip(self.request_ids, seq_lens, strict=True)
-            ])
+            # CPU-accumulate the position list (1 int per output token) and
+            # do a single H2D at the end. The old `torch.cat([torch.arange(...)
+            # + start for ...])` launched 2 GPU kernels per request.
+            pos_ids_list: list[int] = []
+            for rid, sl in zip(self.request_ids, seq_lens, strict=True):
+                start = self._get_state(rid, effective_label).position_id_start
+                pos_ids_list.extend(range(start, start + sl))
+            computed_pos_ids = torch.tensor(
+                pos_ids_list, dtype=torch.long, device=self.device,
+            )
 
         if self._cuda_graph_mode:
             # Update static buffer via .copy_() for CUDA graph compatibility
@@ -341,12 +364,11 @@ class BatchedCacheManager:
         num_qo_heads = cfg.num_qo_heads
         device = self.device
 
+        # CPU-side accumulation (see plan_attention for the same pattern).
         qo_indptr_list = [0]
         kv_indptr_list = [0]
         all_page_indices = []
         kv_last_page_lens = []
-        page_indices_all = []
-        page_offsets_all = []
         combined_seq_lens = []
 
         for label in labels:
@@ -357,15 +379,6 @@ class BatchedCacheManager:
 
                 self.alloc_manager.alloc(rid, label=label, seq_len=total_len)
 
-                pos = torch.arange(state.seq_len, state.seq_len + sl, device=device)
-                page_idx = torch.tensor(
-                    state.page_indices, device=device
-                )[pos // page_size]
-                page_offset = pos % page_size
-
-                page_indices_all.append(page_idx)
-                page_offsets_all.append(page_offset)
-
                 qo_indptr_list.append(qo_indptr_list[-1] + sl)
                 all_page_indices.extend(state.page_indices)
                 kv_indptr_list.append(
@@ -375,10 +388,6 @@ class BatchedCacheManager:
                 last_page_len = total_len % page_size or page_size
                 kv_last_page_lens.append(last_page_len)
                 combined_seq_lens.append(sl)
-
-        page_indices = torch.cat(page_indices_all)
-        page_offsets = torch.cat(page_offsets_all)
-        token_offsets = torch.arange(page_indices.numel(), device=device)
 
         qo_indptr = torch.tensor(
             qo_indptr_list, dtype=torch.int32, device=device
@@ -412,9 +421,6 @@ class BatchedCacheManager:
 
         ps = _PlanState(
             wrapper=wrapper,
-            page_indices=page_indices,
-            page_offsets=page_offsets,
-            token_offsets=token_offsets,
             seq_lens=combined_seq_lens,
             write_store=write_store,
         )
@@ -438,18 +444,25 @@ class BatchedCacheManager:
             combined_label: key for the combined _PlanState (must already exist
                 from plan_attention_batched_cfg).
         """
-        parts = []
+        # Build one tensor *per label* in `labels` order, then concat. Order
+        # matters: downstream attention indexes these positions by
+        # (label_i * per_label_len + within_label_offset), so reordering the
+        # labels silently corrupts the attention computation. For labels with
+        # explicit pos_ids we concat their list as given; for computed labels
+        # we accumulate Python ints on CPU and do one H2D per label.
+        parts: list[torch.Tensor] = []
         for label in labels:
             if per_label_pos_ids and label in per_label_pos_ids:
                 parts.append(torch.cat(per_label_pos_ids[label]))
             else:
-                parts.append(torch.cat([
-                    torch.arange(sl, device=self.device, dtype=torch.long)
-                    + self._get_state(rid, label).position_id_start
-                    for rid, sl in zip(self.request_ids, seq_lens, strict=True)
-                ]))
-
-        combined_pos_ids = torch.cat(parts)
+                pos_ids_list: list[int] = []
+                for rid, sl in zip(self.request_ids, seq_lens, strict=True):
+                    start = self._get_state(rid, label).position_id_start
+                    pos_ids_list.extend(range(start, start + sl))
+                parts.append(torch.tensor(
+                    pos_ids_list, dtype=torch.long, device=self.device,
+                ))
+        combined_pos_ids = parts[0] if len(parts) == 1 else torch.cat(parts)
         self._plan_states[combined_label].pos_ids = combined_pos_ids
 
     @torch.compiler.disable

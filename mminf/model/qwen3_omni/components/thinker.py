@@ -185,7 +185,7 @@ class Qwen3OmniThinkerModel(nn.Module):
 
         # Language model head (at top level: thinker.lm_head)
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
-    
+
     def _deepstack_process(
         self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor
     ):

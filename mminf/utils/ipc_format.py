@@ -1,7 +1,7 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 
-from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo, SequenceInfo
+from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
 from mminf.graph.base import GraphEdge, TensorPointerInfo
 from mminf.graph.loop_index import IterIndexTree
 

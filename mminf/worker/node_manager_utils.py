@@ -4,8 +4,18 @@ from dataclasses import dataclass, field
 
 from mminf.communication.tensors import TensorCommunicationManager
 from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
-from mminf.graph.base import DynamicLoop, FilteredEdges, GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
-from mminf.graph.loop_index import IterIndexTree, build_loop_index_tree, update_loop_index_tree
+from mminf.graph.base import (
+    DynamicLoop,
+    FilteredEdges,
+    GraphEdge,
+    GraphNode,
+    GraphSection,
+    Loop,
+    Parallel,
+    Sequential,
+    TensorPointerInfo,
+)
+from mminf.graph.loop_index import build_loop_index_tree, update_loop_index_tree
 from mminf.graph.request_queues import (
     PerRequestNodeQueues,
     ProcessedInputs,
@@ -58,7 +68,7 @@ class WorkerGraphQueues:
         Returns any signals that should be sent to other worker graphs.
         """
         return self.per_request_queues[request_id].process_new_inputs(inputs)
-    
+
     def process_new_streaming_inputs(self, request_id: str, inputs: list[GraphEdge]) -> ProcessedInputs:
         """
         Add new inputs for a request, and update waiting/ready nodes accordingly.
@@ -130,7 +140,7 @@ class WorkerGraphQueues:
         be used for the next full model forward pass.
         """
         self.per_request_queues[request_id].reset()
-    
+
     def stop_loops(self, request_id: str, loop_names: set[str]):
         def _stop_loops(section: GraphSection):
             if isinstance(section, Sequential) or isinstance(section, Parallel):
@@ -144,7 +154,7 @@ class WorkerGraphQueues:
                 # including dynamic loops
                 _stop_loops(section._curr_iter_section)
         _stop_loops(self.per_request_queues[request_id].waiting)
-    
+
     def get_dynamic_loop_iters(self, request_id: str) -> dict[str, int]:
         iter_dict = {}
         def _get_iters(section: GraphSection):
@@ -253,7 +263,7 @@ class WorkerGraphsManager:
 
     def get_fwd_number(self, request_id: str, partition_name: str):
         return self.get_fwd_info(request_id, partition_name).fwd_index
-    
+
     def has_partition(self,  request_id: str, partition_name: str):
         return partition_name in self.per_request_info[request_id].per_partition_info
 
@@ -281,7 +291,7 @@ class WorkerGraphsManager:
             for worker_graph_id in worker_graph_ids:
                 inputs = self.queues[worker_graph_id].process_new_inputs(request_id, inputs).for_other_worker_graphs
         return inputs
-    
+
     def process_new_streaming_inputs(
         self,
         request_id: str,
@@ -296,7 +306,9 @@ class WorkerGraphsManager:
         for part_info in self.per_request_info[request_id].per_partition_info.values():
             worker_graph_ids = part_info.graph_walk_worker_graph_ids
             for worker_graph_id in worker_graph_ids:
-                inputs = self.queues[worker_graph_id].process_new_streaming_inputs(request_id, inputs).for_other_worker_graphs
+                inputs = self.queues[worker_graph_id].process_new_streaming_inputs(
+                    request_id, inputs
+                ).for_other_worker_graphs
         return inputs
 
 
@@ -310,7 +322,7 @@ class WorkerGraphsManager:
                         (node_name in self.all_worker_graph_ids_to_nodes[gid]):
                 return gid
         raise RuntimeError(f"Could not find worker graph for node {node_name}, request {request_id}")
-    
+
 
     def get_waiting_node(
         self, request_id: str, worker_graph_id: str
@@ -454,7 +466,7 @@ class WorkerGraphsManager:
             streaming_to_workers=streaming_to_workers,
             streaming_local=streaming_local,
         )
-    
+
     def stop_loops(
         self, request_id: str,
         partition: str,
@@ -487,7 +499,7 @@ class WorkerGraphsManager:
                             graph=waiting,
                             fwd_idx=req_info.fwd_index
                         )
-    
+
     def get_dynamic_loop_iters(
         self, request_id: str,
         partition: str,
@@ -577,7 +589,7 @@ class WorkerGraphsManager:
             for queue_id in self.per_request_info[request_id].worker_graph_ids:
                 self.queues[queue_id].remove_request(request_id)
             del self.per_request_info[request_id]
-    
+
     def get_dyn_loop_workers(self, request_id: str, partition_name: str, loop_name: str):
         return self.per_request_info[request_id].dyn_loop_to_workers[NodeAndGraphWalk(
             node=loop_name, graph_walk=self.get_graph_walk(request_id, partition_name)

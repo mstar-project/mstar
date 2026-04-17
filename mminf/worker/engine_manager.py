@@ -8,7 +8,7 @@ from mminf.engine.audio_codec_engine import AudioCodecEngine
 from mminf.engine.base import BaseEngine
 from mminf.engine.enc_dec_engine import EncoderDecoderEngine
 from mminf.engine.flow_engine import FlowEngine
-from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager, TransferEngineInfo
+from mminf.engine.kv_store import KVCacheConfig, TransferEngineInfo
 from mminf.model.base import Model
 
 ENGINE_TYPE_TO_CLASS: dict[str, type[BaseEngine]] = {
@@ -60,7 +60,7 @@ class EngineManager:
         if "autocast_dtype" in model_config:
             autocast_dtype = model_config["autocast_dtype"]
 
-        for engine_type_str, node_names in type_to_nodes.items():
+        for engine_type_str, engine_node_names in type_to_nodes.items():
             engine_cls = ENGINE_TYPE_TO_CLASS[engine_type_str]
 
             engine = engine_cls(
@@ -71,7 +71,7 @@ class EngineManager:
             # Extract submodules from the Model for this engine's nodes
             submodules: dict[str, torch.nn.Module] = {}
             if model is not None:
-                for name in node_names:
+                for name in engine_node_names:
                     submodule = model.get_submodule(name, device)
                     if submodule is not None:
                         if engine.has_autocast():
@@ -93,7 +93,7 @@ class EngineManager:
             )
             logger.info("Engine %s loaded in on device %s", engine_type_str, str(device))
 
-            for name in node_names:
+            for name in engine_node_names:
                 node_to_engine[name] = engine
         logger.info("All engines loaded on device %s", str(device))
 
@@ -133,7 +133,6 @@ class EngineManager:
             if isinstance(engine, AREngine):
                 for submod_mgmt in engine.submodule_management.values():
                     submod_mgmt.kv_management.alloc_manager.write_policy = policy
-        return None
 
     def get_ar_engine(self) -> "AREngine | None":
         """Return the first AR engine instance, if any."""

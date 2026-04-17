@@ -21,8 +21,6 @@ import logging
 
 import torch
 
-from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig
-
 logger = logging.getLogger(__name__)
 
 

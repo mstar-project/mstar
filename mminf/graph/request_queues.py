@@ -2,7 +2,6 @@
 
 import logging
 from dataclasses import dataclass, field
-import time
 
 from mminf.graph.base import DestToGraphEdges, GraphEdge, GraphNode, GraphSection, get_node_to_inputs_mapping
 
@@ -51,7 +50,7 @@ class PerRequestNodeQueues:
         new_ready, new_waiting = self.waiting.split_off_ready()
         self.ready += new_ready
         self.waiting = new_waiting
-    
+
     def process_streaming_input(
         self,
         new_inputs: list[GraphEdge]

@@ -1,9 +1,9 @@
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-import re
 from typing import Any
 
 import torch
@@ -100,7 +100,7 @@ class KeysAndConverter:
 
     def append_key(self, key):
         self.keys.add(key)
-    
+
     def __post_init__(self):
         self.keys = set(self.keys)
 
@@ -118,7 +118,7 @@ def _apply_key_pattern(keys: list[str], conv: list[WeightConverter] | None=None)
                 re.compile(pattern), c.target_patterns,
                 c
             ))
-    
+
 
     mod_key_to_hf_keys: dict[str, KeysAndConverter] = {}
     for key in keys:
@@ -134,7 +134,7 @@ def _apply_key_pattern(keys: list[str], conv: list[WeightConverter] | None=None)
             key = nk
         if not found:
             mod_key_to_hf_keys[key] = KeysAndConverter(keys=[key])
-        
+
     return mod_key_to_hf_keys
 
 
@@ -179,7 +179,7 @@ def _apply_operations(
             ".*" + re.escape(pattern).replace(r"\*", r"(\d+)") + ".*"
         )
 
-        for k in key_to_tensor.keys():
+        for k, tensor in key_to_tensor.items():
             m = regex.match(k)
             if not m:
                 continue
@@ -192,7 +192,7 @@ def _apply_operations(
                 )
 
             idx = int(idx_match.group(1))
-            matched.append((idx, key_to_tensor[k]))
+            matched.append((idx, tensor))
 
         # sort by expert index
         matched.sort(key=lambda x: x[0])

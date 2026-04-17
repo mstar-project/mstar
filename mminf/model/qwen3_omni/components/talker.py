@@ -15,8 +15,6 @@ Weight prefix: ``talker.``
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -29,7 +27,6 @@ from mminf.model.qwen3_omni.components.attention import (
 from mminf.model.qwen3_omni.components.moe import Qwen3OmniTalkerSparseMoeBlock
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig, TalkerTextConfig
 from mminf.utils.flashinfer_utils import run_rms_norm
-
 
 # ---------------------------------------------------------------------------
 # Projection MLP (Thinker -> Talker)
@@ -320,7 +317,7 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
             nn.Embedding(cp.vocab_size, cp.hidden_size)
             for _ in range(num_residual)
         ])
-    
+
     def forward(self, *args):
         # This is never called; keeping for compatibility with nn.Module
         return
@@ -356,7 +353,7 @@ class Qwen3OmniCodePredictor(nn.Module):
             nn.Linear(cp.hidden_size, cp.vocab_size, bias=False)
             for _ in range(num_residual)
         ])
-    
+
     def forward(self, *args):
         # This is never called; keeping for compatibility with nn.Module
         return

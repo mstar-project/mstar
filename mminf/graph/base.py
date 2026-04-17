@@ -169,13 +169,13 @@ class GraphNode(GraphSection):
 
     def is_ready(self):
         return self.input_ids.issubset(set(self.ready_inputs.keys()))
-    
+
     def is_ready_except_streaming(self):
         return self.input_ids.issubset(set(self.ready_inputs.keys()).union(self._streaming_inputs))
 
     def get_node_names(self) -> set[str]:
         return {self.name}
-    
+
     def get_dyn_loop_names(self) -> set[str]:
         return set()
 
@@ -213,7 +213,7 @@ class GraphNode(GraphSection):
         if self.is_ready():
             return [self], None
         return [], self
-    
+
     def split_off_ready_for_streaming(self):
         if self._split_off_for_streaming:
             return []
@@ -221,25 +221,25 @@ class GraphNode(GraphSection):
             self._split_off_for_streaming = True
             return [self]
         return []
-    
+
     def cache_outputs(
         self, tensor_info: dict[str, list[TensorPointerInfo]],
     ):
         return
-    
+
     def complete_loops(self, done_node) -> LoopCompletionOutput:
         return LoopCompletionOutput(self)
-    
+
     def register_communication_info(
         self, communication_manager,
         request_id: str
     ):
         return
-    
+
     def reset(self):
         self.ready_inputs.clear()
         self._split_off_for_streaming = False
-    
+
     def clear_outputs(self):
         for edge in self.outputs:
             edge.tensor_info.clear()
@@ -254,7 +254,7 @@ class Sequential(GraphSection):
         for s in self.sections:
             res.update(s.get_node_names())
         return res
-    
+
     def get_dyn_loop_names(self) -> set[str]:
         res = set()
         for s in self.sections:
@@ -307,27 +307,27 @@ class Sequential(GraphSection):
         if len(waiting) == 0:
             return first_ready, None
         return first_ready, Sequential(sections=waiting)
-    
+
     def split_off_ready_for_streaming(self):
         return self.sections[0].split_off_ready_for_streaming()
-    
+
     def cache_outputs(
         self, tensor_info: dict[str, list[TensorPointerInfo]],
     ):
         for sec in self.sections:
             sec.cache_outputs(tensor_info)
-    
+
     def complete_loops(self, done_node) -> LoopCompletionOutput:
         output = self.sections[0].complete_loops(done_node)
         if output.new_waiting is None:
             waiting = self.sections[1:]
         else:
             waiting = [output.new_waiting] + self.sections[1:]
-        
+
         if len(waiting) > 0:
             output.new_waiting = Sequential(sections=waiting)
         return output
-    
+
     def register_communication_info(
         self, communication_manager,
         request_id: str
@@ -336,7 +336,7 @@ class Sequential(GraphSection):
             sec.register_communication_info(
                 communication_manager, request_id
             )
-    
+
     def reset(self):
         for sec in self.sections:
             sec.reset()
@@ -386,7 +386,7 @@ class Parallel(GraphSection):
         if len(waiting) == 0:
             return ready, None
         return ready, Parallel(sections=waiting)
-    
+
     def split_off_ready_for_streaming(self):
         return sum(
             [sec.split_off_ready_for_streaming() for sec in self.sections],
@@ -398,7 +398,7 @@ class Parallel(GraphSection):
     ):
         for sec in self.sections:
             sec.cache_outputs(tensor_info)
-    
+
     def complete_loops(self, done_node) -> LoopCompletionOutput:
         outputs = []
         loop_back_name_dests = set()
@@ -409,7 +409,7 @@ class Parallel(GraphSection):
             loop_back_name_dests.update(out.loop_back_name_dests_to_remove)
             if out.new_waiting is not None:
                 waiting.append(out.new_waiting)
-        
+
         if len(waiting) > 0:
             return LoopCompletionOutput(
                 new_waiting=Parallel(sections=waiting),
@@ -421,7 +421,7 @@ class Parallel(GraphSection):
             outputs=outputs,
             loop_back_name_dests_to_remove=loop_back_name_dests
         )
-    
+
     def register_communication_info(
         self, communication_manager,
         request_id: str
@@ -430,7 +430,7 @@ class Parallel(GraphSection):
             sec.register_communication_info(
                 communication_manager, request_id
             )
-    
+
     def reset(self):
         for sec in self.sections:
             sec.reset()
@@ -454,7 +454,7 @@ class Loop(GraphSection):
     _uuid_label: str = field(default_factory=lambda: str(uuid4()))
 
     # For handling tensor reference counting of loop outputs
-    _tensor_manager: Any | None = field(default=None) # no type annotation because 
+    _tensor_manager: Any | None = field(default=None) # no type annotation because
                                                       # of circular imports
     _request_id: str | None = field(default=None)
     _waiting_for_execution: set[str] = field(default_factory=set)
@@ -470,7 +470,7 @@ class Loop(GraphSection):
 
     def get_dyn_loop_names(self) -> set[str]:
         return self.section.get_dyn_loop_names()
-    
+
     def register_communication_info(
         self, communication_manager,
         request_id: str
@@ -480,7 +480,7 @@ class Loop(GraphSection):
         self.section.register_communication_info(
             communication_manager, request_id
         )
-    
+
     def cache_outputs(
         self, tensor_info: dict[str, list[TensorPointerInfo]],
     ):
@@ -492,11 +492,11 @@ class Loop(GraphSection):
             self._cached_outputs.setdefault(out_name, []).extend(tensor_infos)
         if self._curr_iter_section is not None:
             self._curr_iter_section.cache_outputs(tensor_info)
-    
+
     def _uncache_outputs(self):
         for tensor_infos in self._cached_outputs.values():
             for info in tensor_infos:
-                self._tensor_manager.dereference(self._request_id, info.uuid) 
+                self._tensor_manager.dereference(self._request_id, info.uuid)
         self._cached_outputs.clear()
 
     def ingest_inputs(self, node_to_inputs: DestToGraphEdges):
@@ -621,9 +621,9 @@ class Loop(GraphSection):
         self.ingest_inputs(get_node_to_inputs_mapping(
             self._external_inputs
         ))
-    
+
     def _is_done(self):
-        return (self.max_iters == self.curr_iter + 1) and self._iter_done() 
+        return (self.max_iters == self.curr_iter + 1) and self._iter_done()
 
     def _iter_done(self):
         return (self._curr_iter_section is None) and len(self._waiting_for_execution) == 0
@@ -641,13 +641,13 @@ class Loop(GraphSection):
         ])
         self._curr_iter_section = first_waiting
         return first_ready, self
-    
+
     def split_off_ready_for_streaming(self):
         return (
             self._curr_iter_section.split_off_ready_for_streaming() \
                 if self._curr_iter_section is not None else []
         ) + self._nxt_iter_section.split_off_ready_for_streaming()
-    
+
     def complete_loops(self, done_node: str) -> LoopCompletionOutput:
         if done_node in self._waiting_for_execution:
             self._waiting_for_execution.remove(done_node)
@@ -660,7 +660,7 @@ class Loop(GraphSection):
             output_signals = recursive_output.outputs
             loop_back_name_dests = recursive_output.loop_back_name_dests_to_remove
             self._curr_iter_section = recursive_output.new_waiting
-        
+
         # check if the loop is done after the recursive call updates _curr_iter_section
         done = self._is_done()
         if not done:
@@ -669,13 +669,13 @@ class Loop(GraphSection):
                 outputs=output_signals,
                 loop_back_name_dests_to_remove=loop_back_name_dests
             )
-        
+
         # if done, new_waiting is None and also need to collect our outputs
         for output in self.outputs:
             if output.name in self._cached_outputs:
                 output.tensor_info = self._cached_outputs[output.name]
                 output_signals.append(output)
-        
+
         loop_back_name_dests.update([
             (edge.name, edge.next_node) for edge in self._loop_back_signals
         ])
@@ -685,7 +685,7 @@ class Loop(GraphSection):
             outputs=output_signals,
             loop_back_name_dests_to_remove=loop_back_name_dests
         )
-    
+
     def reset(self):
         self.section.reset()
         self._curr_iter_section = self.section
@@ -705,12 +705,12 @@ class DynamicLoop(Loop):
         res = super().get_dyn_loop_names()
         res.add(self.name)
         return res
-    
+
     def _is_done(self):
         return (
             (self.max_iters == self.curr_iter + 1) or self._finished) \
                 and self._iter_done()
-    
+
     def reset(self):
         super().reset()
         self._finished = False
