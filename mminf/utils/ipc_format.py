@@ -3,6 +3,7 @@ from enum import Enum
 
 from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo, SequenceInfo
 from mminf.graph.base import GraphEdge, TensorPointerInfo
+from mminf.graph.loop_index import IterIndexTree
 
 
 class Status(Enum):
@@ -28,17 +29,16 @@ class MessageBody:
 class WorkerMessageType(Enum):
     NEW_REQUEST = "new_request"
     REMOVE_REQUEST = "remove_request"
-    KV_TRANSFER_LAYER = "kv_transfer_layer"
-    KV_TRANSFER_META = "kv_transfer_meta"
     INPUT_SIGNALS = "input_signals"
     UNPERSIST_TENSORS = "unpersist"
     TENSOR_RECEIVED = "tensor_received"
+    STOP_LOOPS = "stop_loops"
 
 
 @dataclass
 class NewRequest(MessageBody):
     request_id: str
-    worker_graph_ids: list[str]
+    partition_worker_graph_ids: list[str]
     worker_graph_to_worker: dict[str, str]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
@@ -55,7 +55,7 @@ class InputSignals(MessageBody):
     inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
     partition_name: str = "default"
-    producer_done: bool = False
+    producer_done: set = field(default_factory=set)
 
 
 @dataclass
@@ -69,6 +69,13 @@ class TensorReceived(MessageBody):
 class UnpersistTensors(MessageBody):
     request_id: str
     uuid_to_ref_count: dict[str, int]
+
+@dataclass
+class StopLoops(MessageBody):
+    request_id: str
+    loop_names: set[str]
+    partition_name: str
+    loop_stop_times: dict[str, IterIndexTree] = field(default_factory=dict)
 
 @dataclass
 class WorkerMessage:

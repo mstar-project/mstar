@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
+from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.ar_engine import BatchedCacheManager
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.model.base import NodeSubmodule
@@ -72,6 +73,19 @@ class OrpheusLLMSubmodule(NodeSubmodule):
             return self._forward_decode(cache_handle=cache_handle, **kwargs)
         else:
             raise ValueError(f"Unknown graph walk for OrpheusLLM: {graph_walk!r}")
+
+    def postprocess(
+        self, request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]]
+    ):
+        if "new_token" not in outputs:
+            return
+        outputs["text_inputs"] = outputs["new_token"]
+        token = outputs["new_token"][0].item()
+        eos_token_id = self.config.stop_token_id
+        if (eos_token_id is not None and eos_token_id == token) or \
+                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
+            request_info.register_loop_stop("decode_loop")
 
     def _forward_prefill(
         self,

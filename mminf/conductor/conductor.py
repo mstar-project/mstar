@@ -8,6 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch
 import yaml
 
 from mminf.api_server.request_types import APIServerMessage, RequestComplete
@@ -57,8 +58,10 @@ def _worker_process_target(
     worker_ids: list[str],
     my_worker_graphs: list[WorkerGraph],
     kv_config: list[KVCacheConfig],
+    model_config: dict,
     all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-    all_worker_graph_ids_to_nodes: dict[str, list[str]],
+    all_worker_graph_ids_to_nodes: dict[str, set[str]],
+    all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
     hostname: str,
     socket_path_prefix: str,
     enable_nvtx: bool = False,
@@ -79,20 +82,22 @@ def _worker_process_target(
 
     from mminf.worker.worker import Worker
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
-        sum([wg.section.get_node_names() for wg in my_worker_graphs], start=[])
+        [wg.section.get_node_names() for wg in my_worker_graphs]
     ))
     worker = Worker(
         worker_id=worker_id,
         worker_ids=worker_ids,
+        model=model,
         my_worker_graphs=my_worker_graphs,
         kv_config=kv_config,
+        model_config=model_config,
         all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
         all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
+        all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
         hostname=hostname,
         socket_path_prefix=socket_path_prefix,
         enable_nvtx=enable_nvtx,
         device=torch.device(device),
-        model=model,
         mooncake_port=mooncake_port,
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
@@ -228,8 +233,12 @@ class Conductor:
         self._all_worker_graph_ids_to_graph_walks: dict[str, set[str]] = {
             worker_graph_id: worker_graph.graph_walks for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        self._all_worker_graph_ids_to_nodes: dict[str, list[str]] = {
+        self._all_worker_graph_ids_to_nodes: dict[str, set[str]] = {
             worker_graph_id: worker_graph.section.get_node_names()
+            for worker_graph_id, worker_graph in self.worker_graphs.items()
+        }
+        self._all_worker_graph_ids_to_dyn_loops = {
+            worker_graph_id: worker_graph.section.get_dyn_loop_names()
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
 
@@ -244,8 +253,10 @@ class Conductor:
                     "worker_ids": self.worker_ids,
                     "my_worker_graphs": self._per_worker_graphs[worker_id],
                     "kv_config": self._get_kv_config(),
+                    "model_config": self.model_config,
                     "all_worker_graph_ids_to_graph_walks": self._all_worker_graph_ids_to_graph_walks,
                     "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
+                    "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
                     "hostname": self.hostname,
                     "socket_path_prefix": self.socket_path_prefix,
                     "model": self.model,
@@ -465,9 +476,10 @@ class Conductor:
         # Send NewRequest to each worker with the appropriate partition's inputs
         for worker_id, worker_graph_ids in worker_to_worker_graph_ids.items():
             # Determine which partition this worker serves
-            for partition_name, fwd_args in self._resolve_worker_partition(
-                worker_graph_ids, partitions, partition_fwd_args,
+            for partition_name, partition_wg_ids in self._resolve_worker_partition(
+                worker_graph_ids, partitions,
             ).items():
+                fwd_args = partition_fwd_args[partition_name]
                 pstate = partition_states[partition_name]
                 inputs_per_worker = self._split_inputs_to_workers(
                     worker_graph_to_worker=worker_graph_to_worker,
@@ -477,7 +489,7 @@ class Conductor:
 
                 message = NewRequest(
                     request_id=body.request_id,
-                    worker_graph_ids=worker_graph_ids,
+                    partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_worker=worker_graph_to_worker,
                     initial_inputs=inputs_per_worker.get(worker_id, []),
                     request_info=CurrentForwardPassInfo(
@@ -487,6 +499,7 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         requires_cfg=fwd_args.full_metadata.requires_cfg,
                         partition_name=partition_name,
+                        max_tokens=request_data.max_output_tokens
                     ),
                 )
                 self.communicator.send(
@@ -499,16 +512,15 @@ class Conductor:
     def _resolve_worker_partition(
         self, worker_graph_ids: list[str],
         partitions: list[PartitionDefinition],
-        partition_fwd_args: dict[str, ForwardPassArgs],
-    ) -> dict[str, ForwardPassArgs]:
+    ) -> dict[str, set[str]]:
         """Find which partition(s) a set of worker graphs belongs to."""
-        args = {}
+        partition_wg_ids = {}
         for wg_id in worker_graph_ids:
             wg_walks = self._all_worker_graph_ids_to_graph_walks.get(wg_id, set())
             for p in partitions:
                 if wg_walks & p.graph_walks:
-                    args[p.name] = partition_fwd_args[p.name]
-        return args
+                    partition_wg_ids.setdefault(p.name, set()).add(wg_id)
+        return partition_wg_ids
 
     def _set_partition_worker_graph_ids(
         self, request_id: str, partition_name: str, graph_walk: str,
@@ -670,7 +682,7 @@ class Conductor:
             for conn in request_data.streaming_connections.values():
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
-                    self._send_producer_done(request_id, conn.to_partition)
+                    self._send_producer_done(request_id, conn.from_partition, conn.to_partition)
         elif fwd_args.inputs:
             # Partition has inputs to send — conductor-driven
             self._send_partition_inputs(request_id, partition_name, fwd_args)
@@ -721,13 +733,17 @@ class Conductor:
                         per_label_seq_info=pstate.per_label_seq_info,
                         requires_cfg=fwd_args.full_metadata.requires_cfg,
                         partition_name=partition_name,
+                        max_tokens=request_data.max_output_tokens
                     ),
                     partition_name=partition_name
                 ),
             )
             self.communicator.send(worker, message)
 
-    def _send_producer_done(self, request_id: str, consumer_partition_name: str):
+    def _send_producer_done(
+        self, request_id: str, producer_partition: str,
+        consumer_partition_name: str
+    ):
         """Send producer_done signal to the consumer partition's worker(s)."""
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[consumer_partition_name]
@@ -752,9 +768,10 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         requires_cfg=False,
                         partition_name=consumer_partition_name,
+                        max_tokens=request_data.max_output_tokens
                     ),
                     partition_name=consumer_partition_name,
-                    producer_done=True,
+                    producer_done=set([producer_partition]),
                 ),
             )
             self.communicator.send(worker_id, message)

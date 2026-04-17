@@ -32,6 +32,7 @@ class EngineManager:
         node_names: set[str],
         device: torch.device,
         kv_config: list[KVCacheConfig],
+        model_config: dict,
         transfer_engine_info: TransferEngineInfo,
         model: Model,
         enable_nvtx: bool = False,
@@ -51,22 +52,19 @@ class EngineManager:
 
         node_to_engine: dict[str, BaseEngine] = {}
 
+        # Resolve autocast dtype: explicit YAML config wins; otherwise we
+        # fall back to the Model's own preference (so models that need to
+        # match a reference numerically can override get_autocast_dtype
+        # without forcing every config file to set the same value).
+        autocast_dtype = model.get_autocast_dtype()
+        if "autocast_dtype" in model_config:
+            autocast_dtype = model_config["autocast_dtype"]
+
         for engine_type_str, node_names in type_to_nodes.items():
             engine_cls = ENGINE_TYPE_TO_CLASS[engine_type_str]
 
-            # Resolve autocast dtype: explicit YAML config wins; otherwise we
-            # fall back to the Model's own preference (so models that need to
-            # match a reference numerically can override get_autocast_dtype
-            # without forcing every config file to set the same value).
-            if "autocast_dtype" in model_config:
-                autocast_dtype = model_config["autocast_dtype"]
-            elif model is not None:
-                autocast_dtype = model.get_autocast_dtype()
-            else:
-                autocast_dtype = torch.bfloat16
-
             engine = engine_cls(
-                autocast_dtype=model.get_autocast_dtype(),
+                autocast_dtype=autocast_dtype,
                 enable_nvtx=enable_nvtx,
             )
 
@@ -79,7 +77,7 @@ class EngineManager:
                         if engine.has_autocast():
                             submodules[name] = submodule.to(
                                 device=device,
-                                dtype=model.get_autocast_dtype()
+                                dtype=autocast_dtype
                             )
                         else:
                             submodules[name] = submodule.to(
@@ -90,7 +88,8 @@ class EngineManager:
                 submodules,
                 kv_cache_config=kv_config,
                 device=device,
-                transfer_engine_info=transfer_engine_info
+                transfer_engine_info=transfer_engine_info,
+                kv_cache_type=autocast_dtype
             )
             logger.info("Engine %s loaded in on device %s", engine_type_str, str(device))
 

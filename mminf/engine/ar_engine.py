@@ -390,11 +390,17 @@ class AREngine(BaseEngine):
                     with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
                         # Priority: CUDA graph > batched > sequential
                         if self._can_use_cuda_graph(batch):
-                            return self._execute_with_cuda_graph(batch, submodule)
+                            output = self._execute_with_cuda_graph(batch, submodule)
                         elif submodule.can_batch(batch):
-                            return self._execute_batched(batch, submodule)
+                            output = self._execute_batched(batch, submodule)
                         else:
-                            return self._execute_sequential(batch, submodule)
+                            output = self._execute_sequential(batch, submodule)
+                        for rid, info in batch.per_request_info.items():
+                            submodule.postprocess(
+                                request_info=info,
+                                outputs=output.per_request_output_tensors.get(rid, {})
+                            )
+                        return output
             except RuntimeError:
                 if not cache_mgmt.alloc_manager.alloc_status.success:
                     status = cache_mgmt.alloc_manager.alloc_status

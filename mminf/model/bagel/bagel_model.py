@@ -44,6 +44,7 @@ from mminf.conductor.request_info import CurrentForwardConductorMetadata
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import (
+    DynamicLoop,
     GraphEdge,
     GraphNode,
     GraphSection,
@@ -490,18 +491,25 @@ class BagelModel(Model):
         ])
 
         # -- decode: single LLM node (embed + transformer + lm_head) --
-        decode = GraphNode(
-            name="LLM",
-            input_ids=["text_inputs"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="new_token",
-                    output_modality="text",
-                    is_new_token=True,
-                    persist=True,
-                ),
-            ],
+        decode = DynamicLoop(
+            name="decode_loop",
+            section=GraphNode(
+                name="LLM",
+                input_ids=["text_inputs"],
+                outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="new_token",
+                        output_modality="text",
+                    ),
+                    GraphEdge(
+                        next_node="LLM",
+                        name="text_inputs",
+                    ),
+                ],
+            ),
+            max_iters=self.get_max_output_tokens(),
+            outputs=[],
         )
 
         # -- image_gen: denoising loop (LLM does CFG+Euler) -> VAE decode --
@@ -518,7 +526,7 @@ class BagelModel(Model):
                         GraphEdge(next_node="LLM", name="time_index"),
                     ],
                 ),
-                n_iters=self.config.num_timesteps - 1,
+                max_iters=self.config.num_timesteps - 1,
                 outputs=[
                     GraphEdge(next_node="vae_decoder", name="latents"),
                 ],
@@ -584,7 +592,7 @@ class BagelModel(Model):
                         ],
                     ),
                 ]),
-                n_iters=self.config.num_timesteps - 1,
+                max_iters=self.config.num_timesteps - 1,
                 outputs=[
                     GraphEdge(next_node="vae_decoder", name="latents"),
                 ],
@@ -712,9 +720,8 @@ class BagelModel(Model):
             return [graph_edge]
 
         elif graph_walk == DECODE:
-            # Previous token feeds back as text_inputs
+            # The submodule automatically adds a BOS to start
             graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-            graph_edge.tensor_info = persist_signals.get("new_token", [])
             return [graph_edge]
 
         elif graph_walk == "image_gen":
@@ -865,17 +872,16 @@ class BagelModel(Model):
                     else:
                         metadata.graph_walk = self._image_gen_walk
         elif metadata.graph_walk == DECODE:
-            tokens = new_tokens.get("new_token", [])
-            if self.eos_token_id is not None and self.eos_token_id in tokens:
-                target = metadata.kwargs["target_output"]
-                if metadata.kwargs.get("think_mode", False) and target == "image":
-                    # Thinking graph walk complete — transition to image generation.
-                    metadata.graph_walk = self._image_gen_walk
-                else:
-                    request_done = True
+            target = metadata.kwargs["target_output"]
+            if metadata.kwargs.get("think_mode", False) and target == "image":
+                # Thinking graph walk complete — transition to image generation.
+                metadata.graph_walk = self._image_gen_walk
+            else:
+                request_done = True
 
         elif metadata.graph_walk in ("image_gen", "image_gen_cfg"):
-            # Image generation complete (one image per request)
+            # Image generation complete (one image per request), OR
+            # text generation complete (happens in a dynamic loop)
             request_done = True
 
         step_metadata =  self._get_step_metadata(metadata)

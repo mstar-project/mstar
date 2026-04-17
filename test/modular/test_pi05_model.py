@@ -86,7 +86,7 @@ def test_pi05_action_gen_is_loop_with_action_output_emission():
     walks = model.get_graph_walk_graphs()
     action_gen = walks[Pi05Model.ACTION_GEN_WALK]
     assert isinstance(action_gen, Loop)
-    assert action_gen.n_iters == model.config.num_flow_steps == 10
+    assert action_gen.max_iters== model.config.num_flow_steps == 10
     # The terminal output emits to the client with the action modality.
     # Its ``name`` must match one of the section's loop-back edge names so
     # that Loop._replace_outputs_for_final_iter can swap it in on the final

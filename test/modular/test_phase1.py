@@ -300,7 +300,7 @@ class TestImageGenLoop:
         request_id = "test_req_1"
         manager.add_request(
             request_id=request_id,
-            worker_graph_ids=[worker_graph_id],
+            partition_worker_graph_ids=[worker_graph_id],
             worker_graph_to_worker={worker_graph_id: "worker_0"},
         )
         manager.update_graph_walk(request_id, "image_gen")
@@ -389,7 +389,7 @@ class TestImageGenLoop:
         request_id = "req_sched"
         manager.add_request(
             request_id=request_id,
-            worker_graph_ids=[worker_graph_id],
+            partition_worker_graph_ids=[worker_graph_id],
             worker_graph_to_worker={worker_graph_id: "w0"},
         )
         manager.update_graph_walk(request_id, "image_gen")

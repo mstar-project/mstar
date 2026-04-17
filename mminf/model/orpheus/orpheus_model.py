@@ -30,7 +30,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
-from mminf.graph.base import GraphEdge, GraphNode, GraphSection, TensorPointerInfo
+from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, GraphSection, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
@@ -114,7 +114,7 @@ class OrpheusModel(Model):
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
                     name="new_token",
-                    is_new_token=True,
+                    conductor_new_token=True,
                     persist=True,
                 ),
                 StreamingGraphEdge(
@@ -125,22 +125,30 @@ class OrpheusModel(Model):
             ],
         )
 
-        decode = GraphNode(
-            name="LLM",
-            input_ids=["text_inputs"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMPTY_DESTINATION,
-                    name="new_token",
-                    is_new_token=True,
-                    persist=True,
-                ),
-                StreamingGraphEdge(
-                    next_node="snac_decoder",
-                    name="new_token",
-                    target_partition="SNAC",
-                ),
-            ],
+        decode = DynamicLoop(
+            name="decode_loop",
+            section=GraphNode(
+                name="LLM",
+                input_ids=["text_inputs"],
+                outputs=[
+                    GraphEdge(
+                        next_node="LLM",
+                        name="text_inputs",
+                    ),
+                    StreamingGraphEdge(
+                        next_node="snac_decoder",
+                        name="new_token",
+                        target_partition="SNAC",
+                    ),
+                    # GraphEdge(
+                    #     next_node=EMPTY_DESTINATION,
+                    #     name="new_token",
+                    #     conductor_new_token=True,
+                    # ),
+                ],
+            ),
+            max_iters=self.get_max_output_tokens(),
+            outputs=[],
         )
 
         snac_chunk = GraphNode(
@@ -232,18 +240,9 @@ class OrpheusModel(Model):
         if metadata.is_prefill:
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
-            metadata.kwargs["audio_token_count"] = 0
-            metadata.kwargs["decode_finished"] = False
         elif metadata.graph_walk == "decode":
-            tokens = new_tokens.get("new_token", [])
-            count = metadata.kwargs["audio_token_count"]
-            for t in tokens:
-                if t == self.config.stop_token_id:
-                    request_done = True
-                    metadata.kwargs["decode_finished"] = True
-                    break
-                count += 1
-            metadata.kwargs["audio_token_count"] = count
+            request_done = True
+            metadata.kwargs["decode_finished"] = True
 
         if request_done:
             return ForwardPassArgs(
@@ -278,48 +277,15 @@ class OrpheusModel(Model):
         producer_done: bool,
         consumed: int = 0,
     ) -> ForwardPassArgs:
-        """SNAC partition: trigger one streaming chunk decode.
-
-        The SNAC submodule converts ALL buffered tokens to codes and takes
-        the last 28 valid codes (matching the reference decoder). The
-        conductor just needs to trigger it periodically and track whether
-        there are more tokens to process.
-
-        ``consumed`` comes from the StreamingConnectionState.consumed_count,
-        which is updated from the worker's StreamBuffer via
-        WorkerGraphsDone.stream_tokens_consumed.
+        """SNAC partition: the streaming decode loop is self-triggered,
+        so this function is basically a no-op.
         """
-        stride = self.config.snac_stride_tokens
-
         metadata.graph_walk = "snac_chunk"
-
-        available = token_buffer_count - consumed
-
-        # Nothing left to decode
-        if available <= 0 and producer_done:
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        step_metadata = {"consumed_tokens": stride}
-
-        # Check if this is the last chunk. Basically, the new_consumed = consumed + stride
-        # is only used to calculate is_last. it's asking "after the worker consumes another
-        # stride's worth of tokens, will there be enough left for another chunk?"
-        # It's not actually advancing any state.
-        new_consumed = consumed + stride
-        remaining_after = token_buffer_count - new_consumed
-        is_last = producer_done and remaining_after < stride
 
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=[],
             unpersist_tensors=[],
-            step_metadata=step_metadata,
-            request_done=is_last,
         )
 
     # -------------------------------------------------------------------

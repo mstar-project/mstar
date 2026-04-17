@@ -2,8 +2,10 @@ import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 
+from mminf.communication.tensors import TensorCommunicationManager
 from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
-from mminf.graph.base import GraphEdge, GraphNode, TensorPointerInfo
+from mminf.graph.base import DynamicLoop, FilteredEdges, GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
+from mminf.graph.loop_index import IterIndexTree, build_loop_index_tree, update_loop_index_tree
 from mminf.graph.request_queues import (
     PerRequestNodeQueues,
     ProcessedInputs,
@@ -48,6 +50,7 @@ class WorkerGraphQueues:
                           # but not the prefill graph walk
     worker_graph: WorkerGraph
     per_request_queues: dict[str, PerRequestNodeQueues] # request_id -> queue
+    tensor_manager: TensorCommunicationManager
 
     def process_new_inputs(self, request_id: str, inputs: list[GraphEdge]) -> ProcessedInputs:
         """
@@ -65,14 +68,19 @@ class WorkerGraphQueues:
 
     def is_done(self, request_id) -> bool:
         q = self.per_request_queues[request_id]
-        return q.waiting is None and len(q.ready) == 0
+        return q.waiting is None and len(q.ready) == 0 and len(q.waiting_for_stream) == 0
 
     def add_request(self, request_id: str):
         """
         Initialize queues for a new request
         """
+        section_copy = deepcopy(self.worker_graph.section)
+        section_copy.register_communication_info(
+            self.tensor_manager, request_id
+        )
         self.per_request_queues[request_id] = PerRequestNodeQueues(
-            waiting=deepcopy(self.worker_graph.section),
+            waiting=section_copy,
+            full_section=section_copy,
             worker_graph_id=self.worker_graph_id
         )
 
@@ -121,8 +129,36 @@ class WorkerGraphQueues:
         At the end of a worker graph, reset the queues for a request so it can
         be used for the next full model forward pass.
         """
-        self.per_request_queues[request_id].waiting = deepcopy(self.worker_graph.section)
-        self.per_request_queues[request_id].ready = []
+        self.per_request_queues[request_id].reset()
+    
+    def stop_loops(self, request_id: str, loop_names: set[str]):
+        def _stop_loops(section: GraphSection):
+            if isinstance(section, Sequential) or isinstance(section, Parallel):
+                for sec in section.sections:
+                    _stop_loops(sec)
+                return
+            if isinstance(section, DynamicLoop):
+                if section.name in loop_names:
+                    section.register_finished()
+            if isinstance(section, Loop):
+                # including dynamic loops
+                _stop_loops(section._curr_iter_section)
+        _stop_loops(self.per_request_queues[request_id].waiting)
+    
+    def get_dynamic_loop_iters(self, request_id: str) -> dict[str, int]:
+        iter_dict = {}
+        def _get_iters(section: GraphSection):
+            if isinstance(section, Sequential) or isinstance(section, Parallel):
+                for sec in section.sections:
+                    _get_iters(sec)
+                return
+            if isinstance(section, DynamicLoop):
+                iter_dict[section.name] = section.curr_iter
+            if isinstance(section, Loop):
+                # including dynamic loops
+                _get_iters(section._curr_iter_section)
+        _get_iters(self.per_request_queues[request_id].waiting)
+        return iter_dict
 
 
 @dataclass
@@ -154,6 +190,7 @@ class PerRequestInfo:
     - tensors: TBD
     """
     node_to_worker: dict[NodeAndGraphWalk, str]  # for all nodes
+    dyn_loop_to_workers: dict[NodeAndGraphWalk, list[str]]
     worker_graph_ids: list[str] # for this worker
 
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
@@ -177,7 +214,8 @@ class WorkerGraphsManager:
 
     # The following two are for routing purposes:
     all_worker_graph_ids_to_graph_walks: dict[str, set[str]] # for worker graphs on different workers too
-    all_worker_graph_ids_to_nodes: dict[str, str] # for worker graphs on different workers too
+    all_worker_graph_ids_to_nodes: dict[str, set[str]] # for worker graphs on different workers too
+    all_worker_graph_ids_to_dyn_loops: dict[str, set[str]]
 
     # Maps node_name -> partition_name. Populated from the model's partitions
     # and graph walk definitions. Used to look up which partition a node belongs
@@ -215,6 +253,9 @@ class WorkerGraphsManager:
 
     def get_fwd_number(self, request_id: str, partition_name: str):
         return self.get_fwd_info(request_id, partition_name).fwd_index
+    
+    def has_partition(self,  request_id: str, partition_name: str):
+        return partition_name in self.per_request_info[request_id].per_partition_info
 
     def get_fwd_info(self, request_id: str, partition_name: str):
         part_info = self.per_request_info[request_id].per_partition_info[partition_name]
@@ -258,6 +299,43 @@ class WorkerGraphsManager:
                 inputs = self.queues[worker_graph_id].process_new_streaming_inputs(request_id, inputs).for_other_worker_graphs
         return inputs
 
+
+    def get_worker_graph_id_for_node(
+        self, request_id: str, node_name: str
+    ) -> str:
+        partition = self.get_partition_for_node(node_name)
+        graph_walk = self.get_graph_walk(request_id, partition)
+        for gid in self.per_request_info[request_id].worker_graph_ids:
+            if (graph_walk in self.all_worker_graph_ids_to_graph_walks[gid]) and \
+                        (node_name in self.all_worker_graph_ids_to_nodes[gid]):
+                return gid
+        raise RuntimeError(f"Could not find worker graph for node {node_name}, request {request_id}")
+    
+
+    def get_waiting_node(
+        self, request_id: str, worker_graph_id: str
+    ):
+        return self.queues[worker_graph_id].per_request_queues[request_id].waiting
+
+
+    def complete_loops(
+        self, request_id: str, worker_graph_id: str,
+        output_edges: list[GraphEdge], done_node: str
+    ) -> FilteredEdges:
+        queue = self.queues[worker_graph_id].per_request_queues[request_id]
+        if queue.waiting is None:
+            return FilteredEdges(
+                kept=output_edges,
+                filtered_out=[]
+            )
+        out = queue.waiting.complete_loops(done_node)
+        queue.waiting = out.new_waiting
+
+        filter_result = out.filter_out_loop_back(output_edges)
+        filter_result.kept += out.outputs
+        return filter_result
+
+
     def process_node_outputs(
         self, request_id: str,
         outputs: list[GraphEdge],
@@ -278,7 +356,7 @@ class WorkerGraphsManager:
 
         # (1) find back_to_conductor flags
         to_conductor = [edge for edge in non_streaming_outputs if edge.persist]
-        new_token_outputs = [edge for edge in non_streaming_outputs if edge.is_new_token]
+        new_token_outputs = [edge for edge in non_streaming_outputs if edge.conductor_new_token]
 
         # (2) process all internal-facing outputs
         worker_graph_ids = [
@@ -376,10 +454,57 @@ class WorkerGraphsManager:
             streaming_to_workers=streaming_to_workers,
             streaming_local=streaming_local,
         )
+    
+    def stop_loops(
+        self, request_id: str,
+        partition: str,
+        loop_names: set[str],
+        req_info: CurrentForwardPassInfo | None = None,
+        last_node_run: str | None = None
+    ):
+        """
+        Stops dynamic loops based on stop signals. If req_info is also passed in,
+        then this also updates req_info.loop_stop_times with the urrent loop indices.
+        """
+        part_info = self.per_request_info[request_id].per_partition_info[partition]
+        worker_graph_ids = part_info.graph_walk_worker_graph_ids
+        for worker_graph_id in worker_graph_ids:
+            self.queues[worker_graph_id].stop_loops(request_id, loop_names)
+            waiting = self.queues[worker_graph_id].per_request_queues[request_id].waiting
+
+            if req_info is not None and (
+                last_node_run in self.all_worker_graph_ids_to_nodes[worker_graph_id]
+            ):
+                for name in loop_names:
+                    if name in req_info.loop_stop_times:
+                        update_loop_index_tree(
+                            index_tree=req_info.loop_stop_times[name],
+                            graph=waiting,
+                            fwd_idx=req_info.fwd_index
+                        )
+                    else:
+                        req_info.loop_stop_times[name] = build_loop_index_tree(
+                            graph=waiting,
+                            fwd_idx=req_info.fwd_index
+                        )
+    
+    def get_dynamic_loop_iters(
+        self, request_id: str,
+        partition: str,
+    ) -> dict[str, int]:
+        part_info = self.per_request_info[request_id].per_partition_info[partition]
+        worker_graph_ids = part_info.graph_walk_worker_graph_ids
+
+        iter_counts: dict[str, int] = {}
+        for worker_graph_id in worker_graph_ids:
+            iter_counts.update(
+                self.queues[worker_graph_id].get_dynamic_loop_iters(request_id)
+            )
+        return iter_counts
 
     def add_request(
         self, request_id: str,
-        worker_graph_ids: list[str], # for this worker's worker graphs
+        partition_worker_graph_ids: list[str], # for this worker's worker graphs
         worker_graph_to_worker: dict[str, str], # for other / all worker graphs
         current_fwd_info: CurrentForwardPassInfo,
     ):
@@ -388,45 +513,61 @@ class WorkerGraphsManager:
         to the relevant worker graph queues, and updating the mapping of which worker
         is responsible for which nodes for this request (for output routing).
         """
-        node_to_worker = {}
-        for graph_id in worker_graph_ids:
+
+        current_graph_walk = current_fwd_info.graph_walk
+        my_worker_graph_ids = [gid for gid in partition_worker_graph_ids if gid in self.queues]
+        partition_name = current_fwd_info.partition_name
+
+        for graph_id in partition_worker_graph_ids:
             if graph_id in self.queues:
                 self.queues[graph_id].add_request(request_id)
 
-        for worker_graph_id, worker_id in worker_graph_to_worker.items():
-            if worker_graph_id not in self.all_worker_graph_ids_to_graph_walks:
-                continue
-            for graph_walk in self.all_worker_graph_ids_to_graph_walks[worker_graph_id]:
-                node_to_worker.update({
-                    NodeAndGraphWalk(
-                        node=name,
-                        graph_walk=graph_walk
-                    ): worker_id for name in self.all_worker_graph_ids_to_nodes[worker_graph_id]
-                })
-        graph_walk = current_fwd_info.graph_walk
-        my_worker_graph_ids = [gid for gid in worker_graph_ids if gid in self.queues]
-        partition_name = getattr(current_fwd_info, 'partition_name', 'default')
 
         if request_id not in self.per_request_info:
+            # Note: conductor.py passes the same worker_graph_to_worker dict
+            # on every NewRequest for a given request(i.e., for every partition).
+            # So the below logic only needs to be done once.
+            node_to_worker = {}
+            dyn_loop_to_workers = {}
+            for worker_graph_id, worker_id in worker_graph_to_worker.items():
+                if worker_graph_id not in self.all_worker_graph_ids_to_graph_walks:
+                    continue
+                for graph_walk in self.all_worker_graph_ids_to_graph_walks[worker_graph_id]:
+                    node_to_worker.update({
+                        NodeAndGraphWalk(
+                            node=name,
+                            graph_walk=graph_walk
+                        ): worker_id for name in self.all_worker_graph_ids_to_nodes[worker_graph_id]
+                    })
+
+                    for loop_name in self.all_worker_graph_ids_to_dyn_loops[worker_graph_id]:
+                        dyn_loop_to_workers.setdefault(NodeAndGraphWalk(
+                            node=loop_name,
+                            graph_walk=graph_walk
+                        ), []).append(worker_id)
+
             self.per_request_info[request_id] = PerRequestInfo(
                 node_to_worker=node_to_worker,
+                dyn_loop_to_workers=dyn_loop_to_workers,
                 worker_graph_ids=my_worker_graph_ids,
                 per_partition_info={
                     partition_name: PerPartitionInfo(
                         graph_walk_worker_graph_ids=[
                             graph_id for graph_id in my_worker_graph_ids
-                            if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
+                            if current_graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
                         ],
-                        current_fwd_info=current_fwd_info
+                        current_fwd_info=current_fwd_info,
                     )
                 }
             )
         else:
+            # Just do partition-specific work: updating worker_graph_ids, instantiating PerPartitionInfo
             req_info = self.per_request_info[request_id]
+            req_info.worker_graph_ids += my_worker_graph_ids
             req_info.per_partition_info[partition_name] = PerPartitionInfo(
                 graph_walk_worker_graph_ids=[
                     graph_id for graph_id in my_worker_graph_ids
-                    if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
+                    if current_graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
                 ],
                 current_fwd_info=current_fwd_info
             )
@@ -436,6 +577,11 @@ class WorkerGraphsManager:
             for queue_id in self.per_request_info[request_id].worker_graph_ids:
                 self.queues[queue_id].remove_request(request_id)
             del self.per_request_info[request_id]
+    
+    def get_dyn_loop_workers(self, request_id: str, partition_name: str, loop_name: str):
+        return self.per_request_info[request_id].dyn_loop_to_workers[NodeAndGraphWalk(
+            node=loop_name, graph_walk=self.get_graph_walk(request_id, partition_name)
+        )]
 
     def buffer_persist_signals(
             self, request_id: str,

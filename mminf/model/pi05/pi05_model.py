@@ -276,7 +276,7 @@ class Pi05Model(Model):
                     GraphEdge(next_node="LLM", name="timestep_index"),
                 ],
             ),
-            n_iters=self.config.num_flow_steps,
+            max_iters=self.config.num_flow_steps,
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,

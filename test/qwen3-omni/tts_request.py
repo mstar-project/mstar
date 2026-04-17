@@ -50,7 +50,7 @@ def write_wav(pcm_data: bytes, path: str):
 def main():
     parser = argparse.ArgumentParser(description="Orpheus TTS client")
     parser.add_argument("--text", default="Hello, how are you doing today?", help="Text to synthesize")
-    parser.add_argument("--voice", default="tara", help="Voice name")
+    parser.add_argument("--voice", default="ethan", help="Voice name")
     parser.add_argument("--output", default="output.wav", help="Output WAV file path")
     parser.add_argument("--port", type=int, default=20001, help="Port number to connect to (localhost only)")
     args = parser.parse_args()

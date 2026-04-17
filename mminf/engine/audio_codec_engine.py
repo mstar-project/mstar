@@ -77,6 +77,11 @@ class AudioCodecEngine(BaseEngine):
                             outputs[rid] = {"output": [result]}
                         else:
                             outputs[rid] = {}
+                for rid, info in batch.per_request_info.items():
+                    submodule.postprocess(
+                        request_info=info,
+                        outputs=outputs[rid]
+                    )
                 return NodeOutput(per_request_output_tensors=outputs)
         finally:
             if self.enable_nvtx:

@@ -372,6 +372,7 @@ class TensorCommunicationManager(ABC):
                 )
             for edge in edges:
                 edge.tensor_info = graph_node_info[name]
+        return graph_node_info
 
     # ---- abstract: transport-specific ----
 

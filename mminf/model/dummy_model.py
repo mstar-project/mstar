@@ -74,7 +74,7 @@ class DummyModel(Model):
                         next_node=EMIT_TO_CLIENT,
                         output_modality="text",
                         name="new_token",
-                        is_new_token=True
+                        conductor_new_token=True
                     )
                 ]
             )
@@ -99,7 +99,7 @@ class DummyModel(Model):
                         ]
                     )
                 ]),
-                n_iters=10,
+                max_iters=10,
                 outputs=[
                     GraphEdge(next_node="VAE_dec", name="latents")
                 ]

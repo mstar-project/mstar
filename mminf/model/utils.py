@@ -271,11 +271,12 @@ def load_weights_from_hf_shards(
             if prefix + k in mod_key_to_hf_keys.keys():
                 mod_key_to_hf_keys[k] = mod_key_to_hf_keys[prefix + k]
                 all_hf_keys.update(mod_key_to_hf_keys[k].keys)
-                del mod_key_to_hf_keys[prefix + k]
+                if prefix:
+                    del mod_key_to_hf_keys[prefix + k]
             mod_key_to_idx[k] = i
         module_keys.append(mod.module.state_dict().keys())
         all_module_keys.update(module_keys[-1])
-    
+
     mod_key_to_hf_keys = {
         k: v for k, v in mod_key_to_hf_keys.items() if k in all_module_keys
     }

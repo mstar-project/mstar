@@ -42,7 +42,7 @@ from mminf.conductor.request_info import (
 )
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
-from mminf.graph.base import GraphEdge, GraphNode, Sequential, TensorPointerInfo
+from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule, TensorAndMetadata
 from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
@@ -207,7 +207,6 @@ class Qwen3OmniModel(Model):
                     next_node=EMIT_TO_CLIENT,
                     name="new_token",
                     output_modality="text",
-                    is_new_token=True,
                     persist=True,
                 ),
                 StreamingGraphEdge(
@@ -243,7 +242,6 @@ class Qwen3OmniModel(Model):
                         next_node=EMIT_TO_CLIENT,
                         name="new_token",
                         output_modality="text",
-                        is_new_token=True,
                         persist=True,
                     ),
                     StreamingGraphEdge(
@@ -280,7 +278,6 @@ class Qwen3OmniModel(Model):
                         next_node=EMIT_TO_CLIENT,
                         name="new_token",
                         output_modality="text",
-                        is_new_token=True,
                         persist=True,
                     ),
                     StreamingGraphEdge(
@@ -299,28 +296,36 @@ class Qwen3OmniModel(Model):
 
         # -- Thinker decode: produces new_token (persist) + thinker_states
         #    (streaming to Talker) --
-        thinker_decode = GraphNode(
-            name="Thinker",
-            input_ids=["text_inputs"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="new_token",
-                    output_modality="text",
-                    is_new_token=True,
-                    persist=True,
-                ),
-                StreamingGraphEdge(
-                    next_node="Talker",
-                    name="thinker_states",
-                    target_partition="Talker",
-                ),
-                StreamingGraphEdge(
-                    next_node="Talker",
-                    name="thinker_mask",
-                    target_partition="Talker",
-                ),
-            ],
+        thinker_decode = DynamicLoop(
+            name="thinker_decode_loop",
+            section=GraphNode(
+                name="Thinker",
+                input_ids=["text_inputs"],
+                outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="new_token",
+                        output_modality="text",
+                    ),
+                    GraphEdge(
+                        next_node="Thinker",
+                        name="text_inputs",
+                        output_modality="text",
+                    ),
+                    StreamingGraphEdge(
+                        next_node="Talker",
+                        name="thinker_states",
+                        target_partition="Talker",
+                    ),
+                    StreamingGraphEdge(
+                        next_node="Talker",
+                        name="thinker_mask",
+                        target_partition="Talker",
+                    ),
+                ],
+            ),
+            max_iters=self.get_max_output_tokens(),
+            outputs=[],
         )
 
         # -- Talker prefill: receives thinker_states + talker_trigger --
@@ -331,12 +336,6 @@ class Qwen3OmniModel(Model):
             name="Talker",
             input_ids=["thinker_states", "thinker_mask", "talker_trigger"],
             outputs=[
-                GraphEdge(
-                    next_node=EMPTY_DESTINATION,
-                    name="new_token",
-                    is_new_token=True,
-                    persist=True,
-                ),
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
                     name="all_codes",
@@ -351,27 +350,25 @@ class Qwen3OmniModel(Model):
         )
 
         # -- Talker decode: autoregressive codec token generation --
-        talker_decode = GraphNode(
-            name="Talker",
-            input_ids=["all_codes", "thinker_states", "thinker_mask"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMPTY_DESTINATION,
-                    name="new_token",
-                    is_new_token=True,
-                    persist=True,
-                ),
-                GraphEdge(
-                    next_node=EMPTY_DESTINATION,
-                    name="all_codes",
-                    persist=True,
-                ),
-                StreamingGraphEdge(
-                    next_node="Code2Wav",
-                    name="codec_tokens",
-                    target_partition="Code2Wav",
-                ),
-            ],
+        talker_decode = DynamicLoop(
+            name="talker_decode_loop",
+            section=GraphNode(
+                name="Talker",
+                input_ids=["all_codes", "thinker_states", "thinker_mask"],
+                outputs=[
+                    GraphEdge(
+                        next_node="Talker",
+                        name="all_codes",
+                    ),
+                    StreamingGraphEdge(
+                        next_node="Code2Wav",
+                        name="codec_tokens",
+                        target_partition="Code2Wav",
+                    ),
+                ],
+            ),
+            max_iters=self.get_max_output_tokens(),
+            outputs=[],
         )
 
         # -- Code2Wav chunk: vocoder streaming decode --
@@ -727,7 +724,6 @@ class Qwen3OmniModel(Model):
         4. Each decode step: check new_token for EOS (im_end_token_id)
         5. On EOS: request_done=True for Thinker
         """
-        request_done = False
 
         if metadata.is_prefill:
             # Advance prefill schedule
@@ -744,15 +740,7 @@ class Qwen3OmniModel(Model):
                 metadata.graph_walk = "thinker_decode"
 
         elif metadata.graph_walk == "thinker_decode":
-            # Check for EOS in newly generated tokens
-            tokens = new_tokens.get("new_token", [])
-            for t in tokens:
-                if t == self.config.im_end_token_id:
-                    request_done = True
-                    break
-
-        # Build inputs for next step
-        if request_done:
+            # if the decode loop returns to conductor, the thinker is fully done
             return ForwardPassArgs(
                 full_metadata=metadata,
                 inputs=[],
@@ -760,7 +748,7 @@ class Qwen3OmniModel(Model):
                 request_done=True,
             )
 
-        is_last_prefill = True
+
         if metadata.is_prefill:
             # Still in prefill -- delegate to _get_thinker_prefill_inputs
             # which handles the (walk_name, {input_name: tensor_info}) schedule
@@ -773,6 +761,7 @@ class Qwen3OmniModel(Model):
             inputs = self._get_thinker_prefill_inputs(metadata, persist_signals)
         else:
             # Decode: previous token feeds back as text_inputs
+            is_last_prefill = False
             edge = GraphEdge(next_node="Thinker", name="text_inputs")
             edge.tensor_info = persist_signals.get("new_token", [])
             inputs = [edge]
@@ -822,8 +811,6 @@ class Qwen3OmniModel(Model):
            - If codec_eos: request_done=True for Talker
            - Else: return all_codes as input again (loop)
         """
-        request_done = False
-
         if metadata.is_prefill:
             # Talker is in prefill mode, waiting for conductor triggers.
 
@@ -867,37 +854,12 @@ class Qwen3OmniModel(Model):
             )
 
         elif metadata.graph_walk == "talker_decode":
-            # Decode loop: check only the layer-0 code (first element) for
-            # codec EOS.  Higher codebook layers (1-31) are residual codes
-            # and should not be compared against the EOS token ID.
-            tokens = new_tokens["new_token"]
-            codec_eos = self.config.talker.codec_eos_token_id
-            if tokens and tokens[0] == codec_eos:
-                request_done = True
-
-            if request_done:
-                return ForwardPassArgs(
-                    full_metadata=metadata,
-                    inputs=[],
-                    unpersist_tensors=[],
-                    request_done=True,
-                )
-
-            # Feed all_codes back for next decode step
-            edge = GraphEdge(next_node="Talker", name="all_codes")
-            edge.tensor_info = persist_signals.get("all_codes", [])
-            inputs = [edge]
-            unpersist_tensors = sum(
-                [inp.tensor_info for inp in inputs], start=[]
-            )
-
+            # If the decode loop reaches the conductor, we can end the request.
             return ForwardPassArgs(
                 full_metadata=metadata,
-                inputs=inputs,
-                unpersist_tensors=unpersist_tensors,
-                step_metadata={
-                    "is_prefill": False,
-                },
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
             )
 
         raise ValueError(

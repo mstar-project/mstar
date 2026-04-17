@@ -964,7 +964,6 @@ class LLMSubmodule(NodeSubmodule):
 
         result: NameToTensorList = {output_name: [hidden]}
         if self.node_name == "LLM":
-            result["latents"] = [latents]
             result["time_index"] = [time_index]
         return result
 
@@ -1086,6 +1085,18 @@ class LLMSubmodule(NodeSubmodule):
         self, batch: NodeBatch
     ):
         return batch.graph_walk in ["decode", "prefill_text"]
+    
+    def postprocess(
+        self, request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]]
+    ):
+        if "new_token" not in outputs:
+            return
+        outputs["text_inputs"] = outputs["new_token"]
+        token = outputs["new_token"][0].item()
+        if (self.eos_token_id is not None and self.eos_token_id == token) or \
+                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
+            request_info.register_loop_stop("decode_loop")
 
 
 class VAEDecoderSubmodule(NodeSubmodule):

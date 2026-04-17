@@ -11,7 +11,8 @@ from mminf.communication.tensors import NameToTensorList, create_tensor_communic
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
 from mminf.engine.kv_store import KVCacheConfig, StoreWritePolicy, TransferEngineInfo
-from mminf.graph.base import GraphEdge
+from mminf.graph.base import FilteredEdges, GraphEdge
+from mminf.graph.loop_index import build_loop_index_tree
 from mminf.graph.request_queues import format_graph_edge_list
 from mminf.model.base import Model, WorkerGraph
 from mminf.streaming.stream_buffer import StreamBuffer
@@ -21,6 +22,7 @@ from mminf.utils.ipc_format import (
     InputSignals,
     NewRequest,
     RemoveRequest,
+    StopLoops,
     TensorReceived,
     UnpersistTensors,
     WorkerGraphsDone,
@@ -30,6 +32,7 @@ from mminf.utils.ipc_format import (
 from mminf.worker.engine_manager import EngineManager
 from mminf.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mminf.worker.node_manager_utils import (
+    NodeAndGraphWalk,
     NodeOutputRouting,
     WorkerGraphQueues,
     WorkerGraphsManager,
@@ -55,16 +58,18 @@ class Worker:
         self,
         worker_id: str,
         worker_ids: list[str],
+        model: Model,
         my_worker_graphs: list[WorkerGraph],
         kv_config: dict[str, KVCacheConfig],
+        model_config: dict,
         all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-        all_worker_graph_ids_to_nodes: dict[str, list[str]],
+        all_worker_graph_ids_to_nodes: dict[str, set[str]],
+        all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         device: torch.device = torch.device("cuda"),
         enable_nvtx: bool = False,
-        model: Model | None = None,
         mooncake_port: int=8080,
         tcp_transfer_device=""
     ):
@@ -84,23 +89,6 @@ class Worker:
                         for node_name in section.get_node_names():
                             node_to_partition[node_name] = pdef.name
 
-        self.worker_graphs_manager = WorkerGraphsManager(
-            queues={
-                worker_graph.worker_graph_id: WorkerGraphQueues(
-                    worker_graph_id=worker_graph.worker_graph_id,
-                    graph_walks=worker_graph.graph_walks,
-                    worker_graph=worker_graph,
-                    per_request_queues={},
-                )
-                for worker_graph in my_worker_graphs
-            },
-            per_request_info={},
-            all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
-            all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
-            node_to_partition=node_to_partition,
-        )
-
-
         self.communicator = ZMQCommunicator(
             my_id=worker_id,
             push_ids=worker_ids + ["conductor", "api_server", "api_server_preprocess_worker"],
@@ -115,13 +103,15 @@ class Worker:
             tcp_transfer_device=tcp_transfer_device,
         )
 
-        node_names = set(sum([
-            wg.section.get_node_names() for wg in my_worker_graphs
-        ], start=[]))
+        node_names = set()
+        for wg in my_worker_graphs:
+            node_names.update(wg.section.get_node_names())
+
         self.engine_manager = EngineManager.build(
             node_names,
             device=device,
             kv_config=kv_config,
+            model_config=model_config,
             transfer_engine_info=TransferEngineInfo(
                 my_entity_id=worker_id,
                 my_session_id=self.tensor_manager.my_session_id,
@@ -130,6 +120,25 @@ class Worker:
             model=model,
             enable_nvtx=self.enable_nvtx
         )
+
+        self.worker_graphs_manager = WorkerGraphsManager(
+            queues={
+                worker_graph.worker_graph_id: WorkerGraphQueues(
+                    worker_graph_id=worker_graph.worker_graph_id,
+                    graph_walks=worker_graph.graph_walks,
+                    worker_graph=worker_graph,
+                    per_request_queues={},
+                    tensor_manager=self.tensor_manager
+                )
+                for worker_graph in my_worker_graphs
+            },
+            per_request_info={},
+            all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
+            all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
+            all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
+            node_to_partition=node_to_partition,
+        )
+
         self.scheduler = MicroScheduler(self.engine_manager)
 
         # Determine store write policy based on worker graph topology
@@ -204,7 +213,7 @@ class Worker:
         self,
         my_worker_graphs: list[WorkerGraph],
         all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-        all_worker_graph_ids_to_nodes: dict[str, list[str]],
+        all_worker_graph_ids_to_nodes: dict[str, set[str]],
         node_engine_types: dict[str, EngineType] | None = None,
     ) -> StoreWritePolicy:
         """Determine whether this worker needs to write KV to the mooncake store.
@@ -232,7 +241,7 @@ class Worker:
 
         # Collect all workers' AR graph walks
         for wg_id, walks in all_worker_graph_ids_to_graph_walks.items():
-            nodes = all_worker_graph_ids_to_nodes.get(wg_id, [])
+            nodes = all_worker_graph_ids_to_nodes.get(wg_id, set())
             for node_name in nodes:
                 if _is_ar(node_name):
                     all_ar_walks_nodes.update([(walk, node_name) for walk in walks])
@@ -262,7 +271,7 @@ class Worker:
 
         self.worker_graphs_manager.add_request(
             request_id=body.request_id,
-            worker_graph_ids=body.worker_graph_ids,
+            partition_worker_graph_ids=body.partition_worker_graph_ids,
             worker_graph_to_worker=body.worker_graph_to_worker,
             current_fwd_info=body.request_info
         )
@@ -326,7 +335,10 @@ class Worker:
         if body.producer_done:
             if req_info:
                 for sbuf in req_info.stream_buffers.values():
-                    sbuf.signal_done()
+                    if sbuf.from_partition in body.producer_done:
+                        # If we have multiple consumer partitions colocated, we need to signal
+                        # the right one
+                        sbuf.signal_done()
 
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
@@ -376,11 +388,32 @@ class Worker:
             self.tensor_manager.set_persist(
                 body.request_id, uuid, persist=False
             )
+    
+    def _stop_loops(self, body: StopLoops):
+        if not self.worker_graphs_manager.has_partition(
+            body.request_id, body.partition_name
+        ):
+            return
+        fwd_info = self.worker_graphs_manager.get_fwd_info(
+            body.request_id, body.partition_name
+        )
+        loop_names = set()
+        for name, stop_time in body.loop_stop_times.items():
+            if name not in fwd_info.loop_stop_times or stop_time.label_context_gt(
+                fwd_info.loop_stop_times[name], name
+            ):
+                loop_names.add(name)
+            fwd_info.loop_stop_times[name] = stop_time
+        if loop_names:
+            self.worker_graphs_manager.stop_loops(
+                body.request_id, body.partition_name, loop_names
+            )
 
     def _process_message_list(self, messages: list[WorkerMessage]):
         msg_types_needing_active_request = [
             WorkerMessageType.REMOVE_REQUEST,
             WorkerMessageType.INPUT_SIGNALS,
+            WorkerMessageType.STOP_LOOPS
         ]
         for message in messages:
             if (
@@ -402,6 +435,8 @@ class Worker:
                 self._handle_tensor_received(message.body)
             elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
                 self._unpersist_tensors(message.body)
+            elif message.message_type == WorkerMessageType.STOP_LOOPS:
+                self._stop_loops(message.body)
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
@@ -625,19 +660,13 @@ class Worker:
     # Output handling
     # ------------------------------------------------------------------
 
-    def _store_outputs(
+    def _store_outputs_and_finish_loops(
         self,
         batch: ScheduledBatch,
         output: "NodeOutput",
-        routing_per_request: dict[str, NodeOutputRouting],
         filtered_outputs_per_request: dict[str, list[GraphEdge]],
-    ) -> dict[str, list[GraphEdge]]:
+    ) -> dict[str, FilteredEdges]:
         """
-        For outputs going to other workers: register tensors for RDMA send
-        and populate tensor_info on the GraphEdges.
-        For outputs staying local: store tensors in tensor_manager.
-        Returns the output edges per request (with tensor_info filled in).
-
         ``filtered_outputs_per_request`` contains, for each request, only the
         GraphNode output edges whose names are actually present in the
         submodule's returned output dict. Edges absent from the output dict
@@ -645,25 +674,59 @@ class Worker:
         audio_output=False which omits thinker_states) are excluded so that
         empty-tensor_info edges are not routed downstream.
         """
-        output_edges: dict[str, list[GraphEdge]] = {}
-
+        
+        output_edges: dict[str, FilteredEdges] = {}
         for request_id, node in batch.node_objects.items():
             # output name to list of tensors
             request_output_tensors = output.per_request_output_tensors.get(
                 request_id, {}
             ) # name -> list of tensors
             filtered_outputs = filtered_outputs_per_request.get(request_id, [])
-            output_edges[request_id] = filtered_outputs
+            output_edges[request_id] = FilteredEdges(
+                kept=filtered_outputs,
+                filtered_out=[]
+            )
 
             if not request_output_tensors:
                 continue  # Node produced no outputs (e.g., KV-cache-only prefill step)
 
-            self.tensor_manager.store_and_populate_graph_edges(
+            output_tensor_info = self.tensor_manager.store_and_populate_graph_edges(
                 request_id=request_id,
                 tensors=request_output_tensors,
                 graph_edges=filtered_outputs
             )
+            
+            worker_graph_id = self.worker_graphs_manager.get_worker_graph_id_for_node(
+                request_id, node_name=node.name
+            )
+            waiting_node = self.worker_graphs_manager.get_waiting_node(request_id, worker_graph_id)
+            if waiting_node is not None:
+                waiting_node.cache_outputs(output_tensor_info)
+            output_edges[request_id] = self.worker_graphs_manager.complete_loops(
+                request_id, worker_graph_id, output_edges[request_id].kept,
+                done_node=batch.node_name
+            )
 
+            # if any outputs were filtered out, we must dereference them
+            for edge in output_edges[request_id].filtered_out:
+                for info in edge.tensor_info:
+                    self.tensor_manager.dereference(request_id, info.uuid)
+
+        return output_edges
+        
+
+    def _register_outputs(
+        self,
+        batch: ScheduledBatch,
+        routing_per_request: dict[str, NodeOutputRouting],
+    ):
+        """
+        For outputs going to other workers: register tensors for RDMA send
+        and populate tensor_info on the GraphEdges.
+        For outputs staying local: store tensors in tensor_manager.
+        Returns the output edges per request (with tensor_info filled in).
+        """
+        for request_id, node in batch.node_objects.items():
             routing = routing_per_request[request_id]
             uuids = set()
             for edge in (
@@ -685,7 +748,6 @@ class Worker:
                         request_id=request_id, uuid=info.uuid, persist=True
                     )
 
-        return output_edges
 
     def _send_outputs(
         self, request_id: str, outputs: NodeOutputRouting,
@@ -773,7 +835,6 @@ class Worker:
                 ),
             )
             self.communicator.send(worker_id, message)
-
         if outputs.completed_worker_graph_ids:
             fwd_info = self.worker_graphs_manager.get_fwd_info(request_id, partition_name)
             if partition_name is None:
@@ -827,11 +888,20 @@ class Worker:
                 # 3. Pick next batch via MicroScheduler
                 batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
                 if batch is None:
-                    sleep(0.01)
+                    sleep(0.001)
                     continue
 
                 # 4. Gather input tensors for the batch
                 node_batch = self._build_node_batch(batch)
+                batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
+
+                for request_id, req_info in node_batch.per_request_info.items():
+                    req_info.dynamic_loop_iter_counts.update(
+                        self.worker_graphs_manager.get_dynamic_loop_iters(
+                            request_id, partition=batch_partition,
+                        )
+                    )
+                    batch.node_objects[request_id].clear_outputs()
 
                 # 5. Execute via engine
                 engine = self.engine_manager.get_engine(batch.node_name)
@@ -883,13 +953,22 @@ class Worker:
                 for rid in batch.node_objects:
                     self._last_active[(rid, batch.node_name)] = now
 
-                batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
-
                 for rid, req_info in node_batch.per_request_info.items():
+                    if req_info.dynamic_loop_stop_signals:                        
+                        self.worker_graphs_manager.stop_loops(
+                            rid, partition=batch_partition,
+                            loop_names=req_info.dynamic_loop_stop_signals,
+                            # Pass in req_info and last_node_run to update
+                            # req_info.loop_stop_times
+                            req_info=req_info, last_node_run=batch.node_name
+                        )
+
                     self.worker_graphs_manager.update_request_info(
-                        rid, per_label_seq_info=req_info.per_label_seq_info,
+                        rid, current_fwd_info=req_info,
+                        per_label_seq_info=req_info.per_label_seq_info,
                         partition_name=batch_partition,
                     )
+                    
 
                 # 5b. Free consumed input tensors
                 self._cleanup_consumed_inputs(batch)
@@ -901,7 +980,6 @@ class Worker:
                 # (which omits thinker_states). Without filtering, edges whose names are
                 # absent from the output dict would be routed with empty tensor_info.
                 filtered_outputs_per_request: dict[str, list[GraphEdge]] = {}
-                routing_per_request: dict[str, NodeOutputRouting] = {}
                 for request_id, node in batch.node_objects.items():
                     request_output_tensors = output.per_request_output_tensors.get(
                         request_id, {}
@@ -910,15 +988,44 @@ class Worker:
                         e for e in node.outputs if e.name in request_output_tensors
                     ]
                     filtered_outputs_per_request[request_id] = filtered_outputs
+
+                node_outputs = self._store_outputs_and_finish_loops(
+                    batch, output=output,
+                    filtered_outputs_per_request=filtered_outputs_per_request
+                )
+                
+                routing_per_request: dict[str, NodeOutputRouting] = {}
+                for request_id in batch.node_objects:
                     routing = self.worker_graphs_manager.process_node_outputs(
-                        request_id, filtered_outputs, graph_walk=batch.graph_walk
+                        request_id, node_outputs[request_id].kept, graph_walk=batch.graph_walk
                     )
                     routing_per_request[request_id] = routing
 
+                    # 6b. send "loop done" messages to the corresponding workers
+                    stop_loop_workers = {}
+                    for loop_name in node_batch.per_request_info[request_id].dynamic_loop_stop_signals:
+                        for worker in self.worker_graphs_manager.get_dyn_loop_workers(
+                            request_id,  batch_partition, loop_name
+                        ):
+                            stop_loop_workers.setdefault(worker, set()).add(loop_name)
+                    for worker, loop_names in stop_loop_workers.items():
+                        if worker == self.worker_id:
+                            continue
+                        self.communicator.send(
+                            entity_id=worker,
+                            msg=WorkerMessage(
+                                message_type=WorkerMessageType.STOP_LOOPS,
+                                body=StopLoops(
+                                    request_id=request_id,
+                                    loop_names=loop_names,
+                                    loop_stop_times=node_batch.per_request_info[request_id].loop_stop_times,
+                                    partition_name=batch_partition
+                                )
+                            )
+                        )
+
                 # 7. Store output tensors, register RDMA if needed
-                self._store_outputs(
-                    batch, output, routing_per_request, filtered_outputs_per_request
-                )
+                self._register_outputs(batch, routing_per_request)
 
                 # 8. Send outputs to other workers / conductor
                 for request_id in batch.node_objects.keys():
@@ -927,6 +1034,9 @@ class Worker:
                         graph_walk=batch.graph_walk,
                         partition_name=batch_partition,
                     )
+                
+                for rid, req_info in node_batch.per_request_info.items():
+                    req_info.dynamic_loop_stop_signals.clear()
             except Exception:
                 logger.exception("Worker %s error in main loop", self.worker_id)
                 sleep(0.01)

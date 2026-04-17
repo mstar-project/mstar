@@ -19,7 +19,7 @@ from mminf.engine.base import EngineType, NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.engine.kv_store import KVCacheConfig
-from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
+from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -118,6 +118,17 @@ class NodeSubmodule(torch.nn.Module):
         self, batch: NodeBatch
     ):
         return False
+
+    def postprocess(
+        self, request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]]
+    ):
+        """
+        Performs any required postprocessing (after sampling from logits, if applicable)
+        on the submodule outputs (e.g., checking for EOS to stop the decode loop, as this
+        python-level control flow cannot happen in a cuda graph section).
+        """
+        return
 
 
 @dataclass
@@ -233,22 +244,31 @@ def _divide_into_worker_graphs(
             node_groups=node_groups,
             input_streams=input_streams
         )
-        if len(loop_section_worker_graphs) == 1:
-            # fully colocated case
-            loop_section_worker_graphs[0].section = graph
-            return loop_section_worker_graphs
-
-        # in the disaggregated case, we need to wrap all worker graphs in a loop
-        # with the external signals and loop-back signals pre-computed
+        ext_inps = [
+            inp for inp in graph._external_inputs if inp.name not in input_streams
+        ]
         for s in loop_section_worker_graphs:
-            s.section = Loop(
-                section=s.section,
-                n_iters=graph.n_iters,
-                curr_iter=graph.curr_iter,
-                external_inputs=graph.external_inputs,
-                loop_back_signals=graph.loop_back_signals,
-                outputs=graph.outputs
-            )
+            if isinstance(graph, DynamicLoop):
+                s.section = DynamicLoop(
+                    section=s.section,
+                    name=graph.name,
+                    max_iters=graph.max_iters,
+                    curr_iter=graph.curr_iter,
+                    _external_inputs=ext_inps,
+                    _loop_back_signals=graph._loop_back_signals,
+                    outputs=graph.outputs,
+                    _uuid_label=graph._uuid_label
+                )
+            else:
+                s.section = Loop(
+                    section=s.section,
+                    max_iters=graph.max_iters,
+                    curr_iter=graph.curr_iter,
+                    _external_inputs=ext_inps,
+                    _loop_back_signals=graph._loop_back_signals,
+                    outputs=graph.outputs,
+                    _uuid_label=graph._uuid_label
+                )
         return loop_section_worker_graphs
 
 

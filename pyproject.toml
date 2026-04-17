@@ -45,6 +45,20 @@ bagel = [
     "transformers",
 ]
 
+qwen3_omni = [
+    "einops",
+    "flashinfer-python",
+    "huggingface-hub",
+    "mooncake-transfer-engine",
+    "Pillow",
+    "regex",
+    "qwen-omni-utils",
+    "torchvision",
+    "torchaudio",
+    "torchcodec",
+    "transformers",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["mminf*"]

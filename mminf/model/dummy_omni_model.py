@@ -26,7 +26,7 @@ class DummyOmniModel(Model):
                 outputs=[
                     GraphEdge(next_node="TalkerLLM", name="thinker_hidden"),
                     GraphEdge(
-                        next_node=EMIT_TO_CLIENT, name="thinker_token", is_new_token=True,
+                        next_node=EMIT_TO_CLIENT, name="thinker_token", conductor_new_token=True,
                         output_modality="text"
                     ),
                 ],
@@ -36,7 +36,7 @@ class DummyOmniModel(Model):
                 input_ids=["thinker_hidden"],
                 outputs=[
                     GraphEdge(next_node="MTP", name="codec_hidden"),
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="talker_token", is_new_token=True),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="talker_token", conductor_new_token=True),
                 ],
             ),
             Loop(
@@ -45,10 +45,10 @@ class DummyOmniModel(Model):
                     input_ids=["codec_hidden"],
                     outputs=[
                         GraphEdge(next_node="MTP", name="codec_hidden"),
-                        GraphEdge(next_node=EMIT_TO_CLIENT, name="mtp_token", is_new_token=True),
+                        GraphEdge(next_node=EMIT_TO_CLIENT, name="mtp_token", conductor_new_token=True),
                     ],
                 ),
-                n_iters=16,
+                max_iters=16,
                 outputs=[
                     GraphEdge(next_node="AudioCodec", name="codec_hidden"),
                 ],
