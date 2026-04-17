@@ -74,7 +74,7 @@ class DummyWorker:
         """
         self.worker_graphs_manager.add_request(
             request_id=body.request_id,
-            worker_graph_ids=body.worker_graph_ids,
+            partition_worker_graph_ids=body.partition_worker_graph_ids,
             worker_graph_to_worker=body.worker_graph_to_worker
         )
 

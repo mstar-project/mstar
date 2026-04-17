@@ -1095,7 +1095,7 @@ class LLMSubmodule(NodeSubmodule):
         outputs["text_inputs"] = outputs["new_token"]
         token = outputs["new_token"][0].item()
         if (self.eos_token_id is not None and self.eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) >= request_info.max_tokens):
+                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
             request_info.register_loop_stop("decode_loop")
 
 

@@ -79,11 +79,11 @@ class FlowEngine(BaseEngine):
             with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
                 with torch.no_grad():
                     output = self._execute_sequential(batch, submodule)
-                for rid, info in batch.per_request_info.items():
-                    submodule.postprocess(
-                        request_info=info,
-                        outputs=output.per_request_output_tensors[rid]
-                    )
+                    for rid, info in batch.per_request_info.items():
+                        submodule.postprocess(
+                            request_info=info,
+                            outputs=output.per_request_output_tensors.get(rid, {})
+                        )
                 return output
         finally:
             if self.enable_nvtx:

@@ -87,6 +87,7 @@ def _worker_process_target(
     worker = Worker(
         worker_id=worker_id,
         worker_ids=worker_ids,
+        model=model,
         my_worker_graphs=my_worker_graphs,
         kv_config=kv_config,
         model_config=model_config,
@@ -97,7 +98,6 @@ def _worker_process_target(
         socket_path_prefix=socket_path_prefix,
         enable_nvtx=enable_nvtx,
         device=torch.device(device),
-        model=model,
         mooncake_port=mooncake_port,
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
@@ -489,7 +489,7 @@ class Conductor:
 
                 message = NewRequest(
                     request_id=body.request_id,
-                    worker_graph_ids=partition_wg_ids,
+                    partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_worker=worker_graph_to_worker,
                     initial_inputs=inputs_per_worker.get(worker_id, []),
                     request_info=CurrentForwardPassInfo(

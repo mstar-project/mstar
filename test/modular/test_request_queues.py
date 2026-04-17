@@ -12,7 +12,7 @@ if __name__ == "__main__":
     # show-o2-style graph with weird stuff added to stress-test
 
     loop = Loop(
-        curr_section_replica=Parallel([
+        section=Parallel([
             Sequential([
                 GraphNode(
                     name="LLM",
@@ -23,7 +23,7 @@ if __name__ == "__main__":
                     ]
                 ),
                 Loop(
-                    curr_section_replica=Sequential([
+                    section=Sequential([
                         GraphNode(
                             name="flow",
                             input_ids=["hidden_states", "mystery", "mystery2"],
@@ -40,7 +40,7 @@ if __name__ == "__main__":
                             ]
                         ),
                     ]),
-                    n_iters=2,
+                    max_iters=2,
                     outputs=[
                         GraphEdge(name="latents", next_node="LLM")
                     ]
@@ -64,7 +64,7 @@ if __name__ == "__main__":
                 )
             ])
         ]),
-        n_iters=3,
+        max_iters=3,
         outputs=[
             GraphEdge(name="latents", next_node="VAE_decoder"),
             GraphEdge(name="some_random_external_output", next_node="EMIT_TO_CLIENT")
@@ -74,16 +74,16 @@ if __name__ == "__main__":
     loop = Parallel([
         Sequential([
             Loop(
-                curr_section_replica=loop.curr_section_replica.sections[0].sections[0],
-                n_iters=loop.n_iters,
+                section=loop.section.sections[0].sections[0],
+                max_iters=loop.max_iters,
                 curr_iter=loop.curr_iter,
                 _external_inputs=loop._external_inputs,
                 _loop_back_signals=loop._loop_back_signals,
                 outputs=loop.outputs
             ),
             Loop(
-                curr_section_replica=loop.curr_section_replica.sections[0].sections[1],
-                n_iters=loop.n_iters,
+                section=loop.section.sections[0].sections[1],
+                max_iters=loop.max_iters,
                 curr_iter=loop.curr_iter,
                 _external_inputs=loop._external_inputs,
                 _loop_back_signals=loop._loop_back_signals,
@@ -91,8 +91,8 @@ if __name__ == "__main__":
             )
         ]),
         Loop(
-            curr_section_replica=loop.curr_section_replica.sections[1],
-            n_iters=loop.n_iters,
+            section=loop.section.sections[1],
+            max_iters=loop.max_iters,
             curr_iter=loop.curr_iter,
             _external_inputs=loop._external_inputs,
             _loop_back_signals=loop._loop_back_signals,
@@ -121,7 +121,7 @@ if __name__ == "__main__":
             )
         ]),
         Loop(
-            curr_section_replica=Parallel([
+            section=Parallel([
                 Sequential([
                     GraphNode(
                         name="LLM",
@@ -132,7 +132,7 @@ if __name__ == "__main__":
                         ]
                     ),
                     Loop(
-                        curr_section_replica=Sequential([
+                        section=Sequential([
                             GraphNode(
                                 name="flow",
                                 input_ids=["hidden_states", "mystery", "mystery2"],
@@ -150,7 +150,7 @@ if __name__ == "__main__":
                                 ]
                             ),
                         ]),
-                        n_iters=2,
+                        max_iters=2,
                         outputs=[
                             GraphEdge(next_node="LLM", name="latents")
                         ]
@@ -174,7 +174,7 @@ if __name__ == "__main__":
                     )
                 ])
             ]),
-            n_iters=3,
+            max_iters=3,
             outputs=[
                 GraphEdge(next_node="VAE_decoder", name="latents"),
                 GraphEdge(next_node="EMIT_TO_CLIENT", name="some_random_external_output")

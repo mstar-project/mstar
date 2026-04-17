@@ -438,8 +438,10 @@ class Parallel(GraphSection):
 
 @dataclass
 class Loop(GraphSection):
-    section: GraphSection # this is used to populate next_section and
-                          # in-progress section; it remains "clean"
+    # "section" is used by users to specify the loop iterior.It is also
+    # used in the current copy-free "advance iter" logic; see "_advance_one_iter"
+    # for more information
+    section: GraphSection
     max_iters: int
     outputs: list[GraphEdge]
     curr_iter: int = field(default=0)
@@ -578,7 +580,30 @@ class Loop(GraphSection):
 
 
     def _advance_one_iter(self) -> "Loop":
+        """
+        Advance the iteration by essentially resetting the curr_iter_section
+        and swapping it with the next_iter_section. This allows loop iteration while
+        remaining copy-free. The overall logic is as follows:
+
+        1. Loop instantiation: _curr_iter_section is set to section ("obj A"), and
+        _nxt_iter_section is set to a copy ("obj B")
+
+        2. Advance iter 0 -> 1: reset self.section (obj A). Set _curr_iter_section
+        to obj B (which has possibly accumulated inputs in its tenure as
+        _nxt_iter_section), and _curr_iter_section is set to the newly-reset obj B.
+        We have to use self.section here because _curr_iter_section will be None before
+        calling _advance_one_iter.
+
+        3. Advance iter 1 -> 2: Same as (2), but sets _curr_iter_section to obj A,
+        and sets _nxt_iter_section to a freshly-reset obj B.
+        """
         self._uncache_outputs()
+
+        # TODO: maybe if we call node.reset right after running each node in the worker,
+        # so we know that all nodes in self.section have already been reset if
+        # self._iter_done() returns True, we don't have to call this here. But we
+        # will have to make sure to carefully reset the loop curr_iter in complete_loops(),
+        # so leaving this as a comment to think about later.
         self.section.reset()
 
         new_curr, new_next = self._nxt_iter_section, self.section
@@ -684,7 +709,7 @@ class DynamicLoop(Loop):
     def _is_done(self):
         return (
             (self.max_iters == self.curr_iter + 1) or self._finished) \
-                and (self._curr_iter_section is None)
+                and self._iter_done()
     
     def reset(self):
         super().reset()

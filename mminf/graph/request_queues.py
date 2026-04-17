@@ -56,14 +56,14 @@ class PerRequestNodeQueues:
         self,
         new_inputs: list[GraphEdge]
     ) -> ProcessedInputs:
-        new_inputs: DestToGraphEdges = get_node_to_inputs_mapping(new_inputs)
-        ingested = []
-
         if self.waiting is None:
             return ProcessedInputs(
                 for_other_worker_graphs=new_inputs,
                 routed_to_this_worker_graph=[],
             )
+
+        new_inputs: DestToGraphEdges = get_node_to_inputs_mapping(new_inputs)
+        ingested = []
 
         self.waiting_for_stream.extend(
             self.waiting.split_off_ready_for_streaming()

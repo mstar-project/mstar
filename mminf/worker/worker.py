@@ -58,6 +58,7 @@ class Worker:
         self,
         worker_id: str,
         worker_ids: list[str],
+        model: Model,
         my_worker_graphs: list[WorkerGraph],
         kv_config: dict[str, KVCacheConfig],
         model_config: dict,
@@ -69,7 +70,6 @@ class Worker:
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         device: torch.device = torch.device("cuda"),
         enable_nvtx: bool = False,
-        model: Model | None = None,
         mooncake_port: int=8080,
         tcp_transfer_device=""
     ):
@@ -271,7 +271,7 @@ class Worker:
 
         self.worker_graphs_manager.add_request(
             request_id=body.request_id,
-            worker_graph_ids=body.worker_graph_ids,
+            partition_worker_graph_ids=body.partition_worker_graph_ids,
             worker_graph_to_worker=body.worker_graph_to_worker,
             current_fwd_info=body.request_info
         )
@@ -888,7 +888,7 @@ class Worker:
                 # 3. Pick next batch via MicroScheduler
                 batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
                 if batch is None:
-                    sleep(0.01)
+                    sleep(0.001)
                     continue
 
                 # 4. Gather input tensors for the batch
@@ -957,7 +957,10 @@ class Worker:
                     if req_info.dynamic_loop_stop_signals:                        
                         self.worker_graphs_manager.stop_loops(
                             rid, partition=batch_partition,
-                            loop_names=req_info.dynamic_loop_stop_signals
+                            loop_names=req_info.dynamic_loop_stop_signals,
+                            # Pass in req_info and last_node_run to update
+                            # req_info.loop_stop_times
+                            req_info=req_info, last_node_run=batch.node_name
                         )
 
                     self.worker_graphs_manager.update_request_info(

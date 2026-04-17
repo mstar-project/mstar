@@ -895,7 +895,7 @@ class ThinkerSubmodule(NodeSubmodule):
         token = outputs["new_token"][0].item()
         eos_token_id = self.config.im_end_token_id
         if (eos_token_id is not None and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("thinker_decode_loop", 0) >= request_info.max_tokens):
+                (request_info.dynamic_loop_iter_counts.get("thinker_decode_loop", 0) + 1 >= request_info.max_tokens):
             request_info.register_loop_stop("thinker_decode_loop")
 
 
@@ -1771,7 +1771,7 @@ class TalkerSubmodule(NodeSubmodule):
         token = outputs["new_token"][0].item()
         eos_token_id = self.config.talker.codec_eos_token_id
         if (eos_token_id is not None and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) >= request_info.max_tokens):
+                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= request_info.max_tokens):
             request_info.register_loop_stop("talker_decode_loop")
 
     # ---- cleanup ----

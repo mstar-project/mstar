@@ -398,7 +398,7 @@ class AREngine(BaseEngine):
                         for rid, info in batch.per_request_info.items():
                             submodule.postprocess(
                                 request_info=info,
-                                outputs=output.per_request_output_tensors[rid]
+                                outputs=output.per_request_output_tensors.get(rid, {})
                             )
                         return output
             except RuntimeError:

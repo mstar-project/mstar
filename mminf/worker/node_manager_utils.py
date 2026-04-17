@@ -462,6 +462,10 @@ class WorkerGraphsManager:
         req_info: CurrentForwardPassInfo | None = None,
         last_node_run: str | None = None
     ):
+        """
+        Stops dynamic loops based on stop signals. If req_info is also passed in,
+        then this also updates req_info.loop_stop_times with the urrent loop indices.
+        """
         part_info = self.per_request_info[request_id].per_partition_info[partition]
         worker_graph_ids = part_info.graph_walk_worker_graph_ids
         for worker_graph_id in worker_graph_ids:
@@ -500,7 +504,7 @@ class WorkerGraphsManager:
 
     def add_request(
         self, request_id: str,
-        worker_graph_ids: list[str], # for this worker's worker graphs
+        partition_worker_graph_ids: list[str], # for this worker's worker graphs
         worker_graph_to_worker: dict[str, str], # for other / all worker graphs
         current_fwd_info: CurrentForwardPassInfo,
     ):
@@ -509,34 +513,39 @@ class WorkerGraphsManager:
         to the relevant worker graph queues, and updating the mapping of which worker
         is responsible for which nodes for this request (for output routing).
         """
-        node_to_worker = {}
-        dyn_loop_to_workers = {}
-        for graph_id in worker_graph_ids:
+
+        current_graph_walk = current_fwd_info.graph_walk
+        my_worker_graph_ids = [gid for gid in partition_worker_graph_ids if gid in self.queues]
+        partition_name = current_fwd_info.partition_name
+
+        for graph_id in partition_worker_graph_ids:
             if graph_id in self.queues:
                 self.queues[graph_id].add_request(request_id)
 
-        for worker_graph_id, worker_id in worker_graph_to_worker.items():
-            if worker_graph_id not in self.all_worker_graph_ids_to_graph_walks:
-                continue
-            for graph_walk in self.all_worker_graph_ids_to_graph_walks[worker_graph_id]:
-                node_to_worker.update({
-                    NodeAndGraphWalk(
-                        node=name,
-                        graph_walk=graph_walk
-                    ): worker_id for name in self.all_worker_graph_ids_to_nodes[worker_graph_id]
-                })
-
-                for loop_name in self.all_worker_graph_ids_to_dyn_loops[worker_graph_id]:
-                    dyn_loop_to_workers.setdefault(NodeAndGraphWalk(
-                        node=loop_name,
-                        graph_walk=graph_walk
-                    ), []).append(worker_id)
-
-        graph_walk = current_fwd_info.graph_walk
-        my_worker_graph_ids = [gid for gid in worker_graph_ids if gid in self.queues]
-        partition_name = current_fwd_info.partition_name
 
         if request_id not in self.per_request_info:
+            # Note: conductor.py passes the same worker_graph_to_worker dict
+            # on every NewRequest for a given request(i.e., for every partition).
+            # So the below logic only needs to be done once.
+            node_to_worker = {}
+            dyn_loop_to_workers = {}
+            for worker_graph_id, worker_id in worker_graph_to_worker.items():
+                if worker_graph_id not in self.all_worker_graph_ids_to_graph_walks:
+                    continue
+                for graph_walk in self.all_worker_graph_ids_to_graph_walks[worker_graph_id]:
+                    node_to_worker.update({
+                        NodeAndGraphWalk(
+                            node=name,
+                            graph_walk=graph_walk
+                        ): worker_id for name in self.all_worker_graph_ids_to_nodes[worker_graph_id]
+                    })
+
+                    for loop_name in self.all_worker_graph_ids_to_dyn_loops[worker_graph_id]:
+                        dyn_loop_to_workers.setdefault(NodeAndGraphWalk(
+                            node=loop_name,
+                            graph_walk=graph_walk
+                        ), []).append(worker_id)
+
             self.per_request_info[request_id] = PerRequestInfo(
                 node_to_worker=node_to_worker,
                 dyn_loop_to_workers=dyn_loop_to_workers,
@@ -545,19 +554,20 @@ class WorkerGraphsManager:
                     partition_name: PerPartitionInfo(
                         graph_walk_worker_graph_ids=[
                             graph_id for graph_id in my_worker_graph_ids
-                            if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
+                            if current_graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
                         ],
                         current_fwd_info=current_fwd_info,
                     )
                 }
             )
         else:
+            # Just do partition-specific work: updating worker_graph_ids, instantiating PerPartitionInfo
             req_info = self.per_request_info[request_id]
             req_info.worker_graph_ids += my_worker_graph_ids
             req_info.per_partition_info[partition_name] = PerPartitionInfo(
                 graph_walk_worker_graph_ids=[
                     graph_id for graph_id in my_worker_graph_ids
-                    if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
+                    if current_graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
                 ],
                 current_fwd_info=current_fwd_info
             )

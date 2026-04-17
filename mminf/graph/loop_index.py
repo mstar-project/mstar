@@ -39,6 +39,8 @@ class IterIndexTree:
             if label in other.children and target_label in child.descendent_labels:
                 child_name = label
                 break
+        if child_name is None:
+            return False
         return child.label_context_gt(other.children[child_name], target_label)
 
 
@@ -79,6 +81,7 @@ def update_loop_index_tree(
         if isinstance(graph, Sequential) or isinstance(graph, Parallel):
             for sec in graph.sections:
                 _update(tree, sec)
+                return
 
         # otherwise, this is a loop
         label = graph.name if isinstance(graph, DynamicLoop) else graph._uuid_label
