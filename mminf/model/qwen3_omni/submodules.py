@@ -16,7 +16,6 @@ import logging
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from mminf.communication.tensors import NameToTensorList
@@ -220,7 +219,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         else:
             vision_embeds = encoder_output.pooler_output
             deepstack = encoder_output.deepstack_features
-        
+
         if isinstance(deepstack, torch.Tensor):
             deepstack = [deepstack]
 
@@ -279,7 +278,7 @@ class ThinkerSubmodule(NodeSubmodule):
                 device=device,
             )
         return self._inv_freq
-    
+
     def _get_talker_text_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
         Cut system prompt and previous assistant parts out of the talker input
@@ -347,7 +346,7 @@ class ThinkerSubmodule(NodeSubmodule):
         # second row: text inclusion mask (cuts out system prompt)
         masks_for_talker = {}
 
-        for inp, rid in zip(per_request_inputs, request_ids):
+        for inp, rid in zip(per_request_inputs, request_ids, strict=True):
             text_ids = inp["text_inputs"][0].to(device)  # (seq_len,)
             embeds = self.model.model.embed_tokens(text_ids)
 
@@ -426,7 +425,7 @@ class ThinkerSubmodule(NodeSubmodule):
         audio_start_id = self.config.thinker.audio_start_token_id
         audio_end_id = self.config.thinker.audio_end_token_id
 
-        for inp, rid in zip(per_request_inputs, request_ids):
+        for inp, rid in zip(per_request_inputs, request_ids, strict=True):
             audio_embeds = inp["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
             audio_len = audio_embeds.shape[0]
 
@@ -539,7 +538,7 @@ class ThinkerSubmodule(NodeSubmodule):
         vision_end_id = self.config.thinker.vision_end_token_id
         spatial_merge = self.config.vision.spatial_merge_size
 
-        for inp, rid in zip(per_request_inputs, request_ids):
+        for inp, rid in zip(per_request_inputs, request_ids, strict=True):
             vision_embeds = inp["vision_embeds"][0].to(device)
             vision_len = vision_embeds.shape[0]
 
@@ -622,8 +621,6 @@ class ThinkerSubmodule(NodeSubmodule):
         )
         cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
 
-        deepstack 
-
         result = {
             "input_embeds": input_embeds,
             "cos_sin_3d": cos_sin_3d,
@@ -655,7 +652,7 @@ class ThinkerSubmodule(NodeSubmodule):
         # second row: text inclusion mask (one for decode)
         masks_for_talker = {}
 
-        for inp, rid in zip(per_request_inputs, request_ids):
+        for inp, rid in zip(per_request_inputs, request_ids, strict=True):
             # Get previous token ID from text_inputs
             token_id = inp["text_inputs"][0].to(device)  # (1,) or scalar
             if token_id.dim() == 0:
@@ -786,7 +783,7 @@ class ThinkerSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: NodeBatch) -> bool:
         return batch.graph_walk == "thinker_decode"
-    
+
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         """Return dummy inputs for CUDA graph capture, or None if this walk
         doesn't support CUDA graphs.
@@ -887,7 +884,7 @@ class ThinkerSubmodule(NodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
     ) -> list[str]:
         return ["main"]
-    
+
     def postprocess(
         self, request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]]
@@ -1044,8 +1041,7 @@ class TalkerSubmodule(NodeSubmodule):
         ):
             mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
             start = vocab_size - 1024
-            if start < 0:
-                start = 0
+            start = max(start, 0)
             mask[start:vocab_size] = True
             # Do not suppress codec_eos (the valid stop signal).
             eos = self.config.talker.codec_eos_token_id
@@ -1205,7 +1201,7 @@ class TalkerSubmodule(NodeSubmodule):
             1, self.config.talker_hidden_size, device=device,
             dtype=next(self.model.parameters()).dtype,
         )
-    
+
     def _get_talker_embeds(
         self, layer_0_embed: torch.Tensor, layer_n_hidden: torch.Tensor,
         multimodal_mask: torch.Tensor, text_inclusion_mask: torch.Tensor
@@ -1393,7 +1389,7 @@ class TalkerSubmodule(NodeSubmodule):
         # Talker to drift into garbled output after a few decode steps.
         cp_residual_embeddings = self.code_predictor.model.codec_embedding
 
-        for inp, rid in zip(per_request_inputs, request_ids):
+        for inp, rid in zip(per_request_inputs, request_ids, strict=True):
             # 1. Re-embed all_codes
             all_codes = inp["all_codes"][0].to(device)
             if all_codes.dim() == 2:
@@ -1439,18 +1435,17 @@ class TalkerSubmodule(NodeSubmodule):
                         text_hidden = text_hidden[-1:]
                 else:
                     text_hidden = self._get_tts_pad_embed(device)
+            # Empty thinker_states — Thinker has finished.
+            # HF/vllm/sglang append tts_eos_embed at the end of
+            # trailing_text_hidden so the Talker gets a "text done"
+            # signal before switching to tts_pad_embed.  We replicate
+            # that by using tts_eos_embed for the FIRST empty step,
+            # then tts_pad_embed for all subsequent steps.
+            elif rid not in self._eos_embed_sent:
+                text_hidden = self._get_tts_eos_embed(device)
+                self._eos_embed_sent.add(rid)
             else:
-                # Empty thinker_states — Thinker has finished.
-                # HF/vllm/sglang append tts_eos_embed at the end of
-                # trailing_text_hidden so the Talker gets a "text done"
-                # signal before switching to tts_pad_embed.  We replicate
-                # that by using tts_eos_embed for the FIRST empty step,
-                # then tts_pad_embed for all subsequent steps.
-                if rid not in self._eos_embed_sent:
-                    text_hidden = self._get_tts_eos_embed(device)
-                    self._eos_embed_sent.add(rid)
-                else:
-                    text_hidden = self._get_tts_pad_embed(device)
+                text_hidden = self._get_tts_pad_embed(device)
 
             # Ensure text_hidden is (1, hidden)
             if text_hidden.dim() == 1:
@@ -1673,7 +1668,7 @@ class TalkerSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: NodeBatch) -> bool:
         return batch.graph_walk == "talker_decode"
-    
+
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         """Return dummy inputs for CUDA graph capture, or None if this walk
         doesn't support CUDA graphs.
@@ -1747,7 +1742,7 @@ class TalkerSubmodule(NodeSubmodule):
                 seen_token_mask=seen_mask,
             )  # (1,)
             self._mark_seen(rid, layer0_code)
-            
+
             all_codes = self._run_code_predictor(last_hidden_i, layer0_code)
 
             result[rid] = {
@@ -1764,7 +1759,7 @@ class TalkerSubmodule(NodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
     ) -> list[str]:
         return ["main"]
-    
+
     def postprocess(
         self, request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]]

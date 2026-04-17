@@ -1089,7 +1089,7 @@ class LLMSubmodule(NodeSubmodule):
         self, batch: NodeBatch
     ):
         return batch.graph_walk in ["decode", "prefill_text"]
-    
+
     def postprocess(
         self, request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]]

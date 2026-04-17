@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
 import logging
+from dataclasses import dataclass, field
 
 import torch
 
@@ -50,7 +50,7 @@ class AREngine(BaseEngine):
         enable_nvtx: bool = False,
     ):
         super().__init__(enable_nvtx=enable_nvtx)
-        
+
         self.kv_management: dict[str, KVManagement] = {}
         self.submodule_management: dict[str, SubmoduleManagement] = {}
 

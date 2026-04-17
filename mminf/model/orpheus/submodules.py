@@ -173,7 +173,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
                 dummy_capture_inputs=[{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
             ),
         ]
-        
+
     def preprocess(
         self,
         graph_walk: str,
@@ -309,21 +309,6 @@ class OrpheusLLMSubmodule(NodeSubmodule):
         }
         out["__batched_logits__"] = logits
         return out
-    
-    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
-        """Return dummy inputs for CUDA graph capture, or None if this walk
-        doesn't support CUDA graphs.
-
-        Default: returns text_inputs for "decode" walks. Override in subclasses
-        for walks with different input names (e.g., Qwen3-Omni Thinker uses
-        "input_embeds" and "cos_sin_3d"; Talker uses "input_embeds").
-        """
-        return [
-            CudaGraphConfig(
-                graph_walk="decode", requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=[{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
-            ),
-        ]
 
 
 class SNACDecoderSubmodule(NodeSubmodule):

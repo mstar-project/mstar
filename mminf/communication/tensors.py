@@ -658,15 +658,19 @@ def _deserialize_tensor(data: bytes | memoryview, device: str) -> torch.Tensor:
     if isinstance(data, memoryview):
         data = bytes(data)
     off = 0
-    ndim, dtype_len = struct.unpack_from("<II", data, off); off += 8
-    dtype_tag = data[off:off + dtype_len].decode("ascii"); off += dtype_len
+    ndim, dtype_len = struct.unpack_from("<II", data, off)
+    off += 8
+    dtype_tag = data[off:off + dtype_len].decode("ascii")
+    off += dtype_len
 
     shape = []
     for _ in range(ndim):
-        shape.append(struct.unpack_from("<q", data, off)[0]); off += 8
+        shape.append(struct.unpack_from("<q", data, off)[0])
+        off += 8
     stride = []
     for _ in range(ndim):
-        stride.append(struct.unpack_from("<q", data, off)[0]); off += 8
+        stride.append(struct.unpack_from("<q", data, off)[0])
+        off += 8
 
     dtype = _STR_TO_DTYPE[dtype_tag]
     raw = data[off:]

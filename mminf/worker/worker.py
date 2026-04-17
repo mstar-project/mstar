@@ -12,7 +12,6 @@ from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
 from mminf.engine.kv_store import KVCacheConfig, StoreWritePolicy, TransferEngineInfo
 from mminf.graph.base import FilteredEdges, GraphEdge
-from mminf.graph.loop_index import build_loop_index_tree
 from mminf.graph.request_queues import format_graph_edge_list
 from mminf.model.base import Model, WorkerGraph
 from mminf.streaming.stream_buffer import StreamBuffer
@@ -32,7 +31,6 @@ from mminf.utils.ipc_format import (
 from mminf.worker.engine_manager import EngineManager
 from mminf.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mminf.worker.node_manager_utils import (
-    NodeAndGraphWalk,
     NodeOutputRouting,
     WorkerGraphQueues,
     WorkerGraphsManager,
@@ -388,7 +386,7 @@ class Worker:
             self.tensor_manager.set_persist(
                 body.request_id, uuid, persist=False
             )
-    
+
     def _stop_loops(self, body: StopLoops):
         if not self.worker_graphs_manager.has_partition(
             body.request_id, body.partition_name
@@ -532,7 +530,7 @@ class Worker:
         ar_engine = self.engine_manager.get_ar_engine()
         if ar_engine is None:
             return None
-        
+
         submod_mgmt = ar_engine.submodule_management[node_name]
         cache_mgmt = submod_mgmt.kv_management
         if cache_mgmt.cpu_page_pool is None:
@@ -592,7 +590,7 @@ class Worker:
         ar_engine = self.engine_manager.get_ar_engine()
         if ar_engine is None:
             return False
-        
+
         submod_mgmt = ar_engine.submodule_management[node_name]
         cache_mgmt = submod_mgmt.kv_management
         if cache_mgmt.cpu_page_pool is None:
@@ -705,7 +703,7 @@ class Worker:
                 tensors=request_output_tensors,
                 graph_edges=filtered_outputs
             )
-            
+
             worker_graph_id = self.worker_graphs_manager.get_worker_graph_id_for_node(
                 request_id, node_name=node.name
             )
@@ -723,7 +721,7 @@ class Worker:
                     self.tensor_manager.dereference(request_id, info.uuid)
 
         return output_edges
-        
+
 
     def _register_outputs(
         self,
@@ -736,7 +734,7 @@ class Worker:
         For outputs staying local: store tensors in tensor_manager.
         Returns the output edges per request (with tensor_info filled in).
         """
-        for request_id, node in batch.node_objects.items():
+        for request_id, _node in batch.node_objects.items():
             routing = routing_per_request[request_id]
             uuids = set()
             for edge in (
@@ -1002,7 +1000,7 @@ class Worker:
                     self._last_active[(rid, batch.node_name)] = now
 
                 for rid, req_info in node_batch.per_request_info.items():
-                    if req_info.dynamic_loop_stop_signals:                        
+                    if req_info.dynamic_loop_stop_signals:
                         self.worker_graphs_manager.stop_loops(
                             rid, partition=batch_partition,
                             loop_names=req_info.dynamic_loop_stop_signals,
@@ -1048,7 +1046,7 @@ class Worker:
                     batch, output=output,
                     filtered_outputs_per_request=filtered_outputs_per_request
                 )
-                
+
                 routing_per_request: dict[str, NodeOutputRouting] = {}
                 for request_id in batch.node_objects:
                     routing = self.worker_graphs_manager.process_node_outputs(
@@ -1121,7 +1119,7 @@ class Worker:
                         [t.flatten() for _, _, t in collected]
                     ).cpu().tolist()
                     off = 0
-                    for (rid, sig_name, _), n in zip(collected, lengths):
+                    for (rid, sig_name, _), n in zip(collected, lengths, strict=True):
                         rid_map = prematerialized_per_rid.setdefault(rid, {})
                         rid_map.setdefault(sig_name, []).extend(flat[off:off + n])
                         off += n
@@ -1136,7 +1134,7 @@ class Worker:
                         ),
                     )
 
-                for rid, req_info in node_batch.per_request_info.items():
+                for _rid, req_info in node_batch.per_request_info.items():
                     req_info.dynamic_loop_stop_signals.clear()
                 if self.enable_nvtx:
                     range_pop(synchronize=True)
