@@ -39,20 +39,20 @@ class Sampler:
     def add_request(self, request_id: str):
         self._sampling_config[request_id] = SamplingConfig()
         # lazy init _seen_token_mask, taking vocab size from logits
-    
+
     def remove_request(self, request_id: str):
         if request_id in self._sampling_config:
             del self._sampling_config[request_id]
         if request_id in self._seen_token_mask:
             del self._seen_token_mask[request_id]
-    
+
     def set_config(self, request_id: str, **kwargs):
         curr_config = asdict(self._sampling_config[request_id])
         kwargs = {k: arg for k, arg in kwargs.items() if k in curr_config.keys()}
         self._sampling_config[request_id] = SamplingConfig(**{
             **curr_config, **kwargs
         })
-    
+
     def sample(
         self, request_ids: list[str], logits: torch.Tensor
     ) -> dict[str, torch.Tensor]:

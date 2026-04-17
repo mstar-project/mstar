@@ -54,6 +54,17 @@ class EngineManager:
         for engine_type_str, node_names in type_to_nodes.items():
             engine_cls = ENGINE_TYPE_TO_CLASS[engine_type_str]
 
+            # Resolve autocast dtype: explicit YAML config wins; otherwise we
+            # fall back to the Model's own preference (so models that need to
+            # match a reference numerically can override get_autocast_dtype
+            # without forcing every config file to set the same value).
+            if "autocast_dtype" in model_config:
+                autocast_dtype = model_config["autocast_dtype"]
+            elif model is not None:
+                autocast_dtype = model.get_autocast_dtype()
+            else:
+                autocast_dtype = torch.bfloat16
+
             engine = engine_cls(
                 autocast_dtype=model.get_autocast_dtype(),
                 enable_nvtx=enable_nvtx,

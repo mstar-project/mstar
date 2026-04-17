@@ -29,7 +29,7 @@ from mminf.model.registry import HF_MODELS
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({"text", "image", "audio", "video"})
+SUPPORTED_MODALITIES = frozenset({"text", "image", "audio", "video", "action"})
 
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
@@ -221,12 +221,17 @@ class APIServer:
         output_modalities: list[str],
         model_kwargs: dict | None = None,
         streaming: bool = True,
+        request_id: str | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
-        Returns the ``request_id``.
+        Returns the ``request_id``. If a ``request_id`` is provided by the
+        caller it is used as-is (useful for deterministic-noise debugging,
+        since the conductor's per-request seed is derived from
+        ``hash(request_id)``); otherwise a fresh uuid4 is generated.
         """
-        request_id = str(uuid.uuid4())
+        if request_id is None:
+            request_id = str(uuid.uuid4())
 
         for m in input_modalities + output_modalities:
             if m not in SUPPORTED_MODALITIES:
@@ -443,6 +448,7 @@ async def generate(
     output_modalities: str = Form("text"),
     streaming: bool = Form(True),
     model_kwargs: Optional[str] = Form(None),
+    request_id: Optional[str] = Form(None),
 ):
     """Submit a multimodal generation request.
 
@@ -456,6 +462,10 @@ async def generate(
             (default ``"text"``).
         streaming: If ``True``, return an NDJSON stream of result chunks.
         model_kwargs: Optional JSON string of model-specific parameters.
+        request_id: Optional client-supplied request id. When omitted, the
+            server generates a fresh uuid4. Pinning this is useful for
+            deterministic-noise debugging because the conductor seeds its
+            per-request RNG via ``hash(request_id)``.
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
@@ -497,6 +507,7 @@ async def generate(
             output_modalities=out_mods,
             model_kwargs=parsed_kwargs,
             streaming=streaming,
+            request_id=request_id,
         )
 
         if streaming:

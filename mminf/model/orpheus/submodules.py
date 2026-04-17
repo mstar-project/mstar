@@ -8,7 +8,6 @@ from mminf.engine.ar_engine import BatchedCacheManager
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.model.base import NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
-from mminf.utils.sampling import Sampler
 
 logger = logging.getLogger(__name__)
 

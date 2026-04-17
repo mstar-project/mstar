@@ -66,7 +66,7 @@ class AREngine(BaseEngine):
         kv_cache_config: list[KVCacheConfig],
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
-        kv_cache_type=torch.bfloat16,
+        kv_cache_type=None,
     ) -> None:
         self.device = device
 

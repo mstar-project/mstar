@@ -1,0 +1,13 @@
+model: "pi05"
+max_seq_len: 2048
+
+node_groups:
+  - node_names:
+      - vit_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - LLM
+    ranks:
+      - 0
