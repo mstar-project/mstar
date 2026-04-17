@@ -1,9 +1,12 @@
 import logging
+import queue as _queue
+import threading
 import time as _time
 from enum import Enum
 from time import sleep
 
 import torch
+import zmq
 
 from mminf.api_server.request_types import APIServerMessage, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
@@ -43,6 +46,60 @@ class EvictionPolicy(Enum):
     """Strategy for choosing which request to offload to CPU on OOM."""
     LRU = "lru"              # least-recently-used (by execution time)
     MOST_PAGES = "most_pages"  # request holding the most GPU pages
+
+
+class _InboxPoller(threading.Thread):
+    """Phase-1 of the async worker redesign (see ASYNC_REDESIGN.md).
+
+    Daemon thread that drains the worker's ZMQ PULL socket into a
+    thread-safe queue, so the main worker loop never blocks on I/O or
+    pickle work. Uses `zmq.Poller` with a short timeout so shutdown is
+    detected within `poll_timeout_ms` without resorting to busy-wait.
+    """
+
+    def __init__(
+        self,
+        communicator: ZMQCommunicator,
+        name: str,
+        poll_timeout_ms: int = 50,
+    ):
+        super().__init__(daemon=True, name=name)
+        self._communicator = communicator
+        self._inbox: _queue.Queue = _queue.Queue()
+        self._stop = threading.Event()
+        self._poll_timeout_ms = poll_timeout_ms
+        self._poller = zmq.Poller()
+        self._poller.register(communicator.pull_socket, zmq.POLLIN)
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                ready = self._poller.poll(timeout=self._poll_timeout_ms)
+            except zmq.ZMQError:
+                # Context was terminated (e.g. by Worker shutdown) — exit.
+                break
+            if not ready:
+                continue
+            try:
+                msgs = self._communicator.get_all_new_messages()
+            except Exception:
+                logger.exception("InboxPoller: error while draining socket")
+                continue
+            for msg in msgs:
+                self._inbox.put(msg)
+
+    def drain(self) -> list:
+        """Return all currently-queued messages without blocking."""
+        out: list = []
+        try:
+            while True:
+                out.append(self._inbox.get_nowait())
+        except _queue.Empty:
+            pass
+        return out
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 class Worker:
@@ -92,6 +149,14 @@ class Worker:
             push_ids=worker_ids + ["conductor", "api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
         )
+        # Phase 1 of the async-worker redesign: drain the PULL socket from
+        # a daemon thread so the main loop's `worker.process_messages`
+        # region does not pay ZMQ recv + unpickle cost on the critical path.
+        self._inbox_poller = _InboxPoller(
+            communicator=self.communicator,
+            name=f"mminf-worker-{worker_id}-inbox",
+        )
+        self._inbox_poller.start()
         self.tensor_manager = create_tensor_communication_manager(
             protocol=tensor_comm_protocol,
             my_entity_id=worker_id,
@@ -437,7 +502,7 @@ class Worker:
                 self._stop_loops(message.body)
 
     def _process_messages(self) -> None:
-        self._process_message_list(self.communicator.get_all_new_messages())
+        self._process_message_list(self._inbox_poller.drain())
 
     # ------------------------------------------------------------------
     # Tensor readiness
