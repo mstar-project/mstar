@@ -202,6 +202,14 @@ class Sampler:
     # per request
     _sampling_config: dict[str, SamplingConfig] = field(default_factory=dict)
     _seen_token_mask: dict[str, torch.Tensor]= field(default_factory=dict)
+    # Phase-4 of the async-worker redesign (see worker/ASYNC_REDESIGN.md).
+    # When repetition_penalty is active, the post-sample scatter that marks
+    # each newly-sampled token as "seen" in the per-rid mask is issued on a
+    # side CUDA stream. `_scatter_event` records its completion so the next
+    # sample() call that needs to stack seen_masks can wait on it through
+    # `stream.wait_event` instead of blocking the main stream.
+    _scatter_stream: torch.cuda.Stream | None = field(default=None, init=False)
+    _scatter_event: torch.cuda.Event | None = field(default=None, init=False)
 
     def add_request(self, request_id: str):
         self._sampling_config[request_id] = SamplingConfig()
@@ -244,6 +252,12 @@ class Sampler:
         # repetition penalty active — otherwise sample_tokens ignores it.
         seen_mask = None
         if any_rep_pen:
+            # Before we stack the per-rid masks, make sure the previous
+            # step's side-stream scatter (see below) has committed — else
+            # the stack would read stale data on the main stream.
+            if self._scatter_event is not None:
+                torch.cuda.current_stream().wait_event(self._scatter_event)
+                self._scatter_event = None
             for rid in request_ids:
                 if rid not in self._seen_token_mask:
                     self._seen_token_mask[rid] = torch.zeros(
@@ -265,20 +279,26 @@ class Sampler:
             all_top_k_zero=all_top_k_zero,
         )
 
-        # TODO: make this scatter async. Currently runs 2 kernels per rid
-        # (broadcast-True + index_put) on the default stream, serializing N=bs
-        # small launches that add up (~500 µs at bs=8 for Orpheus with
-        # repetition_penalty=1.3). Two options to fix:
-        #   (a) Shared [max_concurrent, V] buffer with rid→slot mapping; replace
-        #       the loop with a single batched `buf[slots, tokens] = True`
-        #       scatter — one launch instead of N.
-        #   (b) Issue the updates on a side CUDA stream so the main stream
-        #       (next prefill/decode) doesn't wait. The next sample() for the
-        #       same rid would need to sync, but amortized over a full
-        #       generation this is cheap.
+        # Phase-4: issue the per-rid seen-token scatter on a side CUDA
+        # stream so it runs concurrently with whatever the main stream does
+        # next (typically the next decode step's planning kernels + CUDA
+        # graph replay). The next sample() call that needs to stack these
+        # masks waits on `_scatter_event` at the top of its any_rep_pen
+        # block — same effective ordering, but the 2×N small kernels
+        # (broadcast-True + index_put, one pair per rid) are off the main
+        # critical path.
         if any_rep_pen:
-            for i, rid in enumerate(request_ids):
-                self._seen_token_mask[rid][tokens[i:i+1]] = True
+            if self._scatter_stream is None:
+                self._scatter_stream = torch.cuda.Stream(logits.device)
+            # The side stream must not begin scattering until the sample
+            # kernel that produced `tokens` is visible.
+            self._scatter_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._scatter_stream):
+                for i, rid in enumerate(request_ids):
+                    self._seen_token_mask[rid][tokens[i:i+1]] = True
+            event = torch.cuda.Event()
+            event.record(self._scatter_stream)
+            self._scatter_event = event
 
         return tokens
 
