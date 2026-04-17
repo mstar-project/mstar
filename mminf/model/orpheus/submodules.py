@@ -1,4 +1,3 @@
-import bisect
 import logging
 
 import torch
@@ -7,144 +6,12 @@ from torch import nn
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.ar_engine import BatchedCacheManager
-from mminf.engine.cuda_graph_runner import CudaGraphConfig
+from mminf.engine.cuda_graph_runner import CodecCudaGraphRunner, CudaGraphConfig
 from mminf.model.base import NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
-
-
-class SNACCudaGraphRunner:
-    """CUDA graph capture/replay for the SNAC decoder.
-
-    Captures separate graphs per batch size. All captures assume
-    the standard streaming window of ``num_frames`` frames (typically 1)
-    so the time dimension is fixed.
-
-    Warmup flow:
-        For each batch size (largest first for memory-pool reuse):
-            1. Create static input code buffers [codes_0, codes_1, codes_2]
-            2. Run 2 warmup passes
-            3. Capture the graph
-
-    Runtime flow:
-        1. Pad batch to next captured size
-        2. Copy real codes into static buffers
-        3. graph.replay()
-        4. Clone & slice outputs for real batch size
-    """
-
-    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
-
-    def __init__(
-        self,
-        snac_model: nn.Module,
-        config: OrpheusModelConfig,
-        device: torch.device,
-    ):
-        self.snac_model = snac_model
-        self.config = config
-        self.device = device
-
-        # num_windows for standard streaming window: _tokens_to_codes pads to
-        # multiples of 28 then does view(-1, 4, 7), so the first dim is
-        # num_tokens / 28. For the standard 28-token window, this is 1.
-        self.num_frames = config.snac_window_tokens // (4 * config.tokens_per_frame)
-
-        # Keyed by padded batch size
-        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
-        self.static_codes: dict[int, list[torch.Tensor]] = {}  # [codes_0, codes_1, codes_2]
-        self.static_outputs: dict[int, torch.Tensor] = {}
-        self.memory_pool = None
-
-    def warmup_and_capture(self) -> None:
-        if not torch.cuda.is_available():
-            return
-
-        self.memory_pool = torch.cuda.graphs.graph_pool_handle()
-        N = self.num_frames  # frames per request
-
-        for bs in reversed(self.CAPTURE_BATCH_SIZES):
-            try:
-                self._capture_one(bs, N)
-                logger.info(
-                    "Captured SNAC CUDA graph: bs=%d, frames=%d", bs, N,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to capture SNAC CUDA graph: bs=%d",
-                    bs, exc_info=True,
-                )
-
-    def _capture_one(self, bs: int, num_frames: int) -> None:
-        # Static input buffers — code shapes for num_frames frames
-        codes_0 = torch.zeros(bs, num_frames * 4, dtype=torch.long, device=self.device)
-        codes_1 = torch.zeros(bs, num_frames * 8, dtype=torch.long, device=self.device)
-        codes_2 = torch.zeros(bs, num_frames * 16, dtype=torch.long, device=self.device)
-
-        torch.cuda.synchronize()
-        # Warmup
-        for _ in range(2):
-            self.snac_model.decode([codes_0, codes_1, codes_2])
-        torch.cuda.synchronize()
-
-        # Capture
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.memory_pool):
-            static_output = self.snac_model.decode([codes_0, codes_1, codes_2])
-        torch.cuda.synchronize()
-
-        self.graphs[bs] = graph
-        self.static_codes[bs] = [codes_0, codes_1, codes_2]
-        self.static_outputs[bs] = static_output
-
-    def can_run(self, batch_size: int, num_frames: int) -> bool:
-        """Check if we have a captured graph for this configuration."""
-        if not self.graphs:
-            return False
-        if num_frames != self.num_frames:
-            return False
-        padded = self._get_padded_bs(batch_size)
-        return padded is not None and padded in self.graphs
-
-    def _get_padded_bs(self, batch_size: int) -> int | None:
-        idx = bisect.bisect_left(self.CAPTURE_BATCH_SIZES, batch_size)
-        if idx >= len(self.CAPTURE_BATCH_SIZES):
-            return None
-        return self.CAPTURE_BATCH_SIZES[idx]
-
-    def run(
-        self,
-        codes_0: torch.Tensor,
-        codes_1: torch.Tensor,
-        codes_2: torch.Tensor,
-        actual_bs: int,
-    ) -> torch.Tensor:
-        """Replay a captured CUDA graph.
-
-        Args:
-            codes_0/1/2: real code tensors of shape ``(actual_bs, T_i)``.
-            actual_bs: number of real requests in the batch.
-
-        Returns:
-            Audio output tensor of shape ``(actual_bs, 1, audio_len)``.
-        """
-        padded_bs = self._get_padded_bs(actual_bs)
-        static_c0, static_c1, static_c2 = self.static_codes[padded_bs]
-
-        # Zero then copy real codes into static buffers
-        static_c0.zero_()
-        static_c1.zero_()
-        static_c2.zero_()
-        static_c0[:actual_bs].copy_(codes_0)
-        static_c1[:actual_bs].copy_(codes_1)
-        static_c2[:actual_bs].copy_(codes_2)
-
-        self.graphs[padded_bs].replay()
-
-        # Return only the real batch slice, cloned to detach from static buffer
-        return self.static_outputs[padded_bs][:actual_bs].clone()
 
 
 class OrpheusLLMSubmodule(NodeSubmodule):
@@ -329,7 +196,56 @@ class SNACDecoderSubmodule(NodeSubmodule):
         self.idx_14 = torch.tensor([1, 4], dtype=torch.long, device=device)
         self.idx_2356 = torch.tensor([2, 3, 5, 6], dtype=torch.long, device=device)
         self.config = config
-        self.cuda_graph_runner: SNACCudaGraphRunner | None = None
+        self.cuda_graph_runner: CodecCudaGraphRunner | None = None
+
+    # _tokens_to_codes pads to multiples of 28 tokens then reshapes to
+    # (N_frames, 4, 7); for a single streaming window this is 1 frame.
+    @property
+    def _num_frames(self) -> int:
+        return self.config.snac_window_tokens // (4 * self.config.tokens_per_frame)
+
+    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+        """Declare the SNAC decode capture.
+
+        The captured region spans ``snac_model.decode`` + middle-region
+        slicing + int16 conversion (all pointwise / fixed-shape ops), so
+        replay returns an already-int16 [bs, 1, slice_len] tensor that
+        forward_batched just splits per-request. Non-CUDA-graph work
+        (tokens → codes, per-request splitting) lives in forward_batched.
+        """
+        n_frames = self._num_frames
+        dummy = [{
+            "codes_0": [torch.zeros(1, n_frames * 4, dtype=torch.long, device=device)],
+            "codes_1": [torch.zeros(1, n_frames * 8, dtype=torch.long, device=device)],
+            "codes_2": [torch.zeros(1, n_frames * 16, dtype=torch.long, device=device)],
+        }]
+        return [
+            CudaGraphConfig(
+                graph_walk="snac_chunk",
+                dummy_capture_inputs=dummy,
+                capture_batch_sizes=[1, 2, 4, 8, 16],
+            ),
+        ]
+
+    def cuda_graph_forward(
+        self,
+        codes_0: torch.Tensor,
+        codes_1: torch.Tensor,
+        codes_2: torch.Tensor,
+    ) -> torch.Tensor:
+        """SNAC decode + middle-region slice + int16 conversion.
+
+        Called both from the captured CUDA graph (via CodecCudaGraphRunner)
+        and from the eager fallback in forward_batched. All ops are
+        pointwise / fixed-shape so the whole thing is graphable.
+
+        Returns audio int16 tensor of shape [bs, 1, slice_len].
+        """
+        audio_hat = self.snac_model.decode([codes_0, codes_1, codes_2])
+        audio_slice = audio_hat[
+            :, :, self.config.snac_audio_slice_start:self.config.snac_audio_slice_end,
+        ]
+        return (audio_slice.clamp(-1, 1) * 32767).to(torch.int16)
 
     def _tokens_to_codes(self, tokens: torch.Tensor) -> torch.Tensor:
         """Pad raw token IDs to a multiple of 28 and convert to SNAC codes.
@@ -432,20 +348,26 @@ class SNACDecoderSubmodule(NodeSubmodule):
         codes_1 = codes_1.reshape(B, N * 8)
         codes_2 = codes_2.reshape(B, N * 16)
 
-        # CUDA graph path or eager decode
+        # CUDA graph path or eager decode. cuda_graph_forward does decode +
+        # slice + int16 conversion (all graphable); the only non-graph work
+        # left is the per-request dict split below.
         runner = self.cuda_graph_runner
-        if runner is not None and runner.can_run(B, N):
+        if (
+            N == self._num_frames
+            and runner is not None
+            and runner.can_run(B, graph_walk="snac_chunk")
+        ):
             range_push("snac.cuda_graph_replay")
-            audio_hat = runner.run(codes_0, codes_1, codes_2, actual_bs=B)
+            audio_int16 = runner.run(
+                graph_walk="snac_chunk",
+                actual_bs=B,
+                inputs={"codes_0": codes_0, "codes_1": codes_1, "codes_2": codes_2},
+            )
             range_pop()
         else:
             range_push("snac.eager_decode")
-            audio_hat = self.snac_model.decode([codes_0, codes_1, codes_2])
+            audio_int16 = self.cuda_graph_forward(codes_0, codes_1, codes_2)
             range_pop()
-
-        # Slice middle region and convert to int16 per request
-        audio_slice = audio_hat[:, :, self.config.snac_audio_slice_start:self.config.snac_audio_slice_end]
-        audio_int16 = (audio_slice.clamp(-1, 1) * 32767).to(torch.int16)
 
         outputs = {}
         for i, rid in enumerate(request_ids):

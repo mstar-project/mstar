@@ -144,27 +144,35 @@ class AudioCodecEngine(BaseEngine):
         return NodeOutput(per_request_output_tensors=outputs)
 
     def warmup(self) -> None:
-        """Capture CUDA graphs for submodules that support it."""
+        """Capture CUDA graphs for submodules that support it.
+
+        Submodules that opt in expose:
+          - ``cuda_graph_runner`` attribute (set to the captured runner here)
+          - ``get_cuda_graph_configs(device)`` returning at least one config
+          - ``cuda_graph_forward(**static_inputs)`` that the runner captures
+        """
         if not torch.cuda.is_available() or self.device is None:
             return
+
+        from mminf.engine.cuda_graph_runner import CodecCudaGraphRunner
 
         for node_name, submodule in self.submodules.items():
             if not hasattr(submodule, 'cuda_graph_runner'):
                 continue
+            if not hasattr(submodule, 'get_cuda_graph_configs'):
+                continue
 
-            # Import here to avoid circular deps; only SNAC uses this today
-            from mminf.model.orpheus.submodules import SNACCudaGraphRunner
-
-            runner = SNACCudaGraphRunner(
-                snac_model=submodule.snac_model,
-                config=submodule.config,
+            runner = CodecCudaGraphRunner(
+                submodule_name=node_name,
+                submodule=submodule,
                 device=self.device,
             )
+            runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()
             if runner.graphs:
                 submodule.cuda_graph_runner = runner
                 logger.info(
-                    "AudioCodecEngine: CUDA graphs captured for %s (%d batch sizes)",
+                    "AudioCodecEngine: CUDA graphs captured for %s (%d graphs)",
                     node_name, len(runner.graphs),
                 )
 
