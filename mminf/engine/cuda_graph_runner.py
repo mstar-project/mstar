@@ -23,7 +23,6 @@ import torch
 from torch import nn
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
-from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
 from mminf.utils.profiler import range_pop, range_push
@@ -861,40 +860,44 @@ class CodecCudaGraphRunner:
             return False
         return (graph_walk, padded) in self.graphs
 
-    def run(self, batch: "NodeBatch") -> dict[str, dict[str, list[torch.Tensor]]]:
+    def run(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        per_request_inputs: list[dict],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        submodule: nn.Module,
+    ) -> dict[str, dict[str, list[torch.Tensor]]]:
         """End-to-end replay: preprocess + replay + per-rid output split.
 
-        Mirrors ``AREngine._execute_with_cuda_graph`` / ``CudaGraphRunner.run``:
-        orchestration lives in the runner so the engine only has to pick
-        between cuda_graph / batched / sequential paths.
+        Argument shape matches ``CudaGraphRunner.run`` (AR) so the two
+        runners present the same interface to their engines. ``submodule``
+        is passed in at call time (rather than taken from ``self.submodule``)
+        for the same reason AR does it — keeps the runtime call site
+        self-contained and mirrors AR's contract exactly.
 
-        Raises ``CodecGraphNotApplicableError`` when the submodule's preprocess
-        returns an empty dict (e.g. SNAC frame-count mismatch), so the engine
-        can transparently fall back to the eager batched path.
+        Raises ``CodecGraphNotApplicableError`` when preprocess returns
+        an empty dict (e.g. SNAC frame-count mismatch), so the engine can
+        transparently fall back to the eager batched path.
         """
-        request_ids = list(batch.request_ids)
         actual_bs = len(request_ids)
-        padded_bs = self._get_padded_batch_size(actual_bs, batch.graph_walk)
+        padded_bs = self._get_padded_batch_size(actual_bs, graph_walk)
         if padded_bs is None:
             raise RuntimeError(
-                f"{self.submodule_name}: no captured graph for walk={batch.graph_walk!r}, "
+                f"{self.submodule_name}: no captured graph for walk={graph_walk!r}, "
                 f"actual_bs={actual_bs}"
             )
-        key = (batch.graph_walk, padded_bs)
+        key = (graph_walk, padded_bs)
         static_inputs = self.static_inputs[key]
         static_output = self.static_outputs[key]
 
-        per_request_inputs = [
-            batch.per_request_input_tensors.get(rid, {}) for rid in request_ids
-        ]
-
         if self.enable_nvtx:
             range_push("codec_cg.preprocess", synchronize=True)
-        packed = self.submodule.preprocess(
-            graph_walk=batch.graph_walk,
+        packed = submodule.preprocess(
+            graph_walk=graph_walk,
             per_request_inputs=per_request_inputs,
             request_ids=request_ids,
-            per_request_info=batch.per_request_info,
+            per_request_info=per_request_info,
         )
         if self.enable_nvtx:
             range_pop(synchronize=True)

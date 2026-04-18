@@ -104,9 +104,18 @@ class AudioCodecEngine(BaseEngine):
         per-rid split; we only attach streaming buffers and wrap the result.
         """
         self._inject_streaming_buffers(batch)
+        per_request_inputs = [
+            batch.per_request_input_tensors.get(rid, {}) for rid in batch.request_ids
+        ]
         if self.enable_nvtx:
             range_push("codec.cuda_graph.run")
-        per_rid = submodule.cuda_graph_runner.run(batch)
+        per_rid = submodule.cuda_graph_runner.run(
+            graph_walk=batch.graph_walk,
+            request_ids=batch.request_ids,
+            per_request_inputs=per_request_inputs,
+            per_request_info=batch.per_request_info,
+            submodule=submodule,
+        )
         if self.enable_nvtx:
             range_pop()
         return NodeOutput(per_request_output_tensors=per_rid)
