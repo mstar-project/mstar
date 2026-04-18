@@ -94,18 +94,7 @@ class Benchmark:
         os.makedirs(output_dir, exist_ok=True)
         saved = 0
         for m in metrics:
-            if m.output_content is None:
-                continue
-            if isinstance(m.output_content, str):
-                path = os.path.join(output_dir, f"req_{m.request_id}.txt")
-                with open(path, "w") as f:
-                    f.write(m.output_content)
-            elif isinstance(m.output_content, bytes):
-                path = os.path.join(output_dir, f"req_{m.request_id}.png")
-                with open(path, "wb") as f:
-                    f.write(m.output_content)
-            saved += 1
-
+            saved += m.write_files(output_dir)
         if saved:
             print(f"\nSaved {saved} outputs to {output_dir}/")
 
