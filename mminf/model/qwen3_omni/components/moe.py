@@ -11,8 +11,10 @@ Provides three modules:
 
 Expert weights use fused Parameters matching the HF checkpoint layout
 (``experts.gate_up_proj``, ``experts.down_proj``) rather than per-expert
-``nn.Linear`` modules.  Dispatch uses a naive PyTorch expert loop that
-will be replaced with fused kernels in Phase 3.
+``nn.Linear`` modules.  When the optional ``sgl-kernel`` dependency is
+installed and inputs are on CUDA, dispatch goes through the Triton
+fused-MoE kernel in :mod:`.fused_moe`; otherwise it falls back to the
+naive per-expert loop in :func:`_dispatch_experts_fused`.
 
 Reference
 ---------
@@ -28,9 +30,23 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+# Optional fused Triton MoE path.  Imports succeed only on CUDA boxes
+# with sgl-kernel installed; any import failure (including the final
+# moe_align_block_size call) is treated as "fused path unavailable".
+try:
+    from mminf.model.qwen3_omni.components.fused_moe import fused_experts as _fused_experts
+    from mminf.model.qwen3_omni.components.fused_moe.align import has_sgl_kernel
+
+    _HAS_FUSED = has_sgl_kernel()
+except Exception:  # pragma: no cover -- exercised only when optional dep missing
+    _fused_experts = None
+    _HAS_FUSED = False
+
+
 # -----------------------------------------------------------------------
 # SwiGLU MLP  (used as individual experts AND as dense MLP)
 # -----------------------------------------------------------------------
+
 
 class Qwen3OmniMLP(nn.Module):
     """SwiGLU feedforward: ``down(silu(gate(x)) * up(x))``.
@@ -81,6 +97,7 @@ class Qwen3OmniMLP(nn.Module):
 # Top-K Router
 # -----------------------------------------------------------------------
 
+
 class _TopKRouter(nn.Module):
     """Softmax top-k router shared by Thinker and Talker MoE blocks.
 
@@ -110,9 +127,7 @@ class _TopKRouter(nn.Module):
         self.norm_topk_prob = norm_topk_prob
         self.weight = nn.Parameter(torch.zeros(num_experts, hidden_size))
 
-    def forward(
-        self, hidden_states: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Parameters
         ----------
@@ -133,14 +148,10 @@ class _TopKRouter(nn.Module):
         router_logits = F.softmax(router_logits, dtype=torch.float, dim=-1)
 
         # Top-k selection
-        router_top_value, router_indices = torch.topk(
-            router_logits, self.top_k, dim=-1
-        )
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
 
         if self.norm_topk_prob:
-            router_top_value = router_top_value / router_top_value.sum(
-                dim=-1, keepdim=True
-            )
+            router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
 
         routing_weights = router_top_value.to(router_logits.dtype)
         return router_logits, routing_weights, router_indices
@@ -149,6 +160,7 @@ class _TopKRouter(nn.Module):
 # -----------------------------------------------------------------------
 # Naive expert dispatch  (loop over active experts -- fused weight format)
 # -----------------------------------------------------------------------
+
 
 def _dispatch_experts_fused(
     hidden_states: torch.Tensor,
@@ -183,9 +195,7 @@ def _dispatch_experts_fused(
 
     # Build a mask: (num_experts, top_k, tokens) -- one-hot over expert dim
     with torch.no_grad():
-        expert_mask = F.one_hot(
-            selected_experts, num_classes=num_experts
-        )  # (tokens, top_k, num_experts)
+        expert_mask = F.one_hot(selected_experts, num_classes=num_experts)  # (tokens, top_k, num_experts)
         expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, tokens)
         # Identify which experts are actually used
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -202,12 +212,8 @@ def _dispatch_experts_fused(
         # SwiGLU + down projection: [tokens, hidden]
         current_hidden_states = torch.mm(F.silu(gate) * up, down_proj[expert_idx].T)
 
-        current_hidden_states = (
-            current_hidden_states * routing_weights[token_idx, top_k_pos, None]
-        )
-        final_hidden_states.index_add_(
-            0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
-        )
+        current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
+        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
     return final_hidden_states
 
@@ -215,6 +221,7 @@ def _dispatch_experts_fused(
 # -----------------------------------------------------------------------
 # Thinker MoE  (no shared expert)
 # -----------------------------------------------------------------------
+
 
 class Qwen3OmniSparseMoeBlock(nn.Module):
     """Top-K Sparse MoE block for the Qwen3-Omni **Thinker** text backbone.
@@ -262,16 +269,10 @@ class Qwen3OmniSparseMoeBlock(nn.Module):
 
         # Fused expert weights matching HF checkpoint layout
         self.experts = nn.Module()
-        self.experts.gate_up_proj = nn.Parameter(
-            torch.empty(num_experts, 2 * moe_intermediate_size, hidden_size)
-        )
-        self.experts.down_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_size, moe_intermediate_size)
-        )
+        self.experts.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * moe_intermediate_size, hidden_size))
+        self.experts.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, moe_intermediate_size))
 
-    def forward(
-        self, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -285,18 +286,27 @@ class Qwen3OmniSparseMoeBlock(nn.Module):
         """
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
-        hidden_states_flat = hidden_states.view(-1, hidden_dim)
+        hidden_states_flat = hidden_states.view(-1, hidden_dim).contiguous()
 
         _, routing_weights, selected_experts = self.gate(hidden_states_flat)
 
-        final = _dispatch_experts_fused(
-            hidden_states_flat,
-            self.experts.gate_up_proj,
-            self.experts.down_proj,
-            self.num_experts,
-            selected_experts,
-            routing_weights,
-        )
+        if _HAS_FUSED and hidden_states_flat.is_cuda:
+            final = _fused_experts(
+                hidden_states_flat,
+                self.experts.gate_up_proj,
+                self.experts.down_proj,
+                routing_weights,
+                selected_experts,
+            )
+        else:
+            final = _dispatch_experts_fused(
+                hidden_states_flat,
+                self.experts.gate_up_proj,
+                self.experts.down_proj,
+                self.num_experts,
+                selected_experts,
+                routing_weights,
+            )
 
         return final.view(input_shape)
 
@@ -304,6 +314,7 @@ class Qwen3OmniSparseMoeBlock(nn.Module):
 # -----------------------------------------------------------------------
 # Talker MoE  (with shared expert + sigmoid gate)
 # -----------------------------------------------------------------------
+
 
 class Qwen3OmniTalkerSparseMoeBlock(nn.Module):
     """Top-K Sparse MoE block for the Qwen3-Omni **Talker** text backbone.
@@ -364,12 +375,8 @@ class Qwen3OmniTalkerSparseMoeBlock(nn.Module):
             norm_topk_prob=norm_topk_prob,
         )
         self.experts = nn.Module()
-        self.experts.gate_up_proj = nn.Parameter(
-            torch.empty(num_experts, 2 * moe_intermediate_size, hidden_size)
-        )
-        self.experts.down_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_size, moe_intermediate_size)
-        )
+        self.experts.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * moe_intermediate_size, hidden_size))
+        self.experts.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, moe_intermediate_size))
 
         # Shared expert (dense format, not fused)
         self.shared_expert = Qwen3OmniMLP(
@@ -378,9 +385,7 @@ class Qwen3OmniTalkerSparseMoeBlock(nn.Module):
         )
         self.shared_expert_gate = nn.Linear(hidden_size, 1, bias=False)
 
-    def forward(
-        self, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -394,26 +399,33 @@ class Qwen3OmniTalkerSparseMoeBlock(nn.Module):
         """
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
-        hidden_states_flat = hidden_states.view(-1, hidden_dim)
+        hidden_states_flat = hidden_states.view(-1, hidden_dim).contiguous()
 
         # Shared expert -- applied to ALL tokens
         shared_output = self.shared_expert(hidden_states_flat)
 
         # Routed experts -- top-k dispatch
         _, routing_weights, selected_experts = self.gate(hidden_states_flat)
-        routed_output = _dispatch_experts_fused(
-            hidden_states_flat,
-            self.experts.gate_up_proj,
-            self.experts.down_proj,
-            self.num_experts,
-            selected_experts,
-            routing_weights,
-        )
+        if _HAS_FUSED and hidden_states_flat.is_cuda:
+            routed_output = _fused_experts(
+                hidden_states_flat,
+                self.experts.gate_up_proj,
+                self.experts.down_proj,
+                routing_weights,
+                selected_experts,
+            )
+        else:
+            routed_output = _dispatch_experts_fused(
+                hidden_states_flat,
+                self.experts.gate_up_proj,
+                self.experts.down_proj,
+                self.num_experts,
+                selected_experts,
+                routing_weights,
+            )
 
         # Combine: routed + sigmoid-gated shared
-        shared_gate = torch.sigmoid(
-            self.shared_expert_gate(hidden_states_flat)
-        )
+        shared_gate = torch.sigmoid(self.shared_expert_gate(hidden_states_flat))
         combined = routed_output + shared_gate * shared_output
 
         return combined.view(input_shape)
