@@ -373,6 +373,7 @@ def sample_tokens(
             seen_mask=seen_token_mask,
             include_greedy=run_greedy,
         )
+        torch.cuda.current_stream().synchronize()
         result = flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
         return result[0] if isinstance(result, tuple) else result
 
