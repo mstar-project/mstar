@@ -1,16 +1,10 @@
-model: "vjepa2"
+model: "vjepa2_ac"
 max_seq_len: 16384
 
-# V-JEPA 2-AC: ViT-g encoder + action-conditioned predictor.
-# NOTE: AC weight loading from upstream ``.pt`` format is not yet wired in
-# — for now use skip_weight_loading=True and populate weights manually, or
-# wait for the follow-up loader.
-model_kwargs:
-  model_path_hf: "facebook/vjepa2-ac-vitg"
-  predictor_kind: "ac"
-  ac_predictor_config:
-    action_embed_dim: 7
-    use_extrinsics: false
+# Uses facebook/vjepa2-ac-vitg (from HF_MODELS["vjepa2_ac"] in
+# mminf/model/registry.py).  NOTE: AC checkpoint loading is deferred — for
+# now VJepa2ACModel instantiates with weights materialized but not filled;
+# populate them manually or pass skip_weight_loading=True and load yourself.
 
 node_groups:
   - node_names:
