@@ -266,9 +266,6 @@ class ThinkerSubmodule(NodeSubmodule):
         # Pre-compute inverse frequencies for 3D MRoPE
         self._inv_freq: torch.Tensor | None = None
 
-        # Per-request MRoPE position delta tracking
-        self._mrope_position_deltas: dict[str, torch.Tensor] = {}
-
     def _get_inv_freq(self, device: torch.device) -> torch.Tensor:
         """Lazy-initialize and cache inverse frequencies."""
         if self._inv_freq is None or self._inv_freq.device != device:
@@ -358,19 +355,14 @@ class ThinkerSubmodule(NodeSubmodule):
             # prefill graph walk is single-modality so we use the simple
             # per-modality helper instead of the full HF parser.
             #
-            # ``start_pos`` for the text prefill is picked up from the
-            # running per-request delta (0 on the very first walk).
-            delta = self._mrope_position_deltas.get(rid, torch.tensor(0.0))
-            start_pos = float(delta.item()) if delta.numel() > 0 else 0.0
+            # ``start_pos`` is the next MRoPE position for this request,
+            # carried forward across walks by ``state.position_id_start``
+            # (advanced post-forward by ``advance_seq_lens``).
+            state = cache_manager._get_state(rid, "main")
+            start_pos = float(state.position_id_start)
 
             pos_ids = get_rope_index_text(seq_len, start_pos, device)
             all_pos_ids_3d.append(pos_ids)
-
-            # Advance the per-request position delta so the next walk
-            # (audio / vision / decode) starts at the correct offset.
-            self._mrope_position_deltas[rid] = torch.tensor(
-                start_pos + seq_len, device=device
-            )
 
             masks_for_talker[rid] = torch.stack([
                 torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
@@ -381,9 +373,11 @@ class ThinkerSubmodule(NodeSubmodule):
         input_embeds = torch.cat(all_embeds, dim=0)
         position_ids_3d = torch.cat(all_pos_ids_3d, dim=1)  # (3, total_tokens)
 
-        # Compute cos/sin for 3D MRoPE
+        # Compute cos/sin for 3D MRoPE.  Returned as separate tensor keys
+        # (not a tuple) so the CUDA graph runner can detect them as static
+        # inputs and copy them into the captured buffers at replay.
         inv_freq = self._get_inv_freq(device)
-        cos_sin_3d = compute_3d_cos_sin(
+        cos_3d, sin_3d = compute_3d_cos_sin(
             position_ids_3d, inv_freq, mrope_section=self.MROPE_SECTION,
             target_dtype=input_embeds.dtype,
         )
@@ -396,7 +390,8 @@ class ThinkerSubmodule(NodeSubmodule):
 
         return {
             "input_embeds": input_embeds,
-            "cos_sin_3d": cos_sin_3d,
+            "cos_3d": cos_3d,
+            "sin_3d": sin_3d,
             "mrope_section": self.MROPE_SECTION,
             "seq_lens": seq_lens,
             "masks_for_talker": masks_for_talker
@@ -455,10 +450,11 @@ class ThinkerSubmodule(NodeSubmodule):
             total_len = audio_len + 2
             seq_lens.append(total_len)
 
-            # Use the position delta carried over from the text prefill
-            # as the starting offset.
-            delta = self._mrope_position_deltas.get(rid, torch.tensor(0.0))
-            start_pos = float(delta.item()) if delta.numel() > 0 else 0.0
+            # Use the position carried over from the previous walk as
+            # the starting offset (tracked via ``state.position_id_start``;
+            # advanced post-forward by ``advance_seq_lens``).
+            state = cache_manager._get_state(rid, "main")
+            start_pos = float(state.position_id_start)
 
             # Position IDs:
             #   - audio_start_token: text-like position at start_pos
@@ -480,17 +476,11 @@ class ThinkerSubmodule(NodeSubmodule):
             )
             all_pos_ids_3d.append(pos_ids)
 
-            # Update position delta for subsequent walks.  We advanced
-            # by ``2 + audio_len`` positions (BOS + frames + EOS).
-            self._mrope_position_deltas[rid] = torch.tensor(
-                start_pos + total_len, device=device
-            )
-
         input_embeds = torch.cat(all_embeds, dim=0)
         position_ids_3d = torch.cat(all_pos_ids_3d, dim=1)
 
         inv_freq = self._get_inv_freq(device)
-        cos_sin_3d = compute_3d_cos_sin(
+        cos_3d, sin_3d = compute_3d_cos_sin(
             position_ids_3d, inv_freq, mrope_section=self.MROPE_SECTION,
             target_dtype=input_embeds.dtype,
         )
@@ -502,7 +492,8 @@ class ThinkerSubmodule(NodeSubmodule):
 
         return {
             "input_embeds": input_embeds,
-            "cos_sin_3d": cos_sin_3d,
+            "cos_3d": cos_3d,
+            "sin_3d": sin_3d,
             "mrope_section": self.MROPE_SECTION,
             "seq_lens": seq_lens,
             "masks_for_talker": masks_for_talker
@@ -527,6 +518,13 @@ class ThinkerSubmodule(NodeSubmodule):
         all_embeds = []
         all_pos_ids_3d = []
         seq_lens = []
+        # Per-rid MRoPE-position advance for ``advance_seq_lens``.  Vision
+        # prefills span a non-contiguous 3D position range, so the next
+        # walk's MRoPE position is ``max(pos_ids) + 1``, which is generally
+        # larger than ``seq_len``.  Thread this through ``forward_batched``
+        # -> ``thinker.py`` so the post-forward advance lands on the right
+        # ``state.position_id_start``.
+        mrope_pos_advance: list[int] = []
         # first row: multimodal mask (ones except bos and eos)
         # second row: text inclusion mask (bos and eos)
         masks_for_talker = {}
@@ -568,8 +566,8 @@ class ThinkerSubmodule(NodeSubmodule):
             total_len = vision_len + 2
             seq_lens.append(total_len)
 
-            delta = self._mrope_position_deltas.get(rid, torch.tensor(0.0))
-            start_pos = float(delta.item()) if delta.numel() > 0 else 0.0
+            state = cache_manager._get_state(rid, "main")
+            start_pos = float(state.position_id_start)
 
             # Vision tokens use spatial 3D positions (temporal constant,
             # h/w from the spatial grid after merging).  If a proper
@@ -598,11 +596,13 @@ class ThinkerSubmodule(NodeSubmodule):
             )
             all_pos_ids_3d.append(pos_ids)
 
-            # Advance the per-request position delta by one past the
-            # EOS token.
-            self._mrope_position_deltas[rid] = torch.tensor(
-                end_pos_base + 1, device=device
-            )
+            # Next MRoPE position after this vision block is ``end_pos_base
+            # + 1`` (one past the EOS token).  ``advance_seq_lens`` by
+            # default advances ``position_id_start`` by ``seq_len``, which
+            # for vision (= vision_len + 2) is typically smaller than the
+            # 3D-grid span.  Emit the correct per-request advance so the
+            # Thinker forward can pass ``pos_id_ns`` through.
+            mrope_pos_advance.append(int(end_pos_base + 1 - start_pos))
 
             deepstack.append(inp["deepstack"])
 
@@ -611,7 +611,7 @@ class ThinkerSubmodule(NodeSubmodule):
         visual_pos_masks = torch.cat(visual_pos_masks, dim=0)
 
         inv_freq = self._get_inv_freq(device)
-        cos_sin_3d = compute_3d_cos_sin(
+        cos_3d, sin_3d = compute_3d_cos_sin(
             position_ids_3d, inv_freq, mrope_section=self.MROPE_SECTION,
             target_dtype=input_embeds.dtype,
         )
@@ -623,8 +623,10 @@ class ThinkerSubmodule(NodeSubmodule):
 
         result = {
             "input_embeds": input_embeds,
-            "cos_sin_3d": cos_sin_3d,
+            "cos_3d": cos_3d,
+            "sin_3d": sin_3d,
             "mrope_section": self.MROPE_SECTION,
+            "mrope_pos_advance": mrope_pos_advance,
             "seq_lens": seq_lens,
             "masks_for_talker": masks_for_talker,
             "visual_pos_masks": visual_pos_masks,
@@ -661,10 +663,11 @@ class ThinkerSubmodule(NodeSubmodule):
             all_embeds.append(embeds)
             seq_lens.append(1)
 
-            # Next position for all 3 components: use current sequence length
-            # from the cache manager state
-            delta = self._mrope_position_deltas.get(rid, torch.tensor(0.0))
-            next_pos = float(delta.item()) if delta.numel() > 0 else 0.0
+            # Next MRoPE position for all 3 components: read from the
+            # per-request cache-manager state (kept in sync by the
+            # post-forward ``advance_seq_lens`` call in ``thinker.py``).
+            state = cache_manager._get_state(rid, "main")
+            next_pos = float(state.position_id_start)
 
             pos_ids = torch.tensor(
                 [[next_pos], [next_pos], [next_pos]],
@@ -672,11 +675,6 @@ class ThinkerSubmodule(NodeSubmodule):
                 device=device,
             )  # (3, 1)
             all_pos_ids_3d.append(pos_ids)
-
-            # Advance position delta
-            self._mrope_position_deltas[rid] = torch.tensor(
-                next_pos + 1, device=device
-            )
 
             masks_for_talker[rid] = torch.tensor(
                 [[0], [1]], dtype=torch.bool, device=device
@@ -686,7 +684,7 @@ class ThinkerSubmodule(NodeSubmodule):
         position_ids_3d = torch.cat(all_pos_ids_3d, dim=1)
 
         inv_freq = self._get_inv_freq(device)
-        cos_sin_3d = compute_3d_cos_sin(
+        cos_3d, sin_3d = compute_3d_cos_sin(
             position_ids_3d, inv_freq, mrope_section=self.MROPE_SECTION,
             target_dtype=input_embeds.dtype,
         )
@@ -698,7 +696,8 @@ class ThinkerSubmodule(NodeSubmodule):
 
         return {
             "input_embeds": input_embeds,
-            "cos_sin_3d": cos_sin_3d,
+            "cos_3d": cos_3d,
+            "sin_3d": sin_3d,
             "mrope_section": self.MROPE_SECTION,
             "seq_lens": seq_lens,
             "masks_for_talker": masks_for_talker
@@ -712,8 +711,10 @@ class ThinkerSubmodule(NodeSubmodule):
         graph_walk: str = "",
         cache_handle: BatchedCacheManager | None = None,
         input_embeds: torch.Tensor | None = None,
-        cos_sin_3d: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
         mrope_section: list[int] | None = None,
+        mrope_pos_advance: list[int] | None = None,
         masks_for_talker: dict[str, torch.Tensor] | None = None,
         deepstack: list[torch.Tensor] | None = None,
         visual_pos_masks: torch.Tensor | None = None,
@@ -741,11 +742,14 @@ class ThinkerSubmodule(NodeSubmodule):
                 "audio_output", True,
             )
 
+        cos_sin_3d = (cos_3d, sin_3d) if cos_3d is not None else None
+
         hidden, layer_0_embed, layer_n_hidden = self.model(
             input_embeds=input_embeds,
             cache_handle=cache_handle,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
+            mrope_pos_advance=mrope_pos_advance,
             deepstack_visual_embeds=deepstack,
             visual_pos_masks=visual_pos_masks
         )
@@ -790,7 +794,7 @@ class ThinkerSubmodule(NodeSubmodule):
 
         Default: returns text_inputs for "decode" walks. Override in subclasses
         for walks with different input names (e.g., Qwen3-Omni Thinker uses
-        "input_embeds" and "cos_sin_3d"; Talker uses "input_embeds").
+        "input_embeds" + "cos_3d" + "sin_3d"; Talker uses "input_embeds").
         """
         return [
             # CudaGraphConfig(
@@ -818,8 +822,11 @@ class ThinkerSubmodule(NodeSubmodule):
         assert graph_walk == "thinker_decode"
 
         input_embeds = packed_inputs["input_embeds"]  # (batch, hidden)
-        cos_sin_3d = packed_inputs.get("cos_sin_3d")
+        cos_3d = packed_inputs.get("cos_3d")
+        sin_3d = packed_inputs.get("sin_3d")
+        cos_sin_3d = (cos_3d, sin_3d) if cos_3d is not None else None
         mrope_section = packed_inputs.get("mrope_section")
+        mrope_pos_advance = packed_inputs.get("mrope_pos_advance")
         masks_for_talker = packed_inputs.get("masks_for_talker")
 
         cache_manager.set_active_label("main")
@@ -829,6 +836,7 @@ class ThinkerSubmodule(NodeSubmodule):
             cache_handle=cache_manager,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
+            mrope_pos_advance=mrope_pos_advance,
         )
 
         logits = self.model.lm_head(hidden)  # (batch, vocab)
@@ -1675,7 +1683,7 @@ class TalkerSubmodule(NodeSubmodule):
 
         Default: returns text_inputs for "decode" walks. Override in subclasses
         for walks with different input names (e.g., Qwen3-Omni Thinker uses
-        "input_embeds" and "cos_sin_3d"; Talker uses "input_embeds").
+        "input_embeds" + "cos_3d" + "sin_3d"; Talker uses "input_embeds").
         """
         num_groups = self.config.num_code_groups
         return [
