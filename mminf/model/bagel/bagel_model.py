@@ -69,6 +69,7 @@ from mminf.model.bagel.submodules import (
 )
 from mminf.model.base import DECODE, ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.utils import ModuleAndPrefix, load_weights_from_file
+from mminf.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -677,9 +678,6 @@ class BagelModel(Model):
             "cfg_interval": full_metadata.kwargs["cfg_interval"],
             "cfg_renorm_type": full_metadata.kwargs["cfg_renorm_type"],
             "cfg_renorm_min": full_metadata.kwargs["cfg_renorm_min"],
-            "temperature": full_metadata.kwargs.get("temperature", 0.6),
-            "top_k": full_metadata.kwargs.get("top_k", 0),
-            "top_p": full_metadata.kwargs.get("top_p", 1.0),
         }
 
     def _get_fwd_pass_inputs(
@@ -780,7 +778,6 @@ class BagelModel(Model):
         overridable_keys = [
             "cfg_text_scale", "cfg_img_scale", "cfg_interval",
             "cfg_renorm_type", "cfg_renorm_min", "think_mode",
-            "temperature", "top_k", "top_p",
         ]
         params = {k: getattr(self.config, k) for k in overridable_keys}
         if model_kwargs:
@@ -897,4 +894,16 @@ class BagelModel(Model):
             unpersist_tensors=unpersist_tensors,
             step_metadata=step_metadata,
             request_done=request_done
+        )
+    
+    def get_sampling_config(
+        self, node_name: str,
+        model_kwargs: dict | None = None,
+    )  -> SamplingConfig | None:
+        keys = [
+            "temperature", "top_k", "top_p",
+        ]
+        params = {k: getattr(self.config, k) for k in keys}
+        return SamplingConfig(
+            **params
         )

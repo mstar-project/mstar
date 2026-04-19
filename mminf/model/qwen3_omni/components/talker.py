@@ -318,9 +318,20 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
             for _ in range(num_residual)
         ])
 
-    def forward(self, *args):
-        # This is never called; keeping for compatibility with nn.Module
-        return
+    def forward(self, hidden_states: torch.Tensor, cache_handle: BatchedCacheManager):
+        """
+        Just runs the inner layers; does NOT run embedding.
+        """
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(
+                hidden_states,
+                cache_handle
+            )
+        hidden_states = run_rms_norm(
+            hidden_states, self.norm.weight,
+            eps=self.norm.variance_epsilon,
+        )
+        return hidden_states
 
     def get_input_embeddings(self):
         """Return the codec embedding list (for HF compatibility)."""
@@ -338,7 +349,7 @@ class Qwen3OmniCodePredictor(nn.Module):
         talker.code_predictor.lm_head.{0-30}.weight
 
     The Code Predictor runs 31 autoregressive steps (for layers 1-31)
-    with NO persistent KV cache and in float32 for precision.
+    in float32 for precision.
     """
 
     def __init__(self, config: Qwen3OmniModelConfig):
@@ -355,8 +366,16 @@ class Qwen3OmniCodePredictor(nn.Module):
         ])
 
     def forward(self, *args):
-        # This is never called; keeping for compatibility with nn.Module
-        return
+        return self.model(*args)
+    
+    def get_embedding(self, group_idx: int):
+        if group_idx == 0:
+            return self.codec_embedding
+        return self.model.codec_embedding[group_idx-1]
+    
+    def get_lm_head(self, group_idx: int):
+        assert group_idx > 0
+        return self.lm_head[group_idx-1]
 
     @property
     def codec_embedding(self):

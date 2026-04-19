@@ -1091,8 +1091,10 @@ class LLMSubmodule(NodeSubmodule):
         return batch.graph_walk in ["decode", "prefill_text"]
 
     def postprocess(
-        self, request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]]
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        **kwargs
     ):
         if "new_token" not in outputs:
             return

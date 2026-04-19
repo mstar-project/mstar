@@ -84,8 +84,10 @@ class OrpheusLLMSubmodule(NodeSubmodule):
             raise ValueError(f"Unknown graph walk for OrpheusLLM: {graph_walk!r}")
 
     def postprocess(
-        self, request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]]
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        **kwargs
     ):
         if "new_token" not in outputs:
             return

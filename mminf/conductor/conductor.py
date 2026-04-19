@@ -20,6 +20,7 @@ from mminf.conductor.request_info import (
     PartitionState,
     StreamingConnectionState,
 )
+from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, TensorPointerInfo
 from mminf.model.base import ForwardPassArgs, Model, WorkerGraph
@@ -34,6 +35,7 @@ from mminf.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+from mminf.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,7 @@ class RequestData:
     all_worker_graph_ids: set[str]
     max_output_tokens: int
     random_seed: int
+    sampling_config: dict[str, SamplingConfig | None]
 
     # Partition state (always populated — single-partition models use a "default" partition)
     partition_states: dict[str, PartitionState] = field(default_factory=dict)
@@ -205,7 +208,17 @@ class Conductor:
                         setattr(kv_cfg, f.name, yaml_kv_overrides[f.name])
                 logger.info("KV cache config after YAML overrides: %s", kv_cfg)
         return kv_cache_config
-
+    
+    def _get_sampling_configs(self, model_kwargs: dict):
+        ar_nodes = [
+            node for (node, engine) in self.model.get_node_engine_types() \
+                if engine == EngineType.AR
+        ]
+        return {
+            node: self.model.get_sampling_config(
+                node_name=node, model_kwargs=model_kwargs
+            ) for node in ar_nodes
+        }
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from worker graphs and model engine types."""
@@ -442,6 +455,7 @@ class Conductor:
             partition_states=partition_states,
             partition_definitions=partition_definitions,
             streaming_connections=streaming_connections,
+            sampling_config=self._get_sampling_configs(model_kwargs)
         )
         self.requests[body.request_id] = request_data
 
@@ -498,7 +512,8 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         requires_cfg=fwd_args.full_metadata.requires_cfg,
                         partition_name=partition_name,
-                        max_tokens=request_data.max_output_tokens
+                        max_tokens=request_data.max_output_tokens,
+                        sampling_config=request_data.sampling_config
                     ),
                 )
                 self.communicator.send(
@@ -767,7 +782,8 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         requires_cfg=False,
                         partition_name=consumer_partition_name,
-                        max_tokens=request_data.max_output_tokens
+                        max_tokens=request_data.max_output_tokens,
+                        sampling_config=request_data.sampling_config
                     ),
                     partition_name=consumer_partition_name,
                     producer_done=set([producer_partition]),

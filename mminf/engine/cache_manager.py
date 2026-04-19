@@ -598,6 +598,19 @@ class BatchedCacheManager:
                 state.position_id_start += pos_id_ns
             else:
                 state.position_id_start += pos_id_ns[i]
+    
+    @torch.compiler.disable
+    def reset_state(
+        self,
+        request_id: str,
+        label: str="main",
+        dealloc: bool=False
+    ):
+        self.alloc_manager.reset_label(
+            request_id=request_id,
+            label=label,
+            free=dealloc
+        )
 
     @torch.compiler.disable
     def snapshot_all(

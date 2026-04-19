@@ -31,7 +31,9 @@ from mminf.model.qwen3_omni.components.rope import (
     get_rope_index_text,
     get_rope_index_vision,
 )
+from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor, Qwen3OmniTalkerModel
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig
+from mminf.utils.sampling import Sampler
 
 logger = logging.getLogger(__name__)
 
@@ -936,8 +938,10 @@ class ThinkerSubmodule(NodeSubmodule):
         }
 
     def postprocess(
-        self, request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]]
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        **kwargs
     ):
         if "new_token" not in outputs:
             return
@@ -953,246 +957,32 @@ class ThinkerSubmodule(NodeSubmodule):
 # 4. TalkerSubmodule (ar engine) -- SECOND MOST COMPLEX
 # ===================================================================
 
-
-class TalkerSubmodule(NodeSubmodule):
-    """Wraps the Talker MoE transformer + inline Code Predictor.
-
-    Dispatches on graph_walk:
-      - talker_prefill: extend KV cache with projected Thinker states
-        (multiple chunks), then on the LAST chunk build the assistant
-        prefix and sample the first codec token.
-      - talker_decode: re-embed previous all_codes, receive thinker_states
-        as normal graph input, produce next codec token + 31
-        residual codebook tokens via Code Predictor.
-
-    The TalkerSubmodule manages per-request state:
-      - _tts_pad_embed: lazy-initialized fallback embedding when Thinker
-        hasn't generated enough tokens
-    """
-
+class TalkerLLMSubmodule(NodeSubmodule):
     def __init__(
         self,
-        talker_model: nn.Module,
-        code_predictor: nn.Module,
-        config: Qwen3OmniModelConfig,
+        talker_model: Qwen3OmniTalkerModel,
+        config: Qwen3OmniModelConfig
     ):
-        super().__init__()
-        self.model = talker_model    # Qwen3OmniTalkerModel
-        self.code_predictor = code_predictor  # HF Code Predictor (float32)
+        self.model = talker_model   
         self.config = config
 
-        # W3: Pre-computed TTS special embeddings.  These are produced by
-        # running the THINKER's embed_tokens through the Talker's
-        # text_projection.  Initialized via init_tts_embeds() after both
-        # the Thinker and Talker weights are loaded.  Until then the
-        # fallback is zeros (same as old behaviour).
+        # Pre-computed TTS special inputs.
         self._tts_pad_embed_cached: torch.Tensor | None = None
         self._tts_bos_embed_cached: torch.Tensor | None = None
         self._tts_eos_embed_cached: torch.Tensor | None = None
-
-        # ---- Layer-0 codec sampling ------------------------------------
-        # HF's reference Talker.generate call uses:
-        #   do_sample=True, top_k=50, top_p=1.0, temperature=0.9,
-        #   repetition_penalty=1.05, suppress_tokens=[...]
-        # where ``suppress_tokens`` masks out the "special token" region of
-        # the Talker's codec vocab — namely [vocab_size - 1024, vocab_size)
-        # (i.e. IDs 2048..3071 for vocab_size=3072) EXCEPT codec_eos_token_id.
-        # Those IDs live in the Talker vocab but are NOT valid acoustic codes
-        # for Code2Wav (Code2Wav's codebook is only 2048 per layer), so if
-        # they're ever sampled as layer-0 they land in the wrong region of
-        # Code2Wav's code_embedding table and produce garbled audio.
-        # codec_eos is kept because it's the valid stop signal.
-        self._talker_temperature: float = 0.9
-        self._talker_top_k: int = 50
-        self._talker_top_p: float = 1.0
-        # HF uses ``repetition_penalty=1.05`` for the Talker.  Without it the
-        # codec LM tends to loop in a subspace of recently-sampled tokens and
-        # never picks ``codec_eos``, so the utterance "goes off the rails"
-        # past the intended speech and keeps generating random words until
-        # the outer ``max_output_tokens`` cap fires.  The penalty divides the
-        # logit of any previously-seen token (positive logits) or multiplies
-        # it (negative logits), biasing the distribution AWAY from repeats.
-        self._talker_repetition_penalty: float = 1.05
-
-        # Code Predictor residual sampling — HF uses top_k=50, top_p=0.8,
-        # temperature=1.0 (the HF generate() default).  The CP does not
-        # use repetition_penalty (HF's CP.generate call omits it).
-        self._cp_temperature: float = 1.0
-        self._cp_top_k: int = 50
-        self._cp_top_p: float = 0.8
 
         # Lazy-built suppress mask for layer-0 logits.  Shape (vocab_size,)
         # with True at positions to suppress.  Cached on first forward.
         self._suppress_mask: torch.Tensor | None = None
 
-        # Per-request seen-token mask for repetition penalty.  Indexed by
-        # request_id -> bool tensor of shape (vocab_size,) where True means
-        # "this layer-0 codec token has been sampled at least once for this
-        # request".  Initialized lazily on the first layer-0 sample.  The
-        # mask is cleared when the request completes (via ``cleanup_request``).
-        self._seen_layer0_mask: dict[str, torch.Tensor] = {}
-
         # Per-request flag: whether we've already sent tts_eos_embed as
-        # the text conditioning for this request.  In HF/vllm/sglang,
-        # trailing_text_hidden ends with tts_eos_embed appended:
-        #   trailing_text_hidden = cat(assistant_hidden[4:], tts_eos_embed)
-        # This gives the Talker a "text is done" signal before switching
-        # to tts_pad_embed.  In our streaming model, when the Thinker
-        # finishes the stream returns empty chunks.  We use this flag to
+        # the text conditioning for this request. We use this flag to
         # inject tts_eos_embed for ONE step before falling back to pad.
         self._eos_embed_sent: set[str] = set()
-
-        # No delay buffer needed for thinker_states alignment — verified
-        # against vllm-omni.  trailing_text_hidden = assistant_hidden[4:]
-        # starts at the second generated token.  Our stream naturally
-        # delivers thinker_decode_1 for decode step 0 (matching vllm's
-        # trailing_text_hidden[0]) because thinker_decode_0 was consumed
-        # by the last prefill for prefix position 8.
-
-    # ---- Stochastic sampling helpers -------------------------------------
-
-    def _get_seen_mask(
-        self, request_id: str, vocab_size: int, device: torch.device
-    ) -> torch.Tensor:
-        """Return the per-request layer-0 seen-token mask, initializing if needed."""
-        mask = self._seen_layer0_mask.get(request_id)
-        if (
-            mask is None
-            or mask.shape[0] != vocab_size
-            or mask.device != device
-        ):
-            mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-            self._seen_layer0_mask[request_id] = mask
-        return mask
-
-    def _mark_seen(self, request_id: str, token_id: int) -> None:
-        """Record that ``token_id`` has been sampled for this request.
-
-        The token stays marked for the lifetime of the request so the
-        repetition penalty persistently biases the distribution against it.
-        HF's ``RepetitionPenaltyLogitsProcessor`` works the same way -- it
-        penalizes ALL previously-seen tokens, not just recent ones.
-        """
-        mask = self._seen_layer0_mask.get(request_id)
-        if mask is not None and 0 <= token_id < mask.shape[0]:
-            mask[token_id] = True
-
-    def _get_suppress_mask(self, vocab_size: int, device: torch.device) -> torch.Tensor:
-        """Return the bool mask of layer-0 logits to set to -inf.
-
-        Matches HF's ``talker_supppressed_tokens`` list: suppress the top
-        1024 IDs of the Talker vocab (the "special token" region) EXCEPT
-        ``codec_eos_token_id``, which is the valid stop signal.
-        """
-        if (
-            self._suppress_mask is None
-            or self._suppress_mask.shape[0] != vocab_size
-            or self._suppress_mask.device != device
-        ):
-            mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-            start = vocab_size - 1024
-            start = max(start, 0)
-            mask[start:vocab_size] = True
-            # Do not suppress codec_eos (the valid stop signal).
-            eos = self.config.talker.codec_eos_token_id
-            if 0 <= eos < vocab_size:
-                mask[eos] = False
-            self._suppress_mask = mask
-        return self._suppress_mask
-
-    @staticmethod
-    def _top_k_top_p_sample(
-        logits: torch.Tensor,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        repetition_penalty: float = 1.0,
-        seen_token_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Pure-PyTorch stochastic sampler with top-k + top-p filtering.
-
-        Args:
-            logits: shape ``(1, vocab_size)`` — logits for a single token.
-            temperature: scaling factor applied before softmax.
-            top_k: keep only the top-k highest-logit tokens (0 = disabled).
-            top_p: keep the smallest set whose cumulative probability is
-                >= top_p (1.0 = disabled).
-            repetition_penalty: HuggingFace-style sign-aware penalty applied
-                BEFORE temperature scaling.  For each token flagged in
-                ``seen_token_mask``, the logit is divided by ``penalty`` if
-                positive or multiplied by ``penalty`` if negative, matching
-                the ``transformers`` ``RepetitionPenaltyLogitsProcessor``
-                convention.  Ignored when ``seen_token_mask`` is None or
-                when ``repetition_penalty == 1.0``.
-            seen_token_mask: bool tensor of shape ``(vocab_size,)`` marking
-                tokens the current request has already sampled.
-
-        Returns:
-            ``torch.LongTensor`` of shape ``(1,)`` — the sampled token ID.
-        """
-        # Work in float32 for numerical stability (logits from a bf16/fp16
-        # codec_head would otherwise produce unstable softmax/topk results).
-        logits = logits.float()
-
-        # Repetition penalty (applied BEFORE temperature to match HF order).
-        if (
-            repetition_penalty != 1.0
-            and seen_token_mask is not None
-            and seen_token_mask.any()
-        ):
-            mask = seen_token_mask.to(logits.device)
-            if mask.dim() == 1:
-                mask = mask.unsqueeze(0)  # broadcast over batch dim
-            penalized = torch.where(
-                logits > 0, logits / repetition_penalty, logits * repetition_penalty
-            )
-            logits = torch.where(mask, penalized, logits)
-
-        if temperature != 1.0:
-            logits = logits / max(temperature, 1e-5)
-
-        # top-k: mask everything outside the top-k logits
-        if top_k > 0 and top_k < logits.shape[-1]:
-            topk_vals, _ = torch.topk(logits, k=top_k, dim=-1)
-            min_topk = topk_vals[..., -1, None]
-            logits = torch.where(
-                logits < min_topk, torch.full_like(logits, float("-inf")), logits
-            )
-
-        # top-p (nucleus): mask tokens past cumulative probability threshold
-        if 0.0 < top_p < 1.0:
-            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
-            sorted_probs = torch.softmax(sorted_logits, dim=-1)
-            cumprobs = sorted_probs.cumsum(dim=-1)
-            # Mark tokens to remove: those whose cumulative prob > top_p.
-            # Shift right so the first token whose cumprob exceeds top_p
-            # is still kept (the smallest set reaching >= top_p).
-            remove = cumprobs > top_p
-            remove[..., 1:] = remove[..., :-1].clone()
-            remove[..., 0] = False
-            # Scatter back to original vocab order
-            remove_mask = torch.zeros_like(remove)
-            remove_mask.scatter_(-1, sorted_idx, remove)
-            logits = logits.masked_fill(remove_mask, float("-inf"))
-
-        probs = torch.softmax(logits, dim=-1)
-        # Guard against rare all-(-inf) rows (shouldn't happen post-topk).
-        probs = torch.nan_to_num(probs, nan=0.0)
-        if probs.sum(dim=-1).min() <= 0:
-            # Fall back to argmax on (pre-filter) logits
-            return logits.argmax(dim=-1).to(torch.long)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1).to(torch.long)
-
-    # ---- W3: TTS special-token embeddings --------------------------------
-
+    
     def init_tts_embeds(self, thinker_embed_tokens: nn.Embedding) -> None:
-        """Pre-compute TTS pad/bos/eos embeddings using the Thinker's
-        embedding table + the Talker's text_projection.
-
-        The HF reference implementation does:
-            tts_pad_embed = text_projection(thinker.embed_tokens(tts_pad_token_id))
-            tts_bos_embed = text_projection(thinker.embed_tokens(tts_bos_token_id))
-            tts_eos_embed = text_projection(thinker.embed_tokens(tts_eos_token_id))
+        """Pre-compute TTS pad/bos/eos hidden states using the Thinker's
+        embedding table + Talker text_projection
 
         Must be called after both the Thinker and Talker weights are loaded
         (only applicable when both reside on the same worker).  When they
@@ -1218,40 +1008,28 @@ class TalkerSubmodule(NodeSubmodule):
             "TalkerSubmodule: pre-computed TTS special embeddings via "
             "Thinker embed_tokens + Talker text_projection"
         )
+    
+    def _get_suppress_mask(self) -> torch.Tensor:
+        """Return the bool mask of layer-0 logits to set to -inf.
 
-    def _get_tts_pad_embed(self, device: torch.device) -> torch.Tensor:
-        """Return the TTS pad embedding (Thinker embed -> text_projection).
-
-        Falls back to zeros if init_tts_embeds() has not been called.
+        Matches HF's ``talker_supppressed_tokens`` list: suppress the top
+        1024 IDs of the Talker vocab (the "special token" region) EXCEPT
+        ``codec_eos_token_id``, which is the valid stop signal.
         """
-        if self._tts_pad_embed_cached is not None:
-            return self._tts_pad_embed_cached.to(device).unsqueeze(0)
-        # Fallback: zeros (matches old behaviour before W3 fix)
-        return torch.zeros(1, self.config.talker_hidden_size, device=device)
-
-    def _get_tts_eos_embed(self, device: torch.device) -> torch.Tensor:
-        """Return the TTS eos embedding (Thinker embed -> text_projection).
-
-        Falls back to tts_pad_embed if init_tts_embeds() has not been called.
-        """
-        if self._tts_eos_embed_cached is not None:
-            return self._tts_eos_embed_cached.to(device).unsqueeze(0)
-        return self._get_tts_pad_embed(device)
-
-    def _get_tts_bos_embed(self, device: torch.device) -> torch.Tensor:
-        """Return the TTS bos embedding (Thinker embed -> text_projection).
-
-        Falls back to Talker's own embed_tokens (old incorrect behaviour)
-        if init_tts_embeds() has not been called.
-        """
-        if self._tts_bos_embed_cached is not None:
-            return self._tts_bos_embed_cached.to(device).unsqueeze(0)
-        # Fallback: zero vector (init_tts_embeds should be called during setup)
-        return torch.zeros(
-            1, self.config.talker_hidden_size, device=device,
-            dtype=next(self.model.parameters()).dtype,
-        )
-
+        if  self._suppress_mask is None:
+            device = next(self.model.parameters()).device
+            vocab_size = self.config.talker_text.vocab_size
+            mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+            start = vocab_size - 1024
+            start = max(start, 0)
+            mask[start:vocab_size] = True
+            # Do not suppress codec_eos (the valid stop signal).
+            eos = self.config.talker.codec_eos_token_id
+            if 0 <= eos < vocab_size:
+                mask[eos] = False
+            self._suppress_mask = mask
+        return self._suppress_mask
+    
     def _get_talker_embeds(
         self, layer_0_embed: torch.Tensor, layer_n_hidden: torch.Tensor,
         multimodal_mask: torch.Tensor, text_inclusion_mask: torch.Tensor
@@ -1279,8 +1057,7 @@ class TalkerSubmodule(NodeSubmodule):
             )
 
         return projected
-
-
+    
     def preprocess(
         self,
         graph_walk: str,
@@ -1293,33 +1070,31 @@ class TalkerSubmodule(NodeSubmodule):
             return self._preprocess_prefill(
                 cache_manager, per_request_inputs, request_ids, per_request_info
             )
-        else:  # talker_decode
-            return self._preprocess_decode(
+        if graph_walk == "talker_last_prefill":
+            return self._preprocess_last_prefill(
                 cache_manager, per_request_inputs, request_ids, per_request_info
             )
+        # talker_decode
+        return self._preprocess_decode(
+            cache_manager, per_request_inputs, request_ids, per_request_info
+        )
 
-    # ---- talker_prefill ----
     def _preprocess_prefill(
         self,
         cache_manager: BatchedCacheManager,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
         per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> dict[str, torch.Tensor]:
+    ):
         """Build Talker prefill from Thinker states chunk.
-
         Non-last chunks: project states, plan prefill, forward fills KV cache only.
-        Last chunk (is_last_prefill=True): build assistant prefix, sample first token.
         """
         assert len(per_request_inputs) == 1, (
             "Talker prefill processes one request at a time"
         )
         device = next(self.model.parameters()).device
-        rid = request_ids[0]
         inputs = per_request_inputs[0]
-        info = per_request_info[rid]
 
-        is_last_prefill = info.step_metadata.get("is_last_prefill", False)
         # 1. Unpack thinker_states -> split into layer_0 and layer_n
         thinker_states = inputs["thinker_states"][0].to(device)
         thinker_hidden = self.config.thinker_hidden_size
@@ -1333,22 +1108,46 @@ class TalkerSubmodule(NodeSubmodule):
             text_inclusion_mask=mask[1, :]
         )
 
-        if not is_last_prefill:
-            seq_len = projected.shape[0]
-            cache_manager.plan_attention(
-                seq_lens=[seq_len], is_causal=True, label="main"
-            )
-            cache_manager.plan_rope(
-                seq_lens=[seq_len], pos_ids=None, label="main"
-            )
+        seq_len = projected.shape[0]
+        cache_manager.plan_attention(
+            seq_lens=[seq_len], is_causal=True, label="main"
+        )
+        cache_manager.plan_rope(
+            seq_lens=[seq_len], pos_ids=None, label="main"
+        )
 
-            return {
-                "input_embeds": projected,
-                "is_last_prefill": False,
-                "seq_lens": [seq_len],
-            }
+        return {
+            "input_embeds": projected,
+        }
+    
+    def _preprocess_last_prefill(
+        self,
+        cache_manager: BatchedCacheManager,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ):
+        """
+        Last chunk: build assistant prefix, sample first token.
 
-        # ---- Last prefill: build assistant prefix ----
+        The thinker_states come from the first token sampled by the talker so will
+        be text.
+        """
+
+        assert len(per_request_inputs) == 1, (
+            "Talker prefill processes one request at a time"
+        )
+        device = next(self.model.parameters()).device
+        rid = request_ids[0]
+        inputs = per_request_inputs[0]
+        info = per_request_info[rid]
+
+        thinker_states = inputs["thinker_states"][0].to(device)
+        thinker_hidden = self.config.thinker_hidden_size
+        projected = self.model.text_projection(
+            thinker_states[..., :thinker_hidden]
+        )
+
         tc = self.config.talker
 
         # Build assistant prefix (matching HF/sglang-omni/vllm-omni pattern):
@@ -1360,8 +1159,8 @@ class TalkerSubmodule(NodeSubmodule):
         # Text part of assistant prefix
         # W3: pad and bos embeddings use Thinker embed -> text_projection
         # (via pre-computed cached values from init_tts_embeds)
-        pad_embed = self._get_tts_pad_embed(device).expand(4, -1)  # 4 pad tokens
-        bos_text_embed = self._get_tts_bos_embed(device)           # 1 bos token
+        pad_embed = self._tts_pad_embed_cached(device).expand(4, -1)  # 4 pad tokens
+        bos_text_embed = self._tts_bos_embed_cached(device)           # 1 bos token
 
         speaker = info.step_metadata.get("voice", "Ethan")
         speaker_id = tc.speaker_id.get(speaker.lower())
@@ -1399,410 +1198,165 @@ class TalkerSubmodule(NodeSubmodule):
 
         return {
             "input_embeds": input_embeds,
-            "is_last_prefill": True,
-            "seq_lens": [seq_len],
+            "suppress_mask": self._get_suppress_mask()
         }
-
-    # ---- talker_decode ----
-
-    def _preprocess_decode(self, cache_manager, per_request_inputs, request_ids, per_request_info):
-        """Build next decode step: re-embed all_codes + thinker_states.
-
-        Matches HF's ``Qwen3OmniMoeTalkerForConditionalGeneration.prepare_inputs_for_generation``
-        autoregressive path (see modeling_qwen3_omni_moe.py ~line 3270):
-
-            codec_hiddens = [last_id_hidden] + mid_residual_hiddens + [last_residual_hidden]
-            inputs_embeds = codec_hiddens.sum(1, keepdim=True)
-            inputs_embeds = inputs_embeds + trailing_text_hidden[generation_step]
-
-        i.e. the next Talker step's input is the SUM of all ``num_code_groups``
-        codec-layer embeddings (layer-0 via the Talker's own codec_embedding;
-        layers 1..num_code_groups-1 via the Code Predictor's per-layer
-        codec_embedding ModuleList), with the thinker's projected text hidden
-        added on top.  Both sglang-omni and vllm-omni follow the same pattern.
-
-        Steps:
-        1. Re-embed all_codes into codec_embed_sum (layer-0 + 15 residuals)
-        2. Get thinker_states from normal graph input (may be empty after Thinker EOS)
-        3. Project thinker_states via text_projection, or use tts_pad_embed if empty
-        4. input_embed = codec_embed_sum + text_hidden
-        """
-        device = next(self.model.parameters()).device
+    
+    def _preprocess_decode(
+        self,
+        cache_manager: BatchedCacheManager,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ):
         all_embeds = []
-        seq_lens = []
-
-        # Code Predictor's residual embedding ModuleList is at
-        # ``code_predictor.model.codec_embedding`` -- NOT
-        # ``code_predictor.codec_embedding`` (which does not exist).  The
-        # previous code used the wrong path guarded by ``hasattr``, which
-        # silently skipped the residual summing entirely and caused the
-        # Talker to drift into garbled output after a few decode steps.
-        cp_residual_embeddings = self.code_predictor.model.codec_embedding
-
         for inp, rid in zip(per_request_inputs, request_ids, strict=True):
-            # 1. Re-embed all_codes
-            all_codes = inp["all_codes"][0].to(device)
-            if all_codes.dim() == 2:
-                all_codes = all_codes.squeeze(0)
-
-            # Layer-0 via the Talker's own codec_embedding (vocab=3072).
-            layer0_code = all_codes[0:1]
-            codec_embed_sum = self.model.model.codec_embedding(layer0_code)
-
-            # Layers 1..num_code_groups-1 via the Code Predictor's per-layer
-            # embedding ModuleList (each vocab=2048).  Residual layer ``i``
-            # uses ``cp_residual_embeddings[i - 1]`` (layer 1 -> index 0,
-            # layer 2 -> index 1, ..., layer 15 -> index 14).
-            num_groups = min(all_codes.shape[0], self.config.num_code_groups)
-            for i in range(1, num_groups):
-                code_i = all_codes[i:i+1]
-                emb_i = cp_residual_embeddings[i - 1](code_i).to(codec_embed_sum.dtype)
-                codec_embed_sum = codec_embed_sum + emb_i
-
-            # 2. Get thinker_states from normal graph input (stream).
-            #
-            # Alignment with vllm-omni: the last prefill consumed
-            # thinker_decode_0 (first generated token) for prefix position 8.
-            # trailing_text_hidden in vllm starts at assistant_hidden[4:] =
-            # second generated token.  Our stream delivers thinker_decode_1
-            # (second generated token) here — matching vllm's
-            # trailing_text_hidden[0].  No delay buffer needed.
-            thinker_states_list = inp.get("thinker_states", [])
-            if thinker_states_list and thinker_states_list[0] is not None:
-                thinker_state = thinker_states_list[0].to(device)
-            else:
-                thinker_state = None
-
-            # Project thinker_state → text_hidden via text_projection.
+            emb = inp["talker_input_embeds"][0]
+            
+            thinker_state = inp.get("thinker_states", [None])[0]
             if thinker_state is not None:
                 thinker_hidden = self.config.thinker_hidden_size
-                if thinker_state.dim() >= 1 and thinker_state.shape[-1] >= thinker_hidden:
-                    layer_0 = thinker_state[..., :thinker_hidden]
-                    if layer_0.dim() == 1:
-                        layer_0 = layer_0.unsqueeze(0)
-                    text_hidden = self.model.text_projection(layer_0)
-                    if text_hidden.shape[0] > 1:
-                        text_hidden = text_hidden[-1:]
-                else:
-                    text_hidden = self._get_tts_pad_embed(device)
-            # Empty thinker_states — Thinker has finished.
-            # HF/vllm/sglang append tts_eos_embed at the end of
-            # trailing_text_hidden so the Talker gets a "text done"
-            # signal before switching to tts_pad_embed.  We replicate
-            # that by using tts_eos_embed for the FIRST empty step,
-            # then tts_pad_embed for all subsequent steps.
+                emb += self.model.text_projection(
+                    thinker_state[..., :thinker_hidden]
+                )
             elif rid not in self._eos_embed_sent:
-                text_hidden = self._get_tts_eos_embed(device)
+                emb += self._tts_eos_embed_cached
                 self._eos_embed_sent.add(rid)
             else:
-                text_hidden = self._get_tts_pad_embed(device)
+                emb += self._tts_pad_embed_cached
+            all_embeds.append(emb)
 
-            # Ensure text_hidden is (1, hidden)
-            if text_hidden.dim() == 1:
-                text_hidden = text_hidden.unsqueeze(0)
 
-            # 3. input_embed = codec_embed_sum + text_hidden
-            input_embed = codec_embed_sum + text_hidden
-            all_embeds.append(input_embed)
-            seq_lens.append(1)
+        seq_lens = [1] * len(per_request_inputs)
+        cache_manager.plan_attention(
+            seq_lens=seq_lens
+        )
+        cache_manager.plan_rope(
+            seq_lens=seq_lens
+        )
 
         input_embeds = torch.cat(all_embeds, dim=0)
-        cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
-        cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
+        return {
+            "input_embeds": input_embeds,
+            "suppress_mask": self._get_suppress_mask()
+        }
+    
+    def _forward_prefill(
+        self, cache_handle: BatchedCacheManager,
+        input_embeds: torch.Tensor,
+    ):
+        self.model(input_embeds=input_embeds, cache_handle=cache_handle)
+        return {}
 
-        return {"input_embeds": input_embeds, "seq_lens": seq_lens}
-
-    # ---- forward ----
-
-    def forward(
-        self,
-        request_info: CurrentForwardPassInfo,
-        graph_walk: str = "",
-        cache_handle: BatchedCacheManager | None = None,
-        input_embeds: torch.Tensor | None = None,
-        is_last_prefill: bool = False,
-        **kwargs,
-    ) -> NameToTensorList:
-        """Run Talker forward, optionally sample codec token and run Code Predictor.
-
-        Non-last prefill: fill KV cache only, return empty dict.
-        Last prefill / decode: run transformer, sample layer-0 codec token,
-        run Code Predictor for 31 residual codes, return logits + all_codes.
+    def _forward_decode_like(
+        self, cache_handle: BatchedCacheManager,
+        input_embeds: torch.Tensor,
+        suppress_mask: torch.Tensor
+    ):
         """
-        cache_handle.set_active_label("main")
+        Runs the Talker LLM for stages that graoh walks that sample a token
+        and feed into the code predictor.
+        """
 
-        # Check for non-last prefill (KV-cache-only step)
-        if graph_walk == "talker_prefill" and not is_last_prefill:
-            self.model(input_embeds=input_embeds, cache_handle=cache_handle)
-            return {}
-
-        # Normal forward (last prefill or decode)
         hidden = self.model(
             input_embeds=input_embeds, cache_handle=cache_handle
         )
-        last_hidden = hidden[-1:, :]  # (1, hidden_size)
-
-        # Layer-0 codec logits: (1, codec_vocab=3072)
+        last_hidden = hidden[-1:, :]
         logits = self.model.codec_head(last_hidden)
-
-        # Suppress the top-1024 ID region of the Talker vocab (reserved for
-        # special tokens; invalid as Code2Wav inputs) except codec_eos.
-        suppress_mask = self._get_suppress_mask(logits.shape[-1], logits.device)
         logits = logits.masked_fill(suppress_mask.unsqueeze(0), float("-inf"))
 
-        # Per-request seen-token mask for HF-style repetition penalty.
-        # Sequential forward path has exactly one request in the batch.
-        rid = cache_handle.request_ids[0] if cache_handle.request_ids else ""
-        seen_mask = self._get_seen_mask(rid, logits.shape[-1], logits.device)
-
-        # Stochastic layer-0 sampling (HF defaults: temperature=0.9, top_k=50,
-        # top_p=1.0, repetition_penalty=1.05).  Argmax produces flat/garbled
-        # audio — speech codec LMs require stochastic decoding for natural
-        # output.  We sample INSIDE the submodule and return ``new_token``
-        # directly so the AR engine's generic sampler does NOT re-sample from
-        # logits (which would give a different token than the one the Code
-        # Predictor was conditioned on).  Without repetition_penalty the
-        # Talker drifts into loops and never emits codec_eos.
-        layer0_code = self._top_k_top_p_sample(
-            logits,
-            temperature=self._talker_temperature,
-            top_k=self._talker_top_k,
-            top_p=self._talker_top_p,
-            repetition_penalty=self._talker_repetition_penalty,
-            seen_token_mask=seen_mask,
-        )  # (1,)
-
-        # Record the sampled token so the next step's repetition penalty
-        # biases against it.
-        self._mark_seen(rid, layer0_code)
-
-        # Run Code Predictor for residual codebook layers (float32 precision)
-        all_codes = self._run_code_predictor(last_hidden, layer0_code)
-
         return {
-            # Return ``new_token`` directly — the AR engine routes this to the
-            # next Talker step's input_ids. No ``logits`` key so ar_engine's
-            # _sample_decode_outputs skips re-sampling.
-            "new_token": [layer0_code],
-            "all_codes": [all_codes],          # 16 code IDs, persisted for next step
-            "codec_tokens": [all_codes],       # Streamed to Code2Wav
+            "cp_embed": [last_hidden],
+            "logits": [logits]
         }
-
-    def _run_code_predictor(
+    
+    def forward(
         self,
-        last_hidden: torch.Tensor,
-        layer0_code: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run Code Predictor for residual codebook layers 1..(num_code_groups-1).
-
-        For Qwen3-Omni that's layers 1..15 (15 residual layers) since
-        ``num_code_groups = 16``.
-
-        Uses float32 precision for numerical correctness (the Code Predictor
-        is a small 5-layer transformer that is sensitive to precision).
-        No persistent KV cache -- each step is independent.
-
-        Args:
-            last_hidden: Talker's last hidden state, shape (1, hidden_size).
-            layer0_code: Sampled layer-0 codec token ID, shape (1,).
-
-        Returns:
-            all_codes: tensor of shape (num_code_groups,) with all codec IDs
-            (layer-0 + residual layers).
-        """
-        num_groups = self.config.num_code_groups
-        device = last_hidden.device
-        all_codes = torch.zeros(num_groups, dtype=torch.long, device=device)
-        all_codes[0] = layer0_code
-
-        if num_groups <= 1:
-            return all_codes
-
-        # Disable autocast for float32 Code Predictor inference.  HF and
-        # vllm-omni found that fused/autocast kernels degrade audio quality
-        # for the small (5-layer) Code Predictor.
-        with torch.amp.autocast(device_type="cuda", enabled=False):
-            cp = self.code_predictor
-
-            # IMPORTANT: Two DIFFERENT embedding tables are involved here.
-            #
-            #   1. The TALKER's ``codec_embedding`` is an ``nn.Embedding``
-            #      with ``vocab_size = talker_text.vocab_size = 3072``.
-            #      It's used to embed the LAYER-0 codec token that the
-            #      Talker's ``codec_head`` sampled (in [0, 3072)).
-            #
-            #   2. The CODE PREDICTOR's ``codec_embedding`` is an
-            #      ``nn.ModuleList`` of (num_code_groups - 1) = 15
-            #      ``nn.Embedding`` instances, each with
-            #      ``vocab_size = code_predictor.vocab_size = 2048``.
-            #      These embed the RESIDUAL codes for layers 1..15, which
-            #      the Code Predictor AR-samples from its per-layer
-            #      ``lm_head[k]`` (each with vocab=2048).
-            #
-            # We previously used ``code_predictor.codec_embedding[0]`` to
-            # embed the layer-0 code, but the layer-0 code is from the
-            # Talker's 3072-vocab and can be >= 2048, which triggers an
-            # out-of-range embedding lookup and a CUDA device-side assert.
-            # The fix: use the TALKER's codec_embedding for layer-0, and
-            # the Code Predictor's codec_embedding[k] only for residual
-            # layers.  Both hidden_sizes are 1024 so the tensors are
-            # compatible for concatenation.
-            talker_codec_embedding = self.model.model.codec_embedding
-            cp_residual_embeddings = cp.model.codec_embedding
-            lm_heads = cp.lm_head
-
-            # Build initial input: [last_hidden, layer0_embed], shape (1, 2, H).
-            cp_dtype = next(cp.parameters()).dtype
-            last_hidden_cp = last_hidden.to(cp_dtype).unsqueeze(0)  # (1, 1, H)
-            # Layer-0 is embedded via the Talker's codec_embedding (vocab=3072).
-            layer0_embed = talker_codec_embedding(
-                layer0_code.unsqueeze(0)
-            ).to(cp_dtype)  # (1, 1, H)
-            cp_input = torch.cat(
-                [last_hidden_cp, layer0_embed], dim=1,
-            )  # (1, 2, H)
-
-            # AR loop for residual layers 1 through (num_groups - 1).  At
-            # step ``group_idx``, ``lm_heads[group_idx - 1]`` predicts the
-            # layer-``group_idx`` residual code, and
-            # ``cp_residual_embeddings[group_idx - 1]`` embeds it for the
-            # next iteration.  Note: residual layer k uses index (k - 1)
-            # into the ModuleList (layer 1 -> index 0, layer 2 -> index 1,
-            # ..., layer 31 -> index 30).
-            #
-            # We re-prefill the entire growing sequence each step (no
-            # persistent KV cache).  This is O(N^2) but the predictor is
-            # tiny (5 layers, ~80M params, max 31 steps), and matches
-            # vllm-omni's reference implementation for numerical fidelity.
-            for group_idx in range(1, num_groups):
-                # Forward through the Code Predictor's inner model.
-                # ``cp.model`` is a Qwen3OmniMoeTalkerCodePredictorModel
-                # which accepts ``inputs_embeds`` and returns a
-                # BaseModelOutputWithPast.
-                outputs = cp.model(
-                    inputs_embeds=cp_input,
-                    use_cache=False,
-                )
-                hidden_states = outputs.last_hidden_state  # (1, seq, H)
-
-                # Logits for this residual layer (only the last position)
-                cp_logits = lm_heads[group_idx - 1](
-                    hidden_states[:, -1:, :]
-                )  # (1, 1, vocab=2048)
-
-                # Stochastic sampling — HF uses do_sample=True, top_k=50,
-                # top_p=0.8.  Argmax residuals cause mode collapse (each
-                # residual layer picks the "most probable" code, which biases
-                # toward silence/DC and produces garbled/buzzing output).
-                cp_logits_2d = cp_logits.squeeze(1)  # (1, vocab)
-                code_i = self._top_k_top_p_sample(
-                    cp_logits_2d.float(),
-                    temperature=self._cp_temperature,
-                    top_k=self._cp_top_k,
-                    top_p=self._cp_top_p,
-                ).squeeze()  # scalar in [0, 2048)
-                all_codes[group_idx] = code_i
-
-                # Embed the sampled residual code for the next iteration.
-                # Residual layer ``group_idx`` uses index ``group_idx - 1``
-                # in the Code Predictor's ModuleList.
-                if group_idx < num_groups - 1:
-                    next_embed = cp_residual_embeddings[group_idx - 1](
-                        code_i.view(1, 1)
-                    ).to(cp_dtype)  # (1, 1, H)
-                    cp_input = torch.cat([cp_input, next_embed], dim=1)
-
-        return all_codes
-
-    # ---- batching ----
-
-    def can_batch(self, batch: NodeBatch) -> bool:
-        return batch.graph_walk == "talker_decode"
-
-    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
-        """Return dummy inputs for CUDA graph capture, or None if this walk
-        doesn't support CUDA graphs.
-
-        Default: returns text_inputs for "decode" walks. Override in subclasses
-        for walks with different input names (e.g., Qwen3-Omni Thinker uses
-        "input_embeds" + "cos_3d" + "sin_3d"; Talker uses "input_embeds").
-        """
-        num_groups = self.config.num_code_groups
-        return [
-            # CudaGraphConfig(
-            #     graph_walk="talker_decode", requires_cfg=False, labels=["main"],
-            #     dummy_capture_inputs=[{
-            #         "all_codes": [torch.zeros(num_groups, dtype=torch.long, device=device)],
-            #         "thinker_states": [],
-            #     }],
-            #     compile=False
-            # ),
-        ]
-
+        request_info: CurrentForwardPassInfo,
+        graph_walk: str,
+        cache_handle: BatchedCacheManager,
+        input_embeds: torch.Tensor | None = None,
+        suppress_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> NameToTensorList:
+        if graph_walk == "talker_prefill":
+            return self._forward_prefill(
+                cache_handle=cache_handle, input_embeds=input_embeds
+            )
+        return self._forward_decode_like(
+            cache_handle=cache_handle,
+            input_embeds=input_embeds,
+            suppress_mask=suppress_mask
+        )
+    
     def forward_batched(
         self,
         graph_walk: str,
         request_ids: list[str],
         cache_manager: BatchedCacheManager,
         packed_inputs: dict[str, torch.Tensor],
-        per_request_info: dict | None = None,
-        per_request_metadata: dict | None = None,
-    ) -> dict[str, NameToTensorList]:
-        """Batched talker_decode: batch the transformer, per-request Code Predictor.
-
-        The Talker transformer runs once on all requests (each seq_len=1).
-        The Code Predictor then runs per-request (31 sequential AR steps
-        can't be batched across different code histories).
-        """
-        assert graph_walk == "talker_decode"
-
-        input_embeds = packed_inputs["input_embeds"]  # (batch, hidden)
-
-        cache_manager.set_active_label("main")
-
-        # Batched Talker transformer forward
-        hidden = self.model(
-            input_embeds=input_embeds, cache_handle=cache_manager
+        per_request_info: dict[str, CurrentForwardPassInfo]
+    ):
+        fwd_out = self._forward_decode_like(
+            cache_handle=cache_manager,
+            input_embeds=packed_inputs["input_embeds"],
+            suppress_mask=packed_inputs["suppress_mask"],
         )
-        # hidden: (batch, hidden_size) — one token per request
 
-        # Batched layer-0 codec logits
-        logits = self.model.codec_head(hidden)  # (batch, codec_vocab)
+        outputs = {
+            rid: {
+                "cp_embed": fwd_out["cp_embed"][0][i],
+                "logits": fwd_out["logits"][0][i:i+1],
+            } for i, rid in enumerate(request_ids)
+        }
+        outputs["__batched_logits__"] = fwd_out["logits"][0]
+        return outputs
+    
+    def postprocess(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        **kwargs
+    ):
+        if "new_token" not in outputs:
+            return
+        codes = outputs.pop("new_token")[0]
+        device = codes.device
+        token = codes.item()
+        eos_token_id = self.config.talker.codec_eos_token_id
+        if (eos_token_id is not None and eos_token_id == token) or \
+                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= request_info.max_tokens):
+            request_info.register_loop_stop("talker_decode_loop")
+        
+        outputs["group_idx"] = [torch.zeros(1, device=device, drype=torch.long)]
+        outputs["codec_embed_sum"] = [
+            torch.zeros_like(outputs["cp_embed"][0])
+        ]
+        outputs["codec_tokens"] = [codes]
+    
+    def cleanup_request(self, request_id: str) -> None:
+        """Remove per-request state when a request completes."""
+        self._eos_embed_sent.remove(request_id)
+    
+    def can_batch(self, batch: NodeBatch) -> bool:
+        batch.graph_walk == "talker_decode"
+    
+    def _get_dummy_capture_inputs(self, device):
+        return [{
+            "talker_input_embeds": [torch.zeros(self.config.talker_hidden_size, device=device)],
+            "thinker_states": [
+                torch.zeros((1, self.config.thinker_hidden_size), device=device)
+            ],
+        }]
 
-        # Per-request: suppress special-token region, stochastic sample,
-        # then run Code Predictor with the sampled layer-0 token.
-        suppress_mask = self._get_suppress_mask(logits.shape[-1], logits.device)
-        request_ids = cache_manager.request_ids
-        result: dict[str, NameToTensorList] = {}
-
-        for i, rid in enumerate(request_ids):
-            last_hidden_i = hidden[i : i + 1]  # (1, hidden)
-            logits_i = logits[i : i + 1]        # (1, codec_vocab)
-
-            logits_i = logits_i.masked_fill(
-                suppress_mask.unsqueeze(0), float("-inf")
+    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+        return [
+            CudaGraphConfig(
+                graph_walk="talker_decode", requires_cfg=False, labels=["main"],
+                dummy_capture_inputs=self._get_dummy_capture_inputs(device),
+                capture_batch_sizes=[1, 2, 4, 8, 16]
             )
-            seen_mask = self._get_seen_mask(rid, logits_i.shape[-1], logits_i.device)
-            layer0_code = self._top_k_top_p_sample(
-                logits_i,
-                temperature=self._talker_temperature,
-                top_k=self._talker_top_k,
-                top_p=self._talker_top_p,
-                repetition_penalty=self._talker_repetition_penalty,
-                seen_token_mask=seen_mask,
-            )  # (1,)
-            self._mark_seen(rid, layer0_code)
-
-            all_codes = self._run_code_predictor(last_hidden_i, layer0_code)
-
-            result[rid] = {
-                "new_token": [layer0_code],
-                "all_codes": [all_codes],
-                "codec_tokens": [all_codes],
-            }
-
-        return result
-
+        ]
+    
     def get_needed_cache_labels(
         self,
         graph_walk: str,
@@ -1810,25 +1364,155 @@ class TalkerSubmodule(NodeSubmodule):
     ) -> list[str]:
         return ["main"]
 
-    def postprocess(
-        self, request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]]
+
+class CodePredictorSubmodule(NodeSubmodule):
+    def __init__(
+        self, code_predictor: Qwen3OmniCodePredictor,
+        config: Qwen3OmniModelConfig
     ):
-        if "new_token" not in outputs:
-            return
-        token = outputs["new_token"][0].item()
-        eos_token_id = self.config.talker.codec_eos_token_id
-        if (eos_token_id is not None and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= request_info.max_tokens):
-            request_info.register_loop_stop("talker_decode_loop")
+        super().__init__()
+        self.code_predictor = code_predictor
+        self.config = config
+        self.cp_cfg = self.config.code_predictor
+        self.num_residual = self.cp_cfg.num_code_groups - 1
+    
 
-    # ---- cleanup ----
+    def preprocess(
+        self,
+        graph_walk: str,
+        cache_manager: BatchedCacheManager,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ):
+        for rid, inp in zip(request_ids, per_request_inputs):
+            if inp["group_idx"][0].item() == 0:
+                cache_manager.reset_state(
+                    request_id=rid,
+                    dealloc=False
+                )
 
-    def cleanup_request(self, request_id: str) -> None:
-        """Remove per-request state when a request completes."""
-        self._seen_layer0_mask.pop(request_id, None)
-        self._eos_embed_sent.discard(request_id)
+        seq_lens = [1] * len(per_request_inputs)
+        cache_manager.plan_attention(
+            seq_lens=seq_lens
+        )
+        cache_manager.plan_rope(
+            seq_lens=seq_lens
+        )
+        
+        return {
+            "cp_embed": torch.cat([
+                inp["cp_embed"][0] for inp in per_request_inputs
+            ]),
+            "codec_embed_sum": torch.cat([
+                inp["codec_embed_sum"][0] for inp in per_request_inputs
+            ]),
+            "codec_tokens": torch.cat([
+                inp["codec_tokens"][0] for inp in per_request_inputs
+            ]),
+            "group_idx": torch.cat(
+                [inp["group_idx"][0] for inp in per_request_inputs]
+            )
+        }
+    
+    def forward(
+        self,
+        cp_embed: torch.Tensor,
+        codes: torch.Tensor,
+        codec_embed_sum: torch.Tensor,
+        group_idx: torch.Tensor
+    ):
+        hidden = self.code_predictor(cp_embed)
+        return {
+            "hidden": [hidden],
+            "cp_embed": [cp_embed],
+            "codec_embed_sum": [codec_embed_sum],
+            "codec_tokens": [codes],
+            "group_idx": [group_idx],
+        }
+    
+    def forward_batched(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        cache_manager: BatchedCacheManager,
+        packed_inputs: dict[str, torch.Tensor],
+        per_request_info: dict[str, CurrentForwardPassInfo]
+    ) -> dict[str, NameToTensorList]:
+        # Disable autocast for float32 Code Predictor inference.  HF and
+        # vllm-omni found that fused/autocast kernels degrade audio quality
+        # for the small (5-layer) Code Predictor.
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            hidden = self.code_predictor(packed_inputs["cp_embed"])
 
+        return {
+            req_id: {
+                "hidden": [hidden[i:i+1]],
+                "codec_embed_sum": [packed_inputs["codec_embed_sum"][i]],
+                "cp_embed": [packed_inputs["cp_embed"][i]],
+                "codec_tokens": [packed_inputs["codec_tokens"][i]],
+                "group_idx": [packed_inputs["group_idx"][i]],
+            } for i, req_id in enumerate(request_ids)
+        }
+    
+    def postprocess(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        sampler: Sampler,
+        **kwargs
+    ):
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            group_idx = outputs["group_idx"][0].item()
+            if group_idx > 0:
+                # For the first group_idx, the codes are not sampled by the code
+                # predictor, but rather by the talker itself. After, codes are sampled
+                # by the code predictor
+                logits = self.code_predictor.get_lm_head(group_idx)(
+                    outputs["hidden"][0]
+                )
+                code = sampler.sample([request_id], logits)
+            else:
+                code = outputs["code"][0]
+            
+            cp_embed = self.code_predictor.get_embedding(group_idx)(code)
+            outputs["codec_embed_sum"] += cp_embed
+            outputs["cp_embed"] = [cp_embed]
+            outputs["codec_tokens"] = [code]
+            outputs["group_idx"] += 1
+            outputs["talker_input_embeds"] = outputs["codec_embed_sum"]
+
+    def can_batch(self, batch: NodeBatch) -> bool:
+        return True # we can always batch
+    
+    def _get_dummy_capture_inputs(self, device):
+        return [{
+            "group_idx": [torch.zeros(1, device=device, drype=torch.long)],
+            "codec_embed_sum": [torch.zeros(self.cp_cfg.head_dim, device=device)],
+            "cp_embed": [torch.zeros(self.cp_cfg.head_dim, device=device)],
+            "codec_tokens": [torch.zeros(1, device=device, drype=torch.long)],
+        }]
+
+    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+        return [
+            CudaGraphConfig(
+                graph_walk="talker_last_prefill", requires_cfg=False, labels=["main"],
+                dummy_capture_inputs=self._get_dummy_capture_inputs(device),
+                capture_batch_sizes=[1, 2, 4, 8, 16]
+            ),
+            CudaGraphConfig(
+                graph_walk="talker_decode", requires_cfg=False, labels=["main"],
+                dummy_capture_inputs=self._get_dummy_capture_inputs(device),
+                capture_batch_sizes=[1, 2, 4, 8, 16]
+            )
+        ]
+    
+    def get_needed_cache_labels(
+        self,
+        graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> list[str]:
+        return ["main"]
 
 # ===================================================================
 # 5. Code2WavSubmodule (audio_codec engine)
