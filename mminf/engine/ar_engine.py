@@ -294,6 +294,18 @@ class AREngine(BaseEngine):
             output = self._sample_decode_outputs(batch.node_name, output)
         if self.enable_nvtx:
             range_pop(synchronize=True)
+
+        # Apply per-rid output filter so submodules that emit a static set
+        # of keys for CUDA-graph capture compat (e.g. Qwen3-Omni Thinker
+        # always emits thinker_states) can drop keys per real request in
+        # eager mode too, keeping both execution paths consistent.
+        for rid in rids:
+            rid_out = output.per_request_output_tensors.get(rid)
+            if not isinstance(rid_out, dict):
+                continue
+            output.per_request_output_tensors[rid] = submodule.filter_batched_output(
+                batch.per_request_info.get(rid), rid_out,
+            )
         return output
 
     def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:

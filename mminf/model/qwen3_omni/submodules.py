@@ -266,6 +266,13 @@ class ThinkerSubmodule(NodeSubmodule):
         # Pre-compute inverse frequencies for 3D MRoPE
         self._inv_freq: torch.Tensor | None = None
 
+        # Lazily-cached constant mask used by ``_preprocess_decode`` for the
+        # Talker partition.  Every decode-step mask is the same constant
+        # ``[[0], [1]]`` so we allocate it once per device instead of per
+        # request per step.  Helps keep the captured graph's output-dict
+        # contents self-evidently constant, too.
+        self._decode_thinker_mask: torch.Tensor | None = None
+
     def _get_inv_freq(self, device: torch.device) -> torch.Tensor:
         """Lazy-initialize and cache inverse frequencies."""
         if self._inv_freq is None or self._inv_freq.device != device:
@@ -275,6 +282,18 @@ class ThinkerSubmodule(NodeSubmodule):
                 device=device,
             )
         return self._inv_freq
+
+    def _get_decode_thinker_mask(self, device: torch.device) -> torch.Tensor:
+        """Return the constant ``[[0], [1]]`` decode mask (multimodal row =
+        0, text-inclusion row = 1), lazily allocated per device."""
+        if (
+            self._decode_thinker_mask is None
+            or self._decode_thinker_mask.device != device
+        ):
+            self._decode_thinker_mask = torch.tensor(
+                [[0], [1]], dtype=torch.bool, device=device,
+            )
+        return self._decode_thinker_mask
 
     def _get_talker_text_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -676,9 +695,9 @@ class ThinkerSubmodule(NodeSubmodule):
             )  # (3, 1)
             all_pos_ids_3d.append(pos_ids)
 
-            masks_for_talker[rid] = torch.tensor(
-                [[0], [1]], dtype=torch.bool, device=device
-            )
+            # Constant across all decode rids and all steps — use the
+            # lazily-cached per-device tensor.
+            masks_for_talker[rid] = self._get_decode_thinker_mask(device)
 
         input_embeds = torch.cat(all_embeds, dim=0)
         position_ids_3d = torch.cat(all_pos_ids_3d, dim=1)
@@ -789,19 +808,32 @@ class ThinkerSubmodule(NodeSubmodule):
         return batch.graph_walk == "thinker_decode"
 
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
-        """Return dummy inputs for CUDA graph capture, or None if this walk
-        doesn't support CUDA graphs.
+        """Declare a CUDA graph capture for ``thinker_decode``.
 
-        Default: returns text_inputs for "decode" walks. Override in subclasses
-        for walks with different input names (e.g., Qwen3-Omni Thinker uses
-        "input_embeds" + "cos_3d" + "sin_3d"; Talker uses "input_embeds").
+        ``dummy_capture_inputs`` is the PRE-preprocess input (a single
+        dummy token id per rid); the runner calls ``preprocess`` itself to
+        produce the static input buffers (``input_embeds``, ``cos_3d``,
+        ``sin_3d``, etc.).
+
+        ``compile=False`` on first land — mirrors what Orpheus does until
+        we confirm interaction with the Triton fused-MoE autotune cache.
+        ``capture_batch_sizes`` is limited to small buckets since each
+        capture allocates persistent FlashInfer wrappers + static buffers
+        for the full 30B Thinker; revisit after profiling real deployments.
         """
         return [
-            # CudaGraphConfig(
-            #     graph_walk="thinker_decode", requires_cfg=False, labels=["main"],
-            #     dummy_capture_inputs=[{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}],
-            #     compile=False
-            # ),
+            CudaGraphConfig(
+                graph_walk="thinker_decode",
+                requires_cfg=False,
+                labels=["main"],
+                dummy_capture_inputs=[{
+                    "text_inputs": [
+                        torch.zeros(1, dtype=torch.long, device=device),
+                    ],
+                }],
+                compile=False,
+                capture_batch_sizes=[1, 2, 4, 8, 16],
+            ),
         ]
 
     def forward_batched(
@@ -815,9 +847,13 @@ class ThinkerSubmodule(NodeSubmodule):
     ) -> dict[str, NameToTensorList]:
         """Batched decode: multiple requests each contribute 1 token.
 
-        ``thinker_states`` is only included in a request's outputs when
-        that request has ``audio_output=True`` in its step_metadata. Text
-        only requests skip it to save cross-partition bandwidth.
+        Always packs ``thinker_states`` + ``thinker_mask`` in every per-rid
+        output dict so the captured CUDA graph has a static output shape
+        regardless of request metadata.  Per-rid filtering (dropping
+        ``thinker_states`` / ``thinker_mask`` for requests with
+        ``audio_output=False``) happens OUTSIDE the captured region via
+        ``filter_batched_output``, applied by both the AR engine's eager
+        path and the CUDA graph runner.
         """
         assert graph_walk == "thinker_decode"
 
@@ -841,45 +877,29 @@ class ThinkerSubmodule(NodeSubmodule):
 
         logits = self.model.lm_head(hidden)  # (batch, vocab)
 
-        # Determine per-request audio_output flags (default True for
-        # backwards compat).  If ANY request in the batch wants audio
-        # output we still need to compute the packed thinker_states tensor;
-        # we then only include it in the outputs for requests that asked
-        # for it.
-        request_ids = cache_manager.request_ids
-        per_request_info = per_request_info or {}
-        audio_output_flags: dict[str, bool] = {}
-        for rid in request_ids:
-            info = per_request_info.get(rid)
-            if info is not None:
-                audio_output_flags[rid] = info.step_metadata.get(
-                    "audio_output", True,
-                )
-            else:
-                audio_output_flags[rid] = True
-
-        any_audio = any(audio_output_flags.values())
-
-        if any_audio:
-            # Pack thinker_states once for the whole batch
-            if layer_n_hidden is not None:
-                thinker_states = torch.cat(
-                    [layer_0_embed, layer_n_hidden], dim=-1,
-                )
-            else:
-                thinker_states = torch.cat(
-                    [layer_0_embed, layer_0_embed], dim=-1,
-                )
+        # Always pack thinker_states once for the whole batch.  The
+        # per-rid ``audio_output`` gating happens outside this function
+        # via ``filter_batched_output`` so the captured graph's output
+        # shape stays static.  The extra cat is O(tokens * hidden) and
+        # negligible next to the transformer cost.
+        if layer_n_hidden is not None:
+            thinker_states = torch.cat(
+                [layer_0_embed, layer_n_hidden], dim=-1,
+            )
         else:
-            thinker_states = None
+            thinker_states = torch.cat(
+                [layer_0_embed, layer_0_embed], dim=-1,
+            )
 
+        request_ids = cache_manager.request_ids
         outputs: dict[str, NameToTensorList] = {}
         for i, rid in enumerate(request_ids):
-            req_out: NameToTensorList = {"logits": [logits[i : i + 1]]}
-            if audio_output_flags[rid] and thinker_states is not None:
-                req_out["thinker_states"] = [thinker_states[i : i + 1]]
-                if rid in masks_for_talker:
-                    req_out["thinker_mask"] = [masks_for_talker[rid]]
+            req_out: NameToTensorList = {
+                "logits": [logits[i : i + 1]],
+                "thinker_states": [thinker_states[i : i + 1]],
+            }
+            if masks_for_talker is not None and rid in masks_for_talker:
+                req_out["thinker_mask"] = [masks_for_talker[rid]]
             outputs[rid] = req_out
         # Expose the stacked [B, V] tensor under a sentinel key so the CUDA
         # graph runner can sample directly without concatenating per-rid slices.
@@ -892,6 +912,28 @@ class ThinkerSubmodule(NodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
     ) -> list[str]:
         return ["main"]
+
+    def filter_batched_output(
+        self,
+        request_info: CurrentForwardPassInfo,
+        rid_output: dict[str, list[torch.Tensor]],
+    ) -> dict[str, list[torch.Tensor]]:
+        """Drop ``thinker_states`` + ``thinker_mask`` for text-only requests.
+
+        ``forward_batched`` always emits these keys so the captured CUDA
+        graph's output shape is static.  Here, outside the captured
+        region, we gate them on the real request's ``audio_output`` flag
+        so the Talker edge stays unrouted for text-only requests (matches
+        the pre-capture eager-mode behaviour).
+        """
+        if request_info is None:
+            return rid_output
+        if request_info.step_metadata.get("audio_output", True):
+            return rid_output
+        return {
+            k: v for k, v in rid_output.items()
+            if k not in ("thinker_states", "thinker_mask")
+        }
 
     def postprocess(
         self, request_info: CurrentForwardPassInfo,

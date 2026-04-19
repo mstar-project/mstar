@@ -129,6 +129,24 @@ class NodeSubmodule(torch.nn.Module):
         """
         return
 
+    def filter_batched_output(
+        self,
+        request_info: CurrentForwardPassInfo,
+        rid_output: dict[str, list[torch.Tensor]],
+    ) -> dict[str, list[torch.Tensor]]:
+        """Drop per-rid output keys that don't apply to this request.
+
+        Called AFTER ``forward_batched`` (or CUDA graph replay) for each
+        real request, OUTSIDE any captured region.  Submodules that
+        always emit a static set of keys for capture compatibility can
+        override this to drop keys on a per-request basis (e.g. the
+        Qwen3-Omni Thinker always emits ``thinker_states`` inside the
+        graph, then drops it here for requests that don't need audio).
+
+        Default: identity.
+        """
+        return rid_output
+
 
 @dataclass
 class WorkerGraph:

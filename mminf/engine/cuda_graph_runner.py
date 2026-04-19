@@ -590,7 +590,15 @@ class CudaGraphRunner:
                     dummy_rid = dummy_rids[i]
                     if dummy_rid not in static_output:
                         continue
-                    for out_key, val in static_output[dummy_rid].items():
+                    # The captured dummy output has a static set of keys
+                    # (required for graph-compat).  Ask the submodule which
+                    # keys this real request should actually receive — e.g.
+                    # the Thinker always emits thinker_states inside the
+                    # graph but drops it here for audio_output=False.
+                    filtered = submodule.filter_batched_output(
+                        per_request_info.get(rid), static_output[dummy_rid],
+                    )
+                    for out_key, val in filtered.items():
                         if out_key == "logits":
                             continue
                         if isinstance(val, list):
