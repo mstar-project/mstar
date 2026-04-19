@@ -257,17 +257,33 @@ class VisionTransformerPredictorAC(nn.Module):
         self.predictor_norm = nn.LayerNorm(config.predictor_embed_dim, eps=config.layer_norm_eps)
         self.predictor_proj = nn.Linear(config.predictor_embed_dim, config.embed_dim, bias=True)
 
-        attn_mask: torch.Tensor | None = None
-        if config.is_frame_causal:
-            grid_depth = config.num_frames // config.tubelet_size
-            add_tokens = 3 if config.use_extrinsics else 2
-            attn_mask = build_action_block_causal_attention_mask(
-                grid_depth, self.grid_height, self.grid_width, add_tokens=add_tokens
-            )
-        # Register as a non-persistent buffer so it moves with .to(device) but
-        # doesn't appear in state_dict (matches upstream, which stores it on
-        # the module but not in the checkpoint).
-        self.register_buffer("attn_mask", attn_mask, persistent=False)
+        # Causal attention mask is fully derived from config, so we cache it
+        # lazily on the first forward rather than storing a buffer.  A buffer
+        # would be zeroed out by ``meta_device → to_empty(device)``, which is
+        # the pattern the model class uses to avoid a throwaway CPU init.
+        self._attn_mask_cache: torch.Tensor | None = None
+
+    @property
+    def attn_mask(self) -> torch.Tensor | None:
+        """Back-compat accessor used by tests.  Builds the mask on CPU if
+        it hasn't been built yet."""
+        if self._attn_mask_cache is None and self.config.is_frame_causal:
+            self._attn_mask_cache = self._build_attn_mask(torch.device("cpu"))
+        return self._attn_mask_cache
+
+    def _build_attn_mask(self, device: torch.device) -> torch.Tensor:
+        grid_depth = self.config.num_frames // self.config.tubelet_size
+        add_tokens = 3 if self.config.use_extrinsics else 2
+        return build_action_block_causal_attention_mask(
+            grid_depth, self.grid_height, self.grid_width, add_tokens=add_tokens
+        ).to(device)
+
+    def _get_attn_mask(self, device: torch.device) -> torch.Tensor:
+        cache = self._attn_mask_cache
+        if cache is None or cache.device != device:
+            cache = self._build_attn_mask(device)
+            self._attn_mask_cache = cache
+        return cache
 
     def forward(
         self,
@@ -305,8 +321,8 @@ class VisionTransformerPredictorAC(nn.Module):
             x = torch.cat([a, s, x], dim=2).flatten(1, 2)
             cond_tokens = 2
 
-        assert self.attn_mask is not None, "frame-causal attn_mask not built"
-        attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+        assert self.config.is_frame_causal, "non-causal AC predictor is not implemented"
+        attn_mask = self._get_attn_mask(x.device)[: x.size(1), : x.size(1)]
 
         for blk in self.predictor_blocks:
             x = blk(
