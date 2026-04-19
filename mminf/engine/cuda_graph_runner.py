@@ -744,6 +744,18 @@ class CodecCudaGraphRunner:
             )
             return
 
+        # Pin the device so torch.cuda.graph's side stream lands on the
+        # right GPU — without this, capture on cuda:N>0 dispatches on the
+        # default cuda:0 and every captured kernel errors out.
+        torch.cuda.set_device(self.device)
+
+        # Warmup AND capture share one side stream. cuDNN/cuBLAS allocate
+        # per-stream workspaces on their first kernel call; running warmup
+        # on the default stream and then capture on a fresh side stream
+        # triggers that allocation mid-capture, which fails with "operation
+        # not permitted when stream is capturing". Same-stream warmup makes
+        # the workspace land before capture_begin (matches sglang/vllm).
+        self._capture_stream = torch.cuda.Stream(device=self.device)
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
 
         for config in self.capture_configs:
@@ -821,18 +833,20 @@ class CodecCudaGraphRunner:
             static_inputs[name] = torch.zeros(t.shape, dtype=t.dtype, device=self.device)
             static_inputs[name].copy_(t)
 
-        torch.cuda.set_device(self.device)
-        torch.cuda.synchronize()
-        # Warmup (outside graph): compile kernels, prime caches
-        for _ in range(2):
-            fwd(**static_inputs)
-        torch.cuda.synchronize()
+        # Warmup and capture on the shared side stream (see warmup_and_capture
+        # for why). The stream is created in warmup_and_capture before the
+        # first _capture_one call.
+        stream = self._capture_stream
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                fwd(**static_inputs)
+        stream.synchronize()
 
-        # Capture
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.memory_pool):
+        with torch.cuda.graph(graph, pool=self.memory_pool, stream=stream):
             static_output = fwd(**static_inputs)
-        torch.cuda.synchronize()
+        stream.synchronize()
 
         key = (config.graph_walk, bs)
         self.graphs[key] = graph
