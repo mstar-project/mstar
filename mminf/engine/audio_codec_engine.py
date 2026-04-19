@@ -210,8 +210,6 @@ class AudioCodecEngine(BaseEngine):
         from mminf.engine.cuda_graph_runner import CodecCudaGraphRunner
 
         for node_name, submodule in self.submodules.items():
-            if not hasattr(submodule, 'cuda_graph_runner'):
-                continue
             if not hasattr(submodule, 'get_cuda_graph_configs'):
                 continue
 
