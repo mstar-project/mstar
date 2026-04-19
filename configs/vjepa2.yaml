@@ -1,0 +1,22 @@
+model: "vjepa2"
+max_seq_len: 8192
+
+# Override the default HF checkpoint (vitl @ 256).  Swap in any V-JEPA 2
+# variant — the same code loads vitl/h/g at 256 or 384 by reading config.json.
+# Examples:
+#   facebook/vjepa2-vith-fpc64-256
+#   facebook/vjepa2-vitg-fpc64-256
+#   facebook/vjepa2-vitg-fpc64-384
+model_kwargs:
+  model_path_hf: "facebook/vjepa2-vitl-fpc64-256"
+
+node_groups:
+  - node_names:
+      - video_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - predictor
+    ranks:
+      - 0
