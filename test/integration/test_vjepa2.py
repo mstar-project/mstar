@@ -47,6 +47,16 @@ from mminf.model.vjepa2.config import VJepa2ACPredictorConfig, VJepa2Config  # n
 
 HF_REPO = "facebook/vjepa2-vitl-fpc64-256"
 
+# Default to the coriander shared cache convention
+# (/m-coriander/coriander/$USER/mminf_cache/vjepa2), matching the launch
+# scripts under test/<model>/.  ``setdefault`` means a shell-level
+# ``HF_HUB_CACHE`` still wins if set, keeping the test portable.
+if "USER" in os.environ:
+    os.environ.setdefault(
+        "HF_HUB_CACHE",
+        f"/m-coriander/coriander/{os.environ['USER']}/mminf_cache/vjepa2",
+    )
+
 
 def _hf_cache_has_vjepa2() -> bool:
     """Check that the HF cache holds ``HF_REPO`` so we don't trigger a
