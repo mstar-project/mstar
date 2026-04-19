@@ -23,7 +23,6 @@ class AudioCodecEngine(BaseEngine):
         self.submodules: dict[str, torch.nn.Module] = {}
         self.device = None
         self.autocast_dtype = autocast_dtype
-        self._streaming_buffers: dict[str, dict[str, list[torch.Tensor]]] | None = None
 
     def engine_type(self) -> EngineType:
         return EngineType.AUDIO_CODEC
@@ -101,9 +100,8 @@ class AudioCodecEngine(BaseEngine):
 
     def _execute_with_cuda_graph(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Replay the captured graph. Runner handles preprocess + replay +
-        per-rid split; we only attach streaming buffers and wrap the result.
+        per-rid split; we only wrap the result.
         """
-        self._inject_streaming_buffers(batch)
         per_request_inputs = [
             batch.per_request_input_tensors.get(rid, {}) for rid in batch.request_ids
         ]
@@ -122,7 +120,6 @@ class AudioCodecEngine(BaseEngine):
 
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Eager batched path: preprocess → forward_batched(packed) → per-rid."""
-        self._inject_streaming_buffers(batch)
         per_request_inputs = [
             batch.per_request_input_tensors.get(rid, {}) for rid in batch.request_ids
         ]
@@ -153,21 +150,6 @@ class AudioCodecEngine(BaseEngine):
             range_pop()
         return NodeOutput(per_request_output_tensors=outputs)
 
-    def _inject_streaming_buffers(self, batch: NodeBatch) -> None:
-        """Stash the StreamBuffer for each rid in step_metadata so the
-        submodule's preprocess/forward can read it without plumbing.
-        """
-        if not self._streaming_buffers:
-            return
-        for rid in batch.request_ids:
-            if rid not in self._streaming_buffers:
-                continue
-            fwd_info = batch.per_request_info[rid]
-            fwd_info.step_metadata = {
-                **fwd_info.step_metadata,
-                "_streaming_buffer": self._streaming_buffers[rid],
-            }
-
     def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Execute each request individually."""
         outputs = {}
@@ -175,11 +157,6 @@ class AudioCodecEngine(BaseEngine):
             inputs = batch.per_request_input_tensors.get(rid, {})
 
             fwd_info = batch.per_request_info[rid]
-            if self._streaming_buffers and rid in self._streaming_buffers:
-                fwd_info.step_metadata = {
-                    **fwd_info.step_metadata,
-                    "_streaming_buffer": self._streaming_buffers[rid],
-                }
 
             if hasattr(submodule, 'preprocess'):
                 if self.enable_nvtx:

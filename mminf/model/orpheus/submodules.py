@@ -189,11 +189,6 @@ class SNACDecoderSubmodule(NodeSubmodule):
     single SNAC forward pass when all windows have the same frame count.
     """
 
-    # The cuda graph runner is attached by the engine after warmup (mirrors
-    # AR's submodule_management.cuda_graph_runner); None means the eager
-    # path is the only option.
-    cuda_graph_runner = None
-
     def __init__(self, snac_model: nn.Module, config: OrpheusModelConfig):
         super().__init__()
         self.snac_model = snac_model
