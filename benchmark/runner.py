@@ -18,6 +18,7 @@ from benchmark.request import (
     RequestInput,
     RequestMetrics,
     VLLMOmni,
+    VoxServe,
     aggregate_metrics,
 )
 
@@ -30,12 +31,15 @@ class DatasetType(Enum):
 class InferenceSystemType(Enum):
     OURS = "ours"
     VLLM_OMNI = "vllm_omni"
+    VOX_SERVE = "vox_serve"
 
     def instantiate(self) -> InferenceSystem:
         if self == InferenceSystemType.OURS:
             return OurSystem()
         elif self == InferenceSystemType.VLLM_OMNI:
             return VLLMOmni()
+        elif self == InferenceSystemType.VOX_SERVE:
+            return VoxServe()
 
 
 class ProfilingType(Enum):

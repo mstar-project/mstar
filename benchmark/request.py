@@ -468,6 +468,63 @@ class OurSystem(InferenceSystem):
 
         return metrics
 
+class VoxServe(InferenceSystem):
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        base_url: str,
+        request_id: int,
+        req_type: RequestType,
+        model: Model,
+        prompt: str,
+        image_path: Optional[str] = None,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        assert req_type == RequestType.T2S, "vox-serve only supports text-to-speech requests"
+        metrics = RequestMetrics(
+            request_id=request_id, type=req_type,
+            expected_output_modalities=["audio"]
+        )
+
+        try:
+            form = aiohttp.FormData()
+            form.add_field("text", prompt)
+            form.add_field("streaming", "true")
+
+            async with session.post(
+                f"{base_url}/generate", data=form,
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=30)
+            ) as resp:
+                resp.raise_for_status()
+
+                chunk_count = 0
+                async for chunk in resp.content.iter_any():
+                    if not chunk:
+                        break
+
+                    chunk_count += 1
+                    if chunk_count == 1:
+                        # Skip WAV header — vox-serve sends it as the first chunk,
+                        # our metrics abstraction doesn't expect it
+                        continue
+
+                    arrival_time = time.monotonic()
+                    data_b64 = base64.b64encode(chunk)
+
+                    metrics.record_output_chunk(
+                        modality="audio",
+                        data_b64=data_b64,
+                        arrival_time=arrival_time,
+                        n_tokens=1,
+                    )
+
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+
+        return metrics
+
 
 class VLLMOmni(InferenceSystem):
     async def send_request(
