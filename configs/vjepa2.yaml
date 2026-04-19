@@ -1,14 +1,10 @@
 model: "vjepa2"
 max_seq_len: 8192
 
-# Override the default HF checkpoint (vitl @ 256).  Swap in any V-JEPA 2
-# variant — the same code loads vitl/h/g at 256 or 384 by reading config.json.
-# Examples:
-#   facebook/vjepa2-vith-fpc64-256
-#   facebook/vjepa2-vitg-fpc64-256
-#   facebook/vjepa2-vitg-fpc64-384
-model_kwargs:
-  model_path_hf: "facebook/vjepa2-vitl-fpc64-256"
+# Default checkpoint is facebook/vjepa2-vitl-fpc64-256 (~300M), set in
+# HF_MODELS["vjepa2"] in mminf/model/registry.py.  To swap to vith / vitg /
+# vitg-384, edit that entry — the same code path loads every variant by
+# reading its config.json.
 
 node_groups:
   - node_names:
