@@ -49,7 +49,7 @@ from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule, TensorAndMetadata
 from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
 from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
-from mminf.model.qwen3_omni.submodules import Qwen3OmniCodePredictorSubmodule
+from mminf.model.qwen3_omni.submodules import Qwen3OmniCodePredictorSubmodule, Qwen3OmniOldCodePredictorSubmodule
 from mminf.model.utils import Operation, WeightConverter
 from mminf.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -188,6 +188,7 @@ class Qwen3OmniModel(Model):
             "Thinker": EngineType.AR,
             "Talker_LLM": EngineType.AR,
             "code_predictor": EngineType.CODE_PREDICTOR,
+            # "code_predictor": EngineType.ENC_DEC, # TODO DEBUG
             "Code2Wav": EngineType.AUDIO_CODEC,
         }
 
@@ -520,7 +521,7 @@ class Qwen3OmniModel(Model):
                 temperature=temperature, top_p=top_p
             )
         if node_name == "Talker_LLM":
-            temperature = model_kwargs.get("talker_temperature", 0.7)
+            temperature = model_kwargs.get("talker_temperature", 0.9)
             top_k = model_kwargs.get("talker_top_k", 50)
             top_p = model_kwargs.get("talker_top_p", 1.0)
             repetition_penalty = model_kwargs.get("talker_repetition_penalty", 1.05)
@@ -531,7 +532,7 @@ class Qwen3OmniModel(Model):
         if node_name == "code_predictor":
             temperature = model_kwargs.get("cp_temperature", 1.0)
             top_k = model_kwargs.get("cp_top_k", 50)
-            top_p = model_kwargs.get("cp_top_k", 0.8)
+            top_p = model_kwargs.get("cp_top_p", 0.8)
             return SamplingConfig(
                 temperature=temperature, top_p=top_p, top_k=top_k,
             )
@@ -1241,7 +1242,8 @@ class Qwen3OmniModel(Model):
         elif node_name == "Talker_LLM":
             return self._create_talker_submodule(device)
         elif node_name == "code_predictor":
-            return self._create_code_pred_submodule(device)
+            # return self._create_old_code_pred_submodule(device) # TODO DEBUG
+            return self._create_code_pred_submodule(device) # TODO DEBUG
         elif node_name == "Code2Wav":
             return self._create_code2wav_submodule(device)
         elif node_name == "audio_encoder":
@@ -1275,6 +1277,54 @@ class Qwen3OmniModel(Model):
             thinker_model=thinker_model,
             config=self.config,
         )
+
+    def _create_old_code_pred_submodule(self, device: str):  # TODO DEBUG
+        from transformers import AutoConfig
+        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration,
+        )
+
+        hf_full_config = AutoConfig.from_pretrained(
+            self.local_dir, trust_remote_code=True,
+        )
+        cp_hf_config = (
+            hf_full_config.talker_config.code_predictor_config
+        )
+        code_predictor = (
+            Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration
+            ._from_config(cp_hf_config)
+        )
+        load_weights_from_hf_shards(
+            repo_dir=self.local_dir,
+            modules=[
+                ModuleAndPrefix(code_predictor, prefix="talker.code_predictor"),
+            ],
+            device=device,
+        )
+        talker_sub = self._submodule_cache.get("Talker_LLM")
+        if talker_sub is not None and hasattr(talker_sub, "model"):
+            # Colocated: reuse the already-loaded embedding layer
+            embed_tokens = talker_sub.model.model.codec_embedding
+        else:
+            # Disaggregated: load embedding temporarily from the checkpoints
+            text_config = self.config.talker_text
+            embed_tokens = torch.nn.Embedding(text_config.vocab_size, text_config.hidden_size)
+            load_weights_from_hf_shards(
+                repo_dir=self.local_dir,
+                modules=[ModuleAndPrefix(
+                    embed_tokens, prefix="talker.model.codec_embedding"
+                )],
+                device=device,
+            )
+
+        code_predictor.eval()
+        return Qwen3OmniOldCodePredictorSubmodule(
+            code_predictor=code_predictor,
+            talker_code_emb=embed_tokens,
+            config=self.config
+        )
+
     
     def _create_code_pred_submodule(self, device: str) -> CodePredictorSubmodule:
         from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards

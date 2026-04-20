@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 import logging
 from typing import Optional
 
@@ -1237,8 +1238,6 @@ class TalkerLLMSubmodule(NodeSubmodule):
             seq_lens=seq_lens, label="main"
         )
 
-        print(cache_manager._get_state(request_ids[0], "main"))
-
         input_embeds = torch.cat(all_embeds, dim=0)
         return {
             "input_embeds": input_embeds,
@@ -1372,6 +1371,96 @@ class TalkerLLMSubmodule(NodeSubmodule):
         return ["main"]
 
 
+class Qwen3OmniOldCodePredictorSubmodule(CodePredictorSubmodule):
+    def __init__(
+        self, code_predictor: nn.Module,
+        talker_code_emb: nn.Embedding,
+        config: Qwen3OmniModelConfig
+    ):
+        super().__init__()
+        self.code_predictor = code_predictor
+        self.config = config
+        self.cp_cfg = self.config.code_predictor
+        self.num_codes = self.cp_cfg.num_code_groups
+        self.talker_code_emb  = talker_code_emb
+        self.sampler = Sampler()
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ):
+        self.sampler.add_request(request_id=request_ids[0])
+        self.sampler.set_config(
+            request_id=request_ids[0],
+            temperature=1.0,
+            tok_k=50,
+            top_p=0.8
+        )
+        return {
+            "last_hidden": torch.cat([
+                inp["last_hidden"][0] for inp in per_request_inputs
+            ], dim=0),
+            "layer0_codes": torch.cat([
+                inp["layer0_codes"][0] for inp in per_request_inputs
+            ]),
+            "request_id": request_ids[0]
+        }
+    
+    def forward(
+        self,
+        request_id: str,
+        last_hidden: torch.Tensor,
+        layer0_codes: torch.Tensor,
+        **kwargs
+    ) -> dict[str, NameToTensorList]:
+        cp_dtype = next(self.code_predictor.parameters()).dtype
+        orig_dtype = last_hidden.dtype
+        codec_emb_sum = torch.zeros_like(last_hidden).to(cp_dtype)
+
+        all_codes = torch.zeros((
+            1, self.num_codes
+        ), device=layer0_codes.device, dtype=torch.long)
+        all_codes[:, 0] = layer0_codes
+
+        layer0_embed = self.talker_code_emb(layer0_codes).unsqueeze(0)
+        codec_emb_sum += layer0_embed.squeeze(0)
+
+        last_hidden_cp = last_hidden.to(cp_dtype).unsqueeze(0)
+
+        cp_input = torch.cat(
+            [last_hidden_cp, layer0_embed], dim=1,
+        )  # (1, 2, H)
+
+        cp = self.code_predictor
+        cp_residual_embeddings = cp.model.codec_embedding
+        lm_heads = cp.lm_head
+
+        for group_idx in range(1, self.num_codes):
+            outputs = self.code_predictor.model(
+                inputs_embeds=cp_input,
+                use_cache=False,
+            )
+            hidden_states = outputs.last_hidden_state
+            logits = lm_heads[group_idx - 1](hidden_states[:, -1:, :])
+            cp_logits_2d = logits.squeeze(1)
+
+            codes = self.sampler.sample(request_ids=[request_id], logits=cp_logits_2d)
+            all_codes[:, group_idx] = codes
+
+            next_embed = cp_residual_embeddings[group_idx - 1](codes.view(1, 1)).to(cp_dtype)
+            codec_emb_sum += next_embed.squeeze(0)
+
+            cp_input = torch.cat([cp_input, next_embed], dim=1)
+
+        return {
+            "talker_input_embeds": [codec_emb_sum.to(orig_dtype)],
+            "codec_tokens": [all_codes[0]],
+        }
+
+
 class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
     def __init__(
         self, code_predictor: Qwen3OmniCodePredictor,
@@ -1448,13 +1537,18 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
                 graph_walk=graph_walk,
                 embed=embed,
                 cache_manager=cache_manager
-            )["hidden"]
-        
+            )
 
         embed = self.talker_code_emb(layer0_codes)
         codec_emb_sum += embed
 
+        # # TODO DEBUG
+        # cp_input = torch.cat(
+        #     [packed_inputs["last_hidden"], embed], dim=0,
+        # )  # (1, 2, H)
+
         for group_idx in range(1, self.num_codes):
+            print(embed.shape, cache_manager._get_state(request_ids[0], "main"))
             if cuda_graph_runner is not None:
                 hidden = cuda_graph_runner.run(
                     graph_walk=graph_walk,
@@ -1471,6 +1565,15 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
                     embed=embed,
                     cache_manager=cache_manager
                 )["hidden"]
+                # cache_manager.plan_attention([group_idx + 1] * len(request_ids), label="main")
+                # cache_manager.plan_rope([group_idx + 1] * len(request_ids), label="main")
+                # hidden = self.forward_cuda_graph(
+                #     graph_walk=graph_walk,
+                #     embed=cp_input,
+                #     cache_manager=cache_manager
+                # )["hidden"][-1:]
+                # cache_manager.reset_state(request_ids[0])
+
             orig_dtype = hidden.dtype
             lm_head = self.code_predictor.get_lm_head(group_idx)
             logits = lm_head(hidden.to(lm_head.weight.dtype)).to(orig_dtype)
@@ -1479,6 +1582,9 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
 
             embed = self.code_predictor.get_embedding(group_idx)(codes)
             codec_emb_sum += embed
+
+            # TODO DEBUG
+            # cp_input = torch.cat([cp_input, embed], dim=0)
 
         return {
             req_id: {
@@ -1493,6 +1599,7 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
     def get_code_pred_cuda_graph_configs(
         self, device: torch.device
     ) -> list[CodePredictorCudaGraphConfig]:
+        return [] # TODO DEBUG
         return [
             CodePredictorCudaGraphConfig(
                 graph_walk="talker_last_prefill",

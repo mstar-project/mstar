@@ -372,7 +372,6 @@ class CodePredictorCudaGraphRunner:
                 continue
             static_buf = dummy_inputs[key]
             static_buf[:real_val.shape[0]].copy_(real_val)
-
         graph.replay()
 
         # --- Step 5: Advance seq_lens on REAL request states ---

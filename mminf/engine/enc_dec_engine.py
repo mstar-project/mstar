@@ -142,6 +142,8 @@ class EncoderDecoderEngine(BaseEngine):
         if not torch.cuda.is_available():
             return
 
+        return # TODO DEBUG
+
         for node_name, submodule in self.submodules.items():
             try:
                 if hasattr(submodule, 'forward'):
