@@ -6,19 +6,18 @@ Skipped automatically when:
   * CUDA is not available, or
   * The upstream ``vjepa2`` repo isn't importable (``src.models.*``
     needs to be on ``PYTHONPATH``), or
-  * The upstream ``.pt`` hasn't been downloaded yet — either to the HF
-    cache under ``facebook/vjepa2-ac-vitg/original/model.pth`` OR to the
-    shared S3-mirror snapshot on the cluster.
+  * The upstream ``.pt`` hasn't been cached at
+    ``{cache_dir}/vjepa2-ac-vitg.pt``.
 
 Local run::
 
-    git clone https://github.com/facebookresearch/vjepa2 ~/vjepa2
-    export PYTHONPATH=$HOME/vjepa2:$PYTHONPATH
-    # Pre-download (one time, ~11.7 GB):
-    python -c "from huggingface_hub import snapshot_download; \
-        snapshot_download('facebook/vjepa2-ac-vitg', \
-            allow_patterns=['original/*'], \
-            cache_dir='/m-coriander/coriander/$USER/mminf_cache/vjepa2')"
+    git clone https://github.com/facebookresearch/vjepa2 /m-coriander/coriander/$USER/vjepa2
+    export PYTHONPATH=/m-coriander/coriander/$USER/vjepa2:$PYTHONPATH
+    # Pre-download (one time, ~11.7 GB, direct from S3 — no HF auth):
+    python -c "import torch.hub; torch.hub.download_url_to_file( \
+        'https://dl.fbaipublicfiles.com/vjepa2/vjepa2-ac-vitg.pt', \
+        '/m-coriander/coriander/$USER/mminf_cache/vjepa2/vjepa2-ac-vitg.pt', \
+        progress=True)"
     pytest test/integration/test_vjepa2_ac.py -v -s
 
 What it does
@@ -58,15 +57,11 @@ from mminf.model.vjepa2.weight_loader import (  # noqa: E402
     load_vjepa2_ac_upstream_weights,
 )
 
-HF_REPO = "facebook/vjepa2-ac-vitg"
 
-# Share the coriander cache convention with other V-JEPA 2 tests / launch
-# scripts.  ``setdefault`` preserves shell-level overrides.
-if "USER" in os.environ:
-    os.environ.setdefault(
-        "HF_HUB_CACHE",
-        f"/m-coriander/coriander/{os.environ['USER']}/mminf_cache/vjepa2",
-    )
+def _default_cache_dir() -> Path:
+    if "USER" in os.environ:
+        return Path(f"/m-coriander/coriander/{os.environ['USER']}/mminf_cache/vjepa2")
+    return Path.home() / ".cache" / "mminf_vjepa2"
 
 
 def _upstream_pt_path() -> Path | None:
@@ -75,15 +70,15 @@ def _upstream_pt_path() -> Path | None:
     Returns ``None`` if the file hasn't been fetched (so the tests skip
     gracefully rather than blocking on a ~12 GB download).
     """
-    cache_root = Path(
-        os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")
-    ) / "hub"
-    alt_root = os.environ.get("HF_HUB_CACHE")
-    for root in filter(None, [alt_root, str(cache_root)]):
-        repo_dir = Path(root) / f"models--{HF_REPO.replace('/', '--')}"
-        for pt in repo_dir.rglob("original/model.pth"):
-            if pt.is_file():
-                return pt
+    candidates: list[Path] = []
+    env_cache = os.environ.get("MMINF_VJEPA2_CACHE")
+    if env_cache:
+        candidates.append(Path(env_cache))
+    candidates.append(_default_cache_dir())
+    for root in candidates:
+        pt = root / "vjepa2-ac-vitg.pt"
+        if pt.is_file() and pt.stat().st_size > 0:
+            return pt
     return None
 
 
@@ -110,9 +105,9 @@ pytestmark = [
     pytest.mark.skipif(
         _upstream_pt_path() is None,
         reason=(
-            "vjepa2-ac-vitg .pt not found in HF cache; fetch with "
-            f"huggingface-cli download {HF_REPO} --include 'original/*' "
-            f"(mirror: {VJEPA2_AC_VITG_S3_URL})"
+            f"vjepa2-ac-vitg.pt not found in cache; pre-download from "
+            f"{VJEPA2_AC_VITG_S3_URL} or let `test/vjepa2/launch_server_vjepa2_ac.sh` "
+            "trigger the download on first model init"
         ),
     ),
 ]
@@ -168,15 +163,14 @@ def ac_config() -> VJepa2Config:
 
 @pytest.fixture(scope="module")
 def pt_path() -> Path:
-    # Prefer what's already cached; if both HF_HUB_CACHE and HF_HOME miss,
-    # call the downloader (marker already asserted the file exists).
+    # Prefer what's already cached; if not present the module marker above
+    # would already have skipped these tests, so this fallback is effectively
+    # unreachable in normal runs — but we keep it so the test still works
+    # when re-enabled via ``MMINF_VJEPA2_CACHE`` + pre-downloaded weights.
     found = _upstream_pt_path()
     if found is not None:
         return found
-    return download_vjepa2_ac_upstream_pt(
-        HF_REPO,
-        cache_dir=os.environ.get("HF_HUB_CACHE"),
-    )
+    return download_vjepa2_ac_upstream_pt(cache_dir=str(_default_cache_dir()))
 
 
 @pytest.fixture(scope="module")
