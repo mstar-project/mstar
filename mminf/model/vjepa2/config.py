@@ -74,8 +74,17 @@ class VJepa2Config:
     predictor_kind: str = "masked"
     ac_predictor: VJepa2ACPredictorConfig | None = None
 
-    # Rollout (Phase 2)
+    # Rollout (Phase 2).  ``max_rollout_horizon`` caps the DynamicLoop's
+    # ``max_iters`` at graph-build time; per-request ``rollout_horizon`` is
+    # enforced by early-exit (``register_loop_stop``) from inside the
+    # rollout submodule.
     max_rollout_horizon: int = 16
+    # AnticipativeWrapper-parity rollout geometry.  Per-request tuning is a
+    # later extension — for now these are set once from config and baked
+    # into the cached ``rollout_predictor`` submodule.
+    rollout_num_output_frames: int = 2
+    rollout_frames_per_second: int = 4
+    rollout_anticipation_seconds: float = 1.0
 
     @classmethod
     def from_hf_config(cls, config_dict: dict[str, Any]) -> "VJepa2Config":
