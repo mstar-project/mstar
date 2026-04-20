@@ -203,28 +203,52 @@ def our_modules(ac_config: VJepa2Config, pt_path: Path, device: torch.device):
 
 @pytest.fixture(scope="module")
 def upstream_modules(ac_config: VJepa2Config, pt_path: Path, device: torch.device):
-    """Build the upstream reference model via ``_make_vjepa2_ac_model`` and
-    load the same ``.pt`` via upstream's own ``_clean_backbone_key`` path.
+    """Build the upstream reference encoder + AC predictor, each configured
+    so its internal attention kernel matches ours (apples-to-apples parity).
 
-    ``pretrained=False`` so the call doesn't try to reach the upstream
-    CDN (which expects ``VJEPA_BASE_URL=http://localhost:8300`` for tests
-    per ``src/hub/backbones.py``).  We apply weights ourselves to keep the
-    test self-contained.
+    * Encoder → ``use_sdpa=False`` so upstream runs the eager
+      matmul+softmax path that our ``VJEPA2Encoder`` ports from HF
+      Transformers.  Default upstream config is ``use_sdpa=True``, which
+      introduces ~1e-4 per-layer drift that compounds over 40 layers at
+      ViT-g scale to ~6e-3 — not a bug, just kernel-accumulation noise,
+      but enough to blow past an atol=1e-3 parity assertion.
+    * Predictor → keep ``use_sdpa`` default (True): upstream's
+      ``ACRoPEAttention`` and our ported ``ACRoPEAttention`` both call
+      ``F.scaled_dot_product_attention`` directly, so SDPA-on-both is
+      already bit-exact.
+
+    Weights come from the same ``.pt`` via upstream's own
+    ``_clean_backbone_key``, so both sides see identical parameters.
     """
-    from src.hub.backbones import _clean_backbone_key, _make_vjepa2_ac_model
+    from src.hub.backbones import _clean_backbone_key
+    from src.models import ac_predictor as vit_ac_predictor
+    from src.models import vision_transformer as vit_encoder
 
-    encoder, predictor = _make_vjepa2_ac_model(
-        model_name="vit_ac_giant",
-        img_size=256,
+    # Same args ``_make_vjepa2_ac_model(model_name="vit_ac_giant")`` would
+    # pass, except we force ``use_sdpa=False`` to match our encoder's kernel.
+    encoder = vit_encoder.vit_giant_xformers(
         patch_size=16,
-        tubelet_size=2,
+        img_size=(256, 256),
         num_frames=64,
-        pretrained=False,
+        tubelet_size=2,
+        use_sdpa=False,  # eager attention, matches our VJEPA2Encoder port
+        use_SiLU=False,
+        wide_SiLU=True,
+        uniform_power=False,
+        use_rope=True,
     )
+    predictor = vit_ac_predictor.vit_ac_predictor(
+        img_size=(256, 256),
+        patch_size=16,
+        num_frames=64,
+        tubelet_size=2,
+        embed_dim=encoder.embed_dim,
+    )
+
     blob = torch.load(pt_path, map_location="cpu", weights_only=True)
     encoder_sd = _clean_backbone_key(dict(blob["encoder"]))
     predictor_sd = _clean_backbone_key(dict(blob["predictor"]))
-    encoder.load_state_dict(encoder_sd, strict=False)
+    encoder.load_state_dict(encoder_sd, strict=False)  # pos_embed is zero-init + unused under use_rope
     predictor.load_state_dict(predictor_sd, strict=True)
     encoder.to(device)
     predictor.to(device)
