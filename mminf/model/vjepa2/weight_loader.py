@@ -135,7 +135,9 @@ def _rename_upstream_encoder_keys(
     ``VJEPA2Encoder`` is already the ``encoder`` sub-module).
 
     Transforms applied, in order, per key:
-      1. strip ``module.backbone.``
+      1. strip ``module.`` and ``backbone.`` independently (matches upstream
+         ``_clean_backbone_key`` — real checkpoints use either or both
+         depending on the DDP / parent-wrapper situation at save time)
       2. ``blocks.X.``               → ``layer.X.``
       3. ``attn.``                   → ``attention.``
       4. ``patch_embed.``            → ``embeddings.patch_embeddings.``
@@ -156,7 +158,12 @@ def _rename_upstream_encoder_keys(
     """
     out: dict[str, torch.Tensor] = {}
     for raw_key, val in state_dict.items():
-        key = raw_key.replace("module.backbone.", "")
+        # Match upstream ``_clean_backbone_key`` exactly: strip both wrapping
+        # prefixes independently, not as a combined ``module.backbone.`` token.
+        # Real checkpoints may expose either order (``module.backbone.X``,
+        # ``backbone.module.X``, or just one of them) depending on whether
+        # the ``.pt`` was saved after DDP-wrap, backbone-wrap, or both.
+        key = raw_key.replace("module.", "").replace("backbone.", "")
         # Drop RoPE-encoder pos_embed (our VJEPA2Encoder has no position
         # embedding slot — it uses 3D RoPE inside attention instead).
         if key == "pos_embed":
@@ -305,12 +312,21 @@ def load_vjepa2_ac_upstream_weights(
                 "hidden_size must be provided (or encoder_module.config.hidden_size must exist) "
                 "to split the upstream fused qkv weights."
             )
+        # Debug aid for key-rename mismatches: log a few source-side sample
+        # keys so a future failure shows exactly what prefixes the blob uses
+        # (seen at least: ``module.backbone.X``, ``backbone.X``, ``module.X``).
+        src_sample = list(blob["encoder"].keys())[:4]
+        logger.info("AC encoder: %d source keys; sample: %s", len(blob["encoder"]), src_sample)
         renamed = _rename_upstream_encoder_keys(blob["encoder"], hidden_size=hidden_size)
+        logger.info("AC encoder: %d renamed keys; sample: %s", len(renamed), list(renamed.keys())[:4])
         if target_device.type != "cpu":
             renamed = {k: v.to(target_device) for k, v in renamed.items()}
         missing, unexpected = encoder_module.load_state_dict(renamed, strict=False, assign=True)
         if missing:
-            raise KeyError(f"Missing keys when loading AC encoder weights: {missing}")
+            raise KeyError(
+                f"Missing keys when loading AC encoder weights: {missing[:8]} "
+                f"(total {len(missing)}; unexpected = {unexpected[:4]})"
+            )
         if unexpected:
             logger.debug("Ignored %d unexpected AC-encoder keys: %s", len(unexpected), unexpected[:8])
         # Free upstream-layout encoder state once it's been remapped +
@@ -319,12 +335,18 @@ def load_vjepa2_ac_upstream_weights(
         blob["encoder"] = None
 
     if predictor_module is not None:
+        src_sample = list(blob["predictor"].keys())[:4]
+        logger.info("AC predictor: %d source keys; sample: %s", len(blob["predictor"]), src_sample)
         renamed = _rename_upstream_ac_predictor_keys(blob["predictor"])
+        logger.info("AC predictor: %d renamed keys; sample: %s", len(renamed), list(renamed.keys())[:4])
         if target_device.type != "cpu":
             renamed = {k: v.to(target_device) for k, v in renamed.items()}
         missing, unexpected = predictor_module.load_state_dict(renamed, strict=False, assign=True)
         if missing:
-            raise KeyError(f"Missing keys when loading AC predictor weights: {missing}")
+            raise KeyError(
+                f"Missing keys when loading AC predictor weights: {missing[:8]} "
+                f"(total {len(missing)}; unexpected = {unexpected[:4]})"
+            )
         if unexpected:
             logger.debug("Ignored %d unexpected AC-predictor keys: %s", len(unexpected), unexpected[:8])
         blob["predictor"] = None
