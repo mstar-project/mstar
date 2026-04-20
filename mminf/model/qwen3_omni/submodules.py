@@ -1517,7 +1517,7 @@ class Code2WavSubmodule(NodeSubmodule):
         for r in self.config.code2wav.upsampling_ratios:
             total_upsample *= r
         self._total_upsample = total_upsample
-
+    
     def preprocess(
         self,
         graph_walk: str,
@@ -1540,8 +1540,6 @@ class Code2WavSubmodule(NodeSubmodule):
         # codec_tokens: accumulated from StreamBuffer
         # Shape varies: could be (num_frames, num_code_groups) or (num_frames,)
         codec_tokens = inputs["codec_tokens"][0]
-        if isinstance(codec_tokens, dict):
-            codec_tokens = codec_tokens.get("data", codec_tokens)
 
         num_quantizers = self.config.code2wav.num_quantizers  # 16
 
@@ -1633,4 +1631,6 @@ class Code2WavSubmodule(NodeSubmodule):
         return {"audio_chunk": [audio_int16]}
 
     def can_batch(self, batch: NodeBatch) -> bool:
-        return False
+        return len({
+            inputs["codec_tokens"][0].numel() for inputs in batch.per_request_input_tensors.values()
+        }) == 1
