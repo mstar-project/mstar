@@ -444,14 +444,12 @@ class Loop(GraphSection):
     section: GraphSection
     max_iters: int
     outputs: list[GraphEdge]
-    accumulated_outputs: list[GraphEdge] = field(default_factory=None)
     curr_iter: int = field(default=0, repr=False)
     _external_inputs: list[GraphEdge] = field(default=None, repr=False)
     _loop_back_signals: list[GraphEdge] = field(default=None, repr=False)
     _curr_iter_section: GraphSection = field(default=None, repr=False)
     _nxt_iter_section: GraphSection = field(default=None, repr=False)
     _cached_outputs: dict[str, list[TensorPointerInfo]] = field(default_factory=dict, repr=False)
-    _cached_acc_outputs: dict[str, list[TensorPointerInfo]] = field(default_factory=dict, repr=False)
     _output_names: set[str] = field(default_factory=set, repr=False)
     _uuid_label: str = field(default_factory=lambda: str(uuid4()), repr=False)
 
@@ -491,11 +489,7 @@ class Loop(GraphSection):
             tensor_infos = tensor_info[out_name]
             for info in tensor_infos:
                 self._tensor_manager.increment_ref(self._request_id, info.uuid)
-
-            if out_name in self._acc_output_dict:
-                self._acc_output_dict[out_name].tensor_info.extend(tensor_infos)
-            else:
-                self._cached_outputs.setdefault(out_name, []).extend(tensor_infos)
+            self._cached_outputs.setdefault(out_name, []).extend(tensor_infos)
         if self._curr_iter_section is not None:
             self._curr_iter_section.cache_outputs(tensor_info)
 
@@ -540,13 +534,6 @@ class Loop(GraphSection):
                         graph_edge.name, graph_edge.next_node
                     )].tensor_info = graph_edge.tensor_info
                     graph_edge._persist_for_loop = True
-        for edge in ingested:
-            if edge.name in self._acc_output_dict and \
-                    len(self._acc_output_dict[edge.name].tensor_info) == 0:
-                # Also accumulate the initial input value for this signal
-                self._acc_output_dict[edge.name].tensor_info.extend(
-                    edge.tensor_info
-                )
         return ingested
 
     def _get_external_inputs(self):
@@ -590,9 +577,6 @@ class Loop(GraphSection):
             self._external_inputs = self._get_external_inputs()
         if self._loop_back_signals is None:
             self._loop_back_signals = self._get_loop_back_signals()
-        self._acc_output_names = set([
-            edge.name for edge in self.accumulated_outputs
-        ])
 
 
     def _advance_one_iter(self) -> "Loop":
@@ -691,7 +675,6 @@ class Loop(GraphSection):
             if output.name in self._cached_outputs:
                 output.tensor_info = self._cached_outputs[output.name]
                 output_signals.append(output)
-        output_signals.extend(self.accumulated_outputs)
 
         loop_back_name_dests.update([
             (edge.name, edge.next_node) for edge in self._loop_back_signals

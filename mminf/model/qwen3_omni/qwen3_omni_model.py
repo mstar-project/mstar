@@ -46,8 +46,10 @@ from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule, TensorAndMetadata
+from mminf.model.code_predictor import CodePredictorSubmodule
 from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
 from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
+from mminf.model.qwen3_omni.submodules import Qwen3OmniCodePredictorSubmodule
 from mminf.model.utils import Operation, WeightConverter
 from mminf.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -170,7 +172,6 @@ class Qwen3OmniModel(Model):
             num_kv_heads=self.config.code_predictor.num_key_value_heads,
             head_dim=self.config.code_predictor.head_dim,
             max_seq_len=self.config.code_predictor.num_code_groups + 1, # not sure if +1 is needed
-            max_num_pages=512,
             num_qo_heads=self.config.code_predictor.num_attention_heads,
             nodes=["code_predictor"]
         )
@@ -186,7 +187,7 @@ class Qwen3OmniModel(Model):
             "vision_encoder": EngineType.ENC_DEC,
             "Thinker": EngineType.AR,
             "Talker_LLM": EngineType.AR,
-            "code_predictor": EngineType.AR,
+            "code_predictor": EngineType.CODE_PREDICTOR,
             "Code2Wav": EngineType.AUDIO_CODEC,
         }
 
@@ -354,51 +355,13 @@ class Qwen3OmniModel(Model):
         talker_llm_outputs = [
             GraphEdge(
                 next_node="code_predictor",
-                name="cp_embed",
+                name="last_hidden",
             ),
             GraphEdge(
                 next_node="code_predictor",
-                name="codec_embed_sum",
-            ),
-            GraphEdge(
-                next_node="code_predictor",
-                name="codec_tokens",
-            ),
-            GraphEdge(
-                next_node="code_predictor",
-                name="group_idx",
+                name="layer0_codes",
             ),
         ]
-
-        code_predictor = GraphNode(
-            name="code_predictor",
-            input_ids=[
-                "cp_embed", "codec_embed_sum",
-                "codec_tokens", "group_idx"
-            ],
-            outputs=[
-                GraphEdge(
-                    next_node="code_predictor",
-                    name="codec_embed_sum"
-                ),
-                GraphEdge(
-                    next_node="code_predictor",
-                    name="cp_embed"
-                ),
-                GraphEdge(
-                    next_node="code_predictor",
-                    name="codec_tokens"
-                ),
-                GraphEdge(
-                    next_node="code_predictor",
-                    name="group_idx"
-                ),
-                GraphEdge(
-                    next_node=EMPTY_DESTINATION,
-                    name="talker_input_embeds"
-                )
-            ]
-        )
 
         talker_last_prefill = Sequential(
             sections=[
@@ -407,17 +370,17 @@ class Qwen3OmniModel(Model):
                     input_ids=["thinker_states", "thinker_mask", "talker_trigger"],
                     outputs=deepcopy(talker_llm_outputs)
                 ),
-                Loop(
-                    section=deepcopy(code_predictor),
-                    max_iters=self.config.code_predictor.num_code_groups,
+                GraphNode(
+                    name="code_predictor",
+                    input_ids=[
+                        "last_hidden", "layer0_codes"
+                    ],
                     outputs=[
                         GraphEdge(
                             next_node=EMPTY_DESTINATION,
-                            persist=True,
-                            name="talker_input_embeds"
-                        )
-                    ],
-                    accumulated_outputs=[
+                            name="talker_input_embeds",
+                            persist=True
+                        ),
                         StreamingGraphEdge(
                             next_node="Code2Wav",
                             name="codec_tokens",
@@ -438,17 +401,17 @@ class Qwen3OmniModel(Model):
                         input_ids=["thinker_states", "thinker_mask", "talker_input_embeds"],
                         outputs=deepcopy(talker_llm_outputs)
                     ),
-                    Loop(
-                        section=deepcopy(code_predictor),
-                        max_iters=self.config.code_predictor.num_code_groups,
+                    GraphNode(
+                        name="code_predictor",
+                        input_ids=[
+                            "last_hidden", "layer0_codes"
+                        ],
                         outputs=[
                             GraphEdge(
                                 next_node="Talker_LLM",
-                                persist=True,
-                                name="talker_input_embeds"
-                            )
-                        ],
-                        accumulated_outputs=[
+                                name="talker_input_embeds",
+                                persist=True
+                            ),
                             StreamingGraphEdge(
                                 next_node="Code2Wav",
                                 name="codec_tokens",
@@ -929,50 +892,45 @@ class Qwen3OmniModel(Model):
            - If codec_eos: request_done=True for Talker
            - Else: return all_codes as input again (loop)
         """
-        if metadata.is_prefill:
-            # Talker is in prefill mode, waiting for conductor triggers.
-
+        if metadata.graph_walk == "talker_prefill":
             metadata.kwargs["prefill_chunks_processed"] += 1
-            if persist_signals.get("all_codes", []):
-                # Produced all_codes, so can transition to decode
-                metadata.is_prefill = False
-                metadata.graph_walk = "talker_decode"
-                metadata.kwargs["talker_prefill_done"] = True
-
-                # Feed all_codes back as input for first decode step
-                edge = GraphEdge(next_node="Talker", name="all_codes")
-                edge.tensor_info = persist_signals.get("all_codes", [])
-                inputs = [edge]
-                unpersist_tensors = sum(
-                    [inp.tensor_info for inp in inputs], start=[]
-                )
-
-                return ForwardPassArgs(
-                    full_metadata=metadata,
-                    inputs=inputs,
-                    unpersist_tensors=unpersist_tensors,
-                    step_metadata={
-                        "is_prefill": False,
-                        "is_last_prefill": False,
-                    },
-                )
-
             is_last_prefill = metadata.kwargs["num_thinker_prefill_steps"] == \
                  metadata.kwargs["prefill_chunks_processed"]
+            metadata.graph_walk = "talker_last_prefill" if is_last_prefill else "talker_prefill"
             return ForwardPassArgs(
                 full_metadata=metadata,
                 inputs=[GraphEdge(next_node="Talker", name="talker_trigger")],
                 unpersist_tensors=[],
                 step_metadata={
                     "is_prefill": True,
-                    "is_last_prefill": is_last_prefill,
                     # voice is used for the last prefill
                     "voice": metadata.kwargs.get("voice", "Ethan")
                 },
             )
+        elif metadata.graph_walk == "talker_last_prefill":
+            metadata.is_prefill = False
+            metadata.graph_walk = "talker_decode"
+            metadata.kwargs["talker_prefill_done"] = True
+
+            # Feed all_codes back as input for first decode step
+            edge = GraphEdge(next_node="Talker", name="talker_input_embeds")
+            edge.tensor_info = persist_signals["talker_input_embeds"]
+            inputs = [edge]
+            unpersist_tensors = sum(
+                [inp.tensor_info for inp in inputs], start=[]
+            )
+
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=inputs,
+                unpersist_tensors=unpersist_tensors,
+                step_metadata={
+                    "is_prefill": False,
+                },
+            )
 
         elif metadata.graph_walk == "talker_decode":
-            # If the decode loop reaches the conductor, we can end the request.
+            # If the decode dynamic loop reaches the conductor, we can end the request.
             return ForwardPassArgs(
                 full_metadata=metadata,
                 inputs=[],
@@ -1280,8 +1238,10 @@ class Qwen3OmniModel(Model):
     def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
         if node_name == "Thinker":
             return self._create_thinker_submodule(device)
-        elif node_name == "Talker":
+        elif node_name == "Talker_LLM":
             return self._create_talker_submodule(device)
+        elif node_name == "code_predictor":
+            return self._create_code_pred_submodule(device)
         elif node_name == "Code2Wav":
             return self._create_code2wav_submodule(device)
         elif node_name == "audio_encoder":
@@ -1315,6 +1275,24 @@ class Qwen3OmniModel(Model):
             thinker_model=thinker_model,
             config=self.config,
         )
+    
+    def _create_code_pred_submodule(self, device: str) -> CodePredictorSubmodule:
+        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
+
+        with torch.device("meta"):
+            code_predictor = Qwen3OmniCodePredictor(self.config.code_predictor)
+        load_weights_from_hf_shards(
+            repo_dir=self.local_dir,
+            modules=[
+                ModuleAndPrefix(code_predictor, prefix="talker.code_predictor"),
+            ],
+            device=device,
+        )
+
+        code_predictor.eval()
+        return Qwen3OmniCodePredictorSubmodule(
+            code_predictor=code_predictor, config=self.config
+        )
 
     def _create_talker_submodule(self, device: str) -> NodeSubmodule:
         from mminf.model.qwen3_omni.components.talker import Qwen3OmniTalkerModel
@@ -1333,24 +1311,11 @@ class Qwen3OmniModel(Model):
             device=device,
             conv=self.CONVERTER
         )
-
-        with torch.device("meta"):
-            code_predictor = Qwen3OmniCodePredictor(self.config.code_predictor)
-        load_weights_from_hf_shards(
-            repo_dir=self.local_dir,
-            modules=[
-                ModuleAndPrefix(code_predictor, prefix="talker.code_predictor"),
-            ],
-            device=device,
-        )
-
         talker_model.eval()
-        code_predictor.eval()
 
-        from mminf.model.qwen3_omni.submodules import TalkerSubmodule
-        talker_sub = TalkerSubmodule(
+        from mminf.model.qwen3_omni.submodules import TalkerLLMSubmodule
+        talker_sub = TalkerLLMSubmodule(
             talker_model=talker_model,
-            code_predictor=code_predictor,
             config=self.config,
         )
 
@@ -1370,9 +1335,7 @@ class Qwen3OmniModel(Model):
         #    load JUST the embed_tokens layer from the checkpoint, use
         #    it to compute the 3 projected TTS embeds (~12 KB cached on
         #    the Talker submodule), and immediately discard the
-        #    embedding layer to free its memory.  Peak temp cost is
-        #    vocab_size * hidden_size * 2 bytes (~620 MB for the
-        #    151k-vocab Thinker), held only briefly during init.
+        #    embedding layer to free its memory.
         thinker_sub = self._submodule_cache.get("Thinker")
         if thinker_sub is not None and hasattr(thinker_sub, "model"):
             # Colocated: reuse the already-loaded embed_tokens

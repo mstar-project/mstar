@@ -22,6 +22,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
+from mminf.engine.code_predictor_engine import CodePredictorCudaGraphConfig, CodePredictorCudaGraphRunner
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.model.base import NodeSubmodule
 from mminf.model.qwen3_omni.components.rope import (
@@ -1265,7 +1266,7 @@ class TalkerLLMSubmodule(NodeSubmodule):
         logits = logits.masked_fill(suppress_mask.unsqueeze(0), float("-inf"))
 
         return {
-            "cp_embed": [last_hidden],
+            "last_hidden": [last_hidden],
             "logits": [logits]
         }
     
@@ -1304,7 +1305,7 @@ class TalkerLLMSubmodule(NodeSubmodule):
 
         outputs = {
             rid: {
-                "cp_embed": fwd_out["cp_embed"][0][i],
+                "last_hidden": fwd_out["last_hidden"][0][i],
                 "logits": fwd_out["logits"][0][i:i+1],
             } for i, rid in enumerate(request_ids)
         }
@@ -1327,11 +1328,7 @@ class TalkerLLMSubmodule(NodeSubmodule):
                 (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= request_info.max_tokens):
             request_info.register_loop_stop("talker_decode_loop")
         
-        outputs["group_idx"] = [torch.zeros(1, device=device, drype=torch.long)]
-        outputs["codec_embed_sum"] = [
-            torch.zeros_like(outputs["cp_embed"][0])
-        ]
-        outputs["codec_tokens"] = [codes]
+        outputs["layer0_codes"] = [codes]
     
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
@@ -1365,7 +1362,7 @@ class TalkerLLMSubmodule(NodeSubmodule):
         return ["main"]
 
 
-class CodePredictorSubmodule(NodeSubmodule):
+class Qwen3OmniCodePredictorSubmodule(NodeSubmodule):
     def __init__(
         self, code_predictor: Qwen3OmniCodePredictor,
         config: Qwen3OmniModelConfig
@@ -1374,8 +1371,17 @@ class CodePredictorSubmodule(NodeSubmodule):
         self.code_predictor = code_predictor
         self.config = config
         self.cp_cfg = self.config.code_predictor
-        self.num_residual = self.cp_cfg.num_code_groups - 1
+        self.num_codes = self.cp_cfg.num_code_groups
     
+
+    def forward_cuda_graph(
+        self, graph_walk: str,
+        cache_manager: BatchedCacheManager,
+        embed: torch.Tensor
+    ):
+        return {
+            "hidden": self.code_predictor(embed, cache_manager)
+        }
 
     def preprocess(
         self,
@@ -1385,50 +1391,13 @@ class CodePredictorSubmodule(NodeSubmodule):
         request_ids: list[str],
         per_request_info: dict[str, CurrentForwardPassInfo],
     ):
-        for rid, inp in zip(request_ids, per_request_inputs):
-            if inp["group_idx"][0].item() == 0:
-                cache_manager.reset_state(
-                    request_id=rid,
-                    dealloc=False
-                )
-
-        seq_lens = [1] * len(per_request_inputs)
-        cache_manager.plan_attention(
-            seq_lens=seq_lens
-        )
-        cache_manager.plan_rope(
-            seq_lens=seq_lens
-        )
-        
         return {
-            "cp_embed": torch.cat([
-                inp["cp_embed"][0] for inp in per_request_inputs
+            "last_hidden": torch.stack([
+                inp["last_hidden"][0] for inp in per_request_inputs
+            ], dim=0),
+            "layer0_codes": torch.cat([
+                inp["layer0_codes"][0] for inp in per_request_inputs
             ]),
-            "codec_embed_sum": torch.cat([
-                inp["codec_embed_sum"][0] for inp in per_request_inputs
-            ]),
-            "codec_tokens": torch.cat([
-                inp["codec_tokens"][0] for inp in per_request_inputs
-            ]),
-            "group_idx": torch.cat(
-                [inp["group_idx"][0] for inp in per_request_inputs]
-            )
-        }
-    
-    def forward(
-        self,
-        cp_embed: torch.Tensor,
-        codes: torch.Tensor,
-        codec_embed_sum: torch.Tensor,
-        group_idx: torch.Tensor
-    ):
-        hidden = self.code_predictor(cp_embed)
-        return {
-            "hidden": [hidden],
-            "cp_embed": [cp_embed],
-            "codec_embed_sum": [codec_embed_sum],
-            "codec_tokens": [codes],
-            "group_idx": [group_idx],
         }
     
     def forward_batched(
@@ -1436,74 +1405,73 @@ class CodePredictorSubmodule(NodeSubmodule):
         graph_walk: str,
         request_ids: list[str],
         cache_manager: BatchedCacheManager,
+        sampler: Sampler,
+        cuda_graph_runner: CodePredictorCudaGraphRunner,
         packed_inputs: dict[str, torch.Tensor],
         per_request_info: dict[str, CurrentForwardPassInfo]
     ) -> dict[str, NameToTensorList]:
-        # Disable autocast for float32 Code Predictor inference.  HF and
-        # vllm-omni found that fused/autocast kernels degrade audio quality
-        # for the small (5-layer) Code Predictor.
-        with torch.amp.autocast(device_type="cuda", enabled=False):
-            hidden = self.code_predictor(packed_inputs["cp_embed"])
+        embed = packed_inputs["last_hidden"]
+        codec_emb_sum = torch.zeros_like(embed)
+
+        layer0_codes = packed_inputs["layer0_codes"]
+
+        all_codes = torch.zeros((
+            len(request_ids), self.num_codes
+        ), device=layer0_codes.device)
+        all_codes[:, 0] = layer0_codes
+
+        # "prefill" on last_hidden
+        cuda_graph_runner.run(
+            graph_walk=graph_walk,
+            packed_inputs={
+                "embed": embed
+            },
+            request_ids=request_ids
+        )
+
+        embed = self.code_predictor.get_embedding(0)(layer0_codes)
+        codec_emb_sum += embed
+
+        for group_idx in range(1, self.num_codes):
+            hidden = cuda_graph_runner.run(
+                graph_walk=graph_walk,
+                packed_inputs={
+                    "embed": embed
+                },
+                request_ids=request_ids
+            )
+            logits = self.code_predictor.get_lm_head(group_idx)(hidden)
+            codes = sampler.sample(request_ids, logits)
+            all_codes[:, group_idx] = codes
+
+            embed = self.code_predictor.get_embedding(group_idx)(codes)
+            codec_emb_sum += embed
 
         return {
             req_id: {
-                "hidden": [hidden[i:i+1]],
-                "codec_embed_sum": [packed_inputs["codec_embed_sum"][i]],
-                "cp_embed": [packed_inputs["cp_embed"][i]],
-                "codec_tokens": [packed_inputs["codec_tokens"][i]],
-                "group_idx": [packed_inputs["group_idx"][i]],
+                "talker_input_embeds": [codec_emb_sum[i]],
+                "codec_tokens": [all_codes[i]],
             } for i, req_id in enumerate(request_ids)
         }
-    
-    def postprocess(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        sampler: Sampler,
-        **kwargs
-    ):
-        with torch.amp.autocast(device_type="cuda", enabled=False):
-            group_idx = outputs["group_idx"][0].item()
-            if group_idx > 0:
-                # For the first group_idx, the codes are not sampled by the code
-                # predictor, but rather by the talker itself. After, codes are sampled
-                # by the code predictor
-                logits = self.code_predictor.get_lm_head(group_idx)(
-                    outputs["hidden"][0]
-                )
-                code = sampler.sample([request_id], logits)
-            else:
-                code = outputs["code"][0]
-            
-            cp_embed = self.code_predictor.get_embedding(group_idx)(code)
-            outputs["codec_embed_sum"] += cp_embed
-            outputs["cp_embed"] = [cp_embed]
-            outputs["codec_tokens"] = [code]
-            outputs["group_idx"] += 1
-            outputs["talker_input_embeds"] = outputs["codec_embed_sum"]
 
     def can_batch(self, batch: NodeBatch) -> bool:
         return True # we can always batch
-    
-    def _get_dummy_capture_inputs(self, device):
-        return [{
-            "group_idx": [torch.zeros(1, device=device, drype=torch.long)],
-            "codec_embed_sum": [torch.zeros(self.cp_cfg.head_dim, device=device)],
-            "cp_embed": [torch.zeros(self.cp_cfg.head_dim, device=device)],
-            "codec_tokens": [torch.zeros(1, device=device, drype=torch.long)],
-        }]
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+    def get_code_pred_cuda_graph_configs(
+        self, device: torch.device
+    ) -> list[CodePredictorCudaGraphConfig]:
         return [
-            CudaGraphConfig(
-                graph_walk="talker_last_prefill", requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=self._get_dummy_capture_inputs(device),
-                capture_batch_sizes=[1, 2, 4, 8, 16]
+            CodePredictorCudaGraphConfig(
+                graph_walk="talker_last_prefill",
+                dummy_capture_inputs={
+                    "embed": torch.zeros((1, self.cp_cfg.head_dim), device=device),
+                }
             ),
-            CudaGraphConfig(
-                graph_walk="talker_decode", requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=self._get_dummy_capture_inputs(device),
-                capture_batch_sizes=[1, 2, 4, 8, 16]
+            CodePredictorCudaGraphConfig(
+                graph_walk="talker_decode",
+                dummy_capture_inputs={
+                    "embed": torch.zeros((1, self.cp_cfg.head_dim), device=device),
+                }
             )
         ]
     

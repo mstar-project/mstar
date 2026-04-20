@@ -324,6 +324,9 @@ class PagedAllocationManager:
             )
         return per_label_seq_info
 
+    def get_labels(self, request_id: str):
+        return list(self.request_states[request_id].keys())
+
     def reset_label(self, request_id: str, label: str, free: bool=True):
         self.wait_for_retrieves(request_id, label)
         if label in self.request_states[request_id] and free:

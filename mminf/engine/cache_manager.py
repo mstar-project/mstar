@@ -603,14 +603,17 @@ class BatchedCacheManager:
     def reset_state(
         self,
         request_id: str,
-        label: str="main",
+        labels: list[str] | None=None,
         dealloc: bool=False
     ):
-        self.alloc_manager.reset_label(
-            request_id=request_id,
-            label=label,
-            free=dealloc
-        )
+        if labels is None:
+            labels = self.alloc_manager.get_labels(request_id)
+        for label in labels:
+            self.alloc_manager.reset_label(
+                request_id=request_id,
+                label=label,
+                free=dealloc
+            )
 
     @torch.compiler.disable
     def snapshot_all(

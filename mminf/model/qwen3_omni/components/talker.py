@@ -331,6 +331,7 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
             hidden_states, self.norm.weight,
             eps=self.norm.variance_epsilon,
         )
+        cache_handle.advance_seq_len()
         return hidden_states
 
     def get_input_embeddings(self):
