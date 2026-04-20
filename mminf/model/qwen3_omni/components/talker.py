@@ -322,7 +322,8 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
         """
         Just runs the inner layers; does NOT run embedding.
         """
-        for decoder_layer in self.layers:
+        for _layer_idx, decoder_layer in enumerate(self.layers):
+            cache_handle.set_layer_idx(_layer_idx)
             hidden_states = decoder_layer(
                 hidden_states,
                 cache_handle
