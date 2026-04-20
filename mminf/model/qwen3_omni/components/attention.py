@@ -100,6 +100,8 @@ class Qwen3OmniAttention(nn.Module):
         num_tokens = hidden_states.shape[0]
 
         # 1. Project q, k, v
+        orig_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(self.q_proj.weight.dtype)
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -149,4 +151,4 @@ class Qwen3OmniAttention(nn.Module):
 
         # 6. Reshape and project output
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
-        return self.o_proj(attn_output)
+        return self.o_proj(attn_output).to(orig_dtype)

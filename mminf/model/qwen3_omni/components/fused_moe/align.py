@@ -11,15 +11,19 @@ per-expert dispatch path.
 
 from __future__ import annotations
 
+import logging
 from typing import Tuple
 
 import torch
 import triton
 
+logger = logging.getLogger(__name__)
+
 try:
     from sgl_kernel import moe_align_block_size as _sgl_moe_align_block_size
-except ImportError:  # pragma: no cover -- exercised on boxes without sgl_kernel
+except ImportError as e:  # pragma: no cover -- exercised on boxes without sgl_kernel
     _sgl_moe_align_block_size = None
+    logger.warning(f"Could not load _fused_experts: {e}")
 
 
 def has_sgl_kernel() -> bool:

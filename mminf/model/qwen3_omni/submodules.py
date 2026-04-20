@@ -22,7 +22,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.engine.code_predictor_engine import CodePredictorCudaGraphConfig, CodePredictorCudaGraphRunner
+from mminf.engine.code_predictor_engine import CodePredictorCudaGraphConfig, CodePredictorCudaGraphRunner, CodePredictorSubmodule
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.model.base import NodeSubmodule
 from mminf.model.qwen3_omni.components.rope import (
@@ -964,6 +964,7 @@ class TalkerLLMSubmodule(NodeSubmodule):
         talker_model: Qwen3OmniTalkerModel,
         config: Qwen3OmniModelConfig
     ):
+        super().__init__()
         self.model = talker_model   
         self.config = config
 
@@ -1160,8 +1161,8 @@ class TalkerLLMSubmodule(NodeSubmodule):
         # Text part of assistant prefix
         # W3: pad and bos embeddings use Thinker embed -> text_projection
         # (via pre-computed cached values from init_tts_embeds)
-        pad_embed = self._tts_pad_embed_cached(device).expand(4, -1)  # 4 pad tokens
-        bos_text_embed = self._tts_bos_embed_cached(device)           # 1 bos token
+        pad_embed = self._tts_pad_embed_cached.expand(4, -1)  # 4 pad tokens
+        bos_text_embed = self._tts_bos_embed_cached.unsqueeze(0) # 1 bos token
 
         speaker = info.step_metadata.get("voice", "Ethan")
         speaker_id = tc.speaker_id.get(speaker.lower())
@@ -1210,14 +1211,15 @@ class TalkerLLMSubmodule(NodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
     ):
         all_embeds = []
+        dtype = self.model.text_projection.linear_fc1.weight.dtype
         for inp, rid in zip(per_request_inputs, request_ids, strict=True):
-            emb = inp["talker_input_embeds"][0]
+            emb = inp["talker_input_embeds"][0].to(dtype)
             
-            thinker_state = inp.get("thinker_states", [None])[0]
-            if thinker_state is not None:
+            thinker_states = inp.get("thinker_states", [])
+            if thinker_states:
                 thinker_hidden = self.config.thinker_hidden_size
                 emb += self.model.text_projection(
-                    thinker_state[..., :thinker_hidden]
+                    thinker_states[0][..., :thinker_hidden].to(dtype)
                 )
             elif rid not in self._eos_embed_sent:
                 emb += self._tts_eos_embed_cached
@@ -1229,11 +1231,13 @@ class TalkerLLMSubmodule(NodeSubmodule):
 
         seq_lens = [1] * len(per_request_inputs)
         cache_manager.plan_attention(
-            seq_lens=seq_lens
+            seq_lens=seq_lens, label="main"
         )
         cache_manager.plan_rope(
-            seq_lens=seq_lens
+            seq_lens=seq_lens, label="main"
         )
+
+        print(cache_manager._get_state(request_ids[0], "main"))
 
         input_embeds = torch.cat(all_embeds, dim=0)
         return {
@@ -1251,7 +1255,8 @@ class TalkerLLMSubmodule(NodeSubmodule):
     def _forward_decode_like(
         self, cache_handle: BatchedCacheManager,
         input_embeds: torch.Tensor,
-        suppress_mask: torch.Tensor
+        suppress_mask: torch.Tensor,
+        is_batched_decode: bool
     ):
         """
         Runs the Talker LLM for stages that graoh walks that sample a token
@@ -1261,7 +1266,10 @@ class TalkerLLMSubmodule(NodeSubmodule):
         hidden = self.model(
             input_embeds=input_embeds, cache_handle=cache_handle
         )
-        last_hidden = hidden[-1:, :]
+        if not is_batched_decode:
+            last_hidden = hidden[-1:, :]
+        else:
+            last_hidden = hidden
         logits = self.model.codec_head(last_hidden)
         logits = logits.masked_fill(suppress_mask.unsqueeze(0), float("-inf"))
 
@@ -1286,7 +1294,8 @@ class TalkerLLMSubmodule(NodeSubmodule):
         return self._forward_decode_like(
             cache_handle=cache_handle,
             input_embeds=input_embeds,
-            suppress_mask=suppress_mask
+            suppress_mask=suppress_mask,
+            is_batched_decode=(graph_walk == "talker_decode"),
         )
     
     def forward_batched(
@@ -1297,15 +1306,17 @@ class TalkerLLMSubmodule(NodeSubmodule):
         packed_inputs: dict[str, torch.Tensor],
         per_request_info: dict[str, CurrentForwardPassInfo]
     ):
+        assert graph_walk == "talker_decode"
         fwd_out = self._forward_decode_like(
             cache_handle=cache_manager,
             input_embeds=packed_inputs["input_embeds"],
             suppress_mask=packed_inputs["suppress_mask"],
+            is_batched_decode=True
         )
 
         outputs = {
             rid: {
-                "last_hidden": fwd_out["last_hidden"][0][i],
+                "last_hidden": fwd_out["last_hidden"][0][i:i+1],
                 "logits": fwd_out["logits"][0][i:i+1],
             } for i, rid in enumerate(request_ids)
         }
@@ -1321,7 +1332,6 @@ class TalkerLLMSubmodule(NodeSubmodule):
         if "new_token" not in outputs:
             return
         codes = outputs.pop("new_token")[0]
-        device = codes.device
         token = codes.item()
         eos_token_id = self.config.talker.codec_eos_token_id
         if (eos_token_id is not None and eos_token_id == token) or \
@@ -1339,7 +1349,7 @@ class TalkerLLMSubmodule(NodeSubmodule):
     
     def _get_dummy_capture_inputs(self, device):
         return [{
-            "talker_input_embeds": [torch.zeros(self.config.talker_hidden_size, device=device)],
+            "talker_input_embeds": [torch.zeros((1, self.config.talker_hidden_size), device=device)],
             "thinker_states": [
                 torch.zeros((1, self.config.thinker_hidden_size), device=device)
             ],
@@ -1362,9 +1372,10 @@ class TalkerLLMSubmodule(NodeSubmodule):
         return ["main"]
 
 
-class Qwen3OmniCodePredictorSubmodule(NodeSubmodule):
+class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
     def __init__(
         self, code_predictor: Qwen3OmniCodePredictor,
+        talker_code_emb: nn.Embedding,
         config: Qwen3OmniModelConfig
     ):
         super().__init__()
@@ -1372,6 +1383,7 @@ class Qwen3OmniCodePredictorSubmodule(NodeSubmodule):
         self.config = config
         self.cp_cfg = self.config.code_predictor
         self.num_codes = self.cp_cfg.num_code_groups
+        self.talker_code_emb  = talker_code_emb
     
 
     def forward_cuda_graph(
@@ -1392,7 +1404,7 @@ class Qwen3OmniCodePredictorSubmodule(NodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
     ):
         return {
-            "last_hidden": torch.stack([
+            "last_hidden": torch.cat([
                 inp["last_hidden"][0] for inp in per_request_inputs
             ], dim=0),
             "layer0_codes": torch.cat([
@@ -1417,30 +1429,51 @@ class Qwen3OmniCodePredictorSubmodule(NodeSubmodule):
 
         all_codes = torch.zeros((
             len(request_ids), self.num_codes
-        ), device=layer0_codes.device)
+        ), device=layer0_codes.device, dtype=torch.long)
         all_codes[:, 0] = layer0_codes
 
         # "prefill" on last_hidden
-        cuda_graph_runner.run(
-            graph_walk=graph_walk,
-            packed_inputs={
-                "embed": embed
-            },
-            request_ids=request_ids
-        )
-
-        embed = self.code_predictor.get_embedding(0)(layer0_codes)
-        codec_emb_sum += embed
-
-        for group_idx in range(1, self.num_codes):
-            hidden = cuda_graph_runner.run(
+        if cuda_graph_runner is not None:
+            cuda_graph_runner.run(
                 graph_walk=graph_walk,
                 packed_inputs={
                     "embed": embed
                 },
                 request_ids=request_ids
             )
-            logits = self.code_predictor.get_lm_head(group_idx)(hidden)
+        else:
+            cache_manager.plan_attention([1] * len(request_ids), label="main")
+            cache_manager.plan_rope([1] * len(request_ids), label="main")
+            self.forward_cuda_graph(
+                graph_walk=graph_walk,
+                embed=embed,
+                cache_manager=cache_manager
+            )["hidden"]
+        
+
+        embed = self.talker_code_emb(layer0_codes)
+        codec_emb_sum += embed
+
+        for group_idx in range(1, self.num_codes):
+            if cuda_graph_runner is not None:
+                hidden = cuda_graph_runner.run(
+                    graph_walk=graph_walk,
+                    packed_inputs={
+                        "embed": embed
+                    },
+                    request_ids=request_ids
+                )["hidden"]
+            else:
+                cache_manager.plan_attention([1] * len(request_ids), label="main")
+                cache_manager.plan_rope([1] * len(request_ids), label="main")
+                hidden = self.forward_cuda_graph(
+                    graph_walk=graph_walk,
+                    embed=embed,
+                    cache_manager=cache_manager
+                )["hidden"]
+            orig_dtype = hidden.dtype
+            lm_head = self.code_predictor.get_lm_head(group_idx)
+            logits = lm_head(hidden.to(lm_head.weight.dtype)).to(orig_dtype)
             codes = sampler.sample(request_ids, logits)
             all_codes[:, group_idx] = codes
 
@@ -1449,7 +1482,7 @@ class Qwen3OmniCodePredictorSubmodule(NodeSubmodule):
 
         return {
             req_id: {
-                "talker_input_embeds": [codec_emb_sum[i]],
+                "talker_input_embeds": [codec_emb_sum[i:i+1]],
                 "codec_tokens": [all_codes[i]],
             } for i, req_id in enumerate(request_ids)
         }
@@ -1464,13 +1497,13 @@ class Qwen3OmniCodePredictorSubmodule(NodeSubmodule):
             CodePredictorCudaGraphConfig(
                 graph_walk="talker_last_prefill",
                 dummy_capture_inputs={
-                    "embed": torch.zeros((1, self.cp_cfg.head_dim), device=device),
+                    "embed": torch.zeros((1, self.cp_cfg.hidden_size), device=device),
                 }
             ),
             CodePredictorCudaGraphConfig(
                 graph_walk="talker_decode",
                 dummy_capture_inputs={
-                    "embed": torch.zeros((1, self.cp_cfg.head_dim), device=device),
+                    "embed": torch.zeros((1, self.cp_cfg.hidden_size), device=device),
                 }
             )
         ]
@@ -1631,6 +1664,7 @@ class Code2WavSubmodule(NodeSubmodule):
         return {"audio_chunk": [audio_int16]}
 
     def can_batch(self, batch: NodeBatch) -> bool:
-        return len({
-            inputs["codec_tokens"][0].numel() for inputs in batch.per_request_input_tensors.values()
-        }) == 1
+        return False
+        # return len({
+        #     inputs["codec_tokens"][0].numel() for inputs in batch.per_request_input_tensors.values()
+        # }) == 1

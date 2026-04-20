@@ -88,7 +88,7 @@ class CodePredictorCudaGraphRunner:
     ):
         self.submodule_name = submodule_name
         self.submodule = submodule
-        self.capture_configs: list[CodePredictorCudaGraphConfig] = submodule.get_cuda_graph_configs(device)
+        self.capture_configs: list[CodePredictorCudaGraphConfig] = submodule.get_code_pred_cuda_graph_configs(device)
         self.kv_cache_config = kv_cache_config
         self.alloc_manager = alloc_manager
         self.sampler = sampler
@@ -212,10 +212,11 @@ class CodePredictorCudaGraphRunner:
                 )
                 cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label=label)
 
-            dummy_inputs = {
-                key: config.dummy_capture_inputs[key].repeat(bs) \
-                    for key in config.dummy_capture_inputs
-            }
+            dummy_inputs = {}
+            for k, val in config.dummy_capture_inputs.items():
+                if val.shape[0] != 1:
+                    val = val.unsqueeze(0)
+                dummy_inputs[k] = val.repeat(bs, *([1] * (val.dim() -1)))
             static_input_keys = list(dummy_inputs.keys())
 
             forward = getattr(submodule, config.capture_function_name)
@@ -238,8 +239,7 @@ class CodePredictorCudaGraphRunner:
             # Warmup: 2 forward passes
             torch.cuda.synchronize()
             for _ in range(2):
-                with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                    output = run_forward()
+                output = run_forward()
                 # Reset seq_lens after warmup passes so capture starts clean
                 for rid in dummy_rids:
                     for label in config.labels:
@@ -257,9 +257,8 @@ class CodePredictorCudaGraphRunner:
 
             # Capture
             graph = torch.cuda.CUDAGraph()
-            with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                with torch.cuda.graph(graph, pool=self.memory_pool):
-                    output = run_forward()
+            with torch.cuda.graph(graph, pool=self.memory_pool):
+                output = run_forward()
             torch.cuda.synchronize()
 
             logger.info(
@@ -307,6 +306,7 @@ class CodePredictorCudaGraphRunner:
             return None
         return sizes[idx]
 
+    @torch.compiler.disable()
     def run(
         self,
         graph_walk: str,
@@ -392,18 +392,15 @@ class CodePredictorCudaGraphRunner:
                 self.alloc_manager.reset_label(
                     rid, label, free=i>=batch_size,
                 )
-        for rid in request_ids:
-            for label in config_labels:
-                ps = static_cm._plan_states.get(label)
-                if ps is not None and ps.write_store:
-                    self.alloc_manager.flush_to_store(rid, label)
-
         return outputs
 
 
 class CodePredictorEngine(AREngine):
     def engine_type(self) -> EngineType:
         return EngineType.CODE_PREDICTOR
+    
+    def has_autocast(self):
+        return False
     
     def warmup(self) -> None:
         """Compile submodules and capture CUDA graphs."""
@@ -424,8 +421,7 @@ class CodePredictorEngine(AREngine):
                 submodule_mgmt.cuda_graph_runner = runner
                 logger.info("AREngine: CUDA graphs captured for %s (%d configs)",
                             node_name, len(runner.graphs))
-        # Step 1: torch.compile (before CUDA graph capture)
-        self._compile_submodules()
+            # self._compile_submodules()
 
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
@@ -436,7 +432,7 @@ class CodePredictorEngine(AREngine):
         for rid in batch.request_ids:
             cache_manager.reset_state(
                 request_id=rid,
-                dealloc=False
+                keep_pages=True
             )
 
         # Preprocess all requests

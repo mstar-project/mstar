@@ -370,8 +370,7 @@ class Qwen3OmniCodePredictor(nn.Module):
         return self.model(*args)
     
     def get_embedding(self, group_idx: int):
-        if group_idx == 0:
-            return self.codec_embedding
+        assert group_idx > 0
         return self.model.codec_embedding[group_idx-1]
     
     def get_lm_head(self, group_idx: int):

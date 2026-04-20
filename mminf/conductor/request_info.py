@@ -65,14 +65,11 @@ class CurrentForwardPassInfo:
     fwd_index: int
     random_seed: int
     max_tokens: int
+
+    sampling_config: dict[str, SamplingConfig | None]
     step_metadata: dict = field(default_factory=dict)
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")
-
-    # sampling config
-    sampling_config: dict[str, SamplingConfig | None] = field(
-        default=None
-    )
 
     # set of names of loops to stop
     dynamic_loop_stop_signals: set[str] = field(default_factory=set)

@@ -211,7 +211,7 @@ class Conductor:
     
     def _get_sampling_configs(self, model_kwargs: dict):
         ar_nodes = [
-            node for (node, engine) in self.model.get_node_engine_types() \
+            node for (node, engine) in self.model.get_node_engine_types().items() \
                 if engine in {EngineType.AR, EngineType.CODE_PREDICTOR}
         ]
         return {
@@ -747,7 +747,8 @@ class Conductor:
                         per_label_seq_info=pstate.per_label_seq_info,
                         requires_cfg=fwd_args.full_metadata.requires_cfg,
                         partition_name=partition_name,
-                        max_tokens=request_data.max_output_tokens
+                        max_tokens=request_data.max_output_tokens,
+                        sampling_config=request_data.sampling_config,
                     ),
                     partition_name=partition_name
                 ),

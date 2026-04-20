@@ -496,6 +496,8 @@ class BatchedCacheManager:
         """
         if layer_idx is None:
             layer_idx = self.layer_idx
+        
+        orig_dtype = q.dtype
 
         labels = list(self.active_labels.values())
         assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
@@ -512,7 +514,7 @@ class BatchedCacheManager:
                     req_id, label=label, layers=layer_idx
                 )
 
-        return ps.wrapper.run(q, self.kv_cache[layer_idx])
+        return ps.wrapper.run(q, self.kv_cache[layer_idx]).to(orig_dtype)
 
     @torch.compiler.disable
     def apply_rope(
@@ -541,6 +543,9 @@ class BatchedCacheManager:
             q, k = q.to(rope_dtype), k.to(rope_dtype)
         elif torch.is_autocast_enabled():
             dtype = torch.get_autocast_gpu_dtype()
+            q, k = q.to(dtype), k.to(dtype)
+        elif q.dtype == torch.float32:
+            dtype = torch.bfloat16
             q, k = q.to(dtype), k.to(dtype)
 
         llama31_params = {}
@@ -604,16 +609,21 @@ class BatchedCacheManager:
         self,
         request_id: str,
         labels: list[str] | None=None,
-        dealloc: bool=False
+        keep_pages: bool=True
     ):
         if labels is None:
             labels = self.alloc_manager.get_labels(request_id)
         for label in labels:
-            self.alloc_manager.reset_label(
-                request_id=request_id,
-                label=label,
-                free=dealloc
-            )
+            if not keep_pages:
+                self.alloc_manager.reset_label(
+                    request_id=request_id,
+                    label=label,
+                    free=True
+                )
+            else:
+                state:KVRequestState = self._get_state(request_id, label)
+                state.position_id_start = 0
+                state.seq_len = 0
 
     @torch.compiler.disable
     def snapshot_all(

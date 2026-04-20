@@ -24,11 +24,14 @@ HF ``Qwen3OmniMoeThinkerTextSparseMoeBlock`` and
 
 from __future__ import annotations
 
+import logging
 from typing import Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 # Optional fused Triton MoE path.  Imports succeed only on CUDA boxes
 # with sgl-kernel installed; any import failure (including the final
@@ -38,9 +41,10 @@ try:
     from mminf.model.qwen3_omni.components.fused_moe.align import has_sgl_kernel
 
     _HAS_FUSED = has_sgl_kernel()
-except Exception:  # pragma: no cover -- exercised only when optional dep missing
+except Exception as e:  # pragma: no cover -- exercised only when optional dep missing
     _fused_experts = None
     _HAS_FUSED = False
+    logger.warning(f"Could not load _fused_experts: {e}")
 
 
 # -----------------------------------------------------------------------
@@ -90,7 +94,9 @@ class Qwen3OmniMLP(nn.Module):
         -------
         torch.Tensor  shape ``(..., hidden_size)``
         """
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        orig_dtype = x.dtype
+        x = x.to(self.gate_proj.weight.dtype)
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)).to(orig_dtype)
 
 
 # -----------------------------------------------------------------------

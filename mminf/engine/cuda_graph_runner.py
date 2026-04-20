@@ -271,6 +271,7 @@ class CudaGraphRunner:
                     fwd_index=0,
                     random_seed=0,
                     max_tokens=1,
+                    sampling_config={}
                 ) for rid in dummy_rids
             }
 
@@ -814,6 +815,7 @@ class CodecCudaGraphRunner:
                 fwd_index=0,
                 random_seed=0,
                 max_tokens=1,
+                sampling_config={}
             )
             for rid in dummy_rids
         }
