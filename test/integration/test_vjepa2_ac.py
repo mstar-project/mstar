@@ -82,24 +82,33 @@ def _upstream_pt_path() -> Path | None:
     return None
 
 
-def _upstream_importable() -> bool:
+def _upstream_import_error() -> str | None:
+    """Return ``None`` if upstream modules import cleanly, else a short
+    diagnostic string describing the failure (missing PYTHONPATH entry vs
+    transitive-dependency ``ModuleNotFoundError`` — the two failure modes
+    look identical to ``except ImportError`` but need different fixes).
+    """
     try:
         import importlib
 
         importlib.import_module("src.models.ac_predictor")
         importlib.import_module("src.models.vision_transformer")
-        return True
-    except ImportError:
-        return False
+        return None
+    except ImportError as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+_UPSTREAM_ERR = _upstream_import_error()
 
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
     pytest.mark.skipif(
-        not _upstream_importable(),
+        _UPSTREAM_ERR is not None,
         reason=(
-            "upstream vjepa2 repo not on PYTHONPATH; clone "
-            "https://github.com/facebookresearch/vjepa2 and add it to PYTHONPATH"
+            f"upstream vjepa2 imports failed ({_UPSTREAM_ERR}); either the repo "
+            "isn't on PYTHONPATH or a dependency (commonly `timm`) is missing "
+            "in this venv — install it with `pip install timm` and retry"
         ),
     ),
     pytest.mark.skipif(
