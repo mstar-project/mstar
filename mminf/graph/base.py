@@ -13,6 +13,7 @@ class FilteredEdges:
     kept: list["GraphEdge"]
     filtered_out: list["GraphEdge"]
 
+
 @dataclass
 class LoopCompletionOutput:
     new_waiting: "GraphSection"
@@ -21,14 +22,8 @@ class LoopCompletionOutput:
 
     def filter_out_loop_back(self, edges: list["GraphEdge"]) -> FilteredEdges:
         return FilteredEdges(
-            kept=[
-                edge for edge in edges \
-                    if (edge.name, edge.next_node) not in self.loop_back_name_dests_to_remove
-            ],
-            filtered_out=[
-                edge for edge in edges \
-                    if (edge.name, edge.next_node) in self.loop_back_name_dests_to_remove
-            ]
+            kept=[edge for edge in edges if (edge.name, edge.next_node) not in self.loop_back_name_dests_to_remove],
+            filtered_out=[edge for edge in edges if (edge.name, edge.next_node) in self.loop_back_name_dests_to_remove],
         )
 
 
@@ -47,9 +42,10 @@ class TensorPointerInfo:
     nbytes: int
     address: int
     stride: list[int]
-    uuid: str # for indexing storage
-    source_session_id: str # "{HOSTNAME}:{client_engine.get_rpc_port()}"
-    source_entity: str # which {worker, api_server} the tensor is on
+    uuid: str  # for indexing storage
+    source_session_id: str  # "{HOSTNAME}:{client_engine.get_rpc_port()}"
+    source_entity: str  # which {worker, api_server} the tensor is on
+
 
 @dataclass
 class GraphEdge:
@@ -58,19 +54,19 @@ class GraphEdge:
     tensor_info: list[TensorPointerInfo] = field(default_factory=list)
 
     # Flags
-    persist: bool = field(default=False) # previously back_to_conductor
+    persist: bool = field(default=False)  # previously back_to_conductor
     conductor_new_token: bool = field(default=False)
-    is_streaming: bool = field(default=False) # streaming edge: tokens accumulate at destination buffer
+    is_streaming: bool = field(default=False)  # streaming edge: tokens accumulate at destination buffer
     # only for EMIT_TO_CLIENT
-    output_modality: str = field(default="") # text | image | video | audio
+    output_modality: str = field(default="")  # text | image | video | audio
     _persist_for_loop: bool = field(default=False)
+
 
 # Two different ways of defining graph edges
 DestToGraphEdges = dict[str, list[GraphEdge]]
 
-def get_node_to_inputs_mapping(
-    new_inputs: list[GraphEdge]
-)-> DestToGraphEdges:
+
+def get_node_to_inputs_mapping(new_inputs: list[GraphEdge]) -> DestToGraphEdges:
     result: DestToGraphEdges = {}
     for edge in new_inputs:
         if edge.next_node not in result:
@@ -126,7 +122,8 @@ class GraphSection(ABC):
 
     @abstractmethod
     def cache_outputs(
-        self, tensor_info: dict[str, list[TensorPointerInfo]],
+        self,
+        tensor_info: dict[str, list[TensorPointerInfo]],
     ):
         pass
 
@@ -139,10 +136,7 @@ class GraphSection(ABC):
         pass
 
     @abstractmethod
-    def register_communication_info(
-        self, communication_manager,
-        request_id: str
-    ):
+    def register_communication_info(self, communication_manager, request_id: str):
         pass
 
     @abstractmethod
@@ -155,19 +149,33 @@ class GraphNode(GraphSection):
     name: str
     input_ids: set[str]
     outputs: list[GraphEdge]
+    # Names of inputs the node will accept if provided, but that do NOT
+    # block readiness when absent.  Use for optional kwargs to the
+    # underlying submodule (e.g., V-JEPA 2's ``context_mask`` /
+    # ``target_mask``, which have sensible defaults built inside the
+    # submodule).  Must be disjoint from ``input_ids``.
+    optional_input_ids: set[str] = field(default_factory=set)
     consumes_stream: bool = field(default=False)
     _streaming_inputs: set[str] = field(default_factory=set)
     _split_off_for_streaming: bool = field(default=False)
 
     # Populated as previous nodes complete
     # This will also include, e.g., tensor UUIDs associated with these inputs
-    ready_inputs: dict[str, GraphEdge] = field(default_factory=dict) # name -> graph edge
+    ready_inputs: dict[str, GraphEdge] = field(default_factory=dict)  # name -> graph edge
 
     def __post_init__(self):
         # if the user inputs, e.g., a list, turn it into a set
         self.input_ids = set(self.input_ids)
+        self.optional_input_ids = set(self.optional_input_ids)
+        _overlap = self.input_ids & self.optional_input_ids
+        if _overlap:
+            raise ValueError(
+                f"GraphNode.input_ids and GraphNode.optional_input_ids must be disjoint; overlap: {sorted(_overlap)}"
+            )
 
     def is_ready(self):
+        # Only required inputs gate readiness — optional ones are accepted
+        # opportunistically in ingest_inputs and ignored when absent.
         return self.input_ids.issubset(set(self.ready_inputs.keys()))
 
     def is_ready_except_streaming(self):
@@ -180,9 +188,10 @@ class GraphNode(GraphSection):
         return set()
 
     def get_inputs(self) -> list[GraphEdge]:
-        return [
-            GraphEdge(next_node=self.name, name=id) for id in self.input_ids
-        ]
+        # Required + optional — the graph dispatcher routes any matching
+        # edge here; ``is_ready`` still gates only on required names.
+        all_ids = self.input_ids | self.optional_input_ids
+        return [GraphEdge(next_node=self.name, name=id) for id in all_ids]
 
     def get_outputs(self) -> list[GraphEdge]:
         return self.outputs
@@ -191,22 +200,19 @@ class GraphNode(GraphSection):
         if self.name not in node_to_inputs:
             return []
 
+        accept = self.input_ids | self.optional_input_ids
         ingested = {
-            edge.name: edge for edge in node_to_inputs[self.name] \
-                if edge.name in self.input_ids and edge.name not in self.ready_inputs
-        } # ingest ids that this node takes in, and are not already ready
+            edge.name: edge
+            for edge in node_to_inputs[self.name]
+            if edge.name in accept and edge.name not in self.ready_inputs
+        }  # ingest required + optional inputs this node accepts
         self.ready_inputs.update(ingested)
 
         # remove the ingested ids from the node_to_inputs
-        node_to_inputs[self.name] = [
-            edge for edge in node_to_inputs[self.name] \
-                if edge.name not in ingested
-        ]
+        node_to_inputs[self.name] = [edge for edge in node_to_inputs[self.name] if edge.name not in ingested]
         if len(node_to_inputs[self.name]) == 0:
             del node_to_inputs[self.name]
-        logger.debug(
-            "Node %s ingesting inputs %s", self.name, list(ingested.values())
-        )
+        logger.debug("Node %s ingesting inputs %s", self.name, list(ingested.values()))
         return list(ingested.values())
 
     def split_off_ready(self):
@@ -223,17 +229,15 @@ class GraphNode(GraphSection):
         return []
 
     def cache_outputs(
-        self, tensor_info: dict[str, list[TensorPointerInfo]],
+        self,
+        tensor_info: dict[str, list[TensorPointerInfo]],
     ):
         return
 
     def complete_loops(self, done_node) -> LoopCompletionOutput:
         return LoopCompletionOutput(self)
 
-    def register_communication_info(
-        self, communication_manager,
-        request_id: str
-    ):
+    def register_communication_info(self, communication_manager, request_id: str):
         return
 
     def reset(self):
@@ -272,11 +276,9 @@ class Sequential(GraphSection):
             inputs_of_s = s.get_inputs()
 
             # filter out internal signals from the new inputs
-            inputs += ([inp for inp in inputs_of_s if inp.name not in output_names])
+            inputs += [inp for inp in inputs_of_s if inp.name not in output_names]
             # filter internal output signals from the output list
-            outputs = [edge for edge in outputs if not (
-                edge.name not in inputs_of_s and edge.next_node in node_names
-            )]
+            outputs = [edge for edge in outputs if not (edge.name not in inputs_of_s and edge.next_node in node_names)]
 
             # add new outputs to the output list
             outputs_of_s = s.get_outputs()
@@ -312,7 +314,8 @@ class Sequential(GraphSection):
         return self.sections[0].split_off_ready_for_streaming()
 
     def cache_outputs(
-        self, tensor_info: dict[str, list[TensorPointerInfo]],
+        self,
+        tensor_info: dict[str, list[TensorPointerInfo]],
     ):
         for sec in self.sections:
             sec.cache_outputs(tensor_info)
@@ -328,14 +331,9 @@ class Sequential(GraphSection):
             output.new_waiting = Sequential(sections=waiting)
         return output
 
-    def register_communication_info(
-        self, communication_manager,
-        request_id: str
-    ):
+    def register_communication_info(self, communication_manager, request_id: str):
         for sec in self.sections:
-            sec.register_communication_info(
-                communication_manager, request_id
-            )
+            sec.register_communication_info(communication_manager, request_id)
 
     def reset(self):
         for sec in self.sections:
@@ -359,14 +357,10 @@ class Parallel(GraphSection):
         return res
 
     def get_inputs(self):
-        return sum(
-            [s.get_inputs() for s in self.sections], start=[]
-        )
+        return sum([s.get_inputs() for s in self.sections], start=[])
 
     def get_outputs(self):
-        return sum(
-            [s.get_outputs() for s in self.sections], start=[]
-        )
+        return sum([s.get_outputs() for s in self.sections], start=[])
 
     def ingest_inputs(self, node_to_inputs: DestToGraphEdges):
         ingested = []
@@ -388,13 +382,11 @@ class Parallel(GraphSection):
         return ready, Parallel(sections=waiting)
 
     def split_off_ready_for_streaming(self):
-        return sum(
-            [sec.split_off_ready_for_streaming() for sec in self.sections],
-            start=[]
-        )
+        return sum([sec.split_off_ready_for_streaming() for sec in self.sections], start=[])
 
     def cache_outputs(
-        self, tensor_info: dict[str, list[TensorPointerInfo]],
+        self,
+        tensor_info: dict[str, list[TensorPointerInfo]],
     ):
         for sec in self.sections:
             sec.cache_outputs(tensor_info)
@@ -414,22 +406,15 @@ class Parallel(GraphSection):
             return LoopCompletionOutput(
                 new_waiting=Parallel(sections=waiting),
                 outputs=outputs,
-                loop_back_name_dests_to_remove=loop_back_name_dests
+                loop_back_name_dests_to_remove=loop_back_name_dests,
             )
         return LoopCompletionOutput(
-            new_waiting=None,
-            outputs=outputs,
-            loop_back_name_dests_to_remove=loop_back_name_dests
+            new_waiting=None, outputs=outputs, loop_back_name_dests_to_remove=loop_back_name_dests
         )
 
-    def register_communication_info(
-        self, communication_manager,
-        request_id: str
-    ):
+    def register_communication_info(self, communication_manager, request_id: str):
         for sec in self.sections:
-            sec.register_communication_info(
-                communication_manager, request_id
-            )
+            sec.register_communication_info(communication_manager, request_id)
 
     def reset(self):
         for sec in self.sections:
@@ -444,18 +429,29 @@ class Loop(GraphSection):
     section: GraphSection
     max_iters: int
     outputs: list[GraphEdge]
+    # Per-iteration outputs: every iter's tensor_info is appended to an
+    # internal accumulator (``_accumulated_cache``) and the full list is
+    # emitted on loop completion.  Unlike ``outputs`` — whose cache is
+    # wiped by ``_advance_one_iter`` so only the last iter's tensor_info
+    # survives — this cache is preserved across iterations.  Used for
+    # walks that want to stream or gather every iteration's output
+    # (e.g., autoregressive rollout that emits H predictions).
+    # Must be disjoint from ``outputs`` by name.
+    accumulated_outputs: list[GraphEdge] = field(default_factory=list)
     curr_iter: int = field(default=0)
     _external_inputs: list[GraphEdge] = field(default=None)
     _loop_back_signals: list[GraphEdge] = field(default=None)
     _curr_iter_section: GraphSection = field(default=None)
     _nxt_iter_section: GraphSection = field(default=None)
     _cached_outputs: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
+    _accumulated_cache: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     _output_names: set[str] = field(default_factory=set)
+    _accumulated_output_names: set[str] = field(default_factory=set)
     _uuid_label: str = field(default_factory=lambda: str(uuid4()))
 
     # For handling tensor reference counting of loop outputs
-    _tensor_manager: Any | None = field(default=None) # no type annotation because
-                                                      # of circular imports
+    _tensor_manager: Any | None = field(default=None)  # no type annotation because
+    # of circular imports
     _request_id: str | None = field(default=None)
     _waiting_for_execution: set[str] = field(default_factory=set)
 
@@ -471,25 +467,34 @@ class Loop(GraphSection):
     def get_dyn_loop_names(self) -> set[str]:
         return self.section.get_dyn_loop_names()
 
-    def register_communication_info(
-        self, communication_manager,
-        request_id: str
-    ):
+    def register_communication_info(self, communication_manager, request_id: str):
         self._tensor_manager = communication_manager
         self._request_id = request_id
-        self.section.register_communication_info(
-            communication_manager, request_id
-        )
+        self.section.register_communication_info(communication_manager, request_id)
 
     def cache_outputs(
-        self, tensor_info: dict[str, list[TensorPointerInfo]],
+        self,
+        tensor_info: dict[str, list[TensorPointerInfo]],
     ):
+        # Terminal outputs: cache gets wiped at each ``_advance_one_iter`` so
+        # only the last iter's tensor_info survives to completion.
         names = [key for key in tensor_info if key in self._output_names]
         for out_name in names:
             tensor_infos = tensor_info[out_name]
             for info in tensor_infos:
                 self._tensor_manager.increment_ref(self._request_id, info.uuid)
             self._cached_outputs.setdefault(out_name, []).extend(tensor_infos)
+
+        # Per-iteration accumulated outputs: cache survives across iterations
+        # (cleared only on loop completion via ``reset``), so every iter's
+        # tensor_info is preserved and emitted as a single list at the end.
+        acc_names = [key for key in tensor_info if key in self._accumulated_output_names]
+        for out_name in acc_names:
+            tensor_infos = tensor_info[out_name]
+            for info in tensor_infos:
+                self._tensor_manager.increment_ref(self._request_id, info.uuid)
+            self._accumulated_cache.setdefault(out_name, []).extend(tensor_infos)
+
         if self._curr_iter_section is not None:
             self._curr_iter_section.cache_outputs(tensor_info)
 
@@ -498,6 +503,21 @@ class Loop(GraphSection):
             for info in tensor_infos:
                 self._tensor_manager.dereference(self._request_id, info.uuid)
         self._cached_outputs.clear()
+
+    def _uncache_accumulated_outputs(self):
+        """Dereference and clear the per-iteration accumulated cache.
+
+        Called from ``reset`` only — NOT from ``_advance_one_iter`` — because
+        the whole point of ``accumulated_outputs`` is to survive the inter-
+        iteration cleanup that ``_uncache_outputs`` performs.  Guarded against
+        a missing ``_tensor_manager`` so ``reset`` works on freshly built
+        Loop copies before ``register_communication_info`` has run.
+        """
+        if self._tensor_manager is not None and self._request_id is not None:
+            for tensor_infos in self._accumulated_cache.values():
+                for info in tensor_infos:
+                    self._tensor_manager.dereference(self._request_id, info.uuid)
+        self._accumulated_cache.clear()
 
     def ingest_inputs(self, node_to_inputs: DestToGraphEdges):
         # Populate the current iteration first, then populate the next iteration
@@ -510,19 +530,13 @@ class Loop(GraphSection):
         # we should only be populating the nxt_iter_section with loop-back inputs,
         # so exclude external inputs from populating nxt_iter_section. This logic
         # is required to make nested loops work.
-        my_external_inputs = {
-            (edge.name, edge.next_node): edge for edge in self._external_inputs
-        }
+        my_external_inputs = {(edge.name, edge.next_node): edge for edge in self._external_inputs}
         external_inputs = {
-            dest: [
-                edge for edge in inputs if (edge.name, dest) in my_external_inputs
-            ] for dest, inputs in node_to_inputs.items()
+            dest: [edge for edge in inputs if (edge.name, dest) in my_external_inputs]
+            for dest, inputs in node_to_inputs.items()
         }
         for dest in node_to_inputs:
-            node_to_inputs[dest] = [
-                i for i in node_to_inputs[dest] \
-                if i not in external_inputs[dest]
-            ]
+            node_to_inputs[dest] = [i for i in node_to_inputs[dest] if i not in external_inputs[dest]]
 
         ingested += self._nxt_iter_section.ingest_inputs(node_to_inputs)
         update_list_dicts(node_to_inputs, external_inputs)
@@ -530,9 +544,7 @@ class Loop(GraphSection):
         if self.curr_iter != self.max_iters - 1:
             for graph_edge in ingested:
                 if (graph_edge.name, graph_edge.next_node) in my_external_inputs:
-                    my_external_inputs[(
-                        graph_edge.name, graph_edge.next_node
-                    )].tensor_info = graph_edge.tensor_info
+                    my_external_inputs[(graph_edge.name, graph_edge.next_node)].tensor_info = graph_edge.tensor_info
                     graph_edge._persist_for_loop = True
         return ingested
 
@@ -543,32 +555,32 @@ class Loop(GraphSection):
 
         # compute "external inputs", i.e., ones that don't come from looping
         # back, and make sure those are populated for the next loop iter
-        return [
-            inp for inp in inputs if (inp.name, inp.next_node) not in output_names_dests
-        ]
+        return [inp for inp in inputs if (inp.name, inp.next_node) not in output_names_dests]
 
     def _get_loop_back_signals(self) -> list[GraphEdge]:
         # these inputs and outputs only include external and loop-back signals;
         # they do not include signals that are purely internal to the section
         inputs = self.section.get_inputs()
-        input_names_dests = [
-            (edge.name, edge.next_node) for edge in inputs
-        ]
+        input_names_dests = [(edge.name, edge.next_node) for edge in inputs]
         outputs = self.section.get_outputs()
 
-        return [
-            edge for edge in outputs if (edge.name, edge.next_node) in input_names_dests
-        ]
+        return [edge for edge in outputs if (edge.name, edge.next_node) in input_names_dests]
 
     def __post_init__(self):
         # In the disaggregated case, we need filter self.outputs for outputs
         # that this subgraph actually produces
-        outputs_we_produce = set([
-            edge.name for edge in self.section.get_outputs()
-        ])
+        outputs_we_produce = set([edge.name for edge in self.section.get_outputs()])
         self.outputs = [edge for edge in self.outputs if edge.name in outputs_we_produce]
+        self.accumulated_outputs = [edge for edge in self.accumulated_outputs if edge.name in outputs_we_produce]
 
         self._output_names = set([edge.name for edge in self.outputs])
+        self._accumulated_output_names = set([edge.name for edge in self.accumulated_outputs])
+        _overlap = self._output_names & self._accumulated_output_names
+        if _overlap:
+            raise ValueError(
+                f"Loop.outputs and Loop.accumulated_outputs must be disjoint by name; overlap: {sorted(_overlap)}"
+            )
+
         if self._curr_iter_section is None:
             self._curr_iter_section = self.section
         if self._nxt_iter_section is None:
@@ -577,7 +589,6 @@ class Loop(GraphSection):
             self._external_inputs = self._get_external_inputs()
         if self._loop_back_signals is None:
             self._loop_back_signals = self._get_loop_back_signals()
-
 
     def _advance_one_iter(self) -> "Loop":
         """
@@ -614,13 +625,13 @@ class Loop(GraphSection):
 
         logger.debug(
             "Advancing loop with nodes %s from iter %d -> %d (out of %d)",
-            str(self.section.get_node_names()), self.curr_iter,
-            self.curr_iter + 1, self.max_iters
+            str(self.section.get_node_names()),
+            self.curr_iter,
+            self.curr_iter + 1,
+            self.max_iters,
         )
 
-        self.ingest_inputs(get_node_to_inputs_mapping(
-            self._external_inputs
-        ))
+        self.ingest_inputs(get_node_to_inputs_mapping(self._external_inputs))
 
     def _is_done(self):
         return (self.max_iters == self.curr_iter + 1) and self._iter_done()
@@ -636,16 +647,13 @@ class Loop(GraphSection):
         elif self._curr_iter_section is None:
             return [], self
         first_ready, first_waiting = self._curr_iter_section.split_off_ready()
-        self._waiting_for_execution.update([
-            node.name for node in first_ready
-        ])
+        self._waiting_for_execution.update([node.name for node in first_ready])
         self._curr_iter_section = first_waiting
         return first_ready, self
 
     def split_off_ready_for_streaming(self):
         return (
-            self._curr_iter_section.split_off_ready_for_streaming() \
-                if self._curr_iter_section is not None else []
+            self._curr_iter_section.split_off_ready_for_streaming() if self._curr_iter_section is not None else []
         ) + self._nxt_iter_section.split_off_ready_for_streaming()
 
     def complete_loops(self, done_node: str) -> LoopCompletionOutput:
@@ -665,9 +673,7 @@ class Loop(GraphSection):
         done = self._is_done()
         if not done:
             return LoopCompletionOutput(
-                new_waiting=self,
-                outputs=output_signals,
-                loop_back_name_dests_to_remove=loop_back_name_dests
+                new_waiting=self, outputs=output_signals, loop_back_name_dests_to_remove=loop_back_name_dests
             )
 
         # if done, new_waiting is None and also need to collect our outputs
@@ -676,14 +682,18 @@ class Loop(GraphSection):
                 output.tensor_info = self._cached_outputs[output.name]
                 output_signals.append(output)
 
-        loop_back_name_dests.update([
-            (edge.name, edge.next_node) for edge in self._loop_back_signals
-        ])
+        # Emit per-iteration accumulated outputs (disjoint from self.outputs
+        # by __post_init__ validation).  tensor_info here is the concatenated
+        # list of every iter's contribution that was appended by cache_outputs.
+        for output in self.accumulated_outputs:
+            if output.name in self._accumulated_cache:
+                output.tensor_info = self._accumulated_cache[output.name]
+                output_signals.append(output)
+
+        loop_back_name_dests.update([(edge.name, edge.next_node) for edge in self._loop_back_signals])
 
         return LoopCompletionOutput(
-            new_waiting=None,
-            outputs=output_signals,
-            loop_back_name_dests_to_remove=loop_back_name_dests
+            new_waiting=None, outputs=output_signals, loop_back_name_dests_to_remove=loop_back_name_dests
         )
 
     def reset(self):
@@ -691,6 +701,11 @@ class Loop(GraphSection):
         self._curr_iter_section = self.section
         self._nxt_iter_section.reset()
         self.curr_iter = 0
+        # ``_cached_outputs`` is wiped by ``_advance_one_iter`` between iters
+        # and is expected to be empty at reset; the accumulated cache is NOT
+        # wiped between iters, so we must clean it up here or a fresh run of
+        # the same Loop would emit stale tensor_infos from the previous run.
+        self._uncache_accumulated_outputs()
 
 
 @dataclass
@@ -707,9 +722,7 @@ class DynamicLoop(Loop):
         return res
 
     def _is_done(self):
-        return (
-            (self.max_iters == self.curr_iter + 1) or self._finished) \
-                and self._iter_done()
+        return ((self.max_iters == self.curr_iter + 1) or self._finished) and self._iter_done()
 
     def reset(self):
         super().reset()
