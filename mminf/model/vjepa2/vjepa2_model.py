@@ -290,29 +290,67 @@ class VJepa2Model(Model):
     # ------------------------------------------------------------------
 
     def load_video(self, filepath: str, device: str) -> TensorAndMetadata:
-        """Decode a video file into ``[T, C, H, W]`` float in ``[0, 1]``.
+        """Decode a video file into ``[frames_per_clip, C, H, W]`` float in ``[0, 1]``.
 
-        Overrides the base ``Model.load_video`` because that one references
-        an unset ``self.device`` attribute.  We use the supplied ``device``
-        argument directly — torchcodec's ``VideoDecoder`` accepts ``"cpu"``
-        or ``"cuda[:N]"``; falling back to CPU on failure handles envs
-        where torchcodec lacks CUDA support.
+        Mirrors HuggingFace ``BaseVideoProcessor`` Path 2
+        (``video_processing_utils.py:294``): read metadata, compute the
+        uniform sample indices, and hand those indices to the decoder so
+        only the sampled frames are materialized.  For long clips this is
+        the difference between decoding 64 frames and decoding thousands
+        (= seconds, not minutes).
+
+        Device handling mirrors HF too: we don't pass a device to the
+        decoder (HF's decode path doesn't either; device placement happens
+        downstream in ``_prepare_input_videos``).  The ``device`` argument
+        here is kept for signature-compatibility with ``Model.load_video``
+        but is intentionally ignored — decode stays on CPU, later steps
+        move tensors to GPU as needed.
         """
         from dataclasses import asdict
 
         from torchcodec.decoders import VideoDecoder
 
-        try:
-            decoder = VideoDecoder(filepath, device=device)
-        except Exception:  # noqa: BLE001 — torchcodec raises a family of errors
-            decoder = VideoDecoder(filepath, device="cpu")
+        target_frames = self.config.frames_per_clip
+        decoder = VideoDecoder(filepath)
 
-        video = torch.stack([frame for frame in decoder]).float() / 255.0
+        metadata_obj = getattr(decoder, "metadata", None)
+        total = None
+        if metadata_obj is not None:
+            total = getattr(metadata_obj, "num_frames", None)
+        if total is None:
+            total = len(decoder)
+        total = int(total)
+
+        if target_frames > total:
+            raise ValueError(
+                f"Video too short: {total} frames, need at least "
+                f"frames_per_clip={target_frames}."
+            )
+
+        # HF-parity uniform sampling (``BaseVideoProcessor.sample_frames``
+        # at video_processing_utils.py:253):
+        #     indices = torch.arange(0, total, total / num_frames).int()
+        # Truncated to ``num_frames`` to handle float-accumulation overshoot.
+        step = total / target_frames
+        indices = torch.arange(0, total, step).to(torch.int64)[:target_frames].tolist()
+
+        get_at = getattr(decoder, "get_frames_at", None)
+        if get_at is not None:
+            frame_batch = get_at(indices=indices)
+            frames = getattr(frame_batch, "data", frame_batch)
+        else:
+            # Older torchcodec: no batched sampled-decode API, per-index
+            # lookup still avoids materializing the whole video.
+            frames = torch.stack([decoder[i] for i in indices])
+
+        video = frames.float() / 255.0
+
         try:
-            metadata = asdict(decoder.metadata)
+            metadata = asdict(metadata_obj) if metadata_obj is not None else {}
         except TypeError:
-            # metadata object may not be a dataclass across torchcodec versions
             metadata = {}
+        metadata["sampled_indices"] = indices
+        metadata["original_num_frames"] = total
         return TensorAndMetadata(data=video, metadata=metadata)
 
     def process_prompt(
