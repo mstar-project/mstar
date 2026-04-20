@@ -70,23 +70,60 @@ _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+def _sample_frames_uniform(frames: torch.Tensor, target_t: int) -> torch.Tensor:
+    """Uniformly sample ``target_t`` frames from a ``[T, ...]`` video.
+
+    Strict parity with HuggingFace
+    ``BaseVideoProcessor.sample_frames`` (see
+    ``transformers/src/transformers/video_processing_utils.py:205-256``):
+
+        indices = torch.arange(0, total, total / num_frames).int()
+
+    This produces ``target_t`` evenly-spaced integer indices in
+    ``[0, total)``.  Matching HF's behaviour exactly, we raise when the
+    video is shorter than the requested count rather than padding (upstream
+    ``vjepa2/src/datasets/video_dataset.py:loadvideo_decord`` is a
+    training-time multi-clip window sampler with different semantics — not
+    used at inference).
+    """
+    total = int(frames.size(0))
+    if target_t > total:
+        raise ValueError(
+            f"Video can't be sampled: num_frames={target_t} exceeds total_num_frames={total}. "
+            "Either send a longer clip or pass model_kwargs={'num_frames': <=total}."
+        )
+    if target_t == total:
+        return frames
+    step = total / target_t
+    indices = torch.arange(0, total, step, device=frames.device).to(torch.int64)
+    # arange can overshoot by one element due to float accumulation; trim.
+    indices = indices[:target_t]
+    return frames[indices]
+
+
 def _preprocess_video(
     frames: torch.Tensor,
     crop_size: int,
+    target_frames: int,
 ) -> torch.Tensor:
     """Apply the HF VJEPA2VideoProcessor transform inline.
 
     Input: ``[T, C, H, W]`` float in ``[0, 1]`` (matches ``Model.load_video``).
-    Output: ``[T, C, crop_size, crop_size]``, normalized with ImageNet mean/std.
+    Output: ``[target_frames, C, crop_size, crop_size]``, ImageNet-normalized.
+
+    Pipeline: temporal subsample → spatial resize (shortest edge) → center
+    crop → normalize.  Sampling first keeps intermediate memory small.
     """
     if frames.dim() != 4:
         raise ValueError(f"Expected [T,C,H,W] video; got {tuple(frames.shape)}")
-    t, c, h, w = frames.shape
+    _, c, h, w = frames.shape
     if c != 3:
         raise ValueError(f"Expected 3-channel RGB video; got {c} channels")
 
+    # Temporal subsample to the model's pretraining clip length.
+    frames = _sample_frames_uniform(frames, target_frames)
+
     resize_short = int(crop_size * 256 / 224)
-    # Resize shortest edge → keep aspect ratio.
     if h < w:
         new_h, new_w = resize_short, int(round(w * resize_short / h))
     else:
@@ -300,7 +337,15 @@ class VJepa2Model(Model):
 
         if tensors and "video_inputs" in tensors and len(tensors["video_inputs"]) > 0:
             raw = tensors["video_inputs"][0]
-            processed = _preprocess_video(raw.to(torch.float32), crop_size=self.config.crop_size)
+            # Per-request override of the frame budget (e.g. to experiment
+            # with longer clips on larger GPUs); defaults to the model's
+            # pretraining frames_per_clip.
+            target_frames = int(kwargs.get("num_frames", self.config.frames_per_clip))
+            processed = _preprocess_video(
+                raw.to(torch.float32),
+                crop_size=self.config.crop_size,
+                target_frames=target_frames,
+            )
             out["video_frames"] = [processed]
 
         if self.config.predictor_kind == "ac":
