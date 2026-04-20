@@ -40,6 +40,7 @@ from mminf.conductor.request_info import (
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import (
+    DynamicLoop,
     GraphEdge,
     GraphNode,
     GraphSection,
@@ -56,6 +57,7 @@ from mminf.model.vjepa2.submodules import (
     VJepa2ACPredictorSubmodule,
     VJepa2EncoderSubmodule,
     VJepa2PredictorSubmodule,
+    VJepa2RolloutPredictorSubmodule,
 )
 from mminf.model.vjepa2.weight_loader import (
     download_vjepa2_snapshot,
@@ -145,6 +147,12 @@ class VJepa2Model(Model):
 
     PREFILL_VIDEO = "prefill_video"
     PREFILL_VIDEO_ENCODER_ONLY = "prefill_video_encoder_only"
+    PREFILL_VIDEO_ROLLOUT = "prefill_video_rollout"
+
+    # Phase 2 rollout loop name — referenced by
+    # ``VJepa2RolloutPredictorSubmodule.forward`` via
+    # ``request_info.dynamic_loop_iter_counts[...]``.
+    ROLLOUT_LOOP_NAME = "rollout_loop"
 
     def __init__(
         self,
@@ -232,22 +240,28 @@ class VJepa2Model(Model):
         return {
             "video_encoder": EngineType.ENC_DEC,
             "predictor": EngineType.ENC_DEC,
+            # Phase 2 rollout uses a distinct node so the single-pass and
+            # rollout walks can coexist without branching inside a submodule.
+            # Both node names resolve to wrappers around the same underlying
+            # ``VJEPA2Predictor`` nn.Module — no weight duplication.
+            "rollout_predictor": EngineType.ENC_DEC,
         }
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         predictor_inputs: list[str] = ["encoder_hidden"]
+        predictor_optional_inputs: list[str] = []
         if self.config.predictor_kind == "ac":
             predictor_inputs += ["actions", "states"]
             if self.config.ac_predictor and self.config.ac_predictor.use_extrinsics:
                 predictor_inputs.append("extrinsics")
-        # Note: for the masked predictor we intentionally do NOT list
-        # context_mask / target_mask in input_ids.  GraphNode.is_ready
-        # waits for every declared input to arrive; if we listed them and
-        # the caller didn't pass masks (the usual case — the submodule
-        # builds full-coverage defaults), the node would hang forever
-        # waiting.  Custom-mask support will come back as a Phase 2/3
-        # feature when we add a proper "optional input" mechanism to the
-        # graph primitive.
+        else:
+            # Masked predictor: ``context_mask`` / ``target_mask`` are
+            # optional (submodule builds full-coverage defaults when
+            # absent).  Declared as ``optional_input_ids`` so the graph
+            # dispatcher routes them when the caller supplies them but
+            # ``is_ready`` doesn't block waiting for them in the common
+            # no-masks case.  Phase 2 new primitive (``GraphNode.optional_input_ids``).
+            predictor_optional_inputs += ["context_mask", "target_mask"]
 
         prefill_video = Sequential(
             [
@@ -259,6 +273,7 @@ class VJepa2Model(Model):
                 GraphNode(
                     name="predictor",
                     input_ids=predictor_inputs,
+                    optional_input_ids=set(predictor_optional_inputs),
                     outputs=[
                         GraphEdge(
                             next_node=EMIT_TO_CLIENT,
@@ -284,9 +299,59 @@ class VJepa2Model(Model):
             ],
         )
 
+        # ----------------------------------------------------------------
+        # Phase 2: autoregressive rollout (AnticipativeWrapper-parity)
+        # ----------------------------------------------------------------
+        # The rollout section is a single ``rollout_predictor`` node that
+        # consumes the sliding-window ``encoder_hidden`` and emits both the
+        # updated window (loop-back) and the fresh ``predicted_hidden``.
+        # ``predicted_hidden`` is declared as a section output purely so
+        # ``Loop.__post_init__`` recognizes it when filtering the
+        # ``accumulated_outputs`` edge list — its ``next_node`` target is
+        # the same node, meaning the loop-back value is ignored by the
+        # node's ``input_ids`` and only survives in the accumulated cache.
+        rollout_section = GraphNode(
+            name="rollout_predictor",
+            input_ids=["encoder_hidden"],
+            outputs=[
+                GraphEdge(next_node="rollout_predictor", name="encoder_hidden"),
+                GraphEdge(next_node="rollout_predictor", name="predicted_hidden"),
+            ],
+        )
+        # ``max_iters`` is a config-level upper bound baked in at graph-build
+        # time.  The per-request ``rollout_horizon`` is enforced inside the
+        # submodule via ``register_loop_stop`` when iter_idx + 1 reaches it.
+        rollout_loop = DynamicLoop(
+            name=self.ROLLOUT_LOOP_NAME,
+            section=rollout_section,
+            max_iters=self.config.max_rollout_horizon,
+            outputs=[],
+            accumulated_outputs=[
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="predicted_hidden",
+                    output_modality="video",
+                    persist=True,
+                ),
+            ],
+        )
+        prefill_video_rollout = Sequential(
+            [
+                GraphNode(
+                    name="video_encoder",
+                    input_ids=["video_frames"],
+                    outputs=[
+                        GraphEdge(next_node="rollout_predictor", name="encoder_hidden"),
+                    ],
+                ),
+                rollout_loop,
+            ]
+        )
+
         return {
             self.PREFILL_VIDEO: prefill_video,
             self.PREFILL_VIDEO_ENCODER_ONLY: prefill_encoder_only,
+            self.PREFILL_VIDEO_ROLLOUT: prefill_video_rollout,
         }
 
     # ------------------------------------------------------------------
@@ -329,10 +394,7 @@ class VJepa2Model(Model):
         logger.info("load_video: total_frames=%d, target=%d", total, target_frames)
 
         if target_frames > total:
-            raise ValueError(
-                f"Video too short: {total} frames, need at least "
-                f"frames_per_clip={target_frames}."
-            )
+            raise ValueError(f"Video too short: {total} frames, need at least frames_per_clip={target_frames}.")
 
         # HF-parity uniform sampling (``BaseVideoProcessor.sample_frames``
         # at video_processing_utils.py:253):
@@ -342,7 +404,9 @@ class VJepa2Model(Model):
         indices = torch.arange(0, total, step).to(torch.int64)[:target_frames].tolist()
         logger.info(
             "load_video: sampling indices=%s...%s (step=%.2f)",
-            indices[:3], indices[-3:], step,
+            indices[:3],
+            indices[-3:],
+            step,
         )
 
         get_at = getattr(decoder, "get_frames_at", None)
@@ -415,9 +479,15 @@ class VJepa2Model(Model):
                     raise ValueError("use_extrinsics=True but no 'extrinsics' kwarg provided.")
                 out["extrinsics"] = [torch.as_tensor(extrinsics, dtype=torch.float32)]
 
-        # Custom context/target masks via model_kwargs are Phase 2/3 —
-        # see the graph-walk comment for why they can't just be wired in
-        # as optional graph inputs today.
+        # Optional user-supplied masks (masked predictor only).  These are
+        # routed via the new ``GraphNode.optional_input_ids`` primitive —
+        # the predictor node accepts them when present, the submodule
+        # builds full-coverage defaults otherwise.
+        if self.config.predictor_kind != "ac":
+            for mask_name in ("context_mask", "target_mask"):
+                m = kwargs.get(mask_name)
+                if m is not None:
+                    out[mask_name] = [torch.as_tensor(m, dtype=torch.long)]
 
         return out
 
@@ -436,6 +506,13 @@ class VJepa2Model(Model):
     def _initial_walk(self, model_kwargs: dict | None) -> str:
         if model_kwargs and model_kwargs.get("skip_predictor"):
             return self.PREFILL_VIDEO_ENCODER_ONLY
+        # Rollout walk: triggered by ``rollout_horizon > 1``.  H == 1 is
+        # equivalent to a single-pass prefill — save a loop's worth of
+        # overhead and route through the normal ``prefill_video`` walk.
+        if model_kwargs:
+            horizon = int(model_kwargs.get("rollout_horizon", 0) or 0)
+            if horizon > 1:
+                return self.PREFILL_VIDEO_ROLLOUT
         return self.PREFILL_VIDEO
 
     def get_initial_forward_pass_args(
@@ -462,21 +539,35 @@ class VJepa2Model(Model):
             inputs.append(edge)
 
         if walk == self.PREFILL_VIDEO:
-            # context_mask / target_mask intentionally omitted (see
-            # get_graph_walk_graphs — would hang the graph dispatcher
-            # when not provided).
             for name in ("actions", "states", "extrinsics"):
                 if name in input_signals:
                     edge = GraphEdge(next_node="predictor", name=name)
                     edge.tensor_info = input_signals[name]
                     inputs.append(edge)
+            # Optional masks (masked predictor): routed via the predictor
+            # node's ``optional_input_ids``.  When absent, the submodule
+            # builds full-coverage defaults — readiness does not block on
+            # these.
+            for name in ("context_mask", "target_mask"):
+                if name in input_signals:
+                    edge = GraphEdge(next_node="predictor", name=name)
+                    edge.tensor_info = input_signals[name]
+                    inputs.append(edge)
+
+        step_metadata: dict = {"is_prefill": True}
+        if walk == self.PREFILL_VIDEO_ROLLOUT:
+            # Per-request horizon enforced by ``VJepa2RolloutPredictorSubmodule``
+            # via ``register_loop_stop`` once iter_idx + 1 reaches it.  The
+            # graph's DynamicLoop is always built with ``max_iters=config.max_rollout_horizon``.
+            requested = int((model_kwargs or {}).get("rollout_horizon", 2) or 2)
+            step_metadata["rollout_horizon"] = max(1, min(requested, self.config.max_rollout_horizon))
 
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
         return ForwardPassArgs(
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
+            step_metadata=step_metadata,
         )
 
     def get_partition_forward_pass_args(
@@ -518,6 +609,20 @@ class VJepa2Model(Model):
             if self.config.predictor_kind == "ac":
                 return VJepa2ACPredictorSubmodule(self.predictor, self.config)
             return VJepa2PredictorSubmodule(self.predictor, self.config)
+        if node_name == "rollout_predictor":
+            # Masked predictor only (AC rollout is Phase 3 — see plan).
+            if self.config.predictor_kind == "ac":
+                raise NotImplementedError(
+                    "AC-variant rollout is deferred to Phase 3; use predictor_kind='masked' for Phase 2 rollout."
+                )
+            self._init_predictor(device)
+            return VJepa2RolloutPredictorSubmodule(
+                self.predictor,
+                self.config,
+                num_output_frames=self.config.rollout_num_output_frames,
+                frames_per_second=self.config.rollout_frames_per_second,
+                anticipation_seconds=self.config.rollout_anticipation_seconds,
+            )
         return None
 
     def _init_encoder(self, device: str) -> None:
