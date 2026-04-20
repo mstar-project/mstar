@@ -526,6 +526,11 @@ class VJepa2Model(Model):
                 raise ValueError("V-JEPA 2-AC requires 'actions' and 'states' kwargs (per-timestep tensors).")
             out["actions"] = [torch.as_tensor(actions, dtype=torch.float32)]
             out["states"] = [torch.as_tensor(states, dtype=torch.float32)]
+            logger.info(
+                "process_prompt: AC actions shape=%s states shape=%s",
+                tuple(out["actions"][0].shape),
+                tuple(out["states"][0].shape),
+            )
             if self.config.ac_predictor and self.config.ac_predictor.use_extrinsics:
                 extrinsics = kwargs.get("extrinsics")
                 if extrinsics is None:
