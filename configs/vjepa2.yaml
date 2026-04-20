@@ -12,7 +12,12 @@ node_groups:
     ranks:
       - 0
 
+  # Phase 1 single-pass ``predictor`` and Phase 2 ``rollout_predictor`` share
+  # the same underlying VJEPA2Predictor nn.Module (loaded once); colocating
+  # them on the same rank keeps that instance reachable without cross-rank
+  # tensor shipping.
   - node_names:
       - predictor
+      - rollout_predictor
     ranks:
       - 0
