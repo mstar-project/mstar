@@ -1,5 +1,3 @@
-
-
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from typing import Type
@@ -54,12 +52,13 @@ class NodeSubmodule(torch.nn.Module):
     """
 
     def preprocess(
-        self, graph_walk: str,
+        self,
+        graph_walk: str,
         cache_manager: BatchedCacheManager,
         per_request_inputs: list[NameToTensorList],
         request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo]
-    ) -> dict[str, torch.Tensor]: # input name to tensor
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> dict[str, torch.Tensor]:  # input name to tensor
         """
         Convert variable-length list[Tensor] inputs to fixed tensors.
         NOT compiled — handles Python-level variability.
@@ -83,11 +82,7 @@ class NodeSubmodule(torch.nn.Module):
         return None
 
     @abstractmethod
-    def forward(
-        self,
-        request_info: CurrentForwardPassInfo,
-        **kwargs
-    ) -> NameToTensorList:
+    def forward(self, request_info: CurrentForwardPassInfo, **kwargs) -> NameToTensorList:
         """
         Pure tensor → NameToTensorList computation.
         Compilable + CUDA-graphable.
@@ -95,8 +90,7 @@ class NodeSubmodule(torch.nn.Module):
         ...
 
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
-        """TODO: add cuda graph support for pi05.
-        """
+        """TODO: add cuda graph support for pi05."""
         return []
 
     def can_use_cuda_graphs(self, batch: NodeBatch) -> bool:
@@ -113,15 +107,10 @@ class NodeSubmodule(torch.nn.Module):
             }
         return batch.graph_walk in self._cached_cuda_graph_walks
 
-    def can_batch(
-        self, batch: NodeBatch
-    ):
+    def can_batch(self, batch: NodeBatch):
         return False
 
-    def postprocess(
-        self, request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]]
-    ):
+    def postprocess(self, request_info: CurrentForwardPassInfo, outputs: dict[str, list[torch.Tensor]]):
         """
         Performs any required postprocessing (after sampling from logits, if applicable)
         on the submodule outputs (e.g., checking for EOS to stop the decode loop, as this
@@ -151,16 +140,15 @@ class NodeSubmodule(torch.nn.Module):
 @dataclass
 class WorkerGraph:
     section: GraphSection
-    graph_walks: set[str] # e.g., prefill, decode, image_gen
+    graph_walks: set[str]  # e.g., prefill, decode, image_gen
     consumes_stream: bool = field(default=False)
     ranks: list[int] = field(default_factory=list)
-    _group_id: int = field(default=-1) # used in going from config yaml to worker graphs
+    _group_id: int = field(default=-1)  # used in going from config yaml to worker graphs
     worker_graph_id: str = field(default_factory=lambda: str(uuid4()))
 
 
 def _combine_sections_sequential_or_parallel(
-    section: GraphSection, other: GraphSection,
-    comb_type: Type[Sequential] | Type[Parallel]
+    section: GraphSection, other: GraphSection, comb_type: Type[Sequential] | Type[Parallel]
 ):
     if isinstance(section, comb_type) and isinstance(other, comb_type):
         section.sections.extend(other.sections)
@@ -189,13 +177,15 @@ def _divide_into_worker_graphs(
         if len(graph._streaming_inputs) > 0:
             graph.consumes_stream = True
 
-        return [WorkerGraph(
-            section=graph,
-            graph_walks=set([graph_walk]),
-            consumes_stream=graph.consumes_stream,
-            _group_id=node_to_group_idx[graph.name],
-            ranks=node_groups[node_to_group_idx[graph.name]]["ranks"]
-        )]
+        return [
+            WorkerGraph(
+                section=graph,
+                graph_walks=set([graph_walk]),
+                consumes_stream=graph.consumes_stream,
+                _group_id=node_to_group_idx[graph.name],
+                ranks=node_groups[node_to_group_idx[graph.name]]["ranks"],
+            )
+        ]
 
     if isinstance(graph, Sequential):
         worker_graphs = _divide_into_worker_graphs(
@@ -203,7 +193,7 @@ def _divide_into_worker_graphs(
             graph_walk=graph_walk,
             node_to_group_idx=node_to_group_idx,
             node_groups=node_groups,
-            input_streams=input_streams
+            input_streams=input_streams,
         )
 
         for i in range(1, len(graph.sections)):
@@ -214,13 +204,14 @@ def _divide_into_worker_graphs(
                 graph_walk=graph_walk,
                 node_to_group_idx=node_to_group_idx,
                 node_groups=node_groups,
-                input_streams=input_streams
+                input_streams=input_streams,
             )
-            if new_worker_graphs[0]._group_id == worker_graphs[-1]._group_id and \
-                    not new_worker_graphs[0].consumes_stream:
+            if (
+                new_worker_graphs[0]._group_id == worker_graphs[-1]._group_id
+                and not new_worker_graphs[0].consumes_stream
+            ):
                 worker_graphs[-1].section = _combine_sections_sequential_or_parallel(
-                    worker_graphs[-1].section, new_worker_graphs.pop(0).section,
-                    comb_type=Sequential
+                    worker_graphs[-1].section, new_worker_graphs.pop(0).section, comb_type=Sequential
                 )
             worker_graphs.extend(new_worker_graphs)
         return worker_graphs
@@ -228,30 +219,29 @@ def _divide_into_worker_graphs(
     if isinstance(graph, Parallel):
         all_worker_graphs = [
             _divide_into_worker_graphs(
-                s, graph_walk=graph_walk,
+                s,
+                graph_walk=graph_walk,
                 node_to_group_idx=node_to_group_idx,
                 node_groups=node_groups,
-                input_streams=input_streams
-            ) for s in graph.sections
+                input_streams=input_streams,
+            )
+            for s in graph.sections
         ]
         # parallel sections that are all on the same worker can be merged
-        singleton_worker_graphs = [
-            s[0] for s in all_worker_graphs if len(s) == 1 and not s[0].consumes_stream
-        ]
+        singleton_worker_graphs = [s[0] for s in all_worker_graphs if len(s) == 1 and not s[0].consumes_stream]
         group_id_to_worker_graph = {}
         for s in singleton_worker_graphs:
             if s._group_id in group_id_to_worker_graph:
                 existing = group_id_to_worker_graph[s._group_id]
                 existing.section = _combine_sections_sequential_or_parallel(
-                    existing.section, s.section,
-                    comb_type=Parallel
+                    existing.section, s.section, comb_type=Parallel
                 )
             else:
                 group_id_to_worker_graph[s._group_id] = s
 
-        return list(group_id_to_worker_graph.values()) + sum([
-            s for s in all_worker_graphs if len(s) > 1 or s[0].consumes_stream
-        ], start=[]) # remaining worker graphs
+        return list(group_id_to_worker_graph.values()) + sum(
+            [s for s in all_worker_graphs if len(s) > 1 or s[0].consumes_stream], start=[]
+        )  # remaining worker graphs
 
     if isinstance(graph, Loop):
         loop_section_worker_graphs = _divide_into_worker_graphs(
@@ -259,12 +249,16 @@ def _divide_into_worker_graphs(
             graph_walk=graph_walk,
             node_to_group_idx=node_to_group_idx,
             node_groups=node_groups,
-            input_streams=input_streams
+            input_streams=input_streams,
         )
-        ext_inps = [
-            inp for inp in graph._external_inputs if inp.name not in input_streams
-        ]
+        ext_inps = [inp for inp in graph._external_inputs if inp.name not in input_streams]
         for s in loop_section_worker_graphs:
+            # ``accumulated_outputs`` must be propagated to the per-worker
+            # reconstruction — otherwise ``Loop.cache_outputs`` sees an
+            # empty ``_accumulated_output_names`` on the worker side, every
+            # per-iter tensor silently falls on the floor, and nothing ever
+            # reaches ``EMIT_TO_CLIENT`` (symptom: 4 "Deferring cleanup"
+            # warnings + empty client response in the V-JEPA 2 rollout run).
             if isinstance(graph, DynamicLoop):
                 s.section = DynamicLoop(
                     section=s.section,
@@ -274,7 +268,8 @@ def _divide_into_worker_graphs(
                     _external_inputs=ext_inps,
                     _loop_back_signals=graph._loop_back_signals,
                     outputs=graph.outputs,
-                    _uuid_label=graph._uuid_label
+                    accumulated_outputs=graph.accumulated_outputs,
+                    _uuid_label=graph._uuid_label,
                 )
             else:
                 s.section = Loop(
@@ -284,7 +279,8 @@ def _divide_into_worker_graphs(
                     _external_inputs=ext_inps,
                     _loop_back_signals=graph._loop_back_signals,
                     outputs=graph.outputs,
-                    _uuid_label=graph._uuid_label
+                    accumulated_outputs=graph.accumulated_outputs,
+                    _uuid_label=graph._uuid_label,
                 )
         return loop_section_worker_graphs
 
@@ -300,27 +296,24 @@ class ForwardPassArgs:
     unpersist_tensors: list[TensorPointerInfo]
 
     # e.g., saw EOS or max tokens. Is used to end the request
-    request_done: bool =  False
+    request_done: bool = False
 
     # step_metadata is at the engine / worker level; and
     # is passed into the fwd pass
     step_metadata: dict = field(default_factory=dict)
 
+
 class Model(ABC):
     def _get_worker_graphs_for_graph_walk(
-        self, graph_walk: str, graph: GraphSection,
+        self,
+        graph_walk: str,
+        graph: GraphSection,
         node_groups: list[dict],
     ):
-        node_groups = [
-            g for g in node_groups if (
-                "graph_walks" not in g or graph_walk in g["graph_walks"]
-            )
-        ]
+        node_groups = [g for g in node_groups if ("graph_walks" not in g or graph_walk in g["graph_walks"])]
         node_to_group_idx: dict[str, int] = {}
         for i, group in enumerate(node_groups):
-            node_to_group_idx.update({
-                name: i for name in group["node_names"]
-            })
+            node_to_group_idx.update({name: i for name in group["node_names"]})
 
         partition = "default"
         for part in self.get_partitions():
@@ -337,7 +330,7 @@ class Model(ABC):
             graph_walk=graph_walk,
             node_to_group_idx=node_to_group_idx,
             node_groups=node_groups,
-            input_streams=input_streams
+            input_streams=input_streams,
         )
 
     def get_worker_graphs(self, config_path: str) -> list[WorkerGraph]:
@@ -348,10 +341,13 @@ class Model(ABC):
             raise KeyError("Config must define `node_groups`.")
 
         # TODO: merge identical worker graphs from different graph walks
-        return sum([
-            self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups) \
+        return sum(
+            [
+                self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups)
                 for graph_walk, graph in self.get_graph_walk_graphs().items()
-        ], start=[])
+            ],
+            start=[],
+        )
 
     @abstractmethod
     def get_kv_cache_config(self) -> list[KVCacheConfig]:
@@ -419,44 +415,33 @@ class Model(ABC):
         """
         pass
 
-    def load_image(
-        self, filepath: str, device: str
-    ) -> TensorAndMetadata:
+    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         import torchvision
+
         img = torchvision.io.decode_image(filepath).to(device)  # uint8 CxHxW
         img = img.float() / 255.0
 
         return TensorAndMetadata(img)
 
-    def load_audio(
-        self, filepath: str, device: str
-    ) -> TensorAndMetadata:
+    def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         from torchcodec.decoders import AudioDecoder
+
         decoder = AudioDecoder(filepath, sample_rate=16000, num_channels=1)
         audio = decoder.get_all_samples().data[0]
-        return TensorAndMetadata(
-            data=audio,
-            metadata=dict(
-                sample_rate=16000,
-                num_channels=1
-            )
-        )
+        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
-    def load_video(
-        self, filepath: str, device: str
-    ) :
+    def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
+
         decoder = VideoDecoder(filepath, device=self.device)
         video = torch.stack([frame for frame in decoder]).float() / 255.0
-        return TensorAndMetadata(
-            data=video,
-            metadata=asdict(decoder.metadata)
-        )
+        return TensorAndMetadata(data=video, metadata=asdict(decoder.metadata))
 
     @abstractmethod
     def postprocess(
-        self, output: torch.Tensor,
-        modality: str # text | image | video | audio
+        self,
+        output: torch.Tensor,
+        modality: str,  # text | image | video | audio
     ) -> bytes:
         """
         Given an output of a certain modality, encode and return as bytes.
@@ -495,6 +480,7 @@ class Model(ABC):
         Override for models with async partitions (e.g., Orpheus LLM + SNAC).
         """
         from mminf.streaming.topology import PartitionTopology
+
         return PartitionTopology(partitions=["default"], connections=[])
 
     def get_partitions(self) -> list[PartitionDefinition]:
@@ -504,10 +490,14 @@ class Model(ABC):
         Override for models with async partitions (e.g., Orpheus LLM + SNAC).
         """
         walks = set(self.get_graph_walk_graphs().keys())
-        return [PartitionDefinition(
-            name="default", graph_walks=walks,
-            initial_walk=None, producer_partitions=[],
-        )]
+        return [
+            PartitionDefinition(
+                name="default",
+                graph_walks=walks,
+                initial_walk=None,
+                producer_partitions=[],
+            )
+        ]
 
     @abstractmethod
     def get_partition_forward_pass_args(
