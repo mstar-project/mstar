@@ -137,7 +137,32 @@ class TestEncoderCanBatch:
         batch = _make_batch(
             node_name="video_encoder",
             graph_walk="prefill_video",
-            per_request_inputs={"rid_0": {}},
+            per_request_inputs={"rid_0": {}, "rid_1": {}},
+        )
+        assert submodule.can_batch(batch) is False
+
+    def test_b1_rejected_routes_to_sequential_path(self):
+        """``can_batch`` returns False for B=1 regardless of shape
+        homogeneity, so single-request traffic keeps using the proven
+        sequential ``forward`` path.
+
+        Rationale: on vjepa2-ac-vitg (40 layers × 1408 hidden dim), a
+        torch.compile trace through ``forward_batched`` measured ~20×
+        slower at warm than the same input through ``forward``.  Routing
+        B=1 through forward_batched would strictly regress single-request
+        latency from the Phase 2 baseline.  forward_batched only pays off
+        when the scheduler genuinely co-batches concurrent requests, so
+        we gate can_batch on ``len(request_ids) >= 2``.
+        """
+        config = _tiny_config()
+        encoder = VJEPA2Encoder(config).eval()
+        submodule = VJepa2EncoderSubmodule(encoder, config)
+
+        frames = torch.randn(config.frames_per_clip, 3, config.crop_size, config.crop_size)
+        batch = _make_batch(
+            node_name="video_encoder",
+            graph_walk="prefill_video",
+            per_request_inputs={"rid_0": {"video_frames": [frames]}},
         )
         assert submodule.can_batch(batch) is False
 
