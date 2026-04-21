@@ -4,15 +4,28 @@ from enum import Enum
 from time import sleep
 
 import torch
+import torch.distributed as dist
 
 from mminf.api_server.request_types import APIServerMessage, ResultTensors
-from mminf.communication.communicator import CommProtocol, ZMQCommunicator
-from mminf.communication.tensors import NameToTensorList, create_tensor_communication_manager
+from mminf.communication.communicator import (
+    CommProtocol,
+    MOONCAKE_PROTOCOLS,
+    ZMQCommunicator,
+)
+from mminf.communication.tensors import (
+    EdgeSpec,
+    MooncakeCommunicationManager,
+    NameToTensorList,
+    NVSHMEMCommunicationManager,
+    TensorCommunicationManager,
+    create_tensor_communication_manager,
+)
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
 from mminf.engine.kv_store import KVCacheConfig, StoreWritePolicy, TransferEngineInfo
-from mminf.graph.base import FilteredEdges, GraphEdge
+from mminf.graph.base import FilteredEdges, GraphEdge, TensorPointerInfo
 from mminf.graph.request_queues import format_graph_edge_list
+from mminf.graph.special_destinations import SPECIAL_DESTINATIONS
 from mminf.model.base import Model, WorkerGraph
 from mminf.streaming.stream_buffer import StreamBuffer
 from mminf.utils.ipc_format import (
@@ -46,11 +59,32 @@ class EvictionPolicy(Enum):
 
 
 class Worker:
+    """Worker that integrates WorkerGraphsManager, EngineManager, MicroScheduler,
+    and one-or-two TensorCommunicationManagers (Mooncake + optional NVSHMEM)
+    to execute computation via engines.
+
+    Dual-manager design (NVSHMEM mode):
+    - ``self.managers: dict[CommProtocol, TensorCommunicationManager]`` —
+      Mooncake manager always installed (handles api_server↔worker hops).
+      NVSHMEM manager installed when this worker joins the NVSHMEM PG.
+    - ``self._uuid_to_manager: dict[str, TensorCommunicationManager]`` —
+      populated at produce-time (store) and consume-time (start_read_tensors).
+      Used for ACK routing, tensor retrieval, and Loop output refcount.
+    - ``resolve_transport(edge)`` — picks NVSHMEM or Mooncake per
+      ``GraphEdge.transport`` and AUTO-resolution rules.
     """
-    Real worker that integrates WorkerGraphsManager, EngineManager,
-    MicroScheduler, and MooncakeCommunicationManager to execute
-    computation via engines.
-    """
+
+    # ------------------------------------------------------------------
+    # Captured-transport watchdog (per §7.1 of the captured-NVSHMEM design doc)
+    # ------------------------------------------------------------------
+    REPLAY_TIMEOUT_S: float = 30.0
+    REPLAY_POLL_INTERVAL_S: float = 0.001
+
+    class WorkerAbort(RuntimeError):
+        """Raised by replay_with_watchdog when a captured replay exceeds its
+        deadline (indicating a dead peer or hung NVSHMEM operation). The main
+        loop propagates this to process exit; the Conductor surfaces the
+        failure and restarts the worker pool."""
 
     def __init__(
         self,
@@ -68,8 +102,12 @@ class Worker:
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         device: torch.device = torch.device("cuda"),
         enable_nvtx: bool = False,
-        mooncake_port: int=8080,
-        tcp_transfer_device=""
+        mooncake_port: int = 8080,
+        tcp_transfer_device: str = "",
+        # NVSHMEM additions (default-safe so existing callers don't break)
+        master_service: str = "localhost:50051",
+        node_to_rank: dict[str, int] | None = None,
+        edge_specs: list[EdgeSpec] | None = None,
     ):
         self.worker_id = worker_id
         self.device = device
@@ -92,19 +130,84 @@ class Worker:
             push_ids=worker_ids + ["conductor", "api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
         )
-        self.tensor_manager = create_tensor_communication_manager(
-            protocol=tensor_comm_protocol,
+
+        # ------------------------------------------------------------------
+        # Dual-manager setup
+        # ------------------------------------------------------------------
+        self.managers: dict[CommProtocol, TensorCommunicationManager] = {}
+        # Maps uuid → manager that produced/is consuming it. Used for:
+        #   (a) producer side: ACK routing in _handle_tensor_received
+        #   (b) consumer side: tensor retrieval in _build_node_batch /
+        #       _cleanup_consumed_inputs / _send_outputs
+        #   (c) Loop output refcount (via the resolver passed to
+        #       WorkerGraphQueues.manager_resolver)
+        self._uuid_to_manager: dict[str, TensorCommunicationManager] = {}
+
+        if tensor_comm_protocol == CommProtocol.NVSHMEM:
+            # Derive rank from worker_id ("worker_0" → rank 0).
+            nvshmem_rank = int(worker_id.removeprefix("worker_"))
+            nvshmem_world = len(worker_ids)
+            dist.init_process_group(
+                backend="nccl",
+                init_method=f"tcp://{master_service}",
+                rank=nvshmem_rank,
+                world_size=nvshmem_world,
+            )
+            nvshmem_group = dist.group.WORLD
+
+            entity_id_to_rank = {
+                wid: int(wid.removeprefix("worker_")) for wid in worker_ids
+            }
+            # Merge node name → rank so store_and_populate_graph_edges can
+            # look up node names (e.g. "LLM", "vit_encoder") directly.
+            if node_to_rank:
+                entity_id_to_rank.update(node_to_rank)
+
+            nvshmem_mgr = NVSHMEMCommunicationManager(
+                my_entity_id=worker_id,
+                rank=nvshmem_rank,
+                world_size=nvshmem_world,
+                device=self.device,
+                communicator=self.communicator,
+                group=nvshmem_group,
+                entity_id_to_rank=entity_id_to_rank,
+            )
+            self.managers[CommProtocol.NVSHMEM] = nvshmem_mgr
+            self.rank = nvshmem_rank
+            # Mooncake uses RDMA for api_server↔NVSHMEM-worker hops.
+            _mooncake_protocol = CommProtocol.RDMA
+        else:
+            self.rank = -1
+            _mooncake_protocol = tensor_comm_protocol
+
+        # Mooncake (or SHM) — always installed; handles api_server↔worker hops
+        # and any edges that resolve to a non-NVSHMEM protocol. We use the
+        # factory so SHM workers get SharedMemoryCommunicationManager and
+        # RDMA/TCP workers get MooncakeCommunicationManager. ``hostname`` may
+        # arrive as "{host}:{rendezvous_port}" because Conductor overloads it
+        # to carry the NVSHMEM rendezvous addr; Mooncake's P2PHANDSHAKE needs
+        # "{host}:{rpc_port}" (2 fields), so strip the rendezvous part here.
+        # NVSHMEM init uses master_service, not hostname, so stripping is safe.
+        _mooncake_hostname = hostname.split(":", 1)[0] if ":" in hostname else hostname
+        mooncake_mgr = create_tensor_communication_manager(
+            protocol=_mooncake_protocol,
             my_entity_id=worker_id,
-            hostname=hostname,
+            hostname=_mooncake_hostname,
             device=self.device,
             communicator=self.communicator,
             tcp_transfer_device=tcp_transfer_device,
         )
+        for p in MOONCAKE_PROTOCOLS:
+            self.managers[p] = mooncake_mgr
+        self._mooncake_mgr = mooncake_mgr
+        self._mooncake_protocol = _mooncake_protocol
 
         node_names = set()
         for wg in my_worker_graphs:
             node_names.update(wg.section.get_node_names())
 
+        # KV transfers always use the Mooncake/SHM manager's transfer_engine
+        # (NVSHMEM does not carry KV cache pages cross-rank).
         self.engine_manager = EngineManager.build(
             node_names,
             device=device,
@@ -112,12 +215,19 @@ class Worker:
             model_config=model_config,
             transfer_engine_info=TransferEngineInfo(
                 my_entity_id=worker_id,
-                my_session_id=self.tensor_manager.my_session_id,
-                transfer_engine=self.tensor_manager.transfer_engine
+                my_session_id=mooncake_mgr.my_session_id,
+                transfer_engine=mooncake_mgr.transfer_engine,
             ),
             model=model,
-            enable_nvtx=self.enable_nvtx
+            enable_nvtx=self.enable_nvtx,
         )
+
+        # Resolver passed to WorkerGraphQueues so Loop sections can refcount
+        # cached outputs against whichever manager produced each UUID.
+        # Falls back to Mooncake if the UUID hasn't been registered yet
+        # (e.g. UUIDs from EMPTY_DESTINATION edges or pre-registry sites).
+        def _resolve_manager(uuid: str) -> TensorCommunicationManager:
+            return self._uuid_to_manager.get(uuid, self._mooncake_mgr)
 
         self.worker_graphs_manager = WorkerGraphsManager(
             queues={
@@ -126,7 +236,7 @@ class Worker:
                     graph_walks=worker_graph.graph_walks,
                     worker_graph=worker_graph,
                     per_request_queues={},
-                    tensor_manager=self.tensor_manager
+                    manager_resolver=_resolve_manager,
                 )
                 for worker_graph in my_worker_graphs
             },
@@ -172,14 +282,11 @@ class Worker:
             for wg in my_worker_graphs:
                 my_node_names.update(wg.section.get_node_names())
             for conn in self.partition_topology.connections:
-                # Check if any graph walk graph node for the consumer partition is on this worker
-                # by checking if the streaming edge's next_node is in my nodes
                 if any(n in my_node_names for n in self._get_node_names_for_partition(conn.to_partition, model)):
                     self._my_consumer_connections.append(conn)
 
         # Set of edge names that arrive via streaming (used to distinguish
-        # streaming inputs from conductor-triggered non-streaming inputs
-        # when checking whether a target node is ready for ingestion).
+        # streaming inputs from conductor-triggered non-streaming inputs).
         self._streaming_edge_names: set[str] = {
             conn.edge_name for conn in self._my_consumer_connections
         }
@@ -192,6 +299,79 @@ class Worker:
                 for section in walks.values():
                     if hasattr(section, 'input_ids') and conn.edge_name in section.input_ids:
                         self._consumer_node_cache[conn.edge_name] = section.name
+
+        # EdgeSpec list assigned by the Conductor for this worker's rank.
+        # Consumed by run() before engine warmup to bring up the captured
+        # NVSHMEM-transport symmetric heap.
+        self._captured_edge_specs: list[EdgeSpec] = list(edge_specs or [])
+
+    # ------------------------------------------------------------------
+    # Transport resolution
+    # ------------------------------------------------------------------
+
+    def resolve_transport(self, edge: GraphEdge) -> CommProtocol:
+        """Determine the CommProtocol to use for a given GraphEdge.
+
+        Resolution rules (in priority order):
+        1. Explicit override: edge.transport != AUTO → use it directly (validates
+           that the manager is installed).
+        2. EMIT_TO_CLIENT / non-worker destinations → Mooncake (api_server is not
+           an NVSHMEM peer).
+        3. Both producer and consumer are in the NVSHMEM process group AND on
+           different ranks → NVSHMEM.
+        4. Fallback → Mooncake.
+        """
+        if edge.transport != CommProtocol.AUTO:
+            # Rule 1: explicit override wins.
+            if edge.transport in MOONCAKE_PROTOCOLS:
+                return edge.transport
+            if edge.transport == CommProtocol.NVSHMEM:
+                if edge.next_node in SPECIAL_DESTINATIONS:
+                    raise ValueError(
+                        f"Transport NVSHMEM explicitly requested for edge "
+                        f"'{edge.name}' → '{edge.next_node}' which is a special "
+                        "destination (e.g. EMIT_TO_CLIENT); api_server is not "
+                        "an NVSHMEM peer."
+                    )
+                if CommProtocol.NVSHMEM not in self.managers:
+                    raise ValueError(
+                        f"Transport NVSHMEM explicitly requested for edge "
+                        f"'{edge.name}' → '{edge.next_node}' but this worker "
+                        "has no NVSHMEM manager installed."
+                    )
+                return CommProtocol.NVSHMEM
+            raise ValueError(f"Unsupported CommProtocol override: {edge.transport}")
+
+        # Rule 2: special destinations (EMIT_TO_CLIENT, EMPTY_DESTINATION) → Mooncake.
+        if edge.next_node in SPECIAL_DESTINATIONS:
+            return self._mooncake_protocol
+
+        # Rule 3: next_node is in the NVSHMEM process group AND on a different
+        # rank → NVSHMEM. Same-rank self-edges (e.g. LLM→latents→LLM in the
+        # image_gen denoising loop) fall through to Rule 4: the staging-slot
+        # ACK would never arrive in a single-threaded worker loop, causing
+        # deadlock. Mooncake uses the local tensor store with no ACK needed.
+        if CommProtocol.NVSHMEM in self.managers:
+            nvshmem_mgr = self.managers[CommProtocol.NVSHMEM]
+            if edge.next_node in nvshmem_mgr.entity_id_to_rank:
+                consumer_rank = nvshmem_mgr.entity_id_to_rank[edge.next_node]
+                if consumer_rank != nvshmem_mgr.rank:
+                    return CommProtocol.NVSHMEM
+
+        # Rule 4: fallback → Mooncake.
+        return self._mooncake_protocol
+
+    def _get_manager(self, protocol: CommProtocol) -> TensorCommunicationManager:
+        """Return the manager for a resolved (non-AUTO) CommProtocol."""
+        if protocol in self.managers:
+            return self.managers[protocol]
+        raise RuntimeError(
+            f"No manager installed for protocol {protocol} on worker {self.worker_id}"
+        )
+
+    def _mgr(self, uuid: str) -> TensorCommunicationManager:
+        """Look up the manager that owns a given UUID, defaulting to Mooncake."""
+        return self._uuid_to_manager.get(uuid, self._mooncake_mgr)
 
     def _get_node_names_for_partition(self, partition_name: str, model: Model) -> list[str]:
         """Get the node names that belong to a partition."""
@@ -223,7 +403,6 @@ class Worker:
         all_ar_walks_nodes: set[str] = set()
 
         def _is_ar(node_name: str) -> bool:
-            # Check local engine first, then fall back to model's type map
             engine = self.engine_manager.node_to_engine.get(node_name)
             if engine is not None:
                 return engine.engine_type() == EngineType.AR
@@ -231,13 +410,11 @@ class Worker:
                 return node_engine_types[node_name] == EngineType.AR
             return False
 
-        # Collect this worker's AR graph walks
         for wg in my_worker_graphs:
             for node_name in wg.section.get_node_names():
                 if _is_ar(node_name):
                     my_ar_walks_nodes.update([(walk, node_name) for walk in wg.graph_walks])
 
-        # Collect all workers' AR graph walks
         for wg_id, walks in all_worker_graph_ids_to_graph_walks.items():
             nodes = all_worker_graph_ids_to_nodes.get(wg_id, set())
             for node_name in nodes:
@@ -245,14 +422,14 @@ class Worker:
                     all_ar_walks_nodes.update([(walk, node_name) for walk in walks])
 
         if not all_ar_walks_nodes:
-            return StoreWritePolicy.NEVER  # no AR engines at all
+            return StoreWritePolicy.NEVER
 
         if my_ar_walks_nodes == all_ar_walks_nodes:
             logger.info(
                 "No LLM disaggregation detected; my_ar_walks_nodes == all_ar_walks_nodes: %s",
                 str(my_ar_walks_nodes)
             )
-            return StoreWritePolicy.NEVER  # all AR walks on this worker
+            return StoreWritePolicy.NEVER
 
         return StoreWritePolicy.ALWAYS
 
@@ -285,10 +462,9 @@ class Worker:
                 policy=conn.chunk_policy_factory(),
             )
 
-        # Start RDMA reads for tensors that have tensor_info
-        self.tensor_manager.start_read_tensors(
-            body.request_id, body.initial_inputs,
-        )
+        # Consumer dispatch: route each edge to the appropriate manager based
+        # on TPI.source_rank. source_rank >= 0 → NVSHMEM; -1 → Mooncake.
+        self._dispatch_start_read(body.request_id, body.initial_inputs)
 
         # Signal-only edges (tensor_info is None) can be processed immediately
         signal_only = [
@@ -298,29 +474,91 @@ class Worker:
             self.worker_graphs_manager.process_new_inputs(
                 request_id=body.request_id, inputs=signal_only
             )
-        # process messages that may have came in out-of-order
+        # process messages that may have come in out-of-order
         if body.request_id in self._unprocessed_messages:
             self._process_message_list(self._unprocessed_messages[body.request_id])
             del self._unprocessed_messages[body.request_id]
 
+    def _dispatch_start_read(
+        self, request_id: str, graph_edges: list[GraphEdge]
+    ) -> None:
+        """Route graph edges to the appropriate manager's start_read_tensors.
+
+        Consumer dispatch rule: determined by TPI.source_rank.
+          source_rank >= 0  → NVSHMEM (produced by an NVSHMEM peer rank)
+          source_rank == -1 → Mooncake (produced by api_server or Mooncake worker)
+
+        Populates _uuid_to_manager for downstream get_tensor / dereference calls.
+        """
+        nvshmem_edges: list[GraphEdge] = []
+        mooncake_edges: list[GraphEdge] = []
+
+        for edge in graph_edges:
+            if not edge.tensor_info:
+                continue  # signal-only
+            first = edge.tensor_info[0]
+            if first.source_rank >= 0:
+                nvshmem_edges.append(edge)
+                for info in edge.tensor_info:
+                    self._uuid_to_manager[info.uuid] = self.managers.get(
+                        CommProtocol.NVSHMEM, self._mooncake_mgr
+                    )
+            else:
+                mooncake_edges.append(edge)
+                for info in edge.tensor_info:
+                    self._uuid_to_manager[info.uuid] = self._mooncake_mgr
+
+        if nvshmem_edges and CommProtocol.NVSHMEM in self.managers:
+            self.managers[CommProtocol.NVSHMEM].start_read_tensors(
+                request_id, nvshmem_edges
+            )
+            logger.debug(
+                "manager=nvshmem op=read request_id=%s edges=%s",
+                request_id, [e.name for e in nvshmem_edges],
+            )
+        if mooncake_edges:
+            self._mooncake_mgr.start_read_tensors(request_id, mooncake_edges)
+            logger.debug(
+                "manager=mooncake op=read request_id=%s edges=%s",
+                request_id, [e.name for e in mooncake_edges],
+            )
 
     def _remove_request(self, body: RemoveRequest) -> None:
         self.engine_manager.remove_request(body.request_id)
         self.worker_graphs_manager.remove_request(body.request_id)
-        self.tensor_manager.cleanup_request(body.request_id)
+        # Cleanup all unique managers (set() because Mooncake protocols all
+        # alias to one manager).
+        for mgr in set(self.managers.values()):
+            mgr.cleanup_request(body.request_id)
         self.streaming_buffers.pop(body.request_id, None)
 
         ar_engine = self.engine_manager.get_ar_engine()
         if ar_engine is not None:
             for node_name in ar_engine.submodule_management.keys():
-                self._last_active.pop((body.request_id, node_name))
+                self._last_active.pop((body.request_id, node_name), None)
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
-        """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
-        for (uuid, ref_cnt) in body.successful_tensors.items():
-            self.tensor_manager.dereference(
-                body.request_id, uuid, n=ref_cnt
-            )
+        """Sender-side cleanup: receiver confirmed transfer, free source buffers.
+
+        Routes each ACK'd UUID to the manager that produced it via
+        _uuid_to_manager. NVSHMEM UUIDs are batched into one handle_ack call
+        (freeing one staging slot); Mooncake UUIDs are deref'd individually.
+        """
+        nvshmem_mgr = self.managers.get(CommProtocol.NVSHMEM)
+        nvshmem_uuids: dict[str, int] = {}
+        mooncake_uuids: dict[str, int] = {}
+
+        for uuid, ref_cnt in body.successful_tensors.items():
+            mgr = self._uuid_to_manager.get(uuid)
+            if mgr is not None and mgr is nvshmem_mgr:
+                nvshmem_uuids[uuid] = ref_cnt
+            else:
+                mooncake_uuids[uuid] = ref_cnt
+
+        if nvshmem_uuids and nvshmem_mgr is not None:
+            nvshmem_mgr.handle_ack(body.request_id, nvshmem_uuids)
+        for uuid, ref_cnt in mooncake_uuids.items():
+            self._mooncake_mgr.dereference(body.request_id, uuid, n=ref_cnt)
 
     def _process_new_inputs(self, body: InputSignals) -> None:
         logger.debug(
@@ -334,12 +572,9 @@ class Worker:
             if req_info:
                 for sbuf in req_info.stream_buffers.values():
                     if sbuf.from_partition in body.producer_done:
-                        # If we have multiple consumer partitions colocated, we need to signal
-                        # the right one
                         sbuf.signal_done()
 
         # Separate streaming edges — they'll be handled when tensors are ready
-        # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
         non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
         streaming_with_tensors = [edge for edge in body.inputs if edge.is_streaming and edge.tensor_info]
 
@@ -353,22 +588,14 @@ class Worker:
                 partition_name=body.partition_name
             )
 
-        # Start RDMA reads for non-streaming edges with tensor_info
-        self.tensor_manager.start_read_tensors(
-            body.request_id, non_streaming,
-        )
-        # Start RDMA reads for streaming edges with tensor_info (will be routed to buffer in _check_ready_tensors)
+        # Consumer dispatch: route by source_rank.
+        self._dispatch_start_read(body.request_id, non_streaming)
         if streaming_with_tensors:
-            self.tensor_manager.start_read_tensors(
-                body.request_id, streaming_with_tensors,
-            )
+            self._dispatch_start_read(body.request_id, streaming_with_tensors)
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
                 for info in edge.tensor_info:
                     stream_buf.pre_read_register(info.uuid)
-
-        # Streaming signal-only edges: nothing to buffer (no tensor data)
-        # This shouldn't normally happen for streaming edges
 
         # Signal-only non-streaming edges can be processed immediately
         signal_only = [edge for edge in non_streaming if len(edge.tensor_info) == 0]
@@ -380,12 +607,9 @@ class Worker:
 
     def _unpersist_tensors(self, body: UnpersistTensors):
         for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
-            self.tensor_manager.increment_ref(
-                body.request_id, uuid, n=ref_cnt
-            )
-            self.tensor_manager.set_persist(
-                body.request_id, uuid, persist=False
-            )
+            mgr = self._mgr(uuid)
+            mgr.increment_ref(body.request_id, uuid, n=ref_cnt)
+            mgr.set_persist(body.request_id, uuid, persist=False)
 
     def _stop_loops(self, body: StopLoops):
         if not self.worker_graphs_manager.has_partition(
@@ -444,16 +668,15 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _route_streaming_tensor(self, request_id: str, edge: GraphEdge) -> None:
-        """Route a streaming tensor to either a StreamBuffer"""
+        """Route a streaming tensor to a StreamBuffer."""
         req_info = self.worker_graphs_manager.per_request_info.get(request_id)
         stream_buf = req_info.stream_buffers[edge.name]
 
         for info in edge.tensor_info:
-            tensor = self.tensor_manager.get_tensor(
-                request_id=request_id, uuid=info.uuid,
-            )
+            mgr = self._mgr(info.uuid)
+            tensor = mgr.get_tensor(request_id=request_id, uuid=info.uuid)
             stream_buf.put(info.uuid, tensor.clone())
-            self.tensor_manager.dereference(request_id, info.uuid)
+            mgr.dereference(request_id, info.uuid)
 
     def _poll_stream_buffers(self) -> None:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
@@ -469,17 +692,20 @@ class Worker:
                     chunk_tensor = chunk.data.get("data")
                     if chunk_tensor is None:
                         # Empty chunk — producer done, no more data.
-                        # Create edge with empty tensor_info.
                         synthetic_edge = GraphEdge(
                             next_node=consumer_node,
                             name=edge_name,
                             tensor_info=[],
                         )
                     else:
-                        # Normal chunk — store tensor and create edge with tensor_info
-                        tensor_infos = self.tensor_manager.store_and_return_tensor_info(
+                        # Streaming chunks always go through Mooncake; populate
+                        # the registry so downstream get_tensor calls find them.
+                        tensor_infos = self._mooncake_mgr.store_and_return_tensor_info(
                             request_id, {edge_name: [chunk_tensor]},
                         )
+                        for info_list in tensor_infos.values():
+                            for info in info_list:
+                                self._uuid_to_manager[info.uuid] = self._mooncake_mgr
                         synthetic_edge = GraphEdge(
                             next_node=consumer_node,
                             name=edge_name,
@@ -495,22 +721,22 @@ class Worker:
                     elif sbuf.reached_final_chunk:
                         req_info.per_partition_info[partition_name].stream_partition_done = True
 
-
     def _check_ready_tensors(self) -> None:
-        """Poll for completed RDMA transfers, feed ready graph edges to worker graph queues."""
-        ready = self.tensor_manager.get_ready_tensors()
-        for request_id, edges in ready.items():
-            # Separate streaming edges from normal edges
-            streaming = [e for e in edges if e.is_streaming]
-            normal = [e for e in edges if not e.is_streaming]
+        """Poll for completed transfers across all managers, feed ready edges
+        to the worker graph queues."""
+        for mgr in set(self.managers.values()):
+            ready = mgr.get_ready_tensors()
+            for request_id, edges in ready.items():
+                streaming = [e for e in edges if e.is_streaming]
+                normal = [e for e in edges if not e.is_streaming]
 
-            for edge in streaming:
-                self._route_streaming_tensor(request_id, edge)
+                for edge in streaming:
+                    self._route_streaming_tensor(request_id, edge)
 
-            if normal:
-                self.worker_graphs_manager.process_new_inputs(
-                    request_id=request_id, inputs=normal,
-                )
+                if normal:
+                    self.worker_graphs_manager.process_new_inputs(
+                        request_id=request_id, inputs=normal,
+                    )
 
     # ------------------------------------------------------------------
     # CPU offloading
@@ -538,7 +764,6 @@ class Worker:
 
         alloc = cache_mgmt.alloc_manager
 
-        # Gather all candidates with (rid, total_pages), split by location
         external: list[tuple[str, int]] = []
         in_batch: list[tuple[str, int]] = []
         for rid, labels in alloc.request_states.items():
@@ -550,7 +775,6 @@ class Worker:
             else:
                 external.append((rid, total_pages))
 
-        # Prefer external victims; fall back to in-batch
         candidates = external or in_batch
         if not candidates:
             return None
@@ -575,13 +799,11 @@ class Worker:
         if self.eviction_policy == EvictionPolicy.MOST_PAGES:
             return max(candidates, key=lambda x: x[1])[0]
 
-        # LRU: pick the request with the oldest last_active timestamp.
-        # Ties (or missing entries) broken by most pages.
         return min(
             candidates,
             key=lambda x: (
-                self._last_active.get((x[0], node_name), 0.0),  # oldest first
-                -x[1],                               # then most pages
+                self._last_active.get((x[0], node_name), 0.0),
+                -x[1],
             ),
         )[0]
 
@@ -606,7 +828,6 @@ class Worker:
             logger.info("Reloaded request %s from CPU to GPU", request_id)
             return True
         except RuntimeError:
-            # Not enough GPU pages to reload; will retry later
             logger.debug("Cannot reload request %s yet (insufficient GPU pages)", request_id)
             return False
 
@@ -615,16 +836,16 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _build_node_batch(self, batch: ScheduledBatch) -> NodeBatch:
-        """Gather input tensors from tensor_manager for all requests in the batch."""
+        """Gather input tensors from the appropriate manager for each request."""
         per_request_inputs: dict[str, NameToTensorList] = {}
-        per_request_info: dict[CurrentForwardPassInfo] = {}
+        per_request_info: dict[str, CurrentForwardPassInfo] = {}
         batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
         for request_id, node in batch.node_objects.items():
             tensors = {}
             for input_name in node.ready_inputs:
                 tensors[input_name] = [
-                    self.tensor_manager.get_tensor(
+                    self._mgr(info.uuid).get_tensor(
                         request_id=request_id, uuid=info.uuid
                     ) for info in node.ready_inputs[input_name].tensor_info
                 ]
@@ -650,9 +871,7 @@ class Worker:
                 if graph_edge._persist_for_loop:
                     continue
                 for info in graph_edge.tensor_info:
-                    self.tensor_manager.dereference(
-                        request_id, info.uuid
-                    )
+                    self._mgr(info.uuid).dereference(request_id, info.uuid)
 
     # ------------------------------------------------------------------
     # Output handling
@@ -664,31 +883,32 @@ class Worker:
         output: "NodeOutput",
         filtered_outputs_per_request: dict[str, list[GraphEdge]],
     ) -> dict[str, FilteredEdges]:
-        """
+        """Store output tensors via the appropriate manager (resolved per-edge)
+        and finalize Loop bookkeeping.
+
         ``filtered_outputs_per_request`` contains, for each request, only the
         GraphNode output edges whose names are actually present in the
         submodule's returned output dict. Edges absent from the output dict
         (e.g., Talker non-last prefill which returns {}, or Thinker with
         audio_output=False which omits thinker_states) are excluded so that
         empty-tensor_info edges are not routed downstream.
+
+        Each kept edge is grouped by ``resolve_transport(edge)`` and routed to
+        the NVSHMEM manager (cross-rank worker→worker) or the Mooncake manager
+        (everything else, including api_server hops). Both managers' outputs
+        are merged into a single ``output_tensor_info`` dict for Loop caching.
         """
         output_edges: dict[str, FilteredEdges] = {}
 
-        # tensor_manager.register_for_send would issue
-        # `torch.cuda.default_stream().synchronize()` per rid — at bs=8 that
-        # was 8 serialized syncs (+ their implicit API overhead). One sync
-        # before the rid loop is enough: we only need the preceding forward's
-        # writes to be visible on the source stream before we hand tensor
-        # addresses to peers.
+        # Single sync before the rid loop avoids N serialized syncs across
+        # register_for_send calls (each manager respects skip_cuda_sync).
         if torch.cuda.is_available() and batch.node_objects:
             torch.cuda.default_stream().synchronize()
 
-
         for request_id, node in batch.node_objects.items():
-            # output name to list of tensors
             request_output_tensors = output.per_request_output_tensors.get(
                 request_id, {}
-            ) # name -> list of tensors
+            )  # name -> list of tensors
             filtered_outputs = filtered_outputs_per_request.get(request_id, [])
             output_edges[request_id] = FilteredEdges(
                 kept=filtered_outputs,
@@ -698,11 +918,59 @@ class Worker:
             if not request_output_tensors:
                 continue  # Node produced no outputs (e.g., KV-cache-only prefill step)
 
-            output_tensor_info = self.tensor_manager.store_and_populate_graph_edges(
-                request_id=request_id,
-                tensors=request_output_tensors,
-                graph_edges=filtered_outputs
-            )
+            # Group filtered outputs by resolved transport.
+            nvshmem_edges: list[GraphEdge] = []
+            mooncake_edges: list[GraphEdge] = []
+            for edge in filtered_outputs:
+                if self.resolve_transport(edge) == CommProtocol.NVSHMEM:
+                    nvshmem_edges.append(edge)
+                else:
+                    mooncake_edges.append(edge)
+
+            output_tensor_info: dict[str, list[TensorPointerInfo]] = {}
+
+            if nvshmem_edges and CommProtocol.NVSHMEM in self.managers:
+                nvshmem_names = {e.name for e in nvshmem_edges}
+                nvshmem_tensors = {
+                    n: t for n, t in request_output_tensors.items()
+                    if n in nvshmem_names
+                }
+                nvshmem_mgr = self.managers[CommProtocol.NVSHMEM]
+                nv_info = nvshmem_mgr.store_and_populate_graph_edges(
+                    request_id=request_id,
+                    tensors=nvshmem_tensors,
+                    graph_edges=nvshmem_edges,
+                )
+                if nv_info:
+                    output_tensor_info.update(nv_info)
+                for edge in nvshmem_edges:
+                    for info in edge.tensor_info:
+                        self._uuid_to_manager[info.uuid] = nvshmem_mgr
+                logger.debug(
+                    "manager=nvshmem op=store request_id=%s edges=%s",
+                    request_id, [e.name for e in nvshmem_edges],
+                )
+
+            if mooncake_edges:
+                mooncake_names = {e.name for e in mooncake_edges}
+                mooncake_tensors = {
+                    n: t for n, t in request_output_tensors.items()
+                    if n in mooncake_names
+                }
+                mc_info = self._mooncake_mgr.store_and_populate_graph_edges(
+                    request_id=request_id,
+                    tensors=mooncake_tensors,
+                    graph_edges=mooncake_edges,
+                )
+                if mc_info:
+                    output_tensor_info.update(mc_info)
+                for edge in mooncake_edges:
+                    for info in edge.tensor_info:
+                        self._uuid_to_manager[info.uuid] = self._mooncake_mgr
+                logger.debug(
+                    "manager=mooncake op=store request_id=%s edges=%s",
+                    request_id, [e.name for e in mooncake_edges],
+                )
 
             worker_graph_id = self.worker_graphs_manager.get_worker_graph_id_for_node(
                 request_id, node_name=node.name
@@ -715,48 +983,45 @@ class Worker:
                 done_node=batch.node_name
             )
 
-            # if any outputs were filtered out, we must dereference them
+            # Filtered-out edges still need their refcounts dropped, routed
+            # via the per-uuid manager registry.
             for edge in output_edges[request_id].filtered_out:
                 for info in edge.tensor_info:
-                    self.tensor_manager.dereference(request_id, info.uuid)
+                    self._mgr(info.uuid).dereference(request_id, info.uuid)
 
         return output_edges
-
 
     def _register_outputs(
         self,
         batch: ScheduledBatch,
         routing_per_request: dict[str, NodeOutputRouting],
     ):
-        """
-        For outputs going to other workers: register tensors for RDMA send
-        and populate tensor_info on the GraphEdges.
-        For outputs staying local: store tensors in tensor_manager.
-        Returns the output edges per request (with tensor_info filled in).
+        """For outputs going to other workers, register tensors for RDMA send
+        on the Mooncake manager (NVSHMEM has no explicit registration step).
         """
         for request_id, _node in batch.node_objects.items():
             routing = routing_per_request[request_id]
-            uuids = set()
+            mooncake_uuids: set[str] = set()
             for edge in (
                 routing.persist +
                 sum(routing.to_workers.values(), start=[]) +
                 routing.emit_to_client +
                 sum(routing.streaming_to_workers.values(), start=[])
             ):
-                uuids.update([
-                    info.uuid for info in edge.tensor_info
-                ])
-            self.tensor_manager.register_for_send(
-                request_id=request_id, uuids=uuids,
-                skip_cuda_sync=True,
-            )
+                for info in edge.tensor_info:
+                    if self._uuid_to_manager.get(info.uuid) is self._mooncake_mgr:
+                        mooncake_uuids.add(info.uuid)
+            if mooncake_uuids:
+                self._mooncake_mgr.register_for_send(
+                    request_id=request_id, uuids=mooncake_uuids,
+                    skip_cuda_sync=True,
+                )
 
             for edge in routing.persist:
                 for info in edge.tensor_info:
-                    self.tensor_manager.set_persist(
+                    self._mgr(info.uuid).set_persist(
                         request_id=request_id, uuid=info.uuid, persist=True
                     )
-
 
     def _send_outputs(
         self, request_id: str, outputs: NodeOutputRouting,
@@ -764,8 +1029,8 @@ class Worker:
         partition_name: str | None = None,
         prematerialized_new_tokens: dict[str, list[int]] | None = None,
     ) -> None:
-        """
-        Send outputs to other workers and to the conductor.
+        """Send outputs to other workers and to the conductor.
+
         Persist signals are buffered and sent together with the
         WORKER_GRAPHS_DONE message to avoid race conditions.
 
@@ -774,8 +1039,7 @@ class Worker:
         for the new-token tensors. When provided, this function skips the
         per-tensor ``.cpu()`` call — meaningful when the caller batched
         multiple requests' new-token transfers into a single D→H to avoid
-        N serialized ``cudaMemcpyAsync`` + ``cudaStreamSynchronize`` per
-        step.
+        N serialized ``cudaMemcpyAsync`` + ``cudaStreamSynchronize`` per step.
         """
         if graph_walk is None:
             graph_walk = self.worker_graphs_manager.get_graph_walk(request_id, partition_name)
@@ -791,7 +1055,6 @@ class Worker:
             )
             self.communicator.send(worker_id, message)
 
-        # Buffer persist signals for this request
         if outputs.persist:
             self.worker_graphs_manager.buffer_persist_signals(
                 request_id, outputs.persist
@@ -801,7 +1064,7 @@ class Worker:
             name_to_new_token: dict = {}
             for signal in outputs.new_token_outputs:
                 if signal.name in name_to_new_token:
-                    continue # don't double-count new tokens
+                    continue
                 if (
                     prematerialized_new_tokens is not None
                     and signal.name in prematerialized_new_tokens
@@ -810,9 +1073,8 @@ class Worker:
                 else:
                     new_tokens = []  # list[int]
                     for tensor_info in signal.tensor_info:
-                        tensor = self.tensor_manager.get_tensor(
-                            request_id=request_id,
-                            uuid=tensor_info.uuid
+                        tensor = self._mgr(tensor_info.uuid).get_tensor(
+                            request_id=request_id, uuid=tensor_info.uuid,
                         )
                         new_tokens.extend(tensor.cpu().numpy().tolist())
                 name_to_new_token[signal.name] = new_tokens
@@ -838,8 +1100,7 @@ class Worker:
                 )
                 self.communicator.send("api_server", message)
 
-        # Handle streaming edges
-        # Local streaming: route to StreamBuffer or legacy buffer
+        # Local streaming: route to StreamBuffer
         req_info = self.worker_graphs_manager.per_request_info[request_id]
         for edge in outputs.streaming_local:
             stream_buf = req_info.stream_buffers[edge.name]
@@ -867,7 +1128,6 @@ class Worker:
             p_done = req_info.per_partition_info[partition_name].stream_partition_done \
                 if req_info else False
 
-            # Collect stream consumption info
             stream_consumed = {}
             if req_info:
                 for edge_name, sbuf in req_info.stream_buffers.items():
@@ -890,10 +1150,81 @@ class Worker:
             self.communicator.send("conductor", message)
 
     # ------------------------------------------------------------------
+    # Captured-NVSHMEM transport bootstrap + watchdog
+    # ------------------------------------------------------------------
+
+    def _init_captured_transport_if_enabled(self) -> None:
+        """Bring up the captured NVSHMEM-transport symmetric heap + pad
+        bootstrap on this worker's NVSHMEM manager, if any. No-op when NVSHMEM
+        is not installed or when no EdgeSpecs were assigned to this rank."""
+        nvshmem_mgr = self.managers.get(CommProtocol.NVSHMEM)
+        if nvshmem_mgr is None:
+            if self._captured_edge_specs:
+                logger.warning(
+                    "Worker %s received %d captured-transport EdgeSpecs but "
+                    "has no NVSHMEM manager installed; ignoring",
+                    self.worker_id, len(self._captured_edge_specs),
+                )
+            return
+        if not self._captured_edge_specs:
+            logger.info(
+                "Worker %s: no captured-transport EdgeSpecs assigned; "
+                "skipping init_edges/warmup", self.worker_id,
+            )
+            return
+        nvshmem_mgr.init_edges(self._captured_edge_specs)
+        nvshmem_mgr.warmup()
+        logger.info(
+            "Worker %s: captured NVSHMEM transport ready (n_edges=%d)",
+            self.worker_id, len(self._captured_edge_specs),
+        )
+
+    def replay_with_watchdog(
+        self,
+        graph: "torch.cuda.CUDAGraph",
+        stream: torch.cuda.Stream,
+        timeout_s: float | None = None,
+        poll_interval_s: float | None = None,
+    ) -> float:
+        """Replay a captured graph on ``stream`` with a deadline-polling
+        watchdog. Returns the observed wall-clock replay latency in
+        microseconds. Raises :class:`Worker.WorkerAbort` if the replay fails
+        to complete within ``timeout_s`` (default :data:`REPLAY_TIMEOUT_S`)."""
+        deadline_s = self.REPLAY_TIMEOUT_S if timeout_s is None else timeout_s
+        poll_s = (
+            self.REPLAY_POLL_INTERVAL_S if poll_interval_s is None else poll_interval_s
+        )
+        event = torch.cuda.Event()
+        t0 = _time.perf_counter()
+        graph.replay()
+        event.record(stream)
+        deadline = t0 + deadline_s
+        while not event.query():
+            if _time.perf_counter() > deadline:
+                logger.error(
+                    "Worker %s: captured replay exceeded deadline (%.1fs); aborting",
+                    self.worker_id, deadline_s,
+                )
+                raise Worker.WorkerAbort(
+                    f"captured replay exceeded {deadline_s:.1f}s deadline"
+                )
+            _time.sleep(poll_s)
+        latency_us = (_time.perf_counter() - t0) * 1e6
+        nvshmem_mgr = self.managers.get(CommProtocol.NVSHMEM)
+        if nvshmem_mgr is not None:
+            nvshmem_mgr.mark_replay(latency_us)
+        return latency_us
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        # Bring up captured NVSHMEM-transport BEFORE engine warmup. Engine
+        # capture paths may call record_send/record_recv which require a
+        # warmed manager.
+        self._init_captured_transport_if_enabled()
+
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
 
@@ -907,7 +1238,7 @@ class Worker:
                 if self.enable_nvtx:
                     range_pop(synchronize=True)
 
-                # 2. Check for ready RDMA tensors, feed to worker graph queues
+                # 2. Check for ready transfers from all managers
                 if self.enable_nvtx:
                     range_push("worker.check_ready_tensors", synchronize=True)
                 self._check_ready_tensors()
@@ -966,7 +1297,6 @@ class Worker:
                     batch_ids = set(batch.node_objects.keys())
                     victim_id = self._try_offload_cold_request(node_batch.node_name, batch_ids)
 
-                    # Push all batch nodes back to their queues
                     for request_id, node in batch.node_objects.items():
                         wg_id = batch.request_to_worker_graph[request_id]
                         self.worker_graphs_manager.queues[wg_id].push_back_node(
@@ -974,7 +1304,6 @@ class Worker:
                         )
 
                     if victim_id is not None:
-                        # Only hold the offloaded victim (needs CPU→GPU reload)
                         self.scheduler.hold_requests([victim_id])
                         logger.warning(
                             "OOM on node=%s walk=%s: offloaded victim=%s, "
@@ -983,7 +1312,6 @@ class Worker:
                             len(batch_ids) - (1 if victim_id in batch_ids else 0),
                         )
                     else:
-                        # No offloading possible; hold all requests briefly
                         self.scheduler.hold_requests(list(batch_ids))
                         logger.warning(
                             "OOM on node=%s walk=%s: no offload possible, "
@@ -1004,8 +1332,6 @@ class Worker:
                         self.worker_graphs_manager.stop_loops(
                             rid, partition=batch_partition,
                             loop_names=req_info.dynamic_loop_stop_signals,
-                            # Pass in req_info and last_node_run to update
-                            # req_info.loop_stop_times
                             req_info=req_info, last_node_run=batch.node_name
                         )
 
@@ -1026,10 +1352,7 @@ class Worker:
 
                 # 6. Route outputs through WorkerGraphsManager first to determine routing.
                 # Filter each node's output edges to only those the submodule actually
-                # produced. This matters for cases like Talker non-last prefill (which
-                # returns {} -> no edges routed) or Thinker with audio_output=False
-                # (which omits thinker_states). Without filtering, edges whose names are
-                # absent from the output dict would be routed with empty tensor_info.
+                # produced.
                 if self.enable_nvtx:
                     range_push("worker.route_outputs", synchronize=True)
                 filtered_outputs_per_request: dict[str, list[GraphEdge]] = {}
@@ -1060,7 +1383,7 @@ class Worker:
                     stop_loop_workers = {}
                     for loop_name in node_batch.per_request_info[request_id].dynamic_loop_stop_signals:
                         for worker in self.worker_graphs_manager.get_dyn_loop_workers(
-                            request_id,  batch_partition, loop_name
+                            request_id, batch_partition, loop_name
                         ):
                             stop_loop_workers.setdefault(worker, set()).add(loop_name)
                     for worker, loop_names in stop_loop_workers.items():
@@ -1088,11 +1411,7 @@ class Worker:
 
                 # 8. Send outputs to other workers / conductor.
                 # Pre-materialize new-token tensors across all rids in a single
-                # batched D→H: the old per-rid `.cpu().numpy().tolist()` inside
-                # _send_outputs would fire N `cudaMemcpyAsync` + N implicit
-                # `cudaStreamSynchronize` per decode step (~300 µs at bs=8).
-                # Collecting tensors first and issuing one concat + cpu() cuts
-                # that to a single D→H with one sync.
+                # batched D→H to avoid N serialized cudaMemcpyAsync syncs.
                 if self.enable_nvtx:
                     range_push("worker.send_outputs", synchronize=True)
 
@@ -1108,7 +1427,7 @@ class Worker:
                             continue
                         seen_names.add(signal.name)
                         for tinfo in signal.tensor_info:
-                            tensor = self.tensor_manager.get_tensor(
+                            tensor = self._mgr(tinfo.uuid).get_tensor(
                                 request_id=rid, uuid=tinfo.uuid,
                             )
                             collected.append((rid, signal.name, tensor))

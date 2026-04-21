@@ -64,6 +64,39 @@ class CudaGraphData:
     has_non_logit_outputs: bool = False
 
 
+@dataclass
+class CapturedTransportHooks:
+    """Per-runner hook bundle for the captured NVSHMEM worker-to-worker
+    transport (see §3–§5 of the captured-NVSHMEM design doc).
+
+    Wiring mechanism only — existing engines do NOT opt in by default
+    (engines migrate one at a time per §9.3 of the design doc). When set on
+    a graph runner, the runner's `_capture_one` folds `record_recv` (for
+    each inbound edge) and `record_send` (for each outbound edge) into the
+    capture region; replays route through the Worker's
+    `replay_with_watchdog` so hangs trip the 30-second deadline instead of
+    wedging silently.
+
+    Fields:
+      * ``nvshmem_manager``: the Worker's NVSHMEMCommunicationManager; must
+        have had ``init_edges`` + ``warmup`` called already.
+      * ``inbound``: ``(edge_id, static_buffer)`` pairs. Each ``record_recv``
+        captures a device-side copy from the captured-transport slot into
+        the static buffer before the forward pass reads it.
+      * ``outbound``: ``(edge_id, static_buffer)`` pairs. Each ``record_send``
+        captures a device-side copy from the static buffer into the slot and
+        issues ``put_with_signal`` to the consumer rank, after the forward
+        pass writes the buffer.
+      * ``worker_replay_fn``: optional callable ``(graph, stream) -> float``
+        supplied by the Worker (its ``replay_with_watchdog``). If ``None``,
+        the runner falls back to a plain ``graph.replay()`` (no watchdog).
+    """
+    nvshmem_manager: Any
+    inbound: list[tuple[int, torch.Tensor]]
+    outbound: list[tuple[int, torch.Tensor]]
+    worker_replay_fn: Any = None
+
+
 class CudaGraphRunner:
     """Captures and replays CUDA graphs for AR decode batches.
 
@@ -115,6 +148,24 @@ class CudaGraphRunner:
         self.graphs: dict[tuple, CudaGraphData] = {}
 
         self.memory_pool = None
+
+        # Capture-mode NVSHMEM hooks (set via set_capture_hooks). Default:
+        # None means this runner continues to use the side-stream NVSHMEM
+        # path or Mooncake, with no captured put/wait inside the graph.
+        self._capture_hooks: CapturedTransportHooks | None = None
+        # Capture-stream reused for record_send / record_recv inside the
+        # captured region. Lazily allocated the first time the captured
+        # transport is active.
+        self._capture_stream: torch.cuda.Stream | None = None
+
+    def set_capture_hooks(self, hooks: CapturedTransportHooks | None) -> None:
+        """Install (or clear) captured NVSHMEM-transport hooks.
+
+        Must be called before ``warmup_and_capture`` to take effect at
+        capture time. Clearing hooks after capture has no effect on already
+        recorded graphs.
+        """
+        self._capture_hooks = hooks
 
     def warmup_and_capture(self) -> None:
         """Capture graphs for all configs and batch sizes."""
@@ -336,9 +387,30 @@ class CudaGraphRunner:
 
             # Capture
             graph = torch.cuda.CUDAGraph()
+            hooks = self._capture_hooks
+            cap_stream = None
+            if hooks is not None:
+                if self._capture_stream is None:
+                    self._capture_stream = torch.cuda.Stream(device=self.device)
+                cap_stream = self._capture_stream
+                cap_stream.wait_stream(torch.cuda.current_stream(self.device))
             with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                with torch.cuda.graph(graph, pool=self.memory_pool):
-                    output = run_forward()
+                if hooks is None:
+                    with torch.cuda.graph(graph, pool=self.memory_pool):
+                        output = run_forward()
+                else:
+                    with torch.cuda.graph(
+                        graph, stream=cap_stream, pool=self.memory_pool
+                    ):
+                        for edge_id, dst in hooks.inbound:
+                            hooks.nvshmem_manager.record_recv(
+                                cap_stream, edge_id, dst
+                            )
+                        output = run_forward()
+                        for edge_id, src in hooks.outbound:
+                            hooks.nvshmem_manager.record_send(
+                                cap_stream, edge_id, src
+                            )
             torch.cuda.synchronize()
 
             # Inspect per-rid output keys once at capture time so sample_and_remap
@@ -538,7 +610,15 @@ class CudaGraphRunner:
         # --- Step 4: Replay ---
         if self.enable_nvtx:
             range_push("cg.replay")
-        graph.replay()
+        hooks = self._capture_hooks
+        if hooks is not None and hooks.worker_replay_fn is not None \
+                and self._capture_stream is not None:
+            # Route through the Worker's watchdog so captured NVSHMEM
+            # wait_for_signal hangs trip the deadline instead of wedging.
+            hooks.worker_replay_fn(graph, self._capture_stream)
+            torch.cuda.default_stream().synchronize()
+        else:
+            graph.replay()
         if self.enable_nvtx:
             range_pop()
 
@@ -978,6 +1058,14 @@ class EncDecCudaGraphWrapper:
         self.static_inputs: dict[int, torch.Tensor] = {}
         self.static_outputs: dict[int, torch.Tensor] = {}
         self.memory_pool = None
+        # Captured NVSHMEM-transport opt-in (mirrors CudaGraphRunner — see
+        # CapturedTransportHooks).
+        self._capture_hooks: CapturedTransportHooks | None = None
+        self._capture_stream: torch.cuda.Stream | None = None
+
+    def set_capture_hooks(self, hooks: CapturedTransportHooks | None) -> None:
+        """Install (or clear) captured NVSHMEM-transport hooks for this wrapper."""
+        self._capture_hooks = hooks
 
     def warmup_and_capture(
         self, input_shape_template: tuple[int, ...]
@@ -1011,8 +1099,21 @@ class EncDecCudaGraphWrapper:
 
         static_input = dummy_input.clone()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.memory_pool):
-            static_output = self.submodule(static_input)
+        hooks = self._capture_hooks
+        if hooks is None:
+            with torch.cuda.graph(graph, pool=self.memory_pool):
+                static_output = self.submodule(static_input)
+        else:
+            if self._capture_stream is None:
+                self._capture_stream = torch.cuda.Stream(device=self.device)
+            cap_stream = self._capture_stream
+            cap_stream.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.graph(graph, stream=cap_stream, pool=self.memory_pool):
+                for edge_id, dst in hooks.inbound:
+                    hooks.nvshmem_manager.record_recv(cap_stream, edge_id, dst)
+                static_output = self.submodule(static_input)
+                for edge_id, src in hooks.outbound:
+                    hooks.nvshmem_manager.record_send(cap_stream, edge_id, src)
 
         self.graphs[bs] = graph
         self.static_inputs[bs] = static_input
@@ -1037,6 +1138,13 @@ class EncDecCudaGraphWrapper:
         self.static_inputs[padded_bs].zero_()
         self.static_inputs[padded_bs][:actual_bs] = input_tensor
 
-        self.graphs[padded_bs].replay()
+        hooks = self._capture_hooks
+        if hooks is not None and hooks.worker_replay_fn is not None \
+                and self._capture_stream is not None:
+            hooks.worker_replay_fn(
+                self.graphs[padded_bs], self._capture_stream
+            )
+        else:
+            self.graphs[padded_bs].replay()
 
         return self.static_outputs[padded_bs][:actual_bs].clone()

@@ -2,8 +2,11 @@ import logging
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
+
+from mminf.communication.communicator import CommProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,10 @@ class TensorPointerInfo:
     uuid: str # for indexing storage
     source_session_id: str # "{HOSTNAME}:{client_engine.get_rpc_port()}"
     source_entity: str # which {worker, api_server} the tensor is on
+    # --- NVSHMEM-only fields (ignored by Mooncake path) ---
+    source_rank: int = -1          # NVSHMEM PE rank of producer; -1 = Mooncake path
+    symmetric_offset: int = 0     # byte offset in stage_buf (== address for clarity)
+    signal_value: int = 0         # sig_val consumer must wait for
 
 @dataclass
 class GraphEdge:
@@ -64,6 +71,16 @@ class GraphEdge:
     # only for EMIT_TO_CLIENT
     output_modality: str = field(default="") # text | image | video | audio
     _persist_for_loop: bool = field(default=False)
+    # Per-edge transport selection (v4). AUTO = resolved at runtime by Worker.resolve_transport.
+    transport: CommProtocol = field(default=CommProtocol.AUTO)
+    # Deterministic edge identifier assigned by the Conductor at graph-walk
+    # registration, used by the captured NVSHMEM transport. -1 = not assigned
+    # (e.g. edges created at runtime outside the graph-walk registration path,
+    # such as streaming chunks). A non-negative edge_id is required to route
+    # this edge through the captured NVSHMEM path
+    # (NVSHMEMCommunicationManager.record_send / record_recv). Deep copies
+    # (e.g. inside Loop sections) preserve the id.
+    edge_id: int = field(default=-1)
 
 # Two different ways of defining graph edges
 DestToGraphEdges = dict[str, list[GraphEdge]]
@@ -140,9 +157,18 @@ class GraphSection(ABC):
 
     @abstractmethod
     def register_communication_info(
-        self, communication_manager,
+        self, manager_resolver: Callable[[str], Any],
         request_id: str
     ):
+        """Register a per-uuid manager resolver for this section's lifetime.
+
+        ``manager_resolver(uuid) -> TensorCommunicationManager`` returns the
+        manager that produced or is consuming a given UUID. Sections that
+        cache tensor_info (notably Loop) call the resolver per UUID to find
+        the right manager for refcount operations — this lets a single Loop
+        body cache outputs that originated from different transports
+        (NVSHMEM cross-rank, Mooncake api_server, etc.).
+        """
         pass
 
     @abstractmethod
@@ -231,7 +257,7 @@ class GraphNode(GraphSection):
         return LoopCompletionOutput(self)
 
     def register_communication_info(
-        self, communication_manager,
+        self, manager_resolver: Callable[[str], Any],
         request_id: str
     ):
         return
@@ -329,12 +355,12 @@ class Sequential(GraphSection):
         return output
 
     def register_communication_info(
-        self, communication_manager,
+        self, manager_resolver: Callable[[str], Any],
         request_id: str
     ):
         for sec in self.sections:
             sec.register_communication_info(
-                communication_manager, request_id
+                manager_resolver, request_id
             )
 
     def reset(self):
@@ -423,12 +449,12 @@ class Parallel(GraphSection):
         )
 
     def register_communication_info(
-        self, communication_manager,
+        self, manager_resolver: Callable[[str], Any],
         request_id: str
     ):
         for sec in self.sections:
             sec.register_communication_info(
-                communication_manager, request_id
+                manager_resolver, request_id
             )
 
     def reset(self):
@@ -453,9 +479,11 @@ class Loop(GraphSection):
     _output_names: set[str] = field(default_factory=set)
     _uuid_label: str = field(default_factory=lambda: str(uuid4()))
 
-    # For handling tensor reference counting of loop outputs
-    _tensor_manager: Any | None = field(default=None) # no type annotation because
-                                                      # of circular imports
+    # For handling tensor reference counting of loop outputs.
+    # Resolver maps UUID → owning TensorCommunicationManager so that Loop
+    # outputs routed through different transports (NVSHMEM, Mooncake, SHM)
+    # all get refcounted against the right tensor_store.
+    _manager_resolver: Callable[[str], Any] | None = field(default=None)
     _request_id: str | None = field(default=None)
     _waiting_for_execution: set[str] = field(default_factory=set)
 
@@ -472,13 +500,17 @@ class Loop(GraphSection):
         return self.section.get_dyn_loop_names()
 
     def register_communication_info(
-        self, communication_manager,
+        self, manager_resolver: Callable[[str], Any],
         request_id: str
     ):
-        self._tensor_manager = communication_manager
+        # Resolver maps a UUID to its owning TensorCommunicationManager so
+        # that Loop output caching can refcount UUIDs that may have been
+        # routed via different transports (NVSHMEM cross-rank, Mooncake
+        # api_server, etc.).
+        self._manager_resolver = manager_resolver
         self._request_id = request_id
         self.section.register_communication_info(
-            communication_manager, request_id
+            manager_resolver, request_id
         )
 
     def cache_outputs(
@@ -488,7 +520,9 @@ class Loop(GraphSection):
         for out_name in names:
             tensor_infos = tensor_info[out_name]
             for info in tensor_infos:
-                self._tensor_manager.increment_ref(self._request_id, info.uuid)
+                self._manager_resolver(info.uuid).increment_ref(
+                    self._request_id, info.uuid
+                )
             self._cached_outputs.setdefault(out_name, []).extend(tensor_infos)
         if self._curr_iter_section is not None:
             self._curr_iter_section.cache_outputs(tensor_info)
@@ -496,7 +530,9 @@ class Loop(GraphSection):
     def _uncache_outputs(self):
         for tensor_infos in self._cached_outputs.values():
             for info in tensor_infos:
-                self._tensor_manager.dereference(self._request_id, info.uuid)
+                self._manager_resolver(info.uuid).dereference(
+                    self._request_id, info.uuid
+                )
         self._cached_outputs.clear()
 
     def ingest_inputs(self, node_to_inputs: DestToGraphEdges):

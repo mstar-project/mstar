@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 
@@ -60,7 +61,10 @@ class WorkerGraphQueues:
                           # but not the prefill graph walk
     worker_graph: WorkerGraph
     per_request_queues: dict[str, PerRequestNodeQueues] # request_id -> queue
-    tensor_manager: TensorCommunicationManager
+    # Resolver maps tensor UUID → owning TensorCommunicationManager. Loop
+    # sections call this per-uuid to refcount cached outputs against the
+    # right manager when transports are mixed (NVSHMEM + Mooncake).
+    manager_resolver: Callable[[str], TensorCommunicationManager]
 
     def process_new_inputs(self, request_id: str, inputs: list[GraphEdge]) -> ProcessedInputs:
         """
@@ -86,7 +90,7 @@ class WorkerGraphQueues:
         """
         section_copy = deepcopy(self.worker_graph.section)
         section_copy.register_communication_info(
-            self.tensor_manager, request_id
+            self.manager_resolver, request_id
         )
         self.per_request_queues[request_id] = PerRequestNodeQueues(
             waiting=section_copy,

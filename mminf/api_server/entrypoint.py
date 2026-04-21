@@ -59,7 +59,8 @@ def _conductor_process_target(
     cache_dir: str | None = None,
     mooncake_port: int=8080,
     tensor_comm_protocol=CommProtocol.RDMA,
-    tcp_transfer_device=""
+    tcp_transfer_device="",
+    rendezvous_host: str = "localhost:29500",
 ):
     """Runs DummyConductor.run() in a spawned process."""
     logging.basicConfig(
@@ -82,7 +83,8 @@ def _conductor_process_target(
         log_level=log_level,
         mooncake_port=mooncake_port,
         tensor_comm_protocol=tensor_comm_protocol,
-        tcp_transfer_device=tcp_transfer_device
+        tcp_transfer_device=tcp_transfer_device,
+        hostname=rendezvous_host,
     )
     try:
         conductor.run()
@@ -609,6 +611,10 @@ def main():
         help="Directory for caching downloaded HuggingFace model files",
     )
     parser.add_argument(
+        "--rendezvous-host", type=str, default="localhost:29500",
+        help="host:port used as torch.distributed rendezvous (passed to Conductor as hostname)",
+    )
+    parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
@@ -656,7 +662,8 @@ def main():
             args.cache_dir,
             args.mooncake_port,
             CommProtocol(args.tensor_comm_protocol),
-            args.tcp_transfer_device
+            args.tcp_transfer_device,
+            args.rendezvous_host,
         ),
     )
     conductor_proc.start()

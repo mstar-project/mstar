@@ -23,6 +23,7 @@ from mminf.utils.ipc_format import (
     NewRequestConductor,
     TensorReceived,
     UnpersistTensors,
+    WorkerMessage,
     WorkerMessageType,
 )
 
@@ -161,14 +162,26 @@ class PreprocessWorkerThread:
             ipc_socket_path_prefix=socket_path_prefix,
         ) # only used to send
 
+        # PreprocessWorker is not an NVSHMEM peer (NVSHMEM is worker-internal).
+        # Substitute RDMA when the caller requested NVSHMEM transport,
+        # mirroring mminf/worker/worker.py.
+        _resolved_protocol = (
+            CommProtocol.RDMA
+            if tensor_comm_protocol == CommProtocol.NVSHMEM
+            else tensor_comm_protocol
+        )
         self.tensor_manager = create_tensor_communication_manager(
-            protocol=tensor_comm_protocol,
+            protocol=_resolved_protocol,
             my_entity_id="api_server_preprocess_worker",
             hostname=hostname,
             device=self.device,
             communicator=self.communicator,
             tcp_transfer_device=tcp_transfer_device,
         )
+
+    # ------------------------------------------------------------------
+    # Input preprocessing
+    # ------------------------------------------------------------------
 
     def _process_input(
         self, input: PreprocessInput
@@ -230,16 +243,15 @@ class PreprocessWorkerThread:
 
         initial_signals = self.tensor_manager.store_and_return_tensor_info(
             request_id=input.request_id,
-            tensors=tensors # dict(modality_input: list[tensors])
+            tensors=tensors,
         )
         all_uuids = sum([
             [info.uuid for info in infos] for infos in initial_signals.values()
         ], start=[])
         self.tensor_manager.register_for_send(
             request_id=input.request_id,
-            uuids=all_uuids
+            uuids=all_uuids,
         )
-        # also persist all of the input signals
         for uuid in all_uuids:
             self.tensor_manager.set_persist(
                 input.request_id, uuid, persist=True
@@ -253,7 +265,7 @@ class PreprocessWorkerThread:
                 initial_input_modalities=input.input_modalities,
                 initial_output_modalities=input.output_modalities,
                 input_metadata=input_metadata,
-                model_kwargs=input.model_kwargs
+                model_kwargs=input.model_kwargs,
             ),
         )
         self.communicator.send("conductor", msg)
@@ -262,6 +274,7 @@ class PreprocessWorkerThread:
         self, result: ResultTensors
     ):
         result.graph_edge.name = f"{result.modality}_output"
+        # Mooncake path: initiate RDMA read; tensor arrives via get_ready_tensors.
         self.tensor_manager.start_read_tensors(
             request_id=result.request_id,
             graph_edges=[result.graph_edge],

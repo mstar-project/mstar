@@ -2,12 +2,20 @@ import logging
 import os
 import platform
 import struct
+import time as _time
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from uuid import uuid4
 
-from mminf.graph.special_destinations import EMPTY_DESTINATION
+import torch
+import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
+
+from mminf.communication.communicator import BaseCommunicator, CommProtocol
+from mminf.graph.base import GraphEdge, TensorPointerInfo
+from mminf.graph.special_destinations import EMPTY_DESTINATION, SPECIAL_DESTINATIONS
+from mminf.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
 
 try:
     from mooncake.engine import TransferEngine
@@ -16,13 +24,32 @@ except Exception as _err:
     TransferEngine = None
 else:
     MOONCAKE_IMPORT_ERROR = None
-import torch
-
-from mminf.communication.communicator import BaseCommunicator, CommProtocol
-from mminf.graph.base import GraphEdge, TensorPointerInfo
-from mminf.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EdgeSpec:
+    """Declarative description of one NVSHMEM worker-to-worker edge captured inside a CUDA graph.
+
+    Built by the Conductor during graph-walk registration and passed to each
+    worker's ``NVSHMEMCommunicationManager.init_edges``. The Conductor emits
+    one ``EdgeSpec`` per unique (producer_rank, consumer_rank, edge_id) tuple
+    that resolves to NVSHMEM transport; each participating rank receives the
+    same list, so ``init_edges`` is deterministic across ranks.
+
+    ``max_bytes`` is the upper bound on payload size this edge will carry.
+    The manager aligns up to 128 B and allocates one symmetric slot of that
+    size per edge per rank that participates (producer or consumer).
+
+    Self-edges (producer_rank == consumer_rank), api_server edges, and any
+    edge resolving to Mooncake are NOT emitted as EdgeSpecs — they ride the
+    legacy side-stream fallback path.
+    """
+    edge_id: int
+    producer_rank: int
+    consumer_rank: int
+    max_bytes: int
 
 
 @dataclass
@@ -285,6 +312,33 @@ class LocalTransferEngine(TensorTransferEngine):
 
     def get_async_reader(self, device) -> None:
         return None  # no remote reads needed
+
+    def get_session_id(self) -> str:
+        return self._session_id
+
+
+class NVSHMEMTransferEngine(TensorTransferEngine):
+    """No-op TensorTransferEngine for NVSHMEM-mode workers.
+
+    NVSHMEM workers don't transfer KV cache pages cross-worker through
+    Mooncake — kv_store.py's path is bypassed by the polymorphic no-ops
+    below. Implementing the abstract contract this way lets NVSHMEM mode
+    construct a manager via TensorCommunicationManager.__init__ without
+    special-casing the engine, and lets PagedAllocationManager work
+    against an NVSHMEM-mode manager unchanged.
+    """
+
+    def __init__(self, my_entity_id: str):
+        self._session_id = f"nvshmem:{my_entity_id}"
+
+    def register_memory(self, ptr: int, nbytes: int) -> int:
+        return 0  # no-op
+
+    def unregister_memory(self, ptr: int) -> int:
+        return 0  # no-op
+
+    def get_async_reader(self, device) -> None:
+        return None  # NVSHMEM mode does not use the AsyncMooncakeReader path
 
     def get_session_id(self) -> str:
         return self._session_id
@@ -805,7 +859,12 @@ def create_tensor_communication_manager(
     tcp_transfer_device: str = "",
     shm_dir: str | None = None,
 ) -> TensorCommunicationManager:
-    """Select tensor transport backend based on protocol."""
+    """Select tensor transport backend based on protocol.
+
+    NVSHMEM is intentionally not dispatched here — NVSHMEM workers construct
+    NVSHMEMCommunicationManager directly in worker.py because it needs the
+    rank/world_size/dist.ProcessGroup that the factory does not have.
+    """
     if protocol == CommProtocol.SHM:
         return SharedMemoryCommunicationManager(
             my_entity_id=my_entity_id,
@@ -823,3 +882,1135 @@ def create_tensor_communication_manager(
         metadata_server=metadata_server,
         tcp_transfer_device=tcp_transfer_device,
     )
+
+
+# ---------------------------------------------------------------------------
+# NVSHMEM staging pack/unpack helpers (eager fallback path)
+# ---------------------------------------------------------------------------
+
+_DTYPE_TO_CODE: dict[torch.dtype, int] = {
+    torch.float32: 0, torch.float16: 1, torch.bfloat16: 2,
+    torch.int32: 3, torch.int64: 4, torch.uint8: 5, torch.bool: 6,
+}
+_CODE_TO_DTYPE: dict[int, torch.dtype] = {v: k for k, v in _DTYPE_TO_CODE.items()}
+_HEADER_OVERHEAD = 4096  # bytes; generous fixed header budget
+
+
+def _compute_packed_size(tensors: list[torch.Tensor]) -> int:
+    return _HEADER_OVERHEAD + sum(t.nbytes for t in tensors)
+
+
+def _compute_packed_size_from_infos(infos: list[TensorPointerInfo]) -> int:
+    """Compute packed size for consumer side from TensorPointerInfo list."""
+    return _HEADER_OVERHEAD + sum(info.nbytes for info in infos)
+
+
+def _parse_dtype(dtype_str: str) -> torch.dtype:
+    """Parse dtype string like 'torch.float32' to torch.dtype.
+
+    Only the dtypes in _DTYPE_TO_CODE are supported; dtype strings arrive from
+    a peer rank and must not be evaluated as arbitrary code.
+    """
+    mapping = {
+        "torch.float32": torch.float32,
+        "torch.float16": torch.float16,
+        "torch.bfloat16": torch.bfloat16,
+        "torch.int32": torch.int32,
+        "torch.int64": torch.int64,
+        "torch.uint8": torch.uint8,
+        "torch.bool": torch.bool,
+    }
+    if dtype_str in mapping:
+        return mapping[dtype_str]
+    raise ValueError(
+        f"Unsupported dtype string {dtype_str!r}. "
+        f"Supported: {list(mapping)}"
+    )
+
+
+def _pack_tensors_into_slot(
+    tensors: list[torch.Tensor], slot_view: torch.Tensor
+) -> None:
+    """
+    Write header + contiguous tensor data into slot_view (uint8).
+    Called on the transfer stream — ops are CUDA async.
+    """
+    n = len(tensors)
+    header = bytearray()
+    header += struct.pack("<I", n)  # 4 bytes: N tensors
+    offsets = []
+    cur_offset = _HEADER_OVERHEAD  # data starts after header
+    for t in tensors:
+        ct = t.contiguous()
+        ndims = ct.ndim
+        if ct.dtype not in _DTYPE_TO_CODE:
+            raise ValueError(
+                f"Unsupported dtype {ct.dtype} for NVSHMEM staging. "
+                f"Supported: {list(_DTYPE_TO_CODE.keys())}"
+            )
+        dtype_code = _DTYPE_TO_CODE[ct.dtype]
+        header += struct.pack("<IIBB2x", cur_offset, ct.nbytes, ndims, dtype_code)
+        header += struct.pack(f"<{ndims}q", *ct.shape)
+        header += struct.pack(f"<{ndims}q", *ct.stride())
+        offsets.append((cur_offset, ct))
+        cur_offset += ct.nbytes
+
+    # Copy header into slot (sync copy from CPU bytes to GPU tensor).
+    header_bytes = bytes(header)
+    header_tensor = torch.frombuffer(bytearray(header_bytes), dtype=torch.uint8)
+    slot_view[:len(header_tensor)].copy_(header_tensor.to(slot_view.device))
+    # Copy each tensor's data into its offset.
+    # Flatten to 1D uint8 before copy to handle multi-dimensional tensors.
+    for off, ct in offsets:
+        flat_bytes = ct.contiguous().view(-1).view(torch.uint8)
+        slot_view[off : off + ct.nbytes].copy_(flat_bytes)
+
+
+def _unpack_tensors_from_slot(
+    slot_view: torch.Tensor, dst_tensors: list[torch.Tensor]
+) -> None:
+    """
+    Read header from slot_view and copy tensor data into dst_tensors.
+    Called on the transfer stream after nvshmem_wait_for_signal.
+    """
+    header_cpu = slot_view[:_HEADER_OVERHEAD].cpu().numpy().tobytes()
+    n = struct.unpack_from("<I", header_cpu, 0)[0]
+    assert n == len(dst_tensors), (
+        f"Header says {n} tensors but got {len(dst_tensors)} dst"
+    )
+    off = 4
+    for i, dst in enumerate(dst_tensors):
+        data_offset, nbytes, ndims, dtype_code = struct.unpack_from("<IIBB2x", header_cpu, off)
+        off += 12
+        off += ndims * 8 * 2  # skip dims + strides (we already have dst shape)
+        src_view = slot_view[data_offset : data_offset + nbytes]
+        # Flatten dst to 1D uint8 before copy to handle multi-dimensional tensors.
+        dst.contiguous().view(-1).view(torch.uint8).copy_(src_view)
+
+
+# ---------------------------------------------------------------------------
+# NVSHMEMStagingPool (eager fallback path)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SlotDescriptor:
+    """Tracks one in-flight staging slot."""
+    slot_idx: int          # producer rank == slot index
+    consumer_rank: int
+    sig_val: int
+    nbytes: int            # actual payload bytes used in this transfer
+
+
+class NVSHMEMStagingPool:
+    """
+    Manages the symmetric staging buffer and signal pad.
+
+    Layout: stage_buf[slot_idx * max_slot_bytes : (slot_idx+1) * max_slot_bytes]
+    Slot assignment: slot_idx == producer_rank (each rank owns one slot).
+    Concurrency: one in-flight transfer per (producer, consumer) direction.
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        group_name: str,
+        max_slot_bytes: int,
+    ) -> None:
+        self.rank = rank
+        self.world_size = world_size
+        self.max_slot_bytes = max_slot_bytes
+        self.device = device
+
+        total_bytes = world_size * max_slot_bytes
+        self.stage_buf: torch.Tensor = symm_mem.empty(
+            total_bytes, dtype=torch.uint8, device=device
+        )
+        self.hdl = symm_mem.rendezvous(self.stage_buf, group=group_name)
+        raw_pad = self.hdl.get_signal_pad(rank)
+        # cuStreamWriteValue64 (used by nvshmem_put_with_signal) requires the
+        # signal address to be 8-byte aligned. get_signal_pad returns a
+        # torch.uint32 tensor (element_size=4), so indexing at rank*1 gives a
+        # 4-byte offset for rank>=1, which is misaligned and crashes with
+        # cudaErrorMisalignedAddress. Using a stride of 2 uint32 elements (8
+        # bytes) per producer rank ensures every signal element is 8-byte
+        # aligned regardless of rank.
+        _needed = world_size * 2  # 2 uint32 slots per rank for 8-byte alignment
+        if raw_pad.numel() < _needed:
+            raise RuntimeError(
+                f"sig_pad.numel()={raw_pad.numel()} < {_needed} "
+                f"(world_size={world_size} * stride=2); "
+                "cannot assign 8-byte-aligned signal elements per producer rank. "
+                "Increase NVSHMEM_SYMMETRIC_SIZE or reduce world_size."
+            )
+        self.sig_pad: torch.Tensor = raw_pad
+
+        # Per-direction state: indexed by producer_rank.
+        # Phase 1: at most one in-flight per producer_rank regardless of consumer.
+        self._in_use: dict[int, SlotDescriptor] = {}  # producer_rank → active slot
+        self._sig_counters: list[int] = [1] * world_size  # next signal value per slot
+
+    def is_slot_free(self, producer_rank: int) -> bool:
+        return producer_rank not in self._in_use
+
+    def alloc_slot(
+        self, producer_rank: int, consumer_rank: int, nbytes: int
+    ) -> SlotDescriptor:
+        """
+        Allocate slot for producer → consumer transfer.
+        Caller MUST verify is_slot_free(producer_rank) before calling.
+        Raises if nbytes > max_slot_bytes.
+        """
+        if nbytes > self.max_slot_bytes:
+            raise ValueError(
+                f"Transfer payload {nbytes} B exceeds max_slot_bytes "
+                f"{self.max_slot_bytes} B. Increase NVSHMEMCommunicationManager "
+                "max_slot_bytes at construction time."
+            )
+        sig_val = self._sig_counters[producer_rank]
+        self._sig_counters[producer_rank] += 1
+        desc = SlotDescriptor(
+            slot_idx=producer_rank,
+            consumer_rank=consumer_rank,
+            sig_val=sig_val,
+            nbytes=nbytes,
+        )
+        self._in_use[producer_rank] = desc
+        return desc
+
+    def free_slot(self, producer_rank: int) -> None:
+        """Called when TENSOR_RECEIVED ACK arrives from consumer."""
+        self._in_use.pop(producer_rank, None)
+
+    def get_slot_view(self, slot_idx: int, nbytes: int) -> torch.Tensor:
+        """Byte-view into the staging slot for the given slot_idx."""
+        start = slot_idx * self.max_slot_bytes
+        return self.stage_buf[start : start + nbytes]
+
+    def get_sig_pad_element(self, peer_rank: int) -> torch.Tensor:
+        """Single-element view into sig_pad for a given peer rank.
+
+        Uses a stride-2 layout (2 uint32 slots per rank) so that each
+        producer's signal element is 8-byte aligned, satisfying the
+        cuStreamWriteValue64 alignment requirement used internally by
+        nvshmem_put_with_signal.
+        """
+        idx = peer_rank * 2
+        return self.sig_pad[idx : idx + 1]
+
+
+# ---------------------------------------------------------------------------
+# _NVSHMEMPendingTransfer
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _NVSHMEMPendingTransfer:
+    request_id: str
+    graph_edges: list[GraphEdge]
+    completion_event: torch.cuda.Event
+    producer_rank: int  # needed to match ACK back to slot
+
+
+# ---------------------------------------------------------------------------
+# Captured worker-to-worker NVSHMEM transport infrastructure
+# (per §3–§5 of the captured-NVSHMEM design doc)
+# ---------------------------------------------------------------------------
+
+
+# In-graph signal values for the captured ACK cycle (both set-to-1 per §3.1).
+_NVSHMEM_DATA_VAL: int = 1
+_NVSHMEM_ACK_VAL: int = 1
+# 128-byte alignment for per-edge slot sizing (§4.1).
+_NVSHMEM_SLOT_ALIGN: int = 128
+
+
+def _align_up_slot_bytes(n: int, multiple: int = _NVSHMEM_SLOT_ALIGN) -> int:
+    if n <= 0:
+        return multiple
+    return (n + multiple - 1) // multiple * multiple
+
+
+class _CapturedTransportInfra:
+    """Per-manager symmetric heap + pad bookkeeping for captured NVSHMEM edges.
+
+    Owns three symmetric allocations, each rendezvoused once across the NVSHMEM
+    process group:
+
+      * ``slots_buf``  — contiguous uint8 heap of length
+        ``sum(aligned_sizes)``. Every rank sees the same size; edge `e`
+        occupies ``slots_buf[edge_byte_offset[e] : +aligned_sizes[e]]``.
+        Signal pad on this allocation carries the producer→consumer data
+        signal (``data_pad[e]``).
+      * ``ack_src``    — 1-element int32 heap used only as a source tensor
+        for the consumer's ack ``put_with_signal`` call. Signal pad on this
+        allocation carries the consumer→producer ack signal (``ack_pad[e]``).
+
+    Pad slots use stride-2 indexing per the Defect-3 fix (cuStreamWriteValue64
+    needs 8-byte alignment over a torch.uint32 pad).
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        group_name: str,
+        edge_specs: list[EdgeSpec],
+    ) -> None:
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.group_name = group_name
+
+        # Deterministic ordering: sort by edge_id so every rank sees the same
+        # per-edge offsets / pad indices (required for symmetric rendezvous).
+        specs = sorted(edge_specs, key=lambda s: s.edge_id)
+        if not specs:
+            raise ValueError(
+                "_CapturedTransportInfra: edge_specs is empty; init_edges expects at "
+                "least one NVSHMEM worker-to-worker edge"
+            )
+        if len({s.edge_id for s in specs}) != len(specs):
+            raise ValueError(
+                "_CapturedTransportInfra: edge_specs contains duplicate edge_ids"
+            )
+        for s in specs:
+            if s.edge_id < 0:
+                raise ValueError(
+                    f"_CapturedTransportInfra: edge_id must be non-negative, got {s.edge_id}"
+                )
+            if s.producer_rank == s.consumer_rank:
+                raise ValueError(
+                    f"_CapturedTransportInfra: self-edge (producer==consumer={s.producer_rank}) "
+                    f"on edge_id={s.edge_id}; self-edges must fall through to Mooncake"
+                )
+            if s.max_bytes <= 0:
+                raise ValueError(
+                    f"_CapturedTransportInfra: edge_id={s.edge_id} has max_bytes={s.max_bytes}; "
+                    "must be positive"
+                )
+
+        self.edge_specs: dict[int, EdgeSpec] = {s.edge_id: s for s in specs}
+        self.edge_ids: list[int] = [s.edge_id for s in specs]
+        self.aligned_sizes: dict[int, int] = {
+            s.edge_id: _align_up_slot_bytes(s.max_bytes) for s in specs
+        }
+        self.edge_byte_offset: dict[int, int] = {}
+        off = 0
+        for eid in self.edge_ids:
+            self.edge_byte_offset[eid] = off
+            off += self.aligned_sizes[eid]
+        self.total_bytes: int = off
+        # Dense pad slot index per edge (stride-2 slot per edge on both
+        # data_pad and ack_pad). Uniform across ranks because edge_ids is
+        # sorted identically on every rank.
+        self.pad_idx: dict[int, int] = {eid: i for i, eid in enumerate(self.edge_ids)}
+
+        # Rendezvous the slot heap + ack source tensor.
+        self.slots_buf: torch.Tensor = symm_mem.empty(
+            self.total_bytes, dtype=torch.uint8, device=device
+        )
+        self.slots_hdl = symm_mem.rendezvous(self.slots_buf, group=group_name)
+        self.ack_src: torch.Tensor = symm_mem.empty(
+            1, dtype=torch.int32, device=device
+        )
+        self.ack_hdl = symm_mem.rendezvous(self.ack_src, group=group_name)
+
+        # Per-rank signal pads. data_pad lives on the slots allocation;
+        # ack_pad lives on the ack_src allocation. Each edge consumes 2
+        # uint32 elements on each pad (stride-2 alignment).
+        self.data_pad: torch.Tensor = self.slots_hdl.get_signal_pad(rank)
+        self.ack_pad: torch.Tensor = self.ack_hdl.get_signal_pad(rank)
+        needed = len(self.edge_ids) * 2
+        if self.data_pad.numel() < needed:
+            raise RuntimeError(
+                f"_CapturedTransportInfra: data_pad.numel()={self.data_pad.numel()} < {needed} "
+                f"(n_edges={len(self.edge_ids)} * stride=2). Increase "
+                "NVSHMEM_SYMMETRIC_SIZE or reduce edge count."
+            )
+        if self.ack_pad.numel() < needed:
+            raise RuntimeError(
+                f"_CapturedTransportInfra: ack_pad.numel()={self.ack_pad.numel()} < {needed} "
+                f"(n_edges={len(self.edge_ids)} * stride=2). Increase "
+                "NVSHMEM_SYMMETRIC_SIZE or reduce edge count."
+            )
+
+    # Edge-indexed view helpers. All returned tensors are stable views into
+    # the symm heap — safe to capture inside torch.cuda.graph().
+
+    def slot_view(self, edge_id: int, nbytes: int | None = None) -> torch.Tensor:
+        off = self.edge_byte_offset[edge_id]
+        cap = self.aligned_sizes[edge_id]
+        if nbytes is None:
+            end = off + cap
+        else:
+            if nbytes < 0 or nbytes > cap:
+                raise ValueError(
+                    f"_CapturedTransportInfra.slot_view: nbytes={nbytes} out of range for "
+                    f"edge_id={edge_id} (cap={cap})"
+                )
+            end = off + nbytes
+        return self.slots_buf[off:end]
+
+    def data_pad_slot(self, edge_id: int) -> torch.Tensor:
+        i = self.pad_idx[edge_id]
+        return self.data_pad[i * 2 : i * 2 + 1]
+
+    def ack_pad_slot(self, edge_id: int) -> torch.Tensor:
+        i = self.pad_idx[edge_id]
+        return self.ack_pad[i * 2 : i * 2 + 1]
+
+
+# ---------------------------------------------------------------------------
+# NVSHMEMCommunicationManager
+# ---------------------------------------------------------------------------
+
+
+class NVSHMEMCommunicationManager(TensorCommunicationManager):
+    def __init__(
+        self,
+        my_entity_id: str,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        communicator: BaseCommunicator,
+        group: "dist.ProcessGroup",
+        entity_id_to_rank: dict[str, int],
+        max_slot_bytes: int = 128 * 1024 * 1024,  # 128 MB
+    ) -> None:
+        """
+        my_entity_id:      this worker's entity ID (e.g. "worker_0")
+        rank:              NVSHMEM / torch.distributed rank
+        world_size:        total ranks
+        device:            this rank's CUDA device
+        communicator:      ZMQ communicator (for ACK messages)
+        group:             pre-initialized dist.ProcessGroup (NCCL bootstrap)
+        entity_id_to_rank: maps entity IDs → NVSHMEM PE ranks
+        max_slot_bytes:    maximum bytes per staging slot
+        """
+        # Satisfy main's TensorCommunicationManager invariant: base __init__
+        # sets transfer_engine / my_session_id / tensor_store / pending. The
+        # NVSHMEMTransferEngine is a no-op subclass — kv_store.py's path is
+        # handled polymorphically via get_async_reader() returning None.
+        engine = NVSHMEMTransferEngine(my_entity_id)
+        super().__init__(
+            my_entity_id=my_entity_id,
+            my_session_id=engine.get_session_id(),
+            device=device,
+            communicator=communicator,
+            transfer_engine=engine,
+        )
+
+        self.rank = rank
+        self.world_size = world_size
+        self.entity_id_to_rank = entity_id_to_rank
+        self._group = group
+        self._group_name = group.group_name
+
+        if not symm_mem.is_nvshmem_available():
+            raise RuntimeError("NVSHMEM backend not available")
+        symm_mem.set_backend("NVSHMEM")
+
+        self.staging = NVSHMEMStagingPool(
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            group_name=group.group_name,
+            max_slot_bytes=max_slot_bytes,
+        )
+
+        # Dedicated CUDA stream for all NVSHMEM operations.
+        self.transfer_stream = torch.cuda.Stream(device=device)
+
+        # Warmup NVSHMEM on the transfer stream (lazy-init is not capture-safe).
+        self._warmup_nvshmem()
+
+        # Reassign self.pending to the NVSHMEM-specific transfer type. Base
+        # __init__ initialized it to list[FutureAndPointers]; NVSHMEM's eager
+        # path tracks list[_NVSHMEMPendingTransfer] instead.
+        self.pending: list[_NVSHMEMPendingTransfer] = []
+
+        # Captured worker-to-worker transport state; populated by
+        # init_edges() / warmup(). _captured is None until init_edges() is
+        # called. warmup() must be called before any record_send / record_recv
+        # invocation under graph capture.
+        self._captured: "_CapturedTransportInfra | None" = None
+        self._captured_warmed_up: bool = False
+        # Metrics for §8.4: count of captured replays that have passed through
+        # this manager's watchdog, plus a bounded sliding window of replay
+        # latencies (microseconds) used to compute p50 on demand.
+        self.captured_replays_total: int = 0
+        self._captured_replay_latencies_us: list[float] = []
+        self._captured_replay_latency_cap: int = 4096
+
+        logger.info(
+            "NVSHMEMCommunicationManager: initialized rank=%d world=%d device=%s",
+            rank, world_size, device,
+        )
+
+    def _warmup_nvshmem(self) -> None:
+        """
+        Issue a no-op put+signal/wait pair on the transfer stream to trigger
+        any lazy NVSHMEM initialization before the first real transfer.
+        Called once during __init__.
+
+        Protocol (mirrors §2.3): rank 0 is producer, rank 1 is consumer.
+        - Producer (rank 0): signals into *consumer's* sig_pad[producer_rank=0].
+          The local sig_elem passed to put_with_signal is the producer's own
+          sig_pad[0:1]; NVSHMEM writes it at the same symmetric offset on peer.
+        - Consumer (rank >0): must wait on its local sig_pad[producer_rank=0],
+          i.e. get_sig_pad_element(producer_rank=0), not get_sig_pad_element(self.rank).
+        """
+        producer_rank = 0
+        warmup_tensor = self.staging.get_slot_view(producer_rank, 4)
+        # Both producer and consumer reference the same symmetric offset: sig_pad[0].
+        sig_elem = self.staging.get_sig_pad_element(producer_rank)
+        peer = (producer_rank + 1) % self.world_size
+
+        with torch.cuda.stream(self.transfer_stream):
+            if self.rank == producer_rank:
+                torch.ops.symm_mem.nvshmem_put_with_signal(
+                    warmup_tensor, sig_elem, 0, peer
+                )
+            elif self.rank == peer:
+                # Wait on sig_pad[producer_rank] — the element the producer wrote.
+                torch.ops.symm_mem.nvshmem_wait_for_signal(
+                    sig_elem, 0, producer_rank
+                )
+        self.transfer_stream.synchronize()
+        dist.barrier(group=dist.group.WORLD)
+        sig_elem.zero_()
+        self.transfer_stream.synchronize()
+
+    def _drain_acks(self) -> None:
+        """Process any incoming ZMQ messages to pick up TENSOR_RECEIVED ACKs."""
+        for msg in self.communicator.get_all_new_messages():
+            if (
+                hasattr(msg, "message_type")
+                and msg.message_type == WorkerMessageType.TENSOR_RECEIVED
+            ):
+                body = msg.body
+                for uuid in body.successful_tensors:
+                    # Free the slot associated with this producer (self.rank)
+                    # when the consumer sends back an ACK for our outgoing transfer.
+                    self.staging.free_slot(self.rank)
+                    self.tensor_store.dereference(body.request_id, uuid, n=1)
+
+    def _wait_for_slot(self, producer_rank: int, timeout_s: float = 5.0) -> None:
+        """
+        Block (CPU spin) until the outgoing staging slot is free.
+        In normal operation this returns immediately. If it blocks for
+        more than timeout_s, it raises RuntimeError (likely a hung consumer).
+        """
+        deadline = _time.monotonic() + timeout_s
+        while not self.staging.is_slot_free(producer_rank):
+            self._drain_acks()
+            if _time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"NVSHMEM staging slot {producer_rank} still in use after "
+                    f"{timeout_s}s. Consumer may be hung."
+                )
+            _time.sleep(0.001)
+
+    # ------------------------------------------------------------------
+    # ABC method implementations (overrides of TensorCommunicationManager)
+    # ------------------------------------------------------------------
+
+    def store_and_return_tensor_info(
+        self, request_id: str, tensors: NameToTensorList,
+    ) -> dict[str, list[TensorPointerInfo]]:
+        """
+        Store tensors in tensor_store. Does NOT yet copy to staging or issue PUT.
+        The PUT happens in store_and_populate_graph_edges where consumer_rank is known.
+        Returns TensorPointerInfo with placeholder address/signal; these are filled
+        when the edge is populated.
+        """
+        tensor_info: dict[str, list[TensorPointerInfo]] = {}
+        for name, tensor_list in tensors.items():
+            tensor_info[name] = []
+            for tensor in tensor_list:
+                tensor_uuid = str(uuid4())
+                self.tensor_store.put_tensor(request_id, tensor_uuid, tensor)
+                info = TensorPointerInfo(
+                    dims=list(tensor.shape),
+                    dtype=str(tensor.dtype),
+                    stride=list(tensor.stride()),
+                    nbytes=tensor.nbytes,
+                    address=0,        # filled in store_and_populate_graph_edges
+                    uuid=tensor_uuid,
+                    source_session_id=str(self.rank),
+                    source_entity=self.my_entity_id,
+                    source_rank=self.rank,
+                    symmetric_offset=0,
+                    signal_value=0,
+                )
+                tensor_info[name].append(info)
+        return tensor_info
+
+    def store_and_populate_graph_edges(
+        self,
+        request_id: str,
+        tensors: NameToTensorList,
+        graph_edges: list[GraphEdge],
+    ) -> None:
+        # Build name → edges mapping
+        name_to_edges: dict[str, list[GraphEdge]] = {}
+        for edge in graph_edges:
+            name_to_edges.setdefault(edge.name, []).append(edge)
+
+        graph_node_info = self.store_and_return_tensor_info(request_id, tensors)
+
+        for name, info_list in graph_node_info.items():
+            edges = name_to_edges.get(name, [])
+            for info in info_list:
+                self.tensor_store.increment_ref(
+                    request_id, info.uuid,
+                    n=len([e for e in edges if e.next_node != EMPTY_DESTINATION])
+                )
+            for edge in edges:
+                if edge.next_node in SPECIAL_DESTINATIONS:
+                    # EMPTY_DESTINATION: no consumer rank to route to.
+                    # EMIT_TO_CLIENT: api_server is not an NVSHMEM peer; the
+                    # tensor is serialized inline and sent via ZMQ in
+                    # Worker._send_outputs — no NVSHMEM PUT needed here.
+                    # Defect 12 fix: avoids KeyError on non-worker next_nodes.
+                    edge.tensor_info = info_list
+                    continue
+                consumer_rank = self.entity_id_to_rank[edge.next_node]
+                tensors_for_edge = [
+                    self.tensor_store.get_tensor(request_id, info.uuid)
+                    for info in info_list
+                ]
+                # Block if the outgoing slot is already in use.
+                self._wait_for_slot(self.rank)
+
+                # Pack tensors, copy to staging slot, issue PUT + signal.
+                packed_nbytes = _compute_packed_size(tensors_for_edge)
+                slot = self.staging.alloc_slot(self.rank, consumer_rank, packed_nbytes)
+                slot_view = self.staging.get_slot_view(slot.slot_idx, slot.nbytes)
+                sig_elem = self.staging.get_sig_pad_element(self.rank)
+
+                with torch.cuda.stream(self.transfer_stream):
+                    _pack_tensors_into_slot(tensors_for_edge, slot_view)
+                    torch.ops.symm_mem.nvshmem_put_with_signal(
+                        slot_view, sig_elem, slot.sig_val, consumer_rank
+                    )
+
+                # Fill in TensorPointerInfo with slot addressing.
+                for info in info_list:
+                    info.address = slot.slot_idx * self.staging.max_slot_bytes
+                    info.symmetric_offset = info.address
+                    info.signal_value = slot.sig_val
+                edge.tensor_info = info_list
+
+    def register_for_send(
+        self, request_id: str, uuids: list[str],
+        skip_cuda_sync: bool = False,
+    ) -> None:
+        # NVSHMEM symmetric heap requires no explicit registration.
+        # skip_cuda_sync is accepted for ABC compatibility but unused here.
+        pass
+
+    def start_read_tensors(
+        self,
+        request_id: str,
+        graph_edges: list[GraphEdge],
+    ) -> None:
+        for edge in graph_edges:
+            if not edge.tensor_info:
+                continue  # signal-only edge
+
+            # All TensorPointerInfos for an edge share the same staging slot.
+            first = edge.tensor_info[0]
+            if first.source_rank < 0:
+                raise ValueError(
+                    f"NVSHMEMCommunicationManager received TensorPointerInfo "
+                    f"with source_rank={first.source_rank}; is this edge "
+                    "coming from a Mooncake producer?"
+                )
+
+            producer_rank = first.source_rank
+            sig_val = first.signal_value
+            packed_nbytes = _compute_packed_size_from_infos(edge.tensor_info)
+
+            sig_elem = self.staging.get_sig_pad_element(producer_rank)
+            slot_view = self.staging.get_slot_view(
+                slot_idx=producer_rank,
+                nbytes=packed_nbytes,
+            )
+
+            # Allocate destination tensors for each info.
+            dst_tensors = []
+            for info in edge.tensor_info:
+                if self.tensor_store.check_uuid_presence(request_id, info.uuid):
+                    dst = self.tensor_store.get_tensor(request_id, info.uuid)
+                else:
+                    # Parse dtype from string representation (e.g. "torch.float32")
+                    dtype = _parse_dtype(info.dtype)
+                    dst = torch.empty(info.dims, dtype=dtype, device=self.device)
+                    self.tensor_store.put_tensor(request_id, info.uuid, dst)
+                self.tensor_store.increment_ref(request_id, info.uuid, 1)
+                dst_tensors.append(dst)
+
+            # Issue the wait + unpack on the transfer stream.
+            completion_event = torch.cuda.Event()
+            with torch.cuda.stream(self.transfer_stream):
+                torch.ops.symm_mem.nvshmem_wait_for_signal(
+                    sig_elem, sig_val, producer_rank
+                )
+                # After wait: slot_view holds the producer's data.
+                _unpack_tensors_from_slot(slot_view, dst_tensors)
+                # Zero the signal element to allow reuse (before ACK).
+                sig_elem.zero_()
+                completion_event.record(self.transfer_stream)
+
+            self.pending.append(_NVSHMEMPendingTransfer(
+                request_id=request_id,
+                graph_edges=[edge],
+                completion_event=completion_event,
+                producer_rank=producer_rank,
+            ))
+
+    def _cleanup_by_uuid(self, request_id: str, uuid: str) -> None:
+        """Required by main's ABC. NVSHMEM overrides cleanup_request directly,
+        which doesn't delegate per-uuid; this stub exists only to satisfy
+        Python's ABC instantiation requirement."""
+        return
+
+    def get_ready_tensors(self) -> dict[str, list[GraphEdge]]:
+        ready: dict[str, list[GraphEdge]] = {}
+        still_pending: list[_NVSHMEMPendingTransfer] = []
+
+        for transfer in self.pending:
+            if transfer.completion_event.query():
+                for edge in transfer.graph_edges:
+                    ready.setdefault(transfer.request_id, []).append(edge)
+                    logger.debug(
+                        "NVSHMEM transfer complete: %d tensors for edge %s",
+                        len(edge.tensor_info), edge.name,
+                    )
+            else:
+                still_pending.append(transfer)
+
+        self.pending = still_pending
+
+        # Send ACKs and dereference tensors for completed transfers.
+        for req_id, edges in ready.items():
+            self._collect_and_send_acks(req_id, edges)
+            for edge in edges:
+                for info in edge.tensor_info:
+                    self.tensor_store.dereference(req_id, info.uuid, 1)
+
+        return ready
+
+    def _collect_and_send_acks(
+        self, request_id: str, graph_edges: list[GraphEdge]
+    ) -> None:
+        """Mirror of MooncakeCommunicationManager._collect_and_send_acks."""
+        acks: dict[str, dict[str, int]] = {}
+        for edge in graph_edges:
+            for info in edge.tensor_info:
+                if info.source_entity == self.my_entity_id:
+                    continue
+                acks.setdefault(info.source_entity, {})[info.uuid] = (
+                    acks.get(info.source_entity, {}).get(info.uuid, 0) + 1
+                )
+        for source_entity, tensors in acks.items():
+            self.communicator.send(
+                source_entity,
+                WorkerMessage(
+                    message_type=WorkerMessageType.TENSOR_RECEIVED,
+                    body=TensorReceived(
+                        request_id=request_id,
+                        successful_tensors=tensors,
+                        failed_tensor_ids=[],
+                    ),
+                ),
+            )
+
+    def get_tensor(self, request_id: str, uuid: str) -> torch.Tensor:
+        return self.tensor_store.get_tensor(request_id, uuid)
+
+    def set_persist(self, request_id: str, uuid: str, persist: bool) -> None:
+        self.tensor_store.set_metadata(request_id, uuid, persist=persist)
+        if self.tensor_store.can_gc(request_id, uuid):
+            self.tensor_store.remove_tensor(request_id, uuid)
+
+    def dereference(self, request_id: str, uuid: str, n: int = 1) -> None:
+        self.tensor_store.dereference(request_id, uuid, n=n)
+        if self.tensor_store.can_gc(request_id, uuid):
+            self.tensor_store.remove_tensor(request_id, uuid)
+
+    def increment_ref(self, request_id: str, uuid: str, n: int = 1) -> None:
+        self.tensor_store.increment_ref(request_id, uuid, n=n)
+
+    def put_foreign(
+        self,
+        request_id: str,
+        uuid: str,
+        tensor: torch.Tensor,
+        initial_ref_count: int = 1,
+    ) -> None:
+        """Insert an externally-built tensor into tensor_store.
+
+        The tensor must already be on the correct device.  initial_ref_count
+        should equal the number of consuming graph edges on this worker so that
+        the last dereference in _cleanup_consumed_inputs triggers GC.
+        """
+        self.tensor_store.put_tensor(request_id, uuid, tensor)
+        self.tensor_store.increment_ref(request_id, uuid, n=initial_ref_count)
+
+    def cleanup_request(self, request_id: str) -> None:
+        for uuid in self.tensor_store.get_all_uuids(request_id):
+            self.tensor_store.set_metadata(request_id, uuid, persist=False)
+            if not self.tensor_store.can_gc(request_id, uuid):
+                logger.warning("Deferring cleanup of tensor %s (pending ACK)", uuid)
+                continue
+            self.tensor_store.remove_tensor(request_id, uuid)
+        # Drain any pending transfers for this request (send ACKs for abandoned edges).
+        leftover = [t for t in self.pending if t.request_id == request_id]
+        self.pending = [t for t in self.pending if t.request_id != request_id]
+        for transfer in leftover:
+            self._collect_and_send_acks(request_id, transfer.graph_edges)
+
+    def handle_ack(self, request_id: str, uuids: dict[str, int]) -> None:
+        """
+        Called when a TENSOR_RECEIVED ACK arrives from a consumer.
+        Frees the staging slot so the producer can reuse it.
+        """
+        self.staging.free_slot(self.rank)
+        for uuid, ref_cnt in uuids.items():
+            self.tensor_store.dereference(request_id, uuid, n=ref_cnt)
+
+    def release_slot_for_uuid(self, request_id: str, uuid: str, ref_cnt: int = 1) -> None:
+        """Single-UUID wrapper around handle_ack for routing via Worker._uuid_to_manager.
+
+        Frees the staging slot (one slot per producer rank) and dereferences
+        the tensor.  Identical semantics to handle_ack({uuid: ref_cnt}).
+        Used by Worker._handle_tensor_received when dispatching ACKs through
+        the uuid_to_manager registry rather than the legacy isinstance check.
+        """
+        self.handle_ack(request_id, {uuid: ref_cnt})
+
+    # ------------------------------------------------------------------
+    # Captured worker-to-worker transport API
+    # (see §5 of the captured-NVSHMEM design doc)
+    # ------------------------------------------------------------------
+
+    def init_edges(self, edge_specs: list[EdgeSpec]) -> None:
+        """Allocate the captured-transport symmetric heap + pad mappings.
+
+        Called once per worker after graph-walk registration completes and the
+        Conductor has emitted the authoritative list of NVSHMEM worker-to-worker
+        edges. Every rank in the NVSHMEM process group must call this with the
+        same ``edge_specs`` payload; ordering does not matter (the manager sorts
+        by ``edge_id`` internally).
+
+        Idempotent: a second call with an equal spec list is a no-op; a second
+        call with a different spec list raises ``RuntimeError`` (the symmetric
+        heap is rendezvoused once for the lifetime of the manager).
+        """
+        if self._captured is not None:
+            existing = set(self._captured.edge_specs.values())
+            incoming = set(edge_specs)
+            if existing == incoming:
+                logger.debug(
+                    "NVSHMEMCommunicationManager.init_edges: idempotent no-op "
+                    "(n_edges=%d already registered)", len(existing)
+                )
+                return
+            raise RuntimeError(
+                "NVSHMEMCommunicationManager.init_edges called twice with "
+                "different edge_specs; captured-transport symmetric heap cannot be "
+                "re-rendezvoused. Incoming diff: "
+                f"added={sorted(s.edge_id for s in incoming - existing)}, "
+                f"removed={sorted(s.edge_id for s in existing - incoming)}"
+            )
+
+        self._captured = _CapturedTransportInfra(
+            rank=self.rank,
+            world_size=self.world_size,
+            device=self.device,
+            group_name=self._group_name,
+            edge_specs=list(edge_specs),
+        )
+        n = len(self._captured.edge_ids)
+        total_mib = self._captured.total_bytes / (1024 * 1024)
+        if self._captured.total_bytes > 2 * 1024 * 1024 * 1024:
+            raise RuntimeError(
+                f"NVSHMEM captured-transport slot heap would exceed 2 GiB cap "
+                f"(requested {total_mib:.1f} MiB across {n} edges). "
+                "Reduce per-edge max_bytes or edge count."
+            )
+        if self._captured.total_bytes > 1024 * 1024 * 1024:
+            logger.warning(
+                "NVSHMEM captured-transport slot heap is %.1f MiB across %d edges (>1 GiB warning threshold)",
+                total_mib, n,
+            )
+        logger.info(
+            "NVSHMEMCommunicationManager.init_edges: rank=%d n_edges=%d total_slot_heap=%.1f MiB",
+            self.rank, n, total_mib,
+        )
+
+    def warmup(self) -> None:
+        """Off-stream eager put/wait per edge + pad bootstrap (§3.3).
+
+        Forces NVSHMEM lazy init off the capture path (lazy init from inside a
+        captured graph is fatal), then sets steady-state pad values:
+
+          * producer rank `P`: ``ack_pad[e] = ACK_VAL`` (slot starts free)
+          * consumer rank `C`: ``data_pad[e] = 0`` (no pending data)
+
+        Finishes with ``dist.barrier()`` so all ranks have completed bootstrap
+        before any captured replay begins. Idempotent: calling twice is a no-op.
+        """
+        if self._captured is None:
+            raise RuntimeError(
+                "NVSHMEMCommunicationManager.warmup: must call init_edges first"
+            )
+        if self._captured_warmed_up:
+            logger.debug("NVSHMEMCommunicationManager.warmup: idempotent no-op")
+            return
+
+        info = self._captured
+        warm_stream = torch.cuda.Stream(device=self.device)
+        warm_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(warm_stream):
+            for eid in info.edge_ids:
+                spec = info.edge_specs[eid]
+                slot = info.slot_view(eid)
+                data_pad = info.data_pad_slot(eid)
+                ack_pad = info.ack_pad_slot(eid)
+
+                if self.rank == spec.producer_rank:
+                    # One eager put to force NVSHMEM lazy init off the capture
+                    # path. Target is the consumer's data_pad slot.
+                    torch.ops.symm_mem.nvshmem_put_with_signal(
+                        slot, data_pad, _NVSHMEM_DATA_VAL, spec.consumer_rank
+                    )
+                elif self.rank == spec.consumer_rank:
+                    # Wait for the producer's eager put, then reset the pad so
+                    # that the captured graph enters its first replay with
+                    # data_pad=0.
+                    torch.ops.symm_mem.nvshmem_wait_for_signal(
+                        data_pad, _NVSHMEM_DATA_VAL, spec.producer_rank
+                    )
+                    data_pad.zero_()
+                    # Eager ack back to the producer so it sees ack_pad=1
+                    # (steady-state bootstrap: "slot initially free").
+                    torch.ops.symm_mem.nvshmem_put_with_signal(
+                        info.ack_src, ack_pad, _NVSHMEM_ACK_VAL, spec.producer_rank
+                    )
+        warm_stream.synchronize()
+
+        # Final steady-state pad values per §3.3: producer sees ack_pad=1
+        # (already set by consumer's eager ack above); consumer sees
+        # data_pad=0 (already zeroed above). Nothing more to stamp; a barrier
+        # ensures everyone has completed bootstrap before any capture runs.
+        torch.cuda.synchronize()
+        dist.barrier(group=self._group)
+        self._captured_warmed_up = True
+        logger.info(
+            "NVSHMEMCommunicationManager.warmup: rank=%d bootstrapped %d edges",
+            self.rank, len(info.edge_ids),
+        )
+
+    def record_send(
+        self,
+        stream: torch.cuda.Stream,
+        edge_id: int,
+        src: torch.Tensor,
+    ) -> None:
+        """Producer-side capture hook (§5.1).
+
+        Inside a stream-capture context (the caller must already be under
+        ``torch.cuda.graph(..., stream=stream)`` or an equivalent
+        ``torch.cuda.stream(stream)`` on the same capture stream), records:
+
+            wait_for(ack_pad == ACK_VAL, peer=C)
+            ack_pad.zero_()
+            slot[e] <- src  (device-side memcpy)
+            put_with_signal(slot[e], data_pad@C, DATA_VAL, peer=C)
+
+        ``src`` must be a contiguous CUDA tensor whose total byte size is ≤
+        this edge's aligned slot capacity. The memcpy packs ``src`` into the
+        per-edge symmetric slot; the consumer unpacks it inside its matching
+        ``record_recv``.
+        """
+        info = self._require_captured_ready("record_send")
+        if edge_id not in info.edge_specs:
+            raise KeyError(
+                f"record_send: edge_id={edge_id} not registered with this "
+                "NVSHMEM manager (was it resolved to Mooncake?)"
+            )
+        spec = info.edge_specs[edge_id]
+        if self.rank != spec.producer_rank:
+            raise RuntimeError(
+                f"record_send: rank={self.rank} is not the producer of "
+                f"edge_id={edge_id} (producer_rank={spec.producer_rank})"
+            )
+        if not src.is_cuda or src.device != self.device:
+            raise ValueError(
+                f"record_send: src must be a CUDA tensor on device {self.device}; "
+                f"got device={src.device}"
+            )
+        nbytes = src.numel() * src.element_size()
+        cap = info.aligned_sizes[edge_id]
+        if nbytes > cap:
+            raise ValueError(
+                f"record_send: src.nbytes={nbytes} exceeds edge_id={edge_id} "
+                f"slot capacity={cap} (max_bytes={spec.max_bytes})"
+            )
+
+        slot = info.slot_view(edge_id)
+        data_pad = info.data_pad_slot(edge_id)
+        ack_pad = info.ack_pad_slot(edge_id)
+        # uint8 view of src bytes for the pack memcpy (src may be any dtype).
+        src_bytes = src.contiguous().view(torch.uint8).reshape(-1)
+
+        with torch.cuda.stream(stream):
+            # 1. Backpressure: wait until the consumer has freed the slot.
+            torch.ops.symm_mem.nvshmem_wait_for_signal(
+                ack_pad, _NVSHMEM_ACK_VAL, spec.consumer_rank
+            )
+            # 2. Reset ack pad for the *next* iteration's backpressure wait.
+            ack_pad.zero_()
+            # 3. Pack: memcpy src into the per-edge slot (device-side copy).
+            slot[:nbytes].copy_(src_bytes)
+            # 4. Ship + signal the consumer.
+            torch.ops.symm_mem.nvshmem_put_with_signal(
+                slot[:nbytes] if nbytes == cap else slot,
+                data_pad,
+                _NVSHMEM_DATA_VAL,
+                spec.consumer_rank,
+            )
+
+    def record_recv(
+        self,
+        stream: torch.cuda.Stream,
+        edge_id: int,
+        dst: torch.Tensor,
+    ) -> None:
+        """Consumer-side capture hook (§5.1).
+
+        Records, inside a stream-capture context:
+
+            wait_for(data_pad == DATA_VAL, peer=P)
+            data_pad.zero_()
+            dst <- slot[e]  (device-side memcpy)
+            put_with_signal(ack_src, ack_pad@P, ACK_VAL, peer=P)
+
+        ``dst`` must be a contiguous CUDA tensor whose total byte size fits
+        inside this edge's aligned slot capacity. The slot-free ack is folded
+        into this call so engine code cannot forget to ack.
+        """
+        info = self._require_captured_ready("record_recv")
+        if edge_id not in info.edge_specs:
+            raise KeyError(
+                f"record_recv: edge_id={edge_id} not registered with this "
+                "NVSHMEM manager (was it resolved to Mooncake?)"
+            )
+        spec = info.edge_specs[edge_id]
+        if self.rank != spec.consumer_rank:
+            raise RuntimeError(
+                f"record_recv: rank={self.rank} is not the consumer of "
+                f"edge_id={edge_id} (consumer_rank={spec.consumer_rank})"
+            )
+        if not dst.is_cuda or dst.device != self.device:
+            raise ValueError(
+                f"record_recv: dst must be a CUDA tensor on device {self.device}; "
+                f"got device={dst.device}"
+            )
+        nbytes = dst.numel() * dst.element_size()
+        cap = info.aligned_sizes[edge_id]
+        if nbytes > cap:
+            raise ValueError(
+                f"record_recv: dst.nbytes={nbytes} exceeds edge_id={edge_id} "
+                f"slot capacity={cap} (max_bytes={spec.max_bytes})"
+            )
+
+        slot = info.slot_view(edge_id)
+        data_pad = info.data_pad_slot(edge_id)
+        ack_pad = info.ack_pad_slot(edge_id)
+        dst_bytes = dst.contiguous().view(torch.uint8).reshape(-1)
+
+        with torch.cuda.stream(stream):
+            # 1. Wait for the producer's fresh put.
+            torch.ops.symm_mem.nvshmem_wait_for_signal(
+                data_pad, _NVSHMEM_DATA_VAL, spec.producer_rank
+            )
+            # 2. Reset data pad for the *next* iteration.
+            data_pad.zero_()
+            # 3. Unpack: memcpy slot into dst.
+            dst_bytes.copy_(slot[:nbytes])
+            # 4. Ack the producer ASAP so it can overlap iter (i+1)'s pack.
+            torch.ops.symm_mem.nvshmem_put_with_signal(
+                info.ack_src, ack_pad, _NVSHMEM_ACK_VAL, spec.producer_rank
+            )
+
+    def teardown(self) -> None:
+        """Free the captured-transport symmetric heap allocation.
+
+        After teardown, further ``record_send``/``record_recv`` calls raise
+        until ``init_edges`` + ``warmup`` are called again. Mooncake-style
+        cleanup semantics: idempotent, never raises on already-torn-down state.
+        """
+        if self._captured is None:
+            return
+        # Dropping the references to slots_buf / ack_src / handles releases the
+        # symmetric heap via torch's symm_mem allocator. No explicit free API
+        # is exposed; GC handles it.
+        self._captured = None
+        self._captured_warmed_up = False
+        logger.info(
+            "NVSHMEMCommunicationManager.teardown: rank=%d captured-transport resources released",
+            self.rank,
+        )
+
+    def mark_replay(self, latency_us: float) -> None:
+        """Record that one captured replay that routed through this manager
+        has completed in ``latency_us`` microseconds.
+
+        Called by the Worker's watchdog (§7.1) after ``event.query()`` returns
+        True. Metrics are exposed via ``captured_replays_total`` and
+        ``captured_replay_p50_us``.
+        """
+        self.captured_replays_total += 1
+        buf = self._captured_replay_latencies_us
+        buf.append(latency_us)
+        # Bounded ring to avoid unbounded growth on long-running workers.
+        if len(buf) > self._captured_replay_latency_cap:
+            # Drop the oldest half to amortize the copy cost.
+            half = self._captured_replay_latency_cap // 2
+            del buf[:half]
+
+    @property
+    def captured_replay_p50_us(self) -> float:
+        """Median of the recorded captured-replay latencies, or 0.0 if none.
+
+        Computed on demand from the bounded latency ring (not a running
+        estimator — the ring is small enough that sort-every-query is cheap
+        relative to the hot path)."""
+        buf = self._captured_replay_latencies_us
+        if not buf:
+            return 0.0
+        s = sorted(buf)
+        mid = len(s) // 2
+        if len(s) % 2:
+            return s[mid]
+        return 0.5 * (s[mid - 1] + s[mid])
+
+    def _require_captured_ready(self, op: str) -> "_CapturedTransportInfra":
+        if self._captured is None:
+            raise RuntimeError(
+                f"NVSHMEMCommunicationManager.{op}: init_edges() has not been called"
+            )
+        if not self._captured_warmed_up:
+            raise RuntimeError(
+                f"NVSHMEMCommunicationManager.{op}: warmup() has not been called; "
+                "captured put/wait from a cold manager deadlocks"
+            )
+        return self._captured

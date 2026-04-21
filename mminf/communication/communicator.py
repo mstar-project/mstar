@@ -30,6 +30,18 @@ class CommProtocol(Enum):
     TCP = "TCP"
     RDMA = "RDMA"
     SHM = "SHM"
+    NVSHMEM = "NVSHMEM"
+    AUTO = "AUTO"  # resolved per-edge at runtime
+
+
+# All CommProtocol values that map to the Mooncake communication manager.
+# NVSHMEM, SHM, and AUTO are not included — SHM uses
+# SharedMemoryCommunicationManager, AUTO is resolved before use.
+MOONCAKE_PROTOCOLS: frozenset = frozenset({
+    CommProtocol.IPC,
+    CommProtocol.TCP,
+    CommProtocol.RDMA,
+})
 
 
 class ZMQCommunicator(BaseCommunicator):

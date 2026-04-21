@@ -20,8 +20,17 @@ from mminf.conductor.request_info import (
     PartitionState,
     StreamingConnectionState,
 )
+from mminf.communication.tensors import EdgeSpec
 from mminf.engine.kv_store import KVCacheConfig
-from mminf.graph.base import GraphEdge, TensorPointerInfo
+from mminf.graph.base import (
+    GraphEdge,
+    GraphNode,
+    GraphSection,
+    Loop,
+    Parallel,
+    Sequential,
+    TensorPointerInfo,
+)
 from mminf.model.base import ForwardPassArgs, Model, WorkerGraph
 from mminf.utils.ipc_format import (
     ConductorMessageType,
@@ -71,6 +80,9 @@ def _worker_process_target(
     mooncake_port: int=8080,
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
+    master_service: str = "localhost:50051",
+    node_to_rank: dict | None = None,
+    edge_specs: list[EdgeSpec] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
     logging.basicConfig(
@@ -100,6 +112,9 @@ def _worker_process_target(
         mooncake_port=mooncake_port,
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
+        master_service=master_service,
+        node_to_rank=node_to_rank,
+        edge_specs=edge_specs or [],
     )
     worker.run()
 
@@ -241,6 +256,152 @@ class Conductor:
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
 
+        # Node name → NVSHMEM rank mapping for NVSHMEM transport routing.
+        # store_and_populate_graph_edges looks up edge.next_node (a BAGEL node
+        # name like "LLM") in entity_id_to_rank; this map provides that lookup.
+        self._node_to_rank: dict[str, int] = {
+            node_name: rank
+            for rank, wg_list in rank_to_worker_graphs.items()
+            for wg in wg_list
+            for node_name in wg.section.get_node_names()
+        }
+
+        # Assign deterministic edge_ids and build per-worker EdgeSpec lists
+        # for cross-rank NVSHMEM transfers (consumed by the captured-transport
+        # path). This mutates every GraphEdge in every worker_graph subtree
+        # (including Loop deep copies) so the Worker / Engine capture paths
+        # can look up edge_id directly.
+        self._per_worker_edge_specs: dict[str, list[EdgeSpec]] = \
+            self._assign_edge_ids_and_build_edge_specs()
+
+    # ------------------------------------------------------------------
+    # Captured NVSHMEM-transport edge_id assignment
+    # ------------------------------------------------------------------
+
+    # Default slot-byte cap per captured-transport edge when the model config
+    # does not override it. 16 MiB leaves headroom under the 2 GiB-per-rank
+    # hard cap (§4.1 of the captured-NVSHMEM design doc) while comfortably
+    # fitting common BAGEL activation tensors.
+    _DEFAULT_NVSHMEM_MAX_BYTES_PER_EDGE: int = 16 * 1024 * 1024
+
+    def _walk_graph_nodes(self, section: GraphSection):
+        """Yield every GraphNode reachable from `section` in a deterministic
+        pre-order. For a Loop, walks the canonical `section` plus both live
+        deep copies (`curr_iter_section`, `nxt_iter_section`) so edge_id
+        mutation reaches every GraphEdge instance the runtime will observe."""
+        if isinstance(section, GraphNode):
+            yield section
+        elif isinstance(section, (Sequential, Parallel)):
+            for sub in section.sections:
+                yield from self._walk_graph_nodes(sub)
+        elif isinstance(section, Loop):
+            yield from self._walk_graph_nodes(section.section)
+            if section.curr_iter_section is not None:
+                yield from self._walk_graph_nodes(section.curr_iter_section)
+            if section.nxt_iter_section is not None:
+                yield from self._walk_graph_nodes(section.nxt_iter_section)
+        else:
+            raise TypeError(f"Unknown GraphSection subclass: {type(section)}")
+
+    def _assign_edge_ids_and_build_edge_specs(
+        self,
+    ) -> dict[str, list[EdgeSpec]]:
+        """Walk every worker_graph, assign a deterministic edge_id to every
+        GraphEdge in every (producer_node, edge_name, consumer_node) group,
+        and return `{worker_id: [EdgeSpec, ...]}` for the NVSHMEM-cross-rank
+        subset that the captured transport will carry.
+
+        Determinism: worker_graphs are sorted by `worker_graph_id`; within
+        each subtree, nodes are visited in pre-order as yielded by
+        `_walk_graph_nodes`; within each node, edges are visited in their
+        declared `.outputs` order. Running this on any rank with the same
+        model + config produces identical IDs.
+        """
+        # Resolve the per-edge max_bytes cap from model_config if present.
+        nvshmem_cfg = (
+            self.model_config.get("nvshmem", {}) or {}
+        ).get("captured", {}) or {}
+        max_bytes_per_edge = int(
+            nvshmem_cfg.get(
+                "max_bytes_per_edge", self._DEFAULT_NVSHMEM_MAX_BYTES_PER_EDGE
+            )
+        )
+        if max_bytes_per_edge <= 0:
+            raise ValueError(
+                "nvshmem.captured.max_bytes_per_edge must be positive, got "
+                f"{max_bytes_per_edge}"
+            )
+
+        # Pass 1: build the deterministic key → edge_id mapping by visiting
+        # every GraphNode.outputs edge exactly once (keys are dedup'd by
+        # (producer_node, edge.name, edge.next_node) so Loop deep copies map
+        # to the same id).
+        key_to_id: dict[tuple[str, str, str], int] = {}
+        id_to_producer_consumer: dict[int, tuple[str, str]] = {}
+        next_id = 0
+        for wg_id in sorted(self.worker_graphs.keys()):
+            wg = self.worker_graphs[wg_id]
+            for node in self._walk_graph_nodes(wg.section):
+                for edge in node.outputs:
+                    key = (node.name, edge.name, edge.next_node)
+                    if key not in key_to_id:
+                        key_to_id[key] = next_id
+                        id_to_producer_consumer[next_id] = (node.name, edge.next_node)
+                        next_id += 1
+
+        # Pass 2: mutate every edge instance in place so every copy (Loop
+        # duplicates included) carries the assigned id.
+        for wg in self.worker_graphs.values():
+            for node in self._walk_graph_nodes(wg.section):
+                for edge in node.outputs:
+                    key = (node.name, edge.name, edge.next_node)
+                    edge.edge_id = key_to_id[key]
+
+        # Pass 3: classify each assigned edge. An edge is captured-transport
+        # eligible iff BOTH producer and consumer are known worker nodes (i.e.
+        # appear in _node_to_rank) AND their ranks differ. api_server targets
+        # and special destinations are skipped by construction.
+        eligible: list[EdgeSpec] = []
+        for edge_id, (producer_node, consumer_node) in id_to_producer_consumer.items():
+            p_rank = self._node_to_rank.get(producer_node)
+            c_rank = self._node_to_rank.get(consumer_node)
+            if p_rank is None or c_rank is None:
+                continue
+            if p_rank == c_rank:
+                continue
+            eligible.append(
+                EdgeSpec(
+                    edge_id=edge_id,
+                    producer_rank=p_rank,
+                    consumer_rank=c_rank,
+                    max_bytes=max_bytes_per_edge,
+                )
+            )
+
+        # Route each EdgeSpec to the workers that participate (producer and
+        # consumer). Only applies when NVSHMEM transport is available; when
+        # Mooncake-only, all workers receive an empty list (they will simply
+        # never call init_edges on a non-existent manager).
+        nvshmem_active = self.tensor_comm_protocol == CommProtocol.NVSHMEM
+        per_worker: dict[str, list[EdgeSpec]] = {
+            f"worker_{rank}": [] for rank in self._sorted_ranks
+        }
+        if nvshmem_active:
+            for spec in eligible:
+                for rank in (spec.producer_rank, spec.consumer_rank):
+                    wid = f"worker_{rank}"
+                    if wid in per_worker:
+                        per_worker[wid].append(spec)
+
+        total = sum(len(v) for v in per_worker.values())
+        logger.info(
+            "Captured NVSHMEM transport: assigned %d unique edge_ids "
+            "(%d cross-rank eligible, %d dispatched across workers, "
+            "nvshmem_active=%s)",
+            next_id, len(eligible), total, nvshmem_active,
+        )
+        return per_worker
+
     def _launch_workers(self):
         """Spawn one process per worker rank using spawn context."""
         ctx = mp.get_context("spawn")
@@ -264,7 +425,10 @@ class Conductor:
                     "log_level": self.log_level,
                     "mooncake_port": self.mooncake_port,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
-                    "tcp_transfer_device": self.tcp_transfer_device
+                    "tcp_transfer_device": self.tcp_transfer_device,
+                    "master_service": self.hostname,
+                    "node_to_rank": self._node_to_rank,
+                    "edge_specs": self._per_worker_edge_specs.get(worker_id, []),
                 },
                 daemon=False,
             )
@@ -486,11 +650,13 @@ class Conductor:
                     graph_walk=fwd_args.full_metadata.graph_walk,
                 )
 
+                worker_edges = inputs_per_worker.get(worker_id, [])
+
                 message = NewRequest(
                     request_id=body.request_id,
                     partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_worker=worker_graph_to_worker,
-                    initial_inputs=inputs_per_worker.get(worker_id, []),
+                    initial_inputs=worker_edges,
                     request_info=CurrentForwardPassInfo(
                         graph_walk=fwd_args.full_metadata.graph_walk,
                         step_metadata=fwd_args.step_metadata,
