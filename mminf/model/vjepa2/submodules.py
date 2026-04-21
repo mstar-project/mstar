@@ -729,6 +729,318 @@ class VJepa2ACPredictorSubmodule(NodeSubmodule):
         }
 
 
+class VJepa2ACRolloutPredictorSubmodule(NodeSubmodule):
+    """Action-conditioned autoregressive rollout — Phase 3.D.
+
+    **Sliding-window rollout** — diverges from upstream
+    ``vjepa2/notebooks/utils/mpc_utils.py::cem`` which uses growing-context
+    (``T: 1 → rollout+1``) from a single-tubelet initial encoding.  Our
+    encoder's natural output is ``T=grid_depth`` (a full 64-frame clip), so
+    growing-context would immediately hit the AC predictor's pre-built
+    causal attn-mask cap.  See the plan's P3.D "Sliding-window vs upstream
+    growing-context" section for the full rationale.
+
+    Per iter ``k``:
+      * Slice actions/states: ``actions_k = actions[:, k : k + T_ctx]``
+        (T_ctx = ``config.grid_depth``; client supplies the full trajectory
+        once and we slice per-iter based on ``dynamic_loop_iter_counts``).
+      * Run ``VisionTransformerPredictorAC(encoder_hidden, actions_k, states_k)``
+        — returns ``[B, N, D]`` predictions at every one of the T_ctx
+        timesteps.
+      * Take the last tubelet group (``predicted[:, -grid² :]`` — shape
+        ``[B, grid², D]``) as the "new" imagined state, matching upstream
+        ``world_model``'s ``next_frame = predictor_output[:, -HW:, :]``
+        interpretation.
+      * Slide the encoder_hidden window: drop oldest ``grid²`` tokens,
+        append the new ``grid²`` tokens.  Fixed shape ``[B, N, D]`` every
+        iter — torch.compile-friendly, no dynamic-shape recompiles.
+
+    ``actions`` / ``states`` (and optionally ``extrinsics``) are returned
+    unchanged as identity loop-back edges so the graph dispatcher can keep
+    routing them on every iter.  Per-iter slicing happens inside the
+    forward based on ``iter_idx`` — the tensors themselves don't change.
+
+    Shares the sibling rollout submodule's batching contract (``B >= 2``
+    + shape + same-iter homogeneity) and ``register_loop_stop`` early-exit
+    semantics.
+    """
+
+    def __init__(
+        self,
+        predictor: VisionTransformerPredictorAC,
+        config: VJepa2Config,
+    ):
+        super().__init__()
+        self.predictor = predictor
+        self.config = config
+
+    # ------------------------------------------------------------------
+    # Rollout geometry
+    # ------------------------------------------------------------------
+
+    @property
+    def _grid_size(self) -> int:
+        return self.config.grid_size
+
+    @property
+    def _grid_depth(self) -> int:
+        """T_ctx — number of tubelet-group timesteps the AC predictor sees
+        per forward.  Derives from the encoder config; at ViT-g @ 256 this
+        is ``64 / 2 = 32``.
+        """
+        return self.config.grid_depth
+
+    def _window_tokens(self) -> int:
+        """Per-iter slide size — one tubelet group = ``grid²`` spatial tokens.
+
+        This matches (a) upstream ``mpc_utils.cem`` which advances 1 frame
+        per iter, and (b) our masked ``VJepa2RolloutPredictorSubmodule``
+        default ``num_output_frames=2 = 1 tubelet``.
+        """
+        return self._grid_size * self._grid_size
+
+    # ------------------------------------------------------------------
+    # NodeSubmodule ABC
+    # ------------------------------------------------------------------
+
+    def can_batch(self, batch: NodeBatch) -> bool:
+        """Same rule as masked rollout: B >= 2, shape-homogeneous across
+        ``encoder_hidden`` / ``actions`` / ``states`` (+ optional
+        ``extrinsics``), and same ``iter_idx`` for every rid.
+
+        B=1 → sequential ``forward`` path (see
+        ``VJepa2EncoderSubmodule.can_batch`` for the AC warm-latency
+        regression that motivates this gate).
+        """
+        if len(batch.request_ids) < 2:
+            return False
+        enc_shapes: set[tuple] = set()
+        act_shapes: set[tuple] = set()
+        st_shapes: set[tuple] = set()
+        ext_shapes: set[tuple | None] = set()
+        iters: set[int] = set()
+        for rid in batch.request_ids:
+            inputs = batch.per_request_input_tensors.get(rid, {})
+            enc_l = inputs.get("encoder_hidden")
+            act_l = inputs.get("actions")
+            st_l = inputs.get("states")
+            if not enc_l or not act_l or not st_l:
+                return False
+
+            def _norm(t: torch.Tensor, target_rank: int) -> tuple | None:
+                if t.dim() == target_rank:
+                    return tuple(t.shape)
+                if t.dim() == target_rank - 1:
+                    return (1, *t.shape)
+                return None
+
+            enc_s = _norm(enc_l[0], 3)
+            act_s = _norm(act_l[0], 3)
+            st_s = _norm(st_l[0], 3)
+            if enc_s is None or act_s is None or st_s is None:
+                return False
+            enc_shapes.add(enc_s)
+            act_shapes.add(act_s)
+            st_shapes.add(st_s)
+            ext_l = inputs.get("extrinsics")
+            ext_shapes.add(_norm(ext_l[0], 3) if ext_l else None)
+            info = batch.per_request_info.get(rid)
+            if info is None:
+                return False
+            iters.add(info.dynamic_loop_iter_counts.get("rollout_loop", 0))
+        return (
+            len(enc_shapes) == 1
+            and len(act_shapes) == 1
+            and len(st_shapes) == 1
+            and len(ext_shapes) == 1
+            and len(iters) == 1
+        )
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        per_request_inputs: list[NameToTensorList],
+        request_ids: list[str],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        cache_manager: BatchedCacheManager | None = None,
+    ) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {
+            "encoder_hidden": _stack_field(per_request_inputs, "encoder_hidden", target_rank=3),
+            "actions": _stack_field(per_request_inputs, "actions", target_rank=3),
+            "states": _stack_field(per_request_inputs, "states", target_rank=3),
+        }
+        if "extrinsics" in per_request_inputs[0]:
+            out["extrinsics"] = _stack_field(per_request_inputs, "extrinsics", target_rank=3)
+        return out
+
+    def _rollout_step(
+        self,
+        encoder_hidden: torch.Tensor,   # [B, N, D]
+        actions: torch.Tensor,           # [B, T_total, action_embed_dim]
+        states: torch.Tensor,            # [B, T_total, action_embed_dim]
+        extrinsics: torch.Tensor | None, # [B, T_total, action_embed_dim - 1] or None
+        iter_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One sliding-window AC rollout step.
+
+        Returns ``(next_encoder_hidden [B, N, D], predicted_new_tg [B, grid², D])``.
+        ``next_encoder_hidden`` is the shifted context for the next iter;
+        ``predicted_new_tg`` is the single new tubelet group to emit to the
+        client.  Math is symmetric across the batch dim so the same function
+        serves both the sequential and batched paths.
+        """
+        b, n_ctxt, _ = encoder_hidden.shape
+        t_ctx = self._grid_depth
+        window = self._window_tokens()  # grid² — one tubelet group worth of tokens
+        t_total = actions.size(1)
+
+        if n_ctxt != t_ctx * window:
+            raise ValueError(
+                f"encoder_hidden has {n_ctxt} tokens; expected "
+                f"T_ctx * grid² = {t_ctx} * {window} = {t_ctx * window}."
+            )
+        # Per-iter slice: iter k consumes actions[:, k : k + T_ctx].
+        end = iter_idx + t_ctx
+        if end > t_total:
+            raise ValueError(
+                f"actions/states trajectory too short for iter {iter_idx}: "
+                f"need at least {end} timesteps (iter_idx + T_ctx={t_ctx}), "
+                f"got {t_total}.  Client must send T_total >= T_ctx + H - 1 "
+                "when requesting AC rollout with horizon H."
+            )
+        actions_h = actions[:, iter_idx:end].contiguous()
+        states_h = states[:, iter_idx:end].contiguous()
+        extrinsics_h = extrinsics[:, iter_idx:end].contiguous() if extrinsics is not None else None
+
+        predicted = self.predictor(
+            encoder_hidden,
+            actions_h,
+            states_h,
+            extrinsics=extrinsics_h,
+        )  # [B, N, D]
+
+        if predicted.shape[:2] != (b, n_ctxt):
+            raise RuntimeError(
+                f"AC predictor emitted unexpected shape {tuple(predicted.shape)}; "
+                f"expected [{b}, {n_ctxt}, D]."
+            )
+
+        new_tg = predicted[:, -window:, :]
+        next_encoder_hidden = torch.cat([encoder_hidden[:, window:, :], new_tg], dim=1)
+        return next_encoder_hidden, new_tg
+
+    def forward(
+        self,
+        request_info: CurrentForwardPassInfo,
+        encoder_hidden: torch.Tensor,
+        actions: torch.Tensor,
+        states: torch.Tensor,
+        extrinsics: torch.Tensor | None = None,
+        **kwargs,
+    ) -> NameToTensorList:
+        if encoder_hidden.dim() == 2:
+            encoder_hidden = encoder_hidden.unsqueeze(0)
+        if actions.dim() == 2:
+            actions = actions.unsqueeze(0)
+        if states.dim() == 2:
+            states = states.unsqueeze(0)
+        if extrinsics is not None and extrinsics.dim() == 2:
+            extrinsics = extrinsics.unsqueeze(0)
+
+        iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
+        logger.info(
+            "VJepa2ACRolloutPredictorSubmodule.forward: iter=%d encoder_hidden=%s actions=%s states=%s",
+            iter_idx,
+            tuple(encoder_hidden.shape),
+            tuple(actions.shape),
+            tuple(states.shape),
+        )
+
+        next_encoder_hidden, new_tg = self._rollout_step(
+            encoder_hidden, actions, states, extrinsics, iter_idx,
+        )
+
+        # Per-request early-exit — same contract as masked rollout.
+        rollout_horizon = int(request_info.step_metadata.get("rollout_horizon", 0) or 0)
+        if rollout_horizon > 0 and iter_idx + 1 >= rollout_horizon:
+            logger.info(
+                "VJepa2ACRolloutPredictorSubmodule.forward: horizon H=%d reached at iter=%d; stopping rollout_loop.",
+                rollout_horizon,
+                iter_idx,
+            )
+            request_info.register_loop_stop("rollout_loop")
+
+        logger.info(
+            "VJepa2ACRolloutPredictorSubmodule.forward: next_encoder_hidden=%s new_tg=%s",
+            tuple(next_encoder_hidden.shape),
+            tuple(new_tg.shape),
+        )
+        out: NameToTensorList = {
+            "encoder_hidden": [next_encoder_hidden],
+            "predicted_hidden": [new_tg],
+            # Identity loop-back: actions/states don't change across iters
+            # (client sent the full trajectory upfront), but they still need
+            # to be routed on every iter so the graph dispatcher finds them.
+            "actions": [actions],
+            "states": [states],
+        }
+        if extrinsics is not None:
+            out["extrinsics"] = [extrinsics]
+        return out
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        packed_inputs: dict[str, torch.Tensor],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> dict[str, NameToTensorList]:
+        encoder_hidden = packed_inputs["encoder_hidden"]  # [B, N, D]
+        actions = packed_inputs["actions"]                 # [B, T_total, action_embed_dim]
+        states = packed_inputs["states"]                   # [B, T_total, action_embed_dim]
+        extrinsics = packed_inputs.get("extrinsics")
+        if encoder_hidden.size(0) != len(request_ids):
+            raise ValueError(
+                f"encoder_hidden batch dim {encoder_hidden.size(0)} does not "
+                f"match request count {len(request_ids)}."
+            )
+        # can_batch guarantees all rids are at the same iter; read any one.
+        iter_idx = per_request_info[request_ids[0]].dynamic_loop_iter_counts.get("rollout_loop", 0)
+
+        logger.info(
+            "VJepa2ACRolloutPredictorSubmodule.forward_batched: iter=%d enc=%s act=%s rids=%d",
+            iter_idx,
+            tuple(encoder_hidden.shape),
+            tuple(actions.shape),
+            len(request_ids),
+        )
+
+        next_encoder_hidden, new_tg = self._rollout_step(
+            encoder_hidden, actions, states, extrinsics, iter_idx,
+        )
+
+        # Per-rid early-exit (individual rids can drop out while others
+        # continue; the scheduler re-batches remaining rids on the next iter).
+        for rid in request_ids:
+            info = per_request_info[rid]
+            horizon = int(info.step_metadata.get("rollout_horizon", 0) or 0)
+            if horizon > 0 and iter_idx + 1 >= horizon:
+                info.register_loop_stop("rollout_loop")
+
+        per_rid: dict[str, NameToTensorList] = {}
+        for i, rid in enumerate(request_ids):
+            out_i: NameToTensorList = {
+                "encoder_hidden": [next_encoder_hidden[i : i + 1]],
+                "predicted_hidden": [new_tg[i : i + 1]],
+                "actions": [actions[i : i + 1]],
+                "states": [states[i : i + 1]],
+            }
+            if extrinsics is not None:
+                out_i["extrinsics"] = [extrinsics[i : i + 1]]
+            per_rid[rid] = out_i
+        return per_rid
+
+
 # ---------------------------------------------------------------------------
 # P3.B — MPC submodules (intra-request K-way candidate evaluation)
 #
