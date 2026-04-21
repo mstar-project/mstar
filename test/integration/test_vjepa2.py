@@ -280,5 +280,11 @@ def test_registry_has_both_variants():
 
     assert "vjepa2" in MODEL_REGISTRY
     assert "vjepa2_ac" in MODEL_REGISTRY
+    # Masked variants resolve through HuggingFace — owner prefix present.
     assert HF_MODELS["vjepa2"]["model_path_hf"].startswith("facebook/vjepa2-")
-    assert HF_MODELS["vjepa2_ac"]["model_path_hf"].startswith("facebook/vjepa2-ac-")
+    # AC loads from the public S3 mirror (dl.fbaipublicfiles.com) rather
+    # than HF; registry.py keeps the ``model_path_hf`` entry as a bare
+    # backbone identifier (``vjepa2-ac-vitg``), so assert on the
+    # ``vjepa2-ac-`` substring instead of the (nonexistent) ``facebook/``
+    # prefix.  See registry.py's comment above the entry.
+    assert "vjepa2-ac-" in HF_MODELS["vjepa2_ac"]["model_path_hf"]
