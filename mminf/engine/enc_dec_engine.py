@@ -42,39 +42,48 @@ class EncoderDecoderEngine(BaseEngine):
         self.device = device
 
     def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
-        """Stack same-shaped inputs and run a single forward pass."""
-        request_ids = batch.request_ids
+        """Batched execution path for shape-homogeneous ENC_DEC submodules.
 
-        # Preprocess all requests
-        all_preprocessed = submodule.preprocess(
-            batch.graph_walk,
-            per_request_inputs=batch.per_request_input_tensors,
-            request_ids=batch.request_ids,
+        Contract:
+          * ``submodule.preprocess`` receives ``per_request_inputs`` as a
+            ``list[NameToTensorList]`` ordered by ``batch.request_ids`` and
+            returns a single packed dict (tensors stacked along dim 0).
+          * ``submodule.forward_batched(graph_walk, request_ids,
+            packed_inputs, per_request_info)`` runs the stacked forward
+            and returns ``dict[rid -> NameToTensorList]`` directly (each
+            per-rid slot typically slices the batch dim to ``[1, ...]`` so
+            downstream submodules see consistent shapes vs the sequential
+            path).
+
+        Mirrors the audio_codec / AR batched conventions so submodules can
+        share a pattern across engine types.
+        """
+        request_ids = batch.request_ids
+        per_request_inputs = [
+            batch.per_request_input_tensors[rid] for rid in request_ids
+        ]
+
+        packed = submodule.preprocess(
+            graph_walk=batch.graph_walk,
+            per_request_inputs=per_request_inputs,
+            request_ids=request_ids,
             per_request_info=batch.per_request_info,
         )
 
-        # Single forward pass
-        result = submodule(**all_preprocessed)
+        if not hasattr(submodule, 'forward_batched'):
+            raise RuntimeError(
+                f"{type(submodule).__name__}.can_batch returned True but "
+                "the submodule does not implement forward_batched. Either "
+                "add forward_batched or return False from can_batch."
+            )
 
-        # Split outputs back per-request
-        outputs = {}
-        if isinstance(result, dict):
-            for rid_idx, rid in enumerate(request_ids):
-                per_req = {}
-                for name, tensor_list in result.items():
-                    if isinstance(tensor_list, list):
-                        per_req[name] = [t[rid_idx] for t in tensor_list]
-                    elif isinstance(tensor_list, torch.Tensor):
-                        per_req[name] = [tensor_list[rid_idx]]
-                    else:
-                        per_req[name] = tensor_list
-                outputs[rid] = per_req
-        else:
-            # Fallback: return same output for all
-            for rid in request_ids:
-                outputs[rid] = result if isinstance(result, dict) else {}
-
-        return NodeOutput(per_request_output_tensors=outputs)
+        per_rid_outputs = submodule.forward_batched(
+            graph_walk=batch.graph_walk,
+            request_ids=request_ids,
+            packed_inputs=packed,
+            per_request_info=batch.per_request_info,
+        )
+        return NodeOutput(per_request_output_tensors=per_rid_outputs)
 
     def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
         """Original per-request execution."""
@@ -148,7 +157,13 @@ class EncoderDecoderEngine(BaseEngine):
                         submodule.forward,
                         fullgraph=False,
                     )
-                    logger.info("EncDecEngine: torch.compile applied to %s", node_name)
+                    logger.info("EncDecEngine: torch.compile applied to %s.forward", node_name)
+                if hasattr(submodule, 'forward_batched'):
+                    submodule.forward_batched = torch.compile(
+                        submodule.forward_batched,
+                        fullgraph=False,
+                    )
+                    logger.info("EncDecEngine: torch.compile applied to %s.forward_batched", node_name)
             except Exception:
                 logger.warning("EncDecEngine: torch.compile failed for %s, using eager mode",
                                node_name, exc_info=True)
