@@ -17,6 +17,7 @@ from benchmark.request import (
     OurSystem,
     RequestInput,
     RequestMetrics,
+    SGLangOmni,
     VLLMOmni,
     VoxServe,
     aggregate_metrics,
@@ -35,6 +36,7 @@ class InferenceSystemType(Enum):
     OURS = "ours"
     VLLM_OMNI = "vllm_omni"
     VOX_SERVE = "vox_serve"
+    SGLANG_OMNI = "sglang_omni"
 
     # def instantiate(self) -> InferenceSystem:
     def instantiate(self, base_url: str = "") -> InferenceSystem:
@@ -44,6 +46,8 @@ class InferenceSystemType(Enum):
             return VLLMOmni(base_url=base_url)
         elif self == InferenceSystemType.VOX_SERVE:
             return VoxServe()
+        elif self == InferenceSystemType.SGLANG_OMNI:
+            return SGLangOmni()
 
 
 class ProfilingType(Enum):

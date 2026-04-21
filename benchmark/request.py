@@ -797,4 +797,107 @@ class VLLMOmni(InferenceSystem):
 
         content.append({"type": "text", "text": prompt})
         return {"role": "user", "content": content}
-    
+
+
+# ---------------------------------------------------------------------------
+# SGLangOmni — async aiohttp-based adapter for the SGLang-Omni server
+# ---------------------------------------------------------------------------
+
+class SGLangOmni(InferenceSystem):
+    """
+    Benchmark adapter for the SGLang-Omni OpenAI-compatible server.
+
+    Uses aiohttp directly (async, reuses the shared session) against the
+    /v1/chat/completions SSE streaming endpoint.
+    """
+
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        req_type = req_input.req_type
+        output_mod = req_type.get_output_modalities()
+        input_mod = req_type.get_input_modalities()
+
+        metrics = RequestMetrics(
+            request_id=request_id,
+            type=req_type,
+            expected_output_modalities=[output_mod],
+        )
+
+        try:
+            files = req_input.get_all_filepaths()
+            media_path = files.get(input_mod) if input_mod != "text" else None
+            user_message = VLLMOmni._build_user_message(req_input.prompt, input_mod, media_path)
+
+            modalities_arg = [output_mod] if output_mod != "text" else None
+            payload: dict = {
+                "model": model.get_hf_url(),
+                "messages": [_SYSTEM_MESSAGE, user_message],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                **model.get_model_kwargs(req_type),
+                **additional_model_kwargs,
+            }
+            if modalities_arg is not None:
+                payload["modalities"] = modalities_arg
+
+            async with session.post(
+                f"{base_url}/v1/chat/completions",
+                json=payload,
+                read_bufsize=2**24,
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
+            ) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+
+                async for raw_line in resp.content:
+                    line = raw_line.strip()
+                    if not line or not line.startswith(b"data:"):
+                        continue
+                    payload_str = line[len(b"data:"):].strip()
+                    if payload_str == b"[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(payload_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    arrival_time = time.monotonic()
+
+                    # Final usage chunk
+                    if chunk.get("usage"):
+                        metrics.output_tokens = chunk["usage"].get("completion_tokens", 0)
+                        continue
+
+                    modality = chunk.get("modality")
+                    for choice in chunk.get("choices", []):
+                        delta = choice.get("delta") or {}
+                        content = delta.get("content")
+                        if not content:
+                            continue
+
+                        if modality == "audio":
+                            data_b64 = content
+                        else:
+                            data_b64 = base64.b64encode(content.encode()).decode()
+
+                        metrics.record_output_chunk(
+                            modality=modality or "text",
+                            data_b64=data_b64,
+                            arrival_time=arrival_time,
+                            n_tokens=1,
+                        )
+
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+
+        return metrics
+
