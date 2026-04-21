@@ -52,30 +52,27 @@ if [ ! -f "${VIDEO}" ]; then
     exit 1
 fi
 
-# Build model_kwargs: K candidates of (actions, states) + synthetic goal.
-# For ViT-g AC: hidden_size=1408, num_patches = grid_depth * grid_size^2 =
-# (64/2) * (256/16)^2 = 32 * 256 = 8192.
+# Build model_kwargs: K candidates of (actions, states) + scalar goal_hidden_fill.
 #
-# We write kwargs to a temp file (not a shell variable) because
-# goal_hidden alone is ~100 MB of JSON (11.5M floats × ~9 chars each)
-# which blows past the shell's ARG_MAX.  curl's ``-F "field=<file"``
-# form loads the value from a file as form-field text, sidestepping the
-# shell-argument-length limit entirely.
-KWARGS_FILE=$(mktemp /tmp/vjepa2_mpc_kwargs.XXXXXX.json)
-TMPFILE=$(mktemp /tmp/vjepa2_mpc_response.XXXXXX)
-trap "rm -f ${KWARGS_FILE} ${TMPFILE}" EXIT
-
-python3 - "${KWARGS_FILE}" <<PY
+# We use the server-side ``goal_hidden_fill`` convenience (server expands
+# a scalar to the full [1, N, D] tensor) because the full goal_hidden at
+# ViT-g is ~46 MB raw / ~100 MB as JSON list-of-lists, which blows past
+# Starlette's default ``max_part_size`` of 1 MB per form field — requests
+# carrying it return 400 before even reaching the FastAPI handler.
+#
+# The ``goal_hidden_fill`` path serializes to <20 bytes and still exercises
+# the full MPC graph (encoder -> ac_predictor_mpc -> mpc_scorer) end-to-end,
+# so it's a viable smoke test.  Real production MPC clients that need a
+# meaningful goal latent should either (a) bump Starlette's max_part_size
+# in the server config, or (b) use a separate binary-upload field once
+# that plumbing lands.
+MODEL_KWARGS=$(python3 - <<PY
 import json
-import sys
 
 K = ${K}
 T_ACTION = 32  # num_frames (64) // tubelet_size (2)
 DOF = 7
-HIDDEN = 1408
-TOKENS = 8192  # 32 * 16 * 16 for ViT-g AC at 256 crop / 16 patch
 
-# K distinct action/state ramps so the scorer has meaningful variation.
 def ramp(lo, hi, T):
     step = (hi - lo) / max(T - 1, 1)
     return [[lo + i * step] * DOF for i in range(T)]
@@ -83,34 +80,29 @@ def ramp(lo, hi, T):
 actions = [ramp(-0.5 + 0.1 * k, 0.5 + 0.1 * k, T_ACTION) for k in range(K)]
 states  = [ramp( 0.1 + 0.1 * k, 0.9 + 0.1 * k, T_ACTION) for k in range(K)]
 
-# Synthetic goal latent.  ``0.001 * d`` per feature dim — varies across D
-# so the scorer's L1 vs each candidate is non-degenerate.  Size: 1 × 8192
-# × 1408 floats ≈ 100 MB once JSON-serialized; hence the temp-file route.
-goal_hidden = [
-    [[0.001 * d for d in range(HIDDEN)] for _ in range(TOKENS)]
-]
-
-with open(sys.argv[1], "w") as f:
-    json.dump({
-        "mpc": True,
-        "actions": actions,
-        "states":  states,
-        "goal_hidden": goal_hidden,
-    }, f)
+print(json.dumps({
+    "mpc": True,
+    "actions": actions,
+    "states":  states,
+    # Scalar — server broadcasts to torch.full((1, N, D), fill) in process_prompt.
+    "goal_hidden_fill": 0.05,
+}))
 PY
+)
 
-KWARGS_SIZE=$(stat -c%s "${KWARGS_FILE}" 2>/dev/null || stat -f%z "${KWARGS_FILE}")
+TMPFILE=$(mktemp /tmp/vjepa2_mpc_response.XXXXXX)
+trap "rm -f ${TMPFILE}" EXIT
 
 echo "[vjepa2-mpc] POST ${URL}"
-echo "  video:        ${VIDEO}"
-echo "  K:            ${K}"
-echo "  kwargs_file:  ${KWARGS_FILE}  (${KWARGS_SIZE} bytes)"
+echo "  video:  ${VIDEO}"
+echo "  K:      ${K}"
+echo "  kwargs: ${MODEL_KWARGS}"
 
 curl -sS --fail-with-body -X POST "${URL}" \
     -F "files=@${VIDEO}" \
     -F 'input_modalities=video' \
     -F 'output_modalities=scalar,tensor,video' \
-    -F "model_kwargs=<${KWARGS_FILE}" \
+    -F "model_kwargs=${MODEL_KWARGS}" \
     -o "${TMPFILE}"
 
 python3 - <<PY
