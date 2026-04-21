@@ -2,9 +2,9 @@ model: "vjepa2_ac"
 max_seq_len: 16384
 
 # Uses facebook/vjepa2-ac-vitg (from HF_MODELS["vjepa2_ac"] in
-# mminf/model/registry.py).  NOTE: AC checkpoint loading is deferred — for
-# now VJepa2ACModel instantiates with weights materialized but not filled;
-# populate them manually or pass skip_weight_loading=True and load yourself.
+# mminf/model/registry.py).  AC weights loaded from the public S3 mirror
+# at https://dl.fbaipublicfiles.com/vjepa2/vjepa2-ac-vitg.pt via
+# download_vjepa2_ac_upstream_pt on first get_submodule() call.
 
 node_groups:
   - node_names:
@@ -12,7 +12,14 @@ node_groups:
     ranks:
       - 0
 
+  # Single-shot AC (prefill_video walk) + K-way MPC (prefill_video_mpc walk
+  # — Phase 3.B) share the same underlying VisionTransformerPredictorAC
+  # nn.Module, so colocate both node names on the same rank.  mpc_scorer
+  # is cheap (L1 over [K, N*D]) and runs on the same rank to avoid an
+  # extra cross-rank tensor hop.
   - node_names:
       - predictor
+      - ac_predictor_mpc
+      - mpc_scorer
     ranks:
       - 0
