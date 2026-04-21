@@ -476,6 +476,7 @@ class TensorCommunicationManager(ABC):
                         request_id=request_id,
                         successful_tensors=tensors,
                         failed_tensor_ids=[],
+                        sender_entity_id=self.my_entity_id,
                     ),
                 ),
             )
@@ -996,7 +997,8 @@ def _unpack_tensors_from_slot(
 @dataclass
 class SlotDescriptor:
     """Tracks one in-flight staging slot."""
-    slot_idx: int          # producer rank == slot index
+    slot_idx: int          # global slot index in the symmetric heap
+    producer_rank: int
     consumer_rank: int
     sig_val: int
     nbytes: int            # actual payload bytes used in this transfer
@@ -1006,9 +1008,23 @@ class NVSHMEMStagingPool:
     """
     Manages the symmetric staging buffer and signal pad.
 
-    Layout: stage_buf[slot_idx * max_slot_bytes : (slot_idx+1) * max_slot_bytes]
-    Slot assignment: slot_idx == producer_rank (each rank owns one slot).
-    Concurrency: one in-flight transfer per (producer, consumer) direction.
+    Layout: ``world_size * num_slots_per_producer`` slots in the symmetric
+    heap, each ``max_slot_bytes`` wide. Slot indices are encoded as::
+
+        slot_idx    = producer_rank * num_slots_per_producer + slot_offset
+        byte_offset = slot_idx * max_slot_bytes
+        sig_pad     = sig_pad[slot_idx * 2 : slot_idx * 2 + 1]   # stride-2
+
+    Stride-2 sig pad indexing satisfies the 8-byte alignment requirement of
+    cuStreamWriteValue64 (used internally by nvshmem_put_with_signal).
+
+    Concurrency: each producer rank can have up to ``num_slots_per_producer``
+    in-flight transfers simultaneously. Slots in flight are tracked by
+    ``slot_idx`` in ``_in_use``. The producer maintains a per-producer free
+    pool of slot offsets in ``_free_slots[producer_rank]``.
+
+    A single slot is held until the consumer sends back a ``TENSOR_RECEIVED``
+    ACK over ZMQ; the manager then calls ``free_slot(slot_idx)``.
     """
 
     def __init__(
@@ -1018,50 +1034,67 @@ class NVSHMEMStagingPool:
         device: torch.device,
         group_name: str,
         max_slot_bytes: int,
+        num_slots_per_producer: int = 8,
     ) -> None:
+        if num_slots_per_producer < 1:
+            raise ValueError(
+                f"num_slots_per_producer must be >= 1, got {num_slots_per_producer}"
+            )
         self.rank = rank
         self.world_size = world_size
         self.max_slot_bytes = max_slot_bytes
+        self.num_slots_per_producer = num_slots_per_producer
         self.device = device
 
-        total_bytes = world_size * max_slot_bytes
+        total_slots = world_size * num_slots_per_producer
+        total_bytes = total_slots * max_slot_bytes
         self.stage_buf: torch.Tensor = symm_mem.empty(
             total_bytes, dtype=torch.uint8, device=device
         )
         self.hdl = symm_mem.rendezvous(self.stage_buf, group=group_name)
         raw_pad = self.hdl.get_signal_pad(rank)
-        # cuStreamWriteValue64 (used by nvshmem_put_with_signal) requires the
-        # signal address to be 8-byte aligned. get_signal_pad returns a
-        # torch.uint32 tensor (element_size=4), so indexing at rank*1 gives a
-        # 4-byte offset for rank>=1, which is misaligned and crashes with
-        # cudaErrorMisalignedAddress. Using a stride of 2 uint32 elements (8
-        # bytes) per producer rank ensures every signal element is 8-byte
-        # aligned regardless of rank.
-        _needed = world_size * 2  # 2 uint32 slots per rank for 8-byte alignment
+        # Stride-2 (2 uint32 per slot = 8 bytes) for cuStreamWriteValue64
+        # alignment. One sig pad element per slot, indexed by the slot's
+        # global slot_idx.
+        _needed = total_slots * 2
         if raw_pad.numel() < _needed:
             raise RuntimeError(
                 f"sig_pad.numel()={raw_pad.numel()} < {_needed} "
-                f"(world_size={world_size} * stride=2); "
-                "cannot assign 8-byte-aligned signal elements per producer rank. "
-                "Increase NVSHMEM_SYMMETRIC_SIZE or reduce world_size."
+                f"(total_slots={total_slots} * stride=2); "
+                "cannot assign 8-byte-aligned signal elements per slot. "
+                "Increase NVSHMEM_SYMMETRIC_SIZE or reduce slot count."
             )
         self.sig_pad: torch.Tensor = raw_pad
 
-        # Per-direction state: indexed by producer_rank.
-        # Phase 1: at most one in-flight per producer_rank regardless of consumer.
-        self._in_use: dict[int, SlotDescriptor] = {}  # producer_rank → active slot
-        self._sig_counters: list[int] = [1] * world_size  # next signal value per slot
+        # Per-producer free pool of slot offsets [0, num_slots_per_producer).
+        self._free_slots: dict[int, list[int]] = {
+            r: list(range(num_slots_per_producer)) for r in range(world_size)
+        }
+        # Globally indexed by slot_idx → SlotDescriptor.
+        self._in_use: dict[int, SlotDescriptor] = {}
+        # Per-slot signal value counter (monotonic; non-zero so consumer
+        # never confuses 'sig set' with 'sig zeroed').
+        self._sig_counters: list[int] = [1] * total_slots
 
+    def _global_slot_idx(self, producer_rank: int, slot_offset: int) -> int:
+        return producer_rank * self.num_slots_per_producer + slot_offset
+
+    def has_free_slot(self, producer_rank: int) -> bool:
+        return len(self._free_slots[producer_rank]) > 0
+
+    # Backward-compat shim retained so callers / tests that ask "is this
+    # producer's slot pool empty?" still work. Returns False once any slot
+    # is in flight.
     def is_slot_free(self, producer_rank: int) -> bool:
-        return producer_rank not in self._in_use
+        return self.has_free_slot(producer_rank)
 
     def alloc_slot(
         self, producer_rank: int, consumer_rank: int, nbytes: int
     ) -> SlotDescriptor:
         """
-        Allocate slot for producer → consumer transfer.
-        Caller MUST verify is_slot_free(producer_rank) before calling.
-        Raises if nbytes > max_slot_bytes.
+        Allocate the next free slot for producer → consumer transfer.
+        Caller MUST verify ``has_free_slot(producer_rank)`` before calling.
+        Raises if nbytes > max_slot_bytes or no free slot is available.
         """
         if nbytes > self.max_slot_bytes:
             raise ValueError(
@@ -1069,35 +1102,51 @@ class NVSHMEMStagingPool:
                 f"{self.max_slot_bytes} B. Increase NVSHMEMCommunicationManager "
                 "max_slot_bytes at construction time."
             )
-        sig_val = self._sig_counters[producer_rank]
-        self._sig_counters[producer_rank] += 1
+        if not self._free_slots[producer_rank]:
+            raise RuntimeError(
+                f"No free slot for producer_rank={producer_rank}; all "
+                f"{self.num_slots_per_producer} slots in flight. Caller must "
+                "wait for an ACK or increase num_slots_per_producer."
+            )
+        slot_offset = self._free_slots[producer_rank].pop(0)
+        slot_idx = self._global_slot_idx(producer_rank, slot_offset)
+        sig_val = self._sig_counters[slot_idx]
+        self._sig_counters[slot_idx] += 1
         desc = SlotDescriptor(
-            slot_idx=producer_rank,
+            slot_idx=slot_idx,
+            producer_rank=producer_rank,
             consumer_rank=consumer_rank,
             sig_val=sig_val,
             nbytes=nbytes,
         )
-        self._in_use[producer_rank] = desc
+        self._in_use[slot_idx] = desc
         return desc
 
-    def free_slot(self, producer_rank: int) -> None:
-        """Called when TENSOR_RECEIVED ACK arrives from consumer."""
-        self._in_use.pop(producer_rank, None)
+    def free_slot(self, slot_idx: int) -> None:
+        """Return a slot to its producer's free pool. Idempotent."""
+        desc = self._in_use.pop(slot_idx, None)
+        if desc is None:
+            return
+        slot_offset = slot_idx % self.num_slots_per_producer
+        producer_rank = slot_idx // self.num_slots_per_producer
+        free_list = self._free_slots[producer_rank]
+        if slot_offset not in free_list:
+            free_list.append(slot_offset)
 
     def get_slot_view(self, slot_idx: int, nbytes: int) -> torch.Tensor:
         """Byte-view into the staging slot for the given slot_idx."""
         start = slot_idx * self.max_slot_bytes
         return self.stage_buf[start : start + nbytes]
 
-    def get_sig_pad_element(self, peer_rank: int) -> torch.Tensor:
-        """Single-element view into sig_pad for a given peer rank.
+    def get_sig_pad_element(self, slot_idx: int) -> torch.Tensor:
+        """Single-element view into sig_pad for a given slot_idx.
 
-        Uses a stride-2 layout (2 uint32 slots per rank) so that each
-        producer's signal element is 8-byte aligned, satisfying the
+        Uses a stride-2 layout (2 uint32 slots per slot) so that each
+        signal element is 8-byte aligned, satisfying the
         cuStreamWriteValue64 alignment requirement used internally by
         nvshmem_put_with_signal.
         """
-        idx = peer_rank * 2
+        idx = slot_idx * 2
         return self.sig_pad[idx : idx + 1]
 
 
@@ -1279,17 +1328,24 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
         communicator: BaseCommunicator,
         group: "dist.ProcessGroup",
         entity_id_to_rank: dict[str, int],
-        max_slot_bytes: int = 128 * 1024 * 1024,  # 128 MB
+        max_slot_bytes: int = 32 * 1024 * 1024,  # 32 MB
+        num_slots_per_producer: int = 8,
     ) -> None:
         """
-        my_entity_id:      this worker's entity ID (e.g. "worker_0")
-        rank:              NVSHMEM / torch.distributed rank
-        world_size:        total ranks
-        device:            this rank's CUDA device
-        communicator:      ZMQ communicator (for ACK messages)
-        group:             pre-initialized dist.ProcessGroup (NCCL bootstrap)
-        entity_id_to_rank: maps entity IDs → NVSHMEM PE ranks
-        max_slot_bytes:    maximum bytes per staging slot
+        my_entity_id:           this worker's entity ID (e.g. "worker_0")
+        rank:                   NVSHMEM / torch.distributed rank
+        world_size:             total ranks
+        device:                 this rank's CUDA device
+        communicator:           ZMQ communicator (for ACK messages)
+        group:                  pre-initialized dist.ProcessGroup (NCCL bootstrap)
+        entity_id_to_rank:      maps entity IDs → NVSHMEM PE ranks
+        max_slot_bytes:         maximum bytes per staging slot
+        num_slots_per_producer: number of concurrent in-flight slots per
+                                producer rank in the eager staging pool.
+                                Must be >= the maximum number of cross-rank
+                                NVSHMEM-bound output edges from any single
+                                node in one batch. Default 8 covers BAGEL
+                                CFG-parallel (4 cross-rank edges).
         """
         # Satisfy main's TensorCommunicationManager invariant: base __init__
         # sets transfer_engine / my_session_id / tensor_store / pending. The
@@ -1320,6 +1376,7 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
             device=device,
             group_name=group.group_name,
             max_slot_bytes=max_slot_bytes,
+            num_slots_per_producer=num_slots_per_producer,
         )
 
         # Dedicated CUDA stream for all NVSHMEM operations.
@@ -1332,6 +1389,16 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
         # __init__ initialized it to list[FutureAndPointers]; NVSHMEM's eager
         # path tracks list[_NVSHMEMPendingTransfer] instead.
         self.pending: list[_NVSHMEMPendingTransfer] = []
+
+        # Map (uuid, consumer_rank) -> slot_idx, populated when an outgoing
+        # PUT is registered. Cleared in _free_slot_for_ack when the
+        # consumer's TENSOR_RECEIVED ACK arrives. Lets the manager free the
+        # right slot when the same UUID has been broadcast to multiple
+        # consumers (each PUT lives in its own slot).
+        self._uuid_consumer_to_slot: dict[tuple[str, int], int] = {}
+        # Map slot_idx -> set of UUIDs still awaiting ACK from the slot's
+        # consumer. The slot is freed when the set empties.
+        self._slot_uuids: dict[int, set[str]] = {}
 
         # Captured worker-to-worker transport state; populated by
         # init_edges() / warmup(). _captured is None until init_edges() is
@@ -1357,17 +1424,15 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
         any lazy NVSHMEM initialization before the first real transfer.
         Called once during __init__.
 
-        Protocol (mirrors §2.3): rank 0 is producer, rank 1 is consumer.
-        - Producer (rank 0): signals into *consumer's* sig_pad[producer_rank=0].
-          The local sig_elem passed to put_with_signal is the producer's own
-          sig_pad[0:1]; NVSHMEM writes it at the same symmetric offset on peer.
-        - Consumer (rank >0): must wait on its local sig_pad[producer_rank=0],
-          i.e. get_sig_pad_element(producer_rank=0), not get_sig_pad_element(self.rank).
+        Uses producer_rank=0's first slot (slot_idx=0) as a known-uniform
+        symmetric address across ranks. Both ranks must agree on slot_idx
+        because get_slot_view / get_sig_pad_element index into the local
+        symmetric heap at the same offset.
         """
         producer_rank = 0
-        warmup_tensor = self.staging.get_slot_view(producer_rank, 4)
-        # Both producer and consumer reference the same symmetric offset: sig_pad[0].
-        sig_elem = self.staging.get_sig_pad_element(producer_rank)
+        warmup_slot_idx = self.staging._global_slot_idx(producer_rank, 0)
+        warmup_tensor = self.staging.get_slot_view(warmup_slot_idx, 4)
+        sig_elem = self.staging.get_sig_pad_element(warmup_slot_idx)
         peer = (producer_rank + 1) % self.world_size
 
         with torch.cuda.stream(self.transfer_stream):
@@ -1376,7 +1441,7 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
                     warmup_tensor, sig_elem, 0, peer
                 )
             elif self.rank == peer:
-                # Wait on sig_pad[producer_rank] — the element the producer wrote.
+                # Wait on the same sig_pad slot the producer wrote.
                 torch.ops.symm_mem.nvshmem_wait_for_signal(
                     sig_elem, 0, producer_rank
                 )
@@ -1384,6 +1449,33 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
         dist.barrier(group=dist.group.WORLD)
         sig_elem.zero_()
         self.transfer_stream.synchronize()
+
+    def _free_slot_for_ack(self, sender_entity_id: str, uuid: str) -> None:
+        """Free the slot that held an outgoing PUT to ``sender_entity_id``
+        for ``uuid`` — and only that slot.
+
+        Mooncake-routed UUIDs that get accidentally drained here (or ACKs
+        for UUIDs we never tracked) silently no-op. The same UUID can be
+        broadcast to multiple consumers, each in its own slot, so the
+        (uuid, consumer_rank) key is required to free the right one.
+        """
+        if not sender_entity_id:
+            # Older callers / Mooncake ACKs without sender info: nothing
+            # to free on the NVSHMEM side. Refcount is still decremented
+            # by the caller.
+            return
+        consumer_rank = self.entity_id_to_rank.get(sender_entity_id)
+        if consumer_rank is None:
+            return
+        slot_idx = self._uuid_consumer_to_slot.pop((uuid, consumer_rank), None)
+        if slot_idx is None:
+            return
+        uuids_in_slot = self._slot_uuids.get(slot_idx)
+        if uuids_in_slot is not None:
+            uuids_in_slot.discard(uuid)
+            if not uuids_in_slot:
+                self.staging.free_slot(slot_idx)
+                self._slot_uuids.pop(slot_idx, None)
 
     def _drain_acks(self) -> None:
         """Process any incoming ZMQ messages to pick up TENSOR_RECEIVED ACKs."""
@@ -1393,25 +1485,27 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
                 and msg.message_type == WorkerMessageType.TENSOR_RECEIVED
             ):
                 body = msg.body
+                sender = getattr(body, "sender_entity_id", "")
                 for uuid in body.successful_tensors:
-                    # Free the slot associated with this producer (self.rank)
-                    # when the consumer sends back an ACK for our outgoing transfer.
-                    self.staging.free_slot(self.rank)
+                    self._free_slot_for_ack(sender, uuid)
                     self.tensor_store.dereference(body.request_id, uuid, n=1)
 
-    def _wait_for_slot(self, producer_rank: int, timeout_s: float = 5.0) -> None:
+    def _wait_for_slot(self, producer_rank: int, timeout_s: float = 30.0) -> None:
         """
-        Block (CPU spin) until the outgoing staging slot is free.
-        In normal operation this returns immediately. If it blocks for
-        more than timeout_s, it raises RuntimeError (likely a hung consumer).
+        Block (CPU spin) until the producer has at least one free staging
+        slot in its window of the symmetric heap. In normal operation this
+        returns immediately because the pool is sized for the workload.
+        Raises RuntimeError after ``timeout_s`` (likely a hung consumer or
+        an undersized pool).
         """
         deadline = _time.monotonic() + timeout_s
-        while not self.staging.is_slot_free(producer_rank):
+        while not self.staging.has_free_slot(producer_rank):
             self._drain_acks()
             if _time.monotonic() > deadline:
                 raise RuntimeError(
-                    f"NVSHMEM staging slot {producer_rank} still in use after "
-                    f"{timeout_s}s. Consumer may be hung."
+                    f"NVSHMEM staging slots for producer={producer_rank} all "
+                    f"in flight after {timeout_s}s. A consumer may be hung, "
+                    "or num_slots_per_producer is too small for this workload."
                 )
             _time.sleep(0.001)
 
@@ -1484,14 +1578,19 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
                     self.tensor_store.get_tensor(request_id, info.uuid)
                     for info in info_list
                 ]
-                # Block if the outgoing slot is already in use.
+                packed_nbytes = _compute_packed_size(tensors_for_edge)
+
+                # Block until the producer's staging window has at least
+                # one free slot. With multiple slots per producer the loop
+                # can issue back-to-back PUTs to different consumers
+                # without waiting for ACKs in between, which is what
+                # unblocks fan-out batches like combine_cfg → {LLM_cfg_text,
+                # LLM_cfg_img}.
                 self._wait_for_slot(self.rank)
 
-                # Pack tensors, copy to staging slot, issue PUT + signal.
-                packed_nbytes = _compute_packed_size(tensors_for_edge)
                 slot = self.staging.alloc_slot(self.rank, consumer_rank, packed_nbytes)
                 slot_view = self.staging.get_slot_view(slot.slot_idx, slot.nbytes)
-                sig_elem = self.staging.get_sig_pad_element(self.rank)
+                sig_elem = self.staging.get_sig_pad_element(slot.slot_idx)
 
                 with torch.cuda.stream(self.transfer_stream):
                     _pack_tensors_into_slot(tensors_for_edge, slot_view)
@@ -1499,12 +1598,34 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
                         slot_view, sig_elem, slot.sig_val, consumer_rank
                     )
 
-                # Fill in TensorPointerInfo with slot addressing.
+                # Per-edge TPI clones so each edge carries its own slot
+                # address / signal. Sharing one info_list across edges
+                # would let a later edge's slot info clobber an earlier
+                # edge's, which corrupts broadcast routing (different
+                # consumers reading from the same TPI).
+                edge_infos: list[TensorPointerInfo] = []
+                slot_address = slot.slot_idx * self.staging.max_slot_bytes
+                slot_uuid_set = self._slot_uuids.setdefault(slot.slot_idx, set())
                 for info in info_list:
-                    info.address = slot.slot_idx * self.staging.max_slot_bytes
-                    info.symmetric_offset = info.address
-                    info.signal_value = slot.sig_val
-                edge.tensor_info = info_list
+                    edge_info = TensorPointerInfo(
+                        dims=list(info.dims),
+                        dtype=info.dtype,
+                        stride=list(info.stride),
+                        nbytes=info.nbytes,
+                        address=slot_address,
+                        uuid=info.uuid,
+                        source_session_id=info.source_session_id,
+                        source_entity=info.source_entity,
+                        source_rank=info.source_rank,
+                        symmetric_offset=slot_address,
+                        signal_value=slot.sig_val,
+                    )
+                    edge_infos.append(edge_info)
+                    self._uuid_consumer_to_slot[(info.uuid, consumer_rank)] = (
+                        slot.slot_idx
+                    )
+                    slot_uuid_set.add(info.uuid)
+                edge.tensor_info = edge_infos
 
     def register_for_send(
         self, request_id: str, uuids: list[str],
@@ -1536,9 +1657,13 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
             sig_val = first.signal_value
             packed_nbytes = _compute_packed_size_from_infos(edge.tensor_info)
 
-            sig_elem = self.staging.get_sig_pad_element(producer_rank)
+            # Decode the producer's slot_idx from symmetric_offset (set on the
+            # producer side as ``slot_idx * max_slot_bytes``). With multiple
+            # slots per producer, slot_idx is no longer simply producer_rank.
+            slot_idx = first.symmetric_offset // self.staging.max_slot_bytes
+            sig_elem = self.staging.get_sig_pad_element(slot_idx)
             slot_view = self.staging.get_slot_view(
-                slot_idx=producer_rank,
+                slot_idx=slot_idx,
                 nbytes=packed_nbytes,
             )
 
@@ -1627,6 +1752,7 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
                         request_id=request_id,
                         successful_tensors=tensors,
                         failed_tensor_ids=[],
+                        sender_entity_id=self.my_entity_id,
                     ),
                 ),
             )
@@ -1676,24 +1802,40 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
         for transfer in leftover:
             self._collect_and_send_acks(request_id, transfer.graph_edges)
 
-    def handle_ack(self, request_id: str, uuids: dict[str, int]) -> None:
+    def handle_ack(
+        self,
+        request_id: str,
+        uuids: dict[str, int],
+        sender_entity_id: str = "",
+    ) -> None:
         """
         Called when a TENSOR_RECEIVED ACK arrives from a consumer.
-        Frees the staging slot so the producer can reuse it.
+        Frees the staging slot(s) the producer used for this consumer and
+        dereferences the tensors.
+
+        ``sender_entity_id`` identifies the consumer that sent the ACK, so
+        the producer can free the correct (uuid, consumer) → slot mapping.
         """
-        self.staging.free_slot(self.rank)
         for uuid, ref_cnt in uuids.items():
+            self._free_slot_for_ack(sender_entity_id, uuid)
             self.tensor_store.dereference(request_id, uuid, n=ref_cnt)
 
-    def release_slot_for_uuid(self, request_id: str, uuid: str, ref_cnt: int = 1) -> None:
-        """Single-UUID wrapper around handle_ack for routing via Worker._uuid_to_manager.
+    def release_slot_for_uuid(
+        self,
+        request_id: str,
+        uuid: str,
+        ref_cnt: int = 1,
+        sender_entity_id: str = "",
+    ) -> None:
+        """Single-UUID wrapper around handle_ack for routing via
+        Worker._uuid_to_manager.
 
-        Frees the staging slot (one slot per producer rank) and dereferences
-        the tensor.  Identical semantics to handle_ack({uuid: ref_cnt}).
-        Used by Worker._handle_tensor_received when dispatching ACKs through
-        the uuid_to_manager registry rather than the legacy isinstance check.
+        Frees the (uuid, consumer) slot and dereferences the tensor.
+        ``sender_entity_id`` is the consumer that produced the ACK; if
+        empty, no slot is freed (legacy fallback) but the refcount is
+        still decremented.
         """
-        self.handle_ack(request_id, {uuid: ref_cnt})
+        self.handle_ack(request_id, {uuid: ref_cnt}, sender_entity_id)
 
     # ------------------------------------------------------------------
     # Captured worker-to-worker transport API

@@ -63,6 +63,11 @@ class TensorReceived(MessageBody):
     request_id: str
     successful_tensors: dict[str, int] # uuid -> graph edge count
     failed_tensor_ids: list[str] # uuids
+    # Identity of the sender (consumer that read the tensors). Populated by
+    # _collect_and_send_acks so the NVSHMEM producer can map an ACK back to
+    # the (uuid, consumer_rank) -> staging slot it needs to free. Empty for
+    # legacy callers; Mooncake's handle_ack ignores it.
+    sender_entity_id: str = ""
 
 
 @dataclass

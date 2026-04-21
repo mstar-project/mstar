@@ -12,7 +12,7 @@ fi
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 CUDA_VISIBLE_DEVICES=$DEVICES python mminf/api_server/entrypoint.py \
-    --config configs/bagel_cfg_parallel.yaml \
+    --config "${CONFIG:-configs/bagel_cfg_parallel.yaml}" \
     --cache-dir $CACHE_DIR \
     --socket-path-prefix /tmp/mminf_$WHO/ \
     --upload-dir /tmp/mminf_uploads_$WHO/ \

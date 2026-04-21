@@ -296,10 +296,10 @@ class Conductor:
                 yield from self._walk_graph_nodes(sub)
         elif isinstance(section, Loop):
             yield from self._walk_graph_nodes(section.section)
-            if section.curr_iter_section is not None:
-                yield from self._walk_graph_nodes(section.curr_iter_section)
-            if section.nxt_iter_section is not None:
-                yield from self._walk_graph_nodes(section.nxt_iter_section)
+            if section._curr_iter_section is not None:
+                yield from self._walk_graph_nodes(section._curr_iter_section)
+            if section._nxt_iter_section is not None:
+                yield from self._walk_graph_nodes(section._nxt_iter_section)
         else:
             raise TypeError(f"Unknown GraphSection subclass: {type(section)}")
 
@@ -378,20 +378,25 @@ class Conductor:
                 )
             )
 
-        # Route each EdgeSpec to the workers that participate (producer and
-        # consumer). Only applies when NVSHMEM transport is available; when
-        # Mooncake-only, all workers receive an empty list (they will simply
-        # never call init_edges on a non-existent manager).
+        # Distribute the FULL ``eligible`` list to every worker. NVSHMEM
+        # symmetric memory rendezvous is collective: every rank in the group
+        # must allocate the same heap size and lay out per-edge offsets
+        # identically. If a worker only sees the subset of edges it
+        # participates in (as producer or consumer), it computes a different
+        # `total_bytes` and a different `edge_byte_offset[edge_id]` than its
+        # peers — PUTs land at wrong offsets in the peer heap, and the
+        # warmup phase hangs at `nvshmem_wait_for_signal`.
+        #
+        # Non-participating ranks still allocate the symmetric heap (it's a
+        # collective allocation) but never call record_send/record_recv on
+        # those edges, so the per-edge slot just sits unused on those ranks.
         nvshmem_active = self.tensor_comm_protocol == CommProtocol.NVSHMEM
         per_worker: dict[str, list[EdgeSpec]] = {
             f"worker_{rank}": [] for rank in self._sorted_ranks
         }
         if nvshmem_active:
-            for spec in eligible:
-                for rank in (spec.producer_rank, spec.consumer_rank):
-                    wid = f"worker_{rank}"
-                    if wid in per_worker:
-                        per_worker[wid].append(spec)
+            for wid in per_worker:
+                per_worker[wid] = list(eligible)
 
         total = sum(len(v) for v in per_worker.values())
         logger.info(

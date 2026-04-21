@@ -541,7 +541,9 @@ class Worker:
 
         Routes each ACK'd UUID to the manager that produced it via
         _uuid_to_manager. NVSHMEM UUIDs are batched into one handle_ack call
-        (freeing one staging slot); Mooncake UUIDs are deref'd individually.
+        with the consumer's entity id so the manager can free the right
+        (uuid, consumer_rank) → slot mapping; Mooncake UUIDs are deref'd
+        individually.
         """
         nvshmem_mgr = self.managers.get(CommProtocol.NVSHMEM)
         nvshmem_uuids: dict[str, int] = {}
@@ -555,7 +557,11 @@ class Worker:
                 mooncake_uuids[uuid] = ref_cnt
 
         if nvshmem_uuids and nvshmem_mgr is not None:
-            nvshmem_mgr.handle_ack(body.request_id, nvshmem_uuids)
+            nvshmem_mgr.handle_ack(
+                body.request_id,
+                nvshmem_uuids,
+                sender_entity_id=getattr(body, "sender_entity_id", ""),
+            )
         for uuid, ref_cnt in mooncake_uuids.items():
             self._mooncake_mgr.dereference(body.request_id, uuid, n=ref_cnt)
 
