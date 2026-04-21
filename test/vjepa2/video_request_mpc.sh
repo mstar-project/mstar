@@ -55,8 +55,19 @@ fi
 # Build model_kwargs: K candidates of (actions, states) + synthetic goal.
 # For ViT-g AC: hidden_size=1408, num_patches = grid_depth * grid_size^2 =
 # (64/2) * (256/16)^2 = 32 * 256 = 8192.
-MODEL_KWARGS=$(python3 - <<PY
+#
+# We write kwargs to a temp file (not a shell variable) because
+# goal_hidden alone is ~100 MB of JSON (11.5M floats × ~9 chars each)
+# which blows past the shell's ARG_MAX.  curl's ``-F "field=<file"``
+# form loads the value from a file as form-field text, sidestepping the
+# shell-argument-length limit entirely.
+KWARGS_FILE=$(mktemp /tmp/vjepa2_mpc_kwargs.XXXXXX.json)
+TMPFILE=$(mktemp /tmp/vjepa2_mpc_response.XXXXXX)
+trap "rm -f ${KWARGS_FILE} ${TMPFILE}" EXIT
+
+python3 - "${KWARGS_FILE}" <<PY
 import json
+import sys
 
 K = ${K}
 T_ACTION = 32  # num_frames (64) // tubelet_size (2)
@@ -72,35 +83,34 @@ def ramp(lo, hi, T):
 actions = [ramp(-0.5 + 0.1 * k, 0.5 + 0.1 * k, T_ACTION) for k in range(K)]
 states  = [ramp( 0.1 + 0.1 * k, 0.9 + 0.1 * k, T_ACTION) for k in range(K)]
 
-# Synthetic goal latent.  A constant-per-token ramp keeps the JSON
-# size manageable (~180 KB uncompressed) and gives the scorer a
-# deterministic target with variation across the feature dim.
+# Synthetic goal latent.  ``0.001 * d`` per feature dim — varies across D
+# so the scorer's L1 vs each candidate is non-degenerate.  Size: 1 × 8192
+# × 1408 floats ≈ 100 MB once JSON-serialized; hence the temp-file route.
 goal_hidden = [
     [[0.001 * d for d in range(HIDDEN)] for _ in range(TOKENS)]
 ]
 
-print(json.dumps({
-    "mpc": True,
-    "actions": actions,
-    "states":  states,
-    "goal_hidden": goal_hidden,
-}))
+with open(sys.argv[1], "w") as f:
+    json.dump({
+        "mpc": True,
+        "actions": actions,
+        "states":  states,
+        "goal_hidden": goal_hidden,
+    }, f)
 PY
-)
 
-TMPFILE=$(mktemp /tmp/vjepa2_mpc_response.XXXXXX)
-trap "rm -f ${TMPFILE}" EXIT
+KWARGS_SIZE=$(stat -c%s "${KWARGS_FILE}" 2>/dev/null || stat -f%z "${KWARGS_FILE}")
 
 echo "[vjepa2-mpc] POST ${URL}"
-echo "  video:  ${VIDEO}"
-echo "  K:      ${K}"
-echo "  kwargs: ~$(echo "${MODEL_KWARGS}" | wc -c) bytes (goal_hidden dominates)"
+echo "  video:        ${VIDEO}"
+echo "  K:            ${K}"
+echo "  kwargs_file:  ${KWARGS_FILE}  (${KWARGS_SIZE} bytes)"
 
 curl -sS --fail-with-body -X POST "${URL}" \
     -F "files=@${VIDEO}" \
     -F 'input_modalities=video' \
     -F 'output_modalities=scalar,tensor,video' \
-    -F "model_kwargs=${MODEL_KWARGS}" \
+    -F "model_kwargs=<${KWARGS_FILE}" \
     -o "${TMPFILE}"
 
 python3 - <<PY
