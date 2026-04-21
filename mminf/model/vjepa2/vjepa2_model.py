@@ -56,6 +56,8 @@ from mminf.model.vjepa2.config import VJepa2ACPredictorConfig, VJepa2Config
 from mminf.model.vjepa2.submodules import (
     VJepa2ACPredictorSubmodule,
     VJepa2EncoderSubmodule,
+    VJepa2MPCPredictorSubmodule,
+    VJepa2MPCScorerSubmodule,
     VJepa2PredictorSubmodule,
     VJepa2RolloutPredictorSubmodule,
 )
@@ -150,6 +152,8 @@ class VJepa2Model(Model):
     PREFILL_VIDEO = "prefill_video"
     PREFILL_VIDEO_ENCODER_ONLY = "prefill_video_encoder_only"
     PREFILL_VIDEO_ROLLOUT = "prefill_video_rollout"
+    # Phase 3.B: K-way action-candidate MPC (AC variant only).
+    PREFILL_VIDEO_MPC = "prefill_video_mpc"
 
     # Phase 2 rollout loop name — referenced by
     # ``VJepa2RolloutPredictorSubmodule.forward`` via
@@ -283,13 +287,20 @@ class VJepa2Model(Model):
         # walks can coexist without branching inside a submodule.  Both node
         # names resolve to wrappers around the same underlying
         # ``VJEPA2Predictor`` nn.Module — no weight duplication.  AC-variant
-        # rollout (multi-step, action-conditioned) is Phase 3; the rollout
+        # rollout (multi-step, action-conditioned) is Phase 3.D; the rollout
         # submodule factory raises NotImplementedError on ``predictor_kind="ac"``,
         # so we must NOT register the rollout node/walk for AC — otherwise
         # conductor graph construction demands a ``rollout_predictor`` entry
         # in the config's ``node_groups`` that would have no valid submodule.
         if self.config.predictor_kind != "ac":
             types["rollout_predictor"] = EngineType.ENC_DEC
+        # Phase 3.B: MPC nodes advertised only for AC (the masked predictor
+        # has no action input, so K-way candidate evaluation makes no sense
+        # for it).  ``ac_predictor_mpc`` shares the underlying
+        # VisionTransformerPredictorAC nn.Module with ``predictor``.
+        if self.config.predictor_kind == "ac":
+            types["ac_predictor_mpc"] = EngineType.ENC_DEC
+            types["mpc_scorer"] = EngineType.ENC_DEC
         return types
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -404,6 +415,71 @@ class VJepa2Model(Model):
                 ]
             )
             walks[self.PREFILL_VIDEO_ROLLOUT] = prefill_video_rollout
+
+        # ----------------------------------------------------------------
+        # Phase 3.B: K-way action-candidate MPC (AC variant only)
+        # ----------------------------------------------------------------
+        # Graph shape:
+        #   video_encoder -> ac_predictor_mpc -> mpc_scorer
+        # Inputs routed per node:
+        #   video_frames -> video_encoder
+        #   actions [K,T,7] + states [K,T,7] -> ac_predictor_mpc
+        #   goal_hidden [1,N,D] (pre-encoded by the client via a prior
+        #       ``prefill_video_encoder_only`` call) -> mpc_scorer
+        # The AC predictor's forward is natively batch-dim aware; the MPC
+        # submodule ``.expand``s encoder_hidden to [K,N,D] and runs the
+        # predictor with [K,T,7] actions/states in ONE forward — matches
+        # upstream ``mpc_utils.cem`` lines 62-64 + 114.
+        if self.config.predictor_kind == "ac":
+            mpc_predictor_inputs: list[str] = ["encoder_hidden", "actions", "states"]
+            mpc_predictor_optional: list[str] = []
+            if self.config.ac_predictor and self.config.ac_predictor.use_extrinsics:
+                mpc_predictor_inputs.append("extrinsics")
+
+            prefill_video_mpc = Sequential(
+                [
+                    GraphNode(
+                        name="video_encoder",
+                        input_ids=["video_frames"],
+                        outputs=[
+                            GraphEdge(next_node="ac_predictor_mpc", name="encoder_hidden"),
+                        ],
+                    ),
+                    GraphNode(
+                        name="ac_predictor_mpc",
+                        input_ids=mpc_predictor_inputs,
+                        optional_input_ids=set(mpc_predictor_optional),
+                        outputs=[
+                            GraphEdge(next_node="mpc_scorer", name="predicted_hidden"),
+                        ],
+                    ),
+                    GraphNode(
+                        name="mpc_scorer",
+                        input_ids=["predicted_hidden", "goal_hidden"],
+                        outputs=[
+                            GraphEdge(
+                                next_node=EMIT_TO_CLIENT,
+                                name="best_index",
+                                output_modality="scalar",
+                                persist=True,
+                            ),
+                            GraphEdge(
+                                next_node=EMIT_TO_CLIENT,
+                                name="costs",
+                                output_modality="tensor",
+                                persist=True,
+                            ),
+                            GraphEdge(
+                                next_node=EMIT_TO_CLIENT,
+                                name="predicted_hidden",
+                                output_modality="video",
+                                persist=True,
+                            ),
+                        ],
+                    ),
+                ]
+            )
+            walks[self.PREFILL_VIDEO_MPC] = prefill_video_mpc
 
         return walks
 
@@ -537,6 +613,26 @@ class VJepa2Model(Model):
                     raise ValueError("use_extrinsics=True but no 'extrinsics' kwarg provided.")
                 out["extrinsics"] = [torch.as_tensor(extrinsics, dtype=torch.float32)]
 
+            # Phase 3.B: MPC walk requires a pre-encoded goal latent.  When
+            # the client flags ``mpc=True`` they must also supply
+            # ``goal_hidden`` (shape [1, N, D] or [N, D]).  Accepted as a
+            # python list / numpy array / tensor — torch.as_tensor handles
+            # all three.  If mpc=True but no goal_hidden is provided, fail
+            # loudly here rather than waiting for the scorer node to hang.
+            if kwargs.get("mpc"):
+                goal_hidden = kwargs.get("goal_hidden")
+                if goal_hidden is None:
+                    raise ValueError(
+                        "model_kwargs['mpc']=True requires 'goal_hidden' "
+                        "(pre-encoded goal latent from a prior "
+                        "prefill_video_encoder_only call)."
+                    )
+                out["goal_hidden"] = [torch.as_tensor(goal_hidden, dtype=torch.float32)]
+                logger.info(
+                    "process_prompt: MPC goal_hidden shape=%s",
+                    tuple(out["goal_hidden"][0].shape),
+                )
+
         # Optional user-supplied masks (masked predictor only).  These are
         # routed via the new ``GraphNode.optional_input_ids`` primitive —
         # the predictor node accepts them when present, the submodule
@@ -564,10 +660,15 @@ class VJepa2Model(Model):
     def _initial_walk(self, model_kwargs: dict | None) -> str:
         if model_kwargs and model_kwargs.get("skip_predictor"):
             return self.PREFILL_VIDEO_ENCODER_ONLY
+        # Phase 3.B: MPC walk (AC only).  Requested via ``mpc=True`` with
+        # K-way actions/states and a pre-encoded ``goal_hidden``.  Checked
+        # before rollout because AC deployments never hit the rollout walk.
+        if model_kwargs and model_kwargs.get("mpc") and self.config.predictor_kind == "ac":
+            return self.PREFILL_VIDEO_MPC
         # Rollout walk: triggered by ``rollout_horizon > 1``.  H == 1 is
         # equivalent to a single-pass prefill — save a loop's worth of
         # overhead and route through the normal ``prefill_video`` walk.
-        # Not available for AC (Phase 3); see ``get_graph_walk_graphs``.
+        # Not available for AC (Phase 3.D); see ``get_graph_walk_graphs``.
         if model_kwargs and self.config.predictor_kind != "ac":
             horizon = int(model_kwargs.get("rollout_horizon", 0) or 0)
             if horizon > 1:
@@ -612,6 +713,21 @@ class VJepa2Model(Model):
                     edge = GraphEdge(next_node="predictor", name=name)
                     edge.tensor_info = input_signals[name]
                     inputs.append(edge)
+
+        if walk == self.PREFILL_VIDEO_MPC:
+            # actions / states / extrinsics go to the MPC predictor node.
+            for name in ("actions", "states", "extrinsics"):
+                if name in input_signals:
+                    edge = GraphEdge(next_node="ac_predictor_mpc", name=name)
+                    edge.tensor_info = input_signals[name]
+                    inputs.append(edge)
+            # goal_hidden goes directly to the scorer (skips the predictor
+            # entirely — scorer compares predicted vs goal outside the AC
+            # predictor's forward).
+            if "goal_hidden" in input_signals:
+                edge = GraphEdge(next_node="mpc_scorer", name="goal_hidden")
+                edge.tensor_info = input_signals["goal_hidden"]
+                inputs.append(edge)
 
         step_metadata: dict = {"is_prefill": True}
         if walk == self.PREFILL_VIDEO_ROLLOUT:
@@ -669,10 +785,10 @@ class VJepa2Model(Model):
                 return VJepa2ACPredictorSubmodule(self.predictor, self.config)
             return VJepa2PredictorSubmodule(self.predictor, self.config)
         if node_name == "rollout_predictor":
-            # Masked predictor only (AC rollout is Phase 3 — see plan).
+            # Masked predictor only (AC rollout is Phase 3.D — see plan).
             if self.config.predictor_kind == "ac":
                 raise NotImplementedError(
-                    "AC-variant rollout is deferred to Phase 3; use predictor_kind='masked' for Phase 2 rollout."
+                    "AC-variant rollout is deferred to Phase 3.D; use predictor_kind='masked' for Phase 2 rollout."
                 )
             self._init_predictor(device)
             return VJepa2RolloutPredictorSubmodule(
@@ -682,6 +798,21 @@ class VJepa2Model(Model):
                 frames_per_second=self.config.rollout_frames_per_second,
                 anticipation_seconds=self.config.rollout_anticipation_seconds,
             )
+        # Phase 3.B: MPC predictor + scorer (AC only).  Predictor shares
+        # the VisionTransformerPredictorAC nn.Module with ``predictor``.
+        if node_name == "ac_predictor_mpc":
+            if self.config.predictor_kind != "ac":
+                raise NotImplementedError(
+                    "ac_predictor_mpc is only available with predictor_kind='ac'."
+                )
+            self._init_predictor(device)
+            return VJepa2MPCPredictorSubmodule(self.predictor, self.config)
+        if node_name == "mpc_scorer":
+            if self.config.predictor_kind != "ac":
+                raise NotImplementedError(
+                    "mpc_scorer is only available with predictor_kind='ac'."
+                )
+            return VJepa2MPCScorerSubmodule(self.config)
         return None
 
     def _init_encoder(self, device: str) -> None:
