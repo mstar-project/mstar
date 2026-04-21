@@ -1765,10 +1765,55 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
         if self.tensor_store.can_gc(request_id, uuid):
             self.tensor_store.remove_tensor(request_id, uuid)
 
-    def dereference(self, request_id: str, uuid: str, n: int = 1) -> None:
+    def _release_slots_for_uuid(self, uuid: str) -> None:
+        """Force-free every staging slot still holding this UUID.
+
+        Safe to call only once the producer's ``tensor_store`` ref_cnt for
+        ``uuid`` has hit zero: at that point no edge still expects the
+        PUT to be consumed, so any ``(uuid, consumer_rank) → slot_idx``
+        mapping that remains is a PUT whose consumer will never ACK (see
+        ``dereference`` for the scenario that produces this).
+        """
+        stuck = [key for key in self._uuid_consumer_to_slot if key[0] == uuid]
+        for key in stuck:
+            slot_idx = self._uuid_consumer_to_slot.pop(key, None)
+            if slot_idx is None:
+                continue
+            uuids_in_slot = self._slot_uuids.get(slot_idx)
+            if uuids_in_slot is not None:
+                uuids_in_slot.discard(uuid)
+                if not uuids_in_slot:
+                    self.staging.free_slot(slot_idx)
+                    self._slot_uuids.pop(slot_idx, None)
+
+    def _dereference_and_release_if_zero(
+        self, request_id: str, uuid: str, n: int = 1,
+    ) -> None:
+        """Decrement tensor_store ref_cnt; if it hit zero, also free any
+        staging slots this UUID still holds.
+
+        The slot-release step closes the leak in the Loop-final-iteration
+        case: ``Worker._store_outputs_and_finish_loops`` PUTs the
+        loop-back outputs (allocating slots and recording
+        ``_uuid_consumer_to_slot[(uuid, consumer_rank)] = slot_idx``)
+        before ``complete_loops`` runs. ``complete_loops`` then marks
+        those edges as ``filtered_out`` because there is no next
+        iteration to feed them into, and the worker calls
+        ``mgr.dereference(...)`` on them. The consumer never sees the
+        TPI (it was filtered out before routing), never reads the slot,
+        never ACKs. Without this helper, each filtered edge leaks its
+        slot; over BAGEL CFG-parallel (4 loop-back cross-rank edges per
+        request) the producer's eager pool is exhausted after
+        ``num_slots_per_producer / 4`` requests and ``_wait_for_slot``
+        times out.
+        """
         self.tensor_store.dereference(request_id, uuid, n=n)
         if self.tensor_store.can_gc(request_id, uuid):
+            self._release_slots_for_uuid(uuid)
             self.tensor_store.remove_tensor(request_id, uuid)
+
+    def dereference(self, request_id: str, uuid: str, n: int = 1) -> None:
+        self._dereference_and_release_if_zero(request_id, uuid, n=n)
 
     def increment_ref(self, request_id: str, uuid: str, n: int = 1) -> None:
         self.tensor_store.increment_ref(request_id, uuid, n=n)
@@ -1818,7 +1863,7 @@ class NVSHMEMCommunicationManager(TensorCommunicationManager):
         """
         for uuid, ref_cnt in uuids.items():
             self._free_slot_for_ack(sender_entity_id, uuid)
-            self.tensor_store.dereference(request_id, uuid, n=ref_cnt)
+            self._dereference_and_release_if_zero(request_id, uuid, n=ref_cnt)
 
     def release_slot_for_uuid(
         self,

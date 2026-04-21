@@ -22,6 +22,7 @@ from mminf.communication.tensors import (
     EdgeSpec,
     NVSHMEMCommunicationManager,
 )
+from mminf.graph.base import GraphEdge
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -180,3 +181,73 @@ def test_bidirectional_swap(manager, rank, device):
 
     expected = torch.arange(n, dtype=torch.int32, device=device) + ((1 - rank) * 10000)
     torch.testing.assert_close(received, expected)
+
+
+# ---------------------------------------------------------------------------
+# Eager staging-pool leak regression (BAGEL CFG-parallel case)
+# ---------------------------------------------------------------------------
+
+def test_filtered_loopback_releases_staging_slot(manager, rank, device):
+    """Regression: a cross-rank PUT that is later filtered out by
+    ``Loop.complete_loops`` (because the producing iteration was the final
+    one) must still release its eager staging slot.
+
+    Setup: rank 0 calls ``store_and_populate_graph_edges`` with one
+    cross-rank edge targeting rank 1, then calls
+    ``manager.dereference(request_id, uuid)`` for each edge that was
+    allocated — exactly what ``Worker._store_outputs_and_finish_loops``
+    does for edges returned from ``complete_loops().filtered_out``.
+    The consumer (rank 1) never reads the slot and never ACKs.
+
+    Assertion: after dereference, producer's ``_in_use`` slot pool and
+    ``_uuid_consumer_to_slot`` registry must be empty. Without the
+    leak fix in NVSHMEMCommunicationManager.dereference, this fails:
+    ``_uuid_consumer_to_slot`` retains the stuck key and each invocation
+    leaks one slot.
+    """
+    if dist.get_world_size() < 2:
+        pytest.skip("needs at least 2 ranks")
+
+    request_id = "req-leak-test"
+
+    # Do the producer-side work and collect the "did it leak?" verdict
+    # BEFORE the barrier, so a failing assertion doesn't hang rank 1.
+    leaked_slots = 0
+    stuck_keys = 0
+    stuck_slot_uuids = 0
+    if rank == 0:
+        tensor = torch.arange(64, dtype=torch.int32, device=device)
+        edge = GraphEdge(next_node="worker_1", name="latents")
+        manager.store_and_populate_graph_edges(
+            request_id=request_id,
+            tensors={"latents": [tensor]},
+            graph_edges=[edge],
+        )
+        # Exactly one cross-rank edge → one slot in flight.
+        assert len(manager.staging._in_use) == 1
+        assert len(manager._uuid_consumer_to_slot) == 1
+
+        # Simulate the filtered-out dereference path. The single edge was
+        # only a loop-back, so one dereference drops ref_cnt to 0.
+        uuid = edge.tensor_info[0].uuid
+        manager.dereference(request_id, uuid)
+
+        leaked_slots = len(manager.staging._in_use)
+        stuck_keys = len(manager._uuid_consumer_to_slot)
+        stuck_slot_uuids = len(manager._slot_uuids)
+
+    # Rank 1 stands at the barrier so rank 0 can exit cleanly on assertion
+    # failure; it intentionally does NOT call start_read_tensors for the
+    # filtered edge.
+    dist.barrier()
+
+    if rank == 0:
+        # Fix invariant: no slot remains occupied once ref_cnt hits 0.
+        assert leaked_slots == 0, (
+            f"NVSHMEM staging slot leaked: {leaked_slots} slots still in "
+            "use after dereference. The manager.dereference() path must "
+            "free slots whose consumer will never ACK "
+            "(Loop.filter_out_loop_back)."
+        )
+        assert stuck_keys == 0
+        assert stuck_slot_uuids == 0

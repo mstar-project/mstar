@@ -1,4 +1,5 @@
 import logging
+import os
 import time as _time
 from enum import Enum
 from time import sleep
@@ -162,6 +163,15 @@ class Worker:
             if node_to_rank:
                 entity_id_to_rank.update(node_to_rank)
 
+            _nvshmem_kwargs: dict = {}
+            if os.environ.get("MMINF_NVSHMEM_MAX_SLOT_BYTES"):
+                _nvshmem_kwargs["max_slot_bytes"] = int(
+                    os.environ["MMINF_NVSHMEM_MAX_SLOT_BYTES"]
+                )
+            if os.environ.get("MMINF_NVSHMEM_NUM_SLOTS"):
+                _nvshmem_kwargs["num_slots_per_producer"] = int(
+                    os.environ["MMINF_NVSHMEM_NUM_SLOTS"]
+                )
             nvshmem_mgr = NVSHMEMCommunicationManager(
                 my_entity_id=worker_id,
                 rank=nvshmem_rank,
@@ -170,6 +180,7 @@ class Worker:
                 communicator=self.communicator,
                 group=nvshmem_group,
                 entity_id_to_rank=entity_id_to_rank,
+                **_nvshmem_kwargs,
             )
             self.managers[CommProtocol.NVSHMEM] = nvshmem_mgr
             self.rank = nvshmem_rank
