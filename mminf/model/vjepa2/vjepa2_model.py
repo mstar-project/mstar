@@ -153,6 +153,13 @@ class VJepa2Model(Model):
     PREFILL_VIDEO = "prefill_video"
     PREFILL_VIDEO_ENCODER_ONLY = "prefill_video_encoder_only"
     PREFILL_VIDEO_ROLLOUT = "prefill_video_rollout"
+    # Phase 3.E: same rollout but EMIT_TO_CLIENT lives on the section so
+    # each iter's ``predicted_hidden`` is delivered as soon as the iter
+    # completes (instead of accumulating until loop completion).  Same
+    # ``rollout_predictor`` node + same submodule as the batched walk —
+    # only the emit topology differs.  Gated via ``stream_rollout=True``
+    # in ``model_kwargs`` (selected in ``_initial_walk``).
+    PREFILL_VIDEO_ROLLOUT_STREAMING = "prefill_video_rollout_streaming"
     # Phase 3.B: K-way action-candidate MPC (AC variant only).
     PREFILL_VIDEO_MPC = "prefill_video_mpc"
 
@@ -359,7 +366,8 @@ class VJepa2Model(Model):
         }
 
         # ----------------------------------------------------------------
-        # Phase 2 (masked) + Phase 3.D (AC): autoregressive rollout.
+        # Phase 2 (masked) + Phase 3.D (AC) + Phase 3.E (streaming):
+        # autoregressive rollout.
         # ----------------------------------------------------------------
         # The rollout section is a single ``rollout_predictor`` node that
         # consumes a sliding-window ``encoder_hidden`` and emits both the
@@ -378,34 +386,70 @@ class VJepa2Model(Model):
         # ``VJepa2ACRolloutPredictorSubmodule`` for the sliding-window
         # semantics and the P3.D "Sliding-window vs upstream growing-context"
         # note in the plan for why we diverge from upstream.
+        #
+        # Two variants of the walk coexist:
+        #   * batched (default): ``Loop.accumulated_outputs`` gathers the
+        #     per-iter ``predicted_hidden`` and emits a single
+        #     ``result_tensors`` message (with ``len==H`` tensor_infos) when
+        #     the loop completes.
+        #   * streaming (Phase 3.E): an ``EMIT_TO_CLIENT`` edge lives
+        #     directly on the section — the worker routes section outputs
+        #     immediately after each node run, so the client sees one
+        #     ``result_tensors`` message per iter as soon as it's
+        #     produced.  Matches the per-iter emit pattern used by
+        #     ``bagel_model.py``'s ``decode`` loop for tokens
+        #     (``new_token -> EMIT_TO_CLIENT``) and by
+        #     ``qwen3_omni_model.py``'s ``thinker_decode`` loop.  No
+        #     partitions, no ``StreamBuffer``, no ``ChunkPolicy`` needed —
+        #     those primitives are for cross-partition streaming (e.g.
+        #     Orpheus LLM -> SNAC), which isn't what per-iter client
+        #     emit requires.
+        # Both walks route to the SAME ``rollout_predictor`` node name
+        # (same submodule, same engine type, same ``register_loop_stop``
+        # semantics) — only the emit topology differs.  Gated per-request
+        # via ``model_kwargs["stream_rollout"]`` in ``_initial_walk``.
         rollout_inputs: list[str] = ["encoder_hidden"]
-        rollout_outputs: list[GraphEdge] = [
+        rollout_loopback_outputs: list[GraphEdge] = [
             GraphEdge(next_node="rollout_predictor", name="encoder_hidden"),
             GraphEdge(next_node="rollout_predictor", name="predicted_hidden"),
         ]
         if self.config.predictor_kind == "ac":
             rollout_inputs += ["actions", "states"]
-            rollout_outputs += [
+            rollout_loopback_outputs += [
                 GraphEdge(next_node="rollout_predictor", name="actions"),
                 GraphEdge(next_node="rollout_predictor", name="states"),
             ]
             if self.config.ac_predictor and self.config.ac_predictor.use_extrinsics:
                 rollout_inputs.append("extrinsics")
-                rollout_outputs.append(
+                rollout_loopback_outputs.append(
                     GraphEdge(next_node="rollout_predictor", name="extrinsics")
                 )
 
-        rollout_section = GraphNode(
+        def _build_rollout_encoder_node() -> GraphNode:
+            # Fresh instance per walk — GraphNode carries per-request
+            # ``ready_inputs`` state populated during graph execution, so
+            # reusing one instance across two walks would entangle them.
+            return GraphNode(
+                name="video_encoder",
+                input_ids=["video_frames"],
+                outputs=[
+                    GraphEdge(next_node="rollout_predictor", name="encoder_hidden"),
+                ],
+            )
+
+        # -- Batched (Phase 2 + 3.D): accumulated_outputs, one message at
+        # -- loop completion.  ``max_iters`` is a config-level upper bound
+        # -- baked in at graph-build time; the per-request horizon is
+        # -- enforced inside the submodule via ``register_loop_stop`` when
+        # -- iter_idx + 1 reaches it.
+        rollout_section_batched = GraphNode(
             name="rollout_predictor",
             input_ids=rollout_inputs,
-            outputs=rollout_outputs,
+            outputs=list(rollout_loopback_outputs),
         )
-        # ``max_iters`` is a config-level upper bound baked in at graph-build
-        # time.  The per-request ``rollout_horizon`` is enforced inside the
-        # submodule via ``register_loop_stop`` when iter_idx + 1 reaches it.
-        rollout_loop = DynamicLoop(
+        rollout_loop_batched = DynamicLoop(
             name=self.ROLLOUT_LOOP_NAME,
-            section=rollout_section,
+            section=rollout_section_batched,
             max_iters=self.config.max_rollout_horizon,
             outputs=[],
             accumulated_outputs=[
@@ -417,19 +461,34 @@ class VJepa2Model(Model):
                 ),
             ],
         )
-        prefill_video_rollout = Sequential(
-            [
-                GraphNode(
-                    name="video_encoder",
-                    input_ids=["video_frames"],
-                    outputs=[
-                        GraphEdge(next_node="rollout_predictor", name="encoder_hidden"),
-                    ],
-                ),
-                rollout_loop,
-            ]
+        walks[self.PREFILL_VIDEO_ROLLOUT] = Sequential(
+            [_build_rollout_encoder_node(), rollout_loop_batched]
         )
-        walks[self.PREFILL_VIDEO_ROLLOUT] = prefill_video_rollout
+
+        # -- Streaming (Phase 3.E): EMIT_TO_CLIENT on the section itself,
+        # -- one message per iter.  ``persist=False`` (default): each emit
+        # -- is one-shot per iter; nothing needs to survive across iters.
+        rollout_section_streaming = GraphNode(
+            name="rollout_predictor",
+            input_ids=rollout_inputs,
+            outputs=list(rollout_loopback_outputs) + [
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="predicted_hidden",
+                    output_modality="video",
+                ),
+            ],
+        )
+        rollout_loop_streaming = DynamicLoop(
+            name=self.ROLLOUT_LOOP_NAME,
+            section=rollout_section_streaming,
+            max_iters=self.config.max_rollout_horizon,
+            outputs=[],
+            accumulated_outputs=[],
+        )
+        walks[self.PREFILL_VIDEO_ROLLOUT_STREAMING] = Sequential(
+            [_build_rollout_encoder_node(), rollout_loop_streaming]
+        )
 
         # ----------------------------------------------------------------
         # Phase 3.B: K-way action-candidate MPC (AC variant only)
@@ -731,9 +790,13 @@ class VJepa2Model(Model):
         # equivalent to a single-pass prefill — save a loop's worth of
         # overhead and route through the normal ``prefill_video`` walk.
         # Available for both masked (Phase 2) and AC (Phase 3.D sliding-window).
+        # Phase 3.E: opt into per-iter client emit via ``stream_rollout=True``;
+        # default stays batched so existing clients don't break.
         if model_kwargs:
             horizon = int(model_kwargs.get("rollout_horizon", 0) or 0)
             if horizon > 1:
+                if model_kwargs.get("stream_rollout"):
+                    return self.PREFILL_VIDEO_ROLLOUT_STREAMING
                 return self.PREFILL_VIDEO_ROLLOUT
         return self.PREFILL_VIDEO
 
@@ -776,11 +839,14 @@ class VJepa2Model(Model):
                     edge.tensor_info = input_signals[name]
                     inputs.append(edge)
 
-        if walk == self.PREFILL_VIDEO_ROLLOUT and self.config.predictor_kind == "ac":
+        if walk in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING) \
+                and self.config.predictor_kind == "ac":
             # AC rollout: route per-timestep actions/states (and optional
             # extrinsics) to the rollout node.  The submodule identity-
             # loop-backs them across iters and slices per-iter based on
-            # dynamic_loop_iter_counts["rollout_loop"].
+            # dynamic_loop_iter_counts["rollout_loop"].  Streaming variant
+            # routes identically — the only downstream difference is the
+            # section's EMIT_TO_CLIENT edge.
             for name in ("actions", "states", "extrinsics"):
                 if name in input_signals:
                     edge = GraphEdge(next_node="rollout_predictor", name=name)
@@ -803,10 +869,12 @@ class VJepa2Model(Model):
                 inputs.append(edge)
 
         step_metadata: dict = {"is_prefill": True}
-        if walk == self.PREFILL_VIDEO_ROLLOUT:
+        if walk in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING):
             # Per-request horizon enforced by ``VJepa2RolloutPredictorSubmodule``
             # via ``register_loop_stop`` once iter_idx + 1 reaches it.  The
             # graph's DynamicLoop is always built with ``max_iters=config.max_rollout_horizon``.
+            # Streaming variant uses the same horizon logic — the submodule
+            # doesn't distinguish walks.
             requested = int((model_kwargs or {}).get("rollout_horizon", 2) or 2)
             step_metadata["rollout_horizon"] = max(1, min(requested, self.config.max_rollout_horizon))
 
