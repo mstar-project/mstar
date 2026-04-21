@@ -673,6 +673,14 @@ class VJepa2Model(Model):
             # Clients can reshape via (B, N, hidden_size) — shape is
             # communicated separately via the request metadata.
             return output.detach().to(torch.float32).cpu().numpy().tobytes()
+        if modality == "scalar":
+            # MPC ``best_index`` — int64, 8 bytes.  Clients decode via
+            # ``np.frombuffer(raw, dtype=np.int64)[0]``.
+            return output.detach().to(torch.int64).cpu().numpy().tobytes()
+        if modality == "tensor":
+            # MPC ``costs`` ([K] float32) — raw bytes, clients reshape to
+            # ``[K]`` based on the request's candidate count.
+            return output.detach().to(torch.float32).cpu().numpy().tobytes()
         raise ValueError(f"Unsupported modality for V-JEPA 2: {modality!r}")
 
     # ------------------------------------------------------------------
