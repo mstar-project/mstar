@@ -13,6 +13,7 @@ import yaml
 
 from mminf.api_server.request_types import APIServerMessage, RequestComplete
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
+from mminf.communication.tensors import EdgeSpec
 from mminf.conductor.request_info import (
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
@@ -20,7 +21,6 @@ from mminf.conductor.request_info import (
     PartitionState,
     StreamingConnectionState,
 )
-from mminf.communication.tensors import EdgeSpec
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import (
     GraphEdge,

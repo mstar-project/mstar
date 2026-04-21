@@ -18,11 +18,10 @@ import torch.distributed._symmetric_memory as symm_mem
 
 from mminf.communication.communicator import BaseCommunicator
 from mminf.communication.tensors import (
+    _NVSHMEM_ACK_VAL,
     EdgeSpec,
     NVSHMEMCommunicationManager,
-    _NVSHMEM_ACK_VAL,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

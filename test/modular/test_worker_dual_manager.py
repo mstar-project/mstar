@@ -5,13 +5,8 @@ and NVSHMEM modes WITHOUT actually doing any transport work.
 """
 
 import pytest
-import torch
 
 from mminf.communication.communicator import BaseCommunicator, CommProtocol
-from mminf.communication.tensors import (
-    NVSHMEMCommunicationManager,
-    SharedMemoryCommunicationManager,
-)
 from mminf.graph.base import GraphEdge
 
 
@@ -28,7 +23,6 @@ def _make_resolver_with_managers(my_rank: int, world: int, has_nvshmem: bool):
     """Build a minimal stand-in for Worker.resolve_transport without
     invoking the full Worker.__init__ (which requires a Model + engines)."""
     from mminf.communication.communicator import MOONCAKE_PROTOCOLS
-    from mminf.graph.special_destinations import SPECIAL_DESTINATIONS
 
     class _Stub:
         managers: dict

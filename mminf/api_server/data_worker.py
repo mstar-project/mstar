@@ -23,7 +23,6 @@ from mminf.utils.ipc_format import (
     NewRequestConductor,
     TensorReceived,
     UnpersistTensors,
-    WorkerMessage,
     WorkerMessageType,
 )
 

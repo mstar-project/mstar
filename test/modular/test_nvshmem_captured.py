@@ -23,7 +23,6 @@ from mminf.communication.tensors import (
     NVSHMEMCommunicationManager,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures (mirror of test_nvshmem_manager.py)
 # ---------------------------------------------------------------------------

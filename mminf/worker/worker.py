@@ -8,13 +8,12 @@ import torch.distributed as dist
 
 from mminf.api_server.request_types import APIServerMessage, ResultTensors
 from mminf.communication.communicator import (
-    CommProtocol,
     MOONCAKE_PROTOCOLS,
+    CommProtocol,
     ZMQCommunicator,
 )
 from mminf.communication.tensors import (
     EdgeSpec,
-    MooncakeCommunicationManager,
     NameToTensorList,
     NVSHMEMCommunicationManager,
     TensorCommunicationManager,
@@ -80,7 +79,7 @@ class Worker:
     REPLAY_TIMEOUT_S: float = 30.0
     REPLAY_POLL_INTERVAL_S: float = 0.001
 
-    class WorkerAbort(RuntimeError):
+    class WorkerAbortError(RuntimeError):
         """Raised by replay_with_watchdog when a captured replay exceeds its
         deadline (indicating a dead peer or hung NVSHMEM operation). The main
         loop propagates this to process exit; the Conductor surfaces the
@@ -1188,7 +1187,7 @@ class Worker:
     ) -> float:
         """Replay a captured graph on ``stream`` with a deadline-polling
         watchdog. Returns the observed wall-clock replay latency in
-        microseconds. Raises :class:`Worker.WorkerAbort` if the replay fails
+        microseconds. Raises :class:`Worker.WorkerAbortError` if the replay fails
         to complete within ``timeout_s`` (default :data:`REPLAY_TIMEOUT_S`)."""
         deadline_s = self.REPLAY_TIMEOUT_S if timeout_s is None else timeout_s
         poll_s = (
@@ -1205,7 +1204,7 @@ class Worker:
                     "Worker %s: captured replay exceeded deadline (%.1fs); aborting",
                     self.worker_id, deadline_s,
                 )
-                raise Worker.WorkerAbort(
+                raise Worker.WorkerAbortError(
                     f"captured replay exceeded {deadline_s:.1f}s deadline"
                 )
             _time.sleep(poll_s)

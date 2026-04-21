@@ -8,13 +8,13 @@ no GPU required.
 import pytest
 import torch
 
+from mminf.communication.communicator import CommProtocol
 from mminf.communication.tensors import (
     LocalTransferEngine,
     MooncakeTransferEngine,
     NVSHMEMTransferEngine,
     TensorTransferEngine,
 )
-from mminf.communication.communicator import CommProtocol
 
 
 def _try_make_mooncake() -> TensorTransferEngine | None:

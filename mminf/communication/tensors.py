@@ -979,7 +979,7 @@ def _unpack_tensors_from_slot(
         f"Header says {n} tensors but got {len(dst_tensors)} dst"
     )
     off = 4
-    for i, dst in enumerate(dst_tensors):
+    for _i, dst in enumerate(dst_tensors):
         data_offset, nbytes, ndims, dtype_code = struct.unpack_from("<IIBB2x", header_cpu, off)
         off += 12
         off += ndims * 8 * 2  # skip dims + strides (we already have dst shape)

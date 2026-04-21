@@ -1,8 +1,8 @@
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
-from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
