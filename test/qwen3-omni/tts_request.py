@@ -55,7 +55,7 @@ def main():
     args = parser.parse_args()
 
     from _env import get_server_url
-    args.port = get_server_url()
+    args.url = get_server_url()
 
     print(f"Text:  {args.text}")
     print(f"Voice: {args.voice}")
