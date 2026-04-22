@@ -513,6 +513,9 @@ class Qwen3OmniModel(Model):
         self, node_name: str,
         model_kwargs: dict | None = None,
     )  -> SamplingConfig | None:
+        if model_kwargs is None:
+            model_kwargs = {}
+
         if node_name == "Thinker":
             temperature = model_kwargs.get("thinker_temperature", 0.7)
             top_p = model_kwargs.get("thinker_top_p", 0.9)
@@ -912,7 +915,7 @@ class Qwen3OmniModel(Model):
             metadata.graph_walk = "talker_decode"
             metadata.kwargs["talker_prefill_done"] = True
 
-            # Feed all_codes back as input for first decode step
+            # Feed talker_input_embeds back as input for first decode step
             edge = GraphEdge(next_node="Talker_LLM", name="talker_input_embeds")
             edge.tensor_info = persist_signals["talker_input_embeds"]
             inputs = [edge]

@@ -64,6 +64,13 @@ class CudaGraphData:
     has_non_logit_outputs: bool = False
 
 
+@dataclass(frozen=True)
+class CudaGraphKey:
+    graph_walk: str
+    requires_cfg: bool
+    shapes: tuple[tuple[str, int], ...]  # sorted items for hashability
+
+
 class CudaGraphRunner:
     """Captures and replays CUDA graphs for AR decode batches.
 

@@ -35,6 +35,7 @@ from mminf.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+from mminf.utils.profiler import range_pop, range_push
 from mminf.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
@@ -403,7 +404,11 @@ class Conductor:
             )
             self.waiting_queue.append(body)
             return
+        if self.enable_nvtx:
+            range_push("conductor._do_ingest_request")
         self._do_ingest_request(body)
+        if self.enable_nvtx:
+            range_pop()
 
     def _do_ingest_request(
         self, body: NewRequestConductor
@@ -813,11 +818,15 @@ class Conductor:
                             )
                             continue
 
+                        if self.enable_nvtx:
+                            range_push("conductor._process_worker_graphs_done")
                         done_parts = self._process_worker_graphs_done(message.body)
                         for pname in done_parts:
                             done_partition_forwards.append(
                                 (rid, pname, message.body.partition_done)
                             )
+                        if self.enable_nvtx:
+                            range_pop()
                     else:
                         raise ValueError(f"Unknown message type: {message.message_type}")
 

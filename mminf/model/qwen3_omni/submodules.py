@@ -819,8 +819,6 @@ class ThinkerSubmodule(NodeSubmodule):
         produce the static input buffers (``input_embeds``, ``cos_3d``,
         ``sin_3d``, etc.).
 
-        ``compile=False`` on first land — mirrors what Orpheus does until
-        we confirm interaction with the Triton fused-MoE autotune cache.
         ``capture_batch_sizes`` is limited to small buckets since each
         capture allocates persistent FlashInfer wrappers + static buffers
         for the full 30B Thinker; revisit after profiling real deployments.
@@ -835,10 +833,22 @@ class ThinkerSubmodule(NodeSubmodule):
                         torch.zeros(1, dtype=torch.long, device=device),
                     ],
                 }],
-                compile=False,
+                compile=True,
                 capture_batch_sizes=[1, 2, 4, 8, 16],
             ),
-        ]
+            CudaGraphConfig(
+                graph_walk="prefill_text",
+                requires_cfg=False,
+                labels=["main"],
+                dummy_capture_inputs=[{
+                    "text_inputs": [
+                        torch.zeros(seq_len, dtype=torch.long, device=device),
+                    ],
+                } for seq_len in [64, 128, 256, 512, 1024]],
+                compile=True,
+                capture_batch_sizes=[1, 2, 4, 8, 16],
+            ),
+        ],
 
     def forward_batched(
         self,
@@ -1341,7 +1351,7 @@ class TalkerLLMSubmodule(NodeSubmodule):
     
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
-        self._eos_embed_sent.remove(request_id)
+        self._eos_embed_sent.discard(request_id)
     
     def can_batch(self, batch: NodeBatch) -> bool:
         return batch.graph_walk == "talker_decode"
@@ -1475,7 +1485,9 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
         )
         all_codes[:, 0] = layer0_codes
 
-        # "Prefill" over last_hidden.
+        # initialize KV cache with last_hidden; we discard the outputs because
+        # the first code is already "layer0_codes" and we just need to initialize
+        # the KV cache before generating codes 1 to self.num_codes.
         cache_manager.plan_attention([1] * bs, label="main")
         cache_manager.plan_rope([1] * bs, label="main")
         self.code_predictor(last_hidden, cache_manager)

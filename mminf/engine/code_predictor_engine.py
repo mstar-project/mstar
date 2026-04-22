@@ -510,7 +510,6 @@ class CodePredictorEngine(AREngine):
         for rid in batch.request_ids:
             cache_manager.reset_state(
                 request_id=rid,
-                keep_pages=True,
             )
 
         rids = list(batch.per_request_input_tensors.keys())
@@ -580,6 +579,8 @@ class CodePredictorEngine(AREngine):
                     request_info=info,
                     outputs=output.per_request_output_tensors.get(rid, {}),
                 )
+            if self.enable_nvtx:
+                range_pop(synchronize=True)
             return output
 
     def check_ready(self, *args, **kwargs):

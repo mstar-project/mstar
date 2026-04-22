@@ -609,21 +609,15 @@ class BatchedCacheManager:
         self,
         request_id: str,
         labels: list[str] | None=None,
-        keep_pages: bool=True
     ):
         if labels is None:
             labels = self.alloc_manager.get_labels(request_id)
         for label in labels:
-            if not keep_pages:
-                self.alloc_manager.reset_label(
-                    request_id=request_id,
-                    label=label,
-                    free=True
-                )
-            else:
-                state:KVRequestState = self._get_state(request_id, label)
-                state.position_id_start = 0
-                state.seq_len = 0
+            self.alloc_manager.reset_label(
+                request_id=request_id,
+                label=label,
+                free=True
+            )
 
     @torch.compiler.disable
     def snapshot_all(
