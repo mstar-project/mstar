@@ -179,6 +179,11 @@ class NodeSubmodule(torch.nn.Module):
         This function modifies the `outputs` dict in-place and returns nothing.
         """
         return
+    
+    def cleanup_request(self, request_id: str):
+        """Remove per-request state when a request completes."""
+        return
+
 
 class ARNodeSubmodule(NodeSubmodule):
     @abstractmethod
