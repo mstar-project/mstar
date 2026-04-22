@@ -70,6 +70,10 @@ class NodeSubmodule(torch.nn.Module):
     TODO
     """
 
+    @property
+    def device(self):
+        return next(self.model.parameters()).device
+
     @abstractmethod
     def prepare_inputs(
         self,
