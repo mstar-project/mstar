@@ -435,6 +435,8 @@ def sample_depth_gpu(
     temperature: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
 ) -> torch.Tensor:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
@@ -461,5 +463,6 @@ def sample_depth_gpu(
     probs = torch.softmax(scaled, dim=-1)
     samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         probs, top_k, top_p, deterministic=True,
+        seed=seed, offset=offset
     )
     return samples.to(torch.int64)

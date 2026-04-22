@@ -164,6 +164,8 @@ class CodePredictorCudaGraphRunner:
         temperature_buf = torch.ones(max_bs, dtype=torch.float32, device=device)
         top_k_buf = torch.full((max_bs,), vocab, dtype=torch.int32, device=device)
         top_p_buf = torch.ones(max_bs, dtype=torch.float32, device=device)
+        seed_buf = torch.zeros(max_bs, dtype=torch.long, device=device)
+        offset_buf = torch.zeros(max_bs, dtype=torch.long, device=device)
 
         # Position tensors. These never change across replays -- they hold
         # the hardcoded [0, 1] for prefill and [i] for decode iteration i.
@@ -184,8 +186,10 @@ class CodePredictorCudaGraphRunner:
             "temperature_buf": temperature_buf,
             "top_k_buf": top_k_buf,
             "top_p_buf": top_p_buf,
+            "offset_buf": offset_buf,
             "pos_pf": pos_pf,
             "pos_dec": pos_dec,
+            "seed_buf": seed_buf
         }
 
     def _slice_for_bs(self, bs: int) -> dict:
@@ -198,7 +202,9 @@ class CodePredictorCudaGraphRunner:
             "temperature_buf": shared["temperature_buf"][:bs],
             "top_k_buf": shared["top_k_buf"][:bs],
             "top_p_buf": shared["top_p_buf"][:bs],
+            "offset_buf": shared["offset_buf"][:bs],
             "pos_pf": shared["pos_pf"][:bs],
+            "seed_buf": shared["seed_buf"][:bs],
             "pos_dec": {i: shared["pos_dec"][i][:bs] for i in shared["pos_dec"]},
         }
 
@@ -221,8 +227,10 @@ class CodePredictorCudaGraphRunner:
         temperature_buf = slices["temperature_buf"]
         top_k_buf = slices["top_k_buf"]
         top_p_buf = slices["top_p_buf"]
+        offset_buf = slices["offset_buf"] 
         pos_pf = slices["pos_pf"]
         pos_dec = slices["pos_dec"]
+        seed_buf = slices["seed_buf"]
 
         cp = self.code_predictor
         codec_embedding = cp.model.codec_embedding
@@ -241,7 +249,8 @@ class CodePredictorCudaGraphRunner:
         # Sample codebook 1 from the slot-1 hidden (the c0_embed position).
         last_hs = hidden_states[:, -1, :]
         logits = torch.matmul(last_hs, lm_head_weight[0].t())
-        tokens = sample_depth_gpu(logits, temperature_buf, top_k_buf, top_p_buf)
+        tokens = sample_depth_gpu(logits, temperature_buf, top_k_buf, top_p_buf, seed_buf, offset_buf)
+        offset_buf += 1
         all_codes_buf[:, 1] = tokens
         embed = codec_embedding[0](tokens)
         codec_emb_sum_buf.add_(embed)
@@ -255,7 +264,8 @@ class CodePredictorCudaGraphRunner:
             )
             last_hs = hidden_states[:, 0, :]
             logits = torch.matmul(last_hs, lm_head_weight[i - 1].t())
-            tokens = sample_depth_gpu(logits, temperature_buf, top_k_buf, top_p_buf)
+            tokens = sample_depth_gpu(logits, temperature_buf, top_k_buf, top_p_buf, seed_buf, offset_buf)
+            offset_buf += 1
             all_codes_buf[:, i] = tokens
             embed = codec_embedding[i - 1](tokens)
             codec_emb_sum_buf.add_(embed)
@@ -462,6 +472,11 @@ class CodePredictorCudaGraphRunner:
         shared["top_p_buf"][:padded_bs].copy_(
             torch.tensor(top_ps, dtype=torch.float32, device=self.device)
         )
+        # randomly initialize seed buffer
+        shared["seed_buf"][:padded_bs].copy_(
+            torch.randint(0, 2**32, (padded_bs,), dtype=torch.long, device=self.device)
+        )
+        shared["offset_buf"][:] = 0
 
 
 class CodePredictorEngine(AREngine):
