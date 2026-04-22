@@ -32,7 +32,7 @@ class ARNodeInputs(NodeInputs):
     input_seq_len: int
     input_ids: torch.Tensor | None = None
     input_embeds: torch.Tensor | None = None
-    custom_pos_ids: torch.Tensor | None = None
+    custom_pos_ids: torch.Tensor | dict[str, torch.Tensor] | None = None # it's a dict if it's per-label
 
 
 @dataclass
@@ -176,7 +176,7 @@ class ARNodeSubmodule(NodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        pos_info: PositionInfo | None
+        pos_info: dict[str, PositionInfo] = {},
     ) -> ARNodeInputs:
         pass
 
