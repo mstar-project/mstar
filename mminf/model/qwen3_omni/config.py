@@ -277,7 +277,11 @@ class Code2WavConfig:
     num_hidden_layers: int = 8
     upsample_rates: Tuple[int, ...] = (8, 5, 4, 3)
     upsampling_ratios: Tuple[int, ...] = (2, 2)
-    chunk_size: int = 300
+    # 25-frame chunk keeps TTFT low (~1s); matches vllm-omni's
+    # codec_chunk_frames=25 streaming default. The left-context overlap is
+    # prepended to non-first chunks by LeftContextChunkPolicy and trimmed
+    # by Code2WavSubmodule on emit.
+    chunk_size: int = 25
     left_context_size: int = 25
     attention_bias: bool = False
     attention_dropout: float = 0.0
