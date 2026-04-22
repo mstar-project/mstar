@@ -1611,48 +1611,61 @@ class Code2WavSubmodule(NodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
         **kwargs
     ) -> dict[str, NameToTensorList]:
-        fwd_out = self.forward(packed_inputs["codec_tokens"])
-        return {
-            rid: {
-                "audio_chunk": [fwd_out["audio_chunk"][0][i]]
-            } for i, rid in enumerate(request_ids)
-        }
+        """Run the streaming vocoder with per-request left-context trim.
+
+        The Talker→Code2Wav StreamBuffer uses ``LeftContextChunkPolicy``:
+        the first popped chunk for a request contains ``chunk_size`` fresh
+        frames with no overlap; every subsequent chunk contains
+        ``chunk_size + left_context_size`` frames where the leading
+        ``left_context_size`` are overlap from the previous chunk's tail.
+        The overlap lets the causal ConvNet warm up its state at chunk
+        boundaries; the corresponding waveform samples must be trimmed from
+        the emitted audio (they were already emitted by the previous chunk).
+
+        We delegate to ``Qwen3OmniCode2Wav.chunked_decode_streaming`` with a
+        per-request context list derived from ``_first_chunk_emitted`` --
+        ``0`` for any request that has not yet emitted, ``config.left_context_size``
+        otherwise. ``_first_chunk_emitted`` is updated in ``postprocess``
+        after the chunk is handed off downstream.
+        """
+        codec_tokens = packed_inputs.get("codec_tokens")
+        if codec_tokens is None or codec_tokens.numel() == 0:
+            return {rid: {} for rid in request_ids}
+
+        cfg_ctx = self.config.code2wav.left_context_size
+        left_context_size = [
+            0 if rid not in self._first_chunk_emitted else cfg_ctx
+            for rid in request_ids
+        ]
+
+        wavs = self.code2wav.chunked_decode_streaming(
+            codec_tokens, left_context_size=left_context_size
+        )
+
+        results: dict[str, NameToTensorList] = {}
+        for rid, wav in zip(request_ids, wavs, strict=True):
+            audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
+            results[rid] = {"audio_chunk": [audio_int16]}
+        return results
 
     def forward(
         self,
         codec_tokens: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Run Code2Wav vocoder, trim left-context overlap, return audio chunk.
+        """Raw vocoder forward -- returns int16 PCM without any trim.
 
-        The Talker→Code2Wav StreamBuffer uses a sliding-window policy with
-        ``window=chunk_size + left_context_size`` (325) and ``stride=chunk_size``
-        (300), so every popped chunk contains ``left_context_size`` (25) frames
-        of overlap from the previous chunk. This overlap acts as the
-        convolutional vocoder's "warmup" region and must be trimmed from the
-        output of every chunk EXCEPT the first (which has no prior audio to
-        overlap with).
-
-        Mirrors HF's ``Qwen3OmniMoeCode2Wav.chunked_decode``:
-            context_size = left_context_size if start_index - left_context_size > 0 else start_index
-            wavs.append(wav_chunk[..., context_size * self.total_upsample :])
-
-        Returns:
-            {"audio_chunk": [int16 PCM tensor]} or {} if input empty.
+        Prefer ``forward_batched`` for the streaming path; this method exists
+        for callers that need a non-streaming, single-shot decode (e.g.
+        debugging or offline batch use).
         """
         if codec_tokens is None or codec_tokens.numel() == 0:
             return {}
 
-        # Run the ConvNet vocoder
         wav = self.code2wav(codec_tokens)
-
-        # Convert to int16 PCM
-        audio_int16 = (
-            wav.clamp(-1, 1) * 32767
-        ).to(torch.int16)
-
+        audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": [audio_int16]}
-    
+
     def postprocess(
         self,
         request_id: str,
@@ -1660,21 +1673,11 @@ class Code2WavSubmodule(NodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
+        if "audio_chunk" not in outputs or not outputs["audio_chunk"]:
+            return
         outputs["audio_chunk"][0] = outputs["audio_chunk"][0].squeeze()
-        is_first_chunk = (
-            request_id is None or request_id not in self._first_chunk_emitted
-        )
-        if is_first_chunk:
+        if request_id is not None:
             self._first_chunk_emitted.add(request_id)
-        else:
-            # Subsequent chunk: trim the ``left_context_size`` warmup frames
-            # from the front of the output (they were already emitted by the
-            # previous chunk).
-            wav = outputs["audio_chunk"][0]
-            left_context_size = self.config.code2wav.left_context_size  # 25
-            context_samples = left_context_size * self._total_upsample  # 25 * 1920 = 48000
-            if wav.shape[-1] > context_samples:
-                outputs["audio_chunk"][0] = wav[context_samples:]
 
     def can_batch(self, batch: NodeBatch) -> bool:
         return len({
