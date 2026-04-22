@@ -92,6 +92,17 @@ class Qwen3OmniCode2Wav(torch.nn.Module):
         self._hf_model = hf_model
         self.config = hf_cfg
 
+        total_upsample = 1
+        for r in hf_cfg.upsample_rates:
+            total_upsample *= r
+        for r in hf_cfg.upsampling_ratios:
+            total_upsample *= r
+        self._total_upsample = total_upsample
+
+    @property
+    def total_upsample(self) -> int:
+        return self._total_upsample
+
     def forward(self, codes: torch.Tensor, **kwargs) -> torch.Tensor:
         return self._hf_model(codes, **kwargs)
 
@@ -104,3 +115,47 @@ class Qwen3OmniCode2Wav(torch.nn.Module):
         return self._hf_model.chunked_decode(
             codes, chunk_size=chunk_size, left_context_size=left_context_size
         )
+
+    def chunked_decode_streaming(
+        self,
+        codes: torch.Tensor,
+        left_context_size: list[int],
+    ) -> list[torch.Tensor]:
+        """Streaming vocoder decode with per-request left-context trimming.
+
+        Each batch element may have a different number of context frames
+        prepended to its input -- 0 for the first chunk, ``N`` for subsequent
+        chunks where ``N`` codec frames of overlap were carried over from the
+        prior chunk's tail. This method runs the ConvNet vocoder once on the
+        full batched input and then trims ``left_context_size[i] * total_upsample``
+        samples from the start of request ``i``'s waveform.
+
+        Mirrors vllm-omni's ``Qwen3OmniMoeCode2Wav.chunked_decode_streaming``:
+        the model forward is unchanged, trimming is per-request on the output.
+
+        Args:
+            codes: ``[batch, num_quantizers, T]`` RVQ codes where ``T`` is
+                the total codec-frame length (already includes any prepended
+                left-context frames).
+            left_context_size: list of length ``batch`` giving the number of
+                leading codec frames to treat as context and trim from the
+                emitted waveform for each request.
+
+        Returns:
+            List of waveforms, one per batch element, each shape
+            ``[1, (T - left_context_size[i]) * total_upsample]``.
+        """
+        batch_size = codes.shape[0]
+        if len(left_context_size) != batch_size:
+            raise ValueError(
+                f"left_context_size length {len(left_context_size)} "
+                f"does not match batch size {batch_size}"
+            )
+
+        wav = self._hf_model(codes)  # [batch, 1, T * total_upsample]
+
+        outputs: list[torch.Tensor] = []
+        for i in range(batch_size):
+            trim = left_context_size[i] * self._total_upsample
+            outputs.append(wav[i, :, trim:])
+        return outputs

@@ -23,7 +23,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.engine.code_predictor_engine import CodePredictorCudaGraphConfig, CodePredictorCudaGraphRunner, CodePredictorSubmodule
+from mminf.engine.code_predictor_engine import CodePredictorCudaGraphRunner, CodePredictorSubmodule
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.model.base import NodeSubmodule
 from mminf.model.qwen3_omni.components.rope import (
@@ -1372,6 +1372,17 @@ class TalkerLLMSubmodule(NodeSubmodule):
 
 
 class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
+    """Runs the Qwen3-Omni residual-codebook AR loop.
+
+    Fast path (Phase 2): delegates the entire 15-iteration depth loop to
+    ``CodePredictorCudaGraphRunner`` for a single unrolled CUDA-graph replay.
+
+    Eager fallback (used only when the runner could not be captured, e.g. on
+    CPU or if capture failed): Python-level loop with paged-FlashInfer
+    attention via ``cache_manager`` -- functionally equivalent but without
+    the graph speedup.
+    """
+
     def __init__(
         self, code_predictor: Qwen3OmniCodePredictor,
         talker_code_emb: nn.Embedding,
@@ -1382,17 +1393,7 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
         self.config = config
         self.cp_cfg = self.config.code_predictor
         self.num_codes = self.cp_cfg.num_code_groups
-        self.talker_code_emb  = talker_code_emb
-    
-
-    def forward_cuda_graph(
-        self, graph_walk: str,
-        cache_manager: BatchedCacheManager,
-        embed: torch.Tensor
-    ):
-        return {
-            "hidden": self.code_predictor(embed, cache_manager)
-        }
+        self.talker_code_emb = talker_code_emb
 
     def preprocess(
         self,
@@ -1410,74 +1411,39 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
                 inp["layer0_codes"][0] for inp in per_request_inputs
             ]),
         }
-    
+
     def forward_batched(
         self,
         graph_walk: str,
         request_ids: list[str],
         cache_manager: BatchedCacheManager,
         sampler: Sampler,
-        cuda_graph_runner: CodePredictorCudaGraphRunner,
+        cuda_graph_runner: CodePredictorCudaGraphRunner | None,
         packed_inputs: dict[str, torch.Tensor],
         per_request_info: dict[str, CurrentForwardPassInfo]
     ) -> dict[str, NameToTensorList]:
-        embed = packed_inputs["last_hidden"]
-        codec_emb_sum = torch.zeros_like(embed)
-
+        last_hidden = packed_inputs["last_hidden"]
         layer0_codes = packed_inputs["layer0_codes"]
 
-        all_codes = torch.zeros((
-            len(request_ids), self.num_codes
-        ), device=layer0_codes.device, dtype=torch.long)
-        all_codes[:, 0] = layer0_codes
-
-        # "prefill" on last_hidden
         if cuda_graph_runner is not None:
-            cuda_graph_runner.run(
+            # Fast path: one unrolled CUDA-graph replay covers the full
+            # 15-iter MTP loop (attention + LM heads + sampling + embedders).
+            outputs = cuda_graph_runner.run(
                 graph_walk=graph_walk,
-                packed_inputs={
-                    "embed": embed
-                },
-                request_ids=request_ids
+                request_ids=request_ids,
+                last_hidden=last_hidden,
+                layer0_codes=layer0_codes,
             )
+            all_codes = outputs["all_codes"]
+            codec_emb_sum = outputs["codec_emb_sum"]
         else:
-            cache_manager.plan_attention([1] * len(request_ids), label="main")
-            cache_manager.plan_rope([1] * len(request_ids), label="main")
-            self.forward_cuda_graph(
-                graph_walk=graph_walk,
-                embed=embed,
-                cache_manager=cache_manager
+            all_codes, codec_emb_sum = self._forward_batched_eager(
+                request_ids=request_ids,
+                cache_manager=cache_manager,
+                sampler=sampler,
+                last_hidden=last_hidden,
+                layer0_codes=layer0_codes,
             )
-
-        embed = self.talker_code_emb(layer0_codes)
-        codec_emb_sum += embed
-
-        for group_idx in range(1, self.num_codes):
-            if cuda_graph_runner is not None:
-                hidden = cuda_graph_runner.run(
-                    graph_walk=graph_walk,
-                    packed_inputs={
-                        "embed": embed
-                    },
-                    request_ids=request_ids
-                )["hidden"]
-            else:
-                cache_manager.plan_attention([1] * len(request_ids), label="main")
-                cache_manager.plan_rope([1] * len(request_ids), label="main")
-                hidden = self.forward_cuda_graph(
-                    graph_walk=graph_walk,
-                    embed=embed,
-                    cache_manager=cache_manager
-                )["hidden"]
-
-            orig_dtype = hidden.dtype
-            lm_head = self.code_predictor.get_lm_head(group_idx)
-            logits = lm_head(hidden.to(lm_head.weight.dtype)).to(orig_dtype)
-            codes = sampler.sample(request_ids, logits)
-            all_codes[:, group_idx] = codes
-
-            embed = self.code_predictor.get_embedding(group_idx)(codes)
-            codec_emb_sum += embed
 
         return {
             req_id: {
@@ -1486,27 +1452,57 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
             } for i, req_id in enumerate(request_ids)
         }
 
-    def can_batch(self, batch: NodeBatch) -> bool:
-        return True # we can always batch
+    def _forward_batched_eager(
+        self,
+        request_ids: list[str],
+        cache_manager: BatchedCacheManager,
+        sampler: Sampler,
+        last_hidden: torch.Tensor,
+        layer0_codes: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fallback path: Python AR loop over the paged-FlashInfer attention.
 
-    def get_code_pred_cuda_graph_configs(
-        self, device: torch.device
-    ) -> list[CodePredictorCudaGraphConfig]:
-        return [
-            CodePredictorCudaGraphConfig(
-                graph_walk="talker_last_prefill",
-                dummy_capture_inputs={
-                    "embed": torch.zeros((1, self.cp_cfg.hidden_size), device=device),
-                }
-            ),
-            CodePredictorCudaGraphConfig(
-                graph_walk="talker_decode",
-                dummy_capture_inputs={
-                    "embed": torch.zeros((1, self.cp_cfg.hidden_size), device=device),
-                }
-            )
-        ]
-    
+        Kept for environments where CUDA-graph capture is unavailable
+        (CPU testing, capture failure on exotic hardware). Functionally
+        equivalent to the unrolled graph but without the kernel-launch
+        savings.
+        """
+        bs = len(request_ids)
+        codec_emb_sum = torch.zeros_like(last_hidden)
+        all_codes = torch.zeros(
+            (bs, self.num_codes),
+            device=layer0_codes.device, dtype=torch.long,
+        )
+        all_codes[:, 0] = layer0_codes
+
+        # "Prefill" over last_hidden.
+        cache_manager.plan_attention([1] * bs, label="main")
+        cache_manager.plan_rope([1] * bs, label="main")
+        self.code_predictor(last_hidden, cache_manager)
+
+        # Seed codec_emb_sum with the layer-0 codec embedding.
+        embed = self.talker_code_emb(layer0_codes)
+        codec_emb_sum = codec_emb_sum + embed
+
+        for group_idx in range(1, self.num_codes):
+            cache_manager.plan_attention([1] * bs, label="main")
+            cache_manager.plan_rope([1] * bs, label="main")
+            hidden = self.code_predictor(embed, cache_manager)
+
+            orig_dtype = hidden.dtype
+            lm_head = self.code_predictor.get_lm_head(group_idx)
+            logits = lm_head(hidden.to(lm_head.weight.dtype)).to(orig_dtype)
+            codes = sampler.sample(request_ids, logits)
+            all_codes[:, group_idx] = codes
+
+            embed = self.code_predictor.get_embedding(group_idx)(codes)
+            codec_emb_sum = codec_emb_sum + embed
+
+        return all_codes, codec_emb_sum
+
+    def can_batch(self, batch: NodeBatch) -> bool:
+        return True  # we can always batch
+
     def get_needed_cache_labels(
         self,
         graph_walk: str,
@@ -1611,70 +1607,63 @@ class Code2WavSubmodule(NodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
         **kwargs
     ) -> dict[str, NameToTensorList]:
-        fwd_out = self.forward(packed_inputs["codec_tokens"])
-        return {
-            rid: {
-                "audio_chunk": [fwd_out["audio_chunk"][0][i]]
-            } for i, rid in enumerate(request_ids)
-        }
+        """Run the streaming vocoder with per-request left-context trim.
+
+        The Talker→Code2Wav StreamBuffer uses ``LeftContextChunkPolicy``:
+        the first popped chunk for a request contains ``codec_chunk_frames``
+        fresh frames with no overlap; every subsequent chunk contains
+        ``codec_chunk_frames + codec_left_context_frames`` frames where the
+        leading ``codec_left_context_frames`` are overlap from the previous
+        chunk's tail. The overlap lets the causal ConvNet warm up its state
+        at chunk boundaries; the corresponding waveform samples must be
+        trimmed from the emitted audio (they were already emitted by the
+        previous chunk).
+
+        We delegate to ``Qwen3OmniCode2Wav.chunked_decode_streaming`` with a
+        per-request context list derived from ``_first_chunk_emitted`` --
+        ``0`` for any request that has not yet emitted,
+        ``config.codec_left_context_frames`` otherwise. After each request's
+        chunk is converted to int16 PCM, ``_first_chunk_emitted`` is updated
+        inline so the next chunk for the same request trims correctly.
+        """
+        codec_tokens = packed_inputs.get("codec_tokens")
+        if codec_tokens is None or codec_tokens.numel() == 0:
+            return {rid: {} for rid in request_ids}
+
+        cfg_ctx = self.config.code2wav.codec_left_context_frames
+        left_context_size = [
+            0 if rid not in self._first_chunk_emitted else cfg_ctx
+            for rid in request_ids
+        ]
+
+        wavs = self.code2wav.chunked_decode_streaming(
+            codec_tokens, left_context_size=left_context_size
+        )
+
+        results: dict[str, NameToTensorList] = {}
+        for rid, wav in zip(request_ids, wavs, strict=True):
+            audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16).squeeze()
+            results[rid] = {"audio_chunk": [audio_int16]}
+            self._first_chunk_emitted.add(rid)
+        return results
 
     def forward(
         self,
         codec_tokens: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Run Code2Wav vocoder, trim left-context overlap, return audio chunk.
+        """Raw vocoder forward -- returns int16 PCM without any trim.
 
-        The Talker→Code2Wav StreamBuffer uses a sliding-window policy with
-        ``window=chunk_size + left_context_size`` (325) and ``stride=chunk_size``
-        (300), so every popped chunk contains ``left_context_size`` (25) frames
-        of overlap from the previous chunk. This overlap acts as the
-        convolutional vocoder's "warmup" region and must be trimmed from the
-        output of every chunk EXCEPT the first (which has no prior audio to
-        overlap with).
-
-        Mirrors HF's ``Qwen3OmniMoeCode2Wav.chunked_decode``:
-            context_size = left_context_size if start_index - left_context_size > 0 else start_index
-            wavs.append(wav_chunk[..., context_size * self.total_upsample :])
-
-        Returns:
-            {"audio_chunk": [int16 PCM tensor]} or {} if input empty.
+        Prefer ``forward_batched`` for the streaming path; this method exists
+        for callers that need a non-streaming, single-shot decode (e.g.
+        debugging or offline batch use).
         """
         if codec_tokens is None or codec_tokens.numel() == 0:
             return {}
 
-        # Run the ConvNet vocoder
         wav = self.code2wav(codec_tokens)
-
-        # Convert to int16 PCM
-        audio_int16 = (
-            wav.clamp(-1, 1) * 32767
-        ).to(torch.int16)
-
+        audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": [audio_int16]}
-    
-    def postprocess(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs
-    ):
-        outputs["audio_chunk"][0] = outputs["audio_chunk"][0].squeeze()
-        is_first_chunk = (
-            request_id is None or request_id not in self._first_chunk_emitted
-        )
-        if is_first_chunk:
-            self._first_chunk_emitted.add(request_id)
-        else:
-            # Subsequent chunk: trim the ``left_context_size`` warmup frames
-            # from the front of the output (they were already emitted by the
-            # previous chunk).
-            wav = outputs["audio_chunk"][0]
-            left_context_size = self.config.code2wav.left_context_size  # 25
-            context_samples = left_context_size * self._total_upsample  # 25 * 1920 = 48000
-            if wav.shape[-1] > context_samples:
-                outputs["audio_chunk"][0] = wav[context_samples:]
 
     def can_batch(self, batch: NodeBatch) -> bool:
         return len({
@@ -1685,7 +1674,7 @@ class Code2WavSubmodule(NodeSubmodule):
     # transformers module. Until code2wav becomes a bottleneck, making this eager mode for now
     # def can_use_cuda_graphs(self, batch):
     #     total_numel = self.config.num_code_groups * (
-    #         self.config.code2wav.left_context_size + self.config.code2wav.chunk_size
+    #         self.config.code2wav.codec_left_context_frames + self.config.code2wav.codec_chunk_frames
     #     )
     #     return all([
     #         inputs["codec_tokens"][0].numel() == total_numel for inputs in batch.per_request_input_tensors.values()
@@ -1699,7 +1688,7 @@ class Code2WavSubmodule(NodeSubmodule):
     #             dummy_capture_inputs=[{
     #                 "codec_tokens": [
     #                     torch.zeros(
-    #                         (self.config.code2wav.left_context_size + self.config.code2wav.chunk_size, self.config.num_code_groups),
+    #                         (self.config.code2wav.codec_left_context_frames + self.config.code2wav.codec_chunk_frames, self.config.num_code_groups),
     #                         dtype=torch.long, device=device
     #                     ),
     #                 ],

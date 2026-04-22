@@ -499,8 +499,8 @@ class Qwen3OmniModel(Model):
                     to_partition="Code2Wav",
                     edge_name="codec_tokens",
                     chunk_policy_factory=lambda: LeftContextChunkPolicy(
-                        chunk=self.config.code2wav.chunk_size,
-                        left_context=self.config.code2wav.left_context_size
+                        chunk=self.config.code2wav.codec_chunk_frames,
+                        left_context=self.config.code2wav.codec_left_context_frames,
                     ),
                 ),
             ],
@@ -955,7 +955,7 @@ class Qwen3OmniModel(Model):
         Same pattern as Orpheus SNAC -- the conductor just tracks whether
         there are more codec tokens to process.
         """
-        chunk_size = self.config.code2wav.chunk_size
+        chunk_size = self.config.code2wav.codec_chunk_frames
         token_count = conn.token_count if conn else 0
         consumed = conn.consumed_count if conn else 0
         producer_done = conn.producer_done if conn else False
@@ -1288,6 +1288,11 @@ class Qwen3OmniModel(Model):
             ],
             device=device,
         )
+        # Populate the stacked ``lm_head_weight`` buffer from the freshly-
+        # loaded ``lm_head`` ModuleList so the unrolled CUDA-graph path
+        # (CodePredictorCudaGraphRunner) has a real tensor to index into at
+        # capture time (Option P: Python-static indexing of a stacked tensor).
+        code_predictor.consolidate_stacked_weights()
 
         talker_sub = self._submodule_cache.get("Talker_LLM")
         if talker_sub is not None and hasattr(talker_sub, "model"):

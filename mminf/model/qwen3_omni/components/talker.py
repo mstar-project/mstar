@@ -350,8 +350,15 @@ class Qwen3OmniCodePredictor(nn.Module):
         talker.code_predictor.model.codec_embedding.{0-30}.weight
         talker.code_predictor.lm_head.{0-30}.weight
 
-    The Code Predictor runs 31 autoregressive steps (for layers 1-31)
-    in float32 for precision.
+    The Code Predictor runs 15 autoregressive steps (for residual codebooks
+    1..15) in float32 for precision.
+
+    Two forward paths:
+      * ``forward(embed, cache_manager)``  -- paged-FlashInfer eager path,
+        used as a fallback when CUDA graphs are disabled.
+      * ``forward_depth_unrolled(...)``   -- SDPA + dense-KV path that runs
+        every layer with per-token position IDs and a static KV cache tensor.
+        This is what the unrolled CUDA graph captures.
     """
 
     def __init__(self, config: Qwen3OmniModelConfig):
@@ -367,13 +374,49 @@ class Qwen3OmniCodePredictor(nn.Module):
             for _ in range(num_residual)
         ])
 
+        # Stacked LM-head weight buffer, populated by
+        # ``consolidate_stacked_weights()`` after the per-head ``nn.Linear``
+        # weights are loaded. Registered as a non-persistent buffer (so it
+        # doesn't appear in state_dicts) with a meta placeholder -- the real
+        # tensor is assigned later once the per-head weights exist on the
+        # target device. Shape: ``[num_residual, vocab, hidden]``.
+        # The unrolled MTP graph indexes this with a Python-static int at
+        # capture time (Option P), which is fixed-address and graph-safe.
+        self.register_buffer(
+            "lm_head_weight",
+            torch.empty(num_residual, cp.vocab_size, cp.hidden_size),
+            persistent=False,
+        )
+
+        self._num_residual = num_residual
+
+    def consolidate_stacked_weights(self) -> None:
+        """Stack per-head ``nn.Linear`` weights into ``lm_head_weight``.
+
+        Must be called once after ``load_weights_from_hf_shards`` has
+        populated the ``lm_head`` ModuleList. Replaces the placeholder
+        ``lm_head_weight`` buffer with a real, contiguous tensor on the
+        same device/dtype as the per-head weights. After this call, the
+        unrolled graph path uses ``lm_head_weight[i]`` instead of
+        ``lm_head[i].weight``. The per-head ``nn.Linear`` modules are kept
+        (used by the eager fallback path) -- the duplicated memory is
+        ~120 MB, small relative to the full Qwen3-Omni checkpoint.
+        """
+        stacked = torch.stack(
+            [lm.weight.data for lm in self.lm_head], dim=0,
+        ).contiguous()
+        # Assigning via setattr updates the already-registered buffer in
+        # place (see nn.Module.__setattr__); this replaces the meta
+        # placeholder created in __init__ with the real device tensor.
+        self.lm_head_weight = stacked
+
     def forward(self, *args):
         return self.model(*args)
-    
+
     def get_embedding(self, group_idx: int):
         assert group_idx > 0
         return self.model.codec_embedding[group_idx-1]
-    
+
     def get_lm_head(self, group_idx: int):
         assert group_idx > 0
         return self.lm_head[group_idx-1]
@@ -382,3 +425,156 @@ class Qwen3OmniCodePredictor(nn.Module):
     def codec_embedding(self):
         """Alias for submodule access."""
         return self.model.codec_embedding
+
+    # ------------------------------------------------------------------
+    # SDPA + dense-KV depth forward (for unrolled CUDA-graph capture)
+    # ------------------------------------------------------------------
+    def forward_depth_unrolled(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache: torch.Tensor,
+        cache_pos: int,
+    ) -> torch.Tensor:
+        """Run one "slice" of the code-predictor AR loop with SDPA + dense KV.
+
+        This is the CUDA-graph-compatible replacement for the paged-FlashInfer
+        attention path. It is safe to call repeatedly inside a single
+        ``torch.cuda.graph`` capture because:
+
+          * The KV cache is a preallocated dense tensor (no plan() call).
+          * Position IDs come in directly (no PlanState bookkeeping).
+          * Write/read slices use Python-static ``cache_pos`` / ``seq_len`` so
+            the captured kernel sees identical shapes every replay.
+
+        Args:
+            inputs_embeds: ``[bs, seq_len, hidden_size]``. ``seq_len`` is 2 for
+                the initial "prefill" call (``[last_hidden, c0_embed]``) and 1
+                for every subsequent decode iteration.
+            position_ids: ``[bs, seq_len]`` int tensor with the absolute
+                position of each input token within the depth sequence.
+            kv_cache: ``[n_layers, bs, 2, max_seq_len, n_kv_heads, head_dim]``
+                dense tensor preallocated by the runner. The runner zeroes it
+                at the start of every graph replay so stale state cannot leak.
+            cache_pos: write offset into ``kv_cache``'s seq-len axis. The new
+                K/V tokens land at ``[cache_pos : cache_pos + seq_len]``.
+
+        Returns:
+            ``[bs, seq_len, hidden_size]`` final hidden states after the code
+            predictor's 5 layers + final RMSNorm. The caller is responsible
+            for applying the per-codebook LM head.
+        """
+        import flashinfer
+
+        hidden_states = inputs_embeds
+        bs, seq_len, hidden_size = hidden_states.shape
+
+        first_attn = self.model.layers[0].self_attn
+        n_kv_heads = first_attn.num_kv_heads
+        n_q_heads = first_attn.num_heads
+        head_dim = first_attn.head_dim
+        n_groups = n_q_heads // n_kv_heads
+
+        # FlashInfer's rope kernels require bf16; the rest of the code
+        # predictor runs at the weights' native dtype (fp32 for quality per
+        # the AREngine.has_autocast=False invariant).
+        flat_pos = position_ids.reshape(-1)
+
+        for layer_idx, layer in enumerate(self.model.layers):
+            attn = layer.self_attn
+            residual = hidden_states
+
+            # Input RMSNorm -- flashinfer's rmsnorm only accepts 2D input.
+            hs_flat = run_rms_norm(
+                hidden_states.view(-1, hidden_size),
+                layer.input_layernorm.weight,
+                eps=layer.input_layernorm.variance_epsilon,
+            )
+            hidden_states = hs_flat.view(bs, seq_len, hidden_size)
+
+            total_tokens = bs * seq_len
+            q = attn.q_proj(hidden_states).view(total_tokens, n_q_heads, head_dim)
+            k = attn.k_proj(hidden_states).view(total_tokens, n_kv_heads, head_dim)
+            v = attn.v_proj(hidden_states).view(total_tokens, n_kv_heads, head_dim)
+
+            # Per-head QK-norm (matching the paged path in attention.py).
+            q = run_rms_norm(
+                q.reshape(-1, head_dim),
+                attn.q_norm.weight,
+                eps=attn.q_norm.variance_epsilon,
+            ).view(total_tokens, n_q_heads, head_dim)
+            k = run_rms_norm(
+                k.reshape(-1, head_dim),
+                attn.k_norm.weight,
+                eps=attn.k_norm.variance_epsilon,
+            ).view(total_tokens, n_kv_heads, head_dim)
+
+            # RoPE. FlashInfer's rope kernels need bf16 input, so cast at the
+            # boundary and cast back afterwards (same pattern as
+            # BatchedCacheManager.apply_rope).
+            qk_dtype = q.dtype
+            q_rot = q.to(torch.bfloat16) if qk_dtype != torch.bfloat16 else q
+            k_rot = k.to(torch.bfloat16) if qk_dtype != torch.bfloat16 else k
+            q_rot, k_rot = flashinfer.rope.apply_rope_pos_ids(
+                q_rot, k_rot,
+                pos_ids=flat_pos,
+                rope_theta=attn.rope_theta,
+                interleave=False,
+            )
+            if qk_dtype != torch.bfloat16:
+                q = q_rot.to(qk_dtype)
+                k = k_rot.to(qk_dtype)
+            else:
+                q, k = q_rot, k_rot
+
+            q = q.view(bs, seq_len, n_q_heads, head_dim)
+            k = k.view(bs, seq_len, n_kv_heads, head_dim)
+            v = v.view(bs, seq_len, n_kv_heads, head_dim)
+
+            # Append K, V into dense cache at cache_pos .. cache_pos+seq_len.
+            kv_cache[layer_idx, :, 0, cache_pos:cache_pos + seq_len] = k
+            kv_cache[layer_idx, :, 1, cache_pos:cache_pos + seq_len] = v
+
+            # Read K, V for all positions up to and including the new tokens.
+            valid_len = cache_pos + seq_len
+            k_full = kv_cache[layer_idx, :, 0, :valid_len]
+            v_full = kv_cache[layer_idx, :, 1, :valid_len]
+
+            # SDPA expects (bs, n_heads, seq_len, head_dim).
+            q_sdpa = q.transpose(1, 2)
+            k_sdpa = k_full.transpose(1, 2)
+            v_sdpa = v_full.transpose(1, 2)
+
+            # GQA: repeat KV heads to match Q heads.
+            if n_groups > 1:
+                k_sdpa = k_sdpa.repeat_interleave(n_groups, dim=1)
+                v_sdpa = v_sdpa.repeat_interleave(n_groups, dim=1)
+
+            # is_causal=True for the 2-token prefill so the first token only
+            # attends to itself; is_causal=False for single-token decode
+            # where the lone query implicitly attends to all valid past K/V.
+            attn_out = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa, is_causal=(seq_len > 1),
+            )
+            attn_out = attn_out.transpose(1, 2).reshape(bs, seq_len, -1).contiguous()
+            hidden_states = residual + attn.o_proj(attn_out)
+
+            # Post-attention RMSNorm + dense MLP.
+            residual = hidden_states
+            hs_flat = run_rms_norm(
+                hidden_states.view(-1, hidden_size),
+                layer.post_attention_layernorm.weight,
+                eps=layer.post_attention_layernorm.variance_epsilon,
+            )
+            hidden_states = hs_flat.view(bs, seq_len, hidden_size)
+            hidden_states = layer.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+
+        # Final norm.
+        hs_flat = run_rms_norm(
+            hidden_states.view(-1, hidden_size),
+            self.model.norm.weight,
+            eps=self.model.norm.variance_epsilon,
+        )
+        hidden_states = hs_flat.view(bs, seq_len, hidden_size)
+        return hidden_states
