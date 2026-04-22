@@ -1614,25 +1614,27 @@ class Code2WavSubmodule(NodeSubmodule):
         """Run the streaming vocoder with per-request left-context trim.
 
         The Talker→Code2Wav StreamBuffer uses ``LeftContextChunkPolicy``:
-        the first popped chunk for a request contains ``chunk_size`` fresh
-        frames with no overlap; every subsequent chunk contains
-        ``chunk_size + left_context_size`` frames where the leading
-        ``left_context_size`` are overlap from the previous chunk's tail.
-        The overlap lets the causal ConvNet warm up its state at chunk
-        boundaries; the corresponding waveform samples must be trimmed from
-        the emitted audio (they were already emitted by the previous chunk).
+        the first popped chunk for a request contains ``codec_chunk_frames``
+        fresh frames with no overlap; every subsequent chunk contains
+        ``codec_chunk_frames + codec_left_context_frames`` frames where the
+        leading ``codec_left_context_frames`` are overlap from the previous
+        chunk's tail. The overlap lets the causal ConvNet warm up its state
+        at chunk boundaries; the corresponding waveform samples must be
+        trimmed from the emitted audio (they were already emitted by the
+        previous chunk).
 
         We delegate to ``Qwen3OmniCode2Wav.chunked_decode_streaming`` with a
         per-request context list derived from ``_first_chunk_emitted`` --
-        ``0`` for any request that has not yet emitted, ``config.left_context_size``
-        otherwise. ``_first_chunk_emitted`` is updated in ``postprocess``
-        after the chunk is handed off downstream.
+        ``0`` for any request that has not yet emitted,
+        ``config.codec_left_context_frames`` otherwise. After each request's
+        chunk is converted to int16 PCM, ``_first_chunk_emitted`` is updated
+        inline so the next chunk for the same request trims correctly.
         """
         codec_tokens = packed_inputs.get("codec_tokens")
         if codec_tokens is None or codec_tokens.numel() == 0:
             return {rid: {} for rid in request_ids}
 
-        cfg_ctx = self.config.code2wav.left_context_size
+        cfg_ctx = self.config.code2wav.codec_left_context_frames
         left_context_size = [
             0 if rid not in self._first_chunk_emitted else cfg_ctx
             for rid in request_ids
@@ -1644,8 +1646,9 @@ class Code2WavSubmodule(NodeSubmodule):
 
         results: dict[str, NameToTensorList] = {}
         for rid, wav in zip(request_ids, wavs, strict=True):
-            audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
+            audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16).squeeze()
             results[rid] = {"audio_chunk": [audio_int16]}
+            self._first_chunk_emitted.add(rid)
         return results
 
     def forward(
@@ -1666,19 +1669,6 @@ class Code2WavSubmodule(NodeSubmodule):
         audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": [audio_int16]}
 
-    def postprocess(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs
-    ):
-        if "audio_chunk" not in outputs or not outputs["audio_chunk"]:
-            return
-        outputs["audio_chunk"][0] = outputs["audio_chunk"][0].squeeze()
-        if request_id is not None:
-            self._first_chunk_emitted.add(request_id)
-
     def can_batch(self, batch: NodeBatch) -> bool:
         return len({
             inputs["codec_tokens"][0].numel() for inputs in batch.per_request_input_tensors.values()
@@ -1688,7 +1678,7 @@ class Code2WavSubmodule(NodeSubmodule):
     # transformers module. Until code2wav becomes a bottleneck, making this eager mode for now
     # def can_use_cuda_graphs(self, batch):
     #     total_numel = self.config.num_code_groups * (
-    #         self.config.code2wav.left_context_size + self.config.code2wav.chunk_size
+    #         self.config.code2wav.codec_left_context_frames + self.config.code2wav.codec_chunk_frames
     #     )
     #     return all([
     #         inputs["codec_tokens"][0].numel() == total_numel for inputs in batch.per_request_input_tensors.values()
@@ -1702,7 +1692,7 @@ class Code2WavSubmodule(NodeSubmodule):
     #             dummy_capture_inputs=[{
     #                 "codec_tokens": [
     #                     torch.zeros(
-    #                         (self.config.code2wav.left_context_size + self.config.code2wav.chunk_size, self.config.num_code_groups),
+    #                         (self.config.code2wav.codec_left_context_frames + self.config.code2wav.codec_chunk_frames, self.config.num_code_groups),
     #                         dtype=torch.long, device=device
     #                     ),
     #                 ],
