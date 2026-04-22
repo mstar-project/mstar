@@ -25,6 +25,7 @@ from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.code_predictor_engine import CodePredictorCudaGraphRunner, CodePredictorSubmodule
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
+from mminf.engine.kv_store import PositionInfo
 from mminf.model.base import NodeSubmodule
 from mminf.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
@@ -35,6 +36,7 @@ from mminf.model.qwen3_omni.components.rope import (
 )
 from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor, Qwen3OmniTalkerModel
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig
+from mminf.model.submodule_base import ModelInputsFromEngine, NodeInputs
 from mminf.utils.sampling import Sampler
 
 logger = logging.getLogger(__name__)
@@ -59,33 +61,28 @@ class AudioEncoderSubmodule(NodeSubmodule):
         super().__init__()
         self.audio_encoder = audio_encoder
         self.config = config
-
-    def preprocess(
+    
+    def prepare_inputs(
         self,
         graph_walk: str,
-        cache_manager: BatchedCacheManager | None = None,
-        per_request_inputs: list[NameToTensorList] | None = None,
-        request_ids: list[str] | None = None,
-        per_request_info: dict[str, CurrentForwardPassInfo] | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Extract mel spectrograms from inputs and pad for the encoder."""
-        assert len(per_request_inputs) == 1, (
-            "AudioEncoder processes one request at a time"
-        )
-        inputs = per_request_inputs[0]
-
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> NodeInputs:
         # Edge name from graph walk is "audio_features"
         audio_features = inputs["audio_features"][0]
         audio_seqlens = inputs.get("audio_seqlens", [None])[0]
 
-        return {
-            "audio_features": audio_features,
-            "audio_seqlens": audio_seqlens,
-        }
+        return NodeInputs(
+            tensor_inputs={
+                "audio_features": audio_features,
+                "audio_seqlens": audio_seqlens,
+            }
+        )
 
     def forward(
         self,
-        request_info: CurrentForwardPassInfo,
+        engine_inputs: ModelInputsFromEngine,
         audio_features: torch.Tensor,
         audio_seqlens: Optional[torch.Tensor] = None,
         **kwargs,
@@ -110,9 +107,6 @@ class AudioEncoderSubmodule(NodeSubmodule):
             audio_embeds = audio_embeds.squeeze(0)
 
         return {"audio_embeds": [audio_embeds]}
-
-    def can_batch(self, batch: NodeBatch) -> bool:
-        return False
 
 
 # ===================================================================

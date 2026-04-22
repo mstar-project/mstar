@@ -25,6 +25,7 @@ from torch import nn
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
+from mminf.model.submodule_base import CudaGraphConfig
 from mminf.utils.profiler import range_pop, range_push
 from mminf.utils.sampling import Sampler
 
@@ -38,22 +39,6 @@ DEFAULT_AR_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 class DummyCaptureInput:
     tensors: dict[str, list[torch.Tensor]]  # {tensor_name: [tensor(s)]}
     seq_len: int | None = field(default=None)
-
-
-@dataclass
-class CudaGraphConfig:
-    """Defines what computation a captured graph represents."""
-    graph_walk: str  # "decode"
-    dummy_capture_inputs: list[DummyCaptureInput]
-    requires_cfg: bool  = False # whether CFG is active
-    labels: list[str]  = field(default_factory=lambda: ["main"]) # cache labels used: ["main"] or ["main", "cfg_img"]
-    compile: bool = True
-    # Per-config override for the set of batch sizes to capture. None → use the
-    # runner's default (AR engine default: DEFAULT_AR_CAPTURE_BATCH_SIZES;
-    # CodecCudaGraphRunner picks its own default). Useful for codec-style
-    # submodules where memory cost per size is high, or for AR walks where a
-    # small subset is enough.
-    capture_batch_sizes: list[int] | None = None
 
 
 @dataclass
@@ -288,6 +273,7 @@ class CudaGraphRunner:
             # Build per-request metadata
             dummy_metadata = {
                 rid: CurrentForwardPassInfo(
+                    request_id=rid,
                     graph_walk=config.graph_walk,
                     requires_cfg=config.requires_cfg,
                     fwd_index=0,
@@ -862,6 +848,7 @@ class CodecCudaGraphRunner:
         dummy_inputs = [self._clone_template(template) for _ in dummy_rids]
         dummy_info = {
             rid: CurrentForwardPassInfo(
+                request_id=rid,
                 graph_walk=config.graph_walk,
                 requires_cfg=False,
                 fwd_index=0,

@@ -295,7 +295,7 @@ def main():
         from mminf.conductor.request_info import CurrentForwardPassInfo
         info = CurrentForwardPassInfo(
             graph_walk="prefill", requires_cfg=False, fwd_index=0, random_seed=0,
-            sampling_config={}
+            sampling_config={}, request_id="r0"
         )
         prep = vit_submodule.preprocess(
             graph_walk="prefill",
