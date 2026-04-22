@@ -66,6 +66,13 @@ class KVCacheConfig:
         return "///".join(self.nodes)
 
 
+
+@dataclass
+class PositionInfo:
+    full_seq_len: int = 0
+    position_id_start: int = 0
+
+
 @dataclass
 class KVRequestState:
     """Per-request KV cache state for the AR engine."""
@@ -77,6 +84,12 @@ class KVRequestState:
 
     # sequence length of the in-distributed-store KV cache
     is_paused: bool = False
+
+    def get_pos_info(self):
+        return PositionInfo(
+            full_seq_len=self.seq_len,
+            position_id_start=self.position_id_start
+        )
 
 
 LabelToState = dict[str, KVRequestState]

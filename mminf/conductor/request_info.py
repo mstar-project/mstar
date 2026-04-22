@@ -60,6 +60,7 @@ class CurrentForwardPassInfo:
     Information that is passed into the worker / engines about this request
     at the current forward pass
     """
+    request_id: str
     graph_walk: str
     requires_cfg: bool
     fwd_index: int

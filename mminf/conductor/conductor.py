@@ -511,6 +511,7 @@ class Conductor:
                     worker_graph_to_worker=worker_graph_to_worker,
                     initial_inputs=inputs_per_worker.get(worker_id, []),
                     request_info=CurrentForwardPassInfo(
+                        request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
                         step_metadata=fwd_args.step_metadata,
                         fwd_index=pstate.fwd_pass_number,
@@ -745,6 +746,7 @@ class Conductor:
                     request_id=request_id,
                     inputs=inputs,
                     request_info=CurrentForwardPassInfo(
+                        request_id=request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
                         step_metadata=fwd_args.step_metadata,
                         fwd_index=pstate.fwd_pass_number,
@@ -783,6 +785,7 @@ class Conductor:
                     request_id=request_id,
                     inputs=[],
                     request_info=CurrentForwardPassInfo(
+                        request_id=request_id,
                         graph_walk=pstate.metadata.graph_walk or "",
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,

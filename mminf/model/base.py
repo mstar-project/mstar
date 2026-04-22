@@ -9,13 +9,9 @@ import yaml
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import (
     CurrentForwardConductorMetadata,
-    CurrentForwardPassInfo,
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mminf.engine.base import EngineType, NodeBatch
-from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import (
     DynamicLoop,
@@ -37,110 +33,6 @@ MAX_OUTPUT_TOKENS = 2048
 class TensorAndMetadata:
     data: torch.Tensor
     metadata: dict = field(default_factory=dict)
-
-
-class NodeSubmodule(torch.nn.Module):
-    """
-    Base class for node wrapper submodules.
-
-    Separates preprocessing (variable-length list[Tensor] → fixed Tensor)
-    from computation (Tensor → NameToTensorList), enabling torch.compile
-    and CUDA graphs on the forward() path.
-
-    Engine call pattern:
-        preprocessed = submodule.preprocess(graph_walk, **inputs)  # list → tensors
-        result = submodule(**preprocessed)                     # tensor → tensor (compilable)
-    """
-
-    def preprocess(
-        self,
-        graph_walk: str,
-        cache_manager: BatchedCacheManager,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> dict[str, torch.Tensor]:  # input name to tensor
-        """
-        Convert variable-length list[Tensor] inputs to fixed tensors.
-        NOT compiled — handles Python-level variability.
-
-        Returns a dict of input name to batched tensor.
-
-        Default: assume one request.
-        assert each input has exactly 1 tensor and unwrap it.
-        Override for nodes that handle multiple tensors (e.g., stacking images).
-        """
-        return {k: v[0] for k, v in per_request_inputs[0].items()}
-
-    def get_needed_cache_labels(
-        self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo]
-    ) -> list[str] | None:
-        """Return cache labels this node needs, or None to retrieve all.
-
-        Used by AREngine to skip redundant KV cache transfers.
-        Override in subclasses that only need a subset of available labels.
-        """
-        return None
-
-    @abstractmethod
-    def forward(self, request_info: CurrentForwardPassInfo, **kwargs) -> NameToTensorList:
-        """
-        Pure tensor → NameToTensorList computation.
-        Compilable + CUDA-graphable.
-        """
-        ...
-
-    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
-        """TODO: add cuda graph support for pi05."""
-        return []
-
-    def can_use_cuda_graphs(self, batch: NodeBatch) -> bool:
-        """Return True if this submodule supports CUDA graphs for ``batch``.
-
-        Default: derives from ``get_cuda_graph_configs`` — if the submodule
-        declared a capture for this batch's graph_walk, CUDA graphs are
-        supported. Subclasses can override to reject on batch shape /
-        metadata (e.g. codec submodules that need homogeneous frame counts).
-        """
-        if not hasattr(self, "_cached_cuda_graph_walks"):
-            self._cached_cuda_graph_walks = {
-                cfg.graph_walk for cfg in self.get_cuda_graph_configs(device=torch.device("cpu"))
-            }
-        return batch.graph_walk in self._cached_cuda_graph_walks
-
-    def can_batch(self, batch: NodeBatch):
-        return False
-
-    def postprocess(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs
-    ):
-        """
-        Performs any required postprocessing (after sampling from logits, if applicable)
-        on the submodule outputs (e.g., checking for EOS to stop the decode loop, as this
-        python-level control flow cannot happen in a cuda graph section).
-        """
-        return
-
-    def filter_batched_output(
-        self,
-        request_info: CurrentForwardPassInfo,
-        rid_output: dict[str, list[torch.Tensor]],
-    ) -> dict[str, list[torch.Tensor]]:
-        """Drop per-rid output keys that don't apply to this request.
-
-        Called AFTER ``forward_batched`` (or CUDA graph replay) for each
-        real request, OUTSIDE any captured region.  Submodules that
-        always emit a static set of keys for capture compatibility can
-        override this to drop keys on a per-request basis (e.g. the
-        Qwen3-Omni Thinker always emits ``thinker_states`` inside the
-        graph, then drops it here for requests that don't need audio).
-
-        Default: identity.
-        """
-        return rid_output
 
 
 @dataclass
