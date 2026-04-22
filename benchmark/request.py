@@ -84,6 +84,9 @@ class RequestMetrics:
     # Per-modality TTFT: e.g. {"text": 0.12, "audio": 0.34}
     ttft: dict[str, float] = field(default_factory=dict)
 
+    # used to compute ITL
+    last_token_latency: dict[str, float] = field(default_factory=dict)
+
     e2e_latency: Optional[float] = None
     error: Optional[str] = None
 
@@ -192,6 +195,7 @@ class RequestMetrics:
 
         if modality not in self.ttft:
             self.ttft[modality] = now - self.start_time
+        self.last_token_latency[modality] = now - self.start_time
 
         self.output_chunks[modality] = self.output_chunks.get(modality, 0) + 1
         self.output_bytes[modality] = self.output_bytes.get(modality, 0) + nbytes
@@ -233,8 +237,9 @@ class RequestMetrics:
         result = {}
         for modality, n_chunks in self.output_chunks.items():
             ttft = self.ttft.get(modality)
-            if ttft is not None and n_chunks > 1:
-                result[modality] = (self.e2e_latency - ttft) / (n_chunks - 1)
+            ttlt = self.last_token_latency.get(modality)
+            if ttft is not None and ttlt is not None and n_chunks > 1:
+                result[modality] = (ttlt - ttft) / (n_chunks - 1)
         return result
 
     @property
@@ -278,6 +283,8 @@ class AggregateMetrics:
     rate: Optional[float] = None
 
     def __str__(self) -> str:
+        if not self.ttft:
+            return "ERROR: benchmark produced no results."
         if self.online:
             header = f"Online Benchmark Results ({self.n_requests} requests, rate={self.rate} req/s)"
         else:

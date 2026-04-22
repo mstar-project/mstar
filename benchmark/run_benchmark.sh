@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Source .env without overriding env vars set on the command line
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="$SCRIPT_DIR/../test/bagel/.env"
+ENV_FILE="$SCRIPT_DIR/../.env"
 if [ -f "$ENV_FILE" ]; then
     while IFS='=' read -r key value; do
         key="${key%%[[:space:]]*}"
@@ -25,7 +25,7 @@ python -m benchmark.runner \
     --profiling-type "${PROF_TYPE:-offline}" \
     --request-type "${TASK:-text_to_image}" \
     --vbench-cache-dir "$VBENCH_CACHE_DIR" \
-    --local-cache "$BENCMARK_LOCAL_DIR" \
+    --local-cache "$BENCHMARK_LOCAL_DIR" \
     --num-requests "${NUM_REQUESTS:-10}" \
     --inference-system "${INF_SYS:-ours}" \
     --num-warmup "${WARMUP:-3}" \
