@@ -82,6 +82,7 @@ class AudioEncoderSubmodule(NodeSubmodule):
 
     def forward(
         self,
+        graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         audio_features: torch.Tensor,
         audio_seqlens: Optional[torch.Tensor] = None,
@@ -168,6 +169,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
 
     def forward(
         self,
+        graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         pixel_values: torch.Tensor,
         grid_thw: torch.Tensor,
@@ -346,12 +348,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        pos_info: PositionInfo | None
+        pos_info: dict[str, PositionInfo] = {}
     ) -> ARNodeInputs:
         device = self.device
-        assert pos_info is not None, (
-            "ThinkerSubmodule must be in an engine that provides pos_info"
-        )
+        start_pos = pos_info.get("main", PositionInfo()).position_id_start
         if graph_walk == "thinker_decode":
             # Get previous token ID from text_inputs
             token_id = inputs["text_inputs"][0].to(device)  # (1,) or scalar
@@ -362,9 +362,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # Next MRoPE position for all 3 components: read from the
             # per-request cache-manager state (kept in sync by the
             # post-forward ``advance_seq_lens`` call in ``thinker.py``).
-            next_pos = float(pos_info.position_id_start)
             pos_ids = torch.tensor(
-                [[next_pos], [next_pos], [next_pos]],
+                [[start_pos], [start_pos], [start_pos]],
                 dtype=torch.float,
                 device=device,
             )  # (3, 1)
@@ -390,8 +389,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # ``start_pos`` is the next MRoPE position for this request,
             # carried forward across walks by ``state.position_id_start``
             # (advanced post-forward by ``advance_seq_lens``).
-            start_pos = float(pos_info.position_id_start)
-
             pos_ids = get_rope_index_text(seq_len, start_pos, device)
             masks_for_talker = torch.stack([
                 torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
@@ -419,8 +416,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
             wrapped_embeds = self._wrap_audio_input(audio_embeds)
             seq_len = audio_len + 2
-            start_pos = float(pos_info.position_id_start)
-
             # Position IDs:
             #   - audio_start_token: text-like position at start_pos
             #   - audio tokens:      temporal increments per frame,
@@ -461,8 +456,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
             wrapped_embeds = self._wrap_vision_input(vision_embeds)            
             total_len = vision_len + 2
-            start_pos = float(pos_info.position_id_start)
-
             # Vision tokens use spatial 3D positions (temporal constant,
             # h/w from the spatial grid after merging).  If a proper
             # ``image_grid_thw`` is available, use ``get_rope_index_vision``;
@@ -540,6 +533,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         # Plan FlashInfer attention and rope for the main cache label
         cache_manager = engine_inputs.cache_manager
+        cache_manager.set_active_label("main")
         assert cache_manager is not None
         cache_manager.plan_attention(
             seq_lens=seq_lens, is_causal=True, label="main"
@@ -548,13 +542,15 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         extra_inputs = {}
         if graph_walk == "prefill_vision":
-            extra_inputs["deepstack"] = [
-                inp.tensor_inputs.get("deepstack", torch.tensor([])) for inp in inputs
+            assert len(inputs) == 0, \
+                "Batching not implemented for Thinker vision prefill"
+            inp = inputs[0]
+            extra_inputs["deepstack"] = inp.tensor_inputs.get("deepstack", torch.tensor([]))
+            extra_inputs["visual_pos_masks"] = inp.tensor_inputs.get(
+                "visual_pos_masks", torch.tensor([])).unsqueeze(0)
+            extra_inputs["mrope_pos_advance"] = [
+                inp.tensor_inputs.get("mrope_pos_advance", 0)
             ]
-            extra_inputs["visual_pos_masks"] = torch.cat([
-                inp.tensor_inputs.get("visual_pos_masks", torch.tensor([])).unsqueeze(0) \
-                    for inp in inputs
-            ], dim=0)
 
         return {
             "input_embeds": input_embeds,
@@ -573,9 +569,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
     def forward(
         self,
-        request_info: CurrentForwardPassInfo,
-        graph_walk: str = "",
-        cache_handle: BatchedCacheManager | None = None,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor | None = None,
         cos_3d: torch.Tensor | None = None,
         sin_3d: torch.Tensor | None = None,
@@ -594,25 +589,16 @@ class ThinkerSubmodule(ARNodeSubmodule):
         ``True`` for backwards compatibility with callers that do not set
         the flag (e.g. unit tests).
         """
-        cache_handle.set_active_label("main")
-
-        if deepstack is not None:
-            # deepstack was a list of lists...
-            deepstack = deepstack[0]
-
-        # Default True for backwards-compat (tests, text-only callers that
-        # forgot to set the flag still get the old behaviour).
-        audio_output = True
-        if request_info is not None:
-            audio_output = request_info.step_metadata.get(
-                "audio_output", True,
-            )
+        request_info = engine_inputs.single_request_info
+        audio_output = request_info.step_metadata.get(
+            "audio_output", True,
+        )
 
         cos_sin_3d = (cos_3d, sin_3d) if cos_3d is not None else None
 
         hidden, layer_0_embed, layer_n_hidden = self.model(
             input_embeds=input_embeds,
-            cache_handle=cache_handle,
+            cache_handle=engine_inputs.cache_manager,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
             mrope_pos_advance=mrope_pos_advance,
@@ -646,11 +632,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
             result["thinker_states"] = [thinker_states]
             result["thinker_mask"] = [next(iter(masks_for_talker.values()))] \
                 if masks_for_talker else []
-
         return result
 
     # ---- batching ----
-
     def can_batch(self, batch: NodeBatch) -> bool:
         return batch.graph_walk == "thinker_decode"
 
@@ -671,36 +655,26 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 graph_walk="thinker_decode",
                 requires_cfg=False,
                 labels=["main"],
-                dummy_capture_inputs=[{
-                    "text_inputs": [
-                        torch.zeros(1, dtype=torch.long, device=device),
-                    ],
-                }],
+                dummy_capture_inputs=[ARNodeInputs(
+                    input_seq_len=1,
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device)
+                )],
                 compile=True,
                 capture_batch_sizes=[1, 2, 4, 8, 16],
-            ),
-            CudaGraphConfig(
-                graph_walk="prefill_text",
-                requires_cfg=False,
-                labels=["main"],
-                dummy_capture_inputs=[{
-                    "text_inputs": [
-                        torch.zeros(seq_len, dtype=torch.long, device=device),
-                    ],
-                } for seq_len in [64, 128, 256, 512, 1024]],
-                compile=True,
-                capture_batch_sizes=[1, 2, 4, 8, 16],
-            ),
+            )
         ],
 
     def forward_batched(
         self,
         graph_walk: str,
-        request_ids: list[str],
-        cache_manager: BatchedCacheManager,
-        packed_inputs: dict[str, torch.Tensor],
-        per_request_info: dict | None = None,
-        per_request_metadata: dict | None = None,
+        engine_inputs: ModelInputsFromEngine,
+        input_embeds: torch.Tensor | None = None,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
+        mrope_section: list[int] | None = None,
+        mrope_pos_advance: list[int] | None = None,
+        masks_for_talker: dict[str, torch.Tensor] | None = None,
+        **kwargs,
     ) -> dict[str, NameToTensorList]:
         """Batched decode: multiple requests each contribute 1 token.
 
@@ -714,16 +688,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         """
         assert graph_walk == "thinker_decode"
 
-        input_embeds = packed_inputs["input_embeds"]  # (batch, hidden)
-        cos_3d = packed_inputs.get("cos_3d")
-        sin_3d = packed_inputs.get("sin_3d")
         cos_sin_3d = (cos_3d, sin_3d) if cos_3d is not None else None
-        mrope_section = packed_inputs.get("mrope_section")
-        mrope_pos_advance = packed_inputs.get("mrope_pos_advance")
-        masks_for_talker = packed_inputs.get("masks_for_talker")
-
-        cache_manager.set_active_label("main")
-
+        cache_manager = engine_inputs.cache_manager
         hidden, layer_0_embed, layer_n_hidden = self.model(
             input_embeds=input_embeds,
             cache_handle=cache_manager,

@@ -64,6 +64,11 @@ class ModelInputsFromEngine:
     per_request_info: dict[str, CurrentForwardPassInfo]
     cache_manager: BatchedCacheManager | None = None
 
+    @property
+    def single_request_info(self):
+        assert len(self.per_request_info) == 1
+        return self.per_request_info[self.request_ids[0]]
+
 
 class NodeSubmodule(torch.nn.Module):
     """
@@ -102,6 +107,7 @@ class NodeSubmodule(torch.nn.Module):
     @abstractmethod
     def forward(
         self,
+        graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         **kwargs # coming from preprocess output
     ) -> NameToTensorList:
@@ -113,6 +119,7 @@ class NodeSubmodule(torch.nn.Module):
 
     def forward_batched(
         self,
+        graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         **kwargs, # coming from preprocess output
     )  -> dict[str, NameToTensorList]: # request_id to tensors
