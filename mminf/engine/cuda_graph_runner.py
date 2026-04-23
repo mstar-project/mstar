@@ -931,7 +931,8 @@ class CodecCudaGraphRunner:
 
         return {
             rid: {
-                name: [static_output[dummy_rids[i]][name].clone()] \
-                    for name in static_output[dummy_rids[i]]
+                name: [
+                    tensor.clone() for tensor in static_output[dummy_rids[i]][name]
+                ] for name in static_output[dummy_rids[i]]
             } for i, rid in enumerate(request_ids)
         }
