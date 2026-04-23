@@ -441,7 +441,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             )
 
         if graph_walk == "prefill_vision":
-            vision_embeds = input["vision_embeds"][0].to(device)
+            vision_embeds = inputs["vision_embeds"][0].to(device)
             vision_len = vision_embeds.shape[0]
 
             mm_mask = torch.ones(vision_len + 2, dtype=torch.bool, device=device)
@@ -539,12 +539,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         extra_inputs = {}
         if graph_walk == "prefill_vision":
-            assert len(inputs) == 0, \
+            assert len(inputs) == 1, \
                 "Batching not implemented for Thinker vision prefill"
             inp = inputs[0]
             extra_inputs["deepstack"] = inp.tensor_inputs.get("deepstack", torch.tensor([]))
             extra_inputs["visual_pos_masks"] = inp.tensor_inputs.get(
-                "visual_pos_masks", torch.tensor([])).unsqueeze(0)
+                "visual_pos_masks", torch.tensor([]))
             extra_inputs["mrope_pos_advance"] = [
                 inp.tensor_inputs.get("mrope_pos_advance", 0)
             ]
@@ -668,8 +668,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     }
                 )],
                 compile=True,
-                # capture_batch_sizes=[1, 2, 4, 8, 16],
-                capture_batch_sizes=[1, 2], # TODO DEBUG
+                capture_batch_sizes=[1, 2, 4, 8, 16],
             )
         ]
 
@@ -1135,8 +1134,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
                     ),
                     input_seq_len=1
                 )],
-                # capture_batch_sizes=[1, 2, 4, 8, 16]
-                capture_batch_sizes=[1, 2], # TODO DEBUG
+                capture_batch_sizes=[1, 2, 4, 8, 16]
             )
         ]
     

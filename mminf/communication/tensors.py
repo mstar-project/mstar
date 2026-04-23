@@ -317,6 +317,7 @@ class TensorCommunicationManager(ABC):
         self.transfer_engine = transfer_engine
         self.tensor_store = TensorStore()
         self.pending: list[FutureAndPointers] = []
+        self.read_finished: dict[str, set[str]] = {}
 
     # ---- shared: store ----
 
@@ -447,7 +448,9 @@ class TensorCommunicationManager(ABC):
             self._collect_and_send_acks(req_id, edges)
             for edge in edges:
                 for info in edge.tensor_info:
-                    self.tensor_store.dereference(req_id, info.uuid, 1)
+                    if info.uuid not in self.read_finished.setdefault(req_id, set()):
+                        self.tensor_store.dereference(req_id, info.uuid, 1)
+                        self.read_finished[req_id].add(info.uuid)
         return ready
 
     # ---- shared: TensorStore delegation ----
@@ -469,6 +472,7 @@ class TensorCommunicationManager(ABC):
         self.tensor_store.increment_ref(request_id, uuid, n=n)
 
     def cleanup_request(self, request_id: str):
+        self.read_finished.pop(request_id, None)
         for uuid in self.tensor_store.get_all_uuids(request_id):
             self.tensor_store.set_metadata(request_id, uuid, persist=False)
             if not self.tensor_store.can_gc(request_id, uuid):

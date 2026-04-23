@@ -281,8 +281,7 @@ class CodePredictorCudaGraphRunner:
         # outputs = {"all_codes": [bs, n_codebooks], "codec_emb_sum": [bs, hidden]}
     """
 
-    # CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
-    CAPTURE_BATCH_SIZES = [1, 2] # TODO DEBUG
+    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
     def __init__(
         self,
@@ -496,8 +495,6 @@ class CodePredictorCudaGraphRunner:
 
         graph_data = self.graphs[padded_bs]
         graph_data.pos_id_slice.zero_()
-
-        print(inputs)
 
         # Build inputs to preprocess and forward_batched
         dummy_fwd_info = graph_data.dummy_fwd_info
