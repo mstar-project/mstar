@@ -589,10 +589,16 @@ class LLMSubmodule(ARNodeSubmodule):
             )
 
     def forward(
-        self, graph_walk: str, request_info: CurrentForwardPassInfo,
-        cache_handle=None, **kwargs
+        self, 
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine, 
+        **kwargs
     ) -> NameToTensorList:
+
+        request_info = engine_inputs.single_request_info
+        cache_handle = engine_inputs.cache_manager 
         kwargs.update(request_info.step_metadata)
+        
         logger.debug("Running BAGEL LLM for graph walk %s", graph_walk)
 
         if graph_walk == "prefill_text":
