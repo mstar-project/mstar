@@ -35,6 +35,10 @@ def run_rms_norm(
     elif torch.is_autocast_enabled():
         dtype = torch.get_autocast_gpu_dtype()
         input = input.to(dtype)
+    elif input.dtype == torch.float32:
+        # Unsupported dtype; must recast
+        input = input.to(torch.bfloat16)
+
     import flashinfer
     return flashinfer.norm.rmsnorm(
         input, weight, eps=eps

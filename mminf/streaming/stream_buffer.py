@@ -87,7 +87,7 @@ class StreamBuffer:
                 and buf_len == 0
                 and self.policy.continue_after_producer_done()):
             return True
-        return self.policy.is_ready(buf_len, self._consumed)
+        return self.policy.is_ready(buf_len)
 
     def pop_chunk(self) -> StreamChunk:
         """Pop the next chunk. Only call when has_chunk_ready() is True.
@@ -98,21 +98,23 @@ class StreamBuffer:
         """
         self._update_buffer()
         buf_len = len(self._buffer)
-        window = self.policy.window_size(self._consumed)
+        window = self.policy.window_size()
         offset = self._consumed  # global position of buffer[0]
 
-        if self._producer_done_and_all_read() and not self.policy.is_ready(buf_len, self._consumed):
+        if self._producer_done_and_all_read() and not self.policy.is_ready(buf_len):
             # Flush remainder — return whatever is left (may be empty)
             items = list(self._buffer)
             self._buffer.clear()
             self._consumed += len(items)
+            stride = len(items)
         else:
-            stride = self.policy.next_chunk_size(buf_len, self._consumed)
+            stride = self.policy.next_chunk_size(buf_len)
             # Return the first `window` items (overlapping sliding window)
             items = self._buffer[:window]
             # Advance by stride — discard items that fell out of the window
             self._buffer = self._buffer[stride:]
             self._consumed += stride
+        self.policy.register_chunk(stride)
 
         is_final = self._producer_done_and_all_read() and len(self._buffer) == 0
         # When continue_after_producer_done, never mark as final — the

@@ -52,11 +52,10 @@ def main():
     parser.add_argument("--text", default="Hello, how are you doing today?", help="Text to synthesize")
     parser.add_argument("--voice", default="ethan", help="Voice name")
     parser.add_argument("--output", default="output.wav", help="Output WAV file path")
-    parser.add_argument("--port", type=int, default=20001, help="Port number to connect to (localhost only)")
     args = parser.parse_args()
 
-    # Always construct the URL with localhost and user-specified port
-    args.url = f"http://127.0.0.1:{args.port}/generate"
+    from _env import get_server_url
+    args.url = get_server_url()
 
     print(f"Text:  {args.text}")
     print(f"Voice: {args.voice}")

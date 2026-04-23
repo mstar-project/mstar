@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import torch
 
@@ -450,7 +450,9 @@ class AREngine(BaseEngine):
                 if self.enable_nvtx:
                     range_push("ar.sampler_config", synchronize=True)
                 for rid, info in batch.per_request_info.items():
-                    submod_mgmt.sampler.set_config(rid, **info.step_metadata)
+                    sampling_config = info.sampling_config.get(batch.node_name)
+                    sampling_config = {} if sampling_config is None else asdict(sampling_config) 
+                    submod_mgmt.sampler.set_config(rid, **sampling_config)
                 if self.enable_nvtx:
                     range_pop(synchronize=True)
 
@@ -483,6 +485,7 @@ class AREngine(BaseEngine):
                                     range_pop(synchronize=True)
                         for rid, info in batch.per_request_info.items():
                             submodule.postprocess(
+                                request_id=rid,
                                 request_info=info,
                                 outputs=output.per_request_output_tensors.get(rid, {})
                             )

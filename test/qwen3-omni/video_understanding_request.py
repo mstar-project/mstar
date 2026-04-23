@@ -7,7 +7,10 @@ from pathlib import Path
 
 import requests
 
-URL = "http://localhost:20001/generate"
+from _env import get_server_url
+
+
+URL = get_server_url()
 IMAGE_PATH = "test/qwen3-omni/video.webm"
 
 

@@ -294,7 +294,8 @@ def main():
         # NOTE: passing already-[-1,1] images so _preprocess_one's auto-detect leaves them alone.
         from mminf.conductor.request_info import CurrentForwardPassInfo
         info = CurrentForwardPassInfo(
-            graph_walk="prefill", requires_cfg=False, fwd_index=0, random_seed=0
+            graph_walk="prefill", requires_cfg=False, fwd_index=0, random_seed=0,
+            sampling_config={}
         )
         prep = vit_submodule.preprocess(
             graph_walk="prefill",

@@ -36,6 +36,7 @@ from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
 from mminf.streaming.chunk_policy import SlidingWindowChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mminf.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -258,9 +259,6 @@ class OrpheusModel(Model):
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
         step_metadata = {
             "is_prefill": metadata.is_prefill,
-            "temperature": self.config.temperature,
-            "top_p": self.config.top_p,
-            "repetition_penalty": self.config.repetition_penalty,
         }
 
         return ForwardPassArgs(
@@ -349,9 +347,6 @@ class OrpheusModel(Model):
                 unpersist_tensors=unpersist_tensors,
                 step_metadata={
                     "is_prefill": True,
-                    "temperature": self.config.temperature,
-                    "top_p": self.config.top_p,
-                    "repetition_penalty": self.config.repetition_penalty,
                 },
             )
         elif partition_name == "SNAC":
@@ -369,6 +364,18 @@ class OrpheusModel(Model):
                 unpersist_tensors=[],
             )
         raise ValueError(f"Unknown partition: {partition_name!r}")
+    
+    def get_sampling_config(
+        self, node_name: str,
+        model_kwargs: dict | None = None,
+    )  -> SamplingConfig | None:
+        keys = [
+            "temperature", "top_p", "repetition_penalty"
+        ]
+        params = {k: getattr(self.config, k) for k in keys}
+        return SamplingConfig(
+            **params
+        )
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
@@ -378,6 +385,7 @@ class OrpheusModel(Model):
         self,
         output: torch.Tensor,
         modality: str,
+        **kwargs
     ) -> bytes:
         if modality == "audio":
             if output.numel() == 0:

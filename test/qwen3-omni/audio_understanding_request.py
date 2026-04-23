@@ -6,8 +6,10 @@ import sys
 from pathlib import Path
 
 import requests
+from _env import get_server_url
 
-URL = "http://localhost:20001/generate"
+
+URL = get_server_url()
 AUDIO_PATH = "test/qwen3-omni/audio.wav"
 
 

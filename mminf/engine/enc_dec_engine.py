@@ -133,6 +133,7 @@ class EncoderDecoderEngine(BaseEngine):
                         output = self._execute_sequential(batch, submodule)
                     for rid, info in batch.per_request_info.items():
                         submodule.postprocess(
+                            request_id=rid,
                             request_info=info,
                             outputs=output.per_request_output_tensors.get(rid, {})
                         )

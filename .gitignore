@@ -13,7 +13,7 @@ profiler/
 traces/
 
 # per-user env config
-test/bagel/.env
+.env
 
 # output filenames
 output.png

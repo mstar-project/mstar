@@ -41,7 +41,7 @@ class ZMQCommunicator(BaseCommunicator):
         ipc_socket_path_prefix: str="/tmp/mminf/",
         # TODO: for TCP
     ):
-        self.context = zmq.Context()
+        self.context = zmq.Context.instance()
         transport = os.getenv("MMINF_ZMQ_TRANSPORT", protocol.value).upper()
         self.protocol = CommProtocol(transport)
         self.pull_socket = self.context.socket(zmq.PULL)

@@ -438,22 +438,22 @@ class Loop(GraphSection):
     # (e.g., autoregressive rollout that emits H predictions).
     # Must be disjoint from ``outputs`` by name.
     accumulated_outputs: list[GraphEdge] = field(default_factory=list)
-    curr_iter: int = field(default=0)
-    _external_inputs: list[GraphEdge] = field(default=None)
-    _loop_back_signals: list[GraphEdge] = field(default=None)
-    _curr_iter_section: GraphSection = field(default=None)
-    _nxt_iter_section: GraphSection = field(default=None)
-    _cached_outputs: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
-    _accumulated_cache: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
-    _output_names: set[str] = field(default_factory=set)
-    _accumulated_output_names: set[str] = field(default_factory=set)
-    _uuid_label: str = field(default_factory=lambda: str(uuid4()))
+    curr_iter: int = field(default=0, repr=False)
+    _external_inputs: list[GraphEdge] = field(default=None, repr=False)
+    _loop_back_signals: list[GraphEdge] = field(default=None, repr=False)
+    _curr_iter_section: GraphSection = field(default=None, repr=False)
+    _nxt_iter_section: GraphSection = field(default=None, repr=False)
+    _cached_outputs: dict[str, list[TensorPointerInfo]] = field(default_factory=dict, repr=False)
+    _accumulated_cache: dict[str, list[TensorPointerInfo]] = field(default_factory=dict, repr=False)
+    _output_names: set[str] = field(default_factory=set, repr=False)
+    _accumulated_output_names: set[str] = field(default_factory=set, repr=False)
+    _uuid_label: str = field(default_factory=lambda: str(uuid4()), repr=False)
 
     # For handling tensor reference counting of loop outputs
-    _tensor_manager: Any | None = field(default=None)  # no type annotation because
+    _tensor_manager: Any | None = field(default=None, repr=False)  # no type annotation because
     # of circular imports
-    _request_id: str | None = field(default=None)
-    _waiting_for_execution: set[str] = field(default_factory=set)
+    _request_id: str | None = field(default=None, repr=False)
+    _waiting_for_execution: set[str] = field(default_factory=set, repr=False)
 
     def get_outputs(self):
         return self.outputs

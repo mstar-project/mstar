@@ -331,6 +331,7 @@ class APIServer:
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
+                    time.sleep(0.01)
             time.sleep(0.001)
 
     # ----------------------------------------------------------
@@ -419,7 +420,6 @@ class APIServer:
         self.running = False
         if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
             self._msg_thread.join(timeout=2)
-
 
 # ------------------------------------------------------------------
 # FastAPI application

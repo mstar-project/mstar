@@ -57,6 +57,8 @@ qwen3_omni = [
     "torchaudio",
     "torchcodec",
     "transformers",
+    "datasets",
+    "sgl-kernel",
 ]
 
 [tool.setuptools.packages.find]

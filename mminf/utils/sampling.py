@@ -415,3 +415,54 @@ def _to_tensor(
     if isinstance(value, torch.Tensor):
         return value.to(device=device, dtype=dtype).reshape(-1)
     return torch.full((batch_size,), value, device=device, dtype=dtype)
+
+
+# ---------------------------------------------------------------------------
+# Graph-safe depth sampler
+# ---------------------------------------------------------------------------
+#
+# Reads top_k / top_p / temperature from preallocated device tensors so the
+# call can sit inside a CUDA graph capture region without allocating, syncing,
+# or branching on CPU-side values. The full ``Sampler`` class is *not* graph
+# capturable (repetition-penalty state, ``@torch.compiler.disable``, the CPU
+# stream sync inside ``sample_tokens``), so the unrolled MTP loop uses this
+# narrower path. ``deterministic=True`` disables the CPU-RNG-seeded path that
+# FlashInfer would otherwise take.
+
+
+def sample_depth_gpu(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
+) -> torch.Tensor:
+    """Deterministic per-batch top-k/top-p sampling for graph-captured code.
+
+    Uses ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` with
+    ``deterministic=True`` -- the graph-safe variant that avoids CPU-seeded
+    RNG paths (those require a CPU sync to pull a random offset). Callers
+    encode greedy requests as ``(temperature=1.0, top_k=1)`` so this
+    function never needs to branch on CPU values.
+
+    Args:
+        logits: ``[batch_size, vocab_size]`` raw logits from the codebook head.
+        temperature: ``[batch_size]`` float tensor.
+        top_k: ``[batch_size]`` int32 tensor. Use ``vocab_size`` to disable.
+        top_p: ``[batch_size]`` float tensor. Use ``1.0`` to disable.
+
+    Returns:
+        ``[batch_size]`` int64 sampled token IDs. FlashInfer's default
+        output is int32; we cast to int64 so the caller can index
+        ``nn.Embedding`` modules (which require int64 indices) directly.
+    """
+    import flashinfer
+
+    scaled = logits / temperature.unsqueeze(-1).to(logits.dtype)
+    probs = torch.softmax(scaled, dim=-1)
+    samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        probs, top_k, top_p, deterministic=True,
+        seed=seed, offset=offset
+    )
+    return samples.to(torch.int64)

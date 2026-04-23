@@ -277,8 +277,19 @@ class Code2WavConfig:
     num_hidden_layers: int = 8
     upsample_rates: Tuple[int, ...] = (8, 5, 4, 3)
     upsampling_ratios: Tuple[int, ...] = (2, 2)
-    chunk_size: int = 300
-    left_context_size: int = 25
+    # Streaming chunk size (in codec frames) for the Talker→Code2Wav edge.
+    # 25 frames keeps TTFT low (~1s); matches vllm-omni's
+    # ``codec_chunk_frames=25`` default. ``codec_left_context_frames`` is the
+    # number of overlap frames prepended to non-first chunks by
+    # ``LeftContextChunkPolicy`` (warms up the causal ConvNet vocoder) and
+    # trimmed from the emitted waveform in ``Code2WavSubmodule``.
+    #
+    # Named with a ``codec_`` prefix to avoid collision with HF's
+    # ``Qwen3OmniMoeCode2WavConfig`` (which has no such field today but could
+    # add one; the HF method ``chunked_decode(chunk_size=...)`` also uses the
+    # same bare name with different semantics).
+    codec_chunk_frames: int = 25
+    codec_left_context_frames: int = 25
     attention_bias: bool = False
     attention_dropout: float = 0.0
     codebook_dim: int = 512

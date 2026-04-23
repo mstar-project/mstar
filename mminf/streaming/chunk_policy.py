@@ -3,14 +3,21 @@ from abc import ABC, abstractmethod
 
 class ChunkPolicy(ABC):
     """Determines when a StreamBuffer has enough items for the consumer node."""
+    def __init__(self):
+        self.first_chunk_read = False
+        self.items_consumed = 0
+    
+    def register_chunk(self, chunk_size: int):
+        self.first_chunk_read = True
+        self.items_consumed += chunk_size
 
     @abstractmethod
-    def is_ready(self, buffer_len: int, items_consumed: int) -> bool:
+    def is_ready(self, buffer_len: int) -> bool:
         """Return True if the buffer has enough items for a chunk."""
         ...
 
     @abstractmethod
-    def next_chunk_size(self, buffer_len: int, items_consumed: int) -> int:
+    def next_chunk_size(self, buffer_len: int) -> int:
         """Return the number of items to consume for the next chunk.
 
         Only called when is_ready() returns True.
@@ -19,7 +26,7 @@ class ChunkPolicy(ABC):
         ...
 
     @abstractmethod
-    def window_size(self, items_consumed: int) -> int:
+    def window_size(self) -> int:
         """Return the full window of items to include in the chunk.
 
         For non-overlapping policies, equals next_chunk_size.
@@ -55,16 +62,17 @@ class SlidingWindowChunkPolicy(ChunkPolicy):
     """
 
     def __init__(self, window: int, stride: int):
+        super().__init__()
         self._window = window
         self._stride = stride
 
-    def is_ready(self, buffer_len: int, items_consumed: int) -> bool:
+    def is_ready(self, buffer_len: int) -> bool:
         return buffer_len >= self._window
 
-    def next_chunk_size(self, buffer_len: int, items_consumed: int) -> int:
+    def next_chunk_size(self, buffer_len: int) -> int:
         return self._stride
 
-    def window_size(self, items_consumed: int) -> int:
+    def window_size(self) -> int:
         return self._window
 
 
@@ -91,24 +99,25 @@ class LeftContextChunkPolicy(ChunkPolicy):
     """
 
     def __init__(self, chunk: int, left_context: int):
+        super().__init__()
         self._chunk = chunk
         self._left_context = left_context
         self._window = chunk + left_context
 
-    def is_ready(self, buffer_len: int, items_consumed: int) -> bool:
-        if items_consumed == 0:
+    def is_ready(self, buffer_len: int) -> bool:
+        if not self.first_chunk_read:
             return buffer_len >= self._chunk
         return buffer_len >= self._window
 
-    def next_chunk_size(self, buffer_len: int, items_consumed: int) -> int:
+    def next_chunk_size(self, buffer_len: int) -> int:
         # First pop: advance by (chunk - left_context) so the tail of the
         # first chunk stays in the buffer as overlap for the next pop.
-        if items_consumed == 0:
+        if not self.first_chunk_read:
             return self._chunk - self._left_context
         return self._chunk
 
-    def window_size(self, items_consumed: int) -> int:
-        if items_consumed == 0:
+    def window_size(self) -> int:
+        if not self.first_chunk_read:
             return self._chunk
         return self._window
 
@@ -126,16 +135,17 @@ class FixedChunkPolicy(ChunkPolicy):
     """
 
     def __init__(self, chunk_size: int, continue_after_done: bool = False):
+        super().__init__()
         self._chunk_size = chunk_size
         self._continue_after_done = continue_after_done
 
-    def is_ready(self, buffer_len: int, items_consumed: int) -> bool:
+    def is_ready(self, buffer_len) -> bool:
         return buffer_len >= self._chunk_size
 
-    def next_chunk_size(self, buffer_len: int, items_consumed: int) -> int:
+    def next_chunk_size(self, buffer_len: int) -> int:
         return self._chunk_size
 
-    def window_size(self, items_consumed: int) -> int:
+    def window_size(self) -> int:
         return self._chunk_size
 
     def continue_after_producer_done(self) -> bool:

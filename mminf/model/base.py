@@ -27,6 +27,7 @@ from mminf.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
+from mminf.utils.sampling import SamplingConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -110,7 +111,12 @@ class NodeSubmodule(torch.nn.Module):
     def can_batch(self, batch: NodeBatch):
         return False
 
-    def postprocess(self, request_info: CurrentForwardPassInfo, outputs: dict[str, list[torch.Tensor]]):
+    def postprocess(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        **kwargs
+    ):
         """
         Performs any required postprocessing (after sampling from logits, if applicable)
         on the submodule outputs (e.g., checking for EOS to stop the decode loop, as this
@@ -358,6 +364,13 @@ class Model(ABC):
         share the same config, e.g., Bagel's LLM / LLM_cfg_text / LLM_cfg_img).
         """
         pass
+
+    def get_sampling_config(
+        self, node_name: str,
+        model_kwargs: dict | None = None,
+    )  -> SamplingConfig | None:
+        return SamplingConfig()
+        
 
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

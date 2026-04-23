@@ -2,7 +2,9 @@ import glob
 import json
 import os
 from abc import ABC, abstractmethod
+import wave
 
+import numpy as np
 import requests
 
 from benchmark.base import RequestType
@@ -52,15 +54,14 @@ class TxtFileDataset(BaseDataset):
         num_requests: int,
         req_type=RequestType.T2T
     ):
-        assert req_type in [
-            RequestType.T2T, RequestType.T2I
-        ]
+        assert req_type.get_input_modalities() == "text"
+
         self.items = []
         self._num_requests = num_requests
         with open(filename, "r") as f:
             for line in f.readlines():
                 self.items.append(RequestInput(
-                    req_type=RequestType.T2T,
+                    req_type=req_type,
                     prompt=line.strip()
                 ))
         self.items = self._resize_data(self.items)
@@ -76,7 +77,7 @@ class TxtFileDataset(BaseDataset):
         return self.items[idx]
 
 
-UND_PROMPT = "Describe this image in detail."
+VBENCH_UND_PROMPT = "Describe this image in detail."
 
 
 class VBenchDataset(BaseDataset):
@@ -100,7 +101,7 @@ class VBenchDataset(BaseDataset):
     ):
         self.cache_dir = cache_dir
         self.task = task
-        self._num_requests = num_requests
+        self._num_requests = nusm_requests
         self.items = self._load_data()
         self.items = self._resize_data(self.items)
 
@@ -111,7 +112,7 @@ class VBenchDataset(BaseDataset):
     def _load_data(self) -> list[RequestInput]:
         if self.task == RequestType.T2I:
             return self._load_t2v_prompts()
-        elif self.task in [RequestType.I2I, RequestType.I2T]:
+        elif self.task.get_input_modalities() == "image":
             return self._load_i2v_data()
         else:
             raise NotImplementedError(
@@ -221,7 +222,7 @@ class VBenchDataset(BaseDataset):
                     req_type=self.task,
                     prompt=item.get("caption", "") \
                         if self.task == RequestType.I2I \
-                            else UND_PROMPT,
+                            else VBENCH_UND_PROMPT,
                     image_path=img_path,
                 ))
             else:
@@ -246,11 +247,298 @@ class VBenchDataset(BaseDataset):
                 req_type=self.task,
                 prompt=os.path.splitext(os.path.basename(f))[0] \
                     if self.task == RequestType.I2I \
-                        else UND_PROMPT,
+                        else VBENCH_UND_PROMPT,
                 image_path=f,
             )
             for f in files
         ]
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestInput:
+        return self.items[idx]
+
+
+# ---------------------------------------------------------------------------
+# Audio – openslr/librispeech_asr
+# ---------------------------------------------------------------------------
+
+LIBRISPEECH_AUDIO_PROMPTS = [
+    "Transcribe the speech in this audio clip.",
+    "What is being said in this audio recording?",
+    "Please provide a transcription of the spoken content.",
+    "Listen to the audio and write down what you hear.",
+    "Convert the spoken words in this audio to text.",
+]
+
+
+class LibriSpeechDataset(BaseDataset):
+    """
+    Dataset loader for openslr/librispeech_asr.
+    Uses the validation split; default request type is A2T.
+    Audio files are written to a temp directory and paths are passed as audio_path.
+    """
+
+    DEFAULT_PROMPT = LIBRISPEECH_AUDIO_PROMPTS[0]
+
+    def __init__(
+        self,
+        local_file_dir: str,
+        num_requests: int = 100,
+        req_type: RequestType = RequestType.A2T,
+        prompt: str = DEFAULT_PROMPT,
+        split: str = "validation",
+        cache_dir: str | None = None,
+    ):
+        assert req_type.get_input_modalities() == "audio", (
+            f"LibriSpeechDataset requires an audio input RequestType, got {req_type}"
+        )
+
+        from datasets import load_dataset
+        from torchcodec.decoders import AudioDecoder
+
+        os.makedirs(local_file_dir, exist_ok=True)
+
+        self._num_requests = num_requests
+        self.prompt = prompt
+        self.local_file_dir = local_file_dir
+
+        raw = load_dataset(
+            "openslr/librispeech_asr",
+            "clean",
+            split=split,
+            cache_dir=cache_dir,
+            trust_remote_code=True,
+        )
+        # Take first 100 rows before building items to avoid loading the whole dataset
+        raw = raw.select(range(min(100, len(raw))))
+
+        self.items: list[RequestInput] = []
+        
+        for i, row in enumerate(raw):
+            dec: AudioDecoder = row["audio"]
+            
+            # Decode all frames → shape (num_channels, num_samples), float32
+            frames = dec.get_all_samples()
+            audio_data = frames.data  # torch.Tensor
+            sample_rate = frames.sample_rate
+
+            # Convert to int16 PCM for WAV
+            audio_np = (audio_data.numpy() * 32767).clip(-32768, 32767).astype(np.int16)
+            
+            # WAV expects interleaved (num_samples, num_channels), then flatten
+            audio_interleaved = audio_np.T.flatten()
+
+            # Write to disk
+            audio_path = os.path.join(local_file_dir, f"librispeech_{i:05d}.wav")
+            with wave.open(audio_path, "wb") as wf:
+                wf.setnchannels(audio_np.shape[0])       # num channels
+                wf.setsampwidth(2)                        # 2 bytes = int16
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio_interleaved.tobytes())
+
+            self.items.append(RequestInput(
+                req_type=req_type,
+                prompt=self.prompt,
+                audio_path=audio_path,
+            ))
+
+        self.items = self._resize_data(self.items)
+
+    @property
+    def num_requests(self) -> int:
+        return self._num_requests
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestInput:
+        return self.items[idx]
+
+
+# ---------------------------------------------------------------------------
+# Image – ethz/food101
+# ---------------------------------------------------------------------------
+
+FOOD101_IMAGE_PROMPTS = [
+    "What food dish is shown in this image?",
+    "Describe the food item pictured here.",
+    "Identify the cuisine and dish visible in this photo.",
+    "What is the name of this food?",
+    "Generate a caption for this food image.",
+]
+
+FOOD101_IMAGE_GEN_PROMPTS = [
+    "Generate a photorealistic image of a gourmet version of this dish.",
+    "Create a stylized illustration inspired by the food shown.",
+    "Produce a top-down flat-lay photo of the ingredients for this dish.",
+]
+
+
+class Food101Dataset(BaseDataset):
+    """
+    Dataset loader for ethz/food101.
+    Supports both image understanding (I2T) and image generation (T2I / I2I).
+    For T2I the prompt is derived from the class label; for I2T / I2I the raw
+    image is passed via image_path.
+    """
+
+    DEFAULT_PROMPT = FOOD101_IMAGE_PROMPTS[0]
+
+    def __init__(
+        self,
+        num_requests: int = 100,
+        req_type: RequestType = RequestType.I2T,
+        prompt: str = DEFAULT_PROMPT,
+        split: str = "validation",
+        cache_dir: str | None = None,
+    ):
+        valid_types = {RequestType.I2T, RequestType.I2I, RequestType.T2I, RequestType.I2S}
+        assert req_type in valid_types, (
+            f"Food101Dataset supports {valid_types}, got {req_type}"
+        )
+        from datasets import load_dataset
+
+        self._num_requests = num_requests
+        self.prompt = prompt
+
+        raw = load_dataset(
+            "ethz/food101",
+            split=split,
+            cache_dir=cache_dir,
+            trust_remote_code=True,
+        )
+        raw = raw.select(range(min(100, len(raw))))
+
+        # Build label lookup (int -> class name string)
+        label_names: list[str] = raw.features["label"].names
+
+        self.items: list[RequestInput] = []
+        for row in raw:
+            image = row["image"]
+            label: str = label_names[row["label"]]
+
+            if req_type == RequestType.T2I:
+                # Text-to-image: prompt is based on the class label, no image input
+                item_prompt = f"Generate a photorealistic image of {label.replace('_', ' ')}."
+                self.items.append(
+                    RequestInput(req_type=req_type, prompt=item_prompt)
+                )
+            else:
+                # Save image to a temp file so downstream code has a stable path
+                import os, tempfile
+                tmp_dir = tempfile.mkdtemp(prefix="food101_")
+                img_path = os.path.join(tmp_dir, f"{label}_{len(self.items)}.jpg")
+                image.save(img_path)
+                self.items.append(
+                    RequestInput(
+                        req_type=req_type,
+                        prompt=self.prompt,
+                        image_path=img_path,
+                    )
+                )
+
+        self.items = self._resize_data(self.items)
+
+    @property
+    def num_requests(self) -> int:
+        return self._num_requests
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestInput:
+        return self.items[idx]
+
+
+# ---------------------------------------------------------------------------
+# Video – sayakpaul/ucf101-subset
+# ---------------------------------------------------------------------------
+
+UCF101_VIDEO_PROMPTS = [
+    "Describe the action or activity happening in this video.",
+    "What sport or physical activity is being performed in this clip?",
+    "Provide a detailed description of the events in this video.",
+    "What is the person doing in this video?",
+    "Summarize the content of this video clip.",
+]
+
+
+class UCF101Dataset(BaseDataset):
+    """
+    Dataset loader for sayakpaul/ucf101-subset.
+    Default request type is V2T. Each row contains a video file; the path is
+    extracted from the HuggingFace cache and passed as video_path.
+    """
+
+    DEFAULT_PROMPT = UCF101_VIDEO_PROMPTS[0]
+
+    def __init__(
+        self,
+        local_file_dir: str,
+        num_requests: int = 100,
+        req_type: RequestType = RequestType.V2T,
+        prompt: str = DEFAULT_PROMPT,
+        split: str = "train",
+        cache_dir: str | None = None,
+    ):
+        assert req_type.get_input_modalities() == "video", (
+            f"UCF101Dataset requires a video input RequestType, got {req_type}"
+        )
+        from datasets import load_dataset
+        from torchcodec.decoders import VideoDecoder
+        from torchcodec.encoders import VideoEncoder
+        import torch
+
+        self._num_requests = num_requests
+        self.prompt = prompt
+        self.local_file_dir = local_file_dir
+
+        raw = load_dataset(
+            "sayakpaul/ucf101-subset",
+            split=split,
+            cache_dir=cache_dir,
+            trust_remote_code=True,
+        )
+        raw = raw.select(range(min(100, len(raw))))
+
+        self.items: list[RequestInput] = []
+        for i, row in enumerate(raw):
+            dec: VideoDecoder = row["video"]
+            fps = dec.metadata.average_fps
+            dec = iter(dec)
+
+            frames = []
+            
+            while True:
+                try:
+                    frame = next(dec)
+                    frames.append(frame)
+                except RuntimeError as e:
+                    print("[WARNING]", e)
+                    break
+                except StopIteration:
+                    break
+            assert len(frames) > 0
+            frames = torch.stack(frames)
+            
+            video_path = os.path.join(self.local_file_dir, f"ucf101_{i:05d}.mp4")
+
+            encoder = VideoEncoder(frames=frames, frame_rate=fps)
+            encoder.to_file(video_path)
+
+            self.items.append(RequestInput(
+                req_type=req_type,
+                prompt=self.prompt,
+                video_path=video_path,
+            ))
+
+        self.items = self._resize_data(self.items)
+
+    @property
+    def num_requests(self) -> int:
+        return self._num_requests
 
     def __len__(self) -> int:
         return len(self.items)

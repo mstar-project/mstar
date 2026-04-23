@@ -33,6 +33,7 @@ class ScheduledBatch:
 # AR decode is most latency-sensitive
 PRIORITY = {
     EngineType.AR: 0,
+    EngineType.CODE_PREDICTOR: 0.5,
     EngineType.FLOW: 1,
     EngineType.ENC_DEC: 2,
     EngineType.AUDIO_CODEC: 3,

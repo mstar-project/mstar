@@ -4,5 +4,5 @@ node_groups:
   - node_names: [audio_encoder, vision_encoder, Code2Wav]
     ranks: [0]
 
-  - node_names: [Thinker, Talker]
+  - node_names: [Thinker, Talker_LLM, code_predictor]
     ranks: [1]
