@@ -972,6 +972,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
             input_embeds = inputs["talker_input_embeds"][0].to(dtype)
             
             thinker_states = inputs.get("thinker_states", [])
+            rid = fwd_info.request_id
             if thinker_states:
                 thinker_hidden = self.config.thinker_hidden_size
                 input_embeds += self.model.text_projection(

@@ -306,6 +306,7 @@ class ARNodeSubmodule(NodeSubmodule):
         return None
     
     def filter_batched_output(
+        self,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> dict[str, list[torch.Tensor]]:

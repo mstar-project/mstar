@@ -3,8 +3,8 @@ import logging
 import torch
 
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
-from mminf.engine.cuda_graph_runner import CodecCudaGraphRunner, CodecGraphNotApplicableError
-from mminf.model.submodule_base import NodeInputs, NodeSubmodule
+from mminf.engine.cuda_graph_runner import CodecCudaGraphRunner
+from mminf.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ class AudioCodecEngine(BaseEngine):
         self.submodules: dict[str, NodeSubmodule] = {}
         self.device = None
         self.autocast_dtype = autocast_dtype
+        self.cuda_graph_runners: dict[str, CodecCudaGraphRunner] = {}
 
     def engine_type(self) -> EngineType:
         return EngineType.AUDIO_CODEC
@@ -59,22 +60,38 @@ class AudioCodecEngine(BaseEngine):
 
         try:
             with torch.inference_mode():
+                skipped_rids = []
                 node_inputs: list[NodeInputs] = []
                 for rid in batch.request_ids:
-                    node_inputs.append(
-                        submodule.prepare_inputs(
-                            graph_walk=batch.graph_walk,
-                            fwd_info=batch.per_request_info[rid],
-                            inputs=batch.per_request_input_tensors[rid],
-                        )
+                    req_inputs = submodule.prepare_inputs(
+                        graph_walk=batch.graph_walk,
+                        fwd_info=batch.per_request_info[rid],
+                        inputs=batch.per_request_input_tensors[rid],
                     )
+                    if req_inputs is None:
+                        skipped_rids.append(rid)
+                    else:
+                        node_inputs.append(req_inputs)
+                skipped_rids = set(skipped_rids)
+
+                # filter out skipped rids from the batch
+                batch.request_ids = [rid for rid in batch.request_ids if rid not in skipped_rids]
+                batch.per_request_info = {
+                    rid: info for rid, info in batch.per_request_info.items() \
+                        if rid not in skipped_rids
+                    }
                 output = self._dispatch(batch, node_inputs, submodule)
                 for rid, info in batch.per_request_info.items():
+                    if rid in skipped_rids:
+                        continue
                     submodule.postprocess(
                         request_id=rid,
                         request_info=info,
                         outputs=output.per_request_output_tensors.get(rid, {})
                     )
+                output.per_request_output_tensors.update({
+                    rid: {} for rid in skipped_rids
+                })
                 return output
         finally:
             if self.enable_nvtx:
@@ -88,26 +105,17 @@ class AudioCodecEngine(BaseEngine):
         """Pick cuda_graph / batched / sequential, with eager fallback if
         the CUDA-graph runner rejects the batch (e.g. SNAC frame mismatch).
         """
-        # TODO: in progress
-        if self._can_use_cuda_graph(batch, submodule):
-            try:
-                return self._execute_with_cuda_graph(batch, submodule)
-            except CodecGraphNotApplicableError as exc:
-                logger.debug(
-                    "%s: CUDA graph path declined for batch %s (%s); falling back",
-                    batch.node_name, batch.request_ids, exc,
-                )
+        if self._can_use_cuda_graph(batch, submodule, inputs):
+            return self._execute_with_cuda_graph(batch, submodule, inputs)
         if submodule.can_batch(batch, inputs):
-            return self._execute_batched(batch, submodule)
-        return self._execute_sequential(batch, submodule)
+            return self._execute_batched(batch, submodule, inputs)
+        return self._execute_sequential(batch, submodule, inputs)
 
     def _can_use_cuda_graph(
         self, batch: NodeBatch, submodule: NodeSubmodule,
         inputs: NodeInputs
     ) -> bool:
-        runner: CodecCudaGraphRunner | None = getattr(
-            submodule, 'cuda_graph_runner', None,
-        )
+        runner = self.cuda_graph_runners.get(batch.node_name)
         if runner is None:
             return False
         if not submodule.can_use_cuda_graphs(batch, inputs):
@@ -117,19 +125,21 @@ class AudioCodecEngine(BaseEngine):
             graph_walk=batch.graph_walk,
         )
 
-    def _execute_with_cuda_graph(self, batch: NodeBatch, submodule) -> NodeOutput:
+    def _execute_with_cuda_graph(
+        self, batch: NodeBatch,
+        submodule: NodeSubmodule,
+        inputs: list[ARNodeInputs]
+    ) -> NodeOutput:
         """Replay the captured graph. Runner handles preprocess + replay +
         per-rid split; we only wrap the result.
         """
-        per_request_inputs = [
-            batch.per_request_input_tensors.get(rid, {}) for rid in batch.request_ids
-        ]
         if self.enable_nvtx:
             range_push("codec.cuda_graph.run")
-        per_rid = submodule.cuda_graph_runner.run(
+        runner = self.cuda_graph_runners[batch.node_name]
+        per_rid = runner.run(
             graph_walk=batch.graph_walk,
             request_ids=batch.request_ids,
-            per_request_inputs=per_request_inputs,
+            inputs=inputs,
             per_request_info=batch.per_request_info,
             submodule=submodule,
         )
@@ -137,82 +147,71 @@ class AudioCodecEngine(BaseEngine):
             range_pop()
         return NodeOutput(per_request_output_tensors=per_rid)
 
-    def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
+    def _execute_batched(
+        self, batch: NodeBatch,
+        submodule: NodeSubmodule,
+        inputs: list[NodeInputs]
+    ) -> NodeOutput:
         """Eager batched path: preprocess → forward_batched(packed) → per-rid."""
-        per_request_inputs = [
-            batch.per_request_input_tensors.get(rid, {}) for rid in batch.request_ids
-        ]
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=batch.request_ids,
+            per_request_info=batch.per_request_info,
+        )
 
         if self.enable_nvtx:
             range_push("codec.batched.preprocess", synchronize=True)
         packed = submodule.preprocess(
             graph_walk=batch.graph_walk,
-            per_request_inputs=per_request_inputs,
-            request_ids=batch.request_ids,
-            per_request_info=batch.per_request_info,
+            engine_inputs=engine_inputs,
+            inputs=inputs
         )
-        if self.enable_nvtx:
-            range_pop(synchronize=True)
-        if not packed:
-            # Submodule signaled non-batchable — fall back to sequential.
-            return self._execute_sequential(batch, submodule)
 
         if self.enable_nvtx:
             range_push("codec.batched.forward")
         outputs = submodule.forward_batched(
             graph_walk=batch.graph_walk,
-            request_ids=batch.request_ids,
-            packed_inputs=packed,
-            per_request_info=batch.per_request_info,
+            engine_inputs=engine_inputs,
+            **packed
         )
         if self.enable_nvtx:
             range_pop()
         return NodeOutput(per_request_output_tensors=outputs)
 
-    def _execute_sequential(self, batch: NodeBatch, submodule) -> NodeOutput:
+    def _execute_sequential(
+        self, batch: NodeBatch,
+        submodule: NodeSubmodule,
+        inputs: list[NodeInputs]
+    ) -> NodeOutput:
         """Execute each request individually."""
         outputs = {}
         for i, rid in enumerate(batch.request_ids):
             inputs = batch.per_request_input_tensors.get(rid, {})
 
             fwd_info = batch.per_request_info[rid]
+            engine_inputs = ModelInputsFromEngine(
+                request_ids=[rid],
+                per_request_info={rid: fwd_info},
+            )
 
-            if hasattr(submodule, 'preprocess'):
-                if self.enable_nvtx:
-                    range_push(f"codec.preprocess.{i}", synchronize=True)
-                preprocessed = submodule.preprocess(
-                    batch.graph_walk,
-                    per_request_inputs=[inputs],
-                    request_ids=[rid],
-                    per_request_info={
-                        rid: fwd_info,
-                    },
-                )
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
-                # Submodule may signal "skip this request" by returning an
-                # empty dict (e.g. SNAC with <7 new_tokens or a heterogeneous
-                # batch falling back through the sequential path).
-                if not preprocessed:
-                    outputs[rid] = {}
-                    continue
-                if self.enable_nvtx:
-                    range_push(f"codec.forward.{i}")
-                outputs[rid] = submodule(**preprocessed)
-                if self.enable_nvtx:
-                    range_pop()
-            else:
-                if self.enable_nvtx:
-                    range_push(f"codec.forward.{i}")
-                result = submodule(**{k: v[0] for k, v in inputs.items()})
-                if self.enable_nvtx:
-                    range_pop()
-                if isinstance(result, dict):
-                    outputs[rid] = result
-                elif isinstance(result, torch.Tensor):
-                    outputs[rid] = {"output": [result]}
-                else:
-                    outputs[rid] = {}
+            if self.enable_nvtx:
+                range_push(f"codec.preprocess.{i}", synchronize=True)
+            preprocessed = submodule.preprocess(
+                batch.graph_walk,
+                engine_inputs=engine_inputs,
+                inputs=inputs,
+            )
+            if self.enable_nvtx:
+                range_pop(synchronize=True)
+    
+            if self.enable_nvtx:
+                range_push(f"codec.forward.{i}")
+            outputs[rid] = submodule.forward(
+                batch.graph_walk,
+                engine_inputs=engine_inputs,
+                **preprocessed
+            )
+            if self.enable_nvtx:
+                range_pop()
         return NodeOutput(per_request_output_tensors=outputs)
 
     def warmup(self) -> None:
@@ -240,7 +239,7 @@ class AudioCodecEngine(BaseEngine):
             runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()
             if runner.graphs:
-                submodule.cuda_graph_runner = runner
+                self.cuda_graph_runners[node_name] = runner
                 logger.info(
                     "AudioCodecEngine: CUDA graphs captured for %s (%d graphs)",
                     node_name, len(runner.graphs),

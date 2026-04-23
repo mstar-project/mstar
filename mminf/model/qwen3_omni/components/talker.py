@@ -15,6 +15,7 @@ Weight prefix: ``talker.``
 
 from __future__ import annotations
 
+import flashinfer
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -425,6 +426,16 @@ class Qwen3OmniCodePredictor(nn.Module):
     def codec_embedding(self):
         """Alias for submodule access."""
         return self.model.codec_embedding
+    
+    @torch.compiler.disable
+    def _apply_rope(self, q_rot, k_rot, flat_pos, rope_theta):
+        # moved to its own function for torch.compile purposes
+        return flashinfer.rope.apply_rope_pos_ids(
+            q_rot, k_rot,
+            pos_ids=flat_pos,
+            rope_theta=rope_theta,
+            interleave=False,
+        )
 
     # ------------------------------------------------------------------
     # SDPA + dense-KV depth forward (for unrolled CUDA-graph capture)
@@ -464,8 +475,6 @@ class Qwen3OmniCodePredictor(nn.Module):
             predictor's 5 layers + final RMSNorm. The caller is responsible
             for applying the per-codebook LM head.
         """
-        import flashinfer
-
         hidden_states = inputs_embeds
         bs, seq_len, hidden_size = hidden_states.shape
 
@@ -515,11 +524,8 @@ class Qwen3OmniCodePredictor(nn.Module):
             qk_dtype = q.dtype
             q_rot = q.to(torch.bfloat16) if qk_dtype != torch.bfloat16 else q
             k_rot = k.to(torch.bfloat16) if qk_dtype != torch.bfloat16 else k
-            q_rot, k_rot = flashinfer.rope.apply_rope_pos_ids(
-                q_rot, k_rot,
-                pos_ids=flat_pos,
-                rope_theta=attn.rope_theta,
-                interleave=False,
+            q_rot, k_rot = self._apply_rope(
+                q_rot, k_rot, flat_pos, attn.rope_theta
             )
             if qk_dtype != torch.bfloat16:
                 q = q_rot.to(qk_dtype)
