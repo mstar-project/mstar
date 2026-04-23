@@ -21,7 +21,7 @@ class NodeInputs:
 
 
 def _clone_or_none(tensor):
-        return tensor.clone() if tensor is not None else None
+    return tensor.clone() if tensor is not None else None
 
 
 class StackingMethod(Enum):
