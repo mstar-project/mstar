@@ -75,6 +75,7 @@ def _make_info(graph_walk: str = "prefill_video") -> CurrentForwardPassInfo:
         fwd_index=0,
         random_seed=0,
         max_tokens=0,
+        sampling_config={},
     )
 
 
