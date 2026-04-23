@@ -148,6 +148,8 @@ class UnrolledGraphData:
     pos_id_slice: torch.Tensor
     inputs_slices: dict[str, torch.Tensor]
     static_outputs: list[dict[str, torch.Tensor]]
+    dummy_rids: list[str]
+    dummy_fwd_info: dict[str, CurrentForwardPassInfo]
 
 
 @dataclass
@@ -350,7 +352,8 @@ class CodePredictorCudaGraphRunner:
         # need to grow after a smaller bucket has already reserved addresses.
         for bs in reversed(self.CAPTURE_BATCH_SIZES):
             try:
-                self._capture_one(bs, capture_config)
+                with torch.no_grad():
+                    self._capture_one(bs, capture_config)
                 logger.info(
                     "CodePredictorCudaGraphRunner: captured unrolled graph for bs=%d",
                     bs,
@@ -439,32 +442,15 @@ class CodePredictorCudaGraphRunner:
             graph.replay()
         torch.cuda.synchronize()
 
-        # print out fwd_inputs and static_outputs memory addrs
-        for key, tensor in fwd_inputs.items():
-            logger.info(
-                f"Captured graph input '{key}': shape={tensor.shape}, "
-                f"dtype={tensor.dtype}, device={tensor.device}, "
-                f"data_ptr={tensor.data_ptr()}"
-            )
-        for rid in dummy_rids:
-            output = static_outputs[rid]
-            for key, tensors in output.items():
-                tensor = tensors[0]
-                logger.info(
-                    f"Captured graph output '{key}' for rid '{rid}': "
-                    f"shape={tensor.shape}, dtype={tensor.dtype}, "
-                    f"device={tensor.device}, data_ptr={tensor.data_ptr()}"
-                )
-
         self.graphs[bs] = UnrolledGraphData(
             graph=graph,
             bs=bs,
             kv_cache_slice=engine_inputs.kv_cache,
             pos_id_slice=engine_inputs.init_pos_ids,
             inputs_slices=fwd_inputs,
-            static_outputs=[
-                static_outputs[rid] for rid in dummy_rids
-            ]
+            dummy_rids=dummy_rids,
+            dummy_fwd_info=dummy_fwd_info,
+            static_outputs=static_outputs
         )
 
     # ------------------------------------------------------------------
@@ -514,26 +500,21 @@ class CodePredictorCudaGraphRunner:
         print(inputs)
 
         # Build inputs to preprocess and forward_batched
-        dummy_fwd_info, dummy_rids = self._make_dummy_fwd_info(padded_bs, graph_walk)
-        augmented_request_ids = dummy_rids[:]
-        augmented_request_ids[:bs] = request_ids
-        augmented_fwd_info = {
-            **per_request_info,
-            **dummy_fwd_info,
-        }
+        dummy_fwd_info = graph_data.dummy_fwd_info
+        dummy_rids = graph_data.dummy_rids
         sampler = make_mtp_sampler_from_buffers(
             bufs=self.mtp_sampling_buf,
             request_ids=request_ids,
             sampling_configs={
                 rid: info.sampling_config.get(
                     self.node_name, SamplingConfig()
-                ) for rid, info in dummy_fwd_info.items()
+                ) for rid, info in per_request_info.items()
             },
             padded_bs=padded_bs,
         )
         engine_inputs = CodePredictorEngineInputs(
-            request_ids=augmented_request_ids,
-            per_request_info=augmented_fwd_info,
+            request_ids=dummy_rids,
+            per_request_info=dummy_fwd_info,
             sampler=sampler,
             kv_cache=graph_data.kv_cache_slice,
             init_pos_ids=graph_data.pos_id_slice,
@@ -557,38 +538,19 @@ class CodePredictorCudaGraphRunner:
                     f"captured buffer shape {buf.shape}"
                 )
             buf.copy_(tensor)
-        print(buffers)
 
         # --- Step 4: replay. ---
         graph_data.graph.replay()
 
-        torch.cuda.synchronize()
-        # print out fwd_inputs and static_outputs memory addrs
-        for key, tensor in buffers.items():
-            logger.info(
-                f"Replayed graph input '{key}': shape={tensor.shape}, "
-                f"dtype={tensor.dtype}, device={tensor.device}, "
-                f"data_ptr={tensor.data_ptr()}"
-            )
-        for i in range(len(dummy_rids)):
-            output = graph_data.static_outputs[i]
-            for key, tensors in output.items():
-                tensor = tensors[0]
-                logger.info(
-                    f"Received graph output '{key}': "
-                    f"shape={tensor.shape}, dtype={tensor.dtype}, "
-                    f"device={tensor.device}, data_ptr={tensor.data_ptr()}"
-                )
-
         # return req_id -> output tensor dict for the real batch (ignore padding slots)
         outputs = {}
         for i, rid in enumerate(request_ids):
-            outputs[rid] = graph_data.static_outputs[i]
-            print(outputs[rid])
+            static_outputs = graph_data.static_outputs[dummy_rids[i]]
+            outputs[rid] = {}
 
             # clone outputs to detach from the static buffers
             # (which will be overwritten on the next call)
-            for key, val in outputs[rid].items():
+            for key, val in static_outputs.items():
                 if isinstance(val, torch.Tensor):
                     outputs[rid][key] = val.clone()
                 elif isinstance(val, list):
@@ -709,7 +671,6 @@ class CodePredictorEngine(BaseEngine):
             engine_inputs=engine_inputs,
             inputs=inputs
         )
-        print(preprocessed)
 
         if self.enable_nvtx:
             range_pop(synchronize=True)
