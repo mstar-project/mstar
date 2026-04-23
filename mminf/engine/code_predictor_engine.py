@@ -41,7 +41,7 @@ import torch
 
 from mminf.engine.ar_engine import AREngine
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
-from mminf.model.base import NodeSubmodule
+from mminf.model.submodule_base import ModelInputsFromEngine
 from mminf.utils.profiler import range_pop, range_push
 from mminf.utils.sampling import Sampler, sample_depth_gpu
 
@@ -54,20 +54,31 @@ logger = logging.getLogger(__name__)
 # the cuda graph runner into the submodule execution path).
 
 
-class CodePredictorSubmodule(NodeSubmodule):
-    """Marker base class for submodules driven by ``CodePredictorEngine``.
+@dataclass
+class MTPSampler:
+    temperature_buf: torch.Tensor
+    top_k_buf: torch.Tensor
+    top_p_buf: torch.Tensor
+    pos_pf: torch.Tensor
+    seed_buf: torch.Tensor
+    offset_buf: torch.Tensor
 
-    Concrete implementations (e.g. ``Qwen3OmniCodePredictorSubmodule``)
-    must provide ``forward_batched`` that accepts a ``cuda_graph_runner``
-    and returns per-request outputs. The engine does not drive these
-    submodules through the generic ``forward`` path.
-    """
-
-    def forward(self, request_info, **kwargs):
-        raise NotImplementedError(
-            "Code predictor submodules must go through forward_batched."
+    def sample(self, logits: torch.Tensor) -> torch.Tensor:
+        codes = sample_depth_gpu(
+            logits, self.temperature_buf,
+            self.top_k_buf, self.top_p_buf,
+            self.seed_buf, self.offset_buf
         )
+        self.offset_buf += 1
+        return codes
 
+
+@dataclass
+class CodePredictorEngineInputs(ModelInputsFromEngine):
+    sampler: MTPSampler
+    kv_cache: torch.Tensor
+    init_pos_ids: torch.Tensor
+    
 
 @dataclass
 class UnrolledGraphData:
