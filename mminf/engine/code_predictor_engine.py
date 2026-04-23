@@ -279,7 +279,8 @@ class CodePredictorCudaGraphRunner:
         # outputs = {"all_codes": [bs, n_codebooks], "codec_emb_sum": [bs, hidden]}
     """
 
-    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    CAPTURE_BATCH_SIZES = [1, 2] # TODO DEBUG
 
     def __init__(
         self,
@@ -419,6 +420,7 @@ class CodePredictorCudaGraphRunner:
                 engine_inputs=engine_inputs,
                 **fwd_inputs,
             )
+            self.init_pos_ids_buf.zero_()
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
@@ -428,6 +430,7 @@ class CodePredictorCudaGraphRunner:
                 engine_inputs=engine_inputs,
                 **fwd_inputs,
             ) # dummy req_id -> output dict
+            self.init_pos_ids_buf.zero_()
         torch.cuda.synchronize()
 
         # A couple of replay passes to let any pool-internal state settle
@@ -435,6 +438,23 @@ class CodePredictorCudaGraphRunner:
         for _ in range(3):
             graph.replay()
         torch.cuda.synchronize()
+
+        # print out fwd_inputs and static_outputs memory addrs
+        for key, tensor in fwd_inputs.items():
+            logger.info(
+                f"Captured graph input '{key}': shape={tensor.shape}, "
+                f"dtype={tensor.dtype}, device={tensor.device}, "
+                f"data_ptr={tensor.data_ptr()}"
+            )
+        for rid in dummy_rids:
+            output = static_outputs[rid]
+            for key, tensors in output.items():
+                tensor = tensors[0]
+                logger.info(
+                    f"Captured graph output '{key}' for rid '{rid}': "
+                    f"shape={tensor.shape}, dtype={tensor.dtype}, "
+                    f"device={tensor.device}, data_ptr={tensor.data_ptr()}"
+                )
 
         self.graphs[bs] = UnrolledGraphData(
             graph=graph,
@@ -541,6 +561,24 @@ class CodePredictorCudaGraphRunner:
 
         # --- Step 4: replay. ---
         graph_data.graph.replay()
+
+        torch.cuda.synchronize()
+        # print out fwd_inputs and static_outputs memory addrs
+        for key, tensor in buffers.items():
+            logger.info(
+                f"Replayed graph input '{key}': shape={tensor.shape}, "
+                f"dtype={tensor.dtype}, device={tensor.device}, "
+                f"data_ptr={tensor.data_ptr()}"
+            )
+        for i in range(len(dummy_rids)):
+            output = graph_data.static_outputs[i]
+            for key, tensors in output.items():
+                tensor = tensors[0]
+                logger.info(
+                    f"Received graph output '{key}': "
+                    f"shape={tensor.shape}, dtype={tensor.dtype}, "
+                    f"device={tensor.device}, data_ptr={tensor.data_ptr()}"
+                )
 
         # return req_id -> output tensor dict for the real batch (ignore padding slots)
         outputs = {}

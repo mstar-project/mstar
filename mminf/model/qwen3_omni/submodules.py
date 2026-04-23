@@ -668,7 +668,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     }
                 )],
                 compile=True,
-                capture_batch_sizes=[1, 2, 4, 8, 16],
+                # capture_batch_sizes=[1, 2, 4, 8, 16],
+                capture_batch_sizes=[1, 2], # TODO DEBUG
             )
         ]
 
@@ -1134,7 +1135,8 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
                     ),
                     input_seq_len=1
                 )],
-                capture_batch_sizes=[1, 2, 4, 8, 16]
+                # capture_batch_sizes=[1, 2, 4, 8, 16]
+                capture_batch_sizes=[1, 2], # TODO DEBUG
             )
         ]
     
@@ -1238,7 +1240,7 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
         pos = engine_inputs.init_pos_ids
 
         embed = self.talker_code_emb(layer0_codes)  # [bs, hidden]
-        codec_emb_sum += embed
+        codec_emb_sum.add_(embed)
         all_codes[:, 0] = layer0_codes
 
         # forward over [last_hidden] to update kv cache with the Talker's final hidden
@@ -1261,7 +1263,7 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
             tokens = sampler.sample(logits)
             all_codes[:, group_idx] = tokens
             embed = codec_embedding[group_idx - 1](tokens)
-            codec_emb_sum += embed
+            codec_emb_sum.add_(embed)
 
         return {
             req_id: {

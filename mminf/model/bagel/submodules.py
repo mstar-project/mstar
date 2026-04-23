@@ -392,15 +392,19 @@ class LLMSubmodule(ARNodeSubmodule):
         return tensor_inputs
 
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
-        dummy = [{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
+        dummy = ARNodeInputs(
+            input_ids=torch.zeros(1, dtype=torch.long, device=device),
+            input_seq_len=1
+        )
+        
         return [
             CudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=dummy,
+                dummy_capture_inputs=dummy.clone(),
             ),
             CudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=True, labels=["main", "cfg_img"],
-                dummy_capture_inputs=dummy,
+                dummy_capture_inputs=dummy.clone(),
             ),
         ]
 
@@ -437,17 +441,17 @@ class LLMSubmodule(ARNodeSubmodule):
 
         if graph_walk == "prefill_text":
             node_inputs.input_ids = self._preprocess_prefill_text(inputs["text_inputs"][0])
-            node_inputs.seq_len = inputs.shape[0]
+            node_inputs.input_seq_len = inputs.shape[0]
 
         elif graph_walk == "decode":
             bos = torch.tensor([self.bos_token_id], device=device)
             node_inputs.input_ids = inputs["text_inputs"][0] if len(inputs["text_inputs"]) > 0 else bos.clone()
-            node_inputs.seq_len = 1
+            node_inputs.input_seq_len = 1
 
         if graph_walk in ["prefill_vit", "prefill_vae"]:
             node_inputs.input_embeds = self._wrap_with_boi_eoi(inputs["img_emb"][0])
             seq_len = inputs.shape[0]
-            node_inputs.seq_len = seq_len
+            node_inputs.input_seq_len = seq_len
 
             labels = self._get_active_labels(graph_walk, requires_cfg=True) # just return all labels since it is cheap
             
@@ -483,7 +487,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 )
             )
             seq_len = tensor_inputs["empty_combined_emb"].shape[0]
-            node_inputs.seq_len = seq_len
+            node_inputs.input_seq_len = seq_len
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
                 labels, pos_info, device, seq_len
             )
