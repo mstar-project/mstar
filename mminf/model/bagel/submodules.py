@@ -598,7 +598,7 @@ class LLMSubmodule(ARNodeSubmodule):
         request_info = engine_inputs.single_request_info
         cache_handle = engine_inputs.cache_manager 
         kwargs.update(request_info.step_metadata)
-        
+
         logger.debug("Running BAGEL LLM for graph walk %s", graph_walk)
 
         if graph_walk == "prefill_text":
@@ -986,7 +986,7 @@ class LLMSubmodule(ARNodeSubmodule):
             for info in per_request_info.values()
         )
 
-    def forward_batched(
+    def forward_batched( #TODO
         self,
         graph_walk: str,
         request_ids: list[str],
@@ -1118,7 +1118,7 @@ class LLMSubmodule(ARNodeSubmodule):
             request_info.register_loop_stop("decode_loop")
 
 
-class VAEDecoderSubmodule(NodeSubmodule):
+class VAEDecoderSubmodule(NodeSubmodule): #TODO
     """VAE decoder: latent grid -> pixel image."""
 
     def __init__(
@@ -1181,7 +1181,7 @@ class VAEDecoderSubmodule(NodeSubmodule):
         return {"image_output": [image]}
 
 
-class CombineCFGSubmodule(NodeSubmodule):
+class CombineCFGSubmodule(NodeSubmodule): # TODO
     """Lightweight node: applies CFG formula + Euler step.
 
     Receives 3 velocity tensors (v_main, v_cfg_text, v_cfg_img) plus
