@@ -12,6 +12,7 @@ from mminf.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
+from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import (
     DynamicLoop,

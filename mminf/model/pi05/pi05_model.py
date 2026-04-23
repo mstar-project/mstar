@@ -45,7 +45,8 @@ from mminf.graph.base import (
     TensorPointerInfo,
 )
 from mminf.graph.special_destinations import EMIT_TO_CLIENT
-from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
+from mminf.model.base import ForwardPassArgs, Model
+from mminf.model.submodule_base import NodeSubmodule
 from mminf.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mminf.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mminf.model.pi05.components.siglip import Pi05SiglipEncoder

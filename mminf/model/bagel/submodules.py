@@ -26,7 +26,7 @@ from mminf.model.bagel.components.modeling_utils import (
     patchify,
 )
 from mminf.model.bagel.config import BagelModelConfig
-from mminf.model.base import NodeSubmodule
+from mminf.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
@@ -1099,7 +1099,7 @@ class LLMSubmodule(ARNodeSubmodule):
         return torch.cat([boi_emb, emb, eoi_emb], dim=0)
 
     def can_batch(
-        self, batch: NodeBatch
+        self, batch: NodeBatch, model_inputs: list[NodeInputs]
     ):
         return batch.graph_walk in ["decode", "prefill_text"]
 

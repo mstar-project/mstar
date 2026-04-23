@@ -6,9 +6,11 @@ from torch import nn
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.ar_engine import BatchedCacheManager
+from mminf.engine.base import NodeBatch
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
-from mminf.model.base import NodeSubmodule
+from mminf.model.submodule_base import NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
+from mminf.model.submodule_base import NodeInputs
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -130,7 +132,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
         logits = self.lm_head(hidden[-1:])
         return {"logits": [logits]}
 
-    def can_batch(self, batch) -> bool:
+    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
 
     def forward_batched(

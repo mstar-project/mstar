@@ -25,7 +25,7 @@ from torch import nn
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
-from mminf.model.submodule_base import CudaGraphConfig
+from mminf.model.submodule_base import ARNodeInputs, CudaGraphConfig, ModelInputsFromEngine, ARNodeSubmodule
 from mminf.utils.profiler import range_pop, range_push
 from mminf.utils.sampling import Sampler
 
@@ -53,17 +53,6 @@ class CudaGraphData:
     # key besides "logits". When False, sample_and_remap can skip the
     # per-rid collection loop entirely.
     has_non_logit_outputs: bool = False
-
-
-@dataclass(frozen=True)
-class ARCudaGraphKey:
-    graph_walk: str
-    requires_cfg: bool
-    bs: int
-    seq_len: int
-
-    def __str__(self):
-        return  f"{self.graph_walk}_cfg_{self.requires_cfg}_bs_{self.bs}_sl_{self.seq_len}"
 
 
 class CudaGraphRunner:
@@ -94,7 +83,7 @@ class CudaGraphRunner:
     def __init__(
         self,
         submodule_name: str,
-        submodule: nn.Module,
+        submodule: ARNodeSubmodule,
         kv_cache_config: KVCacheConfig,
         alloc_manager: PagedAllocationManager,
         sampler: Sampler,
@@ -114,7 +103,7 @@ class CudaGraphRunner:
         self.enable_nvtx = False  # set by AREngine after construction
 
         # Keyed by (graph_walk, requires_cfg, batch_size)
-        self.graphs: dict[ARCudaGraphKey, CudaGraphData] = {}
+        self.graphs: dict[tuple, CudaGraphData] = {}
 
         self.memory_pool = None
 
@@ -133,30 +122,20 @@ class CudaGraphRunner:
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
 
         for config in self.capture_configs:
-            for i, dummy_input in enumerate(config.dummy_capture_inputs):
-                sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
-                for bs in reversed(sizes):
-                    key = ARCudaGraphKey(
-                        graph_walk=config.capture_graph_walk,
-                        requires_cfg=config.requires_cfg,
-                        bs=bs,
-                        seq_len=dummy_input.seq_len
-                    )
-                    try:
-                        self._capture_one(
-                            key=key, config=config,
-                            dummy_input_idx=i,
-                            submodule=self.submodule
-                        )
-                        logger.info("Captured CUDA graph for %s: %s bs=%d",
-                                    self.submodule_name, key, bs)
-                    except Exception:
-                        logger.warning(
-                            "Failed to capture CUDA graph for %s: %s bs=%d",
-                            self.submodule_name, key, bs, exc_info=True)
+            sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+            for bs in reversed(sizes):
+                key = (config.capture_graph_walk, config.requires_cfg, bs)
+                try:
+                    self._capture_one(bs, config, self.submodule)
+                    logger.info("Captured CUDA graph for %s: %s bs=%d",
+                                self.submodule_name, key, bs)
+                except Exception:
+                    logger.warning(
+                        "Failed to capture CUDA graph for %s: %s bs=%d",
+                        self.submodule_name, key, bs, exc_info=True)
 
     def _create_persistent_wrappers(
-        self, bs: int, config: CudaGraphConfig
+        self, bs: int, config: CudaGraphConfig, is_decode: bool
     ) -> dict:
         """Create persistent FlashInfer wrappers for CUDA graph capture.
 
@@ -177,7 +156,7 @@ class CudaGraphRunner:
         # multi-pass captures (e.g., main + cfg_img in same graph).
         plan_states = {}
         for label in config.labels:
-            if config.capture_graph_walk == "decode":
+            if is_decode:
                 wrapper = FlashInferDecodeWrapper(
                     workspace_buffer=self.buffer_manager.get(f"{label}_cugraph"),
                     num_qo_heads=cfg.num_qo_heads,
@@ -216,14 +195,13 @@ class CudaGraphRunner:
         return plan_states
 
     def _capture_one(
-        self, key: ARCudaGraphKey, config: CudaGraphConfig,
-        dummy_input_idx: int, submodule
+        self, bs: int, config: CudaGraphConfig, submodule: ARNodeSubmodule
     ) -> None:
         """Capture a single CUDA graph for the given batch size and config."""
         from mminf.engine.cache_manager import BatchedCacheManager
 
         cfg = self.kv_cache_config
-        bs = key.bs
+        key = (config.capture_graph_walk, config.requires_cfg, bs)
 
         # Create dummy request IDs
         dummy_rids = [f"__cg_{config.capture_graph_walk}_{config.requires_cfg}_{i}__"
@@ -234,8 +212,24 @@ class CudaGraphRunner:
             self.alloc_manager.add_request(rid, labels=config.labels)
 
         try:
-            # Create persistent wrappers
-            plan_states = self._create_persistent_wrappers(bs, config)
+            # Build dummy per-request inputs via the submodule's own
+            # capture-input generator. This lets each submodule declare what
+            # dummy tensors its preprocess() needs (e.g., Thinker decode needs
+            # a dummy token, Talker decode needs dummy all_codes).
+            capture_templates = config.dummy_capture_inputs
+            if capture_templates is None:
+                # Submodule opts out of CUDA graphs for this walk.
+                logger.info("%s.get_cuda_graph_capture_inputs returned None, skipping...", self.submodule_name)
+                return
+            
+            # Use the first template for each dummy request slot
+            template = capture_templates[0]
+            dummy_inputs = [template.clone() for _ in dummy_rids]
+
+            plan_states = self._create_persistent_wrappers(
+                bs, config,
+                template.input_seq_len==1
+            )
 
             # Create BatchedCacheManager with CUDA graph plan states
             cache_manager = BatchedCacheManager(
@@ -250,26 +244,6 @@ class CudaGraphRunner:
                 auto_write_store=False
             )
 
-            # Build dummy per-request inputs via the submodule's own
-            # capture-input generator. This lets each submodule declare what
-            # dummy tensors its preprocess() needs (e.g., Thinker decode needs
-            # a dummy token, Talker decode needs dummy all_codes).
-            template = config.dummy_capture_inputs[dummy_input_idx].tensors
-            seq_len = config.dummy_capture_inputs[dummy_input_idx].seq_len
-            def _clone_template(tpl):
-                """Deep-copy a capture template (dict of input_name -> list[Tensor])."""
-                out = {}
-                for k, v in tpl.items():
-                    if isinstance(v, list):
-                        out[k] = [t.clone() if isinstance(t, torch.Tensor) else t for t in v]
-                    elif isinstance(v, torch.Tensor):
-                        out[k] = v.clone()
-                    else:
-                        out[k] = v
-                return out
-        
-            dummy_inputs = [_clone_template(template) for _ in dummy_rids]
-
             # Build per-request metadata
             dummy_metadata = {
                 rid: CurrentForwardPassInfo(
@@ -283,13 +257,17 @@ class CudaGraphRunner:
                 ) for rid in dummy_rids
             }
 
+            engine_inputs = ModelInputsFromEngine(
+                request_ids=dummy_rids,
+                per_request_info=dummy_metadata,
+                cache_manager=cache_manager
+            )
+
             # Preprocess (plans attention+rope outside graph)
             preprocessed = submodule.preprocess(
                 graph_walk=config.capture_graph_walk,
-                cache_manager=cache_manager,
-                per_request_inputs=dummy_inputs,
-                request_ids=dummy_rids,
-                per_request_info=dummy_metadata,
+                engine_inputs=engine_inputs,
+                inputs=dummy_inputs,
             )
 
             # Static input buffers for ALL tensor inputs in the preprocessed
@@ -301,23 +279,20 @@ class CudaGraphRunner:
                 if isinstance(v, torch.Tensor)
             ]
 
+            forward = submodule.forward_batched
             if config.compile:
                 forward = torch.compile(
-                    submodule.forward_batched,
+                    forward,
                     mode="max-autotune-no-cudagraphs",
                     fullgraph=False,
                     dynamic=False,
-                )
-            else:
-                forward = submodule.forward_batched
+                )                
 
             def run_forward():
                 return forward(
                     graph_walk=config.capture_graph_walk,
-                    cache_manager=cache_manager,
-                    packed_inputs=preprocessed,
-                    request_ids=dummy_rids,
-                    per_request_info=dummy_metadata,
+                    engine_inputs=engine_inputs,
+                    **preprocessed
                 )
 
             torch.cuda.set_device(self.device)
@@ -330,15 +305,14 @@ class CudaGraphRunner:
                 for rid in dummy_rids:
                     for label in config.labels:
                         state = self.alloc_manager.get_state(rid, label)
-                        state.seq_len = 0
-                        state.position_id_start = 0
+                        state.seq_len = max(0, state.seq_len - 1)
+                        state.position_id_start = max(
+                            0, state.position_id_start - 1)
                 # Re-plan after reset
                 submodule.preprocess(
                     graph_walk=config.capture_graph_walk,
-                    cache_manager=cache_manager,
-                    per_request_inputs=dummy_inputs,
-                    request_ids=dummy_rids,
-                    per_request_info=dummy_metadata,
+                    engine_inputs=engine_inputs,
+                    inputs=dummy_inputs,
                 )
             torch.cuda.synchronize()
 
@@ -368,21 +342,24 @@ class CudaGraphRunner:
                 key, has_non_logit,
             )
 
-            self.graphs[key] = CudaGraphData(
-                graph=graph,
-                static_inputs={
-                    "preprocessed": preprocessed,
-                    "static_input_keys": static_input_keys,
-                    "capture_template": template,
-                    "dummy_rids": dummy_rids,
-                    "dummy_metadata": dummy_metadata,
-                },
-                static_outputs=output,
-                static_cache_manager=cache_manager,
-                config=config,
-                bs=bs,
-                has_non_logit_outputs=has_non_logit,
-            )
+
+            for graph_walk in config.replay_graph_walks:
+                lookup_key = (graph_walk, config.requires_cfg, bs)
+                self.graphs[lookup_key] = CudaGraphData(
+                    graph=graph,
+                    static_inputs={
+                        "preprocessed": preprocessed,
+                        "static_input_keys": static_input_keys,
+                        "capture_template": template,
+                        "dummy_rids": dummy_rids,
+                        "dummy_metadata": dummy_metadata,
+                    },
+                    static_outputs=output,
+                    static_cache_manager=cache_manager,
+                    config=config,
+                    bs=bs,
+                    has_non_logit_outputs=has_non_logit,
+                )
 
             logger.debug("Captured graph %s, output keys: %s", key,
                          list(output.keys()) if isinstance(output, dict)
@@ -396,39 +373,21 @@ class CudaGraphRunner:
     def can_run(
         self,
         batch_size: int,
-        seq_len: int,
         graph_walk: str = "decode",
         requires_cfg: bool = False,
     ) -> bool:
         """Check if a captured graph exists for this configuration."""
         if not self.graphs:
             return False
-
         padded_bs = self._get_padded_batch_size(batch_size, graph_walk, requires_cfg)
         if padded_bs is None:
             return False
-
-        padded_seq = self._get_padded_seq_len(seq_len, graph_walk, requires_cfg)
-        if padded_seq is None:
-            return False
-
-        key = ARCudaGraphKey(
-            graph_walk=graph_walk,
-            requires_cfg=requires_cfg,
-            bs=batch_size,
-            seq_len=seq_len
-        )
+        key = (graph_walk, requires_cfg, padded_bs)
         return key in self.graphs
-    
-    def _seq_lens_for(self, graph_walk: str, requires_cfg: bool) -> list[int]:
-        for cfg in self.capture_configs:
-            if cfg.capture_graph_walk == graph_walk and cfg.requires_cfg == requires_cfg:
-                return [inp.seq_len for inp in cfg.dummy_capture_inputs]
-        return []
 
     def _sizes_for(self, graph_walk: str, requires_cfg: bool) -> list[int]:
         for cfg in self.capture_configs:
-            if cfg.capture_graph_walk == graph_walk and cfg.requires_cfg == requires_cfg:
+            if graph_walk in cfg.replay_graph_walks  and cfg.requires_cfg == requires_cfg:
                 return cfg.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
         return self.CAPTURE_BATCH_SIZES
 
@@ -439,21 +398,8 @@ class CudaGraphRunner:
         requires_cfg: bool = False,
     ) -> int | None:
         """Find smallest captured batch size >= batch_size for this config."""
-        sizes = sorted(self._sizes_for(graph_walk, requires_cfg))
+        sizes = self._sizes_for(graph_walk, requires_cfg)
         idx = bisect.bisect_left(sizes, batch_size)
-        if idx >= len(sizes):
-            return None
-        return sizes[idx]
-    
-    def _get_padded_seq_len(
-        self,
-        seq_len: int,
-        graph_walk: str = "decode",
-        requires_cfg: bool = False,
-    ) -> int | None:
-        """Find smallest captured seq len >= seq_len for this config."""
-        sizes = sorted(self._seq_lens_for(graph_walk, requires_cfg))
-        idx = bisect.bisect_left(sizes, seq_len)
         if idx >= len(sizes):
             return None
         return sizes[idx]
@@ -463,9 +409,9 @@ class CudaGraphRunner:
         graph_walk: str,
         requires_cfg: bool,
         request_ids: list[str],
-        per_request_inputs: list[dict],
+        inputs: list[ARNodeInputs],
         per_request_info: dict[str, CurrentForwardPassInfo],
-        submodule: Any,
+        submodule: ARNodeSubmodule,
     ) -> dict:
         """Run using a captured CUDA graph.
 
@@ -519,25 +465,12 @@ class CudaGraphRunner:
         if self.enable_nvtx:
             range_push("cg.preprocess_replan", synchronize=True)
         # Build real per-request inputs for the real slots
-        real_inputs = []
-        for i in range(batch_size):
-            real_inputs.append(per_request_inputs[i])
+        real_inputs = inputs[:]
         # Pad with dummy inputs for remaining slots using the same capture
         # template that was used during capture. This ensures submodule.preprocess
         # doesn't crash on empty lists for any input key the submodule expects.
-        def _clone_template_for_padding(tpl):
-            out = {}
-            for k, v in tpl.items():
-                if isinstance(v, list):
-                    out[k] = [t.clone() if isinstance(t, torch.Tensor) else t for t in v]
-                elif isinstance(v, torch.Tensor):
-                    out[k] = v.clone()
-                else:
-                    out[k] = v
-            return out
-
         for _i in range(batch_size, padded_bs):
-            real_inputs.append(_clone_template_for_padding(capture_template))
+            real_inputs.append(capture_template.clone())
 
         # Update metadata for real requests
         real_metadata = {}
@@ -546,14 +479,18 @@ class CudaGraphRunner:
                 real_metadata[dummy_rid] = per_request_info[request_ids[i]]
             else:
                 real_metadata[dummy_rid] = static["dummy_metadata"][dummy_rid]
+        
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=dummy_rids,
+            per_request_info=real_metadata,
+            cache_manager=static_cm
+        )
 
         # Preprocess re-plans attention+rope with real page tables
         real_inputs = submodule.preprocess(
             graph_walk=graph_walk,
-            cache_manager=static_cm,
-            per_request_inputs=real_inputs,
-            request_ids=dummy_rids,
-            per_request_info=real_metadata,
+            engine_inputs=engine_inputs,
+            inputs=real_inputs,
         )
         if self.enable_nvtx:
             range_pop(synchronize=True)

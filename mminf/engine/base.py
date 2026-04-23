@@ -77,7 +77,6 @@ class BaseEngine(ABC):
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         ...
     
-    @abstractmethod
     def execute_with_max_batch_size(self, batch: NodeBatch) -> NodeOutput:
         bs = self.get_max_batch_size()
         n = len(batch.request_ids)
