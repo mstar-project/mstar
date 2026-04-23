@@ -99,7 +99,7 @@ class ARNodeInputs(NodeInputs):
         for parent in ["tensor_inputs", "custom_pos_ids", "kwargs"]:
             if parent in out and isinstance(out[parent], dict):
                 for k, v in out[parent].items():
-                    out[parent][k] = maybe_stack(v, stacking_method)
+                    out[k] = maybe_stack(v, stacking_method)
 
         return dict(out)
     

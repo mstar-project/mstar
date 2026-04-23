@@ -475,8 +475,8 @@ class LLMSubmodule(ARNodeSubmodule):
                     self.config, device, seed=fwd_info.random_seed, H=H, W=W
                 )
             else:
-               node_inputs.input_embeds = inputs["latents"]
-               tensor_inputs["time_index"] = inputs["time_index"]
+               node_inputs.input_embeds = inputs["latents"][0]
+               tensor_inputs["time_index"] = inputs["time_index"][0]
 
             tensor_inputs["empty_combined_emb"] = self._wrap_with_boi_eoi(
                 torch.empty(
@@ -496,7 +496,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 **self._get_text_vae_idxs(seq_len, device)
             }
         
-        return node_inputs #### TODO: "input_embeds" name needs to be matched downstream (not called latents anymore) --- check this
+        return node_inputs
     
     def preprocess(
         self,
@@ -528,7 +528,6 @@ class LLMSubmodule(ARNodeSubmodule):
                     if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
             ] for label in labels
         }
-        print("HI", inputs)
         
         result = {}
 
@@ -567,7 +566,6 @@ class LLMSubmodule(ARNodeSubmodule):
         result = ARNodeInputs.collate(inputs, stacking_method=StackingMethod.CAT)
         result["seq_lens"] = seq_lens
         result["requires_cfg"] =  requires_cfg
-
         return result
 
     def _plan_for_graph_walk(
@@ -583,8 +581,6 @@ class LLMSubmodule(ARNodeSubmodule):
         for snap in snapshots:
             cache_handle.snapshot_all(*snap)
 
-
-        print("HELLO", per_label_custom_pos_ids)
         for label in labels:
             pos_ids = per_label_custom_pos_ids.get(label)
             if pos_ids is not None and len(pos_ids) > 0:
@@ -663,7 +659,7 @@ class LLMSubmodule(ARNodeSubmodule):
         return {}
 
     def _forward_prefill_vit(
-        self, combined_emb: torch.Tensor,
+        self, input_embeds: torch.Tensor,
         cache_handle: BatchedCacheManager,
         **kwargs
     ) -> NameToTensorList:
@@ -681,7 +677,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
         cache_handle.set_active_label("main")
         self.language_model(
-            combined_emb, mode="und",
+            input_embeds, mode="und",
             custom_advance_pos_id=1,
             cache_handle=cache_handle, **kwargs
         )
@@ -691,7 +687,7 @@ class LLMSubmodule(ARNodeSubmodule):
         return {}
 
     def _forward_prefill_vae(
-        self, combined_emb: torch.Tensor,
+        self, input_embeds: torch.Tensor,
         vae_token_indexes: torch.Tensor,
         text_indexes: torch.Tensor,
         text_mask: torch.Tensor,
@@ -713,7 +709,7 @@ class LLMSubmodule(ARNodeSubmodule):
         if cache_handle is not None:
             cache_handle.set_active_label("main")
         self.language_model(
-            combined_emb, mode="gen",
+            input_embeds, mode="gen",
             cache_handle=cache_handle,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
@@ -780,7 +776,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _forward_image_gen(
         self,
-        latents: torch.Tensor,
+        input_embeds: torch.Tensor,
         empty_combined_emb: torch.Tensor,
         vae_position_ids: torch.Tensor,
         text_indexes: torch.Tensor,
@@ -807,6 +803,8 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
+
+        latents = input_embeds
 
         N = self.config.num_timesteps
         shift = self.config.timestep_shift
@@ -929,7 +927,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _forward_image_gen_single_branch(
         self,
-        latents: torch.Tensor,
+        input_embeds: torch.Tensor,
         empty_combined_emb: torch.Tensor,
         vae_position_ids: torch.Tensor,
         text_indexes: torch.Tensor,
@@ -954,6 +952,8 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("cfg_renorm_type", None)
         kwargs.pop("cfg_interval", None)
         kwargs.pop("cfg_renorm_min", None)
+
+        latents = input_embeds
 
         pos_embed = self.latent_pos_embed(vae_position_ids)
 
