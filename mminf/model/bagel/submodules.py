@@ -492,7 +492,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 **self._get_text_vae_idxs(seq_len, device)
             }
         
-        return node_inputs
+        return node_inputs #### TODO: "input_embeds" name needs to be matched downstream (not called latents anymore) --- check this
     
     def preprocess(
         self,
@@ -986,19 +986,19 @@ class LLMSubmodule(ARNodeSubmodule):
             for info in per_request_info.values()
         )
 
-    def forward_batched( #TODO
+    def forward_batched(
         self,
         graph_walk: str,
-        request_ids: list[str],
-        cache_manager: BatchedCacheManager,
+        engine_inputs: ModelInputsFromEngine,
         packed_inputs: dict[str, torch.Tensor],
-        per_request_info: dict[str, CurrentForwardPassInfo]
     ) -> dict[str, NameToTensorList]:
         """Batched forward pass for decode and prefill_text.
 
         Concatenates inputs across requests, runs a single LLM forward with
         the BatchedCacheManager, then splits outputs back per-request.
         """
+        request_ids = engine_inputs.request_ids
+        cache_manager = engine_inputs.cache_manager
         requires_cfg = packed_inputs.get("requires_cfg", True)
 
         if graph_walk == "decode":
@@ -1118,7 +1118,7 @@ class LLMSubmodule(ARNodeSubmodule):
             request_info.register_loop_stop("decode_loop")
 
 
-class VAEDecoderSubmodule(NodeSubmodule): #TODO
+class VAEDecoderSubmodule(NodeSubmodule): 
     """VAE decoder: latent grid -> pixel image."""
 
     def __init__(
@@ -1133,25 +1133,32 @@ class VAEDecoderSubmodule(NodeSubmodule): #TODO
         self.latent_patch_size = latent_patch_size
         self.latent_channel = latent_channel
         self.latent_downsample = latent_downsample
-
-    def preprocess(
-        self, graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo] | None=None,
-        cache_manager: BatchedCacheManager=None,
-    ):
+    
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> NodeInputs:
         """Prepare VAE decoder inputs.
 
         Unwraps latents from list. Image dimensions (image_h, image_w)
         are provided via per-request metadata and converted to ints for
         CUDA graph compatibility.
         """
-        assert len(per_request_inputs) == 1
-        return {"latents": per_request_inputs[0]["latents"][0]}
+        return NodeInputs(
+            tensor_inputs={
+                "latents": inputs["latents"][0]
+            }
+            ## NOTE: we could also add image_h, image_w as kwargs here
+        )
+
 
     def forward(
         self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
         latents: torch.Tensor,
         image_h: int | torch.Tensor = 1024, # BAGEL's default image dim
         image_w: int | torch.Tensor = 1024,
@@ -1181,7 +1188,7 @@ class VAEDecoderSubmodule(NodeSubmodule): #TODO
         return {"image_output": [image]}
 
 
-class CombineCFGSubmodule(NodeSubmodule): # TODO
+class CombineCFGSubmodule(NodeSubmodule): 
     """Lightweight node: applies CFG formula + Euler step.
 
     Receives 3 velocity tensors (v_main, v_cfg_text, v_cfg_img) plus
@@ -1206,28 +1213,25 @@ class CombineCFGSubmodule(NodeSubmodule): # TODO
     def _apply_timestep_shift(t: torch.Tensor, shift: float) -> torch.Tensor:
         return shift * t / (1 + (shift - 1) * t)
 
-    def preprocess(
-        self, graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager = None,
-    ) -> dict[str, torch.Tensor]:
-        assert len(per_request_inputs) == 1
-        inputs = per_request_inputs[0]
-        device = inputs["v_main"][0].device
-        metadata = per_request_info[request_ids[0]]
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> NodeInputs:
+        device = self.device
 
         result = {
             "v_main": inputs["v_main"][0],
             "v_cfg_text": inputs["v_cfg_text"][0],
             "v_cfg_img": inputs["v_cfg_img"][0],
-            **metadata.step_metadata
         }
+        kwargs = fwd_info.step_metadata
         if "latents" not in inputs or len(inputs["latents"]) == 0:
             H, W = 1024, 1024
             result["latents"], result["time_index"] = _init_latents_and_time_index(
-                self.config, device=device, seed=metadata.random_seed, H=H, W=W
+                self.config, device=device, seed=fwd_info.random_seed, H=H, W=W
             )
         else:
             result = {
@@ -1235,10 +1239,15 @@ class CombineCFGSubmodule(NodeSubmodule): # TODO
                 "time_index": inputs["time_index"][0],
                 **result,
             }
-        return result
-
+        return NodeInputs(
+            tensor_inputs=result,
+            kwargs=kwargs
+        )
+        
     def forward(
         self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
         v_main: torch.Tensor,
         v_cfg_text: torch.Tensor,
         v_cfg_img: torch.Tensor,
