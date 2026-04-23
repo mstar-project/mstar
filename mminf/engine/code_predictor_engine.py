@@ -443,8 +443,7 @@ class CodePredictorCudaGraphRunner:
             pos_id_slice=engine_inputs.init_pos_ids,
             inputs_slices=fwd_inputs,
             static_outputs=[
-                {key: val for key, val in static_outputs[rid].items()} \
-                    for rid in dummy_rids
+                static_outputs[rid] for rid in dummy_rids
             ]
         )
 
@@ -490,6 +489,9 @@ class CodePredictorCudaGraphRunner:
             )
 
         graph_data = self.graphs[padded_bs]
+        graph_data.pos_id_slice.zero_()
+
+        print(inputs)
 
         # Build inputs to preprocess and forward_batched
         dummy_fwd_info, dummy_rids = self._make_dummy_fwd_info(padded_bs, graph_walk)
@@ -535,6 +537,7 @@ class CodePredictorCudaGraphRunner:
                     f"captured buffer shape {buf.shape}"
                 )
             buf.copy_(tensor)
+        print(buffers)
 
         # --- Step 4: replay. ---
         graph_data.graph.replay()
@@ -543,6 +546,7 @@ class CodePredictorCudaGraphRunner:
         outputs = {}
         for i, rid in enumerate(request_ids):
             outputs[rid] = graph_data.static_outputs[i]
+            print(outputs[rid])
 
             # clone outputs to detach from the static buffers
             # (which will be overwritten on the next call)
@@ -644,6 +648,7 @@ class CodePredictorEngine(BaseEngine):
         
         if self.enable_nvtx:
             range_push("code_pred.batched.preprocesss", synchronize=True)
+        bs = len(batch.request_ids)
         engine_inputs=CodePredictorEngineInputs(
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
@@ -652,11 +657,12 @@ class CodePredictorEngine(BaseEngine):
                     rid: info.sampling_config.get(
                         batch.node_name, SamplingConfig()
                     ) for rid, info in batch.per_request_info.items()
-                }
+                },
+                device=self.device
             ),
-            kv_cache=self.kv_caches[batch.node_name],
+            kv_cache=self.kv_caches[batch.node_name][:, :bs],
             init_pos_ids=torch.zeros(
-                len(batch.request_ids), device=self.device,
+                bs, device=self.device,
                 dtype=torch.long
             )
         )
@@ -665,6 +671,8 @@ class CodePredictorEngine(BaseEngine):
             engine_inputs=engine_inputs,
             inputs=inputs
         )
+        print(preprocessed)
+
         if self.enable_nvtx:
             range_pop(synchronize=True)
 
