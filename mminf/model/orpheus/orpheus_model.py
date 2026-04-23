@@ -32,7 +32,8 @@ from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
 from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, GraphSection, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule
+from mminf.model.base import ForwardPassArgs, Model
+from mminf.model.submodule_base import NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
 from mminf.streaming.chunk_policy import SlidingWindowChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge

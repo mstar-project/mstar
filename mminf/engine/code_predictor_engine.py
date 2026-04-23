@@ -66,6 +66,7 @@ class MTPSampler:
     seed_buf: torch.Tensor
     offset_buf: torch.Tensor
 
+    @torch.compiler.disable
     def sample(self, logits: torch.Tensor) -> torch.Tensor:
         codes = sample_depth_gpu(
             logits, self.temperature_buf,
@@ -78,9 +79,12 @@ class MTPSampler:
 
 @dataclass
 class CodePredictorEngineInputs(ModelInputsFromEngine):
-    sampler: MTPSampler
-    kv_cache: torch.Tensor
-    init_pos_ids: torch.Tensor
+    # These just have defaults so that CodePredictorEngineInputs can inherit
+    # from ModelInputsFromEngine, but all of these values should be filled in,
+    # and are expected to be downstream
+    sampler: MTPSampler | None = None
+    kv_cache: torch.Tensor | None = None
+    init_pos_ids: torch.Tensor | None = None
 
 
 class CodePredictorSubmodule(ARNodeSubmodule):
@@ -123,7 +127,7 @@ class CodePredictorSubmodule(ARNodeSubmodule):
             self.forward_batched(*args, **kwargs).values()
         ))
     
-    def can_batch(self, batch: NodeBatch) -> bool:
+    def can_batch(self, batch: NodeBatch, model_inputs: list[ARNodeInputs]) -> bool:
         return True
 
     def get_needed_cache_labels(
@@ -222,13 +226,15 @@ def make_mtp_sampler_from_buffers(
     request_ids: list[str],
     sampling_configs: dict[str, SamplingConfig],
     padded_bs: int,
+
 ) -> MTPSampler:
     assert padded_bs <= bufs.max_batch_size, (
         f"padded_bs={padded_bs} exceeds MTPSamplerBuffers.max_batch_size={bufs.max_batch_size}"
     )
 
     temps, top_ks, top_ps, seed = _build_sampling_lists(
-        request_ids, sampling_configs, padded_bs
+        request_ids, sampling_configs, padded_bs,
+        device=bufs.temperature_buf.device
     )
     bufs.temperature_buf[:padded_bs].copy_(temps)
     bufs.top_k_buf[:padded_bs].copy_(top_ks)
@@ -246,7 +252,8 @@ def make_mtp_sampler_eager(
 ) -> MTPSampler:
     bs = len(request_ids)
     temps, top_ks, top_ps, seed = _build_sampling_lists(
-        request_ids, sampling_configs, padded_bs=bs
+        request_ids, sampling_configs, padded_bs=bs,
+        device=device
     )
     return MTPSampler(
         temperature_buf=temps,
@@ -604,6 +611,7 @@ class CodePredictorEngine(BaseEngine):
         for node_name, submodule in self.submodules.items():
             runner = CodePredictorCudaGraphRunner(
                 submodule=submodule,
+                node_name=node_name,
                 kv_cache=self.kv_caches[node_name],
                 device=self.device,
             )
@@ -625,11 +633,13 @@ class CodePredictorEngine(BaseEngine):
     ) -> NodeOutput:
         self.kv_caches[batch.node_name].zero_()
         if batch.node_name in self.cuda_graph_runners:
-            return self.cuda_graph_runners[batch.node_name].run(
-                graph_walk=batch.graph_walk,
-                request_ids=batch.request_ids,
-                inputs=inputs,
-                per_request_info=batch.per_request_info
+            return NodeOutput(
+                per_request_output_tensors=self.cuda_graph_runners[batch.node_name].run(
+                    graph_walk=batch.graph_walk,
+                    request_ids=batch.request_ids,
+                    inputs=inputs,
+                    per_request_info=batch.per_request_info
+                )
             )
         
         if self.enable_nvtx:
@@ -711,3 +721,9 @@ class CodePredictorEngine(BaseEngine):
                 range_pop(synchronize=True)
             return output
 
+    def remove_request(self, request_id: str) -> None:
+        for submodule in self.submodules.values():
+            submodule.cleanup_request(request_id)
+
+    def add_request(self, request_id, **kwargs):
+        return # no persistent state

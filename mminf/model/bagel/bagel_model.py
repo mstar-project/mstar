@@ -67,7 +67,8 @@ from mminf.model.bagel.submodules import (
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
 )
-from mminf.model.base import DECODE, ForwardPassArgs, Model, NodeSubmodule
+from mminf.model.base import DECODE, ForwardPassArgs, Model
+from mminf.model.submodule_base import NodeSubmodule
 from mminf.model.utils import ModuleAndPrefix, load_weights_from_file
 from mminf.utils.sampling import SamplingConfig
 

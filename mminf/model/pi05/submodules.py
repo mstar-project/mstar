@@ -18,7 +18,7 @@ from torch import nn
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.model.base import NodeSubmodule
+from mminf.model.submodule_base import NodeSubmodule
 from mminf.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mminf.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mminf.model.pi05.components.paligemma import Pi05PaliGemmaExpert

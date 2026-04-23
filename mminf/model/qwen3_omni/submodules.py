@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import logging
 from typing import Any, Optional
 
@@ -23,10 +22,9 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.engine.code_predictor_engine import CodePredictorCudaGraphRunner, CodePredictorEngineInputs, CodePredictorSubmodule, MTPSampler
+from mminf.engine.code_predictor_engine import CodePredictorEngineInputs, CodePredictorSubmodule, MTPSampler
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
-from mminf.model.base import NodeSubmodule
 from mminf.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
     compute_rope_freqs,
@@ -36,8 +34,7 @@ from mminf.model.qwen3_omni.components.rope import (
 )
 from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor, Qwen3OmniTalkerModel
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig
-from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs
-from mminf.utils.sampling import Sampler
+from mminf.model.submodule_base import NodeSubmodule, ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs
 
 logger = logging.getLogger(__name__)
 
@@ -370,7 +367,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
             return ARNodeInputs(
                 input_seq_len=1,
-                embeds=embeds,
+                input_embeds=embeds,
                 custom_pos_ids=pos_ids,
                 tensor_inputs={
                     "masks_for_talker": self._get_decode_thinker_mask(device)
@@ -396,7 +393,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             ])
             return ARNodeInputs(
                 input_seq_len=seq_len,
-                embeds=embeds,
+                input_embeds=embeds,
                 custom_pos_ids=pos_ids,
                 tensor_inputs={
                     "masks_for_talker": masks_for_talker
@@ -436,7 +433,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             )
             return ARNodeInputs(
                 input_seq_len=seq_len,
-                embeds=wrapped_embeds,
+                input_embeds=wrapped_embeds,
                 custom_pos_ids=pos_ids,
                 tensor_inputs={
                     "masks_for_talker": masks_for_talker
@@ -493,7 +490,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
             return ARNodeInputs(
                 input_seq_len=total_len,
-                embeds=wrapped_embeds,
+                input_embeds=wrapped_embeds,
                 custom_pos_ids=pos_ids,
                 tensor_inputs={
                     "masks_for_talker": masks_for_talker,
@@ -635,7 +632,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         return result
 
     # ---- batching ----
-    def can_batch(self, batch: NodeBatch) -> bool:
+    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk == "thinker_decode"
 
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
@@ -673,7 +670,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 compile=True,
                 capture_batch_sizes=[1, 2, 4, 8, 16],
             )
-        ],
+        ]
 
     def forward_batched(
         self,
@@ -766,6 +763,28 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if (eos_token_id is not None and eos_token_id == token) or \
                 (request_info.dynamic_loop_iter_counts.get("thinker_decode_loop", 0) + 1 >= request_info.max_tokens):
             request_info.register_loop_stop("thinker_decode_loop")
+    
+    def filter_batched_output(
+        self,
+        request_info: CurrentForwardPassInfo,
+        rid_output: dict[str, list[torch.Tensor]],
+    ) -> dict[str, list[torch.Tensor]]:
+        """Drop ``thinker_states`` + ``thinker_mask`` for text-only requests.
+
+        ``forward_batched`` always emits these keys so the captured CUDA
+        graph's output shape is static.  Here, outside the captured
+        region, we gate them on the real request's ``audio_output`` flag
+        so the Talker edge stays unrouted for text-only requests (matches
+        the pre-capture eager-mode behaviour).
+        """
+        if request_info is None:
+            return rid_output
+        if request_info.step_metadata.get("audio_output", True):
+            return rid_output
+        return {
+            k: v for k, v in rid_output.items()
+            if k not in ("thinker_states", "thinker_mask")
+        }
 
 
 # ===================================================================
@@ -1100,20 +1119,20 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
         """Remove per-request state when a request completes."""
         self._eos_embed_sent.discard(request_id)
     
-    def can_batch(self, batch: NodeBatch) -> bool:
+    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk == "talker_decode"
 
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         return [
             CudaGraphConfig(
                 capture_graph_walk="talker_decode", requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=ARNodeInputs(
+                dummy_capture_inputs=[ARNodeInputs(
                     input_embeds=torch.zeros(
                         (1, self.config.talker_hidden_size),
                         device=device, dtype=torch.bfloat16
                     ),
                     input_seq_len=1
-                ),
+                )],
                 capture_batch_sizes=[1, 2, 4, 8, 16]
             )
         ]
@@ -1183,10 +1202,11 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
         "all_codes": [bs, num_codes] int64
         "codec_emb_sum": [bs, hidden] fp32
         """
-        return {
-            "last_hidden": torch.cat([
+        last_hidden = torch.cat([
                 inp.input_embeds for inp in inputs
-            ], dim=0),
+            ], dim=0)
+        return {
+            "last_hidden": last_hidden,
             "layer0_codes": torch.cat([
                 inp.input_ids for inp in inputs
             ], dim=0),
@@ -1194,7 +1214,7 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
                 (len(inputs), self.num_codes),
                 device=inputs[0].input_ids.device, dtype=torch.long
             ),
-            "codec_emb_sum": torch.zeros_like(inputs[0].input_embeds),
+            "codec_emb_sum": torch.zeros_like(last_hidden),
         }
 
     def forward_batched(
@@ -1216,22 +1236,22 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
 
         pos = engine_inputs.init_pos_ids
 
-        c0_embed = self.talker_code_emb(layer0_codes)  # [bs, hidden]
-        codec_emb_sum += c0_embed
+        embed = self.talker_code_emb(layer0_codes)  # [bs, hidden]
+        codec_emb_sum += embed
         all_codes[:, 0] = layer0_codes
 
         # forward over [last_hidden] to update kv cache with the Talker's final hidden
         # state as context for the code prediction. This returns nothing because the
         # layer 0 code is already provided by the talker LLM
         cp.forward_depth_unrolled(
-            last_hidden, pos, kv_cache, cache_pos=0,
+            last_hidden.unsqueeze(1), pos, kv_cache, cache_pos=0,
         )
         pos += 1
 
         for group_idx in range(1, self.num_codes):
             hidden = cp.forward_depth_unrolled(
-                codec_emb_sum, pos, kv_cache, cache_pos=group_idx,
-            )
+                embed.unsqueeze(1), pos, kv_cache, cache_pos=group_idx,
+            ).squeeze(1)
             pos += 1
 
             logits = torch.matmul(
@@ -1264,7 +1284,7 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
             CudaGraphConfig(
                 capture_graph_walk="talker_decode",
                 replay_graph_walks=["talker_last_prefill", "talker_decode"],
-                dummy_capture_inputs=self._get_dummy_inputs(device=device),
+                dummy_capture_inputs=[self._get_dummy_inputs(device=device)],
             )
         ]
 
@@ -1427,7 +1447,8 @@ class Code2WavSubmodule(NodeSubmodule):
         audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": [audio_int16]}
 
-    def can_batch(self, batch: NodeBatch) -> bool:
+    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         return len({
-            inputs["codec_tokens"][0].numel() for inputs in batch.per_request_input_tensors.values()
+            inputs.tensor_inputs["codec_tokens"].numel() \
+                for inputs in model_inputs
         }) == 1

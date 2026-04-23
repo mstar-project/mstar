@@ -34,7 +34,7 @@ class ARNodeInputs(NodeInputs):
     inputs as needed; but the main LLM inputs should be provided in the given
     dedicated fields.
     """
-    input_seq_len: int
+    input_seq_len: int = 0
     input_ids: torch.Tensor | None = None
     input_embeds: torch.Tensor | None = None
 
@@ -304,3 +304,9 @@ class ARNodeSubmodule(NodeSubmodule):
         Override in subclasses that only need a subset of available labels.
         """
         return None
+    
+    def filter_batched_output(
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> dict[str, list[torch.Tensor]]:
+        return outputs

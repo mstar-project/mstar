@@ -46,10 +46,11 @@ from mminf.engine.code_predictor_engine import CodePredictorSubmodule
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mminf.model.base import ForwardPassArgs, Model, NodeSubmodule, TensorAndMetadata
+from mminf.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
 from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mminf.model.qwen3_omni.submodules import Qwen3OmniCodePredictorSubmodule
+from mminf.model.submodule_base import NodeSubmodule
 from mminf.model.utils import Operation, WeightConverter
 from mminf.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge

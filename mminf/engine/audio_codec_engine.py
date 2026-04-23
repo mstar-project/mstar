@@ -4,6 +4,7 @@ import torch
 
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.engine.cuda_graph_runner import CodecCudaGraphRunner, CodecGraphNotApplicableError
+from mminf.model.submodule_base import NodeInputs, NodeSubmodule
 from mminf.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ class AudioCodecEngine(BaseEngine):
         **kwargs
     ):
         super().__init__(enable_nvtx=enable_nvtx)
-        self.submodules: dict[str, torch.nn.Module] = {}
+        self.submodules: dict[str, NodeSubmodule] = {}
         self.device = None
         self.autocast_dtype = autocast_dtype
 
@@ -58,7 +59,16 @@ class AudioCodecEngine(BaseEngine):
 
         try:
             with torch.inference_mode():
-                output = self._dispatch(batch, submodule)
+                node_inputs: list[NodeInputs] = []
+                for rid in batch.request_ids:
+                    node_inputs.append(
+                        submodule.prepare_inputs(
+                            graph_walk=batch.graph_walk,
+                            fwd_info=batch.per_request_info[rid],
+                            inputs=batch.per_request_input_tensors[rid],
+                        )
+                    )
+                output = self._dispatch(batch, node_inputs, submodule)
                 for rid, info in batch.per_request_info.items():
                     submodule.postprocess(
                         request_id=rid,
@@ -70,10 +80,15 @@ class AudioCodecEngine(BaseEngine):
             if self.enable_nvtx:
                 range_pop()
 
-    def _dispatch(self, batch: NodeBatch, submodule) -> NodeOutput:
+    def _dispatch(
+        self, batch: NodeBatch,
+        inputs: list[NodeInputs],
+        submodule: NodeSubmodule
+    ) -> NodeOutput:
         """Pick cuda_graph / batched / sequential, with eager fallback if
         the CUDA-graph runner rejects the batch (e.g. SNAC frame mismatch).
         """
+        # TODO: in progress
         if self._can_use_cuda_graph(batch, submodule):
             try:
                 return self._execute_with_cuda_graph(batch, submodule)
@@ -82,17 +97,20 @@ class AudioCodecEngine(BaseEngine):
                     "%s: CUDA graph path declined for batch %s (%s); falling back",
                     batch.node_name, batch.request_ids, exc,
                 )
-        if hasattr(submodule, 'can_batch') and submodule.can_batch(batch):
+        if submodule.can_batch(batch, inputs):
             return self._execute_batched(batch, submodule)
         return self._execute_sequential(batch, submodule)
 
-    def _can_use_cuda_graph(self, batch: NodeBatch, submodule) -> bool:
+    def _can_use_cuda_graph(
+        self, batch: NodeBatch, submodule: NodeSubmodule,
+        inputs: NodeInputs
+    ) -> bool:
         runner: CodecCudaGraphRunner | None = getattr(
             submodule, 'cuda_graph_runner', None,
         )
         if runner is None:
             return False
-        if not submodule.can_use_cuda_graphs(batch):
+        if not submodule.can_use_cuda_graphs(batch, inputs):
             return False
         return runner.can_run(
             batch_size=len(batch.request_ids),
@@ -232,4 +250,5 @@ class AudioCodecEngine(BaseEngine):
         pass  # stateless
 
     def remove_request(self, request_id: str) -> None:
-        pass  # stateless
+        for submodule in self.submodules.values():
+            submodule.cleanup_request(request_id)
