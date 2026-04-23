@@ -56,7 +56,7 @@ class EncoderDecoderEngine(BaseEngine):
         preprocessed = submodule.preprocess(
             batch.graph_walk,
             engine_inputs=engine_inputs,
-            per_request_inputs=batch.per_request_input_tensors,
+            inputs=inputs,
         )
 
         outputs = submodule.forward_batched(
@@ -84,7 +84,7 @@ class EncoderDecoderEngine(BaseEngine):
             preprocessed = submodule.preprocess(
                 graph_walk=batch.graph_walk,
                 engine_inputs=engine_inputs,
-                inputs=node_inputs
+                inputs=[node_inputs]
             )
             outputs[rid] = submodule.forward(
                 graph_walk=batch.graph_walk,

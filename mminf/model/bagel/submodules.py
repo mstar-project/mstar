@@ -8,7 +8,7 @@ import logging
 from typing import Any
 
 from mminf.engine.kv_store import PositionInfo
-from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, StackingMethod
 import torch
 from torch import nn
 
@@ -365,11 +365,10 @@ class LLMSubmodule(ARNodeSubmodule):
         seq_len: int,
     ):
         return {
-            label: [
-                torch.zeros(
+            label: torch.zeros(
                     seq_len, dtype=torch.int32, device=device
                 ) + pos_info.get(label, PositionInfo()).position_id_start \
-            ] for label in labels
+            for label in labels
         }
 
     def _get_text_vae_idxs(
@@ -400,11 +399,11 @@ class LLMSubmodule(ARNodeSubmodule):
         return [
             CudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=dummy.clone(),
+                dummy_capture_inputs=[dummy.clone()],
             ),
             CudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=True, labels=["main", "cfg_img"],
-                dummy_capture_inputs=dummy.clone(),
+                dummy_capture_inputs=[dummy.clone()],
             ),
         ]
 
@@ -436,12 +435,12 @@ class LLMSubmodule(ARNodeSubmodule):
         pos_info: dict[str, PositionInfo] = {},
     ) -> ARNodeInputs:
         
-        device = self.device
+        device = self.get_device()
         node_inputs = ARNodeInputs(input_seq_len=0)
 
         if graph_walk == "prefill_text":
             node_inputs.input_ids = self._preprocess_prefill_text(inputs["text_inputs"][0])
-            node_inputs.input_seq_len = inputs.shape[0]
+            node_inputs.input_seq_len = node_inputs.input_ids.shape[0]
 
         elif graph_walk == "decode":
             bos = torch.tensor([self.bos_token_id], device=device)
@@ -450,10 +449,10 @@ class LLMSubmodule(ARNodeSubmodule):
 
         if graph_walk in ["prefill_vit", "prefill_vae"]:
             node_inputs.input_embeds = self._wrap_with_boi_eoi(inputs["img_emb"][0])
-            seq_len = inputs.shape[0]
+            seq_len = node_inputs.input_embeds.shape[0]
             node_inputs.input_seq_len = seq_len
 
-            labels = self._get_active_labels(graph_walk, requires_cfg=True) # just return all labels since it is cheap
+            labels = self._get_active_labels(graph_walk, True) # just return all labels since it is cheap
             
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
                 labels, pos_info, device, seq_len
@@ -486,6 +485,7 @@ class LLMSubmodule(ARNodeSubmodule):
                     device=device
                 )
             )
+            labels = self._get_active_labels(graph_walk, True) 
             seq_len = tensor_inputs["empty_combined_emb"].shape[0]
             node_inputs.input_seq_len = seq_len
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
@@ -523,8 +523,12 @@ class LLMSubmodule(ARNodeSubmodule):
         labels = self._get_active_labels(graph_walk, requires_cfg)
         seq_lens = [inp.input_seq_len for inp in inputs]
         per_label_custom_pos_ids = {
-            label: [inp.custom_pos_ids[label] for inp in inputs if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids] for label in labels
+            label: [
+                inp.custom_pos_ids[label] for inp in inputs \
+                    if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
+            ] for label in labels
         }
+        print("HI", inputs)
         
         result = {}
 
@@ -560,7 +564,7 @@ class LLMSubmodule(ARNodeSubmodule):
             )
 
         # Concatenate lists of tensors into single tensors for each input name
-        result = ARNodeInputs.collate(inputs, stack=True)
+        result = ARNodeInputs.collate(inputs, stacking_method=StackingMethod.CAT)
         result["seq_lens"] = seq_lens
         result["requires_cfg"] =  requires_cfg
 
@@ -580,10 +584,13 @@ class LLMSubmodule(ARNodeSubmodule):
             cache_handle.snapshot_all(*snap)
 
 
+        print("HELLO", per_label_custom_pos_ids)
         for label in labels:
             pos_ids = per_label_custom_pos_ids.get(label)
-            if pos_ids is not None:
+            if pos_ids is not None and len(pos_ids) > 0:
                 pos_ids = torch.cat(pos_ids)
+            else:
+                pos_ids = None
             cache_handle.plan_attention(
                 seq_lens=seq_lens, is_causal=is_causal, label=label,
                 write_store=write_cache
@@ -621,7 +628,7 @@ class LLMSubmodule(ARNodeSubmodule):
             raise ValueError(f"Unknown LLM graph walk: {graph_walk!r}")
 
     def _forward_prefill_text(
-        self, text_inputs: torch.Tensor,
+        self, input_ids: torch.Tensor,
         cache_handle: BatchedCacheManager,
         **kwargs
     ) -> NameToTensorList:
@@ -633,7 +640,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
         plan_attention/plan_rope are called in preprocess for all needed labels.
         """
-        emb = self.embed_tokens(text_inputs)
+        emb = self.embed_tokens(input_ids)
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
@@ -720,7 +727,7 @@ class LLMSubmodule(ARNodeSubmodule):
         return {}
 
     def _forward_decode(
-        self, text_inputs: torch.Tensor,
+        self, input_ids: torch.Tensor,
         cache_handle: BatchedCacheManager,
         **kwargs
     ) -> NameToTensorList:
@@ -741,7 +748,7 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("temperature", None)
         kwargs.pop("top_k", None)
         kwargs.pop("top_p", None)
-        emb = self.embed_tokens(text_inputs)
+        emb = self.embed_tokens(input_ids)
 
         if cache_handle is not None:
             cache_handle.set_active_label("main")
@@ -991,10 +998,12 @@ class LLMSubmodule(ARNodeSubmodule):
         )
 
     def forward_batched(
-        self,
+        self, 
         graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        packed_inputs: dict[str, torch.Tensor],
+        engine_inputs: ModelInputsFromEngine, 
+        input_ids: torch.Tensor,
+        requires_cfg: bool=False,
+        **kwargs
     ) -> dict[str, NameToTensorList]:
         """Batched forward pass for decode and prefill_text.
 
@@ -1003,19 +1012,20 @@ class LLMSubmodule(ARNodeSubmodule):
         """
         request_ids = engine_inputs.request_ids
         cache_manager = engine_inputs.cache_manager
-        requires_cfg = packed_inputs.get("requires_cfg", True)
 
         if graph_walk == "decode":
             return self._forward_decode_batched(
                 cache_manager=cache_manager,
                 request_ids=request_ids,
-                packed_inputs=packed_inputs,
+                input_ids=input_ids,
                 requires_cfg=requires_cfg,
             )
         elif graph_walk == "prefill_text":
             self._forward_prefill_text(
                 cache_handle=cache_manager,
-                **packed_inputs
+                input_ids=input_ids,
+                requires_cfg=requires_cfg,
+                **kwargs
             ) # prefill is the same batched and unbatched
             return {rid: [] for rid in request_ids}
         else:
@@ -1025,9 +1035,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         cache_manager: BatchedCacheManager,
         request_ids: list[str],
-        packed_inputs: dict[str, torch.Tensor],
+        input_ids: torch.Tensor,
         requires_cfg: bool = False,
-        per_request_info: dict[str, CurrentForwardPassInfo] | None=None
     ) -> dict[str, NameToTensorList]:
         """Batched decode: all requests generate 1 token each.
 
@@ -1042,7 +1051,7 @@ class LLMSubmodule(ARNodeSubmodule):
         plan_attention/plan_rope are called in preprocess_batched.
         """
         # 1. Embed and concatenate
-        embs = self.embed_tokens(packed_inputs["text_inputs"])
+        embs = self.embed_tokens(input_ids)
 
         # 2. Single LLM forward (main cache, already planned)
         cache_manager.set_active_label("main")
@@ -1224,7 +1233,7 @@ class CombineCFGSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        device = self.device
+        device = self.get_device()
 
         result = {
             "v_main": inputs["v_main"][0],
