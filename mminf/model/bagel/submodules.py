@@ -3,8 +3,12 @@
 # ---------------------------------------------------------------------------
 
 
+from dataclasses import asdict
 import logging
+from typing import Any
 
+from mminf.engine.kv_store import PositionInfo
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs
 import torch
 from torch import nn
 
@@ -53,14 +57,14 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
         self.transform = ImageTransform(980, 224, 14)
         self.vae_transform = ImageTransform(1024, 512, 16)
-
-    def preprocess(
-        self, graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager=None,
-    ) -> dict[str, torch.Tensor]: # input name to tensor
+    
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> NodeInputs:
         """Convert raw images to packed ViT input format.
 
         Full implementation should include prepare_vit_images logic from BAGEL:
@@ -70,8 +74,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         - Packing multiple images with cu_seqlens for FlashAttention
         """
 
-        assert len(per_request_inputs) == 1, "Batching not supported for ViTEncoder"
-        image_inputs = per_request_inputs[0]["image_inputs"]
+        image_inputs = inputs["image_inputs"]
 
         image_tensor = self.vae_transform.resize_transform(image_inputs[0])
         image_tensor = self.transform(image_tensor)
@@ -95,16 +98,20 @@ class ViTEncoderSubmodule(NodeSubmodule):
         ).to(torch.int32)
         max_seqlen = int(num_tokens)
 
-        return {
+        tensor_inputs = {
             "packed_pixel_values": pixel_values,
             "packed_position_ids": position_ids,
+        }
+        kwargs = {
             "cu_seqlens": cu_seqlens,
             "max_seqlen": max_seqlen,
         }
+        return NodeInputs(tensor_inputs=tensor_inputs, kwargs=kwargs)
 
+    
     def forward(
         self,
-        request_info: CurrentForwardPassInfo,
+        engine_inputs: ModelInputsFromEngine,
         packed_pixel_values: torch.Tensor,
         packed_position_ids: torch.Tensor,
         cu_seqlens: torch.Tensor,
@@ -156,13 +163,15 @@ class VAEEncoderSubmodule(NodeSubmodule):
         self.max_latent_size = max_latent_size
         self.transform = ImageTransform(1024, 512, 16)
 
-    def preprocess(
-        self, graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager=None,
-    ) -> dict[str, torch.Tensor]: # input name to tensor
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> NodeInputs:
+
         """Convert raw images to VAE encoder input format.
 
         Computes patchified dimensions as Python ints for CUDA graph
@@ -173,8 +182,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
         - VAE position ID computation from latent grid
         - Timestep preparation
         """
-        assert len(per_request_inputs) == 1, "Batching not supported for ViTEncoder"
-        image_inputs = per_request_inputs[0]["image_inputs"]
+        image_inputs = inputs["image_inputs"]
 
         # [C, H, W]
         image_tensor: torch.Tensor = self.transform(self.transform.resize_transform(image_inputs[0].contiguous()))
@@ -193,16 +201,21 @@ class VAEEncoderSubmodule(NodeSubmodule):
             max_num_patches_per_side=self.max_latent_size
         )
 
-        return {
+        tensor_inputs = {
             "padded_images": image_tensor.unsqueeze(0),
             "packed_vae_position_ids": packed_vae_position_ids,
             "packed_timesteps": torch.tensor([0.0], device=device),
+        }
+        kwargs = {
             "h": h,
             "w": w,
         }
+        return NodeInputs(tensor_inputs=tensor_inputs, kwargs=kwargs)
+
 
     def forward(
         self,
+        engine_inputs: ModelInputsFromEngine,
         padded_images: torch.Tensor,
         packed_vae_position_ids: torch.Tensor,
         packed_timesteps: torch.Tensor,
@@ -239,7 +252,6 @@ class VAEEncoderSubmodule(NodeSubmodule):
         packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
         return {"img_emb": [packed_latent]}
 
-
 def _init_latents_and_time_index(
     config: BagelModelConfig,
     device,
@@ -266,7 +278,7 @@ def _init_latents_and_time_index(
     return latents, time_idx
 
 
-class LLMSubmodule(NodeSubmodule):
+class LLMSubmodule(ARNodeSubmodule):
     """Fat LLM wrapper that dispatches based on graph walk.
 
     Absorbs text_emb, lm_head, and flow_proj into a single node to avoid
@@ -348,46 +360,36 @@ class LLMSubmodule(NodeSubmodule):
 
     def _get_image_pos_ids(
         self, labels: list[str],
-        cache_manager: BatchedCacheManager,
+        pos_info: dict[str, PositionInfo],
         device: str,
-        seq_lens: list[int],
-        request_ids: list[str]
+        seq_len: int,
     ):
         return {
             label: [
                 torch.zeros(
                     seq_len, dtype=torch.int32, device=device
-                ) + cache_manager._get_state(rid, label).position_id_start \
-                    for (seq_len, rid) in zip(seq_lens, request_ids, strict=True)
+                ) + pos_info.get(label, PositionInfo()).position_id_start \
             ] for label in labels
         }
 
     def _get_text_vae_idxs(
-        self, seq_lens: list[int], device: str
+        self, seq_len: int, device: str
     ):
-        result = {
-            "text_indexes": [],
-            "vae_token_indexes": [],
-            "text_mask": []
-        }
-        for seq_len in seq_lens:
-            text_idxs = torch.tensor(
-                [0, seq_len-1], dtype=torch.long, device=device
-            )
-            result["text_indexes"].append(text_idxs)
-            result["vae_token_indexes"].append(
-                torch.arange(
-                    1, seq_len-1,
-                    dtype=torch.long, device=device
-                )
-            )
-            text_mask = torch.zeros(
-                seq_len, dtype=torch.bool, device=device
-            )
-            text_mask[0] = True
-            text_mask[-1] = True
-            result["text_mask"].append(text_mask)
-        return result
+        tensor_inputs = {}
+        tensor_inputs["text_indexes"] = torch.tensor(
+            [0, seq_len-1], dtype=torch.long, device=device
+        )
+        tensor_inputs["vae_token_indexes"] = torch.arange(
+            1, seq_len-1,
+            dtype=torch.long, device=device
+        )
+        tensor_inputs["text_mask"] = torch.zeros(
+            seq_len, dtype=torch.bool, device=device
+        )
+        tensor_inputs["text_mask"][0] = True
+        tensor_inputs["text_mask"][-1] = True
+
+        return tensor_inputs
 
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         dummy = [{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
@@ -422,13 +424,83 @@ class LLMSubmodule(NodeSubmodule):
             return [self._NODE_TO_CFG_LABEL.get(self.node_name, "main")]
         return ["main"]
 
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        pos_info: dict[str, PositionInfo] = {},
+    ) -> ARNodeInputs:
+        
+        device = self.device
+        node_inputs = ARNodeInputs(input_seq_len=0)
+
+        if graph_walk == "prefill_text":
+            node_inputs.input_ids = self._preprocess_prefill_text(inputs["text_inputs"][0])
+            node_inputs.seq_len = inputs.shape[0]
+
+        elif graph_walk == "decode":
+            bos = torch.tensor([self.bos_token_id], device=device)
+            node_inputs.input_ids = inputs["text_inputs"][0] if len(inputs["text_inputs"]) > 0 else bos.clone()
+            node_inputs.seq_len = 1
+
+        if graph_walk in ["prefill_vit", "prefill_vae"]:
+            node_inputs.input_embeds = self._wrap_with_boi_eoi(inputs["img_emb"][0])
+            seq_len = inputs.shape[0]
+            node_inputs.seq_len = seq_len
+
+            labels = self._get_active_labels(graph_walk, requires_cfg=True) # just return all labels since it is cheap
+            
+            node_inputs.custom_pos_ids = self._get_image_pos_ids(
+                labels, pos_info, device, seq_len
+            )
+
+        if graph_walk == "prefill_vae":
+            node_inputs.tensor_inputs = self._get_text_vae_idxs(seq_len, device)
+
+        if graph_walk in ("image_gen", "image_gen_cfg"):
+            tensor_inputs = {}
+            H, W = 1024, 1024 # TODO: make this configurable?
+
+            tensor_inputs["vae_position_ids"] = get_flattened_position_ids_extrapolate(
+                H, W,
+                self.config.latent_downsample,
+                max_num_patches_per_side=self.config.max_latent_size
+            )
+            if "latents" not in inputs or len(inputs["latents"]) == 0:
+                node_inputs.input_embeds, tensor_inputs["time_index"] = _init_latents_and_time_index(
+                    self.config, device, seed=fwd_info.random_seed, H=H, W=W
+                )
+            else:
+               node_inputs.input_embeds = inputs["latents"]
+               tensor_inputs["time_index"] = inputs["time_index"]
+
+            tensor_inputs["empty_combined_emb"] = self._wrap_with_boi_eoi(
+                torch.empty(
+                    (node_inputs.input_embeds.shape[0], self.config.hidden_size),
+                    dtype=node_inputs.input_embeds.dtype,
+                    device=device
+                )
+            )
+            seq_len = tensor_inputs["empty_combined_emb"].shape[0]
+            node_inputs.seq_len = seq_len
+            node_inputs.custom_pos_ids = self._get_image_pos_ids(
+                labels, pos_info, device, seq_len
+            )
+            node_inputs.tensor_inputs = {
+                **tensor_inputs,
+                **self._get_text_vae_idxs(seq_len, device)
+            }
+        
+        return node_inputs
+    
     def preprocess(
-        self, graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager,
-    ) -> dict[str, torch.Tensor]: # input name to tensor
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
+    ) -> dict[str, torch.Tensor | Any]:
+        
         """Data transform + plan attention/rope for all relevant labels.
 
         When cache_handle is provided (sequential execution), calls
@@ -439,84 +511,22 @@ class LLMSubmodule(NodeSubmodule):
         When cache_handle is None (batched execution preprocesses per-request
         without planning; planning is done separately via preprocess_batched).
         """
-        device = next(self.parameters()).device
+        cache_manager = engine_inputs.cache_manager
 
         requires_cfg = self._batch_get_requires_cfg(
-            per_request_info
+            engine_inputs.per_request_info
         )
         labels = self._get_active_labels(graph_walk, requires_cfg)
-
-         # these will get filled in
-        seq_lens = []
-        per_label_custom_pos_ids = {}
+        seq_lens = [inp.input_seq_len for inp in inputs]
+        per_label_custom_pos_ids = {
+            label: [inp.custom_pos_ids[label] for inp in inputs if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids] for label in labels
+        }
+        
         result = {}
 
-        if graph_walk == "prefill_text":
-            result["text_inputs"] = [
-                self._preprocess_prefill_text(inp["text_inputs"][0]) \
-                    for inp in per_request_inputs
-            ]
-            seq_lens = [inp.shape[0] for inp in result["text_inputs"]]
-
-        elif graph_walk == "decode":
-            bos = torch.tensor([self.bos_token_id], device=device)
-            result["text_inputs"] = [
-                inp["text_inputs"][0] if len(inp["text_inputs"]) > 0 else bos.clone() \
-                    for inp in per_request_inputs
-            ]
-            seq_lens = [1] * len(per_request_inputs)
-
-        if graph_walk in ["prefill_vit", "prefill_vae"]:
-            result["combined_emb"] = [
-                self._wrap_with_boi_eoi(inp["img_emb"][0]) for inp in per_request_inputs
-            ]
-            seq_lens = [inp.shape[0] for inp in result["combined_emb"]]
-            per_label_custom_pos_ids = self._get_image_pos_ids(
-                labels, cache_manager, device, seq_lens, request_ids
-            )
-
-        if graph_walk == "prefill_vae":
-            result = {
-                **result,
-                **self._get_text_vae_idxs(seq_lens, device)
-            }
 
         if graph_walk in ("image_gen", "image_gen_cfg"):
-            H, W = 1024, 1024 # TODO: make this configurable?
-
-            # TODO support batching for image gen
-            assert len(per_request_inputs) == 1, "Batching not supported for image gen"
-            inputs = per_request_inputs[0]
-            metadata = per_request_info[request_ids[0]]
-
-            result["vae_position_ids"] = get_flattened_position_ids_extrapolate(
-                H, W,
-                self.config.latent_downsample,
-                max_num_patches_per_side=self.config.max_latent_size
-            )
-            if "latents" not in inputs or len(inputs["latents"]) == 0:
-                result["latents"], result["time_index"] = _init_latents_and_time_index(
-                    self.config, device, seed=metadata.random_seed, H=H, W=W
-                )
-            else:
-               result["latents"] = inputs["latents"][0]
-               result["time_index"] = inputs["time_index"][0]
-
-            result["empty_combined_emb"] = self._wrap_with_boi_eoi(
-                torch.empty(
-                    (result["latents"].shape[0], self.config.hidden_size),
-                    dtype=result["latents"].dtype,
-                    device=device
-                )
-            )
-            seq_lens = [result["empty_combined_emb"].shape[0]]
-            per_label_custom_pos_ids = self._get_image_pos_ids(
-                labels, cache_manager, device, seq_lens, request_ids
-            )
-            result = {
-                **result,
-                **self._get_text_vae_idxs(seq_lens, device)
-            }
+            assert len(inputs) == 1 , "Batching not supported for image gen" 
 
         if graph_walk == "image_gen" and requires_cfg:
             # Batched CFG: plan a single FlashInfer batch across all 3 labels
@@ -545,11 +555,8 @@ class LLMSubmodule(NodeSubmodule):
                 write_cache=graph_walk not in ("image_gen", "image_gen_cfg")
             )
 
-        result = {
-            key: torch.cat(val) if (
-                isinstance(val, list) and isinstance(val[0], torch.Tensor)
-            ) else val for (key, val) in result.items()
-        }
+        # Concatenate lists of tensors into single tensors for each input name
+        result = ARNodeInputs.collate(inputs, stack=True)
         result["seq_lens"] = seq_lens
         result["requires_cfg"] =  requires_cfg
 
