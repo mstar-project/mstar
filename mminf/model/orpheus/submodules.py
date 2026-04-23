@@ -43,7 +43,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
                 requires_cfg=False, labels=["main"],
                 dummy_capture_inputs=[
                     ARNodeInputs(
-                        input_ids=[torch.zeros(1, dtype=torch.long, device=device)],
+                        input_ids=torch.zeros(1, dtype=torch.long, device=device),
                         input_seq_len=1
                     )
                 ]
@@ -227,7 +227,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         # churn we don't want in the cached trace).
         tokens_per_window = self.config.snac_window_tokens
         dummy = ARNodeInputs(
-            input_ids=torch.zeros(tokens_per_window, dtype=torch.long, device=device),
+            input_ids=torch.zeros((1, 4, 7), dtype=torch.long, device=device),
             input_seq_len=tokens_per_window
         )
         return [
@@ -272,7 +272,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         stacked = torch.stack([
-            input.input_seq_len for input in inputs
+            input.input_ids for input in inputs
         ], dim=0)
         B, N = stacked.shape[0], stacked.shape[1]
         flat = stacked.reshape(B * N, 4, 7)
