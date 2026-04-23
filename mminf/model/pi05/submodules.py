@@ -11,6 +11,7 @@ Two submodules:
 
 import logging
 import math
+from typing import Any
 
 import torch
 from torch import nn
@@ -18,7 +19,7 @@ from torch import nn
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.model.submodule_base import NodeSubmodule
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mminf.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mminf.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mminf.model.pi05.components.paligemma import Pi05PaliGemmaExpert
@@ -64,7 +65,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
                 buf.data = buf.data.to(torch.float32)
         return result
 
-    def _preprocess_one(self, images: torch.Tensor) -> torch.Tensor:
+    def _prepare_one(self, images: torch.Tensor) -> torch.Tensor:
         """Resize one request's stack of camera images with aspect-preserving
         letterbox padding.
 
@@ -131,28 +132,35 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
             resized, (pad_w0, pad_w1, pad_h0, pad_h1), mode="constant", value=-1.0
         )
 
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> NodeInputs:
+        return NodeInputs(tensor_inputs={"pixel_values": self._preprocess_one(inputs["image_inputs"][0])})
+
     def preprocess(
         self,
         graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager | None = None,
-    ) -> dict[str, torch.Tensor]:
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
+    ) -> dict[str, torch.Tensor | Any]:
         # Stack images across requests into a single batch dimension.
         all_images = []
-        for inp in per_request_inputs:
-            images = inp["image_inputs"][0]
-            all_images.append(self._preprocess_one(images))
+        for inp in inputs:
+            all_images.append(inp.tensor_inputs["pixel_values"])
         pixel_values = torch.cat(all_images, dim=0)
         return {"pixel_values": pixel_values}
 
     @torch.amp.autocast("cuda", enabled=False)
     def forward(
         self,
-        request_info: CurrentForwardPassInfo,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
         pixel_values: torch.Tensor,
-        **kwargs,
+        **kwargs # coming from preprocess output
     ) -> NameToTensorList:
         # Disable autocast so SigLIP runs in fp32, matching lerobot's
         # to_bfloat16_for_selected_params which keeps vision_tower +
@@ -165,7 +173,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         return {"img_emb": [flat]}
 
 
-class Pi05LLMSubmodule(NodeSubmodule):
+class Pi05LLMSubmodule(ARNodeSubmodule):
     """Combined PaliGemma prefix expert + action expert.
 
     Dispatches by graph_walk:
@@ -300,13 +308,30 @@ class Pi05LLMSubmodule(NodeSubmodule):
     def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
         emb = self.embed_tokens(ids)
         return emb * self._text_embed_scale
-
-    def _preprocess_prefill(
+    
+    def prepare_inputs(
         self,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        cache_manager: BatchedCacheManager,
-    ) -> dict[str, torch.Tensor]:
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> ARNodeInputs:
+        if graph_walk == "prefill":
+            return self._prepare_inputs_prefill(
+                inputs=inputs,
+            )
+        if graph_walk == "action_gen":
+            return self._prepare_inputs_action_gen(
+                inputs=inputs,
+                fwd_info=fwd_info,
+            )
+        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
+    
+    def _prepare_inputs_prefill(
+        self,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> ARNodeInputs:
         # Pi0.5 prefix layout (matches lerobot's embed_prefix):
         #   [image_tokens, language_tokens]
         # The robot state is *not* a separate token stream — it has already
@@ -323,16 +348,70 @@ class Pi05LLMSubmodule(NodeSubmodule):
         # lerobot integration test missed this because it bypasses
         # _preprocess_prefill and feeds in lerobot's pre-scaled embed_prefix
         # output directly.)
-        per_request_seqs = []
-        for inp in per_request_inputs:
-            img_emb = inp["img_emb"][0] * self._image_embed_scale
-            text_ids = inp["text_inputs"][0]
-            text_emb = self._embed_tokens_scaled(text_ids)
-            per_request_seqs.append(torch.cat([img_emb, text_emb], dim=0))
 
-        seq_lens = [seq.shape[0] for seq in per_request_seqs]
+        img_emb = inputs["img_emb"][0] * self._image_embed_scale
+        text_ids = inputs["text_inputs"][0]
+        text_emb = self._embed_tokens_scaled(text_ids)
+        prefix_emb = torch.cat([img_emb, text_emb], dim=0)
+        seq_len = prefix_emb.shape[0]
+
+        return ARNodeInputs(input_embeds=prefix_emb, input_seq_len=seq_len)
+    
+    def _prepare_inputs_action_gen(
+        self,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> ARNodeInputs:
+        device = self.device
+        action_horizon = self.config.action_horizon
+        action_dim = self.config.action_dim
+
+        if "noisy_actions" not in inputs or len(inputs["noisy_actions"]) == 0:
+            generator = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
+            noisy = torch.randn(
+                action_horizon, action_dim, device=device, generator=generator
+            )
+            ts = torch.zeros((), device=device, dtype=torch.long)
+        else:
+            noisy = inputs["noisy_actions"][0]
+            ts = inputs["timestep_index"][0]
+
+        seq_len = action_horizon
+        return ARNodeInputs(input_seq_len=seq_len, 
+                            tensor_inputs={
+                                "noisy_actions": noisy,
+                                "ts": ts
+                            })
+    
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
+    ) -> dict[str, torch.Tensor | Any]:
+        
+        if graph_walk == "prefill":
+            return self._preprocess_prefill(
+                inputs=inputs,
+                cache_manager=engine_inputs.cache_manager,
+            )
+        if graph_walk == "action_gen":
+            return self._preprocess_action_gen(
+                inputs=inputs,
+                cache_manager=engine_inputs.cache_manager,
+            )
+        
+    def _preprocess_prefill(
+        self,
+        inputs: list[NameToTensorList],
+        cache_manager: BatchedCacheManager,
+    ) -> dict[str, torch.Tensor | Any]:
+        per_request_seqs = [inp.input_embeds for inp in inputs]
         prefix_embs = torch.cat(per_request_seqs, dim=0)
-
+        seq_lens = [inp.input_seq_len for inp in inputs]
+        
         # Bidirectional attention over the prefix; PaliGemma is a prefix-LM.
         cache_manager.plan_attention(
             seq_lens=seq_lens, is_causal=False, label="main", dtype=torch.bfloat16
@@ -343,32 +422,13 @@ class Pi05LLMSubmodule(NodeSubmodule):
 
     def _preprocess_action_gen(
         self,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
+        inputs: list[NameToTensorList],
         cache_manager: BatchedCacheManager,
-    ) -> dict[str, torch.Tensor]:
-        device = next(self.parameters()).device
-        action_horizon = self.config.action_horizon
-        action_dim = self.config.action_dim
+    ) -> dict[str, torch.Tensor | Any]:
 
-        all_noisy = []
-        all_ts = []
-        for rid, inputs in zip(request_ids, per_request_inputs, strict=True):
-            info = per_request_info[rid]
-            if "noisy_actions" not in inputs or len(inputs["noisy_actions"]) == 0:
-                generator = torch.Generator(device=device).manual_seed(info.random_seed)
-                noisy = torch.randn(
-                    action_horizon, action_dim, device=device, generator=generator
-                )
-                ts = torch.zeros((), device=device, dtype=torch.long)
-            else:
-                noisy = inputs["noisy_actions"][0]
-                ts = inputs["timestep_index"][0]
-            all_noisy.append(noisy)
-            all_ts.append(ts)
-
-        seq_lens = [action_horizon] * len(request_ids)
+        all_noisy = [inp.tensor_inputs["noisy_actions"] for inp in inputs]
+        all_ts = [inp.tensor_inputs["ts"] for inp in inputs]
+        seq_lens = [inp.input_seq_len for inp in inputs]
 
         # The action suffix attends to the frozen prefix KV cache. We pass
         # write_store=False so the cache is read-only during all 10 iterations.
@@ -392,15 +452,15 @@ class Pi05LLMSubmodule(NodeSubmodule):
     # ------------------------------------------------------------------
     # forward
     # ------------------------------------------------------------------
-
     def forward(
         self,
         graph_walk: str,
-        request_info: CurrentForwardPassInfo,
-        cache_handle: BatchedCacheManager | None = None,
-        **kwargs,
+        engine_inputs: ModelInputsFromEngine,
+        **kwargs # coming from preprocess output
     ) -> NameToTensorList:
-        if graph_walk == "prefill":
+        cache_handle=engine_inputs.cache_manager
+
+        if graph_walk == "prefill": #NOTE: may need to rename prefix_embs (bacame input_embeds)
             return self._forward_prefill(cache_handle=cache_handle, **kwargs)
         if graph_walk == "action_gen":
             return self._forward_action_gen(cache_handle=cache_handle, **kwargs)
@@ -409,12 +469,9 @@ class Pi05LLMSubmodule(NodeSubmodule):
     def forward_batched(
         self,
         graph_walk: str,
-        request_ids: list[str],
-        cache_manager: BatchedCacheManager,
-        packed_inputs: dict[str, torch.Tensor],
-        per_request_info: dict[str, CurrentForwardPassInfo] | None = None,
-        **kwargs,
-    ) -> dict[str, NameToTensorList]:
+        engine_inputs: ModelInputsFromEngine,
+        **kwargs, # coming from preprocess output
+    )  -> dict[str, NameToTensorList]:
         """Batched forward: process all requests in a single transformer pass.
 
         Called by ``AREngine._execute_batched`` when ``can_batch()`` returns
@@ -422,28 +479,29 @@ class Pi05LLMSubmodule(NodeSubmodule):
         concatenated per-request tensors and planned attention/RoPE for the
         full batch.
         """
+
         if graph_walk == "prefill":
             return self._forward_prefill_batched(
-                cache_manager=cache_manager,
-                request_ids=request_ids,
-                packed_inputs=packed_inputs,
+                cache_manager=engine_inputs.cache_manager,
+                request_ids=engine_inputs.request_ids,
+                **kwargs,
             )
         if graph_walk == "action_gen":
             return self._forward_action_gen_batched(
-                cache_manager=cache_manager,
-                request_ids=request_ids,
-                packed_inputs=packed_inputs,
+                cache_manager=engine_inputs.cache_manager,
+                request_ids=engine_inputs.request_ids,
+                **kwargs,
             )
         raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
+
 
     def _forward_prefill_batched(
         self,
         cache_manager: BatchedCacheManager,
         request_ids: list[str],
-        packed_inputs: dict[str, torch.Tensor],
+        prefix_embs: torch.Tensor,
     ) -> dict[str, NameToTensorList]:
         """Batched prefill: single PaliGemma forward over concatenated prefixes."""
-        prefix_embs = packed_inputs["prefix_embs"]
         cache_manager.set_active_label("main")
         self.paligemma(
             query_sequence=prefix_embs,
@@ -457,20 +515,19 @@ class Pi05LLMSubmodule(NodeSubmodule):
         self,
         cache_manager: BatchedCacheManager,
         request_ids: list[str],
-        packed_inputs: dict[str, torch.Tensor],
+        noisy_actions: list[torch.Tensor],
+        timestep_index: list[torch.Tensor],
     ) -> dict[str, NameToTensorList]:
         """Batched action_gen: single action expert forward, then split per-request."""
-        all_noisy: list[torch.Tensor] = packed_inputs["noisy_actions"]
-        all_ts: list[torch.Tensor] = packed_inputs["timestep_index"]
+
         horizon = self.config.action_horizon
 
         # All requests share the same timestep (Loop iterates in lockstep).
         # Concatenate noisy_actions across requests for a single forward.
-        cat_noisy = torch.cat(all_noisy, dim=0)  # [N * horizon, action_dim]
-        timestep_index = all_ts[0]  # scalar, same for all
+        cat_noisy = torch.cat(noisy_actions, dim=0)  # [N * horizon, action_dim]
 
         next_actions, next_index = self._euler_step(
-            cat_noisy, timestep_index, cache_manager
+            cat_noisy, timestep_index[0], cache_manager
         )
 
         # Split back per-request by horizon.
