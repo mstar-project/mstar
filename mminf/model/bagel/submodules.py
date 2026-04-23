@@ -395,11 +395,11 @@ class LLMSubmodule(ARNodeSubmodule):
         dummy = [{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
         return [
             CudaGraphConfig(
-                graph_walk="decode", requires_cfg=False, labels=["main"],
+                capture_graph_walk="decode", requires_cfg=False, labels=["main"],
                 dummy_capture_inputs=dummy,
             ),
             CudaGraphConfig(
-                graph_walk="decode", requires_cfg=True, labels=["main", "cfg_img"],
+                capture_graph_walk="decode", requires_cfg=True, labels=["main", "cfg_img"],
                 dummy_capture_inputs=dummy,
             ),
         ]

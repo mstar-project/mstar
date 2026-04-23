@@ -67,6 +67,7 @@ class CurrentForwardPassInfo:
     random_seed: int
     max_tokens: int
 
+    # node name to sampling config
     sampling_config: dict[str, SamplingConfig | None]
     step_metadata: dict = field(default_factory=dict)
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)

@@ -23,7 +23,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.engine.code_predictor_engine import CodePredictorCudaGraphRunner, CodePredictorEngineInputs, CodePredictorSubmodule
+from mminf.engine.code_predictor_engine import CodePredictorCudaGraphRunner, CodePredictorEngineInputs, CodePredictorSubmodule, MTPSampler
 from mminf.engine.cuda_graph_runner import CudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
 from mminf.model.base import NodeSubmodule
@@ -652,7 +652,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         """
         return [
             CudaGraphConfig(
-                graph_walk="thinker_decode",
+                capture_graph_walk="thinker_decode",
                 requires_cfg=False,
                 labels=["main"],
                 dummy_capture_inputs=[ARNodeInputs(
@@ -747,34 +747,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> list[str]:
         return ["main"]
 
-    def filter_batched_output(
-        self,
-        request_info: CurrentForwardPassInfo,
-        rid_output: dict[str, list[torch.Tensor]],
-    ) -> dict[str, list[torch.Tensor]]:
-        """Drop ``thinker_states`` + ``thinker_mask`` for text-only requests.
-
-        ``forward_batched`` always emits these keys so the captured CUDA
-        graph's output shape is static.  Here, outside the captured
-        region, we gate them on the real request's ``audio_output`` flag
-        so the Talker edge stays unrouted for text-only requests (matches
-        the pre-capture eager-mode behaviour).
-        """
-        if request_info is None:
-            return rid_output
-        if request_info.step_metadata.get("audio_output", True):
-            return rid_output
-        return {
-            k: v for k, v in rid_output.items()
-            if k not in ("thinker_states", "thinker_mask")
-        }
-
     def postprocess(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
+        if not request_info.step_metadata.get("audio_output", True):
+            # drop thinker_states and thinker_match
+            outputs.pop("thinker_states", None)
+            outputs.pop("thinker_mask", None)
+
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
@@ -1123,7 +1106,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         return [
             CudaGraphConfig(
-                graph_walk="talker_decode", requires_cfg=False, labels=["main"],
+                capture_graph_walk="talker_decode", requires_cfg=False, labels=["main"],
                 dummy_capture_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(
                         (1, self.config.talker_hidden_size),
@@ -1143,7 +1126,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
         return ["main"]
 
 
-class Qwen3OmniCodePredictorSubmodule(ARNodeSubmodule):
+class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
     """Runs the Qwen3-Omni residual-codebook AR loop.
 
     Fast path (Phase 2): delegates the entire 15-iteration depth loop to
@@ -1180,12 +1163,18 @@ class Qwen3OmniCodePredictorSubmodule(ARNodeSubmodule):
             input_embeds=inputs["last_hidden"][0]
         )
     
+    def get_num_code_groups(self):
+        return self.num_codes
+    
+    def get_kv_cache_dtype(self):
+        return self.talker_code_emb.weight.dtype
+    
     def preprocess(
         self,
         graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
+        engine_inputs: CodePredictorEngineInputs,
         inputs: list[ARNodeInputs],
-    ) -> dict[str, torch.Tensor | Any]:
+    ) -> dict[str, torch.Tensor]:
         """"
         last_hidden: ``[bs, hidden]`` final Talker hidden state.
         layer0_codes: ``[bs]`` int64 sampled codebook-0 tokens.
@@ -1219,7 +1208,7 @@ class Qwen3OmniCodePredictorSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         kv_cache = engine_inputs.kv_cache
-        sampler = engine_inputs.sampler
+        sampler: MTPSampler = engine_inputs.sampler
 
         cp = self.code_predictor
         codec_embedding = cp.model.codec_embedding
@@ -1227,79 +1216,57 @@ class Qwen3OmniCodePredictorSubmodule(ARNodeSubmodule):
 
         pos = engine_inputs.init_pos_ids
 
+        c0_embed = self.talker_code_emb(layer0_codes)  # [bs, hidden]
+        codec_emb_sum += c0_embed
+        all_codes[:, 0] = layer0_codes
+
         # forward over [last_hidden] to update kv cache with the Talker's final hidden
-        # state as context for the code prediction.
+        # state as context for the code prediction. This returns nothing because the
+        # layer 0 code is already provided by the talker LLM
         cp.forward_depth_unrolled(
             last_hidden, pos, kv_cache, cache_pos=0,
         )
         pos += 1
 
+        for group_idx in range(1, self.num_codes):
+            hidden = cp.forward_depth_unrolled(
+                codec_emb_sum, pos, kv_cache, cache_pos=group_idx,
+            )
+            pos += 1
+
+            logits = torch.matmul(
+                hidden, lm_head_weight[group_idx - 1].t()
+            )
+            tokens = sampler.sample(logits)
+            all_codes[:, group_idx] = tokens
+            embed = codec_embedding[group_idx - 1](tokens)
+            codec_emb_sum += embed
+
         return {
             req_id: {
                 "talker_input_embeds": [codec_emb_sum[i:i+1]],
                 "codec_tokens": [all_codes[i]],
-            } for i, req_id in enumerate(request_ids)
+            } for i, req_id in enumerate(engine_inputs.request_ids)
         }
-
-    def _forward_batched_eager(
-        self,
-        request_ids: list[str],
-        cache_manager: BatchedCacheManager,
-        sampler: Sampler,
-        last_hidden: torch.Tensor,
-        layer0_codes: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fallback path: Python AR loop over the paged-FlashInfer attention.
-
-        Kept for environments where CUDA-graph capture is unavailable
-        (CPU testing, capture failure on exotic hardware). Functionally
-        equivalent to the unrolled graph but without the kernel-launch
-        savings.
-        """
-        bs = len(request_ids)
-        codec_emb_sum = torch.zeros_like(last_hidden)
-        all_codes = torch.zeros(
-            (bs, self.num_codes),
-            device=layer0_codes.device, dtype=torch.long,
+    
+    def _get_dummy_inputs(self, device):
+        return ARNodeInputs(
+            input_embeds=torch.zeros(
+                (1, self.config.talker_hidden_size),
+                device=device, dtype=torch.bfloat16
+            ),
+            input_ids=torch.zeros((1,), device=device, dtype=torch.long),
+            input_seq_len=1
         )
-        all_codes[:, 0] = layer0_codes
-
-        # initialize KV cache with last_hidden; we discard the outputs because
-        # the first code is already "layer0_codes" and we just need to initialize
-        # the KV cache before generating codes 1 to self.num_codes.
-        cache_manager.plan_attention([1] * bs, label="main")
-        cache_manager.plan_rope([1] * bs, label="main")
-        self.code_predictor(last_hidden, cache_manager)
-
-        # Seed codec_emb_sum with the layer-0 codec embedding.
-        embed = self.talker_code_emb(layer0_codes)
-        codec_emb_sum = codec_emb_sum + embed
-
-        for group_idx in range(1, self.num_codes):
-            cache_manager.plan_attention([1] * bs, label="main")
-            cache_manager.plan_rope([1] * bs, label="main")
-            hidden = self.code_predictor(embed, cache_manager)
-
-            orig_dtype = hidden.dtype
-            lm_head = self.code_predictor.get_lm_head(group_idx)
-            logits = lm_head(hidden.to(lm_head.weight.dtype)).to(orig_dtype)
-            codes = sampler.sample(request_ids, logits)
-            all_codes[:, group_idx] = codes
-
-            embed = self.code_predictor.get_embedding(group_idx)(codes)
-            codec_emb_sum = codec_emb_sum + embed
-
-        return all_codes, codec_emb_sum
-
-    def can_batch(self, batch: NodeBatch) -> bool:
-        return True  # we can always batch
-
-    def get_needed_cache_labels(
-        self,
-        graph_walk: str,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> list[str]:
-        return ["main"]
+    
+    def get_cuda_graph_configs(self, device):
+        return [
+            CudaGraphConfig(
+                capture_graph_walk="talker_decode",
+                replay_graph_walks=["talker_last_prefill", "talker_decode"],
+                dummy_capture_inputs=self._get_dummy_inputs(device=device),
+            )
+        ]
 
 # ===================================================================
 # 5. Code2WavSubmodule (audio_codec engine)
@@ -1337,65 +1304,67 @@ class Code2WavSubmodule(NodeSubmodule):
             total_upsample *= r
         self._total_upsample = total_upsample
     
-    def preprocess(
+    def prepare_inputs(
         self,
-        per_request_inputs: list[NameToTensorList] | None = None,
-        request_ids: list[str] | None = None,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
         **kwargs
-    ) -> dict[str, torch.Tensor]:
-        """Unpack codec_tokens from StreamBuffer chunks for a batch of requests.
-
-        For each request, selects the first ``num_quantizers`` (16) of the 32
-        code groups and transposes to [num_quantizers, num_frames].  All
-        requests in the batch must have the same num_frames so the results can
-        be stacked into a single (bs, Q, T) tensor.
-        """
+    ) -> NodeInputs:
         num_quantizers = self.config.code2wav.num_quantizers  # 16
         codec_eos = self.config.talker.codec_eos_token_id
 
         per_request_codec: list[torch.Tensor] = []
 
-        for inputs in per_request_inputs:
-            codec_tokens = inputs["codec_tokens"][0]
+        codec_tokens = inputs["codec_tokens"][0]
+    
+        # Reshape to (num_frames, num_code_groups) if flat
+        if codec_tokens.dim() == 1:
+            num_groups = self.config.num_code_groups  # 16 (Qwen3-Omni)
+            if codec_tokens.shape[0] % num_groups == 0:
+                codec_tokens = codec_tokens.view(-1, num_groups)
+            else:
+                codec_tokens = codec_tokens.unsqueeze(0)
 
-            # Reshape to (num_frames, num_code_groups) if flat
-            if codec_tokens.dim() == 1:
-                num_groups = self.config.num_code_groups  # 16 (Qwen3-Omni)
-                if codec_tokens.shape[0] % num_groups == 0:
-                    codec_tokens = codec_tokens.view(-1, num_groups)
-                else:
-                    codec_tokens = codec_tokens.unsqueeze(0)
+        # Filter out codec_eos frames
+        if codec_tokens.dim() == 2 and codec_tokens.shape[0] > 0:
+            eos_mask = codec_tokens[:, 0] == codec_eos
+            if eos_mask.any():
+                codec_tokens = codec_tokens[~eos_mask]
 
-            # Filter out codec_eos frames
-            if codec_tokens.dim() == 2 and codec_tokens.shape[0] > 0:
-                eos_mask = codec_tokens[:, 0] == codec_eos
-                if eos_mask.any():
-                    codec_tokens = codec_tokens[~eos_mask]
+        # Select first num_quantizers codebook layers
+        if codec_tokens.shape[-1] > num_quantizers:
+            codec_tokens = codec_tokens[..., :num_quantizers]
 
-            # Select first num_quantizers codebook layers
-            if codec_tokens.shape[-1] > num_quantizers:
-                codec_tokens = codec_tokens[..., :num_quantizers]
-
-            # Transpose to (Q, T)
-            codec_tokens = codec_tokens.T  # (Q, T)
-            per_request_codec.append(codec_tokens)
-
+        # Transpose to (Q, T)
+        codec_tokens = codec_tokens.T  # (Q, T)
+        return NodeInputs(tensor_inputs={
+            "codec_tokens": codec_tokens
+        })
+    
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
+    ) -> dict[str, torch.Tensor | Any]:
+        all_codec_tokens = [
+            inp.tensor_inputs["codec_tokens"] for inp in inputs
+        ]
         # Assert all requests have the same numel so they can be batched
-        assert all(t.numel() == per_request_codec[0].numel() for t in per_request_codec), (
+        assert all(t.numel() == all_codec_tokens[0].numel() for t in all_codec_tokens), (
             f"All codec token inputs must have the same numel for batching, "
-            f"got: {[t.numel() for t in per_request_codec]}"
+            f"got: {[t.numel() for t in all_codec_tokens]}"
         )
-
         # Stack into (bs, Q, T)
-        batched_codec_tokens = torch.stack(per_request_codec, dim=0)
-
+        batched_codec_tokens = torch.stack(all_codec_tokens, dim=0)
         return {"codec_tokens": batched_codec_tokens}
     
     def forward_batched(
         self,
-        request_ids: list[str],
-        packed_inputs: dict[str, torch.Tensor],
-        per_request_info: dict[str, CurrentForwardPassInfo],
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        codec_tokens: torch.Tensor,
         **kwargs
     ) -> dict[str, NameToTensorList]:
         """Run the streaming vocoder with per-request left-context trim.
@@ -1417,7 +1386,7 @@ class Code2WavSubmodule(NodeSubmodule):
         chunk is converted to int16 PCM, ``_first_chunk_emitted`` is updated
         inline so the next chunk for the same request trims correctly.
         """
-        codec_tokens = packed_inputs.get("codec_tokens")
+        request_ids = engine_inputs.request_ids
         if codec_tokens is None or codec_tokens.numel() == 0:
             return {rid: {} for rid in request_ids}
 
@@ -1440,8 +1409,10 @@ class Code2WavSubmodule(NodeSubmodule):
 
     def forward(
         self,
-        codec_tokens: torch.Tensor | None = None,
-        **kwargs,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        codec_tokens: torch.Tensor,
+        **kwargs
     ) -> NameToTensorList:
         """Raw vocoder forward -- returns int16 PCM without any trim.
 

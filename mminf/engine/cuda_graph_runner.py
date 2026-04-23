@@ -137,7 +137,7 @@ class CudaGraphRunner:
                 sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
                 for bs in reversed(sizes):
                     key = ARCudaGraphKey(
-                        graph_walk=config.graph_walk,
+                        graph_walk=config.capture_graph_walk,
                         requires_cfg=config.requires_cfg,
                         bs=bs,
                         seq_len=dummy_input.seq_len
@@ -177,7 +177,7 @@ class CudaGraphRunner:
         # multi-pass captures (e.g., main + cfg_img in same graph).
         plan_states = {}
         for label in config.labels:
-            if config.graph_walk == "decode":
+            if config.capture_graph_walk == "decode":
                 wrapper = FlashInferDecodeWrapper(
                     workspace_buffer=self.buffer_manager.get(f"{label}_cugraph"),
                     num_qo_heads=cfg.num_qo_heads,
@@ -226,7 +226,7 @@ class CudaGraphRunner:
         bs = key.bs
 
         # Create dummy request IDs
-        dummy_rids = [f"__cg_{config.graph_walk}_{config.requires_cfg}_{i}__"
+        dummy_rids = [f"__cg_{config.capture_graph_walk}_{config.requires_cfg}_{i}__"
                       for i in range(bs)]
 
         # Add dummy requests with all needed labels
@@ -274,7 +274,7 @@ class CudaGraphRunner:
             dummy_metadata = {
                 rid: CurrentForwardPassInfo(
                     request_id=rid,
-                    graph_walk=config.graph_walk,
+                    graph_walk=config.capture_graph_walk,
                     requires_cfg=config.requires_cfg,
                     fwd_index=0,
                     random_seed=0,
@@ -285,7 +285,7 @@ class CudaGraphRunner:
 
             # Preprocess (plans attention+rope outside graph)
             preprocessed = submodule.preprocess(
-                graph_walk=config.graph_walk,
+                graph_walk=config.capture_graph_walk,
                 cache_manager=cache_manager,
                 per_request_inputs=dummy_inputs,
                 request_ids=dummy_rids,
@@ -313,7 +313,7 @@ class CudaGraphRunner:
 
             def run_forward():
                 return forward(
-                    graph_walk=config.graph_walk,
+                    graph_walk=config.capture_graph_walk,
                     cache_manager=cache_manager,
                     packed_inputs=preprocessed,
                     request_ids=dummy_rids,
@@ -334,7 +334,7 @@ class CudaGraphRunner:
                         state.position_id_start = 0
                 # Re-plan after reset
                 submodule.preprocess(
-                    graph_walk=config.graph_walk,
+                    graph_walk=config.capture_graph_walk,
                     cache_manager=cache_manager,
                     per_request_inputs=dummy_inputs,
                     request_ids=dummy_rids,
@@ -422,13 +422,13 @@ class CudaGraphRunner:
     
     def _seq_lens_for(self, graph_walk: str, requires_cfg: bool) -> list[int]:
         for cfg in self.capture_configs:
-            if cfg.graph_walk == graph_walk and cfg.requires_cfg == requires_cfg:
+            if cfg.capture_graph_walk == graph_walk and cfg.requires_cfg == requires_cfg:
                 return [inp.seq_len for inp in cfg.dummy_capture_inputs]
         return []
 
     def _sizes_for(self, graph_walk: str, requires_cfg: bool) -> list[int]:
         for cfg in self.capture_configs:
-            if cfg.graph_walk == graph_walk and cfg.requires_cfg == requires_cfg:
+            if cfg.capture_graph_walk == graph_walk and cfg.requires_cfg == requires_cfg:
                 return cfg.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
         return self.CAPTURE_BATCH_SIZES
 
@@ -812,12 +812,12 @@ class CodecCudaGraphRunner:
                     self._capture_one(bs, config, fwd)
                     logger.info(
                         "Captured codec CUDA graph for %s: walk=%s bs=%d",
-                        self.submodule_name, config.graph_walk, bs,
+                        self.submodule_name, config.capture_graph_walk, bs,
                     )
                 except Exception:
                     logger.warning(
                         "Failed to capture codec CUDA graph for %s: walk=%s bs=%d",
-                        self.submodule_name, config.graph_walk, bs, exc_info=True,
+                        self.submodule_name, config.capture_graph_walk, bs, exc_info=True,
                     )
 
     def _clone_template(self, tpl: dict) -> dict:
@@ -835,7 +835,7 @@ class CodecCudaGraphRunner:
         if not config.dummy_capture_inputs:
             raise ValueError(
                 f"{self.submodule_name}: CudaGraphConfig for walk "
-                f"{config.graph_walk!r} missing dummy_capture_inputs"
+                f"{config.capture_graph_walk!r} missing dummy_capture_inputs"
             )
 
         # Build dummy per-request inputs (same format as real inputs) and
@@ -843,13 +843,13 @@ class CodecCudaGraphRunner:
         # does the same, so the two code paths stay symmetric.
         template = config.dummy_capture_inputs[0]
         dummy_rids = [
-            f"__codec_cg_{config.graph_walk}_{i}__" for i in range(bs)
+            f"__codec_cg_{config.capture_graph_walk}_{i}__" for i in range(bs)
         ]
         dummy_inputs = [self._clone_template(template) for _ in dummy_rids]
         dummy_info = {
             rid: CurrentForwardPassInfo(
                 request_id=rid,
-                graph_walk=config.graph_walk,
+                graph_walk=config.capture_graph_walk,
                 requires_cfg=False,
                 fwd_index=0,
                 random_seed=0,
@@ -860,7 +860,7 @@ class CodecCudaGraphRunner:
         }
 
         packed = self.submodule.preprocess(
-            graph_walk=config.graph_walk,
+            graph_walk=config.capture_graph_walk,
             per_request_inputs=dummy_inputs,
             request_ids=dummy_rids,
             per_request_info=dummy_info,
@@ -868,7 +868,7 @@ class CodecCudaGraphRunner:
         if not packed or not all(isinstance(v, torch.Tensor) for v in packed.values()):
             raise RuntimeError(
                 f"{self.submodule_name}: preprocess returned non-tensor/empty packed "
-                f"inputs during capture (walk={config.graph_walk!r}); cannot capture"
+                f"inputs during capture (walk={config.capture_graph_walk!r}); cannot capture"
             )
 
         # Static buffers match the preprocessed shapes (leading dim == bs).
@@ -897,14 +897,14 @@ class CodecCudaGraphRunner:
             static_output = fwd(**static_inputs)
         stream.synchronize()
 
-        key = (config.graph_walk, bs)
+        key = (config.capture_graph_walk, bs)
         self.graphs[key] = graph
         self.static_inputs[key] = static_inputs
         self.static_outputs[key] = static_output
 
     def _sizes_for(self, graph_walk: str) -> list[int]:
         for cfg in self.capture_configs:
-            if cfg.graph_walk == graph_walk:
+            if cfg.capture_graph_walk == graph_walk:
                 return cfg.capture_batch_sizes or self.DEFAULT_CAPTURE_BATCH_SIZES
         return self.DEFAULT_CAPTURE_BATCH_SIZES
 

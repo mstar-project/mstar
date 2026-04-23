@@ -19,6 +19,10 @@ class NodeInputs:
     kwargs: dict = field(default_factory=dict)
 
 
+def _clone_or_none(tensor):
+        return tensor.clone() if tensor is not None else None
+
+
 @dataclass
 class ARNodeInputs(NodeInputs):
     """
@@ -33,7 +37,9 @@ class ARNodeInputs(NodeInputs):
     input_seq_len: int
     input_ids: torch.Tensor | None = None
     input_embeds: torch.Tensor | None = None
-    custom_pos_ids: torch.Tensor | dict[str, torch.Tensor] | None = None # it's a dict if it's per-label
+
+    # Tensor for single cache label, dict for multi-label
+    custom_pos_ids: torch.Tensor | dict[str, torch.Tensor] | None = None
 
     @classmethod
     def collate(cls, inputs_list: list["ARNodeInputs"], stack: bool = False):
@@ -43,7 +49,7 @@ class ARNodeInputs(NodeInputs):
             # --- required field ---
             out["input_seq_len"].append(inp.input_seq_len)
 
-            # --- mutually exclusive main inputs ---
+            # --- usually mutually exclusive main inputs ---
             if inp.input_ids is not None:
                 out["input_ids"].append(inp.input_ids)
             if inp.input_embeds is not None:
@@ -86,12 +92,33 @@ class ARNodeInputs(NodeInputs):
                         out[parent][k] = maybe_stack(v)
 
         return dict(out)
+    
+    def clone(self):
+        custom_pos_ids = self.custom_pos_ids
+        if isinstance(custom_pos_ids, torch.Tensor):
+            custom_pos_ids = _clone_or_none(custom_pos_ids)
+        elif isinstance(custom_pos_ids, dict):
+            custom_pos_ids = {
+                label: _clone_or_none(tensor) for label, tensor in custom_pos_ids.items()
+            }
+
+        return ARNodeInputs(
+            input_seq_len=self.input_seq_len,
+            input_ids=_clone_or_none(self.input_ids),
+            input_embeds=_clone_or_none(self.input_embeds),
+            custom_pos_ids=custom_pos_ids,
+            tensor_inputs={k: _clone_or_none(t) for k, t in self.tensor_inputs.items()},
+            kwargs=self.kwargs.copy()
+        )
+
 
 @dataclass
 class CudaGraphConfig:
     """Defines what computation a captured graph represents."""
-    graph_walk: str  # "decode"
+    capture_graph_walk: str  # "decode"
     dummy_capture_inputs: list[ARNodeInputs]
+
+    replay_graph_walks: list[str] = None # set to None to be just capture_graph_walk
 
     # whether CFG is active for image generation
     requires_cfg: bool = False
@@ -108,6 +135,10 @@ class CudaGraphConfig:
     # submodules where memory cost per size is high, or for AR walks where a
     # small subset is enough.
     capture_batch_sizes: list[int] | None = None
+
+    def __post_init__(self):
+        if self.replay_graph_walks is None:
+            self.replay_graph_walks = [self.capture_graph_walk]
 
 
 @dataclass
@@ -208,7 +239,7 @@ class NodeSubmodule(torch.nn.Module):
         """
         if not hasattr(self, "_cached_cuda_graph_walks"):
             self._cached_cuda_graph_walks = {
-                cfg.graph_walk for cfg in self.get_cuda_graph_configs(device=torch.device("cpu"))
+                cfg.capture_graph_walk for cfg in self.get_cuda_graph_configs(device=torch.device("cpu"))
             }
         return batch.graph_walk in self._cached_cuda_graph_walks
 

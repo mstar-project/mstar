@@ -36,7 +36,7 @@ class OrpheusLLMSubmodule(NodeSubmodule):
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         return [
             CudaGraphConfig(
-                graph_walk="decode", requires_cfg=False, labels=["main"],
+                capture_graph_walk="decode", requires_cfg=False, labels=["main"],
                 dummy_capture_inputs=[{"text_inputs": [torch.zeros(1, dtype=torch.long, device=device)]}]
             ),
         ]
@@ -228,7 +228,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         }]
         return [
             CudaGraphConfig(
-                graph_walk="snac_chunk",
+                capture_graph_walk="snac_chunk",
                 dummy_capture_inputs=dummy,
                 capture_batch_sizes=[1, 2, 4, 8, 16],
             ),

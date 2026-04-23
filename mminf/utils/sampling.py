@@ -461,6 +461,7 @@ def sample_depth_gpu(
 
     scaled = logits / temperature.unsqueeze(-1).to(logits.dtype)
     probs = torch.softmax(scaled, dim=-1)
+    top_k = torch.where(top_k > 0, top_k, logits.shape[1])
     samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         probs, top_k, top_p, deterministic=True,
         seed=seed, offset=offset

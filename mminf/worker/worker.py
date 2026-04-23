@@ -956,7 +956,7 @@ class Worker:
                         synchronize=True,
                     )
                 try:
-                    output = engine.execute_batch(node_batch)
+                    output = engine.execute_with_max_batch_size(node_batch)
                 finally:
                     if self.enable_nvtx:
                         range_pop(synchronize=True)

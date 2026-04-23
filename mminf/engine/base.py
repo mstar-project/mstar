@@ -50,6 +50,9 @@ class BaseEngine(ABC):
 
     def has_autocast(self):
         return True
+    
+    def get_max_batch_size(self):
+        return None
 
     @abstractmethod
     def engine_type(self) -> EngineType:
@@ -73,6 +76,43 @@ class BaseEngine(ABC):
     @abstractmethod
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         ...
+    
+    @abstractmethod
+    def execute_with_max_batch_size(self, batch: NodeBatch) -> NodeOutput:
+        bs = self.get_max_batch_size()
+        n = len(batch.request_ids)
+        if bs is None or n <= bs:
+            return self.execute_batch(batch)
+
+        output = NodeOutput(
+            per_request_output_tensors={}
+        )
+       
+        for i in range(0, n, bs):
+            rids = batch.request_ids[i:min(i+bs, n)]
+            minibatch_out = self.execute_batch(NodeBatch(
+                node_name=batch.node_name,
+                graph_walk=batch.graph_walk,
+                request_ids=rids,
+                per_request_input_tensors={
+                    rid: batch.per_request_input_tensors[rid] for rid in rids \
+                        if rid in batch.per_request_input_tensors
+                },
+                per_request_info={
+                    rid: batch.per_request_info[rid] for rid in rids \
+                        if rid in batch.per_request_info
+                },
+                metadata=batch.metadata
+            ))
+            output.per_request_output_tensors.update(
+                minibatch_out.per_request_output_tensors
+            )
+            if minibatch_out.allocation_failed:
+                output.allocation_failed = True
+                output.alloc_pages_short = minibatch_out.alloc_pages_short
+                output.alloc_failed_request_id = minibatch_out.alloc_failed_request_id
+                return output
+        return output
 
     @abstractmethod
     def add_request(self, request_id: str, **kwargs) -> None:

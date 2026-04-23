@@ -33,17 +33,21 @@ Key design choices (see the phase-2 design doc in
 
 from __future__ import annotations
 
+from abc import abstractmethod
 import bisect
 import logging
 from dataclasses import asdict, dataclass
 
 import torch
 
+from mminf.communication.tensors import NameToTensorList
+from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.ar_engine import AREngine
-from mminf.engine.base import EngineType, NodeBatch, NodeOutput
-from mminf.model.submodule_base import ModelInputsFromEngine
+from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
+from mminf.engine.kv_store import KVCacheConfig, PositionInfo, TransferEngineInfo
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, CudaGraphConfig, ModelInputsFromEngine
 from mminf.utils.profiler import range_pop, range_push
-from mminf.utils.sampling import Sampler, sample_depth_gpu
+from mminf.utils.sampling import Sampler, SamplingConfig, sample_depth_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +63,6 @@ class MTPSampler:
     temperature_buf: torch.Tensor
     top_k_buf: torch.Tensor
     top_p_buf: torch.Tensor
-    pos_pf: torch.Tensor
     seed_buf: torch.Tensor
     offset_buf: torch.Tensor
 
@@ -78,6 +81,57 @@ class CodePredictorEngineInputs(ModelInputsFromEngine):
     sampler: MTPSampler
     kv_cache: torch.Tensor
     init_pos_ids: torch.Tensor
+
+
+class CodePredictorSubmodule(ARNodeSubmodule):
+    @abstractmethod
+    def get_num_code_groups(self):
+        pass
+
+    @abstractmethod
+    def get_kv_cache_dtype(self):
+        return torch.float32
+
+    @abstractmethod
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: CodePredictorEngineInputs,
+        inputs: list[ARNodeInputs],
+    ) -> dict[str, torch.Tensor]:
+        pass
+
+    @abstractmethod
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: CodePredictorEngineInputs,
+        last_hidden: torch.Tensor | None = None,
+        layer0_codes: torch.Tensor | None = None,
+        all_codes: torch.Tensor | None = None,
+        codec_emb_sum: torch.Tensor | None = None,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        pass
+
+    def forward(
+        self,
+        *args,
+        **kwargs,
+    ):
+        return next(iter(
+            self.forward_batched(*args, **kwargs).values()
+        ))
+    
+    def can_batch(self, batch: NodeBatch) -> bool:
+        return True
+
+    def get_needed_cache_labels(
+        self,
+        graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> list[str]:
+        return ["main"]
     
 
 @dataclass
@@ -85,11 +139,122 @@ class UnrolledGraphData:
     """State captured for a single batch-size bucket."""
 
     graph: torch.cuda.CUDAGraph
-    # bs-sized views of the shared full-size buffers. Keyed by the same names
-    # used when they were allocated; ``pos_dec`` is itself a dict keyed by
-    # iteration index (2..n_codebooks-1).
-    slices: dict
     bs: int
+    kv_cache_slice: torch.Tensor
+    pos_id_slice: torch.Tensor
+    inputs_slices: dict[str, torch.Tensor]
+    static_outputs: list[dict[str, torch.Tensor]]
+
+
+@dataclass
+class MTPSamplerBuffers:
+    """Pre-allocated static buffers for graph-safe MTP sampling.
+
+    All tensors are sized to ``max_batch_size``. Slice with
+    ``slice_for_bs(bs)`` to get a view suitable for a specific batch.
+    """
+    max_batch_size: int
+    temperature_buf: torch.Tensor   # [max_bs], float32
+    top_k_buf: torch.Tensor         # [max_bs], int32
+    top_p_buf: torch.Tensor         # [max_bs], float32
+    seed_buf: torch.Tensor          # [max_bs], int64
+    offset_buf: torch.Tensor        # [max_bs], int64
+
+    @classmethod
+    def allocate(
+        cls,
+        max_batch_size: int,
+        device: torch.device,
+    ) -> "MTPSamplerBuffers":
+        """Allocate zero-initialised sampling buffers for ``max_batch_size``.
+        """
+        temperature_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
+        top_k_buf = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
+        top_p_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
+        seed_buf = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+        offset_buf = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+        return cls(
+            max_batch_size=max_batch_size,
+            temperature_buf=temperature_buf,
+            top_k_buf=top_k_buf,
+            top_p_buf=top_p_buf,
+            seed_buf=seed_buf,
+            offset_buf=offset_buf,
+        )
+
+    def slice_for_bs(self, bs: int) -> dict[str, torch.Tensor]:
+        """Return bs-sized views into each buffer (zero-copy slices)."""
+        return {
+            "temperature_buf": self.temperature_buf[:bs],
+            "top_k_buf": self.top_k_buf[:bs],
+            "top_p_buf": self.top_p_buf[:bs],
+            "seed_buf": self.seed_buf[:bs],
+            "offset_buf": self.offset_buf[:bs],
+        }
+
+
+def _build_sampling_lists(
+    request_ids: list[str],
+    sampling_configs: dict[str, SamplingConfig],
+    padded_bs: int,
+    device: torch.device
+):
+    """Resolve per-request sampling config into flat Python lists of length ``padded_bs``.
+    """
+    temps = torch.ones(padded_bs, device=device)
+    # in the sampler, topk=0 maps to unrestricted top k
+    top_ks = torch.zeros(padded_bs, dtype=torch.int32, device=device)
+    top_ps = torch.ones(padded_bs, device=device)
+
+    for i, rid in enumerate(request_ids):
+        cfg = sampling_configs.get(rid, SamplingConfig())
+        if cfg.temperature > 0:
+            temps[i] = float(cfg.temperature)
+            top_ks[i] = int(cfg.top_k)
+            top_ps[i] = float(cfg.top_p) if cfg.top_p else 1.0
+        # otherwise, use defaults already filled in
+    return temps, top_ks, top_ps, \
+        torch.randint(0, 2**32, (padded_bs,), dtype=torch.long, device=device)
+
+
+def make_mtp_sampler_from_buffers(
+    bufs: MTPSamplerBuffers,
+    request_ids: list[str],
+    sampling_configs: dict[str, SamplingConfig],
+    padded_bs: int,
+) -> MTPSampler:
+    assert padded_bs <= bufs.max_batch_size, (
+        f"padded_bs={padded_bs} exceeds MTPSamplerBuffers.max_batch_size={bufs.max_batch_size}"
+    )
+
+    temps, top_ks, top_ps, seed = _build_sampling_lists(
+        request_ids, sampling_configs, padded_bs
+    )
+    bufs.temperature_buf[:padded_bs].copy_(temps)
+    bufs.top_k_buf[:padded_bs].copy_(top_ks)
+    bufs.top_p_buf[:padded_bs].copy_(top_ps)
+    bufs.seed_buf[:padded_bs].copy_(seed)
+    bufs.offset_buf[:padded_bs].zero_()
+    slices = bufs.slice_for_bs(padded_bs)
+    return MTPSampler(**slices)
+
+
+def make_mtp_sampler_eager(
+    request_ids: list[str],
+    sampling_configs: dict,
+    device: torch.device,
+) -> MTPSampler:
+    bs = len(request_ids)
+    temps, top_ks, top_ps, seed = _build_sampling_lists(
+        request_ids, sampling_configs, padded_bs=bs
+    )
+    return MTPSampler(
+        temperature_buf=temps,
+        top_k_buf=top_ks,
+        top_p_buf=top_ps,
+        seed_buf=seed,
+        offset_buf=torch.zeros(bs, dtype=torch.long, device=device),
+    )
 
 
 class CodePredictorCudaGraphRunner:
@@ -111,175 +276,43 @@ class CodePredictorCudaGraphRunner:
 
     def __init__(
         self,
-        submodule,
-        sampler: Sampler,
+        submodule: CodePredictorSubmodule,
+        node_name: str,
+        kv_cache: torch.Tensor,
         device: torch.device,
     ):
         # Duck-typed on Qwen3OmniCodePredictorSubmodule: we rely on the
         # attributes documented below so this runner stays agnostic to the
         # specific subclass.
         self.submodule = submodule
-        self.code_predictor = submodule.code_predictor  # Qwen3OmniCodePredictor
-        self.talker_code_emb = submodule.talker_code_emb  # nn.Embedding (layer-0 codes)
-        self.num_codes = submodule.num_codes              # = num_code_groups
-        self.cp_cfg = submodule.cp_cfg                    # CodePredictorConfig
-        self.sampler = sampler
+        self.node_name = node_name
         self.device = device
         self.max_batch_size = max(self.CAPTURE_BATCH_SIZES)
 
         self.graphs: dict[int, UnrolledGraphData] = {}
         self.memory_pool = None
+
         self._shared_bufs: dict | None = None
 
-    # ------------------------------------------------------------------
-    # Buffer allocation
-    # ------------------------------------------------------------------
-    def _allocate_shared_buffers(self) -> None:
-        """Allocate the full-size (max_batch_size) buffers shared by all buckets."""
-        cp = self.cp_cfg
-        max_bs = self.max_batch_size
-        n_layers = cp.num_hidden_layers
-        n_kv_heads = cp.num_key_value_heads
-        head_dim = cp.head_dim
-        hidden = cp.hidden_size
-        vocab = cp.vocab_size
-        n_codes = self.num_codes
-        device = self.device
-
-        # Match the dtype of the layer-0 codec embedding (typically fp32 for
-        # the code predictor, per the "NO autocast" invariant documented in
-        # CodePredictorEngine.has_autocast).
-        dtype = self.talker_code_emb.weight.dtype
-
-        # Dense KV cache: [n_layers, max_bs, 2 (K|V), max_seq_len, n_kv_heads, head_dim].
-        # max_seq_len == n_codes because the depth sequence packs the
-        # two-token prefill + (n_codes - 2) decode iterations into slots
-        # 0..n_codes-1.
-        kv_cache = torch.zeros(
-            n_layers, max_bs, 2, n_codes, n_kv_heads, head_dim,
-            dtype=dtype, device=device,
+        # shared buffers
+        self.mtp_sampling_buf = MTPSamplerBuffers.allocate(
+            max_batch_size=self.max_batch_size, device=device
+        )
+        self.init_pos_ids_buf = torch.zeros(
+            self.max_batch_size, device=device, dtype=torch.long
         )
 
-        # Input: [max_bs, 2, hidden] packs last_hidden (slot 0) and c0_embed
-        # (slot 1) so the prefill pass processes them in a single 2-token
-        # forward. Positions are fixed at [0, 1].
-        hidden_buf = torch.zeros(max_bs, 2, hidden, dtype=dtype, device=device)
+        self.kv_cache = kv_cache
 
-        # Outputs.
-        codec_emb_sum_buf = torch.zeros(max_bs, hidden, dtype=dtype, device=device)
-        all_codes_buf = torch.zeros(max_bs, n_codes, dtype=torch.int64, device=device)
+        # lazily initialized via "preprocess" on max batch size
+        self.fwd_input_buffers: dict[str, torch.Tensor] | None = None
 
-        # Per-request sampling config buffers. Defaults: temperature=1,
-        # top_k=vocab (disabled), top_p=1 (disabled). The runner copies real
-        # values from the Sampler into these before each replay.
-        temperature_buf = torch.ones(max_bs, dtype=torch.float32, device=device)
-        top_k_buf = torch.full((max_bs,), vocab, dtype=torch.int32, device=device)
-        top_p_buf = torch.ones(max_bs, dtype=torch.float32, device=device)
-        seed_buf = torch.zeros(max_bs, dtype=torch.long, device=device)
-        offset_buf = torch.zeros(max_bs, dtype=torch.long, device=device)
-
-        # Position tensors. These never change across replays -- they hold
-        # the hardcoded [0, 1] for prefill and [i] for decode iteration i.
-        pos_pf = torch.tensor(
-            [0, 1], dtype=torch.int32, device=device,
-        ).unsqueeze(0).expand(max_bs, -1).contiguous()
-        pos_dec: dict[int, torch.Tensor] = {}
-        for i in range(2, n_codes):
-            pos_dec[i] = torch.full(
-                (max_bs, 1), i, dtype=torch.int32, device=device,
-            )
-
-        self._shared_bufs = {
-            "kv_cache": kv_cache,
-            "hidden_buf": hidden_buf,
-            "codec_emb_sum_buf": codec_emb_sum_buf,
-            "all_codes_buf": all_codes_buf,
-            "temperature_buf": temperature_buf,
-            "top_k_buf": top_k_buf,
-            "top_p_buf": top_p_buf,
-            "offset_buf": offset_buf,
-            "pos_pf": pos_pf,
-            "pos_dec": pos_dec,
-            "seed_buf": seed_buf
-        }
-
-    def _slice_for_bs(self, bs: int) -> dict:
-        shared = self._shared_bufs
+    def _slice_inputs_for_bs(self, bs: int) -> dict:
         return {
-            "hidden_buf": shared["hidden_buf"][:bs],
-            "kv_cache": shared["kv_cache"][:, :bs],
-            "codec_emb_sum_buf": shared["codec_emb_sum_buf"][:bs],
-            "all_codes_buf": shared["all_codes_buf"][:bs],
-            "temperature_buf": shared["temperature_buf"][:bs],
-            "top_k_buf": shared["top_k_buf"][:bs],
-            "top_p_buf": shared["top_p_buf"][:bs],
-            "offset_buf": shared["offset_buf"][:bs],
-            "pos_pf": shared["pos_pf"][:bs],
-            "seed_buf": shared["seed_buf"][:bs],
-            "pos_dec": {i: shared["pos_dec"][i][:bs] for i in shared["pos_dec"]},
+            key: (
+                val[:bs] if isinstance(val, torch.Tensor) else val
+            ) for key, val in self.fwd_input_buffers.items()
         }
-
-    # ------------------------------------------------------------------
-    # Captured body
-    # ------------------------------------------------------------------
-    def _run_unrolled_loop(self, slices: dict) -> None:
-        """Execute the full 15-iteration MTP loop on the given bs-sized slices.
-
-        This is the exact body captured by ``torch.cuda.graph()``. It is
-        Python-unrolled (``for i in range(2, self.num_codes)``) so that each
-        iteration's LM head slice and codec embedder are fixed-address calls
-        resolved at capture time. No Python-side state, no allocations beyond
-        what ``forward_depth_unrolled`` does internally.
-        """
-        hidden_buf = slices["hidden_buf"]
-        kv_cache = slices["kv_cache"]
-        codec_emb_sum_buf = slices["codec_emb_sum_buf"]
-        all_codes_buf = slices["all_codes_buf"]
-        temperature_buf = slices["temperature_buf"]
-        top_k_buf = slices["top_k_buf"]
-        top_p_buf = slices["top_p_buf"]
-        offset_buf = slices["offset_buf"] 
-        pos_pf = slices["pos_pf"]
-        pos_dec = slices["pos_dec"]
-        seed_buf = slices["seed_buf"]
-
-        cp = self.code_predictor
-        codec_embedding = cp.model.codec_embedding
-        lm_head_weight = cp.lm_head_weight
-
-        # Zero the KV cache at the start of every replay so stale state from
-        # the previous decode step cannot leak into the new one.
-        kv_cache.zero_()
-
-        # Prefill pass: forward over [last_hidden, c0_embed] at positions [0, 1].
-        # Writes K/V into cache slots [0, 1]; returns hidden at both positions.
-        hidden_states = cp.forward_depth_unrolled(
-            hidden_buf, pos_pf, kv_cache, cache_pos=0,
-        )
-
-        # Sample codebook 1 from the slot-1 hidden (the c0_embed position).
-        last_hs = hidden_states[:, -1, :]
-        logits = torch.matmul(last_hs, lm_head_weight[0].t())
-        tokens = sample_depth_gpu(logits, temperature_buf, top_k_buf, top_p_buf, seed_buf, offset_buf)
-        offset_buf += 1
-        all_codes_buf[:, 1] = tokens
-        embed = codec_embedding[0](tokens)
-        codec_emb_sum_buf.add_(embed)
-
-        # Decode iterations for codebooks 2..(num_codes - 1). Each adds one
-        # token at position i, attending to the growing dense KV cache.
-        for i in range(2, self.num_codes):
-            pos_i = pos_dec[i]
-            hidden_states = cp.forward_depth_unrolled(
-                embed.unsqueeze(1), pos_i, kv_cache, cache_pos=i,
-            )
-            last_hs = hidden_states[:, 0, :]
-            logits = torch.matmul(last_hs, lm_head_weight[i - 1].t())
-            tokens = sample_depth_gpu(logits, temperature_buf, top_k_buf, top_p_buf, seed_buf, offset_buf)
-            offset_buf += 1
-            all_codes_buf[:, i] = tokens
-            embed = codec_embedding[i - 1](tokens)
-            codec_emb_sum_buf.add_(embed)
 
     # ------------------------------------------------------------------
     # Warmup + capture
@@ -292,15 +325,24 @@ class CodePredictorCudaGraphRunner:
             )
             return
 
-        self._allocate_shared_buffers()
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
         torch.cuda.set_device(self.device)
+
+        configs = self.submodule.get_cuda_graph_configs(self.device)
+        if len(configs) != 1:
+            raise NotImplementedError("CodePredictor engine does not support multiple cuda graph configs yet.")
+        capture_config = configs[0]
+
+        if len(capture_config.dummy_capture_inputs) != 1:
+            raise NotImplementedError(
+                "CodePredictor engine currently only supports one dummy input set per graph config."
+            )
 
         # Capture largest-first so the shared memory pool allocations never
         # need to grow after a smaller bucket has already reserved addresses.
         for bs in reversed(self.CAPTURE_BATCH_SIZES):
             try:
-                self._capture_one(bs)
+                self._capture_one(bs, capture_config)
                 logger.info(
                     "CodePredictorCudaGraphRunner: captured unrolled graph for bs=%d",
                     bs,
@@ -310,20 +352,75 @@ class CodePredictorCudaGraphRunner:
                     "Failed to capture unrolled depth graph for bs=%d",
                     bs, exc_info=True,
                 )
+    def _make_dummy_fwd_info(self, bs, graph_walk: str):
+        dummy_rids = [
+            f"__mtp_{graph_walk}_{i}__" for i in range(bs)
+        ]
+        return {
+            rid: CurrentForwardPassInfo(
+                request_id=rid,
+                graph_walk=graph_walk,
+                requires_cfg=False,
+                fwd_index=0,
+                random_seed=0,
+                max_tokens=1,
+                sampling_config={}
+            ) for rid in dummy_rids
+        }, dummy_rids
 
-    def _capture_one(self, bs: int) -> None:
-        slices = self._slice_for_bs(bs)
+    def _capture_one(self, bs: int, config: CudaGraphConfig) -> None:
+        dummy_fwd_info, dummy_rids = self._make_dummy_fwd_info(bs, config.capture_graph_walk)
+        engine_inputs = CodePredictorEngineInputs(
+            request_ids=dummy_rids,
+            per_request_info=dummy_fwd_info,
+            sampler=make_mtp_sampler_from_buffers(
+                bufs=self.mtp_sampling_buf,
+                request_ids=[], sampling_configs={},
+                padded_bs=bs
+            ),
+            kv_cache=self.kv_cache[:, :bs],
+            init_pos_ids=self.init_pos_ids_buf[:bs]
+        )
+
+        if self.fwd_input_buffers is None:
+            # allocate buffers on the first capture_one, which is on the max bs
+            self.fwd_input_buffers = self.submodule.preprocess(
+                graph_walk=config.capture_graph_walk,
+                engine_inputs=engine_inputs,
+                inputs=[
+                    config.dummy_capture_inputs[0].clone() \
+                        for _ in range(bs)
+                ]
+            )
+        fwd_inputs = self._slice_inputs_for_bs(bs)
+
+        _run_unrolled_loop = self.submodule.forward_batched
+        if config.compile:
+            _run_unrolled_loop = torch.compile(
+                _run_unrolled_loop,
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=False,
+                dynamic=False,
+            )
 
         # Warmup: 3 full passes to trigger lazy kernel compiles and stabilize
         # the memory pool (matches vox-serve's 3-iter warmup).
         torch.cuda.synchronize()
         for _ in range(3):
-            self._run_unrolled_loop(slices)
+            _run_unrolled_loop(
+                graph_walk=config.capture_graph_walk,
+                engine_inputs=engine_inputs,
+                **fwd_inputs,
+            )
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self.memory_pool):
-            self._run_unrolled_loop(slices)
+            static_outputs = _run_unrolled_loop(
+                graph_walk=config.capture_graph_walk,
+                engine_inputs=engine_inputs,
+                **fwd_inputs,
+            ) # dummy req_id -> output dict
         torch.cuda.synchronize()
 
         # A couple of replay passes to let any pool-internal state settle
@@ -334,8 +431,14 @@ class CodePredictorCudaGraphRunner:
 
         self.graphs[bs] = UnrolledGraphData(
             graph=graph,
-            slices=slices,
             bs=bs,
+            kv_cache_slice=engine_inputs.kv_cache,
+            pos_id_slice=engine_inputs.init_pos_ids,
+            inputs_slices=fwd_inputs,
+            static_outputs=[
+                {key: val for key, val in static_outputs[rid].items()} \
+                    for rid in dummy_rids
+            ]
         )
 
     # ------------------------------------------------------------------
@@ -353,8 +456,8 @@ class CodePredictorCudaGraphRunner:
         self,
         graph_walk: str,
         request_ids: list[str],
-        last_hidden: torch.Tensor,
-        layer0_codes: torch.Tensor,
+        inputs: list[ARNodeInputs],
+        per_request_info: dict[str, CurrentForwardPassInfo],
     ) -> dict[str, torch.Tensor]:
         """Run the full depth loop for one decode step.
 
@@ -380,181 +483,188 @@ class CodePredictorCudaGraphRunner:
             )
 
         graph_data = self.graphs[padded_bs]
-        shared = self._shared_bufs
 
-        # --- Step 1: eagerly embed the layer-0 codes via the Talker's
-        #            shared codec_embedding (a separate module, not the code
-        #            predictor's per-layer embedders). ---
-        c0_embed = self.talker_code_emb(layer0_codes)  # [bs, hidden]
+        # Build inputs to preprocess and forward_batched
+        dummy_fwd_info, dummy_rids = self._make_dummy_fwd_info(padded_bs, graph_walk)
+        augmented_request_ids = dummy_rids[:]
+        augmented_request_ids[:bs] = request_ids
+        augmented_fwd_info = {
+            **per_request_info,
+            **dummy_fwd_info,
+        }
+        sampler = make_mtp_sampler_from_buffers(
+            bufs=self.mtp_sampling_buf,
+            request_ids=request_ids,
+            sampling_configs={
+                rid: info.sampling_config.get(
+                    self.node_name, SamplingConfig()
+                ) for rid, info in dummy_fwd_info.items()
+            },
+            padded_bs=padded_bs,
+        )
+        engine_inputs = CodePredictorEngineInputs(
+            request_ids=augmented_request_ids,
+            per_request_info=augmented_fwd_info,
+            sampler=sampler,
+            kv_cache=graph_data.kv_cache_slice,
+            init_pos_ids=graph_data.pos_id_slice,
+        )
 
-        # --- Step 2: stage inputs into the static buffers. Padding slots
-        #            repeat the last real row so all rows are valid and
-        #            kernel divergence stays zero; the padded outputs are
-        #            discarded on return. ---
-        hidden_buf = shared["hidden_buf"][:padded_bs]
-        hidden_buf[:bs, 0].copy_(last_hidden)
-        hidden_buf[:bs, 1].copy_(c0_embed)
-        if bs < padded_bs:
-            hidden_buf[bs:padded_bs, 0].copy_(
-                last_hidden[-1:].expand(padded_bs - bs, -1)
-            )
-            hidden_buf[bs:padded_bs, 1].copy_(
-                c0_embed[-1:].expand(padded_bs - bs, -1)
-            )
-
-        # Seed codec_emb_sum with c0_embed. The captured graph adds c1..c15
-        # on top (via in-place ``.add_()``), producing the full sum at exit.
-        codec_emb_sum_buf = shared["codec_emb_sum_buf"][:padded_bs]
-        codec_emb_sum_buf[:bs].copy_(c0_embed)
-        if bs < padded_bs:
-            codec_emb_sum_buf[bs:padded_bs].copy_(
-                c0_embed[-1:].expand(padded_bs - bs, -1)
-            )
-
-        # Pre-populate all_codes[:, 0] with layer0_codes; the graph fills
-        # columns 1..num_codes-1. Zero the rest so previous call's state
-        # cannot bleed through.
-        all_codes_buf = shared["all_codes_buf"][:padded_bs]
-        all_codes_buf[:bs, 0].copy_(layer0_codes)
-        if bs < padded_bs:
-            all_codes_buf[bs:padded_bs, 0].copy_(
-                layer0_codes[-1:].expand(padded_bs - bs)
-            )
-        all_codes_buf[:, 1:].zero_()
-
-        # --- Step 3: sampling config. ---
-        self._update_sampling_buffers(request_ids, padded_bs)
+        # Preprocess and copy inputs into the shared buffers.
+        preprocessed = self.submodule.preprocess(
+            graph_walk=graph_walk,
+            engine_inputs=engine_inputs,
+            inputs=inputs,
+        )
+        buffers = graph_data.inputs_slices
+        for key, tensor in preprocessed.items():
+            if key not in buffers:
+                raise KeyError(f"Preprocess output key '{key}' not found in captured graph inputs")
+            buf = buffers[key]
+            if tensor.shape != buf.shape:
+                raise ValueError(
+                    f"Shape mismatch for input '{key}': "
+                    f"preprocessed shape {tensor.shape} vs "
+                    f"captured buffer shape {buf.shape}"
+                )
+            buf.copy_(tensor)
 
         # --- Step 4: replay. ---
         graph_data.graph.replay()
 
-        # --- Step 5: return bs-sized outputs. Clone so callers don't alias
-        #            the static buffers (which will be overwritten on the
-        #            next call). ---
-        return {
-            "all_codes": all_codes_buf[:bs].clone(),
-            "codec_emb_sum": codec_emb_sum_buf[:bs].clone(),
-        }
+        # return req_id -> output tensor dict for the real batch (ignore padding slots)
+        outputs = {}
+        for i, rid in enumerate(request_ids):
+            outputs[rid] = graph_data.static_outputs[i]
 
-    def _update_sampling_buffers(self, request_ids: list[str], padded_bs: int) -> None:
-        """Copy per-request sampling config into the static sampling buffers.
+            # clone outputs to detach from the static buffers
+            # (which will be overwritten on the next call)
+            for key, val in outputs[rid].items():
+                if isinstance(val, torch.Tensor):
+                    outputs[rid][key] = val.clone()
+                elif isinstance(val, list):
+                    outputs[rid][key] = [
+                        v.clone() if isinstance(v, torch.Tensor) \
+                            else v for v in val
+                    ]
+        return outputs
 
-        Greedy (``temperature == 0``) is translated to
-        ``(temperature=1, top_k=1)`` so the graph-safe sampler can remain
-        branch-free. Padding slots repeat the last real entry.
-        """
-        from mminf.utils.sampling import SamplingConfig
 
-        vocab = self.cp_cfg.vocab_size
-
-        temps: list[float] = []
-        top_ks: list[int] = []
-        top_ps: list[float] = []
-        for rid in request_ids:
-            cfg = self.sampler._sampling_config.get(rid, SamplingConfig())
-            if cfg.temperature == 0:
-                temps.append(1.0)
-                top_ks.append(1)
-                top_ps.append(1.0)
-            else:
-                temps.append(float(cfg.temperature))
-                top_ks.append(int(cfg.top_k) if cfg.top_k and cfg.top_k > 0 else vocab)
-                top_ps.append(float(cfg.top_p) if cfg.top_p else 1.0)
-
-        # Pad to padded_bs with the last entry so every slot is well-defined.
-        if not temps:
-            # No requests somehow; just use defaults across all padding slots.
-            temps = [1.0] * padded_bs
-            top_ks = [vocab] * padded_bs
-            top_ps = [1.0] * padded_bs
-        else:
-            while len(temps) < padded_bs:
-                temps.append(temps[-1])
-                top_ks.append(top_ks[-1])
-                top_ps.append(top_ps[-1])
-
-        shared = self._shared_bufs
-        shared["temperature_buf"][:padded_bs].copy_(
-            torch.tensor(temps, dtype=torch.float32, device=self.device)
+class CodePredictorEngine(BaseEngine):
+    def __init__(
+        self,
+        autocast_dtype=torch.bfloat16,
+        enable_nvtx: bool = False,
+    ):
+        super().__init__(enable_nvtx=enable_nvtx)
+        self.cuda_graph_runners: dict[str, CodePredictorCudaGraphRunner] = {}
+        self.submodules: dict[str, CodePredictorSubmodule] = {}
+        self.kv_caches: dict[str, torch.Tensor] = {}
+        self._max_batch_size = max(
+            CodePredictorCudaGraphRunner.CAPTURE_BATCH_SIZES
         )
-        shared["top_k_buf"][:padded_bs].copy_(
-            torch.tensor(top_ks, dtype=torch.int32, device=self.device)
-        )
-        shared["top_p_buf"][:padded_bs].copy_(
-            torch.tensor(top_ps, dtype=torch.float32, device=self.device)
-        )
-        # randomly initialize seed buffer
-        shared["seed_buf"][:padded_bs].copy_(
-            torch.randint(0, 2**32, (padded_bs,), dtype=torch.long, device=self.device)
-        )
-        shared["offset_buf"][:] = 0
 
-
-class CodePredictorEngine(AREngine):
     def engine_type(self) -> EngineType:
         return EngineType.CODE_PREDICTOR
 
     def has_autocast(self):
         return False
+    
+    def load_model(
+        self,
+        submodules: dict[str, CodePredictorSubmodule],
+        kv_cache_config: list[KVCacheConfig],
+        device: torch.device,
+        **kwargs
+    ) -> None:
+        self.device = device
+        node_name_to_kv_cfg: dict[str, KVCacheConfig] = {}
+        for cfg in kv_cache_config:
+            for node_name in cfg.nodes or submodules.keys():
+                node_name_to_kv_cfg[node_name] = cfg
+        
+        self.submodules = submodules
+        for node_name, submodule in submodules.items():
+            kv_cfg = node_name_to_kv_cfg.get(node_name)
+            if kv_cfg is None:
+                raise ValueError(f"No KV cache config found for node '{node_name}'")
+
+            kv_cache = torch.zeros(
+                (kv_cfg.num_layers, self._max_batch_size,
+                2, submodule.get_num_code_groups(),
+                kv_cfg.num_kv_heads, kv_cfg.head_dim),
+                dtype=submodule.get_kv_cache_dtype(),
+                device=device,
+            )
+            self.kv_caches[node_name] = kv_cache
+
 
     def warmup(self) -> None:
         """Capture the unrolled depth graph for each registered submodule."""
-        for node_name, submodule_mgmt in self.submodule_management.items():
+        for node_name, submodule in self.submodules.items():
             runner = CodePredictorCudaGraphRunner(
-                submodule=submodule_mgmt.submodule,
-                sampler=submodule_mgmt.sampler,
+                submodule=submodule,
+                kv_cache=self.kv_caches[node_name],
                 device=self.device,
             )
             runner.warmup_and_capture()
             if runner.graphs:
-                submodule_mgmt.cuda_graph_runner = runner
+                self.cuda_graph_runners[node_name] = runner
                 logger.info(
                     "CodePredictorEngine: unrolled graph runner attached to %s (%d buckets)",
                     node_name, len(runner.graphs),
                 )
 
-    def _execute_batched(self, batch: NodeBatch, submodule) -> NodeOutput:
-        cache_manager = self._create_cache_manager(
-            batch.request_ids, batch.node_name
-        )
+    def get_max_batch_size(self):
+        return self._max_batch_size
 
-        for rid in batch.request_ids:
-            cache_manager.reset_state(
-                request_id=rid,
+    def _execute_batched(
+        self, batch: NodeBatch,
+        inputs: list[ARNodeInputs],
+        submodule: CodePredictorSubmodule
+    ) -> NodeOutput:
+        self.kv_caches[batch.node_name].zero_()
+        if batch.node_name in self.cuda_graph_runners:
+            return self.cuda_graph_runners[batch.node_name].run(
+                graph_walk=batch.graph_walk,
+                request_ids=batch.request_ids,
+                inputs=inputs,
+                per_request_info=batch.per_request_info
             )
-
-        rids = list(batch.per_request_input_tensors.keys())
-        seq_lens = {
-            rid: cache_manager._get_state(rid, "main").seq_len for rid in rids
-        }
-        logger.debug("Execute batched %s", seq_lens)
-        input_tensors = [batch.per_request_input_tensors[rid] for rid in rids]
-
+        
         if self.enable_nvtx:
-            range_push("code_pred.batched.preprocess", synchronize=True)
+            range_push("code_pred.batched.preprocesss", synchronize=True)
+        engine_inputs=CodePredictorEngineInputs(
+            request_ids=batch.request_ids,
+            per_request_info=batch.per_request_info,
+            sampler=make_mtp_sampler_eager(
+                batch.request_ids, sampling_configs={
+                    rid: info.sampling_config.get(
+                        batch.node_name, SamplingConfig()
+                    ) for rid, info in batch.per_request_info.items()
+                }
+            ),
+            kv_cache=self.kv_caches[batch.node_name],
+            init_pos_ids=torch.zeros(
+                len(batch.request_ids), device=self.device,
+                dtype=torch.long
+            )
+        )
         preprocessed = submodule.preprocess(
             graph_walk=batch.graph_walk,
-            cache_manager=cache_manager,
-            per_request_inputs=input_tensors,
-            request_ids=rids,
-            per_request_info=batch.per_request_info,
+            engine_inputs=engine_inputs,
+            inputs=inputs
         )
         if self.enable_nvtx:
             range_pop(synchronize=True)
 
         if self.enable_nvtx:
             range_push("code_pred.batched.forward")
-
-        sampler = self.submodule_management[batch.node_name].sampler
-        cuda_graph_runner = self.submodule_management[batch.node_name].cuda_graph_runner
+        
         batched_output = submodule.forward_batched(
             graph_walk=batch.graph_walk,
-            cache_manager=cache_manager,
-            packed_inputs=preprocessed,
-            sampler=sampler,
-            cuda_graph_runner=cuda_graph_runner,
-            request_ids=rids,
-            per_request_info=batch.per_request_info,
+            engine_inputs=engine_inputs,
+            **preprocessed
         )
         output = NodeOutput(per_request_output_tensors=batched_output)
         if self.enable_nvtx:
@@ -568,14 +678,19 @@ class CodePredictorEngine(AREngine):
                 f".bs{len(batch.request_ids)}"
             )
 
-        submod_mgmt = self.submodule_management[batch.node_name]
-        submodule = submod_mgmt.submodule
+        submodule = self.submodules[batch.node_name]
         if self.enable_nvtx:
-            range_push("code_pred.sampler_config", synchronize=True)
-        for rid, info in batch.per_request_info.items():
-            sampling_config = info.sampling_config.get(batch.node_name)
-            sampling_config = {} if sampling_config is None else asdict(sampling_config)
-            submod_mgmt.sampler.set_config(rid, **sampling_config)
+            range_push("code_pred.prepare_iputs", synchronize=True)
+        
+        node_inputs: list[ARNodeInputs] = []
+        for rid in batch.request_ids:
+            node_inputs.append(
+                submodule.prepare_inputs(
+                    graph_walk=batch.graph_walk,
+                    fwd_info=batch.per_request_info[rid],
+                    inputs=batch.per_request_input_tensors[rid],
+                )
+            )
         if self.enable_nvtx:
             range_pop(synchronize=True)
 
@@ -583,7 +698,9 @@ class CodePredictorEngine(AREngine):
         # vllm-omni found that fused/autocast kernels degrade audio quality
         # for the small (5-layer) Code Predictor.
         with torch.no_grad():
-            output = self._execute_batched(batch, submodule)
+            output = self._execute_batched(
+                batch, node_inputs, submodule
+            )
             for rid, info in batch.per_request_info.items():
                 submodule.postprocess(
                     request_id=rid,
@@ -594,5 +711,3 @@ class CodePredictorEngine(AREngine):
                 range_pop(synchronize=True)
             return output
 
-    def check_ready(self, *args, **kwargs):
-        return True
