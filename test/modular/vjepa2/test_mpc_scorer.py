@@ -42,6 +42,7 @@ def _make_info() -> CurrentForwardPassInfo:
         fwd_index=0,
         random_seed=0,
         max_tokens=0,
+        sampling_config={},
     )
 
 
