@@ -68,6 +68,7 @@ def _make_request_info(iter_idx: int, rollout_horizon: int) -> CurrentForwardPas
         fwd_index=0,
         random_seed=0,
         max_tokens=0,
+        sampling_config={},
     )
     info.dynamic_loop_iter_counts["rollout_loop"] = iter_idx
     info.step_metadata["rollout_horizon"] = rollout_horizon
