@@ -1,6 +1,7 @@
 from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import torch
@@ -23,6 +24,11 @@ def _clone_or_none(tensor):
         return tensor.clone() if tensor is not None else None
 
 
+class StackingMethod(Enum):
+    NONE = "none"
+    STACK = "stack"
+    CAT = "cat"
+
 @dataclass
 class ARNodeInputs(NodeInputs):
     """
@@ -42,7 +48,7 @@ class ARNodeInputs(NodeInputs):
     custom_pos_ids: torch.Tensor | dict[str, torch.Tensor] | None = None
 
     @classmethod
-    def collate(cls, inputs_list: list["ARNodeInputs"], stack: bool = False):
+    def collate(cls, inputs_list: list["ARNodeInputs"], stacking_method=StackingMethod.NONE):
         out = defaultdict(list)
 
         for inp in inputs_list:
@@ -72,24 +78,28 @@ class ARNodeInputs(NodeInputs):
                 out.setdefault("kwargs", {}).setdefault(k, []).append(v)
 
         # --- optional stacking ---
-        def maybe_stack(x):
+        def maybe_stack(x, stacking_method):
+            if stacking_method == StackingMethod.NONE:
+                return x
             if isinstance(x, list) and len(x) > 0 and isinstance(x[0], torch.Tensor):
                 try:
-                    return torch.stack(x)
+                    if stacking_method == StackingMethod.STACK:
+                        return torch.stack(x)
+                    else:
+                        return torch.cat(x)
                 except RuntimeError:
                     return x  # fallback if shapes mismatch
             return x
 
-        if stack:
-            for k in ["input_ids", "input_embeds", "custom_pos_ids"]:
-                if k in out and isinstance(out[k], list):
-                    out[k] = maybe_stack(out[k])
+        for k in ["input_ids", "input_embeds", "custom_pos_ids"]:
+            if k in out and isinstance(out[k], list):
+                out[k] = maybe_stack(out[k], stacking_method)
 
-            # nested dicts
-            for parent in ["tensor_inputs", "custom_pos_ids", "kwargs"]:
-                if parent in out and isinstance(out[parent], dict):
-                    for k, v in out[parent].items():
-                        out[parent][k] = maybe_stack(v)
+        # nested dicts
+        for parent in ["tensor_inputs", "custom_pos_ids", "kwargs"]:
+            if parent in out and isinstance(out[parent], dict):
+                for k, v in out[parent].items():
+                    out[parent][k] = maybe_stack(v, stacking_method)
 
         return dict(out)
     
@@ -158,9 +168,8 @@ class NodeSubmodule(torch.nn.Module):
     TODO
     """
 
-    @property
-    def device(self):
-        return next(self.model.parameters()).device
+    def get_device(self):
+        return next(self.parameters()).device
 
     @abstractmethod
     def prepare_inputs(

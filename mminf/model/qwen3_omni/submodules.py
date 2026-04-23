@@ -299,7 +299,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # Wrap the audio span in ``<|audio_bos|>`` / ``<|audio_eos|>``
         # sentinel token embeddings so the Thinker sees the same
         # prompt layout the HF processor produces.
-        device = self.device
+        device = self.get_device()
         if self._audio_bos_embed is None or self._audio_eos_embed is None:
             audio_start_id = self.config.thinker.audio_start_token_id
             audio_end_id = self.config.thinker.audio_end_token_id
@@ -347,7 +347,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         pos_info: dict[str, PositionInfo] = {}
     ) -> ARNodeInputs:
-        device = self.device
+        device = self.get_device()
         start_pos = pos_info.get("main", PositionInfo()).position_id_start
         if graph_walk == "thinker_decode":
             # Get previous token ID from text_inputs
@@ -506,7 +506,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
-        device = self.device
+        device = self.get_device()
         # Concatenate across requests
         input_embeds = torch.cat([
             inp.input_embeds for inp in inputs
@@ -909,7 +909,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         pos_info: dict[str, PositionInfo] = {},
     ) -> ARNodeInputs:
-        device = self.device
+        device = self.get_device()
     
         thinker_hidden = self.config.thinker_hidden_size    
         if graph_walk == "talker_prefill":
