@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,6 +35,57 @@ class ARNodeInputs(NodeInputs):
     input_embeds: torch.Tensor | None = None
     custom_pos_ids: torch.Tensor | dict[str, torch.Tensor] | None = None # it's a dict if it's per-label
 
+    @classmethod
+    def collate(cls, inputs_list: list["ARNodeInputs"], stack: bool = False):
+        out = defaultdict(list)
+
+        for inp in inputs_list:
+            # --- required field ---
+            out["input_seq_len"].append(inp.input_seq_len)
+
+            # --- mutually exclusive main inputs ---
+            if inp.input_ids is not None:
+                out["input_ids"].append(inp.input_ids)
+            if inp.input_embeds is not None:
+                out["input_embeds"].append(inp.input_embeds)
+
+            # --- custom_pos_ids ---
+            if inp.custom_pos_ids is not None:
+                if isinstance(inp.custom_pos_ids, dict):
+                    for k, v in inp.custom_pos_ids.items():
+                        out.setdefault("custom_pos_ids", {}).setdefault(k, []).append(v)
+                else:
+                    out["custom_pos_ids"].append(inp.custom_pos_ids)
+
+            # --- tensor_inputs ---
+            for k, v in inp.tensor_inputs.items():
+                out.setdefault("tensor_inputs", {}).setdefault(k, []).append(v)
+
+            # --- kwargs ---
+            for k, v in inp.kwargs.items():
+                out.setdefault("kwargs", {}).setdefault(k, []).append(v)
+
+        # --- optional stacking ---
+        def maybe_stack(x):
+            if isinstance(x, list) and len(x) > 0 and isinstance(x[0], torch.Tensor):
+                try:
+                    return torch.stack(x)
+                except RuntimeError:
+                    return x  # fallback if shapes mismatch
+            return x
+
+        if stack:
+            for k in ["input_ids", "input_embeds", "custom_pos_ids"]:
+                if k in out and isinstance(out[k], list):
+                    out[k] = maybe_stack(out[k])
+
+            # nested dicts
+            for parent in ["tensor_inputs", "custom_pos_ids", "kwargs"]:
+                if parent in out and isinstance(out[parent], dict):
+                    for k, v in out[parent].items():
+                        out[parent][k] = maybe_stack(v)
+
+        return dict(out)
 
 @dataclass
 class CudaGraphConfig:
