@@ -43,7 +43,7 @@ from mminf.engine.ar_engine import AREngine
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
 from mminf.model.base import NodeSubmodule
 from mminf.utils.profiler import range_pop, range_push
-from mminf.utils.sampling import Sampler, sample_depth_gpu
+from mminf.utils.sampling import Sampler, req_id_to_seed, sample_depth_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,10 @@ class CodePredictorCudaGraphRunner:
         self.graphs: dict[int, UnrolledGraphData] = {}
         self.memory_pool = None
         self._shared_bufs: dict | None = None
+        # Per-request decode-step counter. Combined with req_id_to_seed it
+        # produces a deterministic seed per (rid, step) so the FlashInfer
+        # sampler is reproducible across runs and identical across TP ranks.
+        self._step_count: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Buffer allocation
@@ -227,7 +231,7 @@ class CodePredictorCudaGraphRunner:
         temperature_buf = slices["temperature_buf"]
         top_k_buf = slices["top_k_buf"]
         top_p_buf = slices["top_p_buf"]
-        offset_buf = slices["offset_buf"] 
+        offset_buf = slices["offset_buf"]
         pos_pf = slices["pos_pf"]
         pos_dec = slices["pos_dec"]
         seed_buf = slices["seed_buf"]
@@ -472,9 +476,23 @@ class CodePredictorCudaGraphRunner:
         shared["top_p_buf"][:padded_bs].copy_(
             torch.tensor(top_ps, dtype=torch.float32, device=self.device)
         )
-        # randomly initialize seed buffer
+        # Deterministic seed per (request_id, decode_step). Same rid in two
+        # different decode steps gets a different seed; same rid in two
+        # different runs (or on two TP ranks) gets the same seed. The
+        # offset_buf advances inside the captured graph (one per codebook
+        # iteration) to vary the RNG within a single decode step.
+        seeds: list[int] = []
+        for rid in request_ids:
+            step = self._step_count.get(rid, 0)
+            self._step_count[rid] = step + 1
+            seeds.append((req_id_to_seed(rid) + step) & 0xFFFFFFFF)
+        if not seeds:
+            seeds = [0] * padded_bs
+        else:
+            while len(seeds) < padded_bs:
+                seeds.append(seeds[-1])
         shared["seed_buf"][:padded_bs].copy_(
-            torch.randint(0, 2**32, (padded_bs,), dtype=torch.long, device=self.device)
+            torch.tensor(seeds, dtype=torch.long, device=self.device)
         )
         shared["offset_buf"][:] = 0
 
@@ -585,3 +603,10 @@ class CodePredictorEngine(AREngine):
 
     def check_ready(self, *args, **kwargs):
         return True
+
+    def remove_request(self, request_id: str) -> None:
+        super().remove_request(request_id)
+        for submodule_mgmt in self.submodule_management.values():
+            runner = getattr(submodule_mgmt, "cuda_graph_runner", None)
+            if runner is not None:
+                runner._step_count.pop(request_id, None)
