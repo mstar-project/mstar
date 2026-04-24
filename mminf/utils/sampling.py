@@ -15,11 +15,23 @@ Usage:
     tokens = sample_tokens(logits, temperature=0.7, top_p=0.9)
 """
 
+import hashlib
 from dataclasses import asdict, dataclass, field
 
 import torch
 import triton
 import triton.language as tl
+
+
+def req_id_to_seed(req_id: str) -> int:
+    """Map a request id to a stable 32-bit seed.
+
+    Uses ``hashlib.md5`` rather than Python's builtin ``hash`` so the result
+    is stable across processes (Python salts ``hash`` per-interpreter via
+    ``PYTHONHASHSEED``). Used wherever a per-request RNG seed must be
+    reproducible across worker restarts and across tensor-parallel ranks.
+    """
+    return int.from_bytes(hashlib.md5(req_id.encode("utf-8")).digest()[:4], "little")
 
 
 @triton.autotune(
