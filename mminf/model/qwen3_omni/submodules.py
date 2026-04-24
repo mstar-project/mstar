@@ -23,7 +23,7 @@ from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.code_predictor_engine import CodePredictorEngineInputs, CodePredictorSubmodule, MTPSampler
-from mminf.engine.cuda_graph_runner import CudaGraphConfig
+from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
 from mminf.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
@@ -635,7 +635,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk == "thinker_decode"
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+    def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
         """Declare a CUDA graph capture for ``thinker_decode``.
 
         ``dummy_capture_inputs`` is the PRE-preprocess input (a single
@@ -648,7 +648,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         for the full 30B Thinker; revisit after profiling real deployments.
         """
         return [
-            CudaGraphConfig(
+            BasicBatchedCudaGraphConfig(
                 capture_graph_walk="thinker_decode",
                 requires_cfg=False,
                 labels=["main"],
@@ -1123,9 +1123,9 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
     def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk == "talker_decode"
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+    def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
         return [
-            CudaGraphConfig(
+            BasicBatchedCudaGraphConfigs(
                 capture_graph_walk="talker_decode", requires_cfg=False, labels=["main"],
                 dummy_capture_inputs=[ARNodeInputs(
                     input_embeds=torch.zeros(
@@ -1282,7 +1282,7 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
     
     def get_cuda_graph_configs(self, device):
         return [
-            CudaGraphConfig(
+            BasicBatchedCudaGraphConfig(
                 capture_graph_walk="talker_decode",
                 replay_graph_walks=["talker_last_prefill", "talker_decode"],
                 dummy_capture_inputs=[self._get_dummy_inputs(device=device)],

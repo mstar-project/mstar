@@ -1,4 +1,4 @@
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,6 +28,7 @@ class StackingMethod(Enum):
     NONE = "none"
     STACK = "stack"
     CAT = "cat"
+
 
 @dataclass
 class ARNodeInputs(NodeInputs):
@@ -120,35 +121,6 @@ class ARNodeInputs(NodeInputs):
             tensor_inputs={k: _clone_or_none(t) for k, t in self.tensor_inputs.items()},
             kwargs=self.kwargs.copy()
         )
-
-
-@dataclass
-class CudaGraphConfig:
-    """Defines what computation a captured graph represents."""
-    capture_graph_walk: str  # "decode"
-    dummy_capture_inputs: list[ARNodeInputs]
-
-    replay_graph_walks: list[str] = None # set to None to be just capture_graph_walk
-
-    # whether CFG is active for image generation
-    requires_cfg: bool = False
-
-    # cache labels used: ["main"] or ["main", "cfg_img"]
-    labels: list[str]  = field(default_factory=lambda: ["main"])
-
-    # whether to run torch.compile on the submodule before cuda graph capture
-    compile: bool = True
-
-    # Per-config override for the set of batch sizes to capture. None → use the
-    # runner's default (AR engine default: DEFAULT_AR_CAPTURE_BATCH_SIZES;
-    # CodecCudaGraphRunner picks its own default). Useful for codec-style
-    # submodules where memory cost per size is high, or for AR walks where a
-    # small subset is enough.
-    capture_batch_sizes: list[int] | None = None
-
-    def __post_init__(self):
-        if self.replay_graph_walks is None:
-            self.replay_graph_walks = [self.capture_graph_walk]
 
 
 @dataclass

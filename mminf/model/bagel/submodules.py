@@ -16,7 +16,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.engine.cuda_graph_runner import CudaGraphConfig
+from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -390,18 +390,18 @@ class LLMSubmodule(ARNodeSubmodule):
 
         return tensor_inputs
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+    def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
         dummy = ARNodeInputs(
             input_ids=torch.zeros(1, dtype=torch.long, device=device),
             input_seq_len=1
         )
         
         return [
-            CudaGraphConfig(
+            BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=False, labels=["main"],
                 dummy_capture_inputs=[dummy.clone()],
             ),
-            CudaGraphConfig(
+            BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=True, labels=["main", "cfg_img"],
                 dummy_capture_inputs=[dummy.clone()],
             ),

@@ -8,7 +8,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.ar_engine import BatchedCacheManager
 from mminf.engine.base import NodeBatch
-from mminf.engine.cuda_graph_runner import CudaGraphConfig
+from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
@@ -37,8 +37,8 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
-        return [CudaGraphConfig(
+    def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
+        return [BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode",
                 requires_cfg=False, labels=["main"],
                 dummy_capture_inputs=[
@@ -217,7 +217,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
     def _num_frames(self) -> int:
         return self.config.snac_window_tokens // (4 * self.config.tokens_per_frame)
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
+    def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
         """Declare the SNAC decode capture.
         """
         # One streaming window is ``snac_window_tokens`` raw tokens
@@ -231,7 +231,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             input_seq_len=tokens_per_window
         )
         return [
-            CudaGraphConfig(
+            BasicBatchedCudaGraphConfig(
                 capture_graph_walk="snac_chunk",
                 dummy_capture_inputs=[dummy],
                 capture_batch_sizes=[1, 2, 4, 8, 16],

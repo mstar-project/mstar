@@ -55,6 +55,21 @@ class CudaGraphData:
     has_non_logit_outputs: bool = False
 
 
+@dataclass(frozen=True)
+class CudaGraphKey:
+    graph_walk: str
+    requires_cfg: bool
+    bs: int
+    seq_len: int
+
+
+@dataclass(frozen=True)
+class CudaGraphKeyPacked:
+    graph_walk: str
+    requires_cfg: bool
+    total_tokens: int
+
+
 class CudaGraphRunner:
     """Captures and replays CUDA graphs for AR decode batches.
 
@@ -102,8 +117,7 @@ class CudaGraphRunner:
         self.buffer_manager = buffer_manager
         self.enable_nvtx = False  # set by AREngine after construction
 
-        # Keyed by (graph_walk, requires_cfg, batch_size)
-        self.graphs: dict[tuple, CudaGraphData] = {}
+        self.graphs: dict[CudaGraphKey, CudaGraphData] = {}
 
         self.memory_pool = None
 
@@ -124,15 +138,23 @@ class CudaGraphRunner:
         for config in self.capture_configs:
             sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
             for bs in reversed(sizes):
-                key = (config.capture_graph_walk, config.requires_cfg, bs)
-                try:
-                    self._capture_one(bs, config, self.submodule)
-                    logger.info("Captured CUDA graph for %s: %s bs=%d",
-                                self.submodule_name, key, bs)
-                except Exception:
-                    logger.warning(
-                        "Failed to capture CUDA graph for %s: %s bs=%d",
-                        self.submodule_name, key, bs, exc_info=True)
+                for i, inputs in enumerate(config.dummy_capture_inputs):
+                    key = CudaGraphKey(
+                        graph_walk=config.capture_graph_walk,
+                        requires_cfg=config.requires_cfg,
+                        bs=bs, seq_len=inputs.input_seq_len
+                    )
+                    try:
+                        self._capture_one(
+                            key, config, self.submodule,
+                            input_idx=i
+                        )
+                        logger.info("Captured CUDA graph for %s: %s bs=%d",
+                                    self.submodule_name, key, bs)
+                    except Exception:
+                        logger.warning(
+                            "Failed to capture CUDA graph for %s: %s bs=%d",
+                            self.submodule_name, key, bs, exc_info=True)
 
     def _create_persistent_wrappers(
         self, bs: int, config: CudaGraphConfig, is_decode: bool
@@ -195,13 +217,16 @@ class CudaGraphRunner:
         return plan_states
 
     def _capture_one(
-        self, bs: int, config: CudaGraphConfig, submodule: ARNodeSubmodule
+        self, key: CudaGraphKey,
+        config: CudaGraphConfig,
+        submodule: ARNodeSubmodule,
+        input_idx: int=0
     ) -> None:
         """Capture a single CUDA graph for the given batch size and config."""
         from mminf.engine.cache_manager import BatchedCacheManager
 
         cfg = self.kv_cache_config
-        key = (config.capture_graph_walk, config.requires_cfg, bs)
+        bs = key.bs
 
         # Create dummy request IDs
         dummy_rids = [f"__cg_{config.capture_graph_walk}_{config.requires_cfg}_{i}__"
@@ -223,12 +248,11 @@ class CudaGraphRunner:
                 return
             
             # Use the first template for each dummy request slot
-            template = capture_templates[0]
+            template = capture_templates[input_idx]
             dummy_inputs = [template.clone() for _ in dummy_rids]
 
             plan_states = self._create_persistent_wrappers(
-                bs, config,
-                template.input_seq_len==1
+                bs, config, is_decode=template.input_seq_len==1
             )
 
             # Create BatchedCacheManager with CUDA graph plan states
@@ -305,9 +329,8 @@ class CudaGraphRunner:
                 for rid in dummy_rids:
                     for label in config.labels:
                         state = self.alloc_manager.get_state(rid, label)
-                        state.seq_len = max(0, state.seq_len - 1)
-                        state.position_id_start = max(
-                            0, state.position_id_start - 1)
+                        state.seq_len = 0
+                        state.position_id_start = 0
                 # Re-plan after reset
                 submodule.preprocess(
                     graph_walk=config.capture_graph_walk,
@@ -373,36 +396,72 @@ class CudaGraphRunner:
     def can_run(
         self,
         batch_size: int,
+        max_seq_len: int,
         graph_walk: str = "decode",
         requires_cfg: bool = False,
     ) -> bool:
         """Check if a captured graph exists for this configuration."""
+        return self._get_key_for(
+            batch_size,  max_seq_len,
+            graph_walk, requires_cfg
+        ) is not None
+    
+    def _get_key_for(
+        self,
+        batch_size: int,
+        total_seq_len: int,
+        graph_walk: str = "decode",
+        requires_cfg: bool = False, 
+    ) -> CudaGraphKey | None:
         if not self.graphs:
-            return False
-        padded_bs = self._get_padded_batch_size(batch_size, graph_walk, requires_cfg)
+            return
+        config = self._config_for(graph_walk, requires_cfg)
+        padded_bs = self._get_padded_batch_size(batch_size, config)
         if padded_bs is None:
-            return False
-        key = (graph_walk, requires_cfg, padded_bs)
-        return key in self.graphs
+            return None
+        padded_seq_len = self._get_padded_seq_len(total_seq_len, config)
+        if padded_seq_len is None:
+            return None
+        
+        key = CudaGraphKey(
+            graph_walk=graph_walk,
+            requires_cfg=requires_cfg,
+            bs=padded_bs,
+            seq_len=padded_seq_len
+        )
+        if key not in self.graphs:
+            return
 
-    def _sizes_for(self, graph_walk: str, requires_cfg: bool) -> list[int]:
+    def _config_for(self, graph_walk: str, requires_cfg: bool) -> CudaGraphConfig | None:
         for cfg in self.capture_configs:
-            if graph_walk in cfg.replay_graph_walks  and cfg.requires_cfg == requires_cfg:
-                return cfg.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
-        return self.CAPTURE_BATCH_SIZES
+            if graph_walk in cfg.replay_graph_walks and cfg.requires_cfg == requires_cfg:
+                return cfg
+        return None
 
     def _get_padded_batch_size(
         self,
         batch_size: int,
-        graph_walk: str = "decode",
-        requires_cfg: bool = False,
+        config: CudaGraphConfig,
     ) -> int | None:
         """Find smallest captured batch size >= batch_size for this config."""
-        sizes = self._sizes_for(graph_walk, requires_cfg)
+        sizes = config.capture_batch_sizes
         idx = bisect.bisect_left(sizes, batch_size)
         if idx >= len(sizes):
             return None
         return sizes[idx]
+    
+    def _get_padded_seq_len(
+        self,
+        seq_len: int,
+        config: CudaGraphConfig,
+    ) -> int | None:
+        """Find smallest captured batch size >= batch_size for this config."""
+        sizes = [inp.input_seq_len for inp in config.dummy_capture_inputs]
+        idx = bisect.bisect_left(sizes, seq_len)
+        if idx >= len(sizes):
+            return None
+        return sizes[idx]
+
 
     def run(
         self,
