@@ -20,15 +20,26 @@ class CudaGraphConfig(ABC):
         requires_cfg: bool = False,
         labels: list[str]  = None,  # cache labels used: ["main"] or ["main", "cfg_img"]
         compile: bool = True, # whether to run torch.compile on the submodule before cuda graph capture
+        # Per-config override for the set of batch sizes to capture. None → use the
+        # runner's default (AR engine default: DEFAULT_AR_CAPTURE_BATCH_SIZES;
+        # CodecCudaGraphRunner picks its own default). Useful for codec-style
+        # submodules where memory cost per size is high, or for AR walks where a
+        # small subset is enough.
+        capture_batch_sizes: list[int] | None = None
     ):
         self.capture_graph_walk = capture_graph_walk
         self.replay_graph_walks = replay_graph_walks or [capture_graph_walk]
         self.requires_cfg = requires_cfg
         self.labels = labels or ["main"]
         self.compile = compile
+        self.capture_batch_sizes = capture_batch_sizes
     
     @abstractmethod
     def get_config_type(self) -> CudaGraphConfigType:
+        pass
+
+    @abstractmethod
+    def get_total_tokens(self, bs: int) -> list[int]:
         pass
 
 
@@ -41,11 +52,6 @@ class BasicBatchedCudaGraphConfig(CudaGraphConfig):
         requires_cfg: bool = False,
         labels: list[str]  = None,
         compile: bool = True,
-        # Per-config override for the set of batch sizes to capture. None → use the
-        # runner's default (AR engine default: DEFAULT_AR_CAPTURE_BATCH_SIZES;
-        # CodecCudaGraphRunner picks its own default). Useful for codec-style
-        # submodules where memory cost per size is high, or for AR walks where a
-        # small subset is enough.
         capture_batch_sizes: list[int] | None = None
     ):
         super().__init__(
@@ -53,13 +59,16 @@ class BasicBatchedCudaGraphConfig(CudaGraphConfig):
             replay_graph_walks=replay_graph_walks,
             requires_cfg=requires_cfg,
             labels=labels,
-            compile=compile
+            compile=compile,
+            capture_batch_sizes=capture_batch_sizes
         )
         self.single_request_inputs = single_request_inputs
-        self.capture_batch_sizes = capture_batch_sizes
     
     def get_config_type(self) -> CudaGraphConfigType:
         return CudaGraphConfigType.BASIC_BATCHED
+    
+    def get_total_tokens(self, bs: int) -> list[int]:
+        return [self.single_request_inputs.input_seq_len * bs]
 
 
 class FlashInferPackedCudaGraphConfig(CudaGraphConfig):
@@ -71,17 +80,22 @@ class FlashInferPackedCudaGraphConfig(CudaGraphConfig):
         requires_cfg: bool = False,
         labels: list[str]  = None,
         compile: bool = True,
-        causal_attention: bool = True
+        causal_attention: bool = True,
+        capture_batch_sizes: list[int] | None = None
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
             replay_graph_walks=replay_graph_walks,
             requires_cfg=requires_cfg,
             labels=labels,
-            compile=compile
+            compile=compile,
+            capture_batch_sizes=capture_batch_sizes
         )
-        self.packed_seq_len_to_inputs = packed_seq_len_to_inputs
+        self.num_token_to_inputs = packed_seq_len_to_inputs
         self.causal_attention = causal_attention
 
     def get_config_type(self) -> CudaGraphConfigType:
         return CudaGraphConfigType.FLASH_INFER_PACKED
+
+    def get_total_tokens(self, bs: int) -> list[int]:
+        return list(self.num_token_to_inputs.keys())

@@ -24,7 +24,7 @@ from torch import nn
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
-from mminf.engine.cuda_graph_config import CudaGraphConfig
+from mminf.engine.cuda_graph_config import BasicBatchedCudaGraphConfig, CudaGraphConfig, CudaGraphConfigType, FlashInferPackedCudaGraphConfig
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
 from mminf.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, ARNodeSubmodule, NodeSubmodule
 from mminf.utils.profiler import range_pop, range_push
@@ -61,14 +61,7 @@ class CudaGraphKey:
     graph_walk: str
     requires_cfg: bool
     bs: int
-    seq_len: int
-
-
-@dataclass(frozen=True)
-class CudaGraphKeyPacked:
-    graph_walk: str
-    requires_cfg: bool
-    total_tokens: int
+    num_tokens: int
 
 
 class CudaGraphRunner:
@@ -139,17 +132,22 @@ class CudaGraphRunner:
         for config in self.capture_configs:
             sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
             for bs in reversed(sizes):
-                for i, inputs in enumerate(config.dummy_capture_inputs):
+                for num_tokens in reversed(sorted(config.get_total_tokens(bs))):
                     key = CudaGraphKey(
                         graph_walk=config.capture_graph_walk,
                         requires_cfg=config.requires_cfg,
-                        bs=bs, seq_len=inputs.input_seq_len
+                        bs=bs, num_tokens=num_tokens
                     )
                     try:
-                        self._capture_one(
-                            key, config, self.submodule,
-                            input_idx=i
-                        )
+                        cfg_type = config.get_config_type() 
+                        if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
+                            self._capture_one_basic_matched(
+                                bs, config, self.submodule
+                            )
+                        elif cfg_type == CudaGraphConfigType.FLASH_INFER_PACKED:
+                            self._capture_one_flashinfer_packed(
+                                key, config, self.submodule,
+                            )
                         logger.info("Captured CUDA graph for %s: %s bs=%d",
                                     self.submodule_name, key, bs)
                     except Exception:
@@ -219,77 +217,246 @@ class CudaGraphRunner:
             )
 
         return plan_states
-
-    def _capture_one(
-        self, key: CudaGraphKey,
-        config: CudaGraphConfig,
-        submodule: ARNodeSubmodule,
-        input_idx: int=0
-    ) -> None:
-        """Capture a single CUDA graph for the given batch size and config."""
-        from mminf.engine.cache_manager import BatchedCacheManager
-
-        cfg = self.kv_cache_config
-        bs = key.bs
-
-        # Create dummy request IDs
+    
+    def _make_dummy_rids(self, config: CudaGraphConfig, bs: int):
         dummy_rids = [f"__cg_{config.capture_graph_walk}_{config.requires_cfg}_{i}__"
                       for i in range(bs)]
 
         # Add dummy requests with all needed labels
         for rid in dummy_rids:
             self.alloc_manager.add_request(rid, labels=config.labels)
+        return dummy_rids
+    
+    def _free_dummy_rids(self, config: CudaGraphConfig, dummy_rids: list[str]):
+        for rid in dummy_rids:
+            for label in config.labels:
+                self.alloc_manager.reset_label(rid, label, free=True)
+    
+    def _clone_template(self, template):
+        if isinstance(template, torch.Tensor):
+            return template.clone()
+        elif isinstance(template, list):
+            return [self._clone_template(t) for t in template]
+        elif isinstance(template, dict):
+            return {k: self._clone_template(v) for k, v in template.items()}
+        else:
+            raise ValueError(f"Unsupported template type: {type(template)}")
+    
+    def _create_cache_mgr_and_dummy_engine_inputs(
+        self, dummy_rids, plan_states,
+        config: CudaGraphConfig
+    ):
+        # Create BatchedCacheManager with CUDA graph plan states
+        cache_manager = BatchedCacheManager(
+            request_ids=dummy_rids,
+            active_labels_per_request={rid: "main" for rid in dummy_rids},
+            kv_cache=self.alloc_manager.kv_cache,
+            alloc_manager=self.alloc_manager,
+            buffer_manager=self.buffer_manager,
+            kv_cache_config=self.kv_cache_config,
+            device=self.device,
+            cuda_graph_plan_states=plan_states,
+            auto_write_store=False
+        )
+        # Build per-request metadata
+        dummy_metadata = {
+            rid: CurrentForwardPassInfo(
+                request_id=rid,
+                graph_walk=config.capture_graph_walk,
+                requires_cfg=config.requires_cfg,
+                fwd_index=0,
+                random_seed=0,
+                max_tokens=1,
+                sampling_config={}
+            ) for rid in dummy_rids
+        }
+
+        return ModelInputsFromEngine(
+            request_ids=dummy_rids,
+            per_request_info=dummy_metadata,
+            cache_manager=cache_manager
+        )
+    
+    def _make_dummy_seq_lens(
+        self, bs: int,
+        total_tokens: int, # total tokens per batch
+    )-> list[int]:
+        # must ensure that the seq lens array sums to total tokens
+        seq_lens = [total_tokens // bs] * bs
+        seq_lens[0] += total_tokens % bs
+        return seq_lens
+    
+    def _postprocess_cuda_graph_output(
+        self, output, config: CudaGraphConfig,
+        key: CudaGraphKey, graph, static_inputs,
+        cache_manager, bs
+    ):
+        # Inspect per-rid output keys once at capture time so sample_and_remap
+        # can skip its per-rid collection loop when only logits are present.
+        # Skip only the __batched_logits__ sentinel — the per-rid entries
+        # (dummy_rids, also "__"-prefixed) ARE what we want to inspect.
+        has_non_logit = False
+        if isinstance(output, dict):
+            for k, v in output.items():
+                if k == "__batched_logits__":
+                    continue
+                if isinstance(v, dict) and any(
+                    out_key != "logits" for out_key in v.keys()
+                ):
+                    has_non_logit = True
+                    break
+        logger.info(
+            "CudaGraphRunner: captured graph %s has_non_logit_outputs=%s",
+            key, has_non_logit,
+        )
+
+        for graph_walk in config.replay_graph_walks:
+            lookup_key = (graph_walk, config.requires_cfg, bs)
+            self.graphs[lookup_key] = CudaGraphData(
+                graph=graph,
+                static_inputs=static_inputs,
+                static_outputs=output,
+                static_cache_manager=cache_manager,
+                config=config,
+                bs=bs,
+                has_non_logit_outputs=has_non_logit,
+            )
+
+        logger.debug("Captured graph %s, output keys: %s", key,
+                        list(output.keys()) if isinstance(output, dict)
+                        else type(output))
+
+    def _capture_one_flashinfer_packed(
+        self, key: CudaGraphKey,
+        config: FlashInferPackedCudaGraphConfig,
+        submodule: ARNodeSubmodule,
+    ):
+        bs = key.bs
+
+        # Create dummy request IDs
+        dummy_rids = self._make_dummy_rids(config, bs)
+        try:
+            # TODO reuse buffers
+            templates = self._clone_template(
+                config.num_token_to_inputs[key.num_tokens]
+            )
+
+            plan_states = self._create_persistent_wrappers(
+                bs, config, total_tokens=key.num_tokens
+            )
+            seq_lens = self._make_dummy_seq_lens(bs, key.num_tokens)
+
+            # manually plan attention
+            def plan_attention():
+                for label in config.labels:
+                    cache_manager.plan_attention(
+                        seq_lens=seq_lens,
+                        is_causal=config.causal_attention,
+                        label=label, write_store=False
+                    )
+                    cache_manager.plan_rope(
+                        seq_lens=seq_lens, label=label
+                    )
+            
+            plan_attention()
+
+            # Create BatchedCacheManager with CUDA graph plan states
+            engine_inputs = self._create_cache_mgr_and_dummy_engine_inputs(
+                dummy_rids=dummy_rids,  plan_states=plan_states, config=config
+            )
+            cache_manager = engine_inputs.cache_manager
+
+            static_input_keys = [
+                k for k, v in templates.items()
+                if isinstance(v, torch.Tensor)
+            ]
+
+            forward = submodule.forward_batched
+            if config.compile:
+                forward = torch.compile(
+                    forward,
+                    mode="max-autotune-no-cudagraphs",
+                    fullgraph=False,
+                    dynamic=False,
+                )                
+
+            def run_forward():
+                return forward(
+                    graph_walk=config.capture_graph_walk,
+                    engine_inputs=engine_inputs,
+                    **templates
+                )
+            
+            torch.cuda.set_device(self.device)
+            # Warmup: 2 forward passes
+            torch.cuda.synchronize()
+            for _ in range(2):
+                with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                    output = run_forward()
+                # Reset seq_lens after warmup passes so capture starts clean
+                for rid in dummy_rids:
+                    for label in config.labels:
+                        state = self.alloc_manager.get_state(rid, label)
+                        state.seq_len = 0
+                        state.position_id_start = 0
+                # Re-plan after reset
+                plan_attention()
+            torch.cuda.synchronize()
+
+            # Capture
+            graph = torch.cuda.CUDAGraph()
+            with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                with torch.cuda.graph(graph, pool=self.memory_pool):
+                    output = run_forward()
+            torch.cuda.synchronize()
+
+            self._postprocess_cuda_graph_output(
+                output=output, config=config, key=key,
+                graph=graph, static_inputs={
+                    "preprocessed": templates,
+                    "static_input_keys": static_input_keys,
+                    "dummy_rids": dummy_rids,
+                    "dummy_metadata": engine_inputs.per_request_info,
+                },
+                cache_manager=cache_manager, bs=bs
+            )
+
+        finally:
+            self._free_dummy_rids(config, dummy_rids)   
+
+
+    def _capture_one_basic_matched(
+        self, key: CudaGraphKey,
+        config: BasicBatchedCudaGraphConfig,
+        submodule: ARNodeSubmodule,
+    ) -> None:
+        """Capture a single CUDA graph for the given batch size and config."""
+        bs = key.bs
+
+        # Create dummy request IDs
+        dummy_rids = self._make_dummy_rids(config, bs)
 
         try:
             # Build dummy per-request inputs via the submodule's own
             # capture-input generator. This lets each submodule declare what
             # dummy tensors its preprocess() needs (e.g., Thinker decode needs
             # a dummy token, Talker decode needs dummy all_codes).
-            capture_templates = config.dummy_capture_inputs
-            if capture_templates is None:
+            template = config.single_request_inputs
+            if template is None:
                 # Submodule opts out of CUDA graphs for this walk.
                 logger.info("%s.get_cuda_graph_capture_inputs returned None, skipping...", self.submodule_name)
                 return
             
-            # Use the first template for each dummy request slot
-            template = capture_templates[input_idx]
             dummy_inputs = [template.clone() for _ in dummy_rids]
 
             plan_states = self._create_persistent_wrappers(
-                bs, config, is_decode=template.input_seq_len==1
+                bs, config, total_tokens=bs * template.input_seq_len
             )
 
-            # Create BatchedCacheManager with CUDA graph plan states
-            cache_manager = BatchedCacheManager(
-                request_ids=dummy_rids,
-                active_labels_per_request={rid: "main" for rid in dummy_rids},
-                kv_cache=self.alloc_manager.kv_cache,
-                alloc_manager=self.alloc_manager,
-                buffer_manager=self.buffer_manager,
-                kv_cache_config=cfg,
-                device=self.device,
-                cuda_graph_plan_states=plan_states,
-                auto_write_store=False
+            engine_inputs = self._create_cache_mgr_and_dummy_engine_inputs(
+                dummy_rids=dummy_rids,  plan_states=plan_states, config=config
             )
-
-            # Build per-request metadata
-            dummy_metadata = {
-                rid: CurrentForwardPassInfo(
-                    request_id=rid,
-                    graph_walk=config.capture_graph_walk,
-                    requires_cfg=config.requires_cfg,
-                    fwd_index=0,
-                    random_seed=0,
-                    max_tokens=1,
-                    sampling_config={}
-                ) for rid in dummy_rids
-            }
-
-            engine_inputs = ModelInputsFromEngine(
-                request_ids=dummy_rids,
-                per_request_info=dummy_metadata,
-                cache_manager=cache_manager
-            )
+            cache_manager = engine_inputs.cache_manager
 
             # Preprocess (plans attention+rope outside graph)
             preprocessed = submodule.preprocess(
@@ -350,52 +517,20 @@ class CudaGraphRunner:
                     output = run_forward()
             torch.cuda.synchronize()
 
-            # Inspect per-rid output keys once at capture time so sample_and_remap
-            # can skip its per-rid collection loop when only logits are present.
-            # Skip only the __batched_logits__ sentinel — the per-rid entries
-            # (dummy_rids, also "__"-prefixed) ARE what we want to inspect.
-            has_non_logit = False
-            if isinstance(output, dict):
-                for k, v in output.items():
-                    if k == "__batched_logits__":
-                        continue
-                    if isinstance(v, dict) and any(
-                        out_key != "logits" for out_key in v.keys()
-                    ):
-                        has_non_logit = True
-                        break
-            logger.info(
-                "CudaGraphRunner: captured graph %s has_non_logit_outputs=%s",
-                key, has_non_logit,
+            self._postprocess_cuda_graph_output(
+                output=output, config=config, key=key,
+                graph=graph, static_inputs={
+                    "preprocessed": preprocessed,
+                    "capture_template": template,
+                    "static_input_keys": static_input_keys,
+                    "dummy_rids": dummy_rids,
+                    "dummy_metadata": engine_inputs.per_request_info,
+                },
+                cache_manager=cache_manager, bs=bs
             )
-
-
-            for graph_walk in config.replay_graph_walks:
-                lookup_key = (graph_walk, config.requires_cfg, bs)
-                self.graphs[lookup_key] = CudaGraphData(
-                    graph=graph,
-                    static_inputs={
-                        "preprocessed": preprocessed,
-                        "static_input_keys": static_input_keys,
-                        "capture_template": template,
-                        "dummy_rids": dummy_rids,
-                        "dummy_metadata": dummy_metadata,
-                    },
-                    static_outputs=output,
-                    static_cache_manager=cache_manager,
-                    config=config,
-                    bs=bs,
-                    has_non_logit_outputs=has_non_logit,
-                )
-
-            logger.debug("Captured graph %s, output keys: %s", key,
-                         list(output.keys()) if isinstance(output, dict)
-                         else type(output))
+           
         finally:
-            # Clean up dummy requests
-            for rid in dummy_rids:
-                for label in config.labels:
-                    self.alloc_manager.reset_label(rid, label, free=True)
+            self._free_dummy_rids(config, dummy_rids)
 
     def can_run(
         self,
@@ -431,7 +566,7 @@ class CudaGraphRunner:
             graph_walk=graph_walk,
             requires_cfg=requires_cfg,
             bs=padded_bs,
-            seq_len=padded_seq_len
+            num_tokens=padded_seq_len
         )
         if key not in self.graphs:
             return
