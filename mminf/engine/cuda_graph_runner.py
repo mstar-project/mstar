@@ -24,8 +24,9 @@ from torch import nn
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
+from mminf.engine.cuda_graph_config import CudaGraphConfig
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
-from mminf.model.submodule_base import ARNodeInputs, CudaGraphConfig, ModelInputsFromEngine, ARNodeSubmodule, NodeSubmodule
+from mminf.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, ARNodeSubmodule, NodeSubmodule
 from mminf.utils.profiler import range_pop, range_push
 from mminf.utils.sampling import Sampler
 
@@ -157,7 +158,8 @@ class CudaGraphRunner:
                             self.submodule_name, key, bs, exc_info=True)
 
     def _create_persistent_wrappers(
-        self, bs: int, config: CudaGraphConfig, is_decode: bool
+        self, bs: int, config: CudaGraphConfig,
+        total_tokens: int
     ) -> dict:
         """Create persistent FlashInfer wrappers for CUDA graph capture.
 
@@ -168,6 +170,8 @@ class CudaGraphRunner:
             FlashInferDecodeWrapper,
             FlashInferPrefillWrapper,
         )
+
+        is_decode = (total_tokens == bs)
 
         cfg = self.kv_cache_config
         # For decode: each request has 1 new token

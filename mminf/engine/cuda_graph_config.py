@@ -1,9 +1,15 @@
 
 from abc import ABC, abstractmethod
+from enum import Enum
 
 import torch
 
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule
+
+
+class CudaGraphConfigType(Enum):
+    BASIC_BATCHED = "basic_batched"
+    FLASH_INFER_PACKED = "flash_infer_packed"
 
 
 class CudaGraphConfig(ABC):
@@ -22,13 +28,8 @@ class CudaGraphConfig(ABC):
         self.compile = compile
     
     @abstractmethod
-    def capture_one(
-        self, device: torch.device,
-        batch_size: int,
-        submodule: ARNodeSubmodule,
-    ):
+    def get_config_type(self) -> CudaGraphConfigType:
         pass
-
 
 
 class BasicBatchedCudaGraphConfig(CudaGraphConfig):
@@ -56,6 +57,9 @@ class BasicBatchedCudaGraphConfig(CudaGraphConfig):
         )
         self.single_request_inputs = single_request_inputs
         self.capture_batch_sizes = capture_batch_sizes
+    
+    def get_config_type(self) -> CudaGraphConfigType:
+        return CudaGraphConfigType.BASIC_BATCHED
 
 
 class FlashInferPackedCudaGraphConfig(CudaGraphConfig):
@@ -78,3 +82,6 @@ class FlashInferPackedCudaGraphConfig(CudaGraphConfig):
         )
         self.packed_seq_len_to_inputs = packed_seq_len_to_inputs
         self.causal_attention = causal_attention
+
+    def get_config_type(self) -> CudaGraphConfigType:
+        return CudaGraphConfigType.FLASH_INFER_PACKED
