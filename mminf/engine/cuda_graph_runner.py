@@ -115,6 +115,24 @@ class CudaGraphRunner:
 
         self.memory_pool = None
 
+        # (config_idx, tensor_key) → max-bucket static buffer. Lazily populated
+        # by _intern_static_buffer on the first capture to touch each key, which
+        # — given warmup_and_capture's largest-first iteration — IS the max
+        # bucket. Smaller-bucket captures slice the leading dim of the same
+        # buffer, so all captures for a (config, key) pair share one allocation
+        # instead of cloning per (bs, num_tokens). See vox-serve's
+        # _initialize_prefill_cuda_graphs (cuda_graph_worker.py:228-373) for
+        # the canonical pattern; the cuda_graph memory_pool + largest-first
+        # capture order keep the slice views' addresses stable across replays.
+        self.shared_static_buffers: dict[tuple[int, str], torch.Tensor] = {}
+        # Sum of bytes that WOULD have been allocated by per-capture clones
+        # (one full tensor per call) — incremented on every _intern_static_buffer
+        # call. Compared against the actual shared-buffer footprint at the end
+        # of warmup_and_capture to surface the Step 5 savings deterministically
+        # (the actual torch.cuda.memory_allocated delta also covers KV cache /
+        # model weights / FlashInfer workspaces, so it's noisier).
+        self._capture_clone_bytes_naive = 0
+
     def warmup_and_capture(self) -> None:
         """Capture graphs for all configs and batch sizes."""
         if self.device is None or not torch.cuda.is_available():
@@ -128,6 +146,7 @@ class CudaGraphRunner:
             return
 
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
+        mem_before = torch.cuda.memory_allocated(self.device)
 
         for config in self.capture_configs:
             sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
@@ -139,7 +158,7 @@ class CudaGraphRunner:
                         bs=bs, num_tokens=num_tokens
                     )
                     try:
-                        cfg_type = config.get_config_type() 
+                        cfg_type = config.get_config_type()
                         if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
                             self._capture_one_basic_matched(
                                 key, config, self.submodule
@@ -154,6 +173,26 @@ class CudaGraphRunner:
                         logger.warning(
                             "Failed to capture CUDA graph for %s: %s bs=%d",
                             self.submodule_name, key, bs, exc_info=True)
+
+        mem_after = torch.cuda.memory_allocated(self.device)
+        shared_bytes = sum(
+            t.numel() * t.element_size() for t in self.shared_static_buffers.values()
+        )
+        # Report both: the deterministic synthetic counter (clean before/after
+        # for the buffer-reuse change in isolation) and the actual GPU delta
+        # (covers FlashInfer wrappers + dummy KV state too, but is noisier).
+        logger.info(
+            "CudaGraphRunner[%s]: warmup_and_capture done. "
+            "shared_static_buffers: %d entries, %.2f MB resident "
+            "(would have been %.2f MB with per-capture clones — saved %.2f MB). "
+            "Total cuda alloc delta during warmup: %.2f MB.",
+            self.submodule_name,
+            len(self.shared_static_buffers),
+            shared_bytes / (1024 ** 2),
+            self._capture_clone_bytes_naive / (1024 ** 2),
+            (self._capture_clone_bytes_naive - shared_bytes) / (1024 ** 2),
+            (mem_after - mem_before) / (1024 ** 2),
+        )
 
     def _create_persistent_wrappers(
         self, bs: int, config: CudaGraphConfig,
@@ -230,15 +269,42 @@ class CudaGraphRunner:
             for label in config.labels:
                 self.alloc_manager.reset_label(rid, label, free=True)
     
-    def _clone_template(self, template):
-        if isinstance(template, torch.Tensor):
-            return template.clone()
-        elif isinstance(template, list):
-            return [self._clone_template(t) for t in template]
-        elif isinstance(template, dict):
-            return {k: self._clone_template(v) for k, v in template.items()}
-        else:
-            raise ValueError(f"Unsupported template type: {type(template)}")
+    def _intern_static_buffer(
+        self, config_idx: int, key: str, value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a leading-dim slice view into the shared buffer for (config_idx, key).
+
+        Allocates the shared buffer at ``value``'s shape on first encounter
+        — relies on ``warmup_and_capture``'s largest-first iteration
+        (``reversed(sizes)`` × ``reversed(sorted(get_total_tokens(bs)))``) so
+        the first capture for each (config_idx, key) is the max bucket.
+        Subsequent captures for the same (config_idx, key) re-slice along the
+        leading dim, sharing the underlying storage so all (bs, num_tokens)
+        buckets cost one max-shape allocation per tensor instead of one full
+        clone per bucket.
+
+        Trailing dims (everything past dim 0) must match between the shared
+        buffer and ``value`` — the bucket varies the leading dim only. A
+        mismatch is a design-level surprise (a tensor whose shape depends on
+        bs in a non-leading way), so we hard-fail with a precise message.
+        """
+        buf_key = (config_idx, key)
+        shared = self.shared_static_buffers.get(buf_key)
+        if shared is None:
+            shared = torch.empty(value.shape, dtype=value.dtype, device=value.device)
+            self.shared_static_buffers[buf_key] = shared
+        self._capture_clone_bytes_naive += value.numel() * value.element_size()
+        leading = value.shape[0]
+        if leading > shared.shape[0] or value.shape[1:] != shared.shape[1:]:
+            raise RuntimeError(
+                f"_intern_static_buffer: capture for key={key!r} (config_idx={config_idx}) "
+                f"requires shape {tuple(value.shape)} but shared buffer is "
+                f"{tuple(shared.shape)} — captures should be ordered largest-first "
+                "by leading dim with matching trailing dims"
+            )
+        sliced = shared[:leading]
+        sliced.copy_(value)
+        return sliced
     
     def _create_cache_mgr_and_dummy_engine_inputs(
         self, dummy_rids, plan_states,
@@ -347,10 +413,13 @@ class CudaGraphRunner:
         # Create dummy request IDs
         dummy_rids = self._make_dummy_rids(config, bs)
         try:
-            # TODO reuse buffers
-            templates = self._clone_template(
-                config.num_token_to_inputs[key.num_tokens]
-            )
+            template_dict = config.num_token_to_inputs[key.num_tokens]
+            config_idx = self.capture_configs.index(config)
+            templates = {
+                k: (self._intern_static_buffer(config_idx, k, v)
+                    if isinstance(v, torch.Tensor) else v)
+                for k, v in template_dict.items()
+            }
 
             plan_states = self._create_persistent_wrappers(
                 bs, config, total_tokens=key.num_tokens
@@ -484,6 +553,19 @@ class CudaGraphRunner:
                 engine_inputs=engine_inputs,
                 inputs=dummy_inputs,
             )
+
+            # Replace each tensor entry with a slice view into a per-(config, key)
+            # shared buffer (Step 5 buffer reuse). Largest-bs capture allocates the
+            # buffer at its preprocess output shape; smaller-bs captures slice into
+            # the same storage. The captured forward sees the slice view, so all
+            # bs buckets for this config share one tensor allocation per key
+            # instead of one full clone each. Non-tensor entries (lists, ints) are
+            # left alone — they're fixed at capture time and don't need a buffer.
+            config_idx = self.capture_configs.index(config)
+            for k in list(preprocessed.keys()):
+                v = preprocessed[k]
+                if isinstance(v, torch.Tensor):
+                    preprocessed[k] = self._intern_static_buffer(config_idx, k, v)
 
             # Static input buffers for ALL tensor inputs in the preprocessed
             # dict. These are the slots that will be overwritten with real
