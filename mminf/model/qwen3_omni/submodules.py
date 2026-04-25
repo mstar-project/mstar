@@ -638,10 +638,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
         """Declare a CUDA graph capture for ``thinker_decode``.
 
-        ``dummy_capture_inputs`` is the PRE-preprocess input (a single
-        dummy token id per rid); the runner calls ``preprocess`` itself to
-        produce the static input buffers (``input_embeds``, ``cos_3d``,
-        ``sin_3d``, etc.).
+        ``single_request_inputs`` is the PRE-preprocess input (a single
+        dummy token id per rid); the runner clones it ``bs`` times and calls
+        ``preprocess`` itself to produce the static input buffers
+        (``input_embeds``, ``cos_3d``, ``sin_3d``, etc.).
 
         ``capture_batch_sizes`` is limited to small buckets since each
         capture allocates persistent FlashInfer wrappers + static buffers
@@ -652,7 +652,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 capture_graph_walk="thinker_decode",
                 requires_cfg=False,
                 labels=["main"],
-                dummy_capture_inputs=[ARNodeInputs(
+                single_request_inputs=ARNodeInputs(
                     input_seq_len=1,
                     input_embeds=torch.zeros(
                         (1, self.config.thinker_hidden_size),
@@ -666,7 +666,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     tensor_inputs={
                         "masks_for_talker": self._get_decode_thinker_mask(device)
                     }
-                )],
+                ),
                 compile=True,
                 capture_batch_sizes=[1, 2, 4, 8, 16],
             )
@@ -1125,15 +1125,15 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
 
     def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
         return [
-            BasicBatchedCudaGraphConfigs(
+            BasicBatchedCudaGraphConfig(
                 capture_graph_walk="talker_decode", requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=[ARNodeInputs(
+                single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(
                         (1, self.config.talker_hidden_size),
                         device=device, dtype=torch.bfloat16
                     ),
                     input_seq_len=1
-                )],
+                ),
                 capture_batch_sizes=[1, 2, 4, 8, 16]
             )
         ]
@@ -1285,7 +1285,7 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="talker_decode",
                 replay_graph_walks=["talker_last_prefill", "talker_decode"],
-                dummy_capture_inputs=[self._get_dummy_inputs(device=device)],
+                single_request_inputs=self._get_dummy_inputs(device=device),
             )
         ]
 
