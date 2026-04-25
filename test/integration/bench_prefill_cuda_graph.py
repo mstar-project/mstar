@@ -122,27 +122,32 @@ def _bring_up_thinker(cache_dir: str | None = None):
 def _make_inputs(
     bs: int,
     total_tokens: int,
-    hidden_size: int,
+    submodule,
     device: torch.device,
     seed: int = 0,
 ) -> tuple[list[str], list[ARNodeInputs]]:
     """Build bs ARNodeInputs whose seq_lens sum to total_tokens.
 
-    total_tokens matches CudaGraphKey.num_tokens semantics (total across the
-    batch — set by FlashInferPackedCudaGraphConfig.get_total_tokens). Splits
-    evenly with the remainder on the last request.
+    Embeds via embed_tokens on random in-vocab token IDs (kept in [0, 10000)
+    to avoid special tokens). Realistic-magnitude embeds keep timings
+    representative — torch.randn N(0, 1) embeds saturate non-linearities
+    and aren't what the model would see in production.
     """
     g = torch.Generator(device=device).manual_seed(seed)
     request_ids = [f"req_{uuid.uuid4().hex[:8]}" for _ in range(bs)]
     base = total_tokens // bs
     seq_lens = [base] * bs
     seq_lens[-1] += total_tokens - sum(seq_lens)
+    safe_vocab_max = 10000
+    embed_layer = submodule.model.model.embed_tokens
     inputs: list[ARNodeInputs] = []
     for sl in seq_lens:
-        embeds = torch.randn(
-            (sl, hidden_size),
-            dtype=torch.bfloat16, device=device, generator=g,
+        token_ids = torch.randint(
+            0, safe_vocab_max, (sl,),
+            dtype=torch.long, device=device, generator=g,
         )
+        with torch.no_grad():
+            embeds = embed_layer(token_ids).to(torch.bfloat16)
         pos_ids = torch.arange(
             sl, dtype=torch.float, device=device,
         ).unsqueeze(0).expand(3, -1).contiguous()
@@ -180,7 +185,6 @@ def _time_eager_one(
     submodule,
     bs: int,
     total_tokens: int,
-    hidden_size: int,
     device: torch.device,
 ) -> float:
     """One timed eager prefill — per-rid sequential, the production path.
@@ -189,7 +193,7 @@ def _time_eager_one(
     qo_indptr_buf). _execute_sequential calls submodule.forward in a per-rid
     loop for prefill_text; we mirror that.
     """
-    rids, inputs = _make_inputs(bs, total_tokens, hidden_size, device, seed=0)
+    rids, inputs = _make_inputs(bs, total_tokens, submodule, device, seed=0)
     per_info = _make_per_request_info(rids)
     for rid in rids:
         engine.add_request(rid, ["main"])
@@ -228,10 +232,9 @@ def _time_graph_one(
     submodule,
     bs: int,
     total_tokens: int,
-    hidden_size: int,
     device: torch.device,
 ) -> float:
-    rids, inputs = _make_inputs(bs, total_tokens, hidden_size, device, seed=0)
+    rids, inputs = _make_inputs(bs, total_tokens, submodule, device, seed=0)
     per_info = _make_per_request_info(rids)
     for rid in rids:
         engine.add_request(rid, ["main"])
@@ -273,7 +276,6 @@ def _bench_bucket(
     submodule,
     bs: int,
     total_tokens: int,
-    hidden_size: int,
     device: torch.device,
     num_warmup: int,
     num_iters: int,
@@ -292,15 +294,15 @@ def _bench_bucket(
         return {"bs": bs, "total_tokens": total_tokens, "error": "no captured graph"}
 
     for _ in range(num_warmup):
-        _time_eager_one(engine, submodule, bs, total_tokens, hidden_size, device)
-        _time_graph_one(engine, runner, submodule, bs, total_tokens, hidden_size, device)
+        _time_eager_one(engine, submodule, bs, total_tokens, device)
+        _time_graph_one(engine, runner, submodule, bs, total_tokens, device)
 
     eager_times = [
-        _time_eager_one(engine, submodule, bs, total_tokens, hidden_size, device) * 1000
+        _time_eager_one(engine, submodule, bs, total_tokens, device) * 1000
         for _ in range(num_iters)
     ]
     graph_times = [
-        _time_graph_one(engine, runner, submodule, bs, total_tokens, hidden_size, device) * 1000
+        _time_graph_one(engine, runner, submodule, bs, total_tokens, device) * 1000
         for _ in range(num_iters)
     ]
     eager_med = statistics.median(eager_times)
@@ -366,7 +368,6 @@ def main() -> None:
 
     print(f"Bringing up Qwen3-Omni Thinker (this may take ~30-60s + ~50s capture)...")
     engine, runner, submodule, device = _bring_up_thinker(cache_dir)
-    hidden_size = submodule.config.thinker_hidden_size
     print(f"Ready. {len(runner.graphs)} captured graphs.")
 
     results: list[dict] = []
@@ -374,7 +375,7 @@ def main() -> None:
         for tt in args.total_tokens_list:
             print(f"  benchmarking bs={bs} total_tokens={tt} ...", flush=True)
             results.append(_bench_bucket(
-                engine, runner, submodule, bs, tt, hidden_size, device,
+                engine, runner, submodule, bs, tt, device,
                 num_warmup=args.num_warmup, num_iters=args.num_iters,
             ))
 
