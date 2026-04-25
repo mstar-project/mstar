@@ -334,6 +334,14 @@ class CudaGraphRunner:
         config: FlashInferPackedCudaGraphConfig,
         submodule: ARNodeSubmodule,
     ):
+        """Capture one prefill graph for (bs, num_tokens) bucket.
+
+        submodule.preprocess is NOT called at capture: config.num_token_to_inputs[num_tokens]
+        is the packed input already in the format forward_batched expects post-preprocess.
+        The runner plans FlashInfer attention/RoPE itself with synthetic seq_lens and
+        captures forward_batched directly. At replay (_run_flashinfer_packed), preprocess IS
+        called on real per-request inputs to fill the static buffers.
+        """
         bs = key.bs
 
         # Create dummy request IDs
@@ -349,6 +357,12 @@ class CudaGraphRunner:
             )
             seq_lens = self._make_dummy_seq_lens(bs, key.num_tokens)
 
+            # Build cache manager FIRST so plan_attention can close over it.
+            engine_inputs = self._create_cache_mgr_and_dummy_engine_inputs(
+                dummy_rids=dummy_rids,  plan_states=plan_states, config=config
+            )
+            cache_manager = engine_inputs.cache_manager
+
             # manually plan attention
             def plan_attention():
                 for label in config.labels:
@@ -360,14 +374,8 @@ class CudaGraphRunner:
                     cache_manager.plan_rope(
                         seq_lens=seq_lens, label=label
                     )
-            
-            plan_attention()
 
-            # Create BatchedCacheManager with CUDA graph plan states
-            engine_inputs = self._create_cache_mgr_and_dummy_engine_inputs(
-                dummy_rids=dummy_rids,  plan_states=plan_states, config=config
-            )
-            cache_manager = engine_inputs.cache_manager
+            plan_attention()
 
             static_input_keys = [
                 k for k, v in templates.items()
@@ -433,7 +441,13 @@ class CudaGraphRunner:
         config: BasicBatchedCudaGraphConfig,
         submodule: ARNodeSubmodule,
     ) -> None:
-        """Capture a single CUDA graph for the given batch size and config."""
+        """Capture one decode graph for (bs, single_request_inputs.input_seq_len * bs) bucket.
+
+        submodule.preprocess IS called at capture with bs cloned single_request_inputs;
+        its output gets captured as static buffers. This is the only path where preprocess
+        logic (including plan_attention/plan_rope) runs inside the captured region — at
+        replay those are re-planned outside the graph.
+        """
         bs = key.bs
 
         # Create dummy request IDs
