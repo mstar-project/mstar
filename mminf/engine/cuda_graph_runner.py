@@ -309,7 +309,12 @@ class CudaGraphRunner:
         )
 
         for graph_walk in config.replay_graph_walks:
-            lookup_key = (graph_walk, config.requires_cfg, bs)
+            lookup_key = CudaGraphKey(
+                graph_walk=graph_walk,
+                requires_cfg=config.requires_cfg,
+                bs=bs,
+                num_tokens=key.num_tokens,
+            )
             self.graphs[lookup_key] = CudaGraphData(
                 graph=graph,
                 static_inputs=static_inputs,
@@ -536,41 +541,42 @@ class CudaGraphRunner:
     def can_run(
         self,
         batch_size: int,
-        max_seq_len: int,
+        num_tokens: int,
         graph_walk: str = "decode",
         requires_cfg: bool = False,
     ) -> bool:
         """Check if a captured graph exists for this configuration."""
         return self._get_key_for(
-            batch_size,  max_seq_len,
-            graph_walk, requires_cfg
+            batch_size, num_tokens,
+            graph_walk, requires_cfg,
         ) is not None
     
     def _get_key_for(
         self,
         batch_size: int,
-        total_seq_len: int,
+        num_tokens: int,
         graph_walk: str = "decode",
-        requires_cfg: bool = False, 
+        requires_cfg: bool = False,
     ) -> CudaGraphKey | None:
         if not self.graphs:
-            return
+            return None
         config = self._config_for(graph_walk, requires_cfg)
+        if config is None:
+            return None
         padded_bs = self._get_padded_batch_size(batch_size, config)
         if padded_bs is None:
             return None
-        padded_seq_len = self._get_padded_seq_len(total_seq_len, config)
-        if padded_seq_len is None:
+        padded_num_tokens = self._get_padded_num_tokens(num_tokens, padded_bs, config)
+        if padded_num_tokens is None:
             return None
-        
+
         key = CudaGraphKey(
             graph_walk=graph_walk,
             requires_cfg=requires_cfg,
             bs=padded_bs,
-            num_tokens=padded_seq_len
+            num_tokens=padded_num_tokens,
         )
-        if key not in self.graphs:
-            return
+        return key if key in self.graphs else None
 
     def _config_for(self, graph_walk: str, requires_cfg: bool) -> CudaGraphConfig | None:
         for cfg in self.capture_configs:
@@ -590,14 +596,15 @@ class CudaGraphRunner:
             return None
         return sizes[idx]
     
-    def _get_padded_seq_len(
+    def _get_padded_num_tokens(
         self,
-        seq_len: int,
+        num_tokens: int,
+        padded_bs: int,
         config: CudaGraphConfig,
     ) -> int | None:
-        """Find smallest captured batch size >= batch_size for this config."""
-        sizes = [inp.input_seq_len for inp in config.dummy_capture_inputs]
-        idx = bisect.bisect_left(sizes, seq_len)
+        """Find smallest captured token-count >= num_tokens for this config and bs."""
+        sizes = sorted(config.get_total_tokens(padded_bs))
+        idx = bisect.bisect_left(sizes, num_tokens)
         if idx >= len(sizes):
             return None
         return sizes[idx]
