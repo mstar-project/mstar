@@ -374,8 +374,10 @@ class AREngine(BaseEngine):
             batch.per_request_info[rid].requires_cfg
             for rid in batch.request_ids
         )
+        num_tokens = sum(inp.input_seq_len for inp in inputs)
         return runner.can_run(
             batch_size=len(batch.request_ids),
+            num_tokens=num_tokens,
             graph_walk=batch.graph_walk,
             requires_cfg=has_cfg,
         )
