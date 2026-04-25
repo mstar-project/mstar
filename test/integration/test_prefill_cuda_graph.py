@@ -89,6 +89,9 @@ class _StubTransferEngine:
         self.registered.append((ptr, nbytes))
         return 0
 
+    def unregister_memory(self, ptr: int) -> int:  # noqa: ARG002
+        return 0
+
     def get_async_reader(self, device):  # noqa: ARG002
         return None
 
@@ -170,38 +173,44 @@ def thinker_engine_with_runner():
 
 def _make_inputs(
     bs: int,
-    num_tokens: int,
+    total_tokens: int,
     hidden_size: int,
     device: torch.device,
     seed: int,
 ) -> tuple[list[str], list[ARNodeInputs]]:
-    """Build bs ARNodeInputs of length num_tokens each, with random bf16 embeds.
+    """Build bs ARNodeInputs whose seq_lens sum to total_tokens.
 
-    Uses a torch.Generator seeded deterministically so eager and graph paths
-    can rebuild the same inputs independently and compare bit-for-bit.
-    Per-request rids are fresh uuids so the alloc_manager treats each test
-    invocation as new requests with fresh KV pages.
+    CudaGraphKey.num_tokens is the TOTAL across the batch — set by
+    FlashInferPackedCudaGraphConfig.get_total_tokens which returns the
+    keys of packed_seq_len_to_inputs, the captured token-bucket dict.
+    Splitting total_tokens evenly across bs requests (with remainder on
+    the last) keeps the test inputs lined up with what was captured.
+    Random bf16 embeds via a seeded generator so eager and graph paths
+    rebuild the same inputs independently.
     """
     g = torch.Generator(device=device).manual_seed(seed)
     request_ids = [f"req_{uuid.uuid4().hex[:8]}" for _ in range(bs)]
+    base = total_tokens // bs
+    seq_lens = [base] * bs
+    seq_lens[-1] += total_tokens - sum(seq_lens)
     inputs: list[ARNodeInputs] = []
-    for _ in range(bs):
+    for sl in seq_lens:
         embeds = torch.randn(
-            (num_tokens, hidden_size),
+            (sl, hidden_size),
             dtype=torch.bfloat16, device=device, generator=g,
         )
-        # 3-row position grid (temporal/h/w) using sequential integers — same
-        # shape ThinkerSubmodule.prepare_inputs builds via get_rope_index_text.
+        # 3-row position grid (temporal/h/w) — same shape ThinkerSubmodule.
+        # prepare_inputs builds via get_rope_index_text on a text prefill.
         pos_ids = torch.arange(
-            num_tokens, dtype=torch.float, device=device,
+            sl, dtype=torch.float, device=device,
         ).unsqueeze(0).expand(3, -1).contiguous()
         # masks_for_talker: simple text-only (multimodal row=0, text row=1).
         masks = torch.stack([
-            torch.zeros(num_tokens, dtype=torch.bool, device=device),
-            torch.ones(num_tokens, dtype=torch.bool, device=device),
+            torch.zeros(sl, dtype=torch.bool, device=device),
+            torch.ones(sl, dtype=torch.bool, device=device),
         ])
         inputs.append(ARNodeInputs(
-            input_seq_len=num_tokens,
+            input_seq_len=sl,
             input_embeds=embeds,
             custom_pos_ids=pos_ids,
             tensor_inputs={"masks_for_talker": masks},
@@ -225,36 +234,53 @@ def _make_per_request_info(request_ids: list[str]) -> dict[str, CurrentForwardPa
     }
 
 
-def _run_eager_forward_batched(
+def _run_eager_per_rid(
     engine: AREngine,
     submodule,
     request_ids: list[str],
     inputs: list[ARNodeInputs],
     per_request_info: dict[str, CurrentForwardPassInfo],
-) -> dict:
-    """Run prefill_text through forward_batched directly, bypassing the engine.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-rid sequential eager prefill — the production eager path.
 
-    Returns the raw forward_batched output (`__batched_logits__` and
-    `__batched_thinker_states__` sentinels) without sampling or remapping.
+    AREngine._execute_sequential calls submodule.forward in a per-rid loop
+    for prefill_text (can_batch returns False for that walk). We can't use
+    forward_batched here: it asserts cache_manager.get_qo_indptr_buf("main")
+    is non-None, which only holds for the runner's static cache manager.
+    A fresh BatchedCacheManager from _create_cache_manager has no CUDA-graph
+    wrapper attached, so the assert fires before any model code runs.
+
+    Returns (concatenated last-token logits (bs, V), concatenated thinker_states
+    (total_tokens, 2*hidden)) — same shapes the graph path emits via the
+    __batched_logits__ + __batched_thinker_states__ sentinels.
     """
-    cache_mgr = engine._create_cache_manager(request_ids, "Thinker")
-    engine_inputs = ModelInputsFromEngine(
-        request_ids=request_ids,
-        per_request_info=per_request_info,
-        cache_manager=cache_mgr,
+    logits_chunks: list[torch.Tensor] = []
+    states_chunks: list[torch.Tensor] = []
+    for rid, inp in zip(request_ids, inputs, strict=True):
+        cache_mgr = engine._create_cache_manager([rid], "Thinker")
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=[rid],
+            per_request_info={rid: per_request_info[rid]},
+            cache_manager=cache_mgr,
+        )
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                preprocessed = submodule.preprocess(
+                    graph_walk="prefill_text",
+                    engine_inputs=engine_inputs,
+                    inputs=[inp],
+                )
+                out = submodule.forward(
+                    graph_walk="prefill_text",
+                    engine_inputs=engine_inputs,
+                    **preprocessed,
+                )
+        logits_chunks.append(out["logits"][0])           # (1, V)
+        states_chunks.append(out["thinker_states"][0])   # (seq_len, 2*hidden)
+    return (
+        torch.cat(logits_chunks, dim=0),                 # (bs, V)
+        torch.cat(states_chunks, dim=0),                 # (total_tokens, 2*hidden)
     )
-    with torch.no_grad():
-        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-            preprocessed = submodule.preprocess(
-                graph_walk="prefill_text",
-                engine_inputs=engine_inputs,
-                inputs=inputs,
-            )
-            return submodule.forward_batched(
-                graph_walk="prefill_text",
-                engine_inputs=engine_inputs,
-                **preprocessed,
-            )
 
 
 def _rel_err(actual: torch.Tensor, ref: torch.Tensor) -> float:
@@ -262,14 +288,18 @@ def _rel_err(actual: torch.Tensor, ref: torch.Tensor) -> float:
     return ((actual - ref).abs() / (ref.abs() + 1e-6)).max().item()
 
 
-@pytest.mark.parametrize("num_tokens", [128, 256, 512, 1024, 2048])
+@pytest.mark.parametrize("total_tokens", [128, 256, 512, 1024, 2048])
 @pytest.mark.parametrize("bs", [1, 2, 4])
 def test_thinker_prefill_text_graph_matches_eager(
-    thinker_engine_with_runner, bs: int, num_tokens: int,
+    thinker_engine_with_runner, bs: int, total_tokens: int,
 ):
-    """Eager forward_batched and CUDA-graph replay should produce matching
-    ``__batched_logits__`` and ``__batched_thinker_states__`` within bf16
-    tolerance (≤ 1e-2 relative on logits per plan §6.2).
+    """Per-rid sequential eager prefill and CUDA-graph replay should produce
+    matching last-token logits and thinker_states within bf16 tolerance
+    (≤ 1e-2 relative on logits per plan §6.2).
+
+    ``total_tokens`` is the sum across the batch (matches CudaGraphKey.num_tokens
+    semantics — see _make_inputs). For each captured (bs, total_tokens) bucket
+    the test distributes total_tokens evenly across bs requests.
     """
     engine, runner, submodule = thinker_engine_with_runner
     device = engine.device
@@ -279,13 +309,12 @@ def test_thinker_prefill_text_graph_matches_eager(
         graph_walk="prefill_text",
         requires_cfg=False,
         bs=bs,
-        num_tokens=num_tokens,
+        num_tokens=total_tokens,
     )
     assert key in runner.graphs, f"capture missing for {key}; available: {list(runner.graphs)}"
 
-    eager_rids, eager_inputs = _make_inputs(bs, num_tokens, hidden_size, device, seed=0)
-    graph_rids, graph_inputs = _make_inputs(bs, num_tokens, hidden_size, device, seed=0)
-    # Sanity: both sides built identical embeds from the same seed.
+    eager_rids, eager_inputs = _make_inputs(bs, total_tokens, hidden_size, device, seed=0)
+    graph_rids, graph_inputs = _make_inputs(bs, total_tokens, hidden_size, device, seed=0)
     for ei, gi in zip(eager_inputs, graph_inputs, strict=True):
         assert torch.equal(ei.input_embeds, gi.input_embeds)
 
@@ -293,11 +322,9 @@ def test_thinker_prefill_text_graph_matches_eager(
         engine.add_request(rid, ["main"])
     try:
         eager_per_info = _make_per_request_info(eager_rids)
-        eager_out = _run_eager_forward_batched(
+        eager_logits, eager_states = _run_eager_per_rid(
             engine, submodule, eager_rids, eager_inputs, eager_per_info,
         )
-        eager_logits = eager_out["__batched_logits__"]                 # (bs, V)
-        eager_states = eager_out["__batched_thinker_states__"]         # (bs*num_tokens, 2*hidden)
 
         graph_per_info = _make_per_request_info(graph_rids)
         with torch.no_grad():
@@ -314,7 +341,7 @@ def test_thinker_prefill_text_graph_matches_eager(
         # them but doesn't overwrite, so they hold the raw replay outputs.
         graph_data = runner.graphs[key]
         graph_logits = graph_data.static_outputs["__batched_logits__"][:bs]
-        graph_states = graph_data.static_outputs["__batched_thinker_states__"][:bs * num_tokens]
+        graph_states = graph_data.static_outputs["__batched_thinker_states__"][:total_tokens]
 
         assert eager_logits.shape == graph_logits.shape, (
             f"logits shape mismatch: eager {tuple(eager_logits.shape)} "
@@ -330,7 +357,7 @@ def test_thinker_prefill_text_graph_matches_eager(
         states_max_abs = (eager_states - graph_states).abs().max().item()
         states_rel = _rel_err(graph_states, eager_states)
         print(
-            f"\nbs={bs} num_tokens={num_tokens}: "
+            f"\nbs={bs} total_tokens={total_tokens}: "
             f"logits max_abs={logits_max_abs:.4e} rel={logits_rel:.4e}; "
             f"thinker_states max_abs={states_max_abs:.4e} rel={states_rel:.4e}"
         )
@@ -346,14 +373,17 @@ def test_thinker_prefill_text_graph_matches_eager(
             engine.remove_request(rid)
 
 
-@pytest.mark.parametrize("num_tokens", [128, 1024])
+@pytest.mark.parametrize("total_tokens", [128, 1024])
 @pytest.mark.parametrize("bs", [1, 4])
 def test_thinker_prefill_text_graph_replay_is_deterministic(
-    thinker_engine_with_runner, bs: int, num_tokens: int,
+    thinker_engine_with_runner, bs: int, total_tokens: int,
 ):
     """Three replays of the same captured graph with identical inputs should
     produce bit-identical outputs. Sanity check that the runner's state-swap
     logic doesn't introduce drift across calls.
+
+    ``total_tokens`` is the sum across the batch — same semantics as the
+    parity test above, matching CudaGraphKey.num_tokens.
     """
     engine, runner, submodule = thinker_engine_with_runner
     device = engine.device
@@ -362,13 +392,13 @@ def test_thinker_prefill_text_graph_replay_is_deterministic(
         graph_walk="prefill_text",
         requires_cfg=False,
         bs=bs,
-        num_tokens=num_tokens,
+        num_tokens=total_tokens,
     )
     assert key in runner.graphs
 
     snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
     for _ in range(3):
-        rids, inputs = _make_inputs(bs, num_tokens, hidden_size, device, seed=0)
+        rids, inputs = _make_inputs(bs, total_tokens, hidden_size, device, seed=0)
         per_info = _make_per_request_info(rids)
         for rid in rids:
             engine.add_request(rid, ["main"])
@@ -386,7 +416,7 @@ def test_thinker_prefill_text_graph_replay_is_deterministic(
             graph_data = runner.graphs[key]
             snapshots.append((
                 graph_data.static_outputs["__batched_logits__"][:bs].clone(),
-                graph_data.static_outputs["__batched_thinker_states__"][:bs * num_tokens].clone(),
+                graph_data.static_outputs["__batched_thinker_states__"][:total_tokens].clone(),
             ))
         finally:
             for rid in rids:
