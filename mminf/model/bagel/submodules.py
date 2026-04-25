@@ -16,6 +16,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
+from mminf.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
 from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import (
@@ -390,12 +391,50 @@ class LLMSubmodule(ARNodeSubmodule):
 
         return tensor_inputs
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
+    PREFILL_TEXT_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
+    PREFILL_TEXT_CAPTURE_BATCH_SIZES = [1, 2, 4]
+
+    def _build_prefill_text_packed(
+        self, num_tokens: int, device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Synthesize a tensor-only post-preprocess packed dict for prefill_text capture.
+
+        BAGEL's ``preprocess`` for prefill_text returns a dict whose only
+        capture-relevant tensor is the packed ``input_ids`` (long); the
+        rest (``seq_lens``, ``requires_cfg``, ``input_seq_len``) are
+        non-tensor entries the runner doesn't intern. ``_forward_prefill_text``
+        embeds and forwards inside the captured region.
+        """
+        return {
+            "input_ids": torch.zeros(
+                (num_tokens,), dtype=torch.long, device=device,
+            ),
+        }
+
+    def get_cuda_graph_configs(
+        self, device: torch.device,
+    ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
+        """Declare CUDA graph captures for ``decode`` (cfg-off + cfg-on) and ``prefill_text`` (cfg-off only).
+
+        cfg-on prefill_text is intentionally NOT captured. BAGEL's
+        ``preprocess`` for prefill_text+cfg calls
+        ``cache_handle.snapshot_all("main", "cfg_text")`` which writes to
+        the cache_manager's ``request_ids`` (= ``dummy_rids`` at replay).
+        ``cfg_text`` is not in ``config.labels`` (only ``main`` + ``cfg_img``
+        get FlashInfer wrappers), so the runner's state-swap doesn't alias
+        it onto the real request and the snapshot lands on the dummy slot.
+        cfg-on prefill_text continues to use the eager path; downstream
+        image_gen / decode+cfg captures are unaffected (they don't depend
+        on this capture's snapshot semantics).
+        """
         dummy = ARNodeInputs(
             input_ids=torch.zeros(1, dtype=torch.long, device=device),
             input_seq_len=1
         )
-        
+        prefill_text_packed = {
+            num_tokens: self._build_prefill_text_packed(num_tokens, device)
+            for num_tokens in self.PREFILL_TEXT_TOKEN_BUCKETS
+        }
         return [
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=False, labels=["main"],
@@ -404,6 +443,16 @@ class LLMSubmodule(ARNodeSubmodule):
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=True, labels=["main", "cfg_img"],
                 single_request_inputs=dummy.clone(),
+            ),
+            FlashInferPackedCudaGraphConfig(
+                capture_graph_walk="prefill_text",
+                replay_graph_walks=["prefill_text"],
+                packed_seq_len_to_inputs=prefill_text_packed,
+                requires_cfg=False,
+                labels=["main"],
+                compile=True,
+                causal_attention=True,
+                capture_batch_sizes=self.PREFILL_TEXT_CAPTURE_BATCH_SIZES,
             ),
         ]
 
@@ -1027,7 +1076,14 @@ class LLMSubmodule(ARNodeSubmodule):
                 requires_cfg=requires_cfg,
                 **kwargs
             ) # prefill is the same batched and unbatched
-            return {rid: [] for rid in request_ids}
+            # Empty top-level dict (NOT ``{rid: []}``): prefill_text only
+            # populates the KV cache, no per-rid outputs. The runner's
+            # ``_sample_and_remap`` slow path falls through to
+            # ``outputs[rid] = {}`` for each rid when no ``__batched_logits__``
+            # sentinel is present and no dummy_rid keys exist in static_output;
+            # ``{rid: []}`` would AttributeError on ``[].items()`` in the
+            # per-rid collection loop.
+            return {}
         else:
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
 
