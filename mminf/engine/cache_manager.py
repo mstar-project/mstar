@@ -111,6 +111,20 @@ class BatchedCacheManager:
     def set_layer_idx(self, layer_idx: int):
         self.layer_idx = layer_idx
 
+    @torch.compiler.disable
+    def get_qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
+        """Return the persistent qo_indptr static buffer for a CUDA-graph
+        prefill wrapper, or None if not in CUDA-graph mode / wrong wrapper.
+
+        Captured prefill paths read this to recover per-request token boundaries
+        from inside the captured region — plan_attention updates the buffer via
+        .copy_() outside the graph, so the address stays stable across replay.
+        """
+        ps = self._plan_states.get(label)
+        if ps is None or ps.wrapper is None:
+            return None
+        return getattr(ps.wrapper, "_qo_indptr_buf", None)
+
     def plan_attention(
         self,
         seq_lens: list[int] | None = None,
