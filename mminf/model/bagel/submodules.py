@@ -399,11 +399,11 @@ class LLMSubmodule(ARNodeSubmodule):
         return [
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=[dummy.clone()],
+                single_request_inputs=dummy.clone(),
             ),
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=True, labels=["main", "cfg_img"],
-                dummy_capture_inputs=[dummy.clone()],
+                single_request_inputs=dummy.clone(),
             ),
         ]
 
