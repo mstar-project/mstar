@@ -633,22 +633,61 @@ class CudaGraphRunner:
         per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: ARNodeSubmodule,
     ) -> dict:
-        """Run using a captured CUDA graph.
+        """Look up the matching captured graph and dispatch on config type.
 
-        Steps:
-        1. Look up the right graph by (graph_walk, requires_cfg, padded_bs)
-        2. Add real requests temporarily, re-plan wrappers with real pages
-        3. Copy real input embeddings into static buffers
-        4. graph.replay()
-        5. advance_seq_lens on real request states (not captured)
-        6. Clone outputs and remap dummy -> real request IDs
-        7. Clean up temporary request states
+        BasicBatched (decode-style): submodule.preprocess re-plans attention/rope
+        and produces packed tensors written into static buffers — same call that
+        was captured. FlashInferPacked (vox-serve-style prefill): submodule.preprocess
+        packs real per-request inputs (with synthetic zero-length padding for empty
+        slots) into the static buffers; trailing static-buffer slots beyond
+        real_num_tokens keep capture-time contents (FlashInfer's qo_indptr-based
+        attention skips them).
         """
-        batch_size = len(request_ids)
-        padded_bs = self._get_padded_batch_size(batch_size, graph_walk, requires_cfg)
-        key = (graph_walk, requires_cfg, padded_bs)
+        real_bs = len(request_ids)
+        real_num_tokens = sum(inp.input_seq_len for inp in inputs)
+
+        key = self._get_key_for(
+            batch_size=real_bs,
+            num_tokens=real_num_tokens,
+            graph_walk=graph_walk,
+            requires_cfg=requires_cfg,
+        )
+        if key is None:
+            raise RuntimeError(
+                f"No captured graph for walk={graph_walk!r}, requires_cfg={requires_cfg}, "
+                f"bs={real_bs}, num_tokens={real_num_tokens} — _can_use_cuda_graph "
+                "should have rejected this batch upstream."
+            )
 
         graph_data: CudaGraphData = self.graphs[key]
+        cfg_type = graph_data.config.get_config_type()
+        if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
+            return self._run_basic_matched(
+                key, graph_data, request_ids, inputs, per_request_info, submodule,
+            )
+        if cfg_type == CudaGraphConfigType.FLASH_INFER_PACKED:
+            return self._run_flashinfer_packed(
+                key, graph_data, request_ids, inputs, per_request_info, submodule,
+            )
+        raise ValueError(f"Unknown CudaGraphConfigType: {cfg_type}")
+
+    def _run_basic_matched(
+        self,
+        key: CudaGraphKey,
+        graph_data: CudaGraphData,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        submodule: ARNodeSubmodule,
+    ) -> dict:
+        """Decode-style replay. Pads real inputs to padded_bs by cloning the capture
+        template, then routes through submodule.preprocess (which re-plans attention
+        and RoPE on the static cache manager) and copies the resulting packed tensors
+        into the static buffers before replay.
+        """
+        real_bs = len(request_ids)
+        padded_bs = key.bs
+
         graph = graph_data.graph
         static = graph_data.static_inputs
         static_cm = graph_data.static_cache_manager
@@ -660,10 +699,9 @@ class CudaGraphRunner:
         capture_template = static["capture_template"]
         config_labels = graph_data.config.labels
 
-        # --- Step 1: Set up real request states on dummy request IDs ---
+        # --- Step 1: Swap real request states onto dummy slots ---
         if self.enable_nvtx:
             range_push("cg.swap_states", synchronize=True)
-        # Save the dummy states, swap in real request states
         for i, rid in enumerate(request_ids):
             dummy_rid = dummy_rids[i]
             for label in config_labels:
@@ -672,61 +710,48 @@ class CudaGraphRunner:
                 self.alloc_manager.get_state(dummy_rid, label)
                 self.alloc_manager.request_states[dummy_rid][label] = real_state
 
-        # For padding slots (i >= batch_size), ensure dummy states exist
-        for i in range(batch_size, padded_bs):
+        # For padding slots (i >= real_bs), ensure dummy states exist
+        for i in range(real_bs, padded_bs):
             dummy_rid = dummy_rids[i]
             for label in config_labels:
-                # makes state if it doesn't exist
                 self.alloc_manager.get_state(dummy_rid, label)
         if self.enable_nvtx:
             range_pop(synchronize=True)
 
-        # --- Step 2: Re-plan with real page tables (outside graph) ---
+        # --- Step 2: Pad inputs to padded_bs and re-plan via preprocess ---
         if self.enable_nvtx:
             range_push("cg.preprocess_replan", synchronize=True)
-        # Build real per-request inputs for the real slots
-        real_inputs = inputs[:]
-        # Pad with dummy inputs for remaining slots using the same capture
-        # template that was used during capture. This ensures submodule.preprocess
-        # doesn't crash on empty lists for any input key the submodule expects.
-        for _i in range(batch_size, padded_bs):
+        real_inputs = list(inputs)
+        # Padding slots reuse the capture_template so submodule.preprocess sees the
+        # same input shape it saw at capture time and doesn't crash on missing keys.
+        for _i in range(real_bs, padded_bs):
             real_inputs.append(capture_template.clone())
 
-        # Update metadata for real requests
-        real_metadata = {}
-        for i, dummy_rid in enumerate(dummy_rids):
-            if i < batch_size:
-                real_metadata[dummy_rid] = per_request_info[request_ids[i]]
-            else:
-                real_metadata[dummy_rid] = static["dummy_metadata"][dummy_rid]
-        
+        real_metadata = self._build_replay_metadata(
+            dummy_rids, request_ids, real_bs,
+            per_request_info, static["dummy_metadata"],
+        )
         engine_inputs = ModelInputsFromEngine(
             request_ids=dummy_rids,
             per_request_info=real_metadata,
-            cache_manager=static_cm
+            cache_manager=static_cm,
         )
-
-        # Preprocess re-plans attention+rope with real page tables
         real_inputs = submodule.preprocess(
-            graph_walk=graph_walk,
+            graph_walk=key.graph_walk,
             engine_inputs=engine_inputs,
             inputs=real_inputs,
         )
         if self.enable_nvtx:
             range_pop(synchronize=True)
 
-        # --- Step 3: Copy real tensor inputs into static buffers ---
-        # The static buffers were captured from the output of preprocess() at
-        # capture time. At runtime, preprocess() produces fresh tensors for the
-        # real inputs; we copy each tensor field into its corresponding static
-        # buffer so the CUDA graph's captured pointers see the new data.
+        # --- Step 3: Copy real packed tensors into static buffers ---
         if self.enable_nvtx:
             range_push("cg.copy_inputs", synchronize=True)
-        for key in static_input_keys:
-            real_val = real_inputs.get(key)
+        for k in static_input_keys:
+            real_val = real_inputs.get(k)
             if real_val is None or not isinstance(real_val, torch.Tensor):
                 continue
-            static_buf = preprocessed[key]
+            static_buf = preprocessed[k]
             static_buf[:real_val.shape[0]].copy_(real_val)
         if self.enable_nvtx:
             range_pop(synchronize=True)
@@ -738,25 +763,256 @@ class CudaGraphRunner:
         if self.enable_nvtx:
             range_pop()
 
-        # --- Step 5: Advance seq_lens on REAL request states ---
-        # During replay, advance_seq_lens ran on dummy states (which point
-        # to real states), so seq_lens are already advanced. But since
-        # advance_seq_lens is Python-only and NOT captured in the graph,
-        # we need to call it manually here.
+        # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
+        # advance_seq_lens is not captured in the graph; we call it manually so
+        # the real states (aliased onto dummy slots) move forward.
         if self.enable_nvtx:
             range_push("cg.advance_seq_lens", synchronize=True)
         for label in config_labels:
             static_cm.set_active_label(label)
-            # advance_seq_lens uses planned seq_lens (all 1 for decode)
             static_cm.advance_seq_lens()
         if self.enable_nvtx:
             range_pop(synchronize=True)
 
-        # --- Step 6: Batched sampling from logits and remap outputs ---
+        # --- Step 6: Sample logits and remap dummy → real outputs ---
         if self.enable_nvtx:
             range_push("cg.sample_and_remap", synchronize=True)
+        outputs = self._sample_and_remap(
+            request_ids=request_ids,
+            dummy_rids=dummy_rids,
+            static_output=static_output,
+            per_request_info=per_request_info,
+            graph_data=graph_data,
+            submodule=submodule,
+        )
+        if self.enable_nvtx:
+            range_pop(synchronize=True)
 
-        outputs = {}
+        # --- Step 7: Restore dummy states ---
+        self._restore_dummy_states(
+            dummy_rids=dummy_rids,
+            request_ids=request_ids,
+            real_bs=real_bs,
+            config_labels=config_labels,
+            static_cm=static_cm,
+        )
+
+        return outputs
+
+    def _run_flashinfer_packed(
+        self,
+        key: CudaGraphKey,
+        graph_data: CudaGraphData,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        submodule: ARNodeSubmodule,
+    ) -> dict:
+        """Prefill-style replay (vox-serve pattern).
+
+        Padding slots are zero-length ARNodeInputs — so qo_indptr (re-planned via
+        cache_manager.plan_attention inside preprocess) sums to real_num_tokens,
+        which FlashInfer's attention path actually walks. Trailing static-buffer
+        slots [real_num_tokens : padded_num_tokens] keep their capture-time
+        contents; non-attention compute over them is wasted work, not a correctness
+        issue. State swap / advance_seq_lens / output remap mirror _run_basic_matched.
+        """
+        real_bs = len(request_ids)
+        padded_bs = key.bs
+
+        graph = graph_data.graph
+        static = graph_data.static_inputs
+        static_cm = graph_data.static_cache_manager
+        static_output = graph_data.static_outputs
+
+        templates = static["preprocessed"]
+        dummy_rids = static["dummy_rids"]
+        static_input_keys = static["static_input_keys"]
+        config_labels = graph_data.config.labels
+
+        # --- Step 1: Swap real request states onto dummy slots ---
+        if self.enable_nvtx:
+            range_push("cg.swap_states", synchronize=True)
+        for i, rid in enumerate(request_ids):
+            dummy_rid = dummy_rids[i]
+            for label in config_labels:
+                real_state = self.alloc_manager.get_state(rid, label)
+                self.alloc_manager.get_state(dummy_rid, label)
+                self.alloc_manager.request_states[dummy_rid][label] = real_state
+
+        for i in range(real_bs, padded_bs):
+            dummy_rid = dummy_rids[i]
+            for label in config_labels:
+                self.alloc_manager.get_state(dummy_rid, label)
+        if self.enable_nvtx:
+            range_pop(synchronize=True)
+
+        # --- Step 2: Build padded per-request inputs and re-plan via preprocess ---
+        if self.enable_nvtx:
+            range_push("cg.preprocess_replan", synchronize=True)
+        # Unlike basic_matched, prefill captures don't expose a capture_template
+        # ARNodeInputs (the config provides post-preprocess packed dicts instead).
+        # Synthesize zero-length ARNodeInputs from the first real input's shape so
+        # all required tensor fields exist as empty slices for the padding slots.
+        padded_inputs = list(inputs)
+        for _i in range(real_bs, padded_bs):
+            padded_inputs.append(self._zero_padding_input(inputs[0]))
+
+        real_metadata = self._build_replay_metadata(
+            dummy_rids, request_ids, real_bs,
+            per_request_info, static["dummy_metadata"],
+        )
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=dummy_rids,
+            per_request_info=real_metadata,
+            cache_manager=static_cm,
+        )
+        real_packed = submodule.preprocess(
+            graph_walk=key.graph_walk,
+            engine_inputs=engine_inputs,
+            inputs=padded_inputs,
+        )
+        if self.enable_nvtx:
+            range_pop(synchronize=True)
+
+        # --- Step 3: Copy real packed tensors into static buffers ---
+        if self.enable_nvtx:
+            range_push("cg.copy_inputs", synchronize=True)
+        for k in static_input_keys:
+            real_val = real_packed.get(k)
+            if real_val is None or not isinstance(real_val, torch.Tensor):
+                continue
+            static_buf = templates[k]
+            static_buf[:real_val.shape[0]].copy_(real_val)
+        if self.enable_nvtx:
+            range_pop(synchronize=True)
+
+        # --- Step 4: Replay ---
+        if self.enable_nvtx:
+            range_push("cg.replay")
+        graph.replay()
+        if self.enable_nvtx:
+            range_pop()
+
+        # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
+        if self.enable_nvtx:
+            range_push("cg.advance_seq_lens", synchronize=True)
+        for label in config_labels:
+            static_cm.set_active_label(label)
+            static_cm.advance_seq_lens()
+        if self.enable_nvtx:
+            range_pop(synchronize=True)
+
+        # --- Step 6: Sample logits and remap dummy → real outputs ---
+        if self.enable_nvtx:
+            range_push("cg.sample_and_remap", synchronize=True)
+        outputs = self._sample_and_remap(
+            request_ids=request_ids,
+            dummy_rids=dummy_rids,
+            static_output=static_output,
+            per_request_info=per_request_info,
+            graph_data=graph_data,
+            submodule=submodule,
+        )
+        if self.enable_nvtx:
+            range_pop(synchronize=True)
+
+        # --- Step 7: Restore dummy states ---
+        self._restore_dummy_states(
+            dummy_rids=dummy_rids,
+            request_ids=request_ids,
+            real_bs=real_bs,
+            config_labels=config_labels,
+            static_cm=static_cm,
+        )
+
+        return outputs
+
+    def _build_replay_metadata(
+        self,
+        dummy_rids: list[str],
+        request_ids: list[str],
+        real_bs: int,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        dummy_metadata: dict[str, CurrentForwardPassInfo],
+    ) -> dict[str, CurrentForwardPassInfo]:
+        """Map dummy_rid → real per_request_info for [:real_bs], dummy_metadata
+        from capture for [real_bs:]. Used by both replay paths."""
+        out = {}
+        for i, dummy_rid in enumerate(dummy_rids):
+            if i < real_bs:
+                out[dummy_rid] = per_request_info[request_ids[i]]
+            else:
+                out[dummy_rid] = dummy_metadata[dummy_rid]
+        return out
+
+    def _zero_padding_input(self, template: ARNodeInputs) -> ARNodeInputs:
+        """Synthetic zero-length ARNodeInputs for prefill padding slots.
+
+        Cloned from the first real input's structure so any tensor fields the
+        submodule's preprocess expects are present as length-0 slices — preprocess
+        can then concatenate them without shape errors. input_seq_len=0 means
+        these slots contribute nothing to qo_indptr, so FlashInfer's attention
+        skips them at replay.
+        """
+        pad = template.clone()
+        pad.input_seq_len = 0
+        if pad.input_ids is not None:
+            pad.input_ids = pad.input_ids[:0]
+        if pad.input_embeds is not None:
+            pad.input_embeds = pad.input_embeds[:0]
+        if isinstance(pad.custom_pos_ids, torch.Tensor):
+            pad.custom_pos_ids = pad.custom_pos_ids[:0]
+        elif isinstance(pad.custom_pos_ids, dict):
+            pad.custom_pos_ids = {k: v[:0] for k, v in pad.custom_pos_ids.items()}
+        pad.tensor_inputs = {
+            k: (v[:0] if isinstance(v, torch.Tensor) else v)
+            for k, v in pad.tensor_inputs.items()
+        }
+        return pad
+
+    def _restore_dummy_states(
+        self,
+        dummy_rids: list[str],
+        request_ids: list[str],
+        real_bs: int,
+        config_labels: list[str],
+        static_cm: BatchedCacheManager,
+    ) -> None:
+        """Reset every dummy slot's per-label state and flush real-request KV
+        writes to the store for any label whose plan_state had write_store enabled."""
+        if self.enable_nvtx:
+            range_push("cg.restore_states", synchronize=True)
+        for i, rid in enumerate(dummy_rids):
+            for label in config_labels:
+                self.alloc_manager.reset_label(
+                    rid, label, free=i >= real_bs,
+                )
+        for rid in request_ids:
+            for label in config_labels:
+                ps = static_cm._plan_states.get(label)
+                if ps is not None and ps.write_store:
+                    self.alloc_manager.flush_to_store(rid, label)
+        if self.enable_nvtx:
+            range_pop(synchronize=True)
+
+    def _sample_and_remap(
+        self,
+        request_ids: list[str],
+        dummy_rids: list[str],
+        static_output: dict,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        graph_data: CudaGraphData,
+        submodule: ARNodeSubmodule,
+    ) -> dict:
+        """Sample logits + copy non-logit per-rid outputs, remapping dummy → real rids.
+
+        Fast path: a __batched_logits__ sentinel holding [padded_bs, V] lets us
+        sample once via Sampler.sample without per-rid concat. Fallback path
+        collects per-rid logits and concatenates. Either way, dummy → real rid
+        remap happens here.
+        """
+        outputs: dict = {}
 
         # Fast path: submodule exposed the stacked [padded_bs, V] logits tensor
         # under a sentinel key, so we can sample directly without per-rid
@@ -769,9 +1025,6 @@ class CudaGraphRunner:
             # graph), so the per-rid views are valid for the lifetime of the
             # Python reference — no .clone() needed.
             sampled = self.sampler.sample(request_ids, stacked_logits)
-            # One `split` call produces N [1] views in C++ (faster than N
-            # Python-level slicing ops). Then zip + dict comprehension builds
-            # the outputs dict without enumerate overhead.
             sampled_views = sampled.split(1)
             outputs = {
                 rid: {"new_token": [view]}
@@ -786,11 +1039,10 @@ class CudaGraphRunner:
                     dummy_rid = dummy_rids[i]
                     if dummy_rid not in static_output:
                         continue
-                    # The captured dummy output has a static set of keys
-                    # (required for graph-compat).  Ask the submodule which
-                    # keys this real request should actually receive — e.g.
-                    # the Thinker always emits thinker_states inside the
-                    # graph but drops it here for audio_output=False.
+                    # Captured dummy output keys are static (graph-compat); ask
+                    # the submodule which keys this real request should actually
+                    # receive (e.g. Thinker emits thinker_states inside the graph
+                    # but drops it here when audio_output=False).
                     filtered = submodule.filter_batched_output(
                         per_request_info.get(rid), static_output[dummy_rid],
                     )
@@ -803,59 +1055,41 @@ class CudaGraphRunner:
                             outputs[rid][out_key] = [val.clone()]
                         else:
                             outputs[rid][out_key] = val
+            return outputs
+
+        # Fallback: collect per-rid logits and concatenate.
+        all_logits = []
+        non_logit_keys: dict[str, list] = {}
+        for i in range(len(request_ids)):
+            dummy_rid = dummy_rids[i]
+            if dummy_rid not in static_output:
+                continue
+            dummy_out = static_output[dummy_rid]
+            for out_key, val in dummy_out.items():
+                if out_key == "logits":
+                    logits_t = val[0] if isinstance(val, list) else val
+                    all_logits.append(logits_t)
+                else:
+                    non_logit_keys.setdefault(out_key, []).append((i, val))
+
+        if all_logits:
+            stacked_logits = torch.cat(all_logits, dim=0)
+            sampled = self.sampler.sample(request_ids, stacked_logits)
+            for i, rid in enumerate(request_ids):
+                outputs[rid] = {"new_token": [sampled[i:i+1]]}
         else:
-            # Fallback: collect per-rid logits and concatenate.
-            all_logits = []
-            non_logit_keys: dict[str, list] = {}
-            for i in range(len(request_ids)):
-                dummy_rid = dummy_rids[i]
-                if dummy_rid not in static_output:
-                    continue
-                dummy_out = static_output[dummy_rid]
-                for out_key, val in dummy_out.items():
-                    if out_key == "logits":
-                        logits_t = val[0] if isinstance(val, list) else val
-                        all_logits.append(logits_t)
-                    else:
-                        non_logit_keys.setdefault(out_key, []).append((i, val))
+            for rid in request_ids:
+                outputs[rid] = {}
 
-            if all_logits:
-                stacked_logits = torch.cat(all_logits, dim=0)
-                sampled = self.sampler.sample(request_ids, stacked_logits)
-                for i, rid in enumerate(request_ids):
-                    outputs[rid] = {"new_token": [sampled[i:i+1]]}
-            else:
-                for rid in request_ids:
-                    outputs[rid] = {}
-
-            for out_key, entries in non_logit_keys.items():
-                for idx, val in entries:
-                    rid = request_ids[idx]
-                    if isinstance(val, list):
-                        outputs[rid][out_key] = [t.clone() for t in val]
-                    elif isinstance(val, torch.Tensor):
-                        outputs[rid][out_key] = [val.clone()]
-                    else:
-                        outputs[rid][out_key] = val
-
-        if self.enable_nvtx:
-            range_pop(synchronize=True)
-
-        # --- Step 7: Restore dummy states ---
-        if self.enable_nvtx:
-            range_push("cg.restore_states", synchronize=True)
-        for i, rid in enumerate(dummy_rids):
-            for label in config_labels:
-                self.alloc_manager.reset_label(
-                    rid, label, free=i>=batch_size,
-                )
-        for rid in request_ids:
-            for label in config_labels:
-                ps = static_cm._plan_states.get(label)
-                if ps is not None and ps.write_store:
-                    self.alloc_manager.flush_to_store(rid, label)
-        if self.enable_nvtx:
-            range_pop(synchronize=True)
+        for out_key, entries in non_logit_keys.items():
+            for idx, val in entries:
+                rid = request_ids[idx]
+                if isinstance(val, list):
+                    outputs[rid][out_key] = [t.clone() for t in val]
+                elif isinstance(val, torch.Tensor):
+                    outputs[rid][out_key] = [val.clone()]
+                else:
+                    outputs[rid][out_key] = val
 
         return outputs
 
