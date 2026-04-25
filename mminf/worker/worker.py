@@ -109,6 +109,11 @@ class _PostProcessJob:
     plus the live ``ScheduledBatch`` so the postproc thread can run
     register_for_send / batched D→H / per-rid send_outputs without re-reading
     any state main thread has since changed.
+
+    ``done_event`` is a CUDA event recorded on the default stream at job
+    submission time — it captures the in-flight kernels for this step.
+    Postproc waits on it before ``register_for_send`` (which hands tensor
+    addresses to peer workers via RDMA, breaking out of stream ordering).
     """
 
     __slots__ = (
@@ -116,6 +121,7 @@ class _PostProcessJob:
         "routing_per_request",
         "batch_partition",
         "graph_walk",
+        "done_event",
     )
 
     def __init__(
@@ -124,11 +130,13 @@ class _PostProcessJob:
         routing_per_request: "dict[str, NodeOutputRouting]",
         batch_partition: str,
         graph_walk: str,
+        done_event: "torch.cuda.Event | None",
     ):
         self.batch = batch
         self.routing_per_request = routing_per_request
         self.batch_partition = batch_partition
         self.graph_walk = graph_walk
+        self.done_event = done_event
 
 
 class _PostProcessThread(threading.Thread):
@@ -1057,11 +1065,23 @@ class Worker:
 
     def _run_postprocess(self, job: "_PostProcessJob") -> None:
         """Run register_for_send + batched D→H + per-rid send_outputs for one
-        step on the postproc thread. Holds ``_state_lock`` for the duration —
-        main thread is typically inside ``execute_batch`` or the GPU sync
-        (lock released) when this runs, so contention is normally tail-only.
+        step on the postproc thread.
+
+        The CUDA event is awaited *outside* ``_state_lock`` — only the GPU
+        needs to be synced before ``register_for_send`` hands tensor addresses
+        to RDMA peers (RDMA reads aren't ordered with our default stream).
+        While this thread is blocked in ``event.synchronize()`` the main
+        thread can keep submitting new steps; once the event fires we grab
+        the lock briefly to do the actual register/D→H/send work.
         """
         from mminf.utils.profiler import range_pop, range_push
+
+        # Wait for the GPU work submitted up to job submission to complete.
+        # The event was recorded on the default stream right after Phase E,
+        # so this synchronize() returns once this step's kernels are done —
+        # subsequent steps queued on the same stream do not delay it.
+        if job.done_event is not None:
+            job.done_event.synchronize()
 
         with self._state_lock:
             # Register output tensors for RDMA send / set persist flags.
@@ -1281,14 +1301,12 @@ class Worker:
                     if self.enable_nvtx:
                         range_pop(synchronize=True)
 
-                # === Phase D: GPU sync (NO LOCK) ===
-                # Postproc thread runs here too. This is the main overlap
-                # window — at bs=8 the sync is ~6 ms, plenty of room for
-                # postproc's ~600 µs of register/D→H/send work.
-                if torch.cuda.is_available() and batch.node_objects:
-                    torch.cuda.default_stream().synchronize()
-
                 # === Phase E: route outputs + hand off to postproc (state lock held) ===
+                # Phase D's blocking GPU sync is gone — replaced by a CUDA
+                # event recorded at the end of Phase E and awaited on the
+                # postproc thread (Phase 2.5). Main thread no longer waits
+                # on the GPU between submitting consecutive steps; kernels
+                # for step N+1 queue behind step N's on the default stream.
                 # Determine routing for each request, then enqueue a
                 # _PostProcessJob carrying the routing decisions. Postproc
                 # thread does the heavy I/O (RDMA register, D→H, ZMQ send)
@@ -1357,14 +1375,26 @@ class Worker:
                     for _rid, req_info in node_batch.per_request_info.items():
                         req_info.dynamic_loop_stop_signals.clear()
 
+                # Record a CUDA event *outside* the lock. It captures the
+                # default stream's state at this point — i.e., all of step N's
+                # kernels submitted by execute_batch above. Postproc waits on
+                # it before register_for_send so RDMA peers see consistent data.
+                done_event: "torch.cuda.Event | None" = None
+                if torch.cuda.is_available() and batch.node_objects:
+                    done_event = torch.cuda.Event()
+                    done_event.record()
+
                 # Hand off register_outputs + batched D→H + send_outputs to
                 # the postproc thread. Submit is bounded; if a previous step's
-                # job is still in flight the call blocks for natural backpressure.
+                # job is still in flight the call blocks for natural backpressure
+                # — this is what keeps main thread from running off ahead of
+                # the GPU and pinning unbounded VRAM.
                 self._postproc_thread.submit(_PostProcessJob(
                     batch=batch,
                     routing_per_request=routing_per_request,
                     batch_partition=batch_partition,
                     graph_walk=batch.graph_walk,
+                    done_event=done_event,
                 ))
             except Exception:
                 logger.exception("Worker %s error in main loop", self.worker_id)
