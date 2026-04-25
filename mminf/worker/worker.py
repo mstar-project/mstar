@@ -102,6 +102,86 @@ class _InboxPoller(threading.Thread):
         self._stop.set()
 
 
+class _PostProcessJob:
+    """One step's worth of post-execute work to run on the postproc thread.
+
+    Carries the bookkeeping the main thread already finished (routing decisions)
+    plus the live ``ScheduledBatch`` so the postproc thread can run
+    register_for_send / batched D→H / per-rid send_outputs without re-reading
+    any state main thread has since changed.
+    """
+
+    __slots__ = (
+        "batch",
+        "routing_per_request",
+        "batch_partition",
+        "graph_walk",
+    )
+
+    def __init__(
+        self,
+        batch: ScheduledBatch,
+        routing_per_request: "dict[str, NodeOutputRouting]",
+        batch_partition: str,
+        graph_walk: str,
+    ):
+        self.batch = batch
+        self.routing_per_request = routing_per_request
+        self.batch_partition = batch_partition
+        self.graph_walk = graph_walk
+
+
+class _PostProcessThread(threading.Thread):
+    """Phase-2 of the async worker redesign (see ASYNC_REDESIGN.md).
+
+    Daemon thread that consumes ``_PostProcessJob``s and runs the
+    register_for_send / batched-D→H / send_outputs chain off the main loop.
+    The main thread can submit step N's job and immediately proceed to step
+    N+1's setup while this thread does the ZMQ pickle/send work for step N
+    in parallel — overlapping with main's GPU-sync wait inside step N+1's
+    route_outputs.
+
+    Backpressure: bounded queue caps the number of in-flight steps so VRAM
+    pinning (RDMA staging tensors, un-ACKed buffers) cannot grow unbounded.
+    """
+
+    def __init__(self, worker: "Worker", name: str, max_pending: int = 2):
+        super().__init__(daemon=True, name=name)
+        self._worker = worker
+        self._queue: _queue.Queue = _queue.Queue(maxsize=max_pending)
+        self._stop = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                job = self._queue.get(timeout=0.05)
+            except _queue.Empty:
+                continue
+            if job is None:
+                self._queue.task_done()
+                break
+            try:
+                self._worker._run_postprocess(job)
+            except Exception:
+                logger.exception("PostProcessThread: error processing job")
+            finally:
+                self._queue.task_done()
+
+    def submit(self, job: "_PostProcessJob") -> None:
+        # Blocks if the queue is full — natural backpressure.
+        self._queue.put(job)
+
+    def join_pending(self) -> None:
+        self._queue.join()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._queue.put_nowait(None)
+        except _queue.Full:
+            pass
+
+
 class Worker:
     """
     Real worker that integrates WorkerGraphsManager, EngineManager,
@@ -157,6 +237,18 @@ class Worker:
             name=f"mminf-worker-{worker_id}-inbox",
         )
         self._inbox_poller.start()
+
+        # Phase 2 of the async-worker redesign: a single coarse lock around
+        # everything that mutates shared worker state (worker_graphs_manager,
+        # tensor_manager, communicator). The lock is released across
+        # execute_batch and the post-execute GPU sync so the postproc thread
+        # can run its work during main's GPU wait window.
+        self._state_lock = threading.Lock()
+        self._postproc_thread = _PostProcessThread(
+            worker=self,
+            name=f"mminf-worker-{worker_id}-postproc",
+        )
+        self._postproc_thread.start()
         self.tensor_manager = create_tensor_communication_manager(
             protocol=tensor_comm_protocol,
             my_entity_id=worker_id,
@@ -501,8 +593,15 @@ class Worker:
             elif message.message_type == WorkerMessageType.STOP_LOOPS:
                 self._stop_loops(message.body)
 
-    def _process_messages(self) -> None:
-        self._process_message_list(self._inbox_poller.drain())
+    def _process_messages(self, msgs: list | None = None) -> None:
+        # When ``msgs`` is None, fall back to draining the inbox here. The
+        # main loop drains the inbox itself before acquiring ``_state_lock``
+        # so it can call ``_postproc_thread.join_pending()`` first when a
+        # REMOVE_REQUEST is pending without risking a lock-vs-postproc
+        # deadlock.
+        if msgs is None:
+            msgs = self._inbox_poller.drain()
+        self._process_message_list(msgs)
 
     # ------------------------------------------------------------------
     # Tensor readiness
@@ -736,18 +835,16 @@ class Worker:
         (e.g., Talker non-last prefill which returns {}, or Thinker with
         audio_output=False which omits thinker_states) are excluded so that
         empty-tensor_info edges are not routed downstream.
+
+        Caller must have synchronized the default stream before invoking
+        this — the previous forward's writes need to be visible on the
+        source stream before we hand tensor addresses to peers (via
+        store_and_populate_graph_edges + downstream register_for_send).
+        The sync is intentionally hoisted into ``Worker.run`` so it can
+        happen with ``_state_lock`` released, letting the postproc thread
+        do its work during the GPU-wait window.
         """
         output_edges: dict[str, FilteredEdges] = {}
-
-        # tensor_manager.register_for_send would issue
-        # `torch.cuda.default_stream().synchronize()` per rid — at bs=8 that
-        # was 8 serialized syncs (+ their implicit API overhead). One sync
-        # before the rid loop is enough: we only need the preceding forward's
-        # writes to be visible on the source stream before we hand tensor
-        # addresses to peers.
-        if torch.cuda.is_available() and batch.node_objects:
-            torch.cuda.default_stream().synchronize()
-
 
         for request_id, node in batch.node_objects.items():
             # output name to list of tensors
@@ -955,6 +1052,71 @@ class Worker:
             self.communicator.send("conductor", message)
 
     # ------------------------------------------------------------------
+    # Postproc thread entry point
+    # ------------------------------------------------------------------
+
+    def _run_postprocess(self, job: "_PostProcessJob") -> None:
+        """Run register_for_send + batched D→H + per-rid send_outputs for one
+        step on the postproc thread. Holds ``_state_lock`` for the duration —
+        main thread is typically inside ``execute_batch`` or the GPU sync
+        (lock released) when this runs, so contention is normally tail-only.
+        """
+        from mminf.utils.profiler import range_pop, range_push
+
+        with self._state_lock:
+            # Register output tensors for RDMA send / set persist flags.
+            if self.enable_nvtx:
+                range_push("worker.store_outputs", synchronize=True)
+            self._register_outputs(job.batch, job.routing_per_request)
+            if self.enable_nvtx:
+                range_pop(synchronize=True)
+
+            # Batched D→H for new-token tensors (one cudaMemcpy + one sync
+            # for the whole batch instead of N).
+            if self.enable_nvtx:
+                range_push("worker.send_outputs", synchronize=True)
+
+            prematerialized_per_rid: dict[str, dict[str, list[int]]] = {}
+            collected: list[tuple[str, str, torch.Tensor]] = []
+            for rid in job.batch.node_objects.keys():
+                routing = job.routing_per_request[rid]
+                if not routing.new_token_outputs:
+                    continue
+                seen_names: set[str] = set()
+                for signal in routing.new_token_outputs:
+                    if signal.name in seen_names:
+                        continue
+                    seen_names.add(signal.name)
+                    for tinfo in signal.tensor_info:
+                        tensor = self.tensor_manager.get_tensor(
+                            request_id=rid, uuid=tinfo.uuid,
+                        )
+                        collected.append((rid, signal.name, tensor))
+
+            if collected:
+                lengths = [t.numel() for t in (tr for _, _, tr in collected)]
+                flat = torch.cat(
+                    [t.flatten() for _, _, t in collected]
+                ).cpu().tolist()
+                off = 0
+                for (rid, sig_name, _), n in zip(collected, lengths, strict=True):
+                    rid_map = prematerialized_per_rid.setdefault(rid, {})
+                    rid_map.setdefault(sig_name, []).extend(flat[off:off + n])
+                    off += n
+
+            for request_id in job.batch.node_objects.keys():
+                self._send_outputs(
+                    request_id, job.routing_per_request[request_id],
+                    graph_walk=job.graph_walk,
+                    partition_name=job.batch_partition,
+                    prematerialized_new_tokens=prematerialized_per_rid.get(
+                        request_id
+                    ),
+                )
+            if self.enable_nvtx:
+                range_pop(synchronize=True)
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
@@ -965,54 +1127,81 @@ class Worker:
         while True:
             from mminf.utils.profiler import range_pop, range_push
             try:
-                # 1. Process ZMQ messages (new requests, input signals, removals)
-                if self.enable_nvtx:
-                    range_push("worker.process_messages", synchronize=True)
-                self._process_messages()
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
+                # === Phase A: setup (state lock held) ===
+                # Drain inbox, RDMA poll, stream-buffer poll, schedule, build
+                # batch. Touches worker_graphs_manager + tensor_manager state
+                # that the postproc thread also reads/writes — hence the lock.
 
-                # 2. Check for ready RDMA tensors, feed to worker graph queues
-                if self.enable_nvtx:
-                    range_push("worker.check_ready_tensors", synchronize=True)
-                self._check_ready_tensors()
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
+                # Drain the inbox BEFORE acquiring _state_lock so that, if a
+                # REMOVE_REQUEST is pending, we can join the postproc queue
+                # first. A queued postproc job for the about-to-be-removed
+                # request still references per_request_info[rid] — letting
+                # main remove the request before postproc lands raises
+                # KeyError. We can't join_pending() while holding _state_lock
+                # because the postproc thread itself acquires it.
+                inbox_msgs = self._inbox_poller.drain()
+                if any(
+                    m.message_type == WorkerMessageType.REMOVE_REQUEST
+                    for m in inbox_msgs
+                ):
+                    self._postproc_thread.join_pending()
 
-                # 2b. Poll StreamBuffers — pop chunks when ready, feed as normal inputs
-                if self.enable_nvtx:
-                    range_push("worker.poll_stream_buffers", synchronize=True)
-                self._poll_stream_buffers()
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
+                with self._state_lock:
+                    # 1. Process ZMQ messages (new requests, input signals, removals)
+                    if self.enable_nvtx:
+                        range_push("worker.process_messages", synchronize=True)
+                    self._process_messages(inbox_msgs)
+                    if self.enable_nvtx:
+                        range_pop(synchronize=True)
 
-                # 3. Pick next batch via MicroScheduler
-                if self.enable_nvtx:
-                    range_push("worker.schedule", synchronize=True)
-                batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
+                    # 2. Check for ready RDMA tensors, feed to worker graph queues
+                    if self.enable_nvtx:
+                        range_push("worker.check_ready_tensors", synchronize=True)
+                    self._check_ready_tensors()
+                    if self.enable_nvtx:
+                        range_pop(synchronize=True)
+
+                    # 2b. Poll StreamBuffers — pop chunks when ready, feed as normal inputs
+                    if self.enable_nvtx:
+                        range_push("worker.poll_stream_buffers", synchronize=True)
+                    self._poll_stream_buffers()
+                    if self.enable_nvtx:
+                        range_pop(synchronize=True)
+
+                    # 3. Pick next batch via MicroScheduler
+                    if self.enable_nvtx:
+                        range_push("worker.schedule", synchronize=True)
+                    batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
+                    if self.enable_nvtx:
+                        range_pop(synchronize=True)
+
+                    if batch is not None:
+                        # 4. Gather input tensors for the batch
+                        if self.enable_nvtx:
+                            range_push("worker.build_node_batch", synchronize=True)
+                        node_batch = self._build_node_batch(batch)
+                        batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
+
+                        for request_id, req_info in node_batch.per_request_info.items():
+                            req_info.dynamic_loop_iter_counts.update(
+                                self.worker_graphs_manager.get_dynamic_loop_iters(
+                                    request_id, partition=batch_partition,
+                                )
+                            )
+                            batch.node_objects[request_id].clear_outputs()
+                        if self.enable_nvtx:
+                            range_pop(synchronize=True)
+                # === lock released ===
+
                 if batch is None:
                     sleep(0.001)
                     continue
 
-                # 4. Gather input tensors for the batch
-                if self.enable_nvtx:
-                    range_push("worker.build_node_batch", synchronize=True)
-                node_batch = self._build_node_batch(batch)
-                batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
-
-                for request_id, req_info in node_batch.per_request_info.items():
-                    req_info.dynamic_loop_iter_counts.update(
-                        self.worker_graphs_manager.get_dynamic_loop_iters(
-                            request_id, partition=batch_partition,
-                        )
-                    )
-                    batch.node_objects[request_id].clear_outputs()
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
-
-                # 5. Execute via engine
+                # === Phase B: execute_batch (NO LOCK) ===
+                # Lock is released so the postproc thread can do its work
+                # (register_for_send, batched D→H, send_outputs) for the
+                # previous step in parallel. execute_batch returns after
+                # submitting kernels; the GPU work is in flight afterward.
                 engine = self.engine_manager.get_engine(batch.node_name)
                 logger.debug("Executing batch for node %s on engine %s", node_batch.node_name, str(type(engine)))
                 if self.enable_nvtx:
@@ -1026,183 +1215,157 @@ class Worker:
                     if self.enable_nvtx:
                         range_pop(synchronize=True)
 
-                # 5a. Handle allocation failure: offload a victim, retry the rest
+                # === Phase C: post-execute CPU bookkeeping (state lock held) ===
+                # 5a. Handle allocation failure: offload a victim, retry the rest.
                 if output.allocation_failed:
-                    batch_ids = set(batch.node_objects.keys())
-                    victim_id = self._try_offload_cold_request(node_batch.node_name, batch_ids)
+                    with self._state_lock:
+                        batch_ids = set(batch.node_objects.keys())
+                        victim_id = self._try_offload_cold_request(node_batch.node_name, batch_ids)
 
-                    # Push all batch nodes back to their queues
-                    for request_id, node in batch.node_objects.items():
-                        wg_id = batch.request_to_worker_graph[request_id]
-                        self.worker_graphs_manager.queues[wg_id].push_back_node(
-                            request_id, node
-                        )
+                        # Push all batch nodes back to their queues
+                        for request_id, node in batch.node_objects.items():
+                            wg_id = batch.request_to_worker_graph[request_id]
+                            self.worker_graphs_manager.queues[wg_id].push_back_node(
+                                request_id, node
+                            )
 
-                    if victim_id is not None:
-                        # Only hold the offloaded victim (needs CPU→GPU reload)
-                        self.scheduler.hold_requests([victim_id])
-                        logger.warning(
-                            "OOM on node=%s walk=%s: offloaded victim=%s, "
-                            "retrying %d remaining requests",
-                            batch.node_name, batch.graph_walk, victim_id,
-                            len(batch_ids) - (1 if victim_id in batch_ids else 0),
-                        )
-                    else:
-                        # No offloading possible; hold all requests briefly
-                        self.scheduler.hold_requests(list(batch_ids))
-                        logger.warning(
-                            "OOM on node=%s walk=%s: no offload possible, "
-                            "holding %d requests",
-                            batch.node_name, batch.graph_walk, len(batch_ids),
-                        )
+                        if victim_id is not None:
+                            # Only hold the offloaded victim (needs CPU→GPU reload)
+                            self.scheduler.hold_requests([victim_id])
+                            logger.warning(
+                                "OOM on node=%s walk=%s: offloaded victim=%s, "
+                                "retrying %d remaining requests",
+                                batch.node_name, batch.graph_walk, victim_id,
+                                len(batch_ids) - (1 if victim_id in batch_ids else 0),
+                            )
+                        else:
+                            # No offloading possible; hold all requests briefly
+                            self.scheduler.hold_requests(list(batch_ids))
+                            logger.warning(
+                                "OOM on node=%s walk=%s: no offload possible, "
+                                "holding %d requests",
+                                batch.node_name, batch.graph_walk, len(batch_ids),
+                            )
                     continue
 
-                # Update LRU timestamps for successfully executed requests
-                if self.enable_nvtx:
-                    range_push("worker.update_request_info", synchronize=True)
-                now = _time.monotonic()
-                for rid in batch.node_objects:
-                    self._last_active[(rid, batch.node_name)] = now
+                with self._state_lock:
+                    # Update LRU timestamps for successfully executed requests
+                    if self.enable_nvtx:
+                        range_push("worker.update_request_info", synchronize=True)
+                    now = _time.monotonic()
+                    for rid in batch.node_objects:
+                        self._last_active[(rid, batch.node_name)] = now
 
-                for rid, req_info in node_batch.per_request_info.items():
-                    if req_info.dynamic_loop_stop_signals:
-                        self.worker_graphs_manager.stop_loops(
-                            rid, partition=batch_partition,
-                            loop_names=req_info.dynamic_loop_stop_signals,
-                            # Pass in req_info and last_node_run to update
-                            # req_info.loop_stop_times
-                            req_info=req_info, last_node_run=batch.node_name
+                    for rid, req_info in node_batch.per_request_info.items():
+                        if req_info.dynamic_loop_stop_signals:
+                            self.worker_graphs_manager.stop_loops(
+                                rid, partition=batch_partition,
+                                loop_names=req_info.dynamic_loop_stop_signals,
+                                # Pass in req_info and last_node_run to update
+                                # req_info.loop_stop_times
+                                req_info=req_info, last_node_run=batch.node_name
+                            )
+
+                        self.worker_graphs_manager.update_request_info(
+                            rid, current_fwd_info=req_info,
+                            per_label_seq_info=req_info.per_label_seq_info,
+                            partition_name=batch_partition,
                         )
+                    if self.enable_nvtx:
+                        range_pop(synchronize=True)
 
-                    self.worker_graphs_manager.update_request_info(
-                        rid, current_fwd_info=req_info,
-                        per_label_seq_info=req_info.per_label_seq_info,
-                        partition_name=batch_partition,
+                    # 5b. Free consumed input tensors
+                    if self.enable_nvtx:
+                        range_push("worker.cleanup_inputs", synchronize=True)
+                    self._cleanup_consumed_inputs(batch)
+                    if self.enable_nvtx:
+                        range_pop(synchronize=True)
+
+                # === Phase D: GPU sync (NO LOCK) ===
+                # Postproc thread runs here too. This is the main overlap
+                # window — at bs=8 the sync is ~6 ms, plenty of room for
+                # postproc's ~600 µs of register/D→H/send work.
+                if torch.cuda.is_available() and batch.node_objects:
+                    torch.cuda.default_stream().synchronize()
+
+                # === Phase E: route outputs + hand off to postproc (state lock held) ===
+                # Determine routing for each request, then enqueue a
+                # _PostProcessJob carrying the routing decisions. Postproc
+                # thread does the heavy I/O (RDMA register, D→H, ZMQ send)
+                # while the main loop circles back to step N+1.
+                with self._state_lock:
+                    # 6. Route outputs through WorkerGraphsManager first to determine routing.
+                    # Filter each node's output edges to only those the submodule actually
+                    # produced. This matters for cases like Talker non-last prefill (which
+                    # returns {} -> no edges routed) or Thinker with audio_output=False
+                    # (which omits thinker_states). Without filtering, edges whose names are
+                    # absent from the output dict would be routed with empty tensor_info.
+                    if self.enable_nvtx:
+                        range_push("worker.route_outputs", synchronize=True)
+                    filtered_outputs_per_request: dict[str, list[GraphEdge]] = {}
+                    for request_id, node in batch.node_objects.items():
+                        request_output_tensors = output.per_request_output_tensors.get(
+                            request_id, {}
+                        )
+                        filtered_outputs = [
+                            e for e in node.outputs if e.name in request_output_tensors
+                        ]
+                        filtered_outputs_per_request[request_id] = filtered_outputs
+
+                    node_outputs = self._store_outputs_and_finish_loops(
+                        batch, output=output,
+                        filtered_outputs_per_request=filtered_outputs_per_request
                     )
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
 
-                # 5b. Free consumed input tensors
-                if self.enable_nvtx:
-                    range_push("worker.cleanup_inputs", synchronize=True)
-                self._cleanup_consumed_inputs(batch)
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
+                    routing_per_request: dict[str, NodeOutputRouting] = {}
+                    for request_id in batch.node_objects:
+                        routing = self.worker_graphs_manager.process_node_outputs(
+                            request_id, node_outputs[request_id].kept, graph_walk=batch.graph_walk
+                        )
+                        routing_per_request[request_id] = routing
+                    if self.enable_nvtx:
+                        range_pop(synchronize=True)
 
-                # 6. Route outputs through WorkerGraphsManager first to determine routing.
-                # Filter each node's output edges to only those the submodule actually
-                # produced. This matters for cases like Talker non-last prefill (which
-                # returns {} -> no edges routed) or Thinker with audio_output=False
-                # (which omits thinker_states). Without filtering, edges whose names are
-                # absent from the output dict would be routed with empty tensor_info.
-                if self.enable_nvtx:
-                    range_push("worker.route_outputs", synchronize=True)
-                filtered_outputs_per_request: dict[str, list[GraphEdge]] = {}
-                for request_id, node in batch.node_objects.items():
-                    request_output_tensors = output.per_request_output_tensors.get(
-                        request_id, {}
-                    )
-                    filtered_outputs = [
-                        e for e in node.outputs if e.name in request_output_tensors
-                    ]
-                    filtered_outputs_per_request[request_id] = filtered_outputs
-
-                node_outputs = self._store_outputs_and_finish_loops(
-                    batch, output=output,
-                    filtered_outputs_per_request=filtered_outputs_per_request
-                )
-
-                routing_per_request: dict[str, NodeOutputRouting] = {}
-                for request_id in batch.node_objects:
-                    routing = self.worker_graphs_manager.process_node_outputs(
-                        request_id, node_outputs[request_id].kept, graph_walk=batch.graph_walk
-                    )
-                    routing_per_request[request_id] = routing
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
-
-                    # 6b. send "loop done" messages to the corresponding workers
-                    stop_loop_workers = {}
-                    for loop_name in node_batch.per_request_info[request_id].dynamic_loop_stop_signals:
-                        for worker in self.worker_graphs_manager.get_dyn_loop_workers(
-                            request_id,  batch_partition, loop_name
-                        ):
-                            stop_loop_workers.setdefault(worker, set()).add(loop_name)
-                    for worker, loop_names in stop_loop_workers.items():
-                        if worker == self.worker_id:
-                            continue
-                        self.communicator.send(
-                            entity_id=worker,
-                            msg=WorkerMessage(
-                                message_type=WorkerMessageType.STOP_LOOPS,
-                                body=StopLoops(
-                                    request_id=request_id,
-                                    loop_names=loop_names,
-                                    loop_stop_times=node_batch.per_request_info[request_id].loop_stop_times,
-                                    partition_name=batch_partition
+                        # 6b. send "loop done" messages to the corresponding workers
+                        stop_loop_workers = {}
+                        for loop_name in node_batch.per_request_info[request_id].dynamic_loop_stop_signals:
+                            for worker in self.worker_graphs_manager.get_dyn_loop_workers(
+                                request_id,  batch_partition, loop_name
+                            ):
+                                stop_loop_workers.setdefault(worker, set()).add(loop_name)
+                        for worker, loop_names in stop_loop_workers.items():
+                            if worker == self.worker_id:
+                                continue
+                            self.communicator.send(
+                                entity_id=worker,
+                                msg=WorkerMessage(
+                                    message_type=WorkerMessageType.STOP_LOOPS,
+                                    body=StopLoops(
+                                        request_id=request_id,
+                                        loop_names=loop_names,
+                                        loop_stop_times=node_batch.per_request_info[request_id].loop_stop_times,
+                                        partition_name=batch_partition
+                                    )
                                 )
                             )
-                        )
 
-                # 7. Store output tensors, register RDMA if needed
-                if self.enable_nvtx:
-                    range_push("worker.store_outputs", synchronize=True)
-                self._register_outputs(batch, routing_per_request)
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
+                    # Clear dynamic_loop_stop_signals on main thread (still under
+                    # _state_lock) before we hand the job to postproc. Doing it
+                    # there would race with the next step's execute_batch
+                    # repopulating the same per-request fwd_info object — by the
+                    # time postproc runs, those signals may already be N+1's.
+                    for _rid, req_info in node_batch.per_request_info.items():
+                        req_info.dynamic_loop_stop_signals.clear()
 
-                # 8. Send outputs to other workers / conductor.
-                # Pre-materialize new-token tensors across all rids in a single
-                # batched D→H: the old per-rid `.cpu().numpy().tolist()` inside
-                # _send_outputs would fire N `cudaMemcpyAsync` + N implicit
-                # `cudaStreamSynchronize` per decode step (~300 µs at bs=8).
-                # Collecting tensors first and issuing one concat + cpu() cuts
-                # that to a single D→H with one sync.
-                if self.enable_nvtx:
-                    range_push("worker.send_outputs", synchronize=True)
-
-                prematerialized_per_rid: dict[str, dict[str, list[int]]] = {}
-                collected: list[tuple[str, str, torch.Tensor]] = []
-                for rid in batch.node_objects.keys():
-                    routing = routing_per_request[rid]
-                    if not routing.new_token_outputs:
-                        continue
-                    seen_names: set[str] = set()
-                    for signal in routing.new_token_outputs:
-                        if signal.name in seen_names:
-                            continue
-                        seen_names.add(signal.name)
-                        for tinfo in signal.tensor_info:
-                            tensor = self.tensor_manager.get_tensor(
-                                request_id=rid, uuid=tinfo.uuid,
-                            )
-                            collected.append((rid, signal.name, tensor))
-
-                if collected:
-                    lengths = [t.numel() for t in (tr for _, _, tr in collected)]
-                    flat = torch.cat(
-                        [t.flatten() for _, _, t in collected]
-                    ).cpu().tolist()
-                    off = 0
-                    for (rid, sig_name, _), n in zip(collected, lengths, strict=True):
-                        rid_map = prematerialized_per_rid.setdefault(rid, {})
-                        rid_map.setdefault(sig_name, []).extend(flat[off:off + n])
-                        off += n
-
-                for request_id in batch.node_objects.keys():
-                    self._send_outputs(
-                        request_id, routing_per_request[request_id],
-                        graph_walk=batch.graph_walk,
-                        partition_name=batch_partition,
-                        prematerialized_new_tokens=prematerialized_per_rid.get(
-                            request_id
-                        ),
-                    )
-
-                for _rid, req_info in node_batch.per_request_info.items():
-                    req_info.dynamic_loop_stop_signals.clear()
-                if self.enable_nvtx:
-                    range_pop(synchronize=True)
+                # Hand off register_outputs + batched D→H + send_outputs to
+                # the postproc thread. Submit is bounded; if a previous step's
+                # job is still in flight the call blocks for natural backpressure.
+                self._postproc_thread.submit(_PostProcessJob(
+                    batch=batch,
+                    routing_per_request=routing_per_request,
+                    batch_partition=batch_partition,
+                    graph_walk=batch.graph_walk,
+                ))
             except Exception:
                 logger.exception("Worker %s error in main loop", self.worker_id)
                 sleep(0.01)
