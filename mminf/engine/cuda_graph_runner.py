@@ -603,8 +603,14 @@ class CudaGraphRunner:
         batch_size: int,
         config: CudaGraphConfig,
     ) -> int | None:
-        """Find smallest captured batch size >= batch_size for this config."""
-        sizes = config.capture_batch_sizes
+        """Find smallest captured batch size >= batch_size for this config.
+
+        Mirrors warmup_and_capture's fallback: when a config doesn't override
+        capture_batch_sizes (the common case — Bagel et al. just defer to the
+        runner's default), capture iterates self.CAPTURE_BATCH_SIZES, so lookup
+        has to consult the same list to find a match.
+        """
+        sizes = sorted(config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES)
         idx = bisect.bisect_left(sizes, batch_size)
         if idx >= len(sizes):
             return None
