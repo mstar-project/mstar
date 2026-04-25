@@ -452,7 +452,7 @@ class LLMSubmodule(ARNodeSubmodule):
             seq_len = node_inputs.input_embeds.shape[0]
             node_inputs.input_seq_len = seq_len
 
-            labels = self._get_active_labels(graph_walk, True) # just return all labels since it is cheap
+            labels = ["main", "cfg_text", "cfg_img"] # just return all labels since it is cheap
             
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
                 labels, pos_info, device, seq_len
@@ -485,7 +485,7 @@ class LLMSubmodule(ARNodeSubmodule):
                     device=device
                 )
             )
-            labels = self._get_active_labels(graph_walk, True) 
+            labels = ["main", "cfg_text", "cfg_img"]
             seq_len = tensor_inputs["empty_combined_emb"].shape[0]
             node_inputs.input_seq_len = seq_len
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
@@ -969,6 +969,7 @@ class LLMSubmodule(ARNodeSubmodule):
         label = self._NODE_TO_CFG_LABEL.get(self.node_name, "main")
         if cache_handle is not None:
             cache_handle.set_active_label(label)
+
         hidden = self.language_model(
             empty_combined_emb, mode="gen",
             cache_handle=cache_handle, write_cache=False,
@@ -1287,6 +1288,12 @@ class CombineCFGSubmodule(NodeSubmodule):
         N = self.config.num_timesteps
         shift = self.config.timestep_shift
 
+        print(v_main)
+        print(v_cfg_text)
+        print(v_cfg_img)
+        print(cfg_interval, cfg_text_scale, cfg_img_scale)
+        print()
+
         # Compute timestep and step size
         t_uniform = 1.0 - time_index / (N - 1)
         t_uniform_next = 1.0 - (time_index + 1) / (N - 1)
@@ -1295,9 +1302,9 @@ class CombineCFGSubmodule(NodeSubmodule):
         dt = (timestep - timestep_next)[0]
 
         # Project to VAE space, strip BOI/EOI
-        v_m = self.llm2vae(v_main)[1:-1]
-        v_ct = self.llm2vae(v_cfg_text)[1:-1]
-        v_ci = self.llm2vae(v_cfg_img)[1:-1]
+        v_m = self.llm2vae(v_main[1:-1])
+        v_ct = self.llm2vae(v_cfg_text[1:-1])
+        v_ci = self.llm2vae(v_cfg_img[1:-1])
 
         # CFG interval
         cfg_lo, cfg_hi = cfg_interval
