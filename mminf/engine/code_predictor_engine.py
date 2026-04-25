@@ -45,7 +45,8 @@ from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.ar_engine import AREngine
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
 from mminf.engine.kv_store import KVCacheConfig, PositionInfo, TransferEngineInfo
-from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, CudaGraphConfig, ModelInputsFromEngine
+from mminf.engine.cuda_graph_config import CudaGraphConfig
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
 from mminf.utils.profiler import range_pop, range_push
 from mminf.utils.sampling import Sampler, SamplingConfig, sample_depth_gpu
 
@@ -342,9 +343,9 @@ class CodePredictorCudaGraphRunner:
             raise NotImplementedError("CodePredictor engine does not support multiple cuda graph configs yet.")
         capture_config = configs[0]
 
-        if len(capture_config.dummy_capture_inputs) != 1:
+        if capture_config.single_request_inputs is None:
             raise NotImplementedError(
-                "CodePredictor engine currently only supports one dummy input set per graph config."
+                "CodePredictor engine requires single_request_inputs to be set."
             )
 
         # Capture largest-first so the shared memory pool allocations never
@@ -398,7 +399,7 @@ class CodePredictorCudaGraphRunner:
                 graph_walk=config.capture_graph_walk,
                 engine_inputs=engine_inputs,
                 inputs=[
-                    config.dummy_capture_inputs[0].clone() \
+                    config.single_request_inputs.clone()
                         for _ in range(bs)
                 ]
             )
