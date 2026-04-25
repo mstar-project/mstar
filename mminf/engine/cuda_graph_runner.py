@@ -142,7 +142,7 @@ class CudaGraphRunner:
                         cfg_type = config.get_config_type() 
                         if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
                             self._capture_one_basic_matched(
-                                bs, config, self.submodule
+                                key, config, self.submodule
                             )
                         elif cfg_type == CudaGraphConfigType.FLASH_INFER_PACKED:
                             self._capture_one_flashinfer_packed(
@@ -172,8 +172,6 @@ class CudaGraphRunner:
         is_decode = (total_tokens == bs)
 
         cfg = self.kv_cache_config
-        # For decode: each request has 1 new token
-        total_tokens = bs
 
         # Allocate workspace buffer for CUDA graph wrappers.
         # Each label gets its own workspace to avoid conflicts during
@@ -443,8 +441,11 @@ class CudaGraphRunner:
             # a dummy token, Talker decode needs dummy all_codes).
             template = config.single_request_inputs
             if template is None:
-                # Submodule opts out of CUDA graphs for this walk.
-                logger.info("%s.get_cuda_graph_capture_inputs returned None, skipping...", self.submodule_name)
+                logger.warning(
+                    "%s.get_cuda_graph_configs returned a BasicBatchedCudaGraphConfig "
+                    "with single_request_inputs=None for walk=%s — skipping capture",
+                    self.submodule_name, config.capture_graph_walk,
+                )
                 return
             
             dummy_inputs = [template.clone() for _ in dummy_rids]
@@ -847,7 +848,7 @@ class CodecCudaGraphRunner:
             Python-level prep that turns variable list-of-dicts inputs into a
             dict of fixed-shape packed tensors. Runs OUTSIDE the captured
             region both during capture (on dummy inputs built from the
-            config's ``dummy_capture_inputs``) and at replay (on real inputs).
+            config's ``single_request_inputs``) and at replay (on real inputs).
             May return an empty dict to signal "can't be batched" — the
             engine falls back to the eager path in that case.
 
@@ -857,10 +858,10 @@ class CodecCudaGraphRunner:
             runner can slice ``[:actual_bs]`` and index per request.
 
         get_cuda_graph_configs(device) -> list[CudaGraphConfig]
-            Each config's ``dummy_capture_inputs`` is a list of per-request
-            NameToTensorList entries (same shape as real runtime inputs).
-            The runner clones one of those entries per capture batch slot,
-            then feeds the whole list to ``submodule.preprocess``.
+            Each config's ``single_request_inputs`` is a single per-request
+            ARNodeInputs (same shape as real runtime inputs). The runner
+            clones it per capture batch slot, then feeds the resulting list
+            to ``submodule.preprocess``.
 
     Warmup flow (per config × batch size):
         1. Clone dummy per-request inputs for ``bs`` slots.
@@ -945,16 +946,16 @@ class CodecCudaGraphRunner:
     def _capture_one(
         self, bs: int, config: CudaGraphConfig, submodule: NodeSubmodule
     ) -> None:
-        if not config.dummy_capture_inputs:
+        if config.single_request_inputs is None:
             raise ValueError(
                 f"{self.submodule_name}: CudaGraphConfig for walk "
-                f"{config.capture_graph_walk!r} missing dummy_capture_inputs"
+                f"{config.capture_graph_walk!r} missing single_request_inputs"
             )
 
         # Build dummy per-request inputs (same format as real inputs) and
         # route them through the submodule's own preprocess — the AR runner
         # does the same, so the two code paths stay symmetric.
-        template = config.dummy_capture_inputs[0]
+        template = config.single_request_inputs
         dummy_rids = [
             f"__codec_cg_{config.capture_graph_walk}_{i}__" for i in range(bs)
         ]
