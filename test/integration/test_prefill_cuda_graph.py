@@ -110,7 +110,10 @@ def thinker_engine_with_runner():
     """
     from mminf.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
-    device = torch.device("cuda")
+    # The runner calls torch.cuda.set_device(self.device) inside the capture
+    # path, which refuses a bare torch.device("cuda") without an index.
+    # Production workers always pass cuda:N explicitly; mirror that here.
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
     cache_dir = os.environ.get("QWEN3_OMNI_CACHE_DIR")  # optional override
 
     model = Qwen3OmniModel(model_path_hf=QWEN3_OMNI_REPO, cache_dir=cache_dir)
