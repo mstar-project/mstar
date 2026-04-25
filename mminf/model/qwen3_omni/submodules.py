@@ -648,13 +648,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
         tensor entries the model forward actually reads (``input_embeds``,
         ``cos_3d``, ``sin_3d``). Non-tensor entries (``mrope_section``,
         ``seq_lens``, ``masks_for_talker``) are intentionally absent — the
-        runner's ``_clone_template`` only handles tensors/lists/dicts and
-        would error on lists of ints; ``forward_batched`` recovers
-        ``mrope_section`` from a class constant and reads token boundaries
-        from ``cache_manager.get_qo_indptr_buf`` instead. Per-token cos/sin
-        values come from running the real RoPE math on a sequential dummy
-        position (3 components × num_tokens) so the captured kernels see
-        non-degenerate inputs at trace time.
+        runner's static-buffer interning is tensor-only by design (non-tensor
+        entries are model-static and don't need a per-bucket buffer), so
+        ``forward_batched`` recovers ``mrope_section`` from a class constant
+        and reads token boundaries from ``cache_manager.get_qo_indptr_buf``
+        instead. Per-token cos/sin values come from running the real RoPE
+        math on a sequential dummy position (3 components × num_tokens) so
+        the captured kernels see non-degenerate inputs at trace time.
         """
         hidden_size = self.config.thinker_hidden_size
         # 3-row position grid (temporal, height, width) — same shape the eager
@@ -768,11 +768,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
         """
         assert graph_walk in ("thinker_decode", "prefill_text")
 
-        # Packed dict from FlashInferPackedCudaGraphConfig is tensor-only
-        # (the runner's _clone_template can't deep-copy scalar lists), so
-        # for prefill_text we recover mrope_section from the class constant
-        # when the kwarg is missing. Decode goes through preprocess which
-        # does pass it explicitly.
+        # Packed dict from FlashInferPackedCudaGraphConfig is tensor-only by
+        # design (the runner's static-buffer interning skips non-tensor
+        # entries), so for prefill_text we recover mrope_section from the
+        # class constant when the kwarg is missing. Decode goes through
+        # preprocess which does pass it explicitly.
         if mrope_section is None and graph_walk == "prefill_text":
             mrope_section = self.MROPE_SECTION
 
