@@ -8,6 +8,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.ar_engine import BatchedCacheManager
 from mminf.engine.base import NodeBatch
+from mminf.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
 from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
@@ -37,15 +38,51 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
-        return [BasicBatchedCudaGraphConfig(
+    PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+
+    def _build_prefill_packed(
+        self, num_tokens: int, device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Synthesize a tensor-only post-preprocess packed dict for prefill capture.
+
+        Orpheus' ``preprocess`` returns ``{"text_inputs": torch.cat(input_ids)}``;
+        ``embed_tokens`` is called inside ``_forward_prefill`` so the captured
+        static buffer is the packed (num_tokens,) long token-id tensor.
+        """
+        return {
+            "text_inputs": torch.zeros(
+                (num_tokens,), dtype=torch.long, device=device,
+            ),
+        }
+
+    def get_cuda_graph_configs(
+        self, device: torch.device,
+    ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
+        prefill_packed = {
+            num_tokens: self._build_prefill_packed(num_tokens, device)
+            for num_tokens in self.PREFILL_TOKEN_BUCKETS
+        }
+        return [
+            BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode",
                 requires_cfg=False, labels=["main"],
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
                     input_seq_len=1
                 ),
-            )]
+            ),
+            FlashInferPackedCudaGraphConfig(
+                capture_graph_walk="prefill",
+                replay_graph_walks=["prefill"],
+                packed_seq_len_to_inputs=prefill_packed,
+                requires_cfg=False,
+                labels=["main"],
+                compile=True,
+                causal_attention=True,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            ),
+        ]
     
     def prepare_inputs(
         self,
@@ -133,7 +170,16 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         text_inputs: torch.Tensor,
         **kwargs
     ) -> dict[str, NameToTensorList]:
-        """Batched forward pass for prefill and decode."""
+        """Batched forward pass for prefill and decode.
+
+        Prefill path emits per-request first-token logits via
+        ``qo_indptr_buf[1:] - 1`` last-token slicing — same pattern Thinker
+        prefill_text uses. Capture happens under
+        ``FlashInferPackedCudaGraphConfig`` so ``cache_handle.get_qo_indptr_buf("main")``
+        is non-None at capture and replay; per-rid output construction
+        mirrors decode (sentinel ``__batched_logits__`` for sample-once
+        fast path + per-rid ``{logits: [...]}`` slices).
+        """
         cache_handle = engine_inputs.cache_manager
         if graph_walk == "decode":
             return self._forward_decode_batched(
@@ -142,14 +188,39 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
                 text_inputs=text_inputs,
             )
         elif graph_walk == "prefill":
-            result = self._forward_prefill(
+            return self._forward_prefill_batched(
                 cache_handle=cache_handle,
-                text_inputs=text_inputs
+                request_ids=engine_inputs.request_ids,
+                text_inputs=text_inputs,
             )
-            # Each request gets the same first token (single-request prefill)
-            return {rid: result for rid in engine_inputs.request_ids}
         else:
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
+
+    def _forward_prefill_batched(
+        self,
+        cache_handle: BatchedCacheManager,
+        request_ids: list[str],
+        text_inputs: torch.Tensor,
+    ) -> dict[str, NameToTensorList]:
+        qo_indptr_buf = cache_handle.get_qo_indptr_buf("main")
+        assert qo_indptr_buf is not None, (
+            "prefill forward_batched requires a CUDA-graph "
+            "FlashInferPrefillWrapper (qo_indptr static buffer); got None."
+        )
+        last_token_indices = (qo_indptr_buf[1:] - 1).long()
+
+        cache_handle.set_active_label("main")
+        emb = self.embed_tokens(text_inputs)
+        hidden = self.language_model(emb, cache_handle=cache_handle)
+        last_hidden = hidden.index_select(0, last_token_indices)
+        logits = self.lm_head(last_hidden)  # (bs, vocab)
+
+        out: dict = {
+            rid: {"logits": [logits[i : i + 1]]}
+            for i, rid in enumerate(request_ids)
+        }
+        out["__batched_logits__"] = logits
+        return out
 
     def _forward_decode_batched(
         self,
