@@ -294,3 +294,22 @@ class ARNodeSubmodule(NodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
     ) -> dict[str, list[torch.Tensor]]:
         return outputs
+
+    def unpack_packed_outputs(
+        self,
+        static_output: dict,
+        request_ids: list[str],
+        real_seq_lens: list[int],
+        inputs: list[ARNodeInputs],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> dict[str, dict[str, list[torch.Tensor]]]:
+        """Per-rid slicing for packed sentinels emitted by the captured graph.
+
+        Decode-style submodules emit per-rid entries inside the captured
+        forward (one slice per request, fixed shape), so they don't need
+        this. Prefill-style submodules pack a (total_tokens, ...) tensor
+        whose per-request slice ends depend on real seq_lens — slicing has
+        to happen post-replay, outside the captured region. Default
+        no-ops; override and key off ``static_output`` sentinel names.
+        """
+        return {}
