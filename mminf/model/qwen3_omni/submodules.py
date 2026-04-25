@@ -1228,9 +1228,38 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
         suppress_mask: torch.Tensor | None = None,
         **kwargs,
     ):
-        assert graph_walk == "talker_decode"
+        """Batched Talker forward shared between ``talker_decode`` and ``talker_prefill``.
+
+        Decode path (1 token per request, ``hidden`` shape ``(bs, hidden)``):
+          Runs the full LLM + codec_head + suppress_mask via _forward_decode_like
+          and emits per-rid {last_hidden, logits} entries plus a ``__batched_logits__``
+          sentinel for the runner's sample-once fast path.
+
+        Prefill path (multi-token-per-request, ``hidden`` shape ``(total_tokens, hidden)``):
+          Runs only the LLM backbone — no codec_head, no sampling. Production
+          ``talker_prefill`` exists solely to populate the KV cache for the
+          subsequent ``talker_last_prefill`` + ``talker_decode_loop``, so
+          ``_forward_prefill`` returns ``{}`` in eager. We expose the post-LLM
+          hidden state under the ``__batched_talker_prefill_hidden__`` sentinel
+          purely so the parity test can compare graph vs eager hidden activations;
+          the runner's _sample_and_remap drops this key (no per-rid dict, no
+          __batched_logits__) and returns ``{rid: {} for rid in request_ids}``,
+          matching eager.
+        """
+        assert graph_walk in ("talker_decode", "talker_prefill")
+        cache_handle = engine_inputs.cache_manager
+
+        if graph_walk == "talker_prefill":
+            hidden = self.model(
+                input_embeds=input_embeds,
+                cache_handle=cache_handle,
+            )
+            return {
+                "__batched_talker_prefill_hidden__": hidden,
+            }
+
         fwd_out = self._forward_decode_like(
-            cache_handle=engine_inputs.cache_manager,
+            cache_handle=cache_handle,
             input_embeds=input_embeds,
             suppress_mask=suppress_mask,
             is_batched_decode=True
@@ -1269,7 +1298,42 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
     def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk == "talker_decode"
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
+    TALKER_PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024]
+    TALKER_PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+
+    def _build_talker_prefill_packed(
+        self, num_tokens: int, device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Synthesize a tensor-only post-preprocess packed dict for talker_prefill capture.
+
+        Talker uses standard 1D RoPE applied inside ``Qwen3OmniAttention`` via
+        ``cache_handle.apply_rope()`` (the cache manager owns the position state,
+        set up by ``plan_rope`` outside the captured region), so unlike Thinker
+        prefill_text we don't need to provide cos/sin tensors here. The captured
+        forward only reads ``input_embeds``; everything else flows through the
+        cache_handle that the runner re-plans on each replay.
+        """
+        talker_hidden_size = self.config.talker_hidden_size
+        return {
+            "input_embeds": torch.zeros(
+                (num_tokens, talker_hidden_size),
+                dtype=torch.bfloat16, device=device,
+            ),
+        }
+
+    def get_cuda_graph_configs(self, device: torch.device):
+        """Declare CUDA graph captures for ``talker_decode`` and ``talker_prefill``.
+
+        Decode uses ``BasicBatchedCudaGraphConfig`` (one capture per bs; runner
+        clones single_request_inputs and runs preprocess itself). Prefill uses
+        ``FlashInferPackedCudaGraphConfig`` (one capture per (bs, num_tokens)
+        bucket; the dict here IS the post-preprocess packed input — runner does
+        not call preprocess at capture).
+        """
+        talker_prefill_packed = {
+            num_tokens: self._build_talker_prefill_packed(num_tokens, device)
+            for num_tokens in self.TALKER_PREFILL_TOKEN_BUCKETS
+        }
         return [
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="talker_decode", requires_cfg=False, labels=["main"],
@@ -1281,7 +1345,17 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
                     input_seq_len=1
                 ),
                 capture_batch_sizes=[1, 2, 4, 8, 16]
-            )
+            ),
+            FlashInferPackedCudaGraphConfig(
+                capture_graph_walk="talker_prefill",
+                replay_graph_walks=["talker_prefill"],
+                packed_seq_len_to_inputs=talker_prefill_packed,
+                requires_cfg=False,
+                labels=["main"],
+                compile=True,
+                causal_attention=True,
+                capture_batch_sizes=self.TALKER_PREFILL_CAPTURE_BATCH_SIZES,
+            ),
         ]
     
     def get_needed_cache_labels(
