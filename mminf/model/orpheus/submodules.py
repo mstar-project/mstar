@@ -41,12 +41,10 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         return [BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode",
                 requires_cfg=False, labels=["main"],
-                dummy_capture_inputs=[
-                    ARNodeInputs(
-                        input_ids=torch.zeros(1, dtype=torch.long, device=device),
-                        input_seq_len=1
-                    )
-                ]
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_seq_len=1
+                ),
             )]
     
     def prepare_inputs(
@@ -233,7 +231,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         return [
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="snac_chunk",
-                dummy_capture_inputs=[dummy],
+                single_request_inputs=dummy,
                 capture_batch_sizes=[1, 2, 4, 8, 16],
             ),
         ]
