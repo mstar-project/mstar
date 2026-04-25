@@ -72,7 +72,10 @@ def _bring_up_thinker(cache_dir: str | None = None):
     """
     from mminf.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
-    device = torch.device("cuda")
+    # cuda_graph_runner calls torch.cuda.set_device(self.device) inside the
+    # capture path; it rejects a bare torch.device("cuda"). Use the explicit
+    # current-device index, matching how production workers pass it.
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
     model = Qwen3OmniModel(model_path_hf=QWEN3_OMNI_REPO, cache_dir=cache_dir)
     thinker = model.get_submodule("Thinker", device=str(device))
     assert thinker is not None
