@@ -790,6 +790,7 @@ class CudaGraphRunner:
             per_request_info=per_request_info,
             graph_data=graph_data,
             submodule=submodule,
+            inputs=inputs,
         )
         if self.enable_nvtx:
             range_pop(synchronize=True)
@@ -919,6 +920,7 @@ class CudaGraphRunner:
             per_request_info=per_request_info,
             graph_data=graph_data,
             submodule=submodule,
+            inputs=inputs,
         )
         if self.enable_nvtx:
             range_pop(synchronize=True)
@@ -960,22 +962,49 @@ class CudaGraphRunner:
         can then concatenate them without shape errors. input_seq_len=0 means
         these slots contribute nothing to qo_indptr, so FlashInfer's attention
         skips them at replay.
+
+        ``custom_pos_ids`` and ``tensor_inputs`` may carry the seq dim in
+        positions other than 0 (Thinker prefill_text uses ``(3, seq_len)``
+        pos_ids and ``(2, seq_len)`` talker masks); ``_zero_seq_dim`` finds
+        the matching dim by matching against the template's ``input_seq_len``.
         """
         pad = template.clone()
+        seq_len = pad.input_seq_len
         pad.input_seq_len = 0
         if pad.input_ids is not None:
             pad.input_ids = pad.input_ids[:0]
         if pad.input_embeds is not None:
             pad.input_embeds = pad.input_embeds[:0]
         if isinstance(pad.custom_pos_ids, torch.Tensor):
-            pad.custom_pos_ids = pad.custom_pos_ids[:0]
+            pad.custom_pos_ids = self._zero_seq_dim(pad.custom_pos_ids, seq_len)
         elif isinstance(pad.custom_pos_ids, dict):
-            pad.custom_pos_ids = {k: v[:0] for k, v in pad.custom_pos_ids.items()}
+            pad.custom_pos_ids = {
+                k: self._zero_seq_dim(v, seq_len) for k, v in pad.custom_pos_ids.items()
+            }
         pad.tensor_inputs = {
-            k: (v[:0] if isinstance(v, torch.Tensor) else v)
+            k: (self._zero_seq_dim(v, seq_len) if isinstance(v, torch.Tensor) else v)
             for k, v in pad.tensor_inputs.items()
         }
         return pad
+
+    @staticmethod
+    def _zero_seq_dim(tensor: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Slice the dim whose size matches ``seq_len`` to length 0.
+
+        Used to build padding inputs for prefill: the seq-dim position varies
+        across submodules (Thinker pos_ids are ``(3, seq_len)``, talker masks
+        are ``(2, seq_len)``, decode tokens are ``(seq_len,)``). Falls back to
+        ``tensor[:0]`` if no dim matches — that path is only hit when the
+        submodule has tensor fields whose shape is independent of seq_len, in
+        which case the resulting empty leading slice is a no-op for the
+        submodule's preprocess concat.
+        """
+        for dim, size in enumerate(tensor.shape):
+            if size == seq_len:
+                slicer = [slice(None)] * tensor.ndim
+                slicer[dim] = slice(0, 0)
+                return tensor[tuple(slicer)]
+        return tensor[:0]
 
     def _restore_dummy_states(
         self,
@@ -1010,6 +1039,7 @@ class CudaGraphRunner:
         per_request_info: dict[str, CurrentForwardPassInfo],
         graph_data: CudaGraphData,
         submodule: ARNodeSubmodule,
+        inputs: list[ARNodeInputs] | None = None,
     ) -> dict:
         """Sample logits + copy non-logit per-rid outputs, remapping dummy → real rids.
 
@@ -1017,6 +1047,12 @@ class CudaGraphRunner:
         sample once via Sampler.sample without per-rid concat. Fallback path
         collects per-rid logits and concatenates. Either way, dummy → real rid
         remap happens here.
+
+        After the per-rid output construction, ``submodule.unpack_packed_outputs``
+        is invoked so prefill-style submodules can slice packed sentinels (e.g.
+        ``__batched_thinker_states__``) at real per-request seq_len boundaries —
+        the captured forward can't do this slicing itself because the slice ends
+        depend on real seq_lens, which only land via plan_attention at replay.
         """
         outputs: dict = {}
 
@@ -1061,6 +1097,10 @@ class CudaGraphRunner:
                             outputs[rid][out_key] = [val.clone()]
                         else:
                             outputs[rid][out_key] = val
+            self._merge_unpacked(
+                outputs, static_output, request_ids, inputs,
+                per_request_info, submodule,
+            )
             return outputs
 
         # Fallback: collect per-rid logits and concatenate.
@@ -1097,7 +1137,44 @@ class CudaGraphRunner:
                 else:
                     outputs[rid][out_key] = val
 
+        self._merge_unpacked(
+            outputs, static_output, request_ids, inputs,
+            per_request_info, submodule,
+        )
         return outputs
+
+    def _merge_unpacked(
+        self,
+        outputs: dict,
+        static_output: dict,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs] | None,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        submodule: ARNodeSubmodule,
+    ) -> None:
+        """Invoke ``submodule.unpack_packed_outputs`` and merge per-rid keys.
+
+        No-op when ``inputs`` is None (legacy callers that haven't been wired
+        through) or when the submodule's hook returns nothing (decode-style
+        submodules whose captured forward already emits per-rid entries at
+        fixed shape).
+        """
+        if inputs is None:
+            return
+        real_seq_lens = [inp.input_seq_len for inp in inputs]
+        unpacked = submodule.unpack_packed_outputs(
+            static_output=static_output,
+            request_ids=request_ids,
+            real_seq_lens=real_seq_lens,
+            inputs=inputs,
+            per_request_info=per_request_info,
+        )
+        if not unpacked:
+            return
+        for rid, rid_out in unpacked.items():
+            outputs.setdefault(rid, {})
+            for k, v in rid_out.items():
+                outputs[rid][k] = v
 
 
 class CodecCudaGraphRunner:
