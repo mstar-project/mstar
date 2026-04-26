@@ -171,7 +171,7 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         )
         self._transfer_info = MooncakeTransferInfo(
             address=kv_cache.data_ptr(),
-            session_id=transfer_engine.get_session_id(),
+            source_session_id=transfer_engine.get_session_id(),
         )
         self._async_reader = transfer_engine.get_async_reader(
             kv_cache.device

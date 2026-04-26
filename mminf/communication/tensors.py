@@ -271,13 +271,12 @@ class MooncakeTransferEngine(TensorTransferEngine):
         )
         self._session_id = f"{hostname}:{self._engine.get_rpc_port()}"
 
-    def register_memory(self, tensor: torch.Tensor) -> int:
-        ptr, nbytes = tensor.data_ptr(), tensor.nbytes
+    def register_memory(self, ptr: int, nbytes: int) -> int:
         return self._engine.register_memory(ptr, nbytes)
     
     def get_source_info(self, tensor: torch.Tensor) -> TransferSourceInfo:
         return MooncakeTransferInfo(
-            address=tensor.data_ptr(), source_entity_id=self._session_id,
+            address=tensor.data_ptr(), source_session_id=self._session_id,
         )
 
     def unregister_memory(self, ptr: int) -> int:
@@ -708,10 +707,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         )
 
                 read_info.append(TransferReadInfo(
-                    source_session_id=info.source_info.source_session_id,
                     local_ptr=buffer.data_ptr(),
-                    remote_ptr=info.source_info.address,
                     nbytes=info.nbytes,
+                    transfer_info=info.source_info
                 ))
                 logger.debug("Started transfer read for uuid %s", info.uuid)
             fut = self._async_reader.submit(read_info)
