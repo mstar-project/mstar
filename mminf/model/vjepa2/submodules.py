@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 
+from mminf.engine.kv_store import PositionInfo
 import torch
 
 from mminf.communication.tensors import NameToTensorList
@@ -360,7 +361,7 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
         }
 
 
-class VJepa2RolloutPredictorSubmodule(NodeSubmodule):
+class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
     """Masked-predictor rollout submodule — Phase 2 autoregressive anticipation.
 
     Parity target: upstream
@@ -481,20 +482,31 @@ class VJepa2RolloutPredictorSubmodule(NodeSubmodule):
             len(enc_shapes) == 1
             and len(iters) == 1
         )
+    
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> ARNodeInputs:
+        encoder_hidden = _ensure_lead_batch_dim(inputs["encoder_hidden"][0], target_rank=3)
+        return ARNodeInputs(
+            input_embeds=encoder_hidden,
+        )
 
     def preprocess(
         self,
         graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager | None = None,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
-        # Sequential (len == 1) and batched (len > 1) share this path.
-
-        # hiii @irmak this deleted _stack_field function did:
-        # torch.cat([_ensure_lead_batch_dim(inp["tensor_name"][0], target_rank) for inp in inputs], dim=0)
-        return {"encoder_hidden": _stack_field(per_request_inputs, "encoder_hidden", target_rank=3)}
+        
+        return {
+            "encoder_hidden": torch.cat([
+                inp.input_embeds for inp in inputs
+            ], dim=0)
+        }
 
     def _rollout_step(
         self,
@@ -523,7 +535,8 @@ class VJepa2RolloutPredictorSubmodule(NodeSubmodule):
 
     def forward(
         self,
-        request_info: CurrentForwardPassInfo,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
         encoder_hidden: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
@@ -534,16 +547,16 @@ class VJepa2RolloutPredictorSubmodule(NodeSubmodule):
         """
         if encoder_hidden.dim() == 2:
             encoder_hidden = encoder_hidden.unsqueeze(0)
+        request_info = engine_inputs.single_request_info
 
         iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
+        
         logger.info(
             "VJepa2RolloutPredictorSubmodule.forward: iter=%d encoder_hidden=%s",
             iter_idx,
             tuple(encoder_hidden.shape),
         )
-
         next_encoder_hidden, predicted = self._rollout_step(encoder_hidden)
-
         # Per-request early-exit.  The DynamicLoop's ``max_iters`` is a
         # config-level upper bound (``max_rollout_horizon``); the caller's
         # ``rollout_horizon`` — snapshotted into ``step_metadata`` by
@@ -568,14 +581,14 @@ class VJepa2RolloutPredictorSubmodule(NodeSubmodule):
             "encoder_hidden": [next_encoder_hidden],
             "predicted_hidden": [predicted],
         }
-
+    
     def forward_batched(
         self,
         graph_walk: str,
-        request_ids: list[str],
-        packed_inputs: dict[str, torch.Tensor],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> dict[str, NameToTensorList]:
+        engine_inputs: ModelInputsFromEngine,
+        encoder_hidden: torch.Tensor,
+        **kwargs, # coming from preprocess output
+    )  -> dict[str, NameToTensorList]: # request_id to tensors
         """Batched rollout step across shape-homogeneous same-iter requests.
 
         ``can_batch`` guarantees all rids are at the same ``iter_idx`` (else
@@ -585,7 +598,9 @@ class VJepa2RolloutPredictorSubmodule(NodeSubmodule):
         reached — individual rids can drop out while others continue, and
         the scheduler re-batches remaining rids on the next iter.
         """
-        encoder_hidden = packed_inputs["encoder_hidden"]  # [B, N, D]
+        request_ids = engine_inputs.request_ids
+        per_request_info = engine_inputs.per_request_info
+
         if encoder_hidden.size(0) != len(request_ids):
             raise ValueError(
                 f"encoder_hidden batch dim {encoder_hidden.size(0)} does not "
@@ -618,8 +633,7 @@ class VJepa2RolloutPredictorSubmodule(NodeSubmodule):
             for i, rid in enumerate(request_ids)
         }
 
-
-class VJepa2ACPredictorSubmodule(NodeSubmodule):
+class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
     """Action-conditioned predictor (V-JEPA 2-AC).
 
     Additional required inputs vs the masked predictor: ``actions``,
@@ -672,28 +686,55 @@ class VJepa2ACPredictorSubmodule(NodeSubmodule):
             shapes.add((enc_s, act_s, st_s, ext_s))
         return len(shapes) == 1
 
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        pos_info: dict[str, PositionInfo] = {},
+    ) -> ARNodeInputs:
+        
+        encoder_hidden = _ensure_lead_batch_dim(inputs["encoder_hidden"][0], 3)
+        
+        tensor_inputs = {}
+        tensor_inputs["actions"] = _ensure_lead_batch_dim(inputs["actions"][0], 3)
+        tensor_inputs["states"] = _ensure_lead_batch_dim(inputs["states"][0], 3)
+        
+        if "extrinsics" in inputs:
+            tensor_inputs["extrinsics"] = _ensure_lead_batch_dim(inputs["extrinsics"][0], 3)
+
+        return ARNodeInputs(
+            input_embeds=encoder_hidden,
+            tensor_inputs=tensor_inputs
+        )
+    
     def preprocess(
         self,
         graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager | None = None,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
-        # hiii @irmak this deleted _stack_field function did:
-        # torch.cat([_ensure_lead_batch_dim(inp["tensor_name"][0], target_rank) for inp in inputs], dim=0)
         out: dict[str, torch.Tensor] = {
-            "encoder_hidden": _stack_field(per_request_inputs, "encoder_hidden", target_rank=3),
-            "actions": _stack_field(per_request_inputs, "actions", target_rank=3),
-            "states": _stack_field(per_request_inputs, "states", target_rank=3),
+            "encoder_hidden": torch.cat([
+                inp.input_embeds for inp in inputs
+            ], dim=0)
         }
-        if "extrinsics" in per_request_inputs[0]:
-            out["extrinsics"] = _stack_field(per_request_inputs, "extrinsics", target_rank=3)
+        out["actions"] = torch.cat([
+            inp.tensor_inputs["actions"] for inp in inputs
+        ], dim=0)
+        out["states"] = torch.cat([
+            inp.tensor_inputs["states"] for inp in inputs
+        ], dim=0)
+        if "extrinsics" in inputs[0].tensor_inputs:
+            out["extrinsics"] = torch.cat([
+                inp.tensor_inputs["extrinsics"] for inp in inputs
+            ], dim=0)
         return out
 
     def forward(
         self,
-        request_info: CurrentForwardPassInfo,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
         encoder_hidden: torch.Tensor,
         actions: torch.Tensor,
         states: torch.Tensor,
@@ -710,18 +751,19 @@ class VJepa2ACPredictorSubmodule(NodeSubmodule):
             extrinsics = extrinsics.unsqueeze(0)
         predicted = self.predictor(encoder_hidden, actions, states, extrinsics=extrinsics)
         return {"predicted_hidden": [predicted]}
-
+    
     def forward_batched(
         self,
         graph_walk: str,
-        request_ids: list[str],
-        packed_inputs: dict[str, torch.Tensor],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> dict[str, NameToTensorList]:
-        encoder_hidden = packed_inputs["encoder_hidden"]  # [B, N, D]
-        actions = packed_inputs["actions"]                # [B, T, action_dim]
-        states = packed_inputs["states"]                  # [B, T, action_dim]
-        extrinsics = packed_inputs.get("extrinsics")
+        engine_inputs: ModelInputsFromEngine,
+        encoder_hidden: torch.Tensor,
+        actions: torch.Tensor,
+        states: torch.Tensor,
+        extrinsics: torch.Tensor | None = None,
+        **kwargs, # coming from preprocess output
+    )  -> dict[str, NameToTensorList]:
+        request_ids = engine_inputs.request_ids
+        
         if encoder_hidden.size(0) != len(request_ids):
             raise ValueError(
                 f"encoder_hidden batch dim {encoder_hidden.size(0)} does not "
@@ -743,7 +785,7 @@ class VJepa2ACPredictorSubmodule(NodeSubmodule):
         }
 
 
-class VJepa2ACRolloutPredictorSubmodule(NodeSubmodule):
+class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     """Action-conditioned autoregressive rollout — Phase 3.D.
 
     **Sliding-window rollout** — diverges from upstream
@@ -869,26 +911,52 @@ class VJepa2ACRolloutPredictorSubmodule(NodeSubmodule):
             and len(ext_shapes) == 1
             and len(iters) == 1
         )
+    
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        pos_info: dict[str, PositionInfo] = {},
+    ) -> ARNodeInputs:
+        
+        encoder_hidden = _ensure_lead_batch_dim(inputs["encoder_hidden"][0], 3)
+        
+        tensor_inputs = {}
+        tensor_inputs["actions"] = _ensure_lead_batch_dim(inputs["actions"][0], 3)
+        tensor_inputs["states"] = _ensure_lead_batch_dim(inputs["states"][0], 3)
+        
+        if "extrinsics" in inputs:
+            tensor_inputs["extrinsics"] = _ensure_lead_batch_dim(inputs["extrinsics"][0], 3)
 
+        return ARNodeInputs(
+            input_embeds=encoder_hidden,
+            tensor_inputs=tensor_inputs
+        )
+    
     def preprocess(
         self,
         graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager | None = None,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
-        # hiii @irmak this deleted _stack_field function did:
-        # torch.cat([_ensure_lead_batch_dim(inp["tensor_name"][0], target_rank) for inp in inputs], dim=0)
         out: dict[str, torch.Tensor] = {
-            "encoder_hidden": _stack_field(per_request_inputs, "encoder_hidden", target_rank=3),
-            "actions": _stack_field(per_request_inputs, "actions", target_rank=3),
-            "states": _stack_field(per_request_inputs, "states", target_rank=3),
+            "encoder_hidden": torch.cat([
+                inp.input_embeds for inp in inputs
+            ], dim=0)
         }
-        if "extrinsics" in per_request_inputs[0]:
-            out["extrinsics"] = _stack_field(per_request_inputs, "extrinsics", target_rank=3)
+        out["actions"] = torch.cat([
+            inp.tensor_inputs["actions"] for inp in inputs
+        ], dim=0)
+        out["states"] = torch.cat([
+            inp.tensor_inputs["states"] for inp in inputs
+        ], dim=0)
+        if "extrinsics" in inputs[0].tensor_inputs:
+            out["extrinsics"] = torch.cat([
+                inp.tensor_inputs["extrinsics"] for inp in inputs
+            ], dim=0)
         return out
-
+    
     def _rollout_step(
         self,
         encoder_hidden: torch.Tensor,   # [B, N, D]
@@ -947,13 +1015,16 @@ class VJepa2ACRolloutPredictorSubmodule(NodeSubmodule):
 
     def forward(
         self,
-        request_info: CurrentForwardPassInfo,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
         encoder_hidden: torch.Tensor,
         actions: torch.Tensor,
         states: torch.Tensor,
         extrinsics: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
+        request_info = engine_inputs.single_request_info
+
         if encoder_hidden.dim() == 2:
             encoder_hidden = encoder_hidden.unsqueeze(0)
         if actions.dim() == 2:
@@ -1007,14 +1078,17 @@ class VJepa2ACRolloutPredictorSubmodule(NodeSubmodule):
     def forward_batched(
         self,
         graph_walk: str,
-        request_ids: list[str],
-        packed_inputs: dict[str, torch.Tensor],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> dict[str, NameToTensorList]:
-        encoder_hidden = packed_inputs["encoder_hidden"]  # [B, N, D]
-        actions = packed_inputs["actions"]                 # [B, T_total, action_embed_dim]
-        states = packed_inputs["states"]                   # [B, T_total, action_embed_dim]
-        extrinsics = packed_inputs.get("extrinsics")
+        engine_inputs: ModelInputsFromEngine,
+        encoder_hidden: torch.Tensor, # [B, N, D]
+        actions: torch.Tensor, # [B, T_total, action_embed_dim]
+        states: torch.Tensor, # [B, T_total, action_embed_dim]
+        extrinsics: torch.Tensor | None = None,
+        **kwargs, # coming from preprocess output
+    )  -> dict[str, NameToTensorList]:
+        
+        request_ids = engine_inputs.request_ids
+        per_request_info = engine_inputs.per_request_info
+
         if encoder_hidden.size(0) != len(request_ids):
             raise ValueError(
                 f"encoder_hidden batch dim {encoder_hidden.size(0)} does not "
@@ -1078,7 +1152,7 @@ class VJepa2ACRolloutPredictorSubmodule(NodeSubmodule):
 # ---------------------------------------------------------------------------
 
 
-class VJepa2MPCPredictorSubmodule(NodeSubmodule):
+class VJepa2MPCPredictorSubmodule(ARNodeSubmodule):
     """Single-request K-way AC predictor forward.
 
     Inputs:
@@ -1100,38 +1174,54 @@ class VJepa2MPCPredictorSubmodule(NodeSubmodule):
         self.predictor = predictor
         self.config = config
 
-    def preprocess(
+    def prepare_inputs(
         self,
         graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager | None = None,
-    ) -> dict[str, torch.Tensor]:
-        # Single request — MPC is intra-request K-way.  Enforce explicitly
-        # so a future scheduler change that co-batches MPC requests trips
-        # this immediately instead of silently mis-broadcasting.
-        if len(per_request_inputs) != 1:
-            raise ValueError(
-                f"VJepa2MPCPredictorSubmodule runs one request at a time; "
-                f"got batch of {len(per_request_inputs)}."
-            )
-        inputs = per_request_inputs[0]
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        pos_info: dict[str, PositionInfo] = {},
+    ) -> ARNodeInputs:
+        
         enc = inputs["encoder_hidden"][0]
         actions = inputs["actions"][0]
         states = inputs["states"][0]
-        out: dict[str, torch.Tensor] = {
-            "encoder_hidden": enc,
+        
+        tensor_inputs: dict[str, torch.Tensor] = {
             "actions": actions,
             "states": states,
         }
         if "extrinsics" in inputs:
-            out["extrinsics"] = inputs["extrinsics"][0]
-        return out
+            tensor_inputs["extrinsics"] = inputs["extrinsics"][0]
+        
+        return ARNodeInputs(
+            input_embeds=enc,
+            tensor_inputs=tensor_inputs
+        )
+    
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
+    ) -> dict[str, torch.Tensor]:
+        # Single request — MPC is intra-request K-way.  Enforce explicitly
+        # so a future scheduler change that co-batches MPC requests trips
+        # this immediately instead of silently mis-broadcasting.
+        if len(inputs) != 1:
+            raise ValueError(
+                f"VJepa2MPCPredictorSubmodule runs one request at a time; "
+                f"got batch of {len(inputs)}."
+            )
+        inputs = inputs[0]
+        return {
+            "encoder_hidden": inputs.input_embeds,
+            **inputs.tensor_inputs
+        }
+
 
     def forward(
         self,
-        request_info: CurrentForwardPassInfo,
+        engine_inputs: ModelInputsFromEngine,
         encoder_hidden: torch.Tensor,
         actions: torch.Tensor,
         states: torch.Tensor,
@@ -1191,24 +1281,33 @@ class VJepa2MPCScorerSubmodule(NodeSubmodule):
         super().__init__()
         self.config = config
 
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> NodeInputs:
+        
+        return NodeInputs(
+            tensor_inputs={
+                "predicted_hidden": inputs["predicted_hidden"][0],
+                "goal_hidden": inputs["goal_hidden"][0],
+            }
+        )
     def preprocess(
         self,
         graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager | None = None,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor]:
-        if len(per_request_inputs) != 1:
+
+        if len(inputs) != 1:
             raise ValueError(
                 f"VJepa2MPCScorerSubmodule runs one request at a time; "
-                f"got batch of {len(per_request_inputs)}."
+                f"got batch of {len(inputs)}."
             )
-        inputs = per_request_inputs[0]
-        return {
-            "predicted_hidden": inputs["predicted_hidden"][0],
-            "goal_hidden": inputs["goal_hidden"][0],
-        }
+        return inputs[0].tensor_inputs
 
     def _cost(self, pred: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
         """Compute per-candidate cost for ``pred [K, N, D]`` vs ``goal [1, N, D]``.
@@ -1231,10 +1330,10 @@ class VJepa2MPCScorerSubmodule(NodeSubmodule):
         raise ValueError(
             f"Unknown mpc_cost_fn {fn!r}; expected one of 'l1', 'l2', 'cosine'."
         )
-
+        
     def forward(
         self,
-        request_info: CurrentForwardPassInfo,
+        engine_inputs: ModelInputsFromEngine,
         predicted_hidden: torch.Tensor,
         goal_hidden: torch.Tensor,
         **kwargs,
