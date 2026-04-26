@@ -7,9 +7,8 @@ from enum import Enum
 from typing import Any
 
 import torch
-from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-from mminf.communication.tensors import LocalTransferEngine, MooncakeTransferEngine, TensorTransferEngine, TransferReadInfo
+from mminf.communication.tensors import CudaIPCTransferEngine, CudaIPCTransferInfo, LocalTransferEngine, MooncakeTransferEngine, MooncakeTransferInfo, TensorTransferEngine, TransferReadInfo, TransferSourceInfo
 from mminf.conductor.request_info import SequenceInfo
 
 logger = logging.getLogger(__name__)
@@ -151,19 +150,12 @@ class KVTransferEngine(ABC):
         pass
 
     @abstractmethod
-    def get_kv_transfer_info(self) -> Any:
+    def get_kv_transfer_info(self) -> TransferSourceInfo:
         pass
 
     @abstractmethod
     def shutdown(self):
         pass
-
-
-@dataclass
-class MooncakeKVTransferInfo:
-    entity_id: str
-    session_id: str
-    data_ptr: int
 
 
 class MooncakeKVTransferEngine(KVTransferEngine):
@@ -177,16 +169,15 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         self._transfer_engine.register_memory(
             kv_cache.data_ptr(), kv_cache.nbytes
         )
-        self._transfer_info = MooncakeKVTransferInfo(
-            entity_id=entity_id,
+        self._transfer_info = MooncakeTransferInfo(
+            address=kv_cache.data_ptr(),
             session_id=transfer_engine.get_session_id(),
-            data_ptr=kv_cache.data_ptr()
         )
         self._async_reader = transfer_engine.get_async_reader(
             kv_cache.device
         )
     
-    def get_kv_transfer_info(self) -> MooncakeKVTransferInfo:
+    def get_kv_transfer_info(self) -> MooncakeTransferInfo:
         return self._transfer_info
     
     def _get_ptr_nbytes(
@@ -218,7 +209,7 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         return ptrs, nbytes
 
     def read_batched_async(
-        self, remote_kv_info: MooncakeKVTransferInfo,
+        self, remote_kv_info: MooncakeTransferInfo,
         read_info: list[KVReadInfo]
     ) -> Future | None:
         mooncake_read_info: list[TransferReadInfo] = []
@@ -228,12 +219,15 @@ class MooncakeKVTransferEngine(KVTransferEngine):
             )
             remote_ptrs, _ = self._get_ptr_nbytes(
                 kv_read_info=info, is_local=False,
-                base_ptr=remote_kv_info.data_ptr
+                base_ptr=remote_kv_info.address
             )
             mooncake_read_info.extend([
                 TransferReadInfo(
-                    remote_kv_info.session_id,
-                    local_ptr, remote_ptr, nbytes
+                    local_ptr=local_ptr,
+                    nbytes=nbytes,
+                    transfer_info=TransferSourceInfo(
+                        address=remote_ptr
+                    )
                 ) for local_ptr, remote_ptr in zip(local_ptrs, remote_ptrs, strict=True)
             ])
         return self._async_reader.submit(mooncake_read_info)
@@ -245,43 +239,24 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         )
 
 
-@dataclass
-class CudaIpcKVTransferInfo:
-    cuda_share: tuple
-    size: tuple
-    stride: tuple
-    offset: int
-    dtype: str
-    requires_grad: bool
-
-
-# TODO: this can also become a regular tensor transport method
 class CudaIpcKVTransferEngine(KVTransferEngine):
     def __init__(
         self, kv_cache: torch.Tensor,
         max_workers=3
     ):
-        storage = kv_cache.untyped_storage()
-        cuda_share = storage._share_cuda_()
-        self._transfer_info = CudaIpcKVTransferInfo(
-            cuda_share=cuda_share,
-            size=kv_cache.size(),
-            stride=kv_cache.stride(),
-            offset=kv_cache.storage_offset(),
-            dtype=str(kv_cache.dtype),
-            requires_grad=kv_cache.requires_grad
-        )
+        self._transfer_engine = CudaIPCTransferEngine()
+        self._transfer_info = self._transfer_engine.get_source_info(kv_cache)
         self._device = kv_cache.device
         self._kv_cache = kv_cache
 
         self._pending: list[Future] = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
     
-    def get_kv_transfer_info(self) -> CudaIpcKVTransferInfo:
+    def get_kv_transfer_info(self) -> CudaIPCTransferInfo:
         return self._transfer_info
 
     def read_batched_async(
-        self, remote_kv_info: CudaIpcKVTransferInfo,
+        self, remote_kv_info: CudaIPCTransferInfo,
         read_info: list[KVReadInfo]
     ):
         if not read_info:
@@ -294,46 +269,19 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         return future
 
     def _do_read(
-        self, remote_kv_info: CudaIpcKVTransferInfo,
+        self, remote_kv_info: CudaIPCTransferInfo,
         read_info: list[KVReadInfo],
         event: torch.Event=None
     ):
         event.synchronize()
-        dtype = getattr(torch, remote_kv_info.dtype.split(".")[-1])
-        (
-            storage_device,
-            storage_handle,
-            storage_size_bytes,
-            storage_offset_bytes,
-            ref_counter_handle,
-            ref_counter_offset,
-            event_handle,
-            event_sync_required,
-        ) = remote_kv_info.cuda_share
-
+        
         # Note: as this is a zero-copy operation and not allocating memory
         # (just building a reference to underlying storage on the sending device),
         # it is ok that this is rebuilding the whole kv cache. What matters is that,
         # in the rest of the function, we are only copying the right pages to
         # self._device. In fact, in testing, we see it is faster to call
         # rebuild_cuda_tensor on the whole KV cache instead of just the slice we need. 
-        tensor = rebuild_cuda_tensor(
-            torch.Tensor,
-            remote_kv_info.size,
-            remote_kv_info.stride,
-            remote_kv_info.offset,
-            torch.UntypedStorage,
-            dtype,
-            storage_device,
-            storage_handle,
-            storage_size_bytes,
-            storage_offset_bytes,
-            remote_kv_info.requires_grad,
-            ref_counter_handle,
-            ref_counter_offset,
-            event_handle,
-            event_sync_required,
-        )
+        tensor = self._transfer_engine.rebuild_tensor(remote_kv_info)
 
         for info in read_info:
             slice = tensor[
@@ -373,7 +321,9 @@ class PagedAllocationManager:
             )
         elif isinstance(
             transfer_engine_info.transfer_engine, LocalTransferEngine
-        ):
+        ) or isinstance(
+            transfer_engine_info.transfer_engine, CudaIPCTransferEngine
+        ): 
             self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
         else:
             raise ValueError(f"Unsupported transfer engine type: {type(transfer_engine_info.transfer_engine)}")

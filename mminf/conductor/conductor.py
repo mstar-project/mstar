@@ -351,7 +351,7 @@ class Conductor:
         uuids = []
         for info in tensor_info:
             uuid_to_ref_count = entity_id_to_msg.setdefault(
-                info.source_entity, UnpersistTensors(
+                info.source_entity_id, UnpersistTensors(
                     request_id=request_id, uuid_to_ref_count={}
                 )
             ).uuid_to_ref_count

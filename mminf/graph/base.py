@@ -40,11 +40,10 @@ class TensorPointerInfo:
     dims: list[int]
     dtype: str
     nbytes: int
-    address: int
     stride: list[int]
     uuid: str  # for indexing storage
-    source_session_id: str  # "{HOSTNAME}:{client_engine.get_rpc_port()}"
-    source_entity: str  # which {worker, api_server} the tensor is on
+    source_entity_id: str # for sending ACKs
+    source_info: Any # TransferSourceInfo
 
 
 @dataclass

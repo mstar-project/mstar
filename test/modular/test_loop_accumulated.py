@@ -13,6 +13,7 @@ import sys
 
 sys.path.insert(0, ".")
 
+from mminf.communication.tensors import TransferSourceInfo
 import pytest
 
 from mminf.graph.base import (
@@ -51,11 +52,12 @@ def _make_info(uuid_str: str) -> TensorPointerInfo:
         dims=[1],
         dtype="float32",
         nbytes=4,
-        address=0,
         stride=[1],
         uuid=uuid_str,
-        source_session_id="test",
-        source_entity="worker",
+        source_entity_id="worker",
+        source_info=TransferSourceInfo(
+            address=0
+        )
     )
 
 

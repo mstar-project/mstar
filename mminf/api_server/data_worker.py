@@ -170,6 +170,11 @@ class PreprocessWorkerThread:
             tcp_transfer_device=tcp_transfer_device,
         )
 
+        self.final_device = self.device
+        if tensor_comm_protocol == CommProtocol.IPC:
+            # cuda IPC needs GPU tensors
+            self.final_device = "cuda:0"
+
     def _process_input(
         self, input: PreprocessInput
     ):
@@ -227,6 +232,10 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
+        
+        if self.final_device != self.device:
+            for key in tensors:
+                tensors[key] = [tensor.to(self.final_device) for tensor in tensors[key]]
 
         initial_signals = self.tensor_manager.store_and_return_tensor_info(
             request_id=input.request_id,

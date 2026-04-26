@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from uuid import uuid4
+from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from mminf.graph.special_destinations import EMPTY_DESTINATION
 
@@ -109,6 +110,18 @@ class TensorStore:
 # TensorTransferEngine abstraction
 # ---------------------------------------------------------------------------
 
+@dataclass
+class TransferSourceInfo:
+    address: int
+
+
+@dataclass
+class TransferReadInfo:
+    local_ptr: int
+    nbytes: int
+    transfer_info: TransferSourceInfo
+
+
 class TensorTransferEngine(ABC):
     """Abstract interface for low-level memory registration and async reads.
 
@@ -121,6 +134,9 @@ class TensorTransferEngine(ABC):
     def register_memory(self, ptr: int, nbytes: int) -> int:
         """Register a memory region for remote access. Returns 0 on success."""
         ...
+    
+    def get_source_info(self, tensor: torch.Tensor) -> TransferSourceInfo:
+        return TransferSourceInfo(address=tensor.data_ptr())
 
     @abstractmethod
     def unregister_memory(self, ptr: int) -> int:
@@ -143,12 +159,9 @@ class TensorTransferEngine(ABC):
 # ---------------------------------------------------------------------------
 
 @dataclass
-class TransferReadInfo:
+class MooncakeTransferInfo(TransferSourceInfo):
     source_session_id: str
-    local_ptr: int
-    remote_ptr: int
-    nbytes: int
-
+    
 
 class AsyncMooncakeReader:
     """Background thread for non-blocking mooncake READ operations.
@@ -190,9 +203,9 @@ class AsyncMooncakeReader:
         self._copy_stream.synchronize()
 
         # group read_info by session id for batch read
-        grouped_read = {}
+        grouped_read: dict[str, list[TransferReadInfo]] = {}
         for info in read_info:
-            grouped_read.setdefault(info.source_session_id, []).append(info)
+            grouped_read.setdefault(info.transfer_info.source_session_id, []).append(info)
 
         for (session_id, infos) in grouped_read.items():
             for start in range(0, len(infos), self.max_batch_size):
@@ -201,7 +214,7 @@ class AsyncMooncakeReader:
                 status = self._engine.batch_transfer_sync_read(
                     session_id,
                     [infos[i].local_ptr for i in range(start, end)],
-                    [infos[i].remote_ptr for i in range(start, end)],
+                    [infos[i].transfer_info.address for i in range(start, end)],
                     [infos[i].nbytes for i in range(start, end)],
                 )
                 if status < 0:
@@ -258,8 +271,14 @@ class MooncakeTransferEngine(TensorTransferEngine):
         )
         self._session_id = f"{hostname}:{self._engine.get_rpc_port()}"
 
-    def register_memory(self, ptr: int, nbytes: int) -> int:
+    def register_memory(self, tensor: torch.Tensor) -> int:
+        ptr, nbytes = tensor.data_ptr(), tensor.nbytes
         return self._engine.register_memory(ptr, nbytes)
+    
+    def get_source_info(self, tensor: torch.Tensor) -> TransferSourceInfo:
+        return MooncakeTransferInfo(
+            address=tensor.data_ptr(), source_entity_id=self._session_id,
+        )
 
     def unregister_memory(self, ptr: int) -> int:
         return self._engine.unregister_memory(ptr)
@@ -270,6 +289,91 @@ class MooncakeTransferEngine(TensorTransferEngine):
     def get_session_id(self) -> str:
         return self._session_id
 
+
+# ---------------------------------------------------------------------------
+# CUDA IPC implementation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CudaIPCTransferInfo(TransferSourceInfo):
+    cuda_share: tuple
+    size: tuple
+    stride: tuple
+    offset: int
+    dtype: str
+    requires_grad: bool
+
+
+class CudaIPCTransferEngine(TensorTransferEngine):
+    """No-op engine for SHM / single-node — data is already in local GPU memory."""
+
+    def register_memory(self, ptr, nbytes):
+        return 0 # no memory registration required
+    
+    def get_source_info(self, tensor):
+        storage = tensor.untyped_storage()
+        cuda_share = storage._share_cuda_()
+        return CudaIPCTransferInfo(
+            address=tensor.data_ptr(),
+            cuda_share=cuda_share,
+            size=tensor.size(),
+            stride=tensor.stride(),
+            offset=tensor.storage_offset(),
+            dtype=str(tensor.dtype),
+            requires_grad=tensor.requires_grad
+        )
+
+    def rebuild_tensor(
+        self, source_info: CudaIPCTransferInfo,
+        device: torch.device | None = None
+    ):
+        (
+            storage_device,
+            storage_handle,
+            storage_size_bytes,
+            storage_offset_bytes,
+            ref_counter_handle,
+            ref_counter_offset,
+            event_handle,
+            event_sync_required,
+        ) = source_info.cuda_share
+
+        
+        tensor = rebuild_cuda_tensor(
+            torch.Tensor,
+            source_info.size,
+            source_info.stride,
+            source_info.offset,
+            torch.UntypedStorage,
+            source_info.dtype,
+            storage_device,
+            storage_handle,
+            storage_size_bytes,
+            storage_offset_bytes,
+            source_info.requires_grad,
+            ref_counter_handle,
+            ref_counter_offset,
+            event_handle,
+            event_sync_required,
+        )
+
+        if device is not None:
+            tensor = tensor.to(device)
+        return tensor
+
+    def unregister_memory(self, ptr: int) -> int:
+        return 0  # no-op
+
+    def get_async_reader(self, device) -> None:
+        return None  # TODO: make async reader
+
+    def get_session_id(self) -> str:
+        return "" # session ID is not applicable here
+
+
+# ---------------------------------------------------------------------------
+# No-op transfer engine
+# ---------------------------------------------------------------------------
 
 class LocalTransferEngine(TensorTransferEngine):
     """No-op engine for SHM / single-node — data is already in local GPU memory."""
@@ -340,10 +444,9 @@ class TensorCommunicationManager(ABC):
                     dtype=tensor.dtype,
                     stride=tensor.stride(),
                     nbytes=tensor.nbytes,
-                    address=tensor.data_ptr(),
                     uuid=tensor_uuid,
-                    source_session_id=self.my_session_id,
-                    source_entity=self.my_entity_id,
+                    source_entity_id=self.my_entity_id,
+                    source_info=self.transfer_engine.get_source_info(tensor)
                 ))
         return tensor_info
 
@@ -408,9 +511,9 @@ class TensorCommunicationManager(ABC):
         acks: dict[str, dict[str, int]] = {}
         for edge in graph_edges:
             for info in edge.tensor_info:
-                if info.source_entity not in acks:
-                    acks[info.source_entity] = {}
-                acks[info.source_entity][info.uuid] = acks[info.source_entity].get(
+                if info.source_entity_id not in acks:
+                    acks[info.source_entity_id] = {}
+                acks[info.source_entity_id][info.uuid] = acks[info.source_entity_id].get(
                     info.uuid, 0) + 1
         for source_entity, tensors in acks.items():
             if source_entity == self.my_entity_id:
@@ -573,7 +676,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 
             read_info = []
             for info in graph_edge.tensor_info:
-                if info.source_entity == self.my_entity_id or self.tensor_store.check_uuid_presence(
+                if info.source_entity_id == self.my_entity_id or self.tensor_store.check_uuid_presence(
                     request_id, info.uuid
                 ):
                     self.tensor_store.increment_ref(
@@ -596,12 +699,18 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 )
 
                 if self.protocol == CommProtocol.RDMA:
-                    self.transfer_engine.register_memory(buffer.data_ptr(), info.nbytes)
+                    success = self.transfer_engine.register_memory(
+                        buffer.data_ptr(), info.nbytes
+                    ) == 0
+                    if not success:
+                        raise RuntimeError(
+                            f"Mooncake memory registration failed for request id {request_id}, uuid {info.uuid} on read."
+                        )
 
                 read_info.append(TransferReadInfo(
-                    source_session_id=info.source_session_id,
+                    source_session_id=info.source_info.source_session_id,
                     local_ptr=buffer.data_ptr(),
-                    remote_ptr=info.address,
+                    remote_ptr=info.source_info.address,
                     nbytes=info.nbytes,
                 ))
                 logger.debug("Started transfer read for uuid %s", info.uuid)
@@ -613,6 +722,83 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 )
             )
 
+
+# ---------------------------------------------------------------------------
+# CudaIPCCommunicationManager
+# ---------------------------------------------------------------------------
+
+class CudaIPCCommunicationManager(TensorCommunicationManager):
+    def __init__(
+        self,
+        my_entity_id: str,
+        device: str,
+        communicator: BaseCommunicator,
+    ):
+        self.engine = CudaIPCTransferEngine()
+        super().__init__(
+            my_entity_id=my_entity_id,
+            my_session_id=self.engine.get_session_id(),
+            device=device,
+            communicator=communicator,
+            transfer_engine=self.engine,
+        )
+
+    def register_for_send(self, request_id, uuids, skip_cuda_sync=False):
+        if not skip_cuda_sync:
+            torch.cuda.default_stream().synchronize()
+        for uuid in uuids:
+            self.tensor_store.set_metadata(
+                request_id, uuid, mem_registered=True
+            )
+
+    def _cleanup_by_uuid(self, request_id: str, uuid: str):
+        logger.debug("Deleting tensor uuid %s", uuid)
+        if not self.tensor_store.check_uuid_presence(request_id, uuid):
+            logger.warning("Trying to cleanup tensor %s, but uuid not found", uuid)
+            return
+        self.tensor_store.remove_tensor(request_id, uuid)
+
+    def start_read_tensors(
+        self, request_id: str, graph_edges: list[GraphEdge],
+    ):
+        for graph_edge in graph_edges:
+            if len(graph_edge.tensor_info) == 0:
+                continue
+
+            logger.debug(
+                "Starting to read in %d tensors %s for graph node %s",
+                len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node
+            )
+
+            for info in graph_edge.tensor_info:
+                if info.source_entity_id == self.my_entity_id or self.tensor_store.check_uuid_presence(
+                    request_id, info.uuid
+                ):
+                    self.tensor_store.increment_ref(
+                        request_id, info.uuid, 1
+                    )
+                    continue
+
+                # TODO: async reader
+                buffer = self.engine.rebuild_tensor(
+                    source_info=info.source_info, device=self.device
+                )
+                self.tensor_store.put_tensor(
+                    request_id=request_id, uuid=info.uuid, tensor=buffer
+                )
+                self.tensor_store.set_metadata(
+                    request_id, info.uuid, mem_registered=True
+                )
+                self.tensor_store.increment_ref(
+                    request_id, info.uuid, 1
+                )
+            # needed downstream for get_ready_tensors
+            self.pending.append(
+                FutureAndPointers(
+                    future=None, graph_edges=[graph_edge],
+                    request_id=request_id
+                )
+            )
 
 # ---------------------------------------------------------------------------
 # Shared-memory tensor serialization helpers
@@ -759,11 +945,11 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                 len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node,
             )
             for info in graph_edge.tensor_info:
-                if info.source_entity == self.my_entity_id or \
+                if info.source_entity_id == self.my_entity_id or \
                    self.tensor_store.check_uuid_presence(request_id, info.uuid):
                     self.tensor_store.increment_ref(request_id, info.uuid, 1)
                     continue
-                path = self._shm_path(info.source_entity, info.uuid)
+                path = self._shm_path(info.source_entity_id, info.uuid)
                 with open(path, "rb") as f:
                     data = f.read()
                 tensor = _deserialize_tensor(data, self.device)
@@ -817,6 +1003,12 @@ def create_tensor_communication_manager(
             device=device,
             communicator=communicator,
             shm_dir=shm_dir,
+        )
+    if protocol == CommProtocol.IPC:
+        return CudaIPCCommunicationManager(
+            my_entity_id=my_entity_id,
+            device=device,
+            communicator=communicator,
         )
     return MooncakeCommunicationManager(
         my_entity_id=my_entity_id,
