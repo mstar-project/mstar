@@ -491,6 +491,9 @@ class VJepa2RolloutPredictorSubmodule(NodeSubmodule):
         cache_manager: BatchedCacheManager | None = None,
     ) -> dict[str, torch.Tensor]:
         # Sequential (len == 1) and batched (len > 1) share this path.
+
+        # hiii @irmak this deleted _stack_field function did:
+        # torch.cat([_ensure_lead_batch_dim(inp["tensor_name"][0], target_rank) for inp in inputs], dim=0)
         return {"encoder_hidden": _stack_field(per_request_inputs, "encoder_hidden", target_rank=3)}
 
     def _rollout_step(
@@ -677,6 +680,8 @@ class VJepa2ACPredictorSubmodule(NodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
         cache_manager: BatchedCacheManager | None = None,
     ) -> dict[str, torch.Tensor]:
+        # hiii @irmak this deleted _stack_field function did:
+        # torch.cat([_ensure_lead_batch_dim(inp["tensor_name"][0], target_rank) for inp in inputs], dim=0)
         out: dict[str, torch.Tensor] = {
             "encoder_hidden": _stack_field(per_request_inputs, "encoder_hidden", target_rank=3),
             "actions": _stack_field(per_request_inputs, "actions", target_rank=3),
@@ -873,6 +878,8 @@ class VJepa2ACRolloutPredictorSubmodule(NodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
         cache_manager: BatchedCacheManager | None = None,
     ) -> dict[str, torch.Tensor]:
+        # hiii @irmak this deleted _stack_field function did:
+        # torch.cat([_ensure_lead_batch_dim(inp["tensor_name"][0], target_rank) for inp in inputs], dim=0)
         out: dict[str, torch.Tensor] = {
             "encoder_hidden": _stack_field(per_request_inputs, "encoder_hidden", target_rank=3),
             "actions": _stack_field(per_request_inputs, "actions", target_rank=3),
