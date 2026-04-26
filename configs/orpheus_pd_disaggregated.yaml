@@ -1,0 +1,12 @@
+model: "orpheus"
+max_seq_len: 131072
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]
+    graph_walks: [prefill]
+  - node_names: [LLM]
+    ranks: [1]
+    graph_walks: [decode]
+  - node_names: [snac_decoder]
+    ranks: [0]
+    graph_walks: [snac_chunk]
