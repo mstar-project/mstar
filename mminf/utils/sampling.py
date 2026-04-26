@@ -385,7 +385,17 @@ def sample_tokens(
             seen_mask=seen_token_mask,
             include_greedy=run_greedy,
         )
-        torch.cuda.current_stream().synchronize()
+        # Both ``fused_temperature_softmax`` (Triton kernel via the current
+        # torch CUDA stream) and ``top_p_sampling_from_probs`` (FlashInfer
+        # via the same stream) are stream-ordered, so explicit
+        # synchronization is unnecessary in steady state. A previous fix
+        # (commit 0f62216) added an unconditional ``current_stream().synchronize()``
+        # here to work around a Triton-autotune timing issue surfacing in
+        # Qwen runs — that path is ``warmup_and_capture()``-covered now via
+        # AREngine.warmup_all, so per-call sync just costs ~30-60 µs at
+        # bs=8 H200 with no upside. If autotune misbehavior recurs, gate
+        # the sync behind a per-config "first-call" flag rather than firing
+        # every step.
         result = flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
         return result[0] if isinstance(result, tuple) else result
 
