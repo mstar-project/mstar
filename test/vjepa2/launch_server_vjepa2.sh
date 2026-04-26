@@ -28,7 +28,9 @@ PORT="${PORT:-20003}"
 
 export LD_LIBRARY_PATH="${CONDA_PREFIX:-}/lib:${LD_LIBRARY_PATH:-}"
 
-CACHE_DIR="/m-coriander/coriander/${USERNAME}/mminf_cache/vjepa2/"
+# CACHE_DIR="/m-coriander/coriander/${USERNAME}/mminf_cache/vjepa2/"
+CACHE_DIR="/mnt/storage/${USERNAME}/mminf_cache/vjepa2/"
+
 mkdir -p "${CACHE_DIR}"
 
 echo "[vjepa2] launching server"

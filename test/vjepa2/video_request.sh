@@ -13,11 +13,11 @@
 #     -> encoder-only mode (returns encoder_hidden instead of predicted_hidden)
 #
 # No test video handy?  Make a synthetic one with:
-#   python -c "
-#   import torch, torchvision
-#   frames = (torch.rand(32, 3, 256, 256) * 255).byte().permute(0, 2, 3, 1)
-#   torchvision.io.write_video('/tmp/synth.mp4', frames, fps=8)
-#   "
+# python -c "
+# import torch, torchvision
+# frames = (torch.rand(32, 3, 256, 256) * 255).byte().permute(0, 2, 3, 1)
+# torchvision.io.write_video('/tmp/synth.mp4', frames, fps=8)
+# "
 
 set -euo pipefail
 

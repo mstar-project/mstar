@@ -441,7 +441,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
     # NodeSubmodule ABC
     # ------------------------------------------------------------------
 
-    def can_batch(self, batch: NodeBatch) -> bool:
+    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         """Batch only when every request is at the same rollout iter AND
         their encoder_hidden shapes agree.
 
@@ -460,20 +460,12 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         """
         if len(batch.request_ids) < 2:
             return False
-        enc_shapes: set[tuple] = set()
+
+        enc_shapes: set[tuple] = {
+            _shape_key(inp.input_embeds) for inp in model_inputs
+        }
         iters: set[int] = set()
         for rid in batch.request_ids:
-            inputs = batch.per_request_input_tensors.get(rid, {})
-            enc_list = inputs.get("encoder_hidden")
-            if not enc_list:
-                return False
-            enc = enc_list[0]
-            if enc.dim() == 2:
-                enc_shapes.add((1, *enc.shape))
-            elif enc.dim() == 3:
-                enc_shapes.add(tuple(enc.shape))
-            else:
-                return False
             info = batch.per_request_info.get(rid)
             if info is None:
                 return False
@@ -649,7 +641,7 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
         self.predictor = predictor
         self.config = config
 
-    def can_batch(self, batch: NodeBatch) -> bool:
+    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         # B=1 → sequential forward.  See VJepa2EncoderSubmodule.can_batch
         # for the rationale — AC ViT-g warm-forward_batched measured ~20×
         # slower than warm-forward on the same input shape, so routing
@@ -859,7 +851,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     # NodeSubmodule ABC
     # ------------------------------------------------------------------
 
-    def can_batch(self, batch: NodeBatch) -> bool:
+    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         """Same rule as masked rollout: B >= 2, shape-homogeneous across
         ``encoder_hidden`` / ``actions`` / ``states`` (+ optional
         ``extrinsics``), and same ``iter_idx`` for every rid.
