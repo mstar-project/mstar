@@ -530,12 +530,10 @@ class CodePredictorCudaGraphRunner:
                 raise KeyError(f"Preprocess output key '{key}' not found in captured graph inputs")
             buf = buffers[key]
             if tensor.shape != buf.shape:
-                raise ValueError(
-                    f"Shape mismatch for input '{key}': "
-                    f"preprocessed shape {tensor.shape} vs "
-                    f"captured buffer shape {buf.shape}"
-                )
-            buf.copy_(tensor)
+                # slice along the batch size dimension
+                buf[:tensor.shape[0], *[slice(0, s) for s in tensor.shape[1:]]].copy_(tensor)
+            else:
+                buf.copy_(tensor)
 
         # --- Step 4: replay. ---
         graph_data.graph.replay()

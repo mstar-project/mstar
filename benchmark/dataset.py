@@ -101,7 +101,7 @@ class VBenchDataset(BaseDataset):
     ):
         self.cache_dir = cache_dir
         self.task = task
-        self._num_requests = nusm_requests
+        self._num_requests = num_requests
         self.items = self._load_data()
         self.items = self._resize_data(self.items)
 
