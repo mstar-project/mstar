@@ -1,4 +1,5 @@
 import ctypes
+import gc
 import logging
 import os
 import platform
@@ -310,65 +311,71 @@ class CudaIPCTransferReadInfo:
     transfer_info: TransferSourceInfo
 
 
-class AsyncCudaIPCReader:
-    """Background thread for non-blocking CUDA IPC tensor reconstruction.
+# this async reader doesn't actually speed things up, so commenting it out for now
+# class AsyncCudaIPCReader:
+#     """Background thread for non-blocking CUDA IPC tensor reconstruction.
 
-    Similar to AsyncMooncakeReader, but instead of issuing RDMA reads,
-    we rebuild tensors from CUDA IPC handles and optionally copy slices.
+#     Similar to AsyncMooncakeReader, but instead of issuing RDMA reads,
+#     we rebuild tensors from CUDA IPC handles and optionally copy slices.
 
-    The default stream is never blocked.
-    """
+#     The default stream is never blocked.
+#     """
 
-    def __init__(self, engine, device, max_workers: int = 3):
-        self._engine = engine
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
-        self._pending: list[Future] = []
+#     def __init__(self, engine, device, max_workers: int = 3):
+#         self._engine = engine
+#         self._executor = ThreadPoolExecutor(max_workers=max_workers)
+#         self._pending: list[Future] = []
 
-        self._device = device
-        if device != "cpu":
-            self._copy_stream = torch.cuda.Stream(device=device)
-        else:
-            self._copy_stream = torch.cuda.Stream()
+#         self._device = device
+#         if device != "cpu":
+#             self._copy_stream = torch.cuda.Stream(device=device)
+#         else:
+#             self._copy_stream = torch.cuda.Stream()
 
-    def submit(self, read_info: list[CudaIPCTransferReadInfo]) -> Future:
-        if not read_info:
-            return
+#     def submit(self, read_info: list[CudaIPCTransferReadInfo]) -> Future:
+#         if not read_info:
+#             return
 
-        event = torch.cuda.current_stream().record_event()
-        future = self._executor.submit(self._do_read, read_info, event)
-        self._pending.append(future)
+#         event = torch.cuda.current_stream().record_event()
+#         future = self._executor.submit(self._do_read, read_info, event)
+#         self._pending.append(future)
 
-        # prune
-        self._pending = [f for f in self._pending if not f.done()]
-        return future
+#         # prune
+#         self._pending = [f for f in self._pending if not f.done()]
+#         return future
 
-    def _do_read(self, read_info: list[CudaIPCTransferReadInfo], event: torch.cuda.Event):
-        # wait for producer writes
-        self._copy_stream.wait_event(event)
-        self._copy_stream.synchronize()
+#     def _do_read(self, read_info: list[CudaIPCTransferReadInfo], event):
+#         self._copy_stream.wait_event(event)
 
-        for info in read_info:
-            src_info: CudaIPCTransferInfo = info.transfer_info
-            remote_tensor = self._engine.rebuild_tensor(
-                src_info,
-                device=None,  # keep on original device first
-            )
+#         cache = {}
 
-            # async copy on copy stream
-            with torch.cuda.stream(self._copy_stream):
-                info.local_tensor.copy_(remote_tensor, non_blocking=True)
+#         with torch.cuda.stream(self._copy_stream):
+#             for info in read_info:
+#                 src_info: CudaIPCTransferInfo = info.transfer_info
 
-        # ensure copies finish before thread exits
-        self._copy_stream.synchronize()
+#                 key = src_info.cuda_share
+#                 if key not in cache:
+#                     cache[key] = self._engine.rebuild_tensor(
+#                         src_info,
+#                         device=None,
+#                     ).contiguous()
 
-    def wait_all(self):
-        for f in self._pending:
-            f.result()
-        self._pending.clear()
+#                 remote_tensor = cache[key]
+#                 info.local_tensor.copy_(remote_tensor, non_blocking=True)
 
-    def shutdown(self):
-        self.wait_all()
-        self._executor.shutdown(wait=True)
+#         self._copy_stream.synchronize()
+
+#         # drop references after sync
+#         cache.clear()
+
+#     def wait_all(self):
+#         for f in self._pending:
+#             f.result()
+#         self._pending.clear()
+
+#     def shutdown(self):
+#         self.wait_all()
+#         self._executor.shutdown(wait=True)
 
 
 class CudaIPCTransferEngine(TensorTransferEngine):
@@ -439,9 +446,7 @@ class CudaIPCTransferEngine(TensorTransferEngine):
         return 0  # no-op
 
     def get_async_reader(self, device) -> None:
-        return AsyncCudaIPCReader(
-            engine=self, device=device
-        )
+        return None
 
     def get_session_id(self) -> str:
         return "" # session ID is not applicable here
@@ -815,7 +820,6 @@ class CudaIPCCommunicationManager(TensorCommunicationManager):
             communicator=communicator,
             transfer_engine=self.engine,
         )
-        self._async_reader = self.engine.get_async_reader(device)
 
     def register_for_send(self, request_id, uuids, skip_cuda_sync=False):
         if not skip_cuda_sync:
@@ -844,40 +848,28 @@ class CudaIPCCommunicationManager(TensorCommunicationManager):
                 len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node
             )
 
-            read_info = []
             for info in graph_edge.tensor_info:
+                self.tensor_store.increment_ref(
+                    request_id, info.uuid, 1
+                )
                 if info.source_entity_id == self.my_entity_id or self.tensor_store.check_uuid_presence(
                     request_id, info.uuid
                 ):
-                    self.tensor_store.increment_ref(
-                        request_id, info.uuid, 1
-                    )
                     continue
 
-                buffer = torch.empty(
-                    info.dims, dtype=info.dtype, device=self.device
-                ).as_strided(info.dims, stride=info.stride)
+                buffer = self.engine.rebuild_tensor(
+                    info.source_info, device=self.device
+                )
                 self.tensor_store.put_tensor(
                     request_id=request_id, uuid=info.uuid, tensor=buffer
                 )
                 self.tensor_store.set_metadata(
                     request_id, info.uuid, mem_registered=True
                 )
-                # +1 for transit (released by get_ready_tensors)
-                # +1 for graph-node usage (released by _cleanup_consumed_inputs)
-                self.tensor_store.increment_ref(
-                    request_id, info.uuid, 2
-                )
 
-                read_info.append(CudaIPCTransferReadInfo(
-                    local_tensor=buffer,
-                    transfer_info=info.source_info
-                ))
-                logger.debug("Started transfer read for uuid %s", info.uuid)
-            fut = self._async_reader.submit(read_info)
             self.pending.append(
                 FutureAndPointers(
-                    future=fut, graph_edges=[graph_edge],
+                    future=None, graph_edges=[graph_edge],
                     request_id=request_id
                 )
             )
