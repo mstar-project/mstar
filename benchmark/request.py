@@ -529,6 +529,28 @@ class RequestInput:
     audio_path: Optional[str] = None
     video_path: Optional[str] = None
 
+    # Fix 6 — pre-loaded media. Populated by `__post_init__` when paths are
+    # provided so adapters never re-read or re-encode per request. Keeping
+    # both raw bytes (for OurSystem multipart uploads) and base64 strings
+    # (for vllm-omni data: URIs) avoids re-encoding at send time.
+    _image_bytes: Optional[bytes] = field(default=None, repr=False)
+    _audio_bytes: Optional[bytes] = field(default=None, repr=False)
+    _video_bytes: Optional[bytes] = field(default=None, repr=False)
+    _image_b64: Optional[str] = field(default=None, repr=False)
+    _audio_b64: Optional[str] = field(default=None, repr=False)
+    _video_b64: Optional[str] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        if self.image_path and self._image_bytes is None:
+            self._image_bytes = Path(self.image_path).read_bytes()
+            self._image_b64 = base64.b64encode(self._image_bytes).decode()
+        if self.audio_path and self._audio_bytes is None:
+            self._audio_bytes = Path(self.audio_path).read_bytes()
+            self._audio_b64 = base64.b64encode(self._audio_bytes).decode()
+        if self.video_path and self._video_bytes is None:
+            self._video_bytes = Path(self.video_path).read_bytes()
+            self._video_b64 = base64.b64encode(self._video_bytes).decode()
+
     def get_all_filepaths(self) -> dict[str, str]:
         res = {}
         if self.image_path:
@@ -538,6 +560,28 @@ class RequestInput:
         if self.video_path:
             res["video"] = self.video_path
         return res
+
+    def get_bytes(self, modality: str) -> Optional[bytes]:
+        return {
+            "image": self._image_bytes,
+            "audio": self._audio_bytes,
+            "video": self._video_bytes,
+        }.get(modality)
+
+    def get_b64(self, modality: str) -> Optional[str]:
+        return {
+            "image": self._image_b64,
+            "audio": self._audio_b64,
+            "video": self._video_b64,
+        }.get(modality)
+
+    def get_filename(self, modality: str) -> str:
+        path = {
+            "image": self.image_path,
+            "audio": self.audio_path,
+            "video": self.video_path,
+        }.get(modality)
+        return os.path.basename(path) if path else ""
 
 
 class InferenceSystem(ABC):
@@ -585,12 +629,14 @@ class OurSystem(InferenceSystem):
             form.add_field("model_kwargs", model_kwargs)
             form.add_field("output_modalities", output_mod)
 
-            for file_path in req_input.get_all_filepaths().values():
-                file_content = Path(file_path).read_bytes()
+            for modality in req_input.get_all_filepaths():
+                file_content = req_input.get_bytes(modality)
+                if file_content is None:
+                    continue
                 form.add_field(
                     "files",
                     file_content,
-                    filename=os.path.basename(file_path),
+                    filename=req_input.get_filename(modality),
                     content_type="application/octet-stream",
                 )
 
@@ -719,25 +765,32 @@ _SYSTEM_MESSAGE_PLAINTEXT = {
 }
 
 
-def _build_openai_user_message(prompt: str, media_type: str, media_path: Optional[str]) -> dict:
-    """Build a vllm-omni-compatible user message with OpenAI content parts."""
+def _build_openai_user_message(prompt: str, input_modality: str, req_input: RequestInput) -> dict:
+    """Build a vllm-omni-compatible user message with OpenAI content parts.
+
+    Pulls the pre-encoded base64 from `req_input.get_b64(...)` (Fix 6) so file
+    I/O and base64 encoding happen once at dataset construction, not per
+    request.
+    """
     content: list[dict] = []
-    if media_path is not None:
-        b64 = base64.b64encode(Path(media_path).read_bytes()).decode()
-        mime = (
-            mimetypes.guess_type(media_path)[0]
-            or {
-                "image": "image/jpeg",
-                "audio": "audio/wav",
-                "video": "video/mp4",
-            }[media_type]
-        )
-        content.append(
-            {
-                "type": f"{media_type}_url",
-                f"{media_type}_url": {"url": f"data:{mime};base64,{b64}"},
-            }
-        )
+    if input_modality != "text":
+        media_path = req_input.get_all_filepaths().get(input_modality)
+        b64 = req_input.get_b64(input_modality)
+        if media_path is not None and b64 is not None:
+            mime = (
+                mimetypes.guess_type(media_path)[0]
+                or {
+                    "image": "image/jpeg",
+                    "audio": "audio/wav",
+                    "video": "video/mp4",
+                }[input_modality]
+            )
+            content.append(
+                {
+                    "type": f"{input_modality}_url",
+                    f"{input_modality}_url": {"url": f"data:{mime};base64,{b64}"},
+                }
+            )
     content.append({"type": "text", "text": prompt})
     return {"role": "user", "content": content}
 
@@ -792,9 +845,7 @@ class VLLMOmni(InferenceSystem):
         )
 
         try:
-            files = req_input.get_all_filepaths()
-            media_path = files.get(input_mod) if input_mod != "text" else None
-            user_message = _build_openai_user_message(req_input.prompt, input_mod, media_path)
+            user_message = _build_openai_user_message(req_input.prompt, input_mod, req_input)
 
             modalities_arg = [output_mod] if output_mod != "text" else None
             payload: dict = {
