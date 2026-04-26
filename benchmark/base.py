@@ -27,14 +27,13 @@ class RequestType(Enum):
     V2T = "video_to_text"
     V2S = "video_to_speech"
 
-
     def get_output_modalities(self):
         if self in [RequestType.I2I, RequestType.T2I]:
             return "image"
         if self in [RequestType.T2S, RequestType.I2S, RequestType.V2S, RequestType.A2S]:
             return "audio"
         return "text"
-    
+
     def get_input_modalities(self):
         if self in [RequestType.I2I, RequestType.I2T, RequestType.I2S]:
             return "image"
@@ -48,7 +47,8 @@ class RequestType(Enum):
 class Model(ABC):
     def __init__(self, **kwargs):
         self.config = kwargs
-    
+        self._tokenizer = None
+
     def get_model_kwargs(self, request_type: RequestType):
         return {}
 
@@ -60,9 +60,20 @@ class Model(ABC):
     def get_supported_modalities(self):
         pass
 
+    def get_tokenizer(self):
+        """Lazy-load the model's HF tokenizer for per-chunk re-tokenization in
+        ITL aggregation (matches sglang.bench_serving --accept-length path).
+        Cached on the instance to avoid repeated downloads."""
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(self.get_hf_url(), trust_remote_code=True)
+        return self._tokenizer
+
 
 class Bagel(Model):
-    def __init__(self, disable_cfg: bool=False, **kwargs):
+    def __init__(self, disable_cfg: bool = False, **kwargs):
+        super().__init__(**kwargs)
         self.disable_cfg = disable_cfg
 
     def get_model_kwargs(self, request_type: RequestType):
@@ -81,29 +92,23 @@ class Bagel(Model):
 
     def get_hf_url(self):
         return "ByteDance-Seed/BAGEL-7B-MoT"
-    
+
     def get_supported_modalities(self):
-        return {
-            RequestType.T2T,
-            RequestType.T2I,
-            RequestType.I2I,
-            RequestType.I2T
-        }
+        return {RequestType.T2T, RequestType.T2I, RequestType.I2I, RequestType.I2T}
 
 
 class Orpheus(Model):
     def get_hf_url(self):
         return "canopylabs/orpheus-3b-0.1-ft"
-    
+
     def get_supported_modalities(self):
-        return {
-            RequestType.T2S
-        }
+        return {RequestType.T2S}
+
 
 class Qwen3Omni(Model):
     def get_hf_url(self):
         return "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-    
+
     def get_supported_modalities(self):
         return {
             RequestType.T2T,
@@ -113,9 +118,9 @@ class Qwen3Omni(Model):
             RequestType.A2T,
             RequestType.A2S,
             RequestType.V2T,
-            RequestType.V2S
+            RequestType.V2S,
         }
-    
+
 
 class ModelType(Enum):
     BAGEL = "bagel"
