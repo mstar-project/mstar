@@ -81,7 +81,8 @@ class FlashInferPackedCudaGraphConfig(CudaGraphConfig):
         labels: list[str]  = None,
         compile: bool = True,
         causal_attention: bool = True,
-        capture_batch_sizes: list[int] | None = None
+        capture_batch_sizes: list[int] | None = None,
+        zero_padding_input: ARNodeInputs | None = None,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -93,6 +94,7 @@ class FlashInferPackedCudaGraphConfig(CudaGraphConfig):
         )
         self.num_token_to_inputs = packed_seq_len_to_inputs
         self.causal_attention = causal_attention
+        self.zero_padding_input = zero_padding_input
 
     def get_config_type(self) -> CudaGraphConfigType:
         return CudaGraphConfigType.FLASH_INFER_PACKED

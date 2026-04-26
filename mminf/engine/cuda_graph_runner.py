@@ -160,7 +160,7 @@ class CudaGraphRunner:
                     try:
                         cfg_type = config.get_config_type()
                         if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
-                            self._capture_one_basic_matched(
+                            self._capture_one_basic_batched(
                                 key, config, self.submodule
                             )
                         elif cfg_type == CudaGraphConfigType.FLASH_INFER_PACKED:
@@ -505,7 +505,7 @@ class CudaGraphRunner:
             self._free_dummy_rids(config, dummy_rids)   
 
 
-    def _capture_one_basic_matched(
+    def _capture_one_basic_batched(
         self, key: CudaGraphKey,
         config: BasicBatchedCudaGraphConfig,
         submodule: ARNodeSubmodule,
@@ -750,7 +750,7 @@ class CudaGraphRunner:
         graph_data: CudaGraphData = self.graphs[key]
         cfg_type = graph_data.config.get_config_type()
         if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
-            return self._run_basic_matched(
+            return self._run_basic_batched(
                 key, graph_data, request_ids, inputs, per_request_info, submodule,
             )
         if cfg_type == CudaGraphConfigType.FLASH_INFER_PACKED:
@@ -759,7 +759,7 @@ class CudaGraphRunner:
             )
         raise ValueError(f"Unknown CudaGraphConfigType: {cfg_type}")
 
-    def _run_basic_matched(
+    def _run_basic_batched(
         self,
         key: CudaGraphKey,
         graph_data: CudaGraphData,
@@ -945,7 +945,12 @@ class CudaGraphRunner:
         # all required tensor fields exist as empty slices for the padding slots.
         padded_inputs = list(inputs)
         for _i in range(real_bs, padded_bs):
-            padded_inputs.append(self._zero_padding_input(inputs[0]))
+            zero_padding_inp = graph_data.config.zero_padding_input
+            if zero_padding_inp is None:
+                zero_padding_inp = self._zero_padding_input(inputs[0])
+            else:
+                zero_padding_inp = zero_padding_inp.clone()
+            padded_inputs.append(zero_padding_inp)
 
         real_metadata = self._build_replay_metadata(
             dummy_rids, request_ids, real_bs,

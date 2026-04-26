@@ -677,19 +677,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             "sin_3d": sin_3d,
         }
 
-    def _build_prefill_audio_packed(
-        self, num_tokens: int, device: torch.device,
-    ) -> dict[str, torch.Tensor]:
-        """Same packed shape as ``_build_prefill_text_packed``.
-
-        Both walks feed ``forward_batched`` an identical post-preprocess tensor
-        triple (``input_embeds``, ``cos_3d``, ``sin_3d``). The modality difference
-        (text-token embeds vs encoder-output audio embeds) only matters at
-        replay-time when ``submodule.preprocess`` re-fills the static buffers
-        with real per-request values; the captured kernels are the same.
-        """
-        return self._build_prefill_text_packed(num_tokens, device)
-
     def get_cuda_graph_configs(self, device: torch.device):
         """Declare CUDA graph captures for ``thinker_decode`` and the prefill walks.
 
@@ -710,10 +697,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         """
         prefill_text_packed = {
             num_tokens: self._build_prefill_text_packed(num_tokens, device)
-            for num_tokens in self.PREFILL_TOKEN_BUCKETS
-        }
-        prefill_audio_packed = {
-            num_tokens: self._build_prefill_audio_packed(num_tokens, device)
             for num_tokens in self.PREFILL_TOKEN_BUCKETS
         }
         return [
@@ -741,23 +724,32 @@ class ThinkerSubmodule(ARNodeSubmodule):
             ),
             FlashInferPackedCudaGraphConfig(
                 capture_graph_walk="prefill_text",
-                replay_graph_walks=["prefill_text"],
+                replay_graph_walks=["prefill_text", "prefill_audio"],
                 packed_seq_len_to_inputs=prefill_text_packed,
                 requires_cfg=False,
                 labels=["main"],
                 compile=True,
                 causal_attention=True,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-            ),
-            FlashInferPackedCudaGraphConfig(
-                capture_graph_walk="prefill_audio",
-                replay_graph_walks=["prefill_audio"],
-                packed_seq_len_to_inputs=prefill_audio_packed,
-                requires_cfg=False,
-                labels=["main"],
-                compile=True,
-                causal_attention=True,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                zero_padding_input=ARNodeInputs(
+                    input_seq_len=0,
+                    input_embeds=torch.zeros(
+                        (0, self.config.thinker_hidden_size),
+                        device=device, dtype=torch.bfloat16
+                    ),
+                    custom_pos_ids=torch.zeros(
+                        (3, 0),
+                        dtype=torch.float,
+                        device=device,
+                    ),
+                    tensor_inputs={
+                        "masks_for_talker": torch.zeros(
+                            (2, 0),
+                            dtype=torch.float,
+                            device=device,
+                        )
+                    }
+                ),
             ),
         ]
 
