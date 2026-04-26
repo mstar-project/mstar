@@ -231,10 +231,22 @@ class Sampler:
         the hot path doesn't need.
         """
         configs = [self._sampling_config[rid] for rid in request_ids]
-        temperature = torch.tensor([c.temperature for c in configs], device=logits.device)
-        top_k = torch.tensor([c.top_k for c in configs], device=logits.device, dtype=torch.int32)
-        top_p = torch.tensor([c.top_p for c in configs], device=logits.device)
-        r_pen = torch.tensor([c.repetition_penalty for c in configs], device=logits.device)
+        # Pack all four per-request scalars into one CPU list, do one H2D,
+        # then slice. Four separate ``torch.tensor([...], device='cuda')``
+        # calls each force an implicit synchronize because the source list
+        # lives in unpinned memory — combining them cuts the API overhead
+        # from 4 cudaMemcpyAsync + sync to 1. ``top_k`` is int but fits
+        # exactly in float32 for any realistic value (< 2**24).
+        B = len(configs)
+        flat = [c.temperature for c in configs]
+        flat.extend(c.top_k for c in configs)
+        flat.extend(c.top_p for c in configs)
+        flat.extend(c.repetition_penalty for c in configs)
+        params = torch.tensor(flat, device=logits.device, dtype=torch.float32)
+        temperature = params[0:B]
+        top_k = params[B:2 * B].to(torch.int32)
+        top_p = params[2 * B:3 * B]
+        r_pen = params[3 * B:4 * B]
         any_rep_pen = any(c.repetition_penalty != 1.0 for c in configs)
         any_greedy = any(c.temperature == 0 for c in configs)
         any_top_k_zero = any(c.top_k == 0 for c in configs)
