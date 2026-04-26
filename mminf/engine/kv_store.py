@@ -144,18 +144,6 @@ class KVReadInfo:
 
 class KVTransferEngine(ABC):
     @abstractmethod
-    def read_batched_sync(
-        self, remote_kv_info,
-        read_info: list[KVReadInfo]
-    ):
-        future = self.read_batched_async(
-            remote_kv_info, read_info
-        )
-        if future is None:
-            return
-        future.result()
-
-    @abstractmethod
     def read_batched_async(
         self, remote_kv_info,
         read_info: list[KVReadInfo]
@@ -248,7 +236,7 @@ class MooncakeKVTransferEngine(KVTransferEngine):
                     local_ptr, remote_ptr, nbytes
                 ) for local_ptr, remote_ptr in zip(local_ptrs, remote_ptrs, strict=True)
             ])
-        return self._async_reader.submit(read_info)
+        return self._async_reader.submit(mooncake_read_info)
 
     def shutdown(self):
         self._async_reader.shutdown()
@@ -286,7 +274,6 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         self._device = kv_cache.device
         self._kv_cache = kv_cache
 
-        self._copy_stream = torch.cuda.Stream(device=kv_cache.device)
         self._pending: list[Future] = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
     
@@ -305,23 +292,13 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         # Prune completed futures to avoid unbounded growth
         self._pending = [f for f in self._pending if not f.done()]
         return future
-    
-    def read_batched_sync(
-        self, remote_kv_info: CudaIpcKVTransferInfo,
-        read_info: list[KVReadInfo]
-    ):
-        if not read_info:
-            return
-        return self._do_read(remote_kv_info, read_info)
 
     def _do_read(
         self, remote_kv_info: CudaIpcKVTransferInfo,
         read_info: list[KVReadInfo],
         event: torch.Event=None
     ):
-        if event is not None:
-            self._copy_stream.wait_event(event)
-            self._copy_stream.synchronize()
+        event.synchronize()
         dtype = getattr(torch, remote_kv_info.dtype.split(".")[-1])
         (
             storage_device,
@@ -371,7 +348,7 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
     def shutdown(self):
         for fut in self._pending:
             fut.result()
-
+        self._executor.shutdown(wait=True)
 
 class PagedAllocationManager:
     def __init__(
@@ -524,6 +501,14 @@ class PagedAllocationManager:
                     token_start=token_start,
                     token_end=token_end
                 ))
+        # Important: in both the RDMA and SHM paths, we need to make sure that the KV
+        # cache data is ready at the producer end before the consumer reads it. Pytorch
+        # does not currently support transmitting Event objects over IPC, so we opt to
+        # use the following contract: the producer always default-stream-syncs before
+        # publishing seq_info (this currently happens in worker.py, right before sending
+        # outputs). Once torch.Event supports the interprocess flag (it's present in the
+        # function signature but currently a no-op), this path can be refatored to wait
+        # on an event on the reader end instead.
         future = self._kv_transfer_engine.read_batched_async(
             remote_kv_info=seq_info.latest_kv_transfer_info,
             read_info=read_info

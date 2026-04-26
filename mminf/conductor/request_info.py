@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+import torch
+
 from mminf.graph.loop_index import IterIndexTree
 from mminf.utils.sampling import SamplingConfig
 
