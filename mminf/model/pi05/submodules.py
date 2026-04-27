@@ -203,7 +203,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         ".norm.",   # final RMSNorm / adaRMS norm
     )
 
-    # TODO: check what numbers to actually use here
+    # For the default image size and a simple text prompt, one request is about 400 tokens
     PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
