@@ -928,78 +928,85 @@ class VLLMOmni(InferenceSystem):
 
                 _vllm_dbg_count = 0
                 _vllm_dbg_max = 6
-                async for raw_line in resp.content:
-                    chunk = _parse_sse_chunk(raw_line)
-                    if chunk is None:
+                # Use iter_any() + manual buffer instead of async-for-line.
+                # vllm-omni's older `async_chunk: false` mode emits all generated
+                # audio as ONE huge SSE message (~6+ MB base64 WAV) at the end
+                # of the stream. aiohttp's line iterator silently truncates
+                # lines that exceed its default limit; iter_any() + `\n\n`
+                # message-buffering matches vllm-omni's own bench behavior at
+                # `patch.py:391` and accepts arbitrarily large audio chunks.
+                _buffer = b""
+                async for raw_bytes in resp.content.iter_any():
+                    if not raw_bytes:
                         continue
-                    if chunk.get("_done"):
-                        # vllm-omni emits multiple `data: [DONE]` markers (one
-                        # per pipeline stage in async-chunk mode). Don't break;
-                        # keep reading until the stream is naturally closed,
-                        # matching vllm-omni's own bench behavior at
-                        # `vllm_omni/benchmarks/patch/patch.py:411`.
-                        print(f"DBG [req {request_id}]: saw [DONE] marker (continuing)", file=sys.stderr)
-                        continue
-
-                    arrival_time = time.monotonic()
-
-                    # Final usage chunk (Fix 3): authoritative token counts.
-                    usage = chunk.get("usage")
-                    if usage:
-                        ct = usage.get("completion_tokens")
-                        if ct is not None:
-                            metrics.output_text_tokens = ct
-                        pt = usage.get("prompt_tokens")
-                        if pt is not None:
-                            metrics.input_tokens = pt
-                        continue
-
-                    chunk_modality = chunk.get("modality")
-                    for choice in chunk.get("choices", []):
-                        delta = choice.get("delta") or {}
-                        content = delta.get("content")
-                        audio_obj = delta.get("audio") if isinstance(delta.get("audio"), dict) else None
-                        audio_b64_field = audio_obj.get("data") if audio_obj else None
-
-                        # DEBUG: dump first few chunks per request to see vllm-omni's actual shape
-                        if _vllm_dbg_count < _vllm_dbg_max:
-                            _vllm_dbg_count += 1
-                            print(
-                                f"DBG [req {request_id}] chunk #{_vllm_dbg_count}: "
-                                f"top_modality={chunk_modality!r}, "
-                                f"delta_keys={list(delta.keys())}, "
-                                f"content_preview={(str(content)[:60] if content else None)!r}, "
-                                f"audio_obj={audio_obj!r}",
-                                file=sys.stderr,
-                            )
-
-                        # Decide modality + payload bytes for this chunk.
-                        if content and chunk_modality == "audio":
-                            modality, data_b64 = "audio", content
-                        elif content and chunk_modality == "image":
-                            modality, data_b64 = "image", content
-                        elif content:
-                            modality = "text"
-                            data_b64 = base64.b64encode(content.encode()).decode()
-                        elif audio_b64_field:
-                            modality, data_b64 = "audio", audio_b64_field
-                        else:
-                            # DEBUG: dump unrecognized chunks (might be audio in unknown shape)
-                            print(
-                                f"DBG [req {request_id}] UNRECOGNIZED chunk: "
-                                f"top_modality={chunk_modality!r}, "
-                                f"chunk_keys={list(chunk.keys())}, "
-                                f"delta_full={delta!r}",
-                                file=sys.stderr,
-                            )
+                    _buffer += raw_bytes
+                    while b"\n\n" in _buffer:
+                        message, _buffer = _buffer.split(b"\n\n", 1)
+                        message = message.strip()
+                        if not message:
+                            continue
+                        chunk = _parse_sse_chunk(message)
+                        if chunk is None:
+                            continue
+                        if chunk.get("_done"):
+                            print(f"DBG [req {request_id}]: saw [DONE] marker (continuing)", file=sys.stderr)
                             continue
 
-                        metrics.record_output_chunk(
-                            modality=modality,
-                            data_b64=data_b64,
-                            arrival_time=arrival_time,
-                            n_tokens=1,
-                        )
+                        arrival_time = time.monotonic()
+
+                        usage = chunk.get("usage")
+                        if usage:
+                            ct = usage.get("completion_tokens")
+                            if ct is not None:
+                                metrics.output_text_tokens = ct
+                            pt = usage.get("prompt_tokens")
+                            if pt is not None:
+                                metrics.input_tokens = pt
+                            continue
+
+                        chunk_modality = chunk.get("modality")
+                        for choice in chunk.get("choices", []):
+                            delta = choice.get("delta") or {}
+                            content = delta.get("content")
+                            audio_obj = delta.get("audio") if isinstance(delta.get("audio"), dict) else None
+                            audio_b64_field = audio_obj.get("data") if audio_obj else None
+
+                            if _vllm_dbg_count < _vllm_dbg_max:
+                                _vllm_dbg_count += 1
+                                print(
+                                    f"DBG [req {request_id}] chunk #{_vllm_dbg_count}: "
+                                    f"top_modality={chunk_modality!r}, "
+                                    f"delta_keys={list(delta.keys())}, "
+                                    f"content_len={len(content) if content else 0}, "
+                                    f"audio_obj_present={audio_obj is not None}",
+                                    file=sys.stderr,
+                                )
+
+                            if content and chunk_modality == "audio":
+                                modality, data_b64 = "audio", content
+                            elif content and chunk_modality == "image":
+                                modality, data_b64 = "image", content
+                            elif content:
+                                modality = "text"
+                                data_b64 = base64.b64encode(content.encode()).decode()
+                            elif audio_b64_field:
+                                modality, data_b64 = "audio", audio_b64_field
+                            else:
+                                print(
+                                    f"DBG [req {request_id}] UNRECOGNIZED chunk: "
+                                    f"top_modality={chunk_modality!r}, "
+                                    f"chunk_keys={list(chunk.keys())}, "
+                                    f"delta_keys={list(delta.keys())}",
+                                    file=sys.stderr,
+                                )
+                                continue
+
+                            metrics.record_output_chunk(
+                                modality=modality,
+                                data_b64=data_b64,
+                                arrival_time=arrival_time,
+                                n_tokens=1,
+                            )
 
         except Exception as e:
             metrics.record_error(str(e))
