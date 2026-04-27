@@ -224,7 +224,11 @@ class CudaGraphRunner:
             # Create persistent wrappers
             plan_states = self._create_persistent_wrappers(bs, config)
 
-            # Create BatchedCacheManager with CUDA graph plan states
+            # Create BatchedCacheManager with CUDA graph plan states.
+            # Force async-plan OFF until capture is complete: CUDA forbids
+            # side-stream submissions while a stream is mid-capture, and the
+            # PlanWorkerThread submits to a side stream. Re-enabled below
+            # after the capture context exits.
             cache_manager = BatchedCacheManager(
                 request_ids=dummy_rids,
                 active_labels_per_request={rid: "main" for rid in dummy_rids},
@@ -236,6 +240,9 @@ class CudaGraphRunner:
                 cuda_graph_plan_states=plan_states,
                 auto_write_store=False
             )
+            # Disable async plan during capture (CUDA driver rejects
+            # side-stream submissions while default stream is capturing).
+            cache_manager.set_async_plan(False)
 
             # Build dummy per-request inputs via the submodule's own
             # capture-input generator. This lets each submodule declare what
@@ -359,6 +366,12 @@ class CudaGraphRunner:
                 "CudaGraphRunner: captured graph %s has_non_logit_outputs=%s",
                 key, has_non_logit,
             )
+
+            # Capture done — safe to re-enable async wrapper.plan() dispatch.
+            # Subsequent runtime calls on this static_cache_manager will
+            # offload plan() to the PlanWorkerThread; the captured graph
+            # itself doesn't change.
+            cache_manager.set_async_plan(True)
 
             self.graphs[key] = CudaGraphData(
                 graph=graph,
@@ -536,6 +549,13 @@ class CudaGraphRunner:
             range_pop(synchronize=True)
 
         # --- Step 4: Replay ---
+        # Phase 3: if plan_attention dispatched wrapper.plan() to the worker
+        # thread (BatchedCacheManager._async_plan_enabled), the plan's
+        # memcpys are on a side stream. Make the default stream wait on the
+        # plan's done_event before replay() reads wrapper buffers. No-op when
+        # async plan is disabled or no plan was dispatched.
+        for label in config_labels:
+            static_cm.wait_for_plan(label)
         if self.enable_nvtx:
             range_push("cg.replay")
         graph.replay()

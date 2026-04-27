@@ -1,9 +1,14 @@
-from dataclasses import dataclass
+import logging
+import queue as _queue
+import threading
+from dataclasses import dataclass, field
 
 import torch
 
 from mminf.engine.kv_store import KVCacheConfig, KVRequestState, PagedAllocationManager
 from mminf.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPrefillWrapper
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -17,11 +22,110 @@ class _PlanState:
     In CUDA graph mode, wrapper is a persistent FlashInferPrefillWrapper or
     FlashInferDecodeWrapper created once during capture. plan_attention()
     calls wrapper.plan() which updates static buffers via .copy_().
+
+    ``pending_plan_event`` is set when plan_attention dispatched
+    ``wrapper.plan()`` to the PlanWorkerThread (Phase 3); callers must
+    wait on it before any kernel that reads wrapper buffers (i.e.,
+    before run_attention or graph.replay()).
     """
     wrapper: FlashInferPrefillWrapper | FlashInferDecodeWrapper | None = None
     pos_ids: torch.Tensor | None = None
     seq_lens: list[int] | None = None
     write_store: bool = True
+    pending_plan_event: "torch.cuda.Event | None" = None
+
+
+@dataclass
+class _PlanRequest:
+    """One wrapper.plan() call dispatched to the worker thread.
+
+    The worker invokes ``wrapper.plan(**kwargs)`` on its dedicated CUDA
+    stream, then records ``done_event`` on that stream. The caller waits
+    on ``done_event`` from the default stream (cross-stream wait) before
+    issuing kernels that read wrapper buffers.
+    """
+    wrapper: object  # FlashInferDecodeWrapper | FlashInferPrefillWrapper
+    kwargs: dict
+    done_event: "torch.cuda.Event"
+    cpu_done: threading.Event = field(default_factory=threading.Event)
+
+
+class _PlanWorkerThread(threading.Thread):
+    """Phase-3 of the async-worker redesign (see ``ASYNC_REDESIGN.md``).
+
+    Runs ``wrapper.plan()`` calls off the main thread on a dedicated CUDA
+    stream. plan() is dominated by Python/C++ bookkeeping inside FlashInfer
+    (~700-1000 µs) plus a handful of cudaMemcpyAsyncs and an internal D→H
+    CUB-scan read; moving it off the main thread frees main to run other
+    CPU work concurrently. The dedicated stream keeps plan's GPU work off
+    the default stream so it doesn't interfere with the previous step's
+    in-flight kernels — the caller cross-stream-waits via the recorded
+    ``done_event`` before any subsequent kernel that reads wrapper state.
+    """
+
+    def __init__(self, device: torch.device, name: str = "mminf-plan-worker"):
+        super().__init__(daemon=True, name=name)
+        self._device = device
+        self._queue: "_queue.Queue[_PlanRequest | None]" = _queue.Queue()
+        self._stop = threading.Event()
+        self._stream: "torch.cuda.Stream | None" = None  # lazy-init in run()
+
+    def run(self) -> None:
+        # Allocate the dedicated stream on the worker thread itself so it's
+        # owned by this thread's context (avoids cross-thread stream issues
+        # when the worker enters ``torch.cuda.stream(...)``).
+        self._stream = torch.cuda.Stream(device=self._device)
+        while not self._stop.is_set():
+            try:
+                req = self._queue.get(timeout=0.05)
+            except _queue.Empty:
+                continue
+            if req is None:
+                self._queue.task_done()
+                break
+            try:
+                with torch.cuda.stream(self._stream):
+                    req.wrapper.plan(**req.kwargs)
+                    req.done_event.record(self._stream)
+            except Exception:
+                logger.exception("PlanWorkerThread: error during wrapper.plan()")
+                # Record the event anyway so the caller's cross-stream wait
+                # doesn't hang. Replay will hit the same error path on its own.
+                try:
+                    req.done_event.record(self._stream)
+                except Exception:
+                    pass
+            finally:
+                req.cpu_done.set()
+                self._queue.task_done()
+
+    def submit(self, req: _PlanRequest) -> None:
+        self._queue.put(req)
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._queue.put_nowait(None)
+        except _queue.Full:
+            pass
+
+
+# Module-level singleton: one PlanWorkerThread per (process, device). Lazy-
+# created on first BatchedCacheManager instantiation so test/dummy paths
+# that never trigger CUDA graph mode don't pay the worker-thread overhead.
+_PLAN_WORKER_LOCK = threading.Lock()
+_PLAN_WORKERS: dict[torch.device, _PlanWorkerThread] = {}
+
+
+def _get_plan_worker(device: torch.device) -> _PlanWorkerThread:
+    key = device
+    with _PLAN_WORKER_LOCK:
+        worker = _PLAN_WORKERS.get(key)
+        if worker is None or not worker.is_alive():
+            worker = _PlanWorkerThread(device=device)
+            worker.start()
+            _PLAN_WORKERS[key] = worker
+    return worker
 
 
 class WorkspaceBufferManager:
@@ -63,7 +167,8 @@ class BatchedCacheManager:
         kv_cache_config: KVCacheConfig,
         device,
         cuda_graph_plan_states: dict[str, _PlanState] | None = None,
-        auto_write_store: bool=False
+        auto_write_store: bool=False,
+        async_plan: bool = True,
     ):
         self.request_ids = request_ids
         self.active_labels = active_labels_per_request  # {req_id: label}
@@ -88,9 +193,30 @@ class BatchedCacheManager:
         else:
             self._plan_states: dict[str, _PlanState] = {}
 
+        # Phase 3: dispatch wrapper.plan() to a worker thread on a dedicated
+        # CUDA stream. Only enabled in CUDA-graph mode (where plan() runs
+        # outside the captured graph). Eager-mode plan still runs inline.
+        # ``CudaGraphRunner`` toggles this off via ``set_async_plan(False)``
+        # around graph capture (CUDA forbids non-capture-stream submissions
+        # while another stream is mid-capture in the same process), and
+        # re-enables it for runtime replay.
+        self._async_plan_initial = bool(
+            async_plan and self._cuda_graph_mode and torch.cuda.is_available()
+        )
+        self._async_plan_enabled = self._async_plan_initial
+
         self.base_pos_ids = torch.arange(
             kv_cache_config.max_seq_len, dtype=torch.long, device=device
         )
+
+    def set_async_plan(self, enabled: bool) -> None:
+        """Toggle async plan dispatch. CudaGraphRunner disables this around
+        warmup_and_capture (CUDA driver forbids side-stream submissions
+        during graph capture) and re-enables it for runtime replay.
+        """
+        if enabled and not self._async_plan_initial:
+            return  # cannot enable on a manager that wasn't constructed for it
+        self._async_plan_enabled = enabled
 
     @torch.compiler.disable
     def _get_state(self, request_id: str, label: str | None = None) -> KVRequestState:
@@ -302,14 +428,14 @@ class BatchedCacheManager:
         # If sample(N) ever runs shorter than plan(N+1) (short prefill, very
         # small batch), main thread waits — still no worse than today.
         if isinstance(wrapper, FlashInferDecodeWrapper):
-            wrapper.plan(
+            plan_kwargs = dict(
                 paged_kv_indptr=paged_kv_indptr,
                 paged_kv_indices=paged_kv_indices,
                 paged_kv_last_page_len=paged_kv_last_page_len,
                 dtype=dtype,
             )
         else:
-            wrapper.plan(
+            plan_kwargs = dict(
                 qo_indptr=qo_indptr,
                 paged_kv_indptr=paged_kv_indptr,
                 paged_kv_indices=paged_kv_indices,
@@ -317,12 +443,71 @@ class BatchedCacheManager:
                 causal=is_causal,
                 dtype=dtype,
             )
+
+        # During CUDA graph capture, plan() must run synchronously so its
+        # memcpy effects are visible to the captured kernels via stream
+        # ordering, and so we don't accidentally entangle the worker's
+        # side stream with the captured graph.
+        capturing = (
+            torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
+        )
+        if self._async_plan_enabled and not capturing:
+            # Dispatch wrapper.plan() to the plan worker thread; record an
+            # event on its dedicated stream. ``wait_for_plan(label)`` must be
+            # called before any kernel that reads wrapper buffers (e.g.,
+            # graph.replay()). The combined-H2D tensor ``combined_t`` and
+            # its slices stay alive via the closure inside _PlanRequest, so
+            # the worker can safely cudaMemcpy from them.
+            done_event = torch.cuda.Event()
+            req = _PlanRequest(
+                wrapper=wrapper,
+                kwargs=plan_kwargs,
+                done_event=done_event,
+            )
+            _get_plan_worker(self.device).submit(req)
+            # Don't block on ``cpu_done``: between this dispatch and the
+            # caller's next kernel-launching read of wrapper state (i.e.,
+            # ``graph.replay()`` via ``wait_for_plan``), main thread runs
+            # only ``plan_rope`` (touches ``_plan_states.pos_ids`` not the
+            # wrapper) and ``cg.copy_inputs`` (static-buffer copies, also
+            # wrapper-independent). FlashInfer wrapper Python attrs set by
+            # plan() (``_n_req``, ``dtype``) are not read after capture, so
+            # main never observes mid-update Python state in the steady
+            # state. ``wait_for_plan`` serializes the GPU side via the
+            # cross-stream event before replay reads wrapper buffers.
+            ps.pending_plan_event = done_event
+        else:
+            wrapper.plan(**plan_kwargs)
+            ps.pending_plan_event = None
+
         # seq_lens is read by the flush_to_store path; write_store by
         # run_attention. The page_indices / page_offsets / token_offsets /
         # per_req_page_indices fields were legacy bookkeeping and had no
         # reader — dropped along with their per-rid GPU construction above.
         ps.seq_lens = seq_lens
         ps.write_store = write_store
+
+    def wait_for_plan(self, label: str | None = None) -> None:
+        """Make the default CUDA stream wait for any in-flight plan() work.
+
+        Call this before issuing kernels that read the wrapper's plan
+        buffers (e.g., ``graph.replay()``). When ``async_plan`` is disabled
+        or no plan was dispatched, this is a no-op.
+        """
+        if not self._async_plan_enabled:
+            return
+        if label is None:
+            labels = list(self.active_labels.values())
+            if not labels:
+                return
+            assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
+            label = next(iter(self.active_labels.values()))
+        ps = self._plan_states.get(label)
+        if ps is None or ps.pending_plan_event is None:
+            return
+        ps.pending_plan_event.wait(torch.cuda.current_stream(self.device))
+        ps.pending_plan_event = None
 
     def plan_rope(
         self,
