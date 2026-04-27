@@ -58,16 +58,22 @@ class Pi05AdaRMSNorm(nn.Module):
     def forward(
         self, x: torch.Tensor, cond: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # reshape instead of flattening early
+        BS = cond.shape[0]
+        AH = x.shape[0] // BS
+        x = x.view(BS, AH, -1)
+
         normed = self._rms_normalize(x)
-        modulation = self.dense(cond)
-        if modulation.dim() == 1:
-            # cond was a single vector (e.g., [hidden]); broadcast to the seq.
-            scale, shift, gate = modulation.chunk(3, dim=-1)
-        else:
-            # cond was [B, hidden] -> modulation [B, 3*hidden]; add seq dim.
-            modulation = modulation.unsqueeze(-2)  # [B, 1, 3*hidden]
-            scale, shift, gate = modulation.chunk(3, dim=-1)
+
+        modulation = self.dense(cond)[:, None, :]  # [BS, 1, 3*emb_dim]
+        scale, shift, gate = modulation.chunk(3, dim=-1)
+
         normed = normed * (1.0 + scale) + shift
+
+        # flatten back if needed
+        normed = normed.view(BS * AH, -1)
+        gate = gate.expand(BS, AH, -1).reshape(BS * AH, -1)
+
         return normed, gate
 
 

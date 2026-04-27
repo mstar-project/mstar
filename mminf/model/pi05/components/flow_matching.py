@@ -8,6 +8,8 @@ import torch
 def sincos_timestep_embedding(
     t: torch.Tensor,
     dim: int,
+    fraction: torch.Tensor,
+    output_buffer: torch.Tensor,
     min_period: float = 4e-3,
     max_period: float = 4.0,
 ) -> torch.Tensor:
@@ -25,16 +27,19 @@ def sincos_timestep_embedding(
         raise ValueError(f"sincos embedding requires even dim, got {dim}")
     if t.dim() == 0:
         t = t[None]
-    half = dim // 2
-    # Geometric progression of frequencies between min_period and max_period.
-    # Use float64 for the frequency computation to match the openpi reference;
-    # bf16 has only ~3 digits of precision and rounds higher-frequency
-    # components, which compounds through time_mlp -> adaRMS -> 18 layers.
-    fraction = torch.linspace(0.0, 1.0, half, device=t.device, dtype=torch.float64)
-    period = min_period * (max_period / min_period) ** fraction
-    omega = (2.0 * math.pi / period).to(t.dtype)
-    angles = t[..., None] * omega
-    return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+    
+    period = min_period * torch.pow(max_period / min_period, fraction)
+    omega = (2.0 * torch.pi / period).to(t.dtype)
+
+    K = dim // 2
+    # angles: (N, K)
+    angles = t.unsqueeze(-1) * omega  # omega should be (K,)
+
+    # Fill in-place instead of cat
+    output_buffer[:, :K] = torch.sin(angles)
+    output_buffer[:, K:] = torch.cos(angles)
+
+    return output_buffer
 
 
 def euler_step(
