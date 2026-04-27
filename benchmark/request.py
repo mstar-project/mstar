@@ -926,8 +926,13 @@ class VLLMOmni(InferenceSystem):
                     if chunk is None:
                         continue
                     if chunk.get("_done"):
-                        print(f"DBG [req {request_id}]: hit [DONE] terminator", file=sys.stderr)
-                        break
+                        # vllm-omni emits multiple `data: [DONE]` markers (one
+                        # per pipeline stage in async-chunk mode). Don't break;
+                        # keep reading until the stream is naturally closed,
+                        # matching vllm-omni's own bench behavior at
+                        # `vllm_omni/benchmarks/patch/patch.py:411`.
+                        print(f"DBG [req {request_id}]: saw [DONE] marker (continuing)", file=sys.stderr)
+                        continue
 
                     arrival_time = time.monotonic()
 
