@@ -878,14 +878,14 @@ class VLLMOmni(InferenceSystem):
         try:
             user_message = _build_openai_user_message(req_input.prompt, input_mod, req_input)
 
-            # For audio output, request both text and audio modalities. vllm-omni's
-            # talker depends on the thinker's text output, and asking for audio-only
-            # produces an empty stream. Matches vllm-omni's own seed_tts bench
-            # convention (`patch.py:344-346`) and sglang-omni's TTS task (`tts.py:907`).
-            if output_mod == "audio":
-                modalities_arg = ["text", "audio"]
-            elif output_mod != "text":
-                modalities_arg = [output_mod]
+            # vllm-omni's server convention: omit `modalities` for audio output and
+            # let the server produce text+audio by default (this is what their own
+            # sharegpt-path bench does, see `vllm_omni/benchmarks/patch/patch.py`).
+            # Setting `modalities=["text", "audio"]` explicitly enters a different
+            # code path that filters out audio chunks. Image output still needs
+            # the explicit modality so the diffusion stage runs.
+            if output_mod == "image":
+                modalities_arg = ["image"]
             else:
                 modalities_arg = None
             payload: dict = {
