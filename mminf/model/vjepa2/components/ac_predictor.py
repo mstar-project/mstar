@@ -171,7 +171,7 @@ class ACRoPEAttention(nn.Module):
             q = merge_(q, action_q)
             k = merge_(k, action_k)
             v = merge_(v, action_v)
-
+        # TODO: FlashInfer here. replace sdpa with flashInfer kernels or add KV caching
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         x = x.transpose(1, 2).reshape(b, n, c)
         return self.proj(x)
@@ -342,23 +342,3 @@ class VisionTransformerPredictorAC(nn.Module):
         x = self.predictor_proj(x)
         return x
 
-
-def _init_ac_predictor_weights(module: nn.Module, init_std: float = 0.02) -> None:
-    """Match upstream initialization + rescale_blocks scheme.
-
-    Only used when instantiating without a checkpoint (parity-test reference
-    setup).  Real deployments load weights via the weight_loader.
-    """
-    for m in module.modules():
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=init_std)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    if isinstance(module, VisionTransformerPredictorAC):
-        for layer_id, blk in enumerate(module.predictor_blocks, start=1):
-            blk.attn.proj.weight.data.div_(math.sqrt(2.0 * layer_id))
-            blk.mlp.fc2.weight.data.div_(math.sqrt(2.0 * layer_id))

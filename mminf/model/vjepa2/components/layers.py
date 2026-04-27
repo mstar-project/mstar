@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from mminf.model.vjepa2.components.rope_utils import rotate_queries_or_keys
 from mminf.model.vjepa2.config import VJepa2Config
@@ -29,6 +30,8 @@ _ACT2FN = {
     "silu": nn.SiLU(),
 }
 
+# TODO: replace with SDPA (flashInfer does not support float32 precision)
+# x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
 def _eager_attention(
     query: torch.Tensor,
@@ -46,6 +49,37 @@ def _eager_attention(
     attn_output = torch.matmul(attn_weights, value)
     return attn_output.transpose(1, 2).contiguous()
 
+def _sdpa_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    # query/key/value: [B, H, N, D]
+    
+    # # Option 1:
+    # attn_output = F.scaled_dot_product_attention(
+    #     query.float(), # force all operations to be in float32 precision
+    #     key.float(),
+    #     value.float(),
+    #     attn_mask=None,
+    #     dropout_p=0.0,
+    #     is_causal=False,
+    # ).to(query.dtype)
+
+    # Option 2:
+    with torch.backends.cuda.sdp_kernel(
+        enable_flash=False,
+        enable_mem_efficient=False,
+        enable_math=True,
+    ):
+        attn_output = F.scaled_dot_product_attention(
+            query, key, value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+
+    return attn_output.transpose(1, 2).contiguous()
 
 class VJEPA2MLP(nn.Module):
     def __init__(self, config: VJepa2Config, hidden_size: int, mlp_ratio: float):
@@ -161,7 +195,8 @@ class VJEPA2RopeAttention(nn.Module):
         q = self.apply_rotary_embeddings(q, pos_ids)
         k = self.apply_rotary_embeddings(k, pos_ids)
 
-        context = _eager_attention(q, k, v, self.scaling)
+        # context = _eager_attention(q, k, v, self.scaling)
+        context = _sdpa_attention(q, k, v)
         context = context.reshape(*input_shape, self.all_head_size)
         return self.proj(context)
 
