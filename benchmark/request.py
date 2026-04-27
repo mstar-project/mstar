@@ -900,6 +900,7 @@ class VLLMOmni(InferenceSystem):
             payload: dict = {
                 "model": model.get_hf_url(),
                 "messages": [user_message],
+                "temperature": 0.0,  # match vllm-omni's bench (`patch.py:336`).
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 **model.get_model_kwargs(req_type),
