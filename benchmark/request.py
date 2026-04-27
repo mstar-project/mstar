@@ -909,10 +909,17 @@ class VLLMOmni(InferenceSystem):
             if modalities_arg is not None:
                 payload["modalities"] = modalities_arg
 
+            # Match vllm-omni bench headers byte-for-byte (`patch.py:354-358`)
+            # in case server-side routing depends on Authorization being present.
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+            }
             metrics.start_time = time.monotonic()
             async with session.post(
                 f"{base_url}/v1/chat/completions",
                 json=payload,
+                headers=headers,
                 read_bufsize=2**24,
                 timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
             ) as resp:
