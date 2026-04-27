@@ -1,5 +1,6 @@
 import logging
 import queue
+import threading
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
@@ -147,6 +148,15 @@ class PagedAllocationManager:
         # {req_id: {label: futures}}
         self.pending_reads: dict[str, dict[str, list[Future]]] = {}
 
+        # Reentrant lock around state-mutating operations (``alloc``,
+        # ``reset_label``, lazy state creation in ``get_state``). This is the
+        # Phase-3 prerequisite from ``cache_manager.py``'s plan-overlap TODO:
+        # a future plan-worker thread will issue ``alloc()`` for step N+1
+        # while the main thread is still mid-step-N. Reentrant because some
+        # callsites (e.g., ``start_async_retrieve``) call ``alloc`` while
+        # already holding state, and we want safe nesting.
+        self._lock = threading.RLock()
+
     @property
     def num_free_pages(self) -> int:
         return self.page_allocator.num_free
@@ -199,31 +209,34 @@ class PagedAllocationManager:
         return state
 
     def get_state(self, request_id: str, label: str):
-        if label not in self.request_states[request_id]:
-
-            self.request_states[request_id][label] = self._new_state()
-        return self.request_states[request_id][label]
+        # Lazy state creation must be serialized with concurrent ``alloc``
+        # / ``reset_label`` from a future plan-worker thread.
+        with self._lock:
+            if label not in self.request_states[request_id]:
+                self.request_states[request_id][label] = self._new_state()
+            return self.request_states[request_id][label]
 
     def alloc(
         self, request_id: str, label: str, seq_len: int
     ):
-        state = self.request_states[request_id][label]
-        num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
-        num_new_pages = num_pages_needed - len(state.page_indices)
-        if num_new_pages > 0:
-            new_pages = self.page_allocator.try_allocate(num_new_pages)
-            if new_pages is None:
-                self.alloc_status = AllocationStatus(
-                    success=False,
-                    pages_short=num_new_pages - self.page_allocator.num_free,
-                    request_id=request_id,
-                    label=label,
-                )
-                raise RuntimeError(
-                    f"Not enough free pages: requested {num_new_pages}, "
-                    f"available {self.page_allocator.num_free}"
-                )
-            state.page_indices.extend(new_pages)
+        with self._lock:
+            state = self.request_states[request_id][label]
+            num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
+            num_new_pages = num_pages_needed - len(state.page_indices)
+            if num_new_pages > 0:
+                new_pages = self.page_allocator.try_allocate(num_new_pages)
+                if new_pages is None:
+                    self.alloc_status = AllocationStatus(
+                        success=False,
+                        pages_short=num_new_pages - self.page_allocator.num_free,
+                        request_id=request_id,
+                        label=label,
+                    )
+                    raise RuntimeError(
+                        f"Not enough free pages: requested {num_new_pages}, "
+                        f"available {self.page_allocator.num_free}"
+                    )
+                state.page_indices.extend(new_pages)
 
     def wait_for_retrieves(
         self, request_id: str, label: str
@@ -326,10 +339,11 @@ class PagedAllocationManager:
 
     def reset_label(self, request_id: str, label: str, free: bool=True):
         self.wait_for_retrieves(request_id, label)
-        if label in self.request_states[request_id] and free:
-            state = self.request_states[request_id][label]
-            self.page_allocator.free(state.page_indices)
-        self.request_states[request_id][label] = self._new_state()
+        with self._lock:
+            if label in self.request_states[request_id] and free:
+                state = self.request_states[request_id][label]
+                self.page_allocator.free(state.page_indices)
+            self.request_states[request_id][label] = self._new_state()
 
     def cleanup(self):
         if self._async_reader is not None:

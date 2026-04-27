@@ -231,44 +231,76 @@ class BatchedCacheManager:
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[effective_label] = ps
 
-        # TODO(perf): overlap wrapper.plan(step N+1) with the previous step's
-        # replay+sample to hide its ~750 µs critical-path cost.
+        # TODO(perf): Phase 3 — overlap wrapper.plan(step N+1) with step N's
+        # GPU work to hide its ~1.3 ms median CPU cost from the critical
+        # path. (`PagedAllocationManager._lock` is in place; see kv_store.py.)
+        #
+        # Latest measurements (b5d64e8, bs=8 H200 colocated, NVTX sync=False):
+        #   * cg.preprocess_replan median: 1290 µs (was 1385 µs before this
+        #     fn's combined-H2D fix) — dominates the per-step CPU window
+        #     before any kernel can launch.
+        #   * cg.sample_and_remap median: 1365 µs.
+        #   * engine.ar.LLM.decode.bs8 median: 7683 µs (~6 ms of which is
+        #     GPU-bound replay).
+        #   * Pure GPU idle between consecutive bs=8 decode replays: ~3 ms
+        #     (dominated by CPU work between steps; preprocess_replan is
+        #     the largest chunk of that).
         #
         # plan() only depends on the next KV state (seq_lens + page indices),
         # not on the token sampled by the previous step, so it can be issued
         # as soon as advance_seq_lens(N) runs — well before sample(N) returns.
-        # At bs=8 on H200, sample_and_remap is ~0.9 ms vs plan ~0.75 ms, so
-        # the whole plan could in principle be hidden.
         #
-        # Design sketch (double-buffered wrappers):
-        #   * Keep two FlashInferDecodeWrappers, wrapper[0] and wrapper[1],
-        #     each with its own persistent workspace + static plan buffers.
-        #   * Step N's run() uses wrapper[N % 2]; a background worker thread
-        #     calls plan(N+1) on wrapper[(N+1) % 2] concurrently.
-        #   * Main thread join()s the plan future just before replay(N+1).
+        # Two viable design points:
+        #
+        # (A) Double-buffered wrappers.
+        #   * Two ``FlashInferDecodeWrapper``s, each with its own persistent
+        #     workspace + static plan buffers.
+        #   * Two captured CUDA graphs (one per wrapper). Memory cost: 2x
+        #     graph captures + 2x workspace.
+        #   * Step N's run() uses wrapper[N % 2]; a plan_worker thread calls
+        #     plan(N+1) on wrapper[(N+1) % 2] concurrently with replay(N).
+        #   * Main thread joins the plan future via a CUDA event before
+        #     replay(N+1).
+        #   * Full overlap: hides the entire 1.29 ms per step.
+        #
+        # (B) Single buffer + cross-step plan dispatch.
+        #   * One wrapper. plan_worker submits plan(N+1) on a side CUDA stream
+        #     after replay(N) completes (cudaEvent gates side-stream wait).
+        #   * Default stream waits for a second event before replay(N+1).
+        #   * No memory overhead. Saves CPU bookkeeping inside wrapper.plan
+        #     (~700-1000 µs internal Python/C++ work) by overlapping with
+        #     main thread's other CPU work.
+        #   * Worse-case win is bounded by main-thread work between
+        #     advance_seq_lens(N) and replay(N+1) submission — currently
+        #     ~330-530 µs of swap/copy/sample-CPU. So expected savings
+        #     ~330-500 µs/step, not the full 1290.
         #
         # Why a worker *thread* and not just a side CUDA stream:
         #   plan()'s wall-clock is dominated by CPU-side work — Python
-        #   bookkeeping, a dozen cudaMemcpyAsync API calls (~13 µs host-side
-        #   each), and two internal D→H reads (CUB scan result) that block
-        #   the calling thread. A side stream only hides plan's ~50 µs of
-        #   actual GPU kernel time; the thread still stalls on the D→H waits.
-        #   PyTorch releases the GIL inside CUDA ops, so a Python thread can
-        #   issue plan() while the main thread submits sample(N).
+        #   bookkeeping, ~10 cudaMemcpyAsync API calls (~10-15 µs host-side
+        #   each), and internal D→H reads (CUB scan result) that block the
+        #   calling thread. A side stream alone only hides plan's ~50 µs of
+        #   actual GPU kernel time. PyTorch releases the GIL inside CUDA
+        #   ops, so a Python thread can do plan()'s CPU work while the main
+        #   thread submits replay/sample.
         #
-        # Risks / prerequisites:
-        #   * PagedAllocationManager mutation (.alloc, .reset_label) is not
-        #     currently thread-safe — needs a per-manager mutex, or the
-        #     worker must operate on a snapshot captured at "end of step N".
-        #   * advance_seq_lens() inside a captured CUDA graph updates state
-        #     via .copy_(); the worker must wait on a real cudaEvent, not a
-        #     torch stream sync, before reading page indices.
-        #   * wrapper[(N+1) % 2]'s static buffers are read by the main
-        #     thread's next replay — need a handshake (Event/Condition) so
-        #     replay doesn't start before the worker finishes plan().
-        #   * If sample(N) ever runs shorter than plan(N+1) (short prefill,
-        #     very small batch), the main thread waits. Still no worse than
-        #     today.
+        # Architectural prerequisites still pending:
+        #   * Hook in CudaGraphRunner to dispatch plan(N+1) at end-of-step-N
+        #     (current run() is per-step, no inter-step state).
+        #   * For (A): a way to pass which wrapper-slot to use into the
+        #     captured-graph pre-plan flow. The capture-time
+        #     ``_PlanState.wrapper`` reference is single-valued today.
+        #   * For (B): plan_worker needs a snapshot of (request_ids,
+        #     post-advance seq_lens, page_indices) captured at end of step N
+        #     so the worker can compute index lists without racing main on
+        #     ``alloc()`` even though _lock allows concurrent calls.
+        #   * advance_seq_lens() inside a captured graph updates state via
+        #     .copy_(); plan_worker must wait on a real cudaEvent (recorded
+        #     after replay(N) on default stream), not a Python flag, before
+        #     reading the post-advance page_indices.
+        #
+        # If sample(N) ever runs shorter than plan(N+1) (short prefill, very
+        # small batch), main thread waits — still no worse than today.
         if isinstance(wrapper, FlashInferDecodeWrapper):
             wrapper.plan(
                 paged_kv_indptr=paged_kv_indptr,
