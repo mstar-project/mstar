@@ -202,7 +202,7 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
 
 def _build_default_masks(
     encoder_hidden: torch.Tensor,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+) -> tuple[list[torch.Tensor], torch.Tensor]:
     """Build full-context / full-target masks given encoder hidden states.
 
     Matches HF's default in ``VJEPA2Model.forward`` when the caller doesn't
@@ -210,7 +210,7 @@ def _build_default_masks(
     """
     b, n, _ = encoder_hidden.shape
     ids = torch.arange(n, device=encoder_hidden.device).unsqueeze(0).repeat(b, 1)
-    return [ids], [ids]
+    return ids, ids
 
 
 class VJepa2PredictorSubmodule(ARNodeSubmodule):
@@ -292,19 +292,25 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
         # Sequential (len == 1) and batched (len > 1) share this path.
+        encoder_hidden = torch.cat([
+            inp.input_embeds for inp in inputs
+        ], dim=0)
         out: dict[str, torch.Tensor] = {
-            "encoder_hidden": torch.cat([
-                inp.input_embeds for inp in inputs
-            ], dim=0)
+            "encoder_hidden": encoder_hidden
         }
-        if "context_mask" in inputs[0].tensor_inputs:
+        has_context_mask = "context_mask" in inputs[0].tensor_inputs
+        has_target_mask = "target_mask" in inputs[0].tensor_inputs
+        
+        if has_context_mask:
             out["context_mask"] = torch.cat([
                 inp.tensor_inputs["context_mask"] for inp in inputs
             ], dim=0)
-        if "target_mask" in inputs[0].tensor_inputs:
+        if has_target_mask:
             out["target_mask"] = torch.cat([
                 inp.tensor_inputs["target_mask"] for inp in inputs
             ], dim=0)
+        if (not has_context_mask) or not(has_target_mask):
+            out["context_mask"], out["target_mask"] = _build_default_masks(encoder_hidden)
         return out
 
     def forward(
@@ -322,11 +328,9 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
         )
         if encoder_hidden.dim() == 2:
             encoder_hidden = encoder_hidden.unsqueeze(0)
-        if context_mask is None or target_mask is None:
-            ctx_list, tgt_list = _build_default_masks(encoder_hidden)
-        else:
-            ctx_list = [context_mask]
-            tgt_list = [target_mask]
+
+        ctx_list = [context_mask]
+        tgt_list = [target_mask]
         predicted = self.predictor(encoder_hidden, ctx_list, tgt_list)
         logger.info("VJepa2PredictorSubmodule.forward: output shape=%s", tuple(predicted.shape))
         return {"predicted_hidden": [predicted]}
@@ -341,11 +345,9 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         request_ids = engine_inputs.request_ids
-        if context_mask is None or target_mask is None:
-            ctx_list, tgt_list = _build_default_masks(encoder_hidden)
-        else:
-            ctx_list = [context_mask]
-            tgt_list = [target_mask]
+
+        ctx_list = [context_mask]
+        tgt_list = [target_mask]
         logger.info(
             "VJepa2PredictorSubmodule.forward_batched: encoder_hidden=%s rids=%d",
             tuple(encoder_hidden.shape),
