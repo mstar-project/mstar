@@ -878,7 +878,16 @@ class VLLMOmni(InferenceSystem):
         try:
             user_message = _build_openai_user_message(req_input.prompt, input_mod, req_input)
 
-            modalities_arg = [output_mod] if output_mod != "text" else None
+            # For audio output, request both text and audio modalities. vllm-omni's
+            # talker depends on the thinker's text output, and asking for audio-only
+            # produces an empty stream. Matches vllm-omni's own seed_tts bench
+            # convention (`patch.py:344-346`) and sglang-omni's TTS task (`tts.py:907`).
+            if output_mod == "audio":
+                modalities_arg = ["text", "audio"]
+            elif output_mod != "text":
+                modalities_arg = [output_mod]
+            else:
+                modalities_arg = None
             payload: dict = {
                 "model": model.get_hf_url(),
                 "messages": [_SYSTEM_MESSAGE, user_message],
@@ -991,7 +1000,15 @@ class SGLangOmni(InferenceSystem):
         )
 
         try:
-            modalities_arg = [output_mod] if output_mod != "text" else None
+            # Same logic as VLLMOmni: audio output needs ["text", "audio"] so
+            # the talker has the thinker's text to consume. Matches sglang-omni's
+            # own TTS task convention (`benchmarks/tasks/tts.py:907`).
+            if output_mod == "audio":
+                modalities_arg = ["text", "audio"]
+            elif output_mod != "text":
+                modalities_arg = [output_mod]
+            else:
+                modalities_arg = None
             payload: dict = {
                 "model": model.get_hf_url(),
                 "messages": [
