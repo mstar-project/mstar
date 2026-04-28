@@ -165,6 +165,14 @@ class FlashInferPrefillWrapper:
 
         In CUDA graph mode, updates static buffers via .copy_() so that
         the same GPU addresses are used during graph replay.
+
+        Inputs may be on CPU — that's preferred because FlashInfer's
+        ``BatchPrefillWithPagedKVCacheWrapper.plan`` does ``indptr.to("cpu")``
+        / ``last_page_len.to("cpu")`` internally; passing GPU tensors there
+        triggers a synchronous default-stream sync that drains the
+        speculatively-queued next decode step. We let the inner plan
+        consume them as CPU and async-H2D copy to the device for our own
+        per-token bookkeeping below.
         """
         self.dtype = dtype
         self.attn_wrapper.plan(
@@ -179,6 +187,13 @@ class FlashInferPrefillWrapper:
             causal=causal,
             q_data_type=dtype,
         )
+
+        # Async H2D for the GPU-side per-token bookkeeping that follows.
+        if qo_indptr.device.type != "cuda":
+            qo_indptr = qo_indptr.to(self.device, non_blocking=True)
+            paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
+            paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
+            paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
 
         # Compute per-token page and offset for vectorized KV writes
         n_req = qo_indptr.shape[0] - 1
@@ -348,6 +363,8 @@ class FlashInferDecodeWrapper:
         For decode, each request appends exactly 1 token. The write
         location is the last page at position = last_page_len (before
         the append; after append it becomes last_page_len).
+
+        Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
         n_req = paged_kv_indptr.shape[0] - 1
 
@@ -361,6 +378,12 @@ class FlashInferDecodeWrapper:
             page_size=self.page_size,
             q_data_type=dtype,
         )
+
+        # Async H2D before our own per-rid bookkeeping.
+        if paged_kv_indptr.device.type != "cuda":
+            paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
+            paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
+            paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
 
         # Compute KV write locations: page and position for each request's new token
         page_idx = paged_kv_indices[paged_kv_indptr[1:] - 1]
