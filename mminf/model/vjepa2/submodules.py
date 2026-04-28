@@ -991,8 +991,9 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         )
 
         new_tg = self._rollout_step(
-            encoder_hidden, actions, states, extrinsics,
-            t_0=iter_idx, cache_handle=engine_inputs.cache_manager
+            encoder_hidden, actions, states,
+            t_0=iter_idx, cache_handle=engine_inputs.cache_manager,
+            extrinsics=extrinsics,
         )
 
         # Per-request early-exit — same contract as masked rollout.
@@ -1006,7 +1007,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             request_info.register_loop_stop("rollout_loop")
 
         logger.info(
-            "VJepa2ACRolloutPredictorSubmodule.forward: next_encoder_hidden=%s new_tg=%s",
+            "VJepa2ACRolloutPredictorSubmodule.forward: new_tg=%s",
             tuple(new_tg.shape),
         )
         out: NameToTensorList = {
