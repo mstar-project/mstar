@@ -957,9 +957,10 @@ class Worker:
     ) -> NodeOutput:
         """Run the engine on the GPU executor thread.
 
-        The NVTX range is pushed/popped on this thread so its
-        ``synchronize=True`` waits cover only this batch's GPU work, not the
-        main thread's CPU phases happening concurrently.
+        The NVTX range bracketing this call is ``synchronize=False`` —
+        adding a ``cudaDeviceSynchronize`` at the marker boundary would
+        drain the GPU on every iter and hide the overlap between
+        post-processing and the next step's kernel execution.
 
         After ``execute_with_max_batch_size`` returns we record a CUDA event
         on the default stream and stash it on the output. Downstream sync
@@ -982,7 +983,7 @@ class Worker:
         if self.enable_nvtx:
             range_push(
                 f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
-                synchronize=True,
+                synchronize=False,
             )
         try:
             output = engine.execute_with_max_batch_size(node_batch)
@@ -993,7 +994,7 @@ class Worker:
             return output
         finally:
             if self.enable_nvtx:
-                range_pop(synchronize=True)
+                range_pop(synchronize=False)
 
     def _handle_allocation_failure(
         self, batch: ScheduledBatch, node_batch: NodeBatch
