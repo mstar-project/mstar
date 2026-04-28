@@ -1062,6 +1062,7 @@ class SGLangOmni(InferenceSystem):
                     _SYSTEM_MESSAGE_PLAINTEXT,
                     {"role": "user", "content": req_input.prompt},
                 ],
+                "temperature": 0.0,  # match VLLMOmni — greedy for cross-system parity
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 **model.get_model_kwargs(req_type),
