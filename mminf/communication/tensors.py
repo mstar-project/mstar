@@ -323,8 +323,17 @@ class TensorCommunicationManager(ABC):
 
     def store_and_return_tensor_info(
         self, request_id: str, tensors: NameToTensorList,
+        skip_cuda_sync: bool = False,
     ) -> dict[str, list[TensorPointerInfo]]:
-        if torch.cuda.is_available():
+        # CUDA sync ensures GPU writes to ``tensors`` are visible before
+        # callers hand out ``tensor.data_ptr()`` to peers (RDMA register,
+        # SHM serialize). With same-thread async scheduling the caller
+        # has typically already synced on ``output.completion_event``
+        # (which waits for *only* the producing step, not the queued next
+        # step), so the unconditional default-stream sync here would
+        # uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from
+        # those call sites.
+        if not skip_cuda_sync and torch.cuda.is_available():
             torch.cuda.default_stream().synchronize()
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
@@ -350,6 +359,7 @@ class TensorCommunicationManager(ABC):
     def store_and_populate_graph_edges(
         self, request_id: str, tensors: NameToTensorList,
         graph_edges: list[GraphEdge],
+        skip_cuda_sync: bool = False,
     ):
         name_to_graph_edges: dict[str, list[GraphEdge]] = {}
         for edge in graph_edges:
@@ -357,6 +367,7 @@ class TensorCommunicationManager(ABC):
 
         graph_node_info = self.store_and_return_tensor_info(
             request_id=request_id, tensors=tensors,
+            skip_cuda_sync=skip_cuda_sync,
         )
         for name in tensors:
             logger.debug(

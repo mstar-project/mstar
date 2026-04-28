@@ -745,7 +745,12 @@ class Worker:
             output_tensor_info = self.tensor_manager.store_and_populate_graph_edges(
                 request_id=request_id,
                 tensors=request_output_tensors,
-                graph_edges=filtered_outputs
+                graph_edges=filtered_outputs,
+                # We already synced on output.completion_event above,
+                # which waits only for GPU(N) — the unconditional
+                # default-stream sync inside store_and_return_tensor_info
+                # would also drain the speculatively-queued GPU(N+1).
+                skip_cuda_sync=True,
             )
 
             worker_graph_id = self.worker_graphs_manager.get_worker_graph_id_for_node(
