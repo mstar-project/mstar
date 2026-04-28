@@ -1564,9 +1564,27 @@ class Worker:
         self.engine_manager.warmup_all()
 
         # Single dedicated GPU thread.
-        gpu_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"mminf-gpu-{self.worker_id}"
-        )
+        # Set MMINF_NO_GPU_THREAD=1 to run the engine synchronously on the
+        # main thread (control experiment for the GIL-contention diagnosis;
+        # see ASYNC_REDESIGN.md "What Phase 1' actually delivers"). When
+        # enabled, every engine call returns a real Future via a fake
+        # executor whose `submit` runs the function inline.
+        no_gpu_thread = os.environ.get("MMINF_NO_GPU_THREAD", "") == "1"
+        if no_gpu_thread:
+            class _InlineExecutor:
+                def submit(self, fn, *args, **kwargs):
+                    fut: Future = Future()
+                    try:
+                        fut.set_result(fn(*args, **kwargs))
+                    except BaseException as exc:
+                        fut.set_exception(exc)
+                    return fut
+            gpu_executor = _InlineExecutor()
+            logger.info("Worker %s: MMINF_NO_GPU_THREAD=1 — engine runs on main thread", self.worker_id)
+        else:
+            gpu_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"mminf-gpu-{self.worker_id}"
+            )
 
         # Cross-iter async-scheduling state lives on self (initialized in
         # __init__) so _remove_request can see it from message processing.

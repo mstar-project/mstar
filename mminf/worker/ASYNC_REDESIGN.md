@@ -164,6 +164,74 @@ Mutations of `tensor_manager` happen only in fast/slow postprocess on
 the main thread (after `await GPU(N)`). The GPU thread doesn't touch
 `tensor_manager`.
 
+## What Phase 1' actually delivers (measured)
+
+`MMINF_PHASE_TIMING=<n>` instruments the speculative loop. Steady-state
+Orpheus single-request decode (after autotune):
+
+| phase | p50 | mean |
+|---|---|---|
+| `await_gpu` | 3.90 ms | 3.90 ms |
+| `fast_post` | 0.49 ms | 0.49 ms |
+| `slow_post` | 0.19 ms | 0.19 ms |
+| `speculate` | 0.04 ms | 0.04 ms |
+| `submit_spec` | 0.01 ms | 0.01 ms |
+| `iter_total` | **4.79 ms** | 4.80 ms |
+
+`iter_total ≈ await_gpu + fast_post + slow_post + preamble`. Concurrent
+×4 shows the same pattern: `iter_total = 6.87 ≈ await_gpu (4.64) +
+fast_post (1.21) + slow_post (0.59) + preamble`. **The CPU and GPU
+work are running serially — there is essentially no overlap.**
+
+Why the design doesn't pay off as drawn:
+
+- The "GPU thread" is a `ThreadPoolExecutor(max_workers=1)`. After
+  `submit_spec`, the future is queued, but the GPU thread can only
+  execute `engine.execute_with_max_batch_size` once it acquires the
+  GIL. The main thread holds the GIL throughout `fast_post` /
+  `slow_post` (mostly Python: dict mutations, ZMQ pickling, no CUDA
+  calls that release the GIL).
+- By the time the main thread reaches `await_gpu` and releases the
+  GIL inside `future.result()`, the GPU thread has done **zero**
+  kernel launching for N+1 yet. So `await_gpu` measures the full
+  3.9 ms of (GPU thread's Python kernel-launch + GPU kernel
+  execution), not the residual after CPU work overlaps.
+- The `current_stream().synchronize()` in `sampling.py` doesn't help
+  either: it sits *inside* the GPU thread's work, so it just makes
+  `future.result()` block longer. Removing it (gated to skip after
+  the first ~64 calls) was tried and reverted: it caused a different
+  concurrent regression on Orpheus (likely a different GIL-yield
+  path) and is load-bearing for Qwen.
+
+This is a structural Python-GIL limitation of the executor-thread
+pattern, not an mminf-specific bug. The infrastructure (event-gated
+default-stream sync, side-stream D→H of new tokens, fresh-rid spec
+merge with mismatch-skip) is correct and necessary for any future
+approach — it just doesn't translate to wall-clock gains on its own.
+
+### Plausible paths that would actually deliver overlap
+
+1. **Same-thread async with CUDA events.** Drop the executor thread.
+   Main thread directly launches kernels via `engine.execute_batch`
+   and records a completion event. Post-processing waits the event
+   (releases GIL) instead of a Python future. Removes GIL contention
+   entirely because only one Python thread is running. Requires the
+   engine to be free of internal `current_stream().synchronize()`
+   calls — would need the sampling.py:376 sync removed (with a
+   model-aware gate so Qwen still gets it).
+2. **Postproc thread (original Phase 2).** Move `slow_postprocess`
+   onto a separate thread. Main thread keeps doing GPU submissions
+   and `fast_postprocess`. Slow path runs in parallel and only blocks
+   on its own ZMQ sends. GIL contention shifts but doesn't disappear;
+   measured wins likely small (~0.5 ms / iter from `slow_post`).
+3. **C++/Cython wrapper that releases the GIL during kernel launch.**
+   Wrap the engine's hot Python launch path in an extension that
+   uses `Py_BEGIN_ALLOW_THREADS` around the (mostly C++) CUDA API
+   calls. Highest invasiveness, biggest potential win.
+
+The phase-timing harness is left in place (env-var-gated) so future
+attempts can be measured directly rather than guessed at.
+
 ## Open follow-ons (still on the original plan)
 
 The doc below this line is the original staged plan. Phases 0/1 now
