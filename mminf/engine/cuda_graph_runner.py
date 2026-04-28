@@ -56,6 +56,15 @@ class CudaGraphData:
     # per-rid collection loop entirely.
     has_non_logit_outputs: bool = False
 
+@dataclass
+class PiecewiseGraphData:
+    graph: torch.cuda.CUDAGraph
+    static_x: torch.Tensor                          # [bs, seq_len, embed_dim]
+    static_out: torch.Tensor                        # same shape — graph output
+    static_pos_bufs: dict[str, torch.Tensor]        # updated via .copy_() before each replay
+    static_cache_manager: BatchedCacheManager | None
+    dummy_rids: list[str]
+    bs: int
 
 @dataclass(frozen=True)
 class CudaGraphKey:
@@ -1567,17 +1576,6 @@ class CodecCudaGraphRunner:
 # PiecewiseCudaGraphRunner
 # ---------------------------------------------------------------------------
 
-@dataclass
-class PiecewiseGraphData:
-    graph: torch.cuda.CUDAGraph
-    static_x: torch.Tensor                          # [bs, seq_len, embed_dim]
-    static_out: torch.Tensor                        # same shape — graph output
-    static_pos_bufs: dict[str, torch.Tensor]        # updated via .copy_() before each replay
-    static_cache_manager: BatchedCacheManager | None
-    dummy_rids: list[str]
-    bs: int
-
-
 class PiecewiseCudaGraphRunner:
     """Captures a transformer block-loop callable as one CUDA graph per batch-size bucket.
 
@@ -1651,13 +1649,17 @@ class PiecewiseCudaGraphRunner:
                 )
 
     def _capture_one(self, bs: int) -> None:
-        # Static x buffer (fp32; autocast inside the forward handles precision)
+        # Match autocast_dtype so copy_() at replay is a same-dtype memcpy
+        # (no silent upcast from bfloat16 → float32 followed by an immediate
+        # cast back inside the first linear).
         static_x = torch.zeros(
             bs, self.capture_seq_len, self.embed_dim,
-            dtype=torch.float32, device=self.device,
+            dtype=self.autocast_dtype, device=self.device,
         )
 
-        # Static position buffers (float32 — the RoPE functions accept any dtype)
+        # Position buffers stay float32: they hold scalar position indices
+        # (frame id, height id, ...) and RoPE uses them as frequencies, where
+        # float32 precision matters more than matching the hidden state dtype.
         static_pos_bufs: dict[str, torch.Tensor] = {
             name: torch.zeros(shape, dtype=torch.float32, device=self.device)
             for name, shape in self.pos_buf_shapes.items()

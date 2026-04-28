@@ -18,6 +18,8 @@ Weight layout (prefix ``predictor.``):
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 from torch import nn
 
@@ -107,6 +109,66 @@ class VJEPA2Predictor(nn.Module):
         reverse_argsort = torch.argsort(argsort, dim=1)
         gather_idx = reverse_argsort.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
         return torch.gather(hidden_states, dim=1, index=gather_idx)
+
+    def _run_forward_piecewise(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        context_mask: list[torch.Tensor],
+        target_mask: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, int, torch.Tensor]:
+        """Preamble for PiecewiseCudaGraphRunner: embed, sort, and return layer-loop input.
+
+        Returns ``(hidden_states, n_ctxt, argsort)`` so the postamble
+        ``_finalize_forward_piecewise`` can unsort and slice correctly.
+        All ops here run eagerly (outside any CUDA-graph-captured region).
+        """
+        encoder_hidden_states = apply_masks(encoder_hidden_states, context_mask)
+        _, n_ctxt, _ = encoder_hidden_states.shape
+        hidden_states, position_masks = self.embeddings(encoder_hidden_states, context_mask, target_mask)
+        argsort = torch.argsort(position_masks, dim=1)
+        hidden_states, _ = self._sort_tokens(hidden_states, position_masks, argsort)
+        return hidden_states, n_ctxt, argsort
+
+    def _finalize_forward_piecewise(
+        self,
+        hidden_states: torch.Tensor,
+        n_ctxt: int,
+        argsort: torch.Tensor,
+    ) -> torch.Tensor:
+        """Postamble for PiecewiseCudaGraphRunner: layernorm, unsort, slice, project."""
+        hidden_states = self.layernorm(hidden_states)
+        hidden_states = self._unsort_tokens(hidden_states, argsort)
+        hidden_states = hidden_states[:, n_ctxt:]
+        return self.proj(hidden_states)
+
+    def make_layer_loop_fn(
+        self,
+        static_cm,                           # always None for masked predictor (no KV cache)
+        static_pos_bufs: dict[str, torch.Tensor],
+    ) -> Callable[[torch.Tensor], torch.Tensor]:
+        """Return a closure over the layer loop for PiecewiseCudaGraphRunner capture.
+
+        ``static_pos_bufs["position_mask"]`` must already be filled with the
+        static ``[n_seq]`` position IDs for this rollout config before this
+        method is called (the fn_factory in get_piecewise_runner_config does
+        this via ``.copy_()``).  At replay, the runner never updates this buffer
+        (callers pass ``pos_bufs=None``), so the captured ops always see the
+        same position IDs.
+
+        The ``unsqueeze(0)`` inside ``fn`` is a zero-copy view, CUDA-graph
+        compatible.  ``VJEPA2RopeAttention.get_position_ids`` broadcasts
+        ``[1, H, N]`` IDs against ``[B, H, N, D]`` Q/K tensors correctly.
+        """
+        layers = self.layer
+        pm = static_pos_bufs["position_mask"]   # [n_seq], device-resident
+
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            position_mask = pm.unsqueeze(0)      # [1, n_seq] — view, no allocation
+            for layer in layers:
+                x = layer(x, position_mask=position_mask)
+            return x
+
+        return fn
 
     def forward(
         self,
