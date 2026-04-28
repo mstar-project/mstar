@@ -276,10 +276,14 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
         """
         encoder_hidden = _ensure_lead_batch_dim(inputs["encoder_hidden"][0], 3)
         tensor_inputs = {}
-        if "context_mask" in inputs:
-            tensor_inputs["context_mask"] = _ensure_lead_batch_dim(inputs["context_mask"][0], 2)
-        if "target_mask" in inputs:
-            tensor_inputs["target_mask"] = _ensure_lead_batch_dim(inputs["target_mask"][0], 2)
+
+        context_mask = tensor_inputs.get("context_mask")
+        target_mask = tensor_inputs.get("target_mask")
+
+        if context_mask:
+            tensor_inputs["context_mask"] = _ensure_lead_batch_dim(context_mask[0], 2)
+        if target_mask:
+            tensor_inputs["target_mask"] = _ensure_lead_batch_dim(target_mask[0], 2)
         return ARNodeInputs(
             input_embeds=encoder_hidden,
             tensor_inputs=tensor_inputs
