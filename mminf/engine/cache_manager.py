@@ -201,11 +201,22 @@ class BatchedCacheManager:
             last_page_len = total_len % page_size or page_size
             kv_last_page_lens.append(last_page_len)
 
-        # Build batched FlashInfer index tensors (one H2D per tensor).
-        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32, device=device)
-        paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32, device=device)
-        paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32, device=device)
-        paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32, device=device)
+        # Build batched FlashInfer index tensors on CPU so wrapper.plan()
+        # doesn't trigger a synchronous D→H inside its body. FlashInfer
+        # calls ``indptr.to("cpu")`` / ``last_page_len.to("cpu")`` near the
+        # top of ``plan()`` to get host views of those metadata tensors;
+        # if we hand them GPU tensors that ``.to("cpu")`` becomes a
+        # synchronous default-stream sync that waits for the entire
+        # outstanding stream — including the speculatively-queued next
+        # decode step. By creating these on CPU directly, ``.to("cpu")``
+        # is a no-op and FlashInfer does its own async H2D
+        # (``non_blocking=True``) when it needs them on the device.
+        # Tensors are tiny (int32, batch-size length), so the H2D done
+        # inside ``plan()`` is inconsequential.
+        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
+        paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
+        paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
+        paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
 
 
         is_decode = all([sl == 1 for sl in seq_lens])
@@ -403,18 +414,14 @@ class BatchedCacheManager:
                 kv_last_page_lens.append(last_page_len)
                 combined_seq_lens.append(sl)
 
-        qo_indptr = torch.tensor(
-            qo_indptr_list, dtype=torch.int32, device=device
-        )
-        paged_kv_indptr = torch.tensor(
-            kv_indptr_list, dtype=torch.int32, device=device
-        )
-        paged_kv_indices = torch.tensor(
-            all_page_indices, dtype=torch.int32, device=device
-        )
-        paged_kv_last_page_len = torch.tensor(
-            kv_last_page_lens, dtype=torch.int32, device=device
-        )
+        # CPU tensors — see comment in ``plan_attention`` above. FlashInfer
+        # async-H2Ds these inside ``plan()``; passing GPU tensors would
+        # trigger a synchronous default-stream sync via the internal
+        # ``.to("cpu")`` call.
+        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
+        paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
+        paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
+        paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
 
         wrapper = FlashInferPrefillWrapper(
             workspace_buffer=self.buffer_manager.get(combined_label),
