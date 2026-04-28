@@ -287,11 +287,11 @@ class VJepa2Model(Model):
         # KV cache exists for the AC rollout predictor
         if self.config.predictor_kind == "ac":
             return [KVCacheConfig(
-                num_layers=self.config.num_hidden_layers,
-                num_kv_heads=self.config.pred_num_attention_heads,
-                head_dim=self.config.hidden_size // self.config.num_attention_heads,
+                num_layers=self.config.ac_predictor.depth,
+                num_kv_heads=self.config.ac_predictor.num_heads,
+                head_dim=self.config.ac_predictor.predictor_embed_dim // self.config.ac_predictor.num_heads,
                 max_seq_len=16384, # TODO: actually compute this
-                num_qo_heads=self.config.num_attention_heads,
+                num_qo_heads=self.config.ac_predictor.num_heads,
                 nodes=["rollout_predictor"]
             )]
         return [] # otherwise no kv cache
