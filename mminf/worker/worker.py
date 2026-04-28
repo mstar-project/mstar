@@ -1,5 +1,7 @@
 import logging
+import os
 import time as _time
+from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from enum import Enum
 from time import sleep
@@ -1576,9 +1578,41 @@ class Worker:
             pending = p
             self._in_flight_rids = set(p[0].node_objects.keys()) if p else set()
 
+        # Per-phase wall-clock instrumentation, gated by MMINF_PHASE_TIMING.
+        # When enabled, every Nth speculative iter logs a histogram so we can
+        # see whether await_gpu time = "GPU still running" (overlap working)
+        # vs "GPU done, idle" (overlap not paying off). Set the env var to a
+        # positive integer = the dump period in iters (e.g. 200).
+        phase_period = int(os.environ.get("MMINF_PHASE_TIMING", "0") or "0")
+        phase_buf: dict[str, list[float]] = defaultdict(list)
+        phase_iter = [0]
+
+        def _phase_record(name: str, dt: float) -> None:
+            if phase_period > 0:
+                phase_buf[name].append(dt)
+
+        def _phase_flush() -> None:
+            if phase_period <= 0 or phase_iter[0] % phase_period != 0:
+                return
+            samples = sorted((k, v) for k, v in phase_buf.items() if v)
+            parts = []
+            for name, vs in samples:
+                vs.sort()
+                n = len(vs)
+                p50 = vs[n // 2] * 1000
+                p95 = vs[min(n - 1, int(n * 0.95))] * 1000
+                mean = (sum(vs) / n) * 1000
+                parts.append(f"{name}: p50={p50:.2f}ms p95={p95:.2f}ms mean={mean:.2f}ms n={n}")
+            logger.info(
+                "Worker %s phase-timing iter=%d: %s",
+                self.worker_id, phase_iter[0], " | ".join(parts),
+            )
+            phase_buf.clear()
+
         while True:
             from mminf.utils.profiler import range_pop, range_push
             try:
+                _iter_start = _time.perf_counter() if phase_period else 0.0
                 # 1. CPU preamble — overlaps with GPU(N).
                 # synchronize=False on every range so torch.cuda.synchronize()
                 # doesn't drain the in-flight GPU work and undo the overlap.
@@ -1608,9 +1642,12 @@ class Worker:
                 if pending is not None and self._can_speculate(pending[0]):
                     if self.enable_nvtx:
                         range_push("worker.speculate", synchronize=False)
+                    _t0 = _time.perf_counter() if phase_period else 0.0
                     speculation = self._try_speculate_next(
                         pending[0], pending[2]
                     )
+                    if phase_period:
+                        _phase_record("speculate", _time.perf_counter() - _t0)
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
 
@@ -1623,7 +1660,10 @@ class Worker:
                     _set_pending(None)
                     if self.enable_nvtx:
                         range_push("worker.await_gpu", synchronize=False)
+                    _t0 = _time.perf_counter() if phase_period else 0.0
                     output = p_future.result()
+                    if phase_period:
+                        _phase_record("await_gpu", _time.perf_counter() - _t0)
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
 
@@ -1661,10 +1701,13 @@ class Worker:
                                 spec_consumed[rid] = set(loop_back_inputs)
                             if self.enable_nvtx:
                                 range_push("worker.submit_spec", synchronize=False)
+                            _t0 = _time.perf_counter() if phase_period else 0.0
                             spec_future = gpu_executor.submit(
                                 self._execute_on_gpu_thread,
                                 spec_batch, spec_node_batch,
                             )
+                            if phase_period:
+                                _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                             spec_pending = (
@@ -1674,13 +1717,19 @@ class Worker:
 
                     # Post-process N — runs concurrently with GPU(N+1)
                     # if we submitted one above.
+                    _t0 = _time.perf_counter() if phase_period else 0.0
                     routing = self._fast_postprocess(
                         p_batch, p_node_batch, p_partition, output,
                         speculation_consumed_loop_back=spec_consumed,
                     )
+                    if phase_period:
+                        _phase_record("fast_post", _time.perf_counter() - _t0)
+                    _t0 = _time.perf_counter() if phase_period else 0.0
                     new_stops = self._slow_postprocess(
                         p_batch, p_node_batch, p_partition, output, routing,
                     )
+                    if phase_period:
+                        _phase_record("slow_post", _time.perf_counter() - _t0)
                     if new_stops:
                         # These apply to the in-flight spec step's batch
                         # (which is N+1) — applied at iter K+1's fast
@@ -1694,6 +1743,10 @@ class Worker:
                     self._apply_pending_removes_safe_to_drop(in_flight)
 
                 if spec_pending is not None:
+                    if phase_period:
+                        _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                        phase_iter[0] += 1
+                        _phase_flush()
                     _set_pending(spec_pending)
                     continue
 
