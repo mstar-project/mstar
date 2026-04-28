@@ -18,8 +18,16 @@ dependencies = [
     "torch",
     "uvicorn",
     "gdown",
-    "torchaudio>=2.11.0",
-    "torchvision>=0.26.0",
+    "torchaudio",
+    "torchvision",
+    # Required by models (registry imports all unconditionally)
+    "einops",
+    "flashinfer-python",
+    "huggingface-hub",
+    "Pillow",
+    "regex",
+    "safetensors",
+    "transformers",
 ]
 
 [project.scripts]
@@ -29,6 +37,7 @@ mminf-serve = "mminf.api_server.entrypoint:main"
 dev = [
     "ruff",
     "pytest",
+    "aiohttp",
 ]
 
 bagel = [
