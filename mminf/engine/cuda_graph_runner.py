@@ -11,13 +11,14 @@ Key requirements for CUDA graph compatibility:
 - No Python control flow that changes between replays
 - advance_seq_lens() is Python-only — called AFTER graph.replay(), not inside
 
-Also provides EncDecCudaGraphWrapper for stateless encoder/decoder submodules.
+Also provides EncDecCudaGraphWrapper for stateless encoder/decoder submodules
+and PiecewiseCudaGraphRunner for capturing transformer block loops (VJepa2 predictors).
 """
 
 import bisect
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch import nn
@@ -1560,3 +1561,275 @@ class CodecCudaGraphRunner:
                 ] for name in static_output[dummy_rids[i]]
             } for i, rid in enumerate(request_ids)
         }
+
+
+# ---------------------------------------------------------------------------
+# PiecewiseCudaGraphRunner
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PiecewiseGraphData:
+    graph: torch.cuda.CUDAGraph
+    static_x: torch.Tensor                          # [bs, seq_len, embed_dim]
+    static_out: torch.Tensor                        # same shape — graph output
+    static_pos_bufs: dict[str, torch.Tensor]        # updated via .copy_() before each replay
+    static_cache_manager: BatchedCacheManager | None
+    dummy_rids: list[str]
+    bs: int
+
+
+class PiecewiseCudaGraphRunner:
+    """Captures a transformer block-loop callable as one CUDA graph per batch-size bucket.
+
+    Designed for the inner block loops of VJepa2 predictors
+    (VisionTransformerPredictorAC with KV cache, and VJEPA2Predictor without).
+    The caller supplies a ``fn_factory`` that builds the capturable
+    ``fn(x) -> x`` closure given a static BatchedCacheManager and a dict of
+    pre-allocated position-tensor buffers.  The runner owns those buffers;
+    callers update them via ``.copy_()`` through the ``pos_bufs`` argument of
+    ``run()``, making per-step position tensors visible to the captured GPU ops
+    without creating new tensors inside the captured region.
+
+    Key invariants (matching CudaGraphRunner):
+    - FlashInfer wrappers are PERSISTENT (created once per bs bucket at capture).
+    - plan_attention is called OUTSIDE the graph before each replay.
+    - advance_seq_len is called OUTSIDE the graph after each replay.
+    - KV state is swapped onto dummy slots before replay and restored after.
+    """
+
+    def __init__(
+        self,
+        fn_factory: Callable[
+            [BatchedCacheManager | None, dict[str, torch.Tensor]],
+            Callable[[torch.Tensor], torch.Tensor],
+        ],
+        embed_dim: int,
+        capture_batch_sizes: list[int],
+        capture_seq_len: int,
+        device: torch.device,
+        autocast_dtype: torch.dtype,
+        pos_buf_shapes: dict[str, tuple[int, ...]] | None = None,
+        kv_cache_config: KVCacheConfig | None = None,
+        alloc_manager: PagedAllocationManager | None = None,
+        buffer_manager: WorkspaceBufferManager | None = None,
+        cache_labels: list[str] | None = None,
+    ):
+        self.fn_factory = fn_factory
+        self.embed_dim = embed_dim
+        self.capture_batch_sizes = sorted(capture_batch_sizes)
+        self.capture_seq_len = capture_seq_len
+        self.device = device
+        self.autocast_dtype = autocast_dtype
+        self.pos_buf_shapes: dict[str, tuple[int, ...]] = pos_buf_shapes or {}
+        self.kv_cache_config = kv_cache_config
+        self.alloc_manager = alloc_manager
+        self.buffer_manager = buffer_manager
+        self.cache_labels: list[str] = cache_labels or ["main"]
+
+        self.graphs: dict[int, PiecewiseGraphData] = {}
+        self.memory_pool = None
+
+    # ------------------------------------------------------------------
+    # Capture
+    # ------------------------------------------------------------------
+
+    def warmup_and_capture(self) -> None:
+        if not torch.cuda.is_available() or self.device is None:
+            logger.warning("CUDA not available — skipping PiecewiseCudaGraphRunner capture")
+            return
+
+        torch.cuda.set_device(self.device)
+        self.memory_pool = torch.cuda.graphs.graph_pool_handle()
+
+        for bs in reversed(self.capture_batch_sizes):
+            try:
+                self._capture_one(bs)
+                logger.info("PiecewiseCudaGraphRunner: captured bs=%d seq_len=%d", bs, self.capture_seq_len)
+            except Exception:
+                logger.warning(
+                    "PiecewiseCudaGraphRunner: failed to capture bs=%d", bs, exc_info=True
+                )
+
+    def _capture_one(self, bs: int) -> None:
+        # Static x buffer (fp32; autocast inside the forward handles precision)
+        static_x = torch.zeros(
+            bs, self.capture_seq_len, self.embed_dim,
+            dtype=torch.float32, device=self.device,
+        )
+
+        # Static position buffers (float32 — the RoPE functions accept any dtype)
+        static_pos_bufs: dict[str, torch.Tensor] = {
+            name: torch.zeros(shape, dtype=torch.float32, device=self.device)
+            for name, shape in self.pos_buf_shapes.items()
+        }
+
+        # KV cache support
+        static_cm: BatchedCacheManager | None = None
+        dummy_rids: list[str] = []
+        if self.kv_cache_config is not None:
+            assert self.alloc_manager is not None and self.buffer_manager is not None
+            dummy_rids = [f"__pcgr_{bs}_{i}__" for i in range(bs)]
+            for rid in dummy_rids:
+                self.alloc_manager.add_request(rid, labels=self.cache_labels)
+
+            plan_states = self._build_persistent_wrappers(bs)
+            static_cm = BatchedCacheManager(
+                request_ids=dummy_rids,
+                active_labels_per_request={rid: self.cache_labels[0] for rid in dummy_rids},
+                kv_cache=self.alloc_manager.kv_cache,
+                alloc_manager=self.alloc_manager,
+                buffer_manager=self.buffer_manager,
+                kv_cache_config=self.kv_cache_config,
+                device=self.device,
+                cuda_graph_plan_states=plan_states,
+            )
+
+        fn = self.fn_factory(static_cm, static_pos_bufs)
+
+        def _plan():
+            if static_cm is not None:
+                static_cm.plan_attention(
+                    seq_lens=[self.capture_seq_len] * bs,
+                    is_causal=False,
+                )
+
+        def _reset_dummy_states():
+            for rid in dummy_rids:
+                for label in self.cache_labels:
+                    state = self.alloc_manager.get_state(rid, label)
+                    state.seq_len = 0
+                    state.position_id_start = 0
+
+        _plan()
+
+        # Warmup — 2 passes
+        torch.cuda.synchronize()
+        for _ in range(2):
+            with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                fn(static_x)
+            _reset_dummy_states()
+            _plan()
+        torch.cuda.synchronize()
+
+        # Capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+            with torch.cuda.graph(graph, pool=self.memory_pool):
+                static_out = fn(static_x)
+        torch.cuda.synchronize()
+
+        # Free dummy KV state so it doesn't accumulate across bs captures
+        for rid in dummy_rids:
+            for label in self.cache_labels:
+                self.alloc_manager.reset_label(rid, label, free=True)
+
+        self.graphs[bs] = PiecewiseGraphData(
+            graph=graph,
+            static_x=static_x,
+            static_out=static_out,
+            static_pos_bufs=static_pos_bufs,
+            static_cache_manager=static_cm,
+            dummy_rids=dummy_rids,
+            bs=bs,
+        )
+
+    def _build_persistent_wrappers(self, bs: int) -> dict:
+        from mminf.engine.cache_manager import _PlanState
+        from mminf.utils.flashinfer_utils import FlashInferPrefillWrapper
+
+        cfg = self.kv_cache_config
+        plan_states: dict = {}
+        for label in self.cache_labels:
+            wrapper = FlashInferPrefillWrapper(
+                workspace_buffer=self.buffer_manager.get(f"{label}_pcgr_{bs}"),
+                num_qo_heads=cfg.num_qo_heads,
+                num_kv_heads=cfg.num_kv_heads,
+                head_dim=cfg.head_dim,
+                page_size=cfg.page_size,
+                batch_size=bs,
+                max_total_tokens=bs * self.capture_seq_len,
+                max_num_pages=cfg.max_num_pages,
+                device=self.device,
+                use_cuda_graph=True,
+            )
+            plan_states[label] = _PlanState(wrapper=wrapper)
+        return plan_states
+
+    # ------------------------------------------------------------------
+    # Runtime
+    # ------------------------------------------------------------------
+
+    def can_run(self, batch_size: int) -> bool:
+        return bool(self.graphs) and self._padded_bs(batch_size) is not None
+
+    def _padded_bs(self, batch_size: int) -> int | None:
+        idx = bisect.bisect_left(self.capture_batch_sizes, batch_size)
+        if idx >= len(self.capture_batch_sizes):
+            return None
+        return self.capture_batch_sizes[idx]
+
+    def run(
+        self,
+        x: torch.Tensor,                                    # [real_bs, seq_len, D]
+        pos_bufs: dict[str, torch.Tensor] | None = None,   # updated into static buffers
+        request_ids: list[str] | None = None,
+        cache_manager: BatchedCacheManager | None = None,   # real engine cache manager
+    ) -> torch.Tensor:
+        """Replay the captured graph for the given input.
+
+        Steps (mirroring CudaGraphRunner._run_basic_batched):
+          1. Copy real x into static buffer.
+          2. Update position buffers via .copy_().
+          3. Swap real KV states onto dummy slots + plan_attention.
+          4. graph.replay().
+          5. advance_seq_len (Python-only, outside graph).
+          6. Restore dummy states.
+          7. Return static_out[:real_bs].clone().
+        """
+        real_bs = x.size(0)
+        padded_bs = self._padded_bs(real_bs)
+        if padded_bs is None:
+            raise RuntimeError(
+                f"PiecewiseCudaGraphRunner: no captured graph for bs={real_bs}"
+            )
+        data = self.graphs[padded_bs]
+
+        # --- 1: copy input ---
+        data.static_x[:real_bs].copy_(x)
+        if real_bs < padded_bs:
+            data.static_x[real_bs:].zero_()
+
+        # --- 2: update position buffers ---
+        if pos_bufs:
+            for name, val in pos_bufs.items():
+                if name in data.static_pos_bufs:
+                    data.static_pos_bufs[name].copy_(val)
+
+        # --- 3: KV state swap + plan_attention ---
+        if data.static_cache_manager is not None and request_ids is not None:
+            for i, rid in enumerate(request_ids):
+                dummy_rid = data.dummy_rids[i]
+                for label in self.cache_labels:
+                    real_state = self.alloc_manager.get_state(rid, label)
+                    self.alloc_manager.get_state(dummy_rid, label)   # ensure slot exists
+                    self.alloc_manager.request_states[dummy_rid][label] = real_state
+            data.static_cache_manager.plan_attention(
+                seq_lens=[self.capture_seq_len] * padded_bs,
+                is_causal=False,
+            )
+
+        # --- 4: replay ---
+        data.graph.replay()
+
+        # --- 5: advance seq_len (Python-only, post-replay) ---
+        if data.static_cache_manager is not None and request_ids is not None:
+            data.static_cache_manager.advance_seq_len(n=self.capture_seq_len)
+
+        # --- 6: restore dummy states ---
+        if data.static_cache_manager is not None and request_ids is not None:
+            for i, dummy_rid in enumerate(data.dummy_rids):
+                for label in self.cache_labels:
+                    self.alloc_manager.reset_label(dummy_rid, label, free=i >= real_bs)
+
+        # --- 7: return output ---
+        return data.static_out[:real_bs].clone()

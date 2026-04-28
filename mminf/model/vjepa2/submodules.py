@@ -766,6 +766,10 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
 class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     """Action-conditioned autoregressive rollout — Phase 3.D.
 
+    Optionally uses a PiecewiseCudaGraphRunner to accelerate the inner block
+    loop. Set via set_piecewise_runner() after construction (typically done by
+    the engine after warmup_and_capture).
+
     **Sliding-window rollout** — diverges from upstream
     ``vjepa2/notebooks/utils/mpc_utils.py::cem`` which uses growing-context
     (``T: 1 → rollout+1``) from a single-tubelet initial encoding.  Our
@@ -807,6 +811,49 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         super().__init__()
         self.predictor = predictor
         self.config = config
+        self._piecewise_runner = None   # set via set_piecewise_runner() after warmup
+
+    def set_piecewise_runner(self, runner) -> None:
+        """Attach a warmed-up PiecewiseCudaGraphRunner for the block loop."""
+        self._piecewise_runner = runner
+
+    def get_piecewise_runner_config(self) -> dict | None:
+        """Return construction args for PiecewiseCudaGraphRunner, or None.
+
+        Called by AREngine.warmup() to build and install the runner without
+        the engine needing to know the model internals.  The returned dict
+        contains everything PiecewiseCudaGraphRunner.__init__ needs except
+        device/autocast_dtype/memory_pool (those come from the engine).
+
+        Keys:
+          fn_factory    - (static_cm, static_pos_bufs) -> fn(x) -> x
+          embed_dim     - hidden dim of the intermediate sequence
+          capture_seq_len - tokens per frame (cond_tokens + grid_h * grid_w)
+          pos_buf_shapes  - {name: shape} for per-step position tensors
+          cache_labels    - KV cache labels (always ["main"] here)
+        """
+        ac = self.config.ac_predictor
+        if ac is None:
+            return None
+        N = ac.img_size[0] // ac.patch_size   # grid_height (== grid_width for square)
+        cond_tokens = 3 if ac.use_extrinsics else 2
+        predictor = self.predictor
+
+        def fn_factory(static_cm, static_pos_bufs):
+            return predictor.make_block_loop_fn(static_cm, static_pos_bufs, cond_tokens)
+
+        return {
+            "fn_factory": fn_factory,
+            "embed_dim": ac.predictor_embed_dim,
+            "capture_seq_len": cond_tokens + N * N,
+            "pos_buf_shapes": {
+                "d_pos":   (N * N,),
+                "h_pos":   (N * N,),
+                "w_pos":   (N * N,),
+                "time_pos": (cond_tokens,),
+            },
+            "cache_labels": ["main"],
+        }
 
     # ------------------------------------------------------------------
     # Rollout geometry
@@ -934,39 +981,60 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     
     def _rollout_step(
         self,
-        encoder_hidden: torch.Tensor,   # [B, H*W, D]
-        actions: torch.Tensor,           # [B, 1, action_embed_dim]
-        states: torch.Tensor,            # [B, 1, action_embed_dim]
+        encoder_hidden: torch.Tensor,            # [B, H*W, D]
+        actions: torch.Tensor,                   # [B, 1, action_embed_dim]
+        states: torch.Tensor,                    # [B, 1, action_embed_dim]
         t_0: int,
         cache_handle: BatchedCacheManager,
-        extrinsics: torch.Tensor | None, # [B, 1, action_embed_dim - 1] or None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One sliding-window AC rollout step.
+        extrinsics: torch.Tensor | None = None,  # [B, 1, action_embed_dim - 1] or None
+        request_ids: list[str] | None = None,    # needed by PiecewiseCudaGraphRunner
+    ) -> torch.Tensor:
+        """One AC rollout step using either the CUDA-graph or eager path.
 
-        Returns ``(next_encoder_hidden [B, N, D], predicted_new_tg [B, grid², D])``.
-        ``next_encoder_hidden`` is the shifted context for the next iter;
-        ``predicted_new_tg`` is the single new tubelet group to emit to the
-        client.  Math is symmetric across the batch dim so the same function
-        serves both the sequential and batched paths.
+        The CUDA-graph path (when PiecewiseCudaGraphRunner is attached):
+          1. Preamble (predictor_embed + action/state concat) runs eagerly.
+          2. Position tensors are computed eagerly (hoisted out of the graph).
+          3. Block loop replays the captured graph.
+          4. advance_seq_len is called by the runner after replay.
+          5. Postamble (drop action tokens, norm, proj) runs eagerly.
+
+        The eager path calls predictor.forward end-to-end (same as before).
         """
-        b, n_ctxt, _ = encoder_hidden.shape
-        window = self._window_tokens()  # grid² — one tubelet group worth of tokens
-  
-        predicted = self.predictor(
-            encoder_hidden, # [B, HW, D]
+        p = self.predictor
+
+        runner = self._piecewise_runner
+        if runner is not None and runner.can_run(encoder_hidden.size(0)):
+            # --- CUDA-graph path ---
+            x, cond_tokens, b, t = p._prepare_sequence(
+                encoder_hidden, actions, states, extrinsics
+            )
+            d_pos, h_pos, w_pos, time_pos = p._compute_rope_positions(
+                t_0, p.grid_height, p.grid_width, cond_tokens, x.device, x.dtype
+            )
+            pos_bufs = {
+                "d_pos": d_pos, "h_pos": h_pos, "w_pos": w_pos,
+            }
+            if time_pos is not None:
+                pos_bufs["time_pos"] = time_pos
+
+            x = runner.run(
+                x=x,
+                pos_bufs=pos_bufs,
+                request_ids=request_ids,
+                cache_manager=cache_handle,
+            )
+            # advance_seq_len already called by runner; skip it in _decode_sequence
+            return p._decode_sequence(x, cond_tokens, b, t)
+
+        # --- Eager path ---
+        return self.predictor(
+            encoder_hidden,
             actions,
             states,
             extrinsics=extrinsics,
             t_0=t_0,
-            cache_handle=cache_handle
-        )  # [B, HW, D]
-
-        print(
-            f"AC predictor emitted shape {tuple(predicted.shape)}; "
-            f"expected [{b}, {n_ctxt}, D] before"
-            f"window was set to {window}. now expecting [{b}, {window}, D]"
+            cache_handle=cache_handle,
         )
-        return predicted
 
     def forward(
         self,
@@ -979,8 +1047,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> NameToTensorList:
         request_info = engine_inputs.single_request_info
-
-
         iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
         logger.info(
             "VJepa2ACRolloutPredictorSubmodule.forward: iter=%d encoder_hidden=%s actions=%s states=%s",
@@ -992,8 +1058,10 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 
         new_tg = self._rollout_step(
             encoder_hidden, actions, states,
-            t_0=iter_idx, cache_handle=engine_inputs.cache_manager,
+            t_0=iter_idx,
+            cache_handle=engine_inputs.cache_manager,
             extrinsics=extrinsics,
+            request_ids=engine_inputs.request_ids,
         )
 
         # Per-request early-exit — same contract as masked rollout.

@@ -177,14 +177,18 @@ class AREngine(BaseEngine):
 
     def warmup(self) -> None:
         """Compile submodules and capture CUDA graphs."""
-        from mminf.engine.cuda_graph_runner import CudaGraphRunner
+        from mminf.engine.cuda_graph_runner import (
+            CudaGraphRunner, PiecewiseCudaGraphRunner, DEFAULT_AR_CAPTURE_BATCH_SIZES,
+        )
 
-        # CUDA graph capture for decode (Option A keying)
         for node_name, submodule_mgmt in self.submodule_management.items():
             kv_mgmt = submodule_mgmt.kv_management
+            submodule = submodule_mgmt.submodule
+
+            # Standard AR decode CUDA graph (CudaGraphRunner).
             runner = CudaGraphRunner(
                 submodule_name=node_name,
-                submodule=submodule_mgmt.submodule,
+                submodule=submodule,
                 kv_cache_config=kv_mgmt.kv_cache_config,
                 alloc_manager=kv_mgmt.alloc_manager,
                 sampler=submodule_mgmt.sampler,
@@ -198,7 +202,34 @@ class AREngine(BaseEngine):
                 submodule_mgmt.cuda_graph_runner = runner
                 logger.info("AREngine: CUDA graphs captured for %s (%d configs)",
                             node_name, len(runner.graphs))
-        # Step 1: torch.compile (before CUDA graph capture)
+
+            # Piecewise CUDA graph for transformer block loops (e.g. VJepa2 AC rollout).
+            # Submodules opt in by implementing get_piecewise_runner_config().
+            pcgr_config = getattr(submodule, "get_piecewise_runner_config", lambda: None)()
+            if pcgr_config is not None:
+                pcgr = PiecewiseCudaGraphRunner(
+                    fn_factory=pcgr_config["fn_factory"],
+                    embed_dim=pcgr_config["embed_dim"],
+                    capture_batch_sizes=DEFAULT_AR_CAPTURE_BATCH_SIZES,
+                    capture_seq_len=pcgr_config["capture_seq_len"],
+                    device=self.device,
+                    autocast_dtype=self.autocast_dtype,
+                    pos_buf_shapes=pcgr_config.get("pos_buf_shapes"),
+                    kv_cache_config=kv_mgmt.kv_cache_config,
+                    alloc_manager=kv_mgmt.alloc_manager,
+                    buffer_manager=kv_mgmt.buffer_manager,
+                    cache_labels=pcgr_config.get("cache_labels", ["main"]),
+                )
+                pcgr.warmup_and_capture()
+                if pcgr.graphs:
+                    submodule.set_piecewise_runner(pcgr)
+                    logger.info(
+                        "AREngine: PiecewiseCudaGraphRunner installed for %s (%d bs buckets)",
+                        node_name, len(pcgr.graphs),
+                    )
+
+        # torch.compile applied after CUDA graph capture so compiled kernels
+        # are baked into the graphs.
         self._compile_submodules()
 
     def _sample_decode_outputs(
