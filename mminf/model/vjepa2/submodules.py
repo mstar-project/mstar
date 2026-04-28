@@ -435,30 +435,44 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         argsort in VJEPA2Predictor.forward is identity; the buffer is filled
         once in fn_factory and never updated at replay.
         """
-        n_ctxt = self.config.grid_depth * self._grid_size ** 2
-        n_pred = self._n_pred
-        skip = n_ctxt + self._grid_size ** 2 * self._anticipation_steps
-        n_seq = n_ctxt + n_pred
+        # n_ctxt = self.config.grid_depth * self._grid_size ** 2
+        # n_pred = self._n_pred
+        # skip = n_ctxt + self._grid_size ** 2 * self._anticipation_steps
+        # n_seq = n_ctxt + n_pred
 
-        position_ids = torch.cat([
-            torch.arange(n_ctxt, dtype=torch.float32),
-            torch.arange(n_pred, dtype=torch.float32) + skip,
-        ])  # [n_seq], CPU; fn_factory .copy_()s it into the GPU buffer
+        # position_ids = torch.cat([
+        #     torch.arange(n_ctxt, dtype=torch.float32),
+        #     torch.arange(n_pred, dtype=torch.float32) + skip,
+        # ])  # [n_seq], CPU; fn_factory .copy_()s it into the GPU buffer
 
-        predictor = self.predictor
+        # predictor = self.predictor
 
-        def fn_factory(static_cm, static_pos_bufs):
-            static_pos_bufs["position_mask"].copy_(position_ids)
-            return predictor.make_layer_loop_fn(static_cm, static_pos_bufs)
+        # def fn_factory(static_cm, static_pos_bufs):
+        #     static_pos_bufs["position_mask"].copy_(position_ids)
+        #     return predictor.make_layer_loop_fn(static_cm, static_pos_bufs)
 
-        return {
-            "fn_factory": fn_factory,
-            "embed_dim": self.config.pred_hidden_size,
-            "capture_seq_len": n_seq,
-            "capture_batch_sizes": [1, 2, 4, 8],
-            "pos_buf_shapes": {"position_mask": (n_seq,)},
-            "cache_labels": ["main"],
-        }
+        # return {
+        #     "fn_factory": fn_factory,
+        #     "embed_dim": self.config.pred_hidden_size,
+        #     "capture_seq_len": n_seq,
+        #     "capture_batch_sizes": [1, 2, 4, 8],
+        #     "pos_buf_shapes": {"position_mask": (n_seq,)},
+        #     "cache_labels": ["main"],
+        # }
+        
+        """Masked predictor rollout does not use piecewise CUDA graphs.
+
+        The non-AC predictor attends over n_ctxt + n_pred ≈ 8448 tokens using
+        plain SDPA (no FlashInfer).  At that sequence length the O(N²) attention
+        computation dominates completely — Python kernel-launch overhead is
+        negligible relative to the ~1.7 GB attention matrix per layer, so CUDA
+        graphs provide no meaningful speedup.  Attempting to capture them also
+        risks OOM on top of the already-loaded ViT-g encoder weights.
+
+        CUDA graphs are only useful for the AC predictor (capture_seq_len=258,
+        FlashInfer per-call overhead worth eliminating).
+        """
+        return None
 
     # ------------------------------------------------------------------
     # Rollout geometry (derived from config + hyperparams; shape-static)
