@@ -110,20 +110,39 @@ class Qwen3Omni(Model):
         return "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
     def get_model_kwargs(self, request_type: RequestType):
-        # Cap thinker output at 256 tokens to match sglang-omni's published
-        # H200 benchmark convention (THINKER_MAX_NEW_TOKENS=256 in their
-        # benchmarks/tasks/tts.py:911 and same value used across MMSU /
-        # videomme / videoamme result tables). Without this cap the talker
-        # speaks the full 8192-token thinker max, producing 5+ min of audio
-        # per request and making B=1 cells take minutes instead of seconds.
+        # Cap thinker output at 256 tokens for cross-system fairness. Matches
+        # sglang-omni's H200 conventions (THINKER_MAX_NEW_TOKENS=256 in
+        # benchmarks/tasks/tts.py:911, max_tokens=256 default in
+        # video_understanding.py and benchmark_omni_videomme.py) and
+        # vllm-omni's bench convention (always sets max_tokens via
+        # per-dataset --output-len flags → patch.py:336). Without a cap the
+        # comparison becomes "whose EOS detection terminates earlier?"
+        # rather than "whose decode is faster per token?".
+        #
+        # Force greedy on every sub-model that participates so cross-system
+        # runs see deterministic tokens for the same prompt. mminf's
+        # qwen3_omni_model.py:521-540 defaults are thinker=0.7, talker=0.9,
+        # cp=1.0, which would otherwise make output length (and therefore
+        # RTF / audio duration / text token count) vary across runs.
+        # Send both `max_tokens` (OpenAI convention — vllm-omni / sglang-omni)
+        # and `max_output_tokens` (mminf's own kwarg, read in
+        # mminf/model/base.py:372-373; default MAX_OUTPUT_TOKENS=2048). Without
+        # the second key, mminf silently ignores the cap and runs to natural
+        # EOS, which on T2T was observed at ~361 tokens/req vs vllm-omni's 256.
+        kwargs = {
+            "max_tokens": 256,
+            "max_output_tokens": 256,
+            "thinker_temperature": 0.0,
+        }
         if request_type in (
             RequestType.T2S,
             RequestType.I2S,
             RequestType.A2S,
             RequestType.V2S,
         ):
-            return {"max_tokens": 256}
-        return {}
+            kwargs["talker_temperature"] = 0.0
+            kwargs["cp_temperature"] = 0.0
+        return kwargs
 
     def get_supported_modalities(self):
         return {

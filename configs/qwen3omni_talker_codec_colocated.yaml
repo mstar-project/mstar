@@ -1,0 +1,8 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+node_groups:
+  - node_names: [audio_encoder, vision_encoder, Thinker]
+    ranks: [0]
+
+  - node_names: [Talker_LLM, code_predictor, Code2Wav]
+    ranks: [1]
