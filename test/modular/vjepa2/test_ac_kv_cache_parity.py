@@ -31,50 +31,73 @@ from mminf.model.vjepa2.config import VJepa2ACPredictorConfig
 class FakeCacheManager:
     """Emulates BatchedCacheManager.run_attention with plain Python lists.
 
-    Per layer, we accumulate all K/V tokens across time steps (each call to
-    run_attention appends the current step's K/V before computing attention).
-    This matches the real FlashInfer path where set_kv_cache writes K/V and
-    wrapper.run computes attention over the full paged history.
+    Per layer and per request, we accumulate K/V tokens across time steps.
+    This matches the real FlashInfer path where each request has its own KV
+    pages and full attention is computed over that request's accumulated history.
+
+    plan_attention must be called before each forward pass (as preprocess does
+    in production) so run_attention knows how to split the flattened
+    [sum(seq_lens), H, D] tensor back into per-request slices.
     """
 
     def __init__(self):
         self.layer_idx: int = 0
-        # layer -> (list[k_tensor], list[v_tensor])
-        # Each tensor is [tokens_this_step, num_heads, head_dim].
-        self._kv: dict[int, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
+        self._seq_lens: list[int] = []
+        # layer -> list of per-request (list[k], list[v])
+        self._kv: dict[int, list[tuple[list[torch.Tensor], list[torch.Tensor]]]] = {}
 
     def set_layer_idx(self, idx: int) -> None:
         self.layer_idx = idx
 
     def plan_attention(self, seq_lens: list[int], is_causal: bool = False) -> None:
-        pass  # no page allocation in the fake
+        """Record per-request token counts for the upcoming forward pass."""
+        self._seq_lens = list(seq_lens)
+        n_req = len(seq_lens)
+        # Initialise KV history for any new layer that hasn't been seen yet.
+        for layer, req_kvs in self._kv.items():
+            if len(req_kvs) != n_req:
+                self._kv[layer] = [([], []) for _ in range(n_req)]
 
     def advance_seq_len(self, n: int | None = None) -> None:
-        pass  # seq tracking not needed; K/V lists serve as the history
+        pass  # seq tracking not needed; accumulated K/V lists are the history
 
     def run_attention(
         self,
-        q: torch.Tensor,  # [B*n, num_heads, head_dim]
+        q: torch.Tensor,  # [sum(seq_lens), num_heads, head_dim]
         k: torch.Tensor,
         v: torch.Tensor,
         layer_idx: int | None = None,
     ) -> torch.Tensor:
         layer = layer_idx if layer_idx is not None else self.layer_idx
+
+        # Fall back to single-request if plan_attention wasn't called.
+        seq_lens = self._seq_lens if self._seq_lens else [q.shape[0]]
+        n_req = len(seq_lens)
+
         if layer not in self._kv:
-            self._kv[layer] = ([], [])
-        self._kv[layer][0].append(k)
-        self._kv[layer][1].append(v)
+            self._kv[layer] = [([], []) for _ in range(n_req)]
 
-        all_k = torch.cat(self._kv[layer][0], dim=0)  # [total_ctx_tokens, H, D]
-        all_v = torch.cat(self._kv[layer][1], dim=0)
+        req_kvs = self._kv[layer]
+        q_splits = torch.split(q, seq_lens)
+        k_splits = torch.split(k, seq_lens)
+        v_splits = torch.split(v, seq_lens)
 
-        # SDPA expects [batch, heads, seq, dim]; batch=1 here.
-        q_t = q.permute(1, 0, 2).unsqueeze(0)       # [1, H, L,  D]
-        k_t = all_k.permute(1, 0, 2).unsqueeze(0)   # [1, H, S,  D]
-        v_t = all_v.permute(1, 0, 2).unsqueeze(0)   # [1, H, S,  D]
+        outputs: list[torch.Tensor] = []
+        for i, (q_i, k_i, v_i) in enumerate(zip(q_splits, k_splits, v_splits)):
+            req_kvs[i][0].append(k_i)
+            req_kvs[i][1].append(v_i)
 
-        out = F.scaled_dot_product_attention(q_t, k_t, v_t)  # [1, H, L, D]
-        return out.squeeze(0).permute(1, 0, 2)  # [L, H, D]
+            all_k = torch.cat(req_kvs[i][0], dim=0)  # [ctx_tokens, H, D]
+            all_v = torch.cat(req_kvs[i][1], dim=0)
+
+            # SDPA: [1, H, L, D] x [1, H, S, D]
+            q_t = q_i.permute(1, 0, 2).unsqueeze(0)
+            k_t = all_k.permute(1, 0, 2).unsqueeze(0)
+            v_t = all_v.permute(1, 0, 2).unsqueeze(0)
+            out_i = F.scaled_dot_product_attention(q_t, k_t, v_t)
+            outputs.append(out_i.squeeze(0).permute(1, 0, 2))  # [L, H, D]
+
+        return torch.cat(outputs, dim=0)  # [sum(seq_lens), H, D]
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +206,12 @@ class TestKVCacheParity:
                 )
 
     def test_parity_batch_size_2(self):
-        """Parity holds for B=2 (two independent sequences in the same forward)."""
+        """Parity holds for B=2 (two independent sequences in the same forward).
+
+        plan_attention must be called before each frame to tell FakeCacheManager
+        (and, in production, BatchedCacheManager) the per-request token count so
+        run_attention can split the flattened [B*n, H, D] tensor correctly.
+        """
         torch.manual_seed(99)
         cfg = _tiny_ac_config()
         model = VisionTransformerPredictorAC(cfg).eval()
@@ -191,6 +219,8 @@ class TestKVCacheParity:
         B = 2
         T = cfg.num_frames // cfg.tubelet_size
         N = (cfg.img_size[0] // cfg.patch_size) ** 2
+        cond_tokens = 3 if cfg.use_extrinsics else 2
+        tokens_per_req = N + cond_tokens  # tokens per request per frame
 
         x_full  = torch.randn(B, T * N, cfg.embed_dim)
         actions = torch.randn(B, T, cfg.action_embed_dim)
@@ -206,6 +236,8 @@ class TestKVCacheParity:
                 act_t = actions[:, t_0 : t_0 + 1, :]
                 st_t  = states[:, t_0 : t_0 + 1, :]
 
+                # Mirror what preprocess does in production.
+                cache.plan_attention(seq_lens=[tokens_per_req] * B, is_causal=False)
                 out_t = model(x_t, act_t, st_t, t_0=t_0, cache_handle=cache)
 
                 expected = out_full[:, t_0 * N : (t_0 + 1) * N, :]
