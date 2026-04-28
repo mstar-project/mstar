@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 
+from mminf.engine.cache_manager import BatchedCacheManager
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -171,11 +172,98 @@ class ACRoPEAttention(nn.Module):
             q = merge_(q, action_q)
             k = merge_(k, action_k)
             v = merge_(v, action_v)
-        # TODO: FlashInfer here. replace sdpa with flashInfer kernels or add KV caching
+
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         x = x.transpose(1, 2).reshape(b, n, c)
         return self.proj(x)
 
+    def forward_cached(
+        self,
+        x: torch.Tensor, # one chunk of tokens from one encoded frame
+        attn_mask: torch.Tensor,
+        t_0: int,
+        h: int,
+        w: int,
+        action_tokens: int,
+        cache_handle: BatchedCacheManager,
+    ) -> torch.Tensor:
+        b, n, c = x.size()
+
+        # Position ids for the spatial part of each frame
+        # We will only do this kv cache fwd function if we are running one block at a time (that's what matches the forward call)
+        # we would need the attention mask if we did more blocks, and that is not supported.
+        spatial_ids = torch.arange(t_0 * h * w, (t_0 + 1) * h * w, device=x.device)
+        d_pos, h_pos, w_pos = self._separate_positions(spatial_ids, h, w)
+        
+        # Upstream snaps to the RoPE grid in case inference H/W differ
+        # from training; these are no-ops when grid_size matches.
+        h_pos = h_pos * (self.grid_size / h)
+        w_pos = w_pos * (self.grid_size / w)
+
+        if action_tokens > 0:
+            x = x.view(b, -1, action_tokens + h * w, c)  # [B, 1, A+H*W, C]
+
+            action_q, action_k, action_v = [], [], []
+            for i in range(action_tokens):
+                a = x[:, :, i : i + 1, :].flatten(1, 2)  # [B, 1, C]
+                qkv = (
+                    self.qkv(a).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
+                )  # [3, B, num_heads, 1, head_dim]
+                q, k, v = qkv[0], qkv[1], qkv[2]
+                time_pos = torch.tensor(t_0, device=x.device)
+                qd = rotate_queries_or_keys(q[..., : self.d_dim], pos=time_pos)
+                kd = rotate_queries_or_keys(k[..., : self.d_dim], pos=time_pos)
+                qr = q[..., self.d_dim :]
+                kr = k[..., self.d_dim :]
+                action_q.append(torch.cat([qd, qr], dim=-1).view(b, self.num_heads, t_0, 1, -1))
+                action_k.append(torch.cat([kd, kr], dim=-1).view(b, self.num_heads, t_0, 1, -1))
+                action_v.append(v.view(b, self.num_heads, t, 1, -1))
+
+            action_q = torch.cat(action_q, dim=3).flatten(2, 3)
+            action_k = torch.cat(action_k, dim=3).flatten(2, 3)
+            action_v = torch.cat(action_v, dim=3).flatten(2, 3)
+            x = x[:, :, action_tokens:, :].flatten(1, 2)  # [B, 1*H*W, C]
+
+        # Spatial qkv + 3D RoPE
+        qkv = self.qkv(x).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        s = 0
+        qd = rotate_queries_or_keys(q[..., s : s + self.d_dim], pos=d_pos)
+        kd = rotate_queries_or_keys(k[..., s : s + self.d_dim], pos=d_pos)
+        s += self.d_dim
+        qh = rotate_queries_or_keys(q[..., s : s + self.h_dim], pos=h_pos)
+        kh = rotate_queries_or_keys(k[..., s : s + self.h_dim], pos=h_pos)
+        s += self.h_dim
+        qw = rotate_queries_or_keys(q[..., s : s + self.w_dim], pos=w_pos)
+        kw = rotate_queries_or_keys(k[..., s : s + self.w_dim], pos=w_pos)
+        s += self.w_dim
+        if s < self.head_dim:
+            qr, kr = q[..., s:], k[..., s:]
+            q = torch.cat([qd, qh, qw, qr], dim=-1)
+            k = torch.cat([kd, kh, kw, kr], dim=-1)
+        else:
+            q = torch.cat([qd, qh, qw], dim=-1)
+            k = torch.cat([kd, kh, kw], dim=-1)
+
+        if action_tokens > 0:
+            # Interleave back: per frame, [A action tokens, H*W spatial tokens]
+            def merge_(tx: torch.Tensor, ta: torch.Tensor) -> torch.Tensor:
+                tx = tx.view(b, self.num_heads, 1, h * w, -1)
+                ta = ta.view(b, self.num_heads, 1, action_tokens, -1)
+                return torch.cat([ta, tx], dim=3).flatten(2, 3)
+
+            q = merge_(q, action_q)
+            k = merge_(k, action_k)
+            v = merge_(v, action_v)
+
+        # qkv shape should be: B, num_heads, block_size, head_dim
+        def _fix_shapes_for_attn(x):
+            return x.transpose(1,2).flatten(0,1) # B*block_size, num_heads, head_dim
+        #run attention wants: N, H, D
+        attn_output = cache_handle.run_attention(_fix_shapes_for_attn(q), _fix_shapes_for_attn(k), _fix_shapes_for_attn(v)) # non-causal attention (will be specified in plan_attention)
+        x = x.reshape(b, n, c)
+        return self.proj(x)
 
 class ACBlock(nn.Module):
     def __init__(
