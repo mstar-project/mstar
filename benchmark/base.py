@@ -116,13 +116,24 @@ class Qwen3Omni(Model):
         # videomme / videoamme result tables). Without this cap the talker
         # speaks the full 8192-token thinker max, producing 5+ min of audio
         # per request and making B=1 cells take minutes instead of seconds.
+        #
+        # Force greedy sampling on all three sub-models (thinker, talker,
+        # code-predictor) so cross-system runs see the same tokens for the
+        # same prompt. mminf's qwen3_omni_model.py:521-540 defaults are
+        # thinker=0.7, talker=0.9, cp=1.0, which would otherwise make audio
+        # length (and therefore RTF) vary across runs.
         if request_type in (
             RequestType.T2S,
             RequestType.I2S,
             RequestType.A2S,
             RequestType.V2S,
         ):
-            return {"max_tokens": 256}
+            return {
+                "max_tokens": 256,
+                "thinker_temperature": 0.0,
+                "talker_temperature": 0.0,
+                "cp_temperature": 0.0,
+            }
         return {}
 
     def get_supported_modalities(self):
