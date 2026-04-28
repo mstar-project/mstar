@@ -455,6 +455,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
             "fn_factory": fn_factory,
             "embed_dim": self.config.pred_hidden_size,
             "capture_seq_len": n_seq,
+            "capture_batch_sizes": [1, 2, 4, 8],
             "pos_buf_shapes": {"position_mask": (n_seq,)},
             "cache_labels": ["main"],
         }
@@ -902,6 +903,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             "fn_factory": fn_factory,
             "embed_dim": ac.predictor_embed_dim,
             "capture_seq_len": cond_tokens + N * N,
+            "capture_batch_sizes": [1, 2, 4, 8],
             "pos_buf_shapes": {
                 "d_pos":   (N * N,),
                 "h_pos":   (N * N,),

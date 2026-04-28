@@ -179,7 +179,7 @@ class EncoderDecoderEngine(BaseEngine):
                     pcgr = PiecewiseCudaGraphRunner(
                         fn_factory=pcgr_config["fn_factory"],
                         embed_dim=pcgr_config["embed_dim"],
-                        capture_batch_sizes=DEFAULT_AR_CAPTURE_BATCH_SIZES,
+                        capture_batch_sizes=pcgr_config.get("capture_batch_sizes", DEFAULT_AR_CAPTURE_BATCH_SIZES),
                         capture_seq_len=pcgr_config["capture_seq_len"],
                         device=self.device,
                         autocast_dtype=self.autocast_dtype,
