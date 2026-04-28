@@ -26,6 +26,7 @@ import torch
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
+from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mminf.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mminf.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -911,10 +912,20 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         out["states"] = torch.cat([
             inp.tensor_inputs["states"] for inp in inputs
         ], dim=0)
+
+        per_req_seq_len = out["encoder_hidden"].shape[1] + 2
         if "extrinsics" in inputs[0].tensor_inputs:
             out["extrinsics"] = torch.cat([
                 inp.tensor_inputs["extrinsics"] for inp in inputs
             ], dim=0)
+            per_req_seq_len += 1
+        
+        # plan attention
+        engine_inputs.cache_manager.plan_attention(
+            seq_lens=[per_req_seq_len] * len(inputs),
+            is_causal=False
+        )
+
         return out
     
     def _rollout_step(
@@ -922,6 +933,8 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         encoder_hidden: torch.Tensor,   # [B, H*W, D]
         actions: torch.Tensor,           # [B, 1, action_embed_dim]
         states: torch.Tensor,            # [B, 1, action_embed_dim]
+        t_0: int,
+        cache_handle: BatchedCacheManager,
         extrinsics: torch.Tensor | None, # [B, 1, action_embed_dim - 1] or None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One sliding-window AC rollout step.
@@ -940,6 +953,8 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             actions,
             states,
             extrinsics=extrinsics,
+            t_0=t_0,
+            cache_handle=cache_handle
         )  # [B, HW, D]
 
         print(
@@ -973,6 +988,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 
         new_tg = self._rollout_step(
             encoder_hidden, actions, states, extrinsics,
+            t_0=iter_idx, cache_handle=engine_inputs.cache_manager
         )
 
         # Per-request early-exit — same contract as masked rollout.
@@ -1013,6 +1029,10 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 f"match request count {len(request_ids)}."
             )
         
+        # Now, can_batch ensures that all requests in a batch have the same loop index
+        # TODO: this no longer needs to be the case.
+        iter_idx = engine_inputs.first_request_info.dynamic_loop_iter_counts.get(
+            "rollout_loop", 0)
         outputs = self.forward(
             graph_walk,
             engine_inputs,
@@ -1020,6 +1040,8 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             actions,
             states,
             extrinsics,
+            t_0=iter_idx,
+            cache_handle=engine_inputs.cache_manager
         )
 
         per_rid = {

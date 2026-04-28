@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mminf.model.vjepa2.components.rope_utils import rotate_queries_or_keys
+from mminf.model.vjepa2.components.rope_utils import rotate_queries_or_keys, rotate_queries_or_keys_BNHD
 from mminf.model.vjepa2.config import VJepa2ACPredictorConfig
 
 
@@ -105,7 +105,16 @@ class ACRoPEAttention(nn.Module):
         h: int,
         w: int,
         action_tokens: int,
+        t_0: int = 0,
+        cache_handle: BatchedCacheManager | None=None,
     ) -> torch.Tensor:
+        if cache_handle is not None:
+            return self.forward_cached(
+                x=x, t_0=t_0,
+                h=h, w=w,
+                action_tokens=action_tokens,
+                cache_handle=cache_handle
+            )
         b, n, c = x.size()
 
         # Position ids for the spatial part of each frame
@@ -179,95 +188,123 @@ class ACRoPEAttention(nn.Module):
 
     def forward_cached(
         self,
-        x: torch.Tensor, # one chunk of tokens from one encoded frame
-        attn_mask: torch.Tensor,
+        x: torch.Tensor, # [B, L, C]
         t_0: int,
         h: int,
         w: int,
         action_tokens: int,
-        cache_handle: BatchedCacheManager,
+        cache_handle: BatchedCacheManager
     ) -> torch.Tensor:
-        b, n, c = x.size()
+        # Validity of this function in comparison with the regular forward
+        # was partially checked with test/modular/vjepa2/test_ac_rope_parity.py
+        b, n, c = x.shape
+        hd = self.head_dim
 
-        # Position ids for the spatial part of each frame
-        # We will only do this kv cache fwd function if we are running one block at a time (that's what matches the forward call)
-        # we would need the attention mask if we did more blocks, and that is not supported.
-        spatial_ids = torch.arange(t_0 * h * w, (t_0 + 1) * h * w, device=x.device)
+        spatial_tokens = h * w
+
+        # ------------------------------------------------------------
+        # Build spatial positions for this frame
+        # ------------------------------------------------------------
+        spatial_ids = torch.arange(
+            t_0 * spatial_tokens, (t_0 + 1) * spatial_tokens, device=x.device,
+        )
+
         d_pos, h_pos, w_pos = self._separate_positions(spatial_ids, h, w)
-        
-        # Upstream snaps to the RoPE grid in case inference H/W differ
-        # from training; these are no-ops when grid_size matches.
+
         h_pos = h_pos * (self.grid_size / h)
         w_pos = w_pos * (self.grid_size / w)
 
+        # ------------------------------------------------------------
+        # Single QKV projection
+        # q/k/v -> [B, L, H, D]
+        # ------------------------------------------------------------
+        qkv: torch.Tensor = self.qkv(x).view(b, n, 3, self.num_heads, hd)
+        q, k, v = qkv.unbind(dim=2)
+
+        # ------------------------------------------------------------
+        # Split action + spatial tokens
+        # ------------------------------------------------------------
         if action_tokens > 0:
-            x = x.view(b, -1, action_tokens + h * w, c)  # [B, 1, A+H*W, C]
+            q_action = q[:, :action_tokens]
+            k_action = k[:, :action_tokens]
+            v_action = v[:, :action_tokens]
 
-            action_q, action_k, action_v = [], [], []
-            for i in range(action_tokens):
-                a = x[:, :, i : i + 1, :].flatten(1, 2)  # [B, 1, C]
-                qkv = (
-                    self.qkv(a).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
-                )  # [3, B, num_heads, 1, head_dim]
-                q, k, v = qkv[0], qkv[1], qkv[2]
-                time_pos = torch.tensor(t_0, device=x.device)
-                qd = rotate_queries_or_keys(q[..., : self.d_dim], pos=time_pos)
-                kd = rotate_queries_or_keys(k[..., : self.d_dim], pos=time_pos)
-                qr = q[..., self.d_dim :]
-                kr = k[..., self.d_dim :]
-                action_q.append(torch.cat([qd, qr], dim=-1).view(b, self.num_heads, 1, 1, -1))
-                action_k.append(torch.cat([kd, kr], dim=-1).view(b, self.num_heads, 1, 1, -1))
-                action_v.append(v.view(b, self.num_heads, 1, 1, -1))
-
-            action_q = torch.cat(action_q, dim=3).flatten(2, 3)
-            action_k = torch.cat(action_k, dim=3).flatten(2, 3)
-            action_v = torch.cat(action_v, dim=3).flatten(2, 3)
-            x = x[:, :, action_tokens:, :].flatten(1, 2)  # [B, 1*H*W, C]
-
-        # Spatial qkv + 3D RoPE
-        qkv = self.qkv(x).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        s = 0
-        qd = rotate_queries_or_keys(q[..., s : s + self.d_dim], pos=d_pos)
-        kd = rotate_queries_or_keys(k[..., s : s + self.d_dim], pos=d_pos)
-        s += self.d_dim
-        qh = rotate_queries_or_keys(q[..., s : s + self.h_dim], pos=h_pos)
-        kh = rotate_queries_or_keys(k[..., s : s + self.h_dim], pos=h_pos)
-        s += self.h_dim
-        qw = rotate_queries_or_keys(q[..., s : s + self.w_dim], pos=w_pos)
-        kw = rotate_queries_or_keys(k[..., s : s + self.w_dim], pos=w_pos)
-        s += self.w_dim
-        if s < self.head_dim:
-            qr, kr = q[..., s:], k[..., s:]
-            q = torch.cat([qd, qh, qw, qr], dim=-1)
-            k = torch.cat([kd, kh, kw, kr], dim=-1)
+            q_spatial = q[:, action_tokens:]
+            k_spatial = k[:, action_tokens:]
+            v_spatial = v[:, action_tokens:]
         else:
-            q = torch.cat([qd, qh, qw], dim=-1)
-            k = torch.cat([kd, kh, kw], dim=-1)
+            q_spatial, k_spatial, v_spatial = q, k, v
 
+        # ------------------------------------------------------------
+        # Apply RoPE to spatial tokens
+        # ------------------------------------------------------------
+        s = 0
+        qd = rotate_queries_or_keys_BNHD(q_spatial[..., s:s+self.d_dim], d_pos)
+        kd = rotate_queries_or_keys_BNHD(k_spatial[..., s:s+self.d_dim], d_pos)
+        s += self.d_dim
+
+        qh = rotate_queries_or_keys_BNHD(q_spatial[..., s:s+self.h_dim], h_pos)
+        kh = rotate_queries_or_keys_BNHD(k_spatial[..., s:s+self.h_dim], h_pos)
+        s += self.h_dim
+
+        qw = rotate_queries_or_keys_BNHD(q_spatial[..., s:s+self.w_dim], w_pos)
+        kw = rotate_queries_or_keys_BNHD(k_spatial[..., s:s+self.w_dim], w_pos)
+        s += self.w_dim
+
+        if s < hd:
+            q_spatial = torch.cat(
+                [qd, qh, qw, q_spatial[..., s:]],
+                dim=-1,
+            )
+            k_spatial = torch.cat(
+                [kd, kh, kw, k_spatial[..., s:]],
+                dim=-1,
+            )
+        else:
+            q_spatial = torch.cat([qd, qh, qw], dim=-1)
+            k_spatial = torch.cat([kd, kh, kw], dim=-1)
+
+        # ------------------------------------------------------------
+        # Apply temporal RoPE to action tokens (all at once)
+        # ------------------------------------------------------------
         if action_tokens > 0:
-            # Interleave back: per frame, [A action tokens, H*W spatial tokens]
-            def merge_(tx: torch.Tensor, ta: torch.Tensor) -> torch.Tensor:
-                tx = tx.view(b, self.num_heads, 1, h * w, -1)
-                ta = ta.view(b, self.num_heads, 1, action_tokens, -1)
-                return torch.cat([ta, tx], dim=3).flatten(2, 3)
+            time_pos = torch.full(
+                (action_tokens,),
+                t_0,
+                device=x.device,
+                dtype=x.dtype,
+            )
 
-            q = merge_(q, action_q)
-            k = merge_(k, action_k)
-            v = merge_(v, action_v)
+            qd = rotate_queries_or_keys_BNHD(q_action[..., :self.d_dim], time_pos)
+            kd = rotate_queries_or_keys_BNHD(k_action[..., :self.d_dim], time_pos)
 
-        # qkv shape should be: B, num_heads, block_size, head_dim
-        def _fix_shapes_for_attn(x):
-            return x.transpose(1,2).flatten(0,1) # B*block_size, num_heads, head_dim
-        #run attention wants: N, H, D
-        x = cache_handle.run_attention(
-            _fix_shapes_for_attn(q),
-            _fix_shapes_for_attn(k),
-            _fix_shapes_for_attn(v)
-        ) # non-causal attention (will be specified in plan_attention)
+            q_action = torch.cat(
+                [qd, q_action[..., self.d_dim:]],
+                dim=-1,
+            )
+            k_action = torch.cat(
+                [kd, k_action[..., self.d_dim:]],
+                dim=-1,
+            )
+
+            q = torch.cat([q_action, q_spatial], dim=1)
+            k = torch.cat([k_action, k_spatial], dim=1)
+            v = torch.cat([v_action, v_spatial], dim=1)
+        else:
+            q, k, v = q_spatial, k_spatial, v_spatial
+
+        # ------------------------------------------------------------
+        # Flatten directly for cache attention
+        # [B, L, H, D] -> [B*L, H, D]
+        # ------------------------------------------------------------
+        q = q.reshape(b * n, self.num_heads, hd)
+        k = k.reshape(b * n, self.num_heads, hd)
+        v = v.reshape(b * n, self.num_heads, hd)
+
+        x = cache_handle.run_attention(q, k, v) # non-causal attention (specified in plan_attention)
         x = x.reshape(b, n, c)
         return self.proj(x)
+
 
 class ACBlock(nn.Module):
     def __init__(
@@ -298,8 +335,14 @@ class ACBlock(nn.Module):
         h: int,
         w: int,
         action_tokens: int,
+        t_0: int = 0,
+        cache_handle: BatchedCacheManager | None=None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), attn_mask=attn_mask, t=t, h=h, w=w, action_tokens=action_tokens)
+        x = x + self.attn(
+            self.norm1(x), attn_mask=attn_mask, t=t, h=h, w=w,
+            action_tokens=action_tokens,
+            t_0=t_0, cache_handle=cache_handle
+        )
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -383,6 +426,8 @@ class VisionTransformerPredictorAC(nn.Module):
         actions: torch.Tensor,
         states: torch.Tensor,
         extrinsics: torch.Tensor | None = None,
+        t_0: int = 0,
+        cache_handle: BatchedCacheManager | None=None,
     ) -> torch.Tensor:
         """
         Args:
@@ -414,9 +459,15 @@ class VisionTransformerPredictorAC(nn.Module):
             cond_tokens = 2
 
         assert self.config.is_frame_causal, "non-causal AC predictor is not implemented"
-        attn_mask = self._get_attn_mask(x.device)[: x.size(1), : x.size(1)]
 
-        for blk in self.predictor_blocks:
+        if cache_handle is None:
+            attn_mask = self._get_attn_mask(x.device)[: x.size(1), : x.size(1)]
+        else:
+            attn_mask = None # frame causal pattern handled by KV cache
+
+        for blk_num, blk in enumerate(self.predictor_blocks):
+            if cache_handle is not None:
+                cache_handle.set_layer_idx(blk_num)
             x = blk(
                 x,
                 attn_mask=attn_mask,
@@ -424,7 +475,12 @@ class VisionTransformerPredictorAC(nn.Module):
                 h=self.grid_height,
                 w=self.grid_width,
                 action_tokens=cond_tokens,
+                t_0=t_0,
+                cache_handle=cache_handle,
             )
+        
+        if cache_handle is not None:
+            cache_handle.advance_seq_len()
 
         # Drop interleaved action/state(+extrinsics) tokens, keep spatial ones.
         x = x.view(b, t, cond_tokens + self.grid_height * self.grid_width, d)

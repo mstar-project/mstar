@@ -284,8 +284,17 @@ class VJepa2Model(Model):
     # ------------------------------------------------------------------
 
     def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        # V-JEPA 2 has no KV cache (stateless ViT encoder + stateless predictor).
-        return []
+        # KV cache exists for the AC rollout predictor
+        if self.config.predictor_kind == "ac":
+            return [KVCacheConfig(
+                num_layers=self.config.num_hidden_layers,
+                num_kv_heads=self.config.pred_num_attention_heads,
+                head_dim=self.config.hidden_size // self.config.num_attention_heads,
+                max_seq_len=16384, # TODO: actually compute this
+                num_qo_heads=self.config.num_attention_heads,
+                nodes=["rollout_predictor"]
+            )]
+        return [] # otherwise no kv cache
 
     def get_node_engine_types(self) -> dict[str, EngineType]:
         types: dict[str, EngineType] = {
@@ -379,14 +388,6 @@ class VJepa2Model(Model):
         # the same node, meaning the loop-back value is ignored by the
         # node's ``input_ids`` and only survives in the accumulated cache.
         #
-        # AC rollout additionally carries ``actions`` / ``states`` (+
-        # optional ``extrinsics``) as identity loop-back edges: the client
-        # sends the full per-iter trajectory once and the submodule slices
-        # per-iter from ``iter_idx``, so the tensors don't change across
-        # iters but still need to be routed on every iter.  See
-        # ``VJepa2ACRolloutPredictorSubmodule`` for the sliding-window
-        # semantics and the P3.D "Sliding-window vs upstream growing-context"
-        # note in the plan for why we diverge from upstream.
         #
         # Two variants of the walk coexist:
         #   * batched (default): ``Loop.accumulated_outputs`` gathers the
@@ -415,16 +416,13 @@ class VJepa2Model(Model):
             GraphEdge(next_node="rollout_predictor", name="predicted_hidden"),
         ]
         if self.config.predictor_kind == "ac":
+            # NOTE: in the absence of "actions" and "states" loopback outputs,
+            # the look primitives always pass in the initial action and state inputs;
+            # no additional wiring needed because the actions and states are constant
+            # buffers across loop iterations (we just take different indices at each iter)
             rollout_inputs += ["actions", "states"]
-            rollout_loopback_outputs += [
-                GraphEdge(next_node="rollout_predictor", name="actions"),
-                GraphEdge(next_node="rollout_predictor", name="states"),
-            ]
             if self.config.ac_predictor and self.config.ac_predictor.use_extrinsics:
                 rollout_inputs.append("extrinsics")
-                rollout_loopback_outputs.append(
-                    GraphEdge(next_node="rollout_predictor", name="extrinsics")
-                )
 
         def _build_rollout_encoder_node() -> GraphNode:
             # Fresh instance per walk — GraphNode carries per-request

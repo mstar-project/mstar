@@ -133,7 +133,17 @@ class ModelInputsFromEngine:
 
     @property
     def single_request_info(self):
+        """
+        IMPORTANT: asserts that there is only one request
+        """
         assert len(self.per_request_info) == 1
+        return self.per_request_info[self.request_ids[0]]
+    
+    @property
+    def first_request_info(self):
+        """
+        unlike single_request_info, does not assert that there is only one request
+        """
         return self.per_request_info[self.request_ids[0]]
 
 
