@@ -373,6 +373,11 @@ def sample_tokens(
             seen_mask=seen_token_mask,
             include_greedy=run_greedy,
         )
+        # NOTE: this sync is load-bearing — see git history of sampling.py
+        # for the Qwen issue it fixes. Removing/gating it caused concurrent
+        # regression on Orpheus (worker GIL contention with the GPU thread)
+        # even though both kernels run on the same stream. Leave alone
+        # unless you're prepared to do thorough multi-model verification.
         torch.cuda.current_stream().synchronize()
         result = flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
         return result[0] if isinstance(result, tuple) else result

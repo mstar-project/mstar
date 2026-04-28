@@ -936,12 +936,21 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
+
+    def check_stop(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> set[str]:
+        if "new_token" not in outputs:
+            return set()
         token = outputs["new_token"][0].item()
         eos_token_id = self.config.im_end_token_id
         if (eos_token_id is not None and eos_token_id == token) or \
                 (request_info.dynamic_loop_iter_counts.get("thinker_decode_loop", 0) + 1 >= request_info.max_tokens):
-            request_info.register_loop_stop("thinker_decode_loop")
-    
+            return {"thinker_decode_loop"}
+        return set()
+
     def filter_batched_output(
         self,
         request_info: CurrentForwardPassInfo,
@@ -1348,15 +1357,25 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
     ):
         if "new_token" not in outputs:
             return
+        # Rename new_token → layer0_codes for downstream graph routing.
+        # check_stop reads layer0_codes (same tensor) on the worker's slow path.
         codes = outputs.pop("new_token")[0]
-        token = codes.item()
+        outputs["layer0_codes"] = [codes]
+
+    def check_stop(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> set[str]:
+        if "layer0_codes" not in outputs:
+            return set()
+        token = outputs["layer0_codes"][0].item()
         eos_token_id = self.config.talker.codec_eos_token_id
         if (eos_token_id is not None and eos_token_id == token) or \
                 (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= request_info.max_tokens):
-            request_info.register_loop_stop("talker_decode_loop")
-        
-        outputs["layer0_codes"] = [codes]
-    
+            return {"talker_decode_loop"}
+        return set()
+
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
         self._eos_embed_sent.discard(request_id)

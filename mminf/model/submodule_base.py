@@ -234,19 +234,48 @@ class NodeSubmodule(torch.nn.Module):
         **kwargs
     ):
         """
-        Performs any required postprocessing (after sampling from logits, if applicable)
-        on the submodule outputs (e.g., checking for EOS to stop the decode loop, as this
-        python-level control flow cannot happen in a cuda graph section).
+        Metadata-only postprocessing on the submodule outputs.
 
-        E.g., submodules that always emit a static set of keys for capture
-        compatibility can override this to drop keys on a per-request basis
-        (e.g. the Qwen3-Omni Thinker always emits ``thinker_states`` inside
-        the graph, then drops it here for requests that don't need audio).
+        Runs on the GPU thread inside ``execute_batch``. **Must not read tensor
+        values** — no ``.item()`` / ``.cpu()`` / ``.tolist()`` etc. — because
+        any sync here blocks the GPU thread and forfeits the worker's async-
+        scheduling overlap. Stop-condition decisions that need token values
+        (e.g. EOS) belong in ``check_stop``.
 
-        This function modifies the `outputs` dict in-place and returns nothing.
+        Typical uses:
+          - rebind output names for graph routing (``outputs["text_inputs"] =
+            outputs["new_token"]``);
+          - drop keys on a per-request basis for static-capture submodules
+            (e.g. Qwen3-Omni Thinker dropping ``thinker_states`` for requests
+            that don't need audio).
+
+        Modifies ``outputs`` in-place; returns nothing.
         """
         return
-    
+
+    def check_stop(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> set[str]:
+        """
+        Return the set of dynamic-loop names that should stop after this step.
+
+        Runs on the worker's slow-postprocess path *after* ``execute_batch``
+        returns — never inside ``execute_batch``. **Allowed** to read tensor
+        values (``.item()`` / ``.cpu()``) because by this point the GPU
+        thread is no longer blocked by it.
+
+        Stops returned here are deferred by one step: they apply to the
+        worker's *next* iter's fast postprocess. The current in-flight step
+        (already submitted under the assumption that the rid continues)
+        will run for that rid and its output discarded — the standard
+        1-wasted-step cost for any stop signal.
+
+        Default: no stops.
+        """
+        return set()
+
     def cleanup_request(self, request_id: str):
         """Remove per-request state when a request completes."""
         return

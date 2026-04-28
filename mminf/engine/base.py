@@ -42,6 +42,12 @@ class NodeOutput:
     # When allocation_failed=True, details about the failure:
     alloc_pages_short: int = 0
     alloc_failed_request_id: str | None = None
+    # CUDA event recorded on the default stream after this step's GPU work
+    # was submitted, used by the worker to (a) sync only on GPU(N) (not
+    # GPU(N+1) which is queued behind it after speculation), and (b) gate a
+    # side-stream D→H copy of the produced tokens. Set by the worker in
+    # _execute_on_gpu_thread; engines don't populate it themselves.
+    completion_event: "torch.cuda.Event | None" = None
 
 
 class BaseEngine(ABC):
@@ -129,6 +135,21 @@ class BaseEngine(ABC):
         Check if the engine is ready to execute.
         """
         return True
+
+    def check_stop_for_batch(
+        self, batch: NodeBatch, output: NodeOutput
+    ) -> dict[str, set[str]]:
+        """
+        Per-rid stop-condition check for a finished batch.
+
+        Called by the worker on its slow-postprocess path *after*
+        ``execute_batch`` returns. May read tensor values. Returns
+        ``{request_id: {loop_name, ...}}`` for rids whose loops should stop.
+
+        Default: no stops (engines without value-driven stop conditions —
+        FlowEngine, EncoderDecoderEngine, AudioCodecEngine — return {}).
+        """
+        return {}
 
     def warmup(self) -> None:
         """Optional CUDA graph capture. Override in subclasses."""

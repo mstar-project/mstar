@@ -1,10 +1,214 @@
 # Worker async-first redesign — sketch
 
-Status: **design note, not yet implemented**. Consolidates the TODOs scattered
-across the codebase (`sampling.py` seen-mask scatter, `cache_manager.py`
-double-buffered FlashInfer wrappers) into a single staging plan.
+Status: **Phase 1 + speculative scheduling (Option A') implemented.** AR
+decode loops now overlap full CPU-side post-processing with GPU work.
+Notes for follow-on phases (b)/(c)/sampler-staleness/sampling-sync/
+postproc-thread/stream-isolation) at the bottom.
 
-## Motivation
+## Phase 1' — speculative scheduling (Option A', SHIPPED)
+
+The previous Phase 1 only overlapped the message/RDMA-polling trio
+(~360 µs) with GPU work. Most CPU overhead — `route_outputs`,
+`store_outputs`, `send_outputs`, plus `schedule + build` — still sat on
+the critical path between GPU steps. With ~6 ms GPU step and ~1 ms
+serial CPU per step, ceiling was ~15% speedup.
+
+Option A' moves to vLLM-style 1-deep speculative scheduling, restricted
+to AR engine + intra-worker, with a uniform 1-iter deferral of EOS
+detection.
+
+Two follow-on fixes shipped alongside the initial Option A' (without
+which it regressed both single-request latency and concurrent
+throughput vs the synchronous baseline):
+
+1. **New-rid merge into the speculative batch** (`_try_speculate_next`).
+   The first cut only carried forward `batch_N`'s rids — new requests
+   couldn't join the spec batch until the entire current chain
+   finished, regressing concurrent throughput ~40%. Now, after building
+   the continuing-rid placeholders, we run `MicroScheduler.get_next_batch`
+   and merge in any fresh rids whose ready node matches the spec
+   batch's `(node_name, graph_walk)`. Mismatched fresh batches get
+   pushed back onto their queues for the non-speculative path.
+
+2. **Stream-isolated D→H + event-gated default-stream sync.** With
+   GPU(N+1) queued on default stream behind GPU(N), every
+   `default_stream().synchronize()` on the main thread (in
+   `_store_outputs_and_finish_loops` and `.cpu()` in `_slow_postprocess`)
+   stalled waiting for GPU(N+1) to drain — undoing the overlap. Now
+   `_execute_on_gpu_thread` records a `torch.cuda.Event` on the default
+   stream right after `execute_with_max_batch_size` returns and stashes
+   it on the `NodeOutput`. Downstream, the main thread waits on the
+   event (returns as soon as GPU(N) is done) for the
+   `register_for_send` sync, and queues a batched D→H copy of the new
+   tokens on a worker-owned side stream gated by `wait_event`. The
+   side-stream copy assumes the new-token tensors are fresh sampler
+   allocations (FlashInfer `top_p_sampling_from_probs`), not views
+   into CUDA-graph static buffers — verify this every time the sampler
+   path changes.
+
+```
+                Main thread                                  GPU thread
+
+iter K start:  pending = (batch_N, future_N)
+               _pending_stops, _pending_removes from prior iters
+
+  CPU preamble                                  ◄── overlap GPU(N)
+    process_messages
+    check_ready_tensors
+    poll_stream_buffers
+
+  speculate + build N+1                         ◄── overlap GPU(N)
+    continuing_rids = batch_N.rids
+                       - _pending_removes
+                       - _pending_stops
+    spec_batch  = clone(batch_N) with continuing rids only
+                  (GraphNode.clone_for_next_iter; fresh edges)
+    spec_node_batch = NodeBatch with placeholder loop-back inputs
+
+  await GPU(N) Python return                    ◄── only sync point
+
+  (if alloc_failed: drop speculation, retry batch_N, drain pipeline)
+
+  thread N's outputs → N+1's loop-back inputs   ~ tens of µs
+    spec_node_batch.input["text_inputs"] =
+        output_N["text_inputs"]                 (Python pointer assign;
+                                                 CUDA stream order
+                                                 guarantees N's writes
+                                                 visible to N+1's reads)
+
+  submit GPU(N+1) ─────────────────────────────►  execute_batch(N+1)
+
+  fast_postprocess(N)                           ◄── overlap GPU(N+1)
+    apply _pending_stops_to_batch (1-step-late stops from N-1)
+    cleanup_consumed_inputs
+    store_outputs_and_finish_loops (incl loop-back so complete_loops
+                                    sees the loop-continue signal)
+    process_node_outputs (skip loop-back edges that speculation
+                          already consumed; manually deref their
+                          UUIDs to keep tensor_store refcounts clean)
+    register_for_send (intra-worker)
+
+  slow_postprocess(N)                           ◄── overlap GPU(N+1)
+    prematerialize new tokens via .cpu()
+      ⚠ syncs on default stream → blocks until GPU(N+1) drains
+        (streaming-token-latency cost; see "Open follow-ons" below)
+    _send_outputs (ZMQ to conductor / api_server)
+    check_stop_for_batch(N) → _pending_stops    (will fire next iter)
+```
+
+### Submodule API split
+
+Models that previously did `.item()` + `register_loop_stop` *inside*
+`submodule.postprocess` (Orpheus, BAGEL, Qwen3-Omni Thinker/Talker)
+have been refactored to split that logic:
+
+- `postprocess(rid, info, outputs)` — metadata-only (rebind output
+  names, drop optional outputs). MUST NOT read tensor values.
+  Runs on the GPU thread inside `execute_batch`.
+- `check_stop(rid, info, outputs) → set[str]` — value-reading EOS /
+  max-tokens check. Returns loop names to stop. Runs on the worker's
+  slow-postprocess path.
+
+vjepa2 retains `register_loop_stop` inside `forward` because its check
+is CPU-only (`iter_idx + 1 >= rollout_horizon`) — no GPU sync to
+remove. The 1-iter deferral is uniform regardless of where the signal
+originates (vjepa2 still pays 1 wasted GPU step per stop).
+
+### Wasted-step semantics
+
+| Source of stop                                 | Wasted steps |
+|------------------------------------------------|--------------|
+| Conductor `REMOVE_REQUEST` (e.g. external EOS) | 1 (rid was in spec batch when message arrived) |
+| Submodule `check_stop` (Orpheus/BAGEL/Qwen3)   | 1 (spec already submitted before stop known) |
+| Submodule `register_loop_stop` in `forward` (vjepa2) | 1 (deferred uniformly to next iter's fast_postprocess) |
+| `output.allocation_failed` from engine         | up to 1 spec step also discarded; pipeline drained, batch_N retried |
+
+### Speculation eligibility
+
+`_can_speculate(batch_N)` returns True iff:
+- `engine.engine_type() == EngineType.AR`, AND
+- `_try_speculate_next` finds at least one continuing rid whose node's
+  required inputs are all loop-back (i.e. `next_node == node.name` for
+  some output edge with the same name).
+
+For non-AR engines (Flow, EncDec, AudioCodec) and for AR steps that
+aren't pure loop-back (e.g. prefill → decode transitions), the worker
+falls through to the non-speculative path — drains the in-flight step,
+runs MicroScheduler, submits the next step. Same as Phase 1.
+
+### Cross-iter state on `Worker`
+
+- `_in_flight_rids: set[str]` — rids in the currently-pending GPU step.
+  Read by `_remove_request` to defer destructive teardown.
+- `_pending_removes: set[str]` — `REMOVE_REQUEST` for rids that were
+  in flight at message time. Applied in next iter once no in-flight
+  step references them.
+- `_pending_stops: dict[rid, set[str]]` — loop names to stop. Filled
+  by `check_stop_for_batch` in slow_postprocess; consumed in next
+  iter's fast_postprocess (this is the 1-iter deferral).
+
+### Thread safety
+
+The GPU thread only mutates engine-internal state plus
+`batch.per_request_info[rid].per_label_seq_info` in `execute_batch`'s
+finally block. The main thread, while GPU(N) is in flight, only:
+- Reads `worker_graphs_manager` queue state (untouched by GPU thread).
+- Reads `batch_N.node_objects[rid]` (`name`, `outputs`, `input_ids`)
+  for cloning into spec_batch — no writes.
+- Reads `worker_graphs_manager.get_fwd_info(rid)` — returns the live
+  fwd_info ref, which `execute_batch(N+1)` reads later on the GPU
+  thread *after* `execute_batch(N)` finished its finally write. Strict
+  per-step serialization on the GPU thread keeps these races out.
+
+Mutations of `tensor_manager` happen only in fast/slow postprocess on
+the main thread (after `await GPU(N)`). The GPU thread doesn't touch
+`tensor_manager`.
+
+## Open follow-ons (still on the original plan)
+
+The doc below this line is the original staged plan. Phases 0/1 now
+correspond to the shipped state (Phase 1 = GPU thread offload, Phase 1'
+= speculative scheduling above). The remaining items below are
+unchanged in spirit but should be re-read in light of Phase 1':
+
+1. ~~**Stream-isolated D→H of new tokens.**~~ Shipped — see Phase 1'
+   above. Side-stream D→H of new tokens + event-gated
+   `register_for_send` sync. Sequential single-request latency
+   regression dropped from +24% to +7%; what remains is sampler
+   staleness (item 4 below) and main-thread CPU residue.
+2. **`sampling.py:376` `current_stream().synchronize()`.** Sits inside
+   the engine's hot path between `fused_temperature_softmax` and
+   FlashInfer's `top_p_sampling_from_probs`. Blocks the GPU thread for
+   the full softmax/replay duration. Investigate whether FlashInfer
+   actually requires this sync or if it's a vestige; if removable,
+   GPU thread returns truly-async and Phase 1' overlap window grows
+   from "schedule + build + thread-through" to "the whole iter".
+3. **Postproc thread (Phase 2 from original plan).** Move
+   `_slow_postprocess` to a separate thread so the main thread can
+   start the next iter's CPU preamble without waiting on the .cpu()
+   sync above. Less impactful once stream isolation lands; mostly
+   useful if a future profile shows the main thread becoming the
+   bottleneck again.
+4. **Sampler `_seen_token_mask` rep-penalty staleness.** With Option
+   A', step N+1 is submitted before N's `check_stop` (slow path) has
+   updated the seen-mask with N's token. So N+1's rep-penalty sees a
+   one-step-stale mask. Accepted for now — Orpheus + most Qwen
+   configs are the affected paths. Fix would need an event-gated mask
+   update on the GPU thread between steps.
+5. **Speculation extension (b): same-engine, any walk.** Today
+   speculation only fires for AR steps whose required inputs are all
+   loop-back. Generalize to e.g. flow loop bodies (which iterate the
+   same flow node K times); needs the speculation to know the next
+   walk's required inputs, not just loop-back.
+6. **Speculation extension (c): cross-engine / cross-worker.** AR →
+   flow transitions, or LLM-on-worker-A → flow-on-worker-B. Needs
+   event-gated RDMA send (sender records event after GPU writes,
+   receiver waits on it before reading) instead of the current
+   `default_stream().synchronize()` in `register_for_send`.
+
+---
+
+## Motivation (original notes)
 
 Today `Worker._run_loop` is a single serial sequence per decode step:
 
@@ -171,11 +375,70 @@ wrapping every blocking call in `run_in_executor`, which defeats the purpose.
 sub-step granularity (already done for `send_outputs` sub-parts during the
 latest round). Capture baseline for each phase.
 
-**Phase 1 — pull ZMQ inbound off the critical path.**
-- Single `io_thread`, single `scheduler_inbox` queue.
-- `_process_messages` becomes `_drain_inbox` (reads queue, no ZMQ).
-- **Risk:** low. ZMQ thread-safety is well-understood.
-- **Expected win:** ≈ 300 µs median off `process_messages`.
+**Phase 1 (revised) — push the engine call onto a single GPU thread.**
+
+Implemented. Instead of the originally-proposed io_thread split, the actual
+landed Phase 1 keeps a single main thread but offloads
+`engine.execute_with_max_batch_size` to a 1-worker `ThreadPoolExecutor` and
+runs the iteration body in two halves:
+
+```
+top of iter:
+  process_messages          ┐  run while pending GPU step (from previous
+  check_ready_tensors        │  iter) is still in flight on the GPU thread
+  poll_stream_buffers       ┘
+  ─────────────── await pending future ───────────────
+  postprocess(prev step)    (depends on output tensors + updates queues
+                             that the next schedule() will read)
+  schedule
+  build_node_batch
+  submit GPU(next step) → pending = future
+```
+
+So the per-step CPU work that overlaps with GPU is the message/RDMA polling
+trio at the top of the loop (~360 µs median). Schedule + build + post-
+processing remain serialized with respect to the GPU step they belong to,
+because each has a real read-after-write dependency on the previous step's
+post-processing (queues, fwd_info, tensor_manager refcounts).
+
+NVTX caveat: range_push/range_pop with `synchronize=True` calls
+`torch.cuda.synchronize()`, which on the main thread would block on the GPU
+thread's submitted work and undo the overlap. CPU-side NVTX ranges on the
+main thread therefore use `synchronize=False`. The single `worker[…].node[…]`
+range that brackets the engine call stays `synchronize=True` and is now
+pushed/popped from inside the GPU thread itself, so it gives accurate GPU
+timing without polluting the main thread.
+
+Thread safety as actually implemented:
+- `engine.execute_with_max_batch_size` is the only thing on the GPU thread.
+  It does not touch `tensor_manager` or `worker_graphs_manager`. It does
+  mutate `batch.per_request_info[rid].per_label_seq_info` (AR engine,
+  `kv_sync_retrieve` finally block).
+- During the overlap window the main thread runs only the message-/RDMA-
+  polling trio, which mutates queues, tensor_manager state, and stream
+  buffers — disjoint from what the GPU thread writes.
+- A conductor `INPUT_SIGNALS` arriving in the overlap window can call
+  `update_request_info(current_fwd_info=…)` and replace
+  `per_partition_info[partition].current_fwd_info`. The GPU thread keeps
+  writing to the *old* fwd_info object (held via `node_batch.per_request_info`),
+  so the GPU's writes are simply lost relative to the new fwd_info — but
+  that is also what the previous serial code did at the iteration boundary,
+  because `_build_node_batch` of the next iteration would have re-read the
+  fresh fwd_info from `worker_graphs_manager`. No new race.
+
+Subsequent phases (2-4) below remain as planned. The original "io_thread
+pulls ZMQ off the critical path" idea is *not* what shipped in Phase 1; it
+is now folded into a future Phase that splits inbound ZMQ off if profiling
+shows process_messages still on the critical path after the GPU offload.
+
+- **Risk (as shipped):** low-medium. Engine + tensor_manager / queue
+  isolation verified by inspection; the only mutation the GPU thread does
+  to shared state is `per_label_seq_info` on stale fwd_info, which is
+  benign (see above).
+- **Expected win:** the message/RDMA-polling trio (~360 µs median at bs=8)
+  hides behind a ~6.1 ms GPU step, so per-step wall-clock should drop by
+  roughly that amount. Larger wins (route_outputs, send_outputs,
+  flashinfer.plan) need the later phases.
 
 **Phase 2 — move `send_outputs` to `postproc_thread`.**
 - Queue `PostProcessJob` with (batch, routing, token-cpu-materialized-dict,

@@ -591,6 +591,28 @@ class AREngine(BaseEngine):
             return False
         return super().check_ready(node_name, request_id, request_info)
 
+    def check_stop_for_batch(
+        self, batch: NodeBatch, output: NodeOutput
+    ) -> dict[str, set[str]]:
+        """Delegate to each rid's submodule.check_stop. Worker calls this on
+        the slow-postprocess path so the .item() / .cpu() reads no longer
+        block ``execute_batch`` on the GPU thread."""
+        if batch.node_name not in self.submodule_management:
+            return {}
+        submodule = self.submodule_management[batch.node_name].submodule
+        result: dict[str, set[str]] = {}
+        for rid in batch.request_ids:
+            req_outputs = output.per_request_output_tensors.get(rid, {})
+            if not req_outputs:
+                continue
+            req_info = batch.per_request_info.get(rid)
+            if req_info is None:
+                continue
+            stops = submodule.check_stop(rid, req_info, req_outputs)
+            if stops:
+                result[rid] = stops
+        return result
+
     def add_request(
         self, request_id: str, cache_labels: list[str] | None = None,
     ) -> None:
