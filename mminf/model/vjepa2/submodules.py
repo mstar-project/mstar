@@ -417,6 +417,48 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         self.num_output_frames = max(int(num_output_frames), config.tubelet_size)
         self.frames_per_second = int(frames_per_second)
         self.anticipation_seconds = float(anticipation_seconds)
+        self._piecewise_runner = None
+
+    def set_piecewise_runner(self, runner) -> None:
+        """Attach a warmed-up PiecewiseCudaGraphRunner for the layer loop."""
+        self._piecewise_runner = runner
+
+    def get_piecewise_runner_config(self) -> dict | None:
+        """Return construction args for PiecewiseCudaGraphRunner.
+
+        Called by EncoderDecoderEngine.warmup() (masked predictor uses ENC_DEC).
+        kv_cache_config / alloc_manager / buffer_manager are all None since the
+        masked predictor is stateless — no KV cache between rollout steps.
+
+        The ``position_mask`` buffer is a static [n_seq] float32 tensor holding
+        the sorted position IDs for the rollout config.  For sequential context
+        (arange(n_ctxt)) + skip target, the positions are already sorted so
+        argsort in VJEPA2Predictor.forward is identity; the buffer is filled
+        once in fn_factory and never updated at replay.
+        """
+        n_ctxt = self.config.grid_depth * self._grid_size ** 2
+        n_pred = self._n_pred
+        skip = n_ctxt + self._grid_size ** 2 * self._anticipation_steps
+        n_seq = n_ctxt + n_pred
+
+        position_ids = torch.cat([
+            torch.arange(n_ctxt, dtype=torch.float32),
+            torch.arange(n_pred, dtype=torch.float32) + skip,
+        ])  # [n_seq], CPU; fn_factory .copy_()s it into the GPU buffer
+
+        predictor = self.predictor
+
+        def fn_factory(static_cm, static_pos_bufs):
+            static_pos_bufs["position_mask"].copy_(position_ids)
+            return predictor.make_layer_loop_fn(static_cm, static_pos_bufs)
+
+        return {
+            "fn_factory": fn_factory,
+            "embed_dim": self.config.pred_hidden_size,
+            "capture_seq_len": n_seq,
+            "pos_buf_shapes": {"position_mask": (n_seq,)},
+            "cache_labels": ["main"],
+        }
 
     # ------------------------------------------------------------------
     # Rollout geometry (derived from config + hyperparams; shape-static)
@@ -512,8 +554,12 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         """Compute one rollout step for a [B, N, D] encoder_hidden.
 
         Returns ``(next_encoder_hidden [B, N, D], predicted [B, n_pred, D])``.
-        Shape math is symmetric across B, so this function is used by both
-        the sequential and batched paths.
+        Shape math is symmetric across B.
+
+        CUDA-graph path (when PiecewiseCudaGraphRunner is set): splits the
+        predictor forward into preamble (embed+sort), captured layer loop,
+        and postamble (layernorm+unsort+proj), with no KV cache involved.
+        Eager path calls predictor.forward end-to-end (unchanged).
         """
         b, n_ctxt, _ = encoder_hidden.shape
         device = encoder_hidden.device
@@ -526,7 +572,17 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         ctxt_positions = torch.arange(n_ctxt, device=device).unsqueeze(0).repeat(b, 1)
         skip = n_ctxt + self._grid_size * self._grid_size * self._anticipation_steps
         tgt_positions = (torch.arange(n_pred, device=device) + skip).unsqueeze(0).repeat(b, 1)
-        predicted = self.predictor(encoder_hidden, [ctxt_positions], [tgt_positions])
+
+        runner = self._piecewise_runner
+        if runner is not None and runner.can_run(b):
+            hidden_states, n_ctxt_out, argsort = self.predictor._run_forward_piecewise(
+                encoder_hidden, [ctxt_positions], [tgt_positions]
+            )
+            hidden_states = runner.run(hidden_states)
+            predicted = self.predictor._finalize_forward_piecewise(hidden_states, n_ctxt_out, argsort)
+        else:
+            predicted = self.predictor(encoder_hidden, [ctxt_positions], [tgt_positions])
+
         next_encoder_hidden = torch.cat([encoder_hidden[:, n_pred:, :], predicted], dim=1)
         return next_encoder_hidden, predicted
 

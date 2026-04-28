@@ -139,10 +139,12 @@ class EncoderDecoderEngine(BaseEngine):
                 range_pop()
 
     def warmup(self) -> None:
-        """Apply torch.compile to stateless encoder/decoder submodules.
+        """Apply torch.compile and optionally PiecewiseCudaGraphRunner to submodules.
 
-        ViT and VAE models are excellent torch.compile candidates since they
-        have fixed computation graphs with no control flow.
+        torch.compile targets stateless encoder/decoder submodules (ViT, VAE).
+        PiecewiseCudaGraphRunner is installed for submodules that opt in via
+        get_piecewise_runner_config() — currently VJepa2RolloutPredictorSubmodule
+        (masked predictor, no KV cache).
         """
         if not torch.cuda.is_available():
             return
@@ -164,6 +166,40 @@ class EncoderDecoderEngine(BaseEngine):
             except Exception:
                 logger.warning("EncDecEngine: torch.compile failed for %s, using eager mode",
                                node_name, exc_info=True)
+
+            # PiecewiseCudaGraphRunner — opt-in via get_piecewise_runner_config().
+            # No KV cache infrastructure needed: kv_cache_config=None skips all
+            # FlashInfer / alloc_manager paths inside the runner.
+            pcgr_config = getattr(submodule, "get_piecewise_runner_config", lambda: None)()
+            if pcgr_config is not None:
+                try:
+                    from mminf.engine.cuda_graph_runner import (
+                        PiecewiseCudaGraphRunner, DEFAULT_AR_CAPTURE_BATCH_SIZES,
+                    )
+                    pcgr = PiecewiseCudaGraphRunner(
+                        fn_factory=pcgr_config["fn_factory"],
+                        embed_dim=pcgr_config["embed_dim"],
+                        capture_batch_sizes=DEFAULT_AR_CAPTURE_BATCH_SIZES,
+                        capture_seq_len=pcgr_config["capture_seq_len"],
+                        device=self.device,
+                        autocast_dtype=self.autocast_dtype,
+                        pos_buf_shapes=pcgr_config.get("pos_buf_shapes"),
+                        kv_cache_config=None,
+                        alloc_manager=None,
+                        buffer_manager=None,
+                    )
+                    pcgr.warmup_and_capture()
+                    if pcgr.graphs:
+                        submodule.set_piecewise_runner(pcgr)
+                        logger.info(
+                            "EncDecEngine: PiecewiseCudaGraphRunner installed for %s (%d bs buckets)",
+                            node_name, len(pcgr.graphs),
+                        )
+                except Exception:
+                    logger.warning(
+                        "EncDecEngine: PiecewiseCudaGraphRunner capture failed for %s, using eager mode",
+                        node_name, exc_info=True,
+                    )
 
     def add_request(self, request_id: str) -> None:
         pass  # stateless
