@@ -587,6 +587,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         next_encoder_hidden = torch.cat([encoder_hidden[:, n_pred:, :], predicted], dim=1)
         return next_encoder_hidden, predicted
 
+    @torch.compiler.disable
     def forward(
         self,
         graph_walk: str,
@@ -1095,6 +1096,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             cache_handle=cache_handle,
         )
 
+    @torch.compiler.disable
     def forward(
         self,
         graph_walk: str,
