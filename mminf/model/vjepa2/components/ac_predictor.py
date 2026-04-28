@@ -215,9 +215,9 @@ class ACRoPEAttention(nn.Module):
                 kd = rotate_queries_or_keys(k[..., : self.d_dim], pos=time_pos)
                 qr = q[..., self.d_dim :]
                 kr = k[..., self.d_dim :]
-                action_q.append(torch.cat([qd, qr], dim=-1).view(b, self.num_heads, t_0, 1, -1))
-                action_k.append(torch.cat([kd, kr], dim=-1).view(b, self.num_heads, t_0, 1, -1))
-                action_v.append(v.view(b, self.num_heads, t, 1, -1))
+                action_q.append(torch.cat([qd, qr], dim=-1).view(b, self.num_heads, 1, 1, -1))
+                action_k.append(torch.cat([kd, kr], dim=-1).view(b, self.num_heads, 1, 1, -1))
+                action_v.append(v.view(b, self.num_heads, 1, 1, -1))
 
             action_q = torch.cat(action_q, dim=3).flatten(2, 3)
             action_k = torch.cat(action_k, dim=3).flatten(2, 3)
@@ -261,7 +261,11 @@ class ACRoPEAttention(nn.Module):
         def _fix_shapes_for_attn(x):
             return x.transpose(1,2).flatten(0,1) # B*block_size, num_heads, head_dim
         #run attention wants: N, H, D
-        attn_output = cache_handle.run_attention(_fix_shapes_for_attn(q), _fix_shapes_for_attn(k), _fix_shapes_for_attn(v)) # non-causal attention (will be specified in plan_attention)
+        x = cache_handle.run_attention(
+            _fix_shapes_for_attn(q),
+            _fix_shapes_for_attn(k),
+            _fix_shapes_for_attn(v)
+        ) # non-causal attention (will be specified in plan_attention)
         x = x.reshape(b, n, c)
         return self.proj(x)
 
