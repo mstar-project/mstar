@@ -3,6 +3,7 @@ import os
 import time as _time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from enum import Enum
 from time import sleep
 
@@ -40,6 +41,12 @@ from mminf.worker.node_manager_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SlowPostprocessResult:
+    prematerialized_new_tokens: dict[str, dict[str, list[int]]]
+    new_stops: dict[str, set[str]]
 
 
 class EvictionPolicy(Enum):
@@ -169,6 +176,7 @@ class Worker:
         # _pending_stops: deferred loop-stop signals from check_stop in the
         #   prior iter's slow_postprocess.
         self._in_flight_rids: set[str] = set()
+        self._postproc_inflight_rids: set[str] = set()
         self._pending_removes: set[str] = set()
         self._pending_stops: dict[str, set[str]] = {}
 
@@ -335,7 +343,8 @@ class Worker:
         # / KV pages. Queue the remove and apply it once no in-flight step
         # references the rid (see _apply_pending_removes_safe_to_drop in
         # the run loop).
-        if body.request_id in getattr(self, "_in_flight_rids", set()):
+        if body.request_id in getattr(self, "_in_flight_rids", set()) or \
+                body.request_id in getattr(self, "_postproc_inflight_rids", set()):
             self._pending_removes.add(body.request_id)
             return
         self.engine_manager.remove_request(body.request_id)
@@ -1300,6 +1309,40 @@ class Worker:
 
         speculation_consumed_loop_back = speculation_consumed_loop_back or {}
 
+        # Some engines can skip requests after prepare_inputs() decides the
+        # current inputs are not executable yet (for example, SNAC needs enough
+        # streamed tokens to form a frame). They remove those rids from
+        # NodeBatch, but ScheduledBatch still owns the popped graph nodes. Push
+        # skipped nodes back and shrink this postprocess pass to the rids that
+        # actually ran.
+        active_rids = {
+            rid for rid in node_batch.request_ids
+            if rid in node_batch.per_request_info and rid in batch.node_objects
+        }
+        skipped_rids = set(batch.node_objects) - active_rids
+        for rid in skipped_rids:
+            node = batch.node_objects[rid]
+            wg_id = batch.request_to_worker_graph.get(rid) \
+                if batch.request_to_worker_graph else None
+            if wg_id is not None:
+                self.worker_graphs_manager.queues[wg_id].push_back_node(rid, node)
+        if skipped_rids:
+            logger.debug(
+                "Worker %s: skipped %d/%d rids in %s.%s after engine filtering",
+                self.worker_id, len(skipped_rids),
+                len(active_rids) + len(skipped_rids),
+                batch.node_name, batch.graph_walk,
+            )
+            batch.node_objects = {
+                rid: node for rid, node in batch.node_objects.items()
+                if rid in active_rids
+            }
+            if batch.request_to_worker_graph is not None:
+                batch.request_to_worker_graph = {
+                    rid: wg_id for rid, wg_id in batch.request_to_worker_graph.items()
+                    if rid in active_rids
+                }
+
         # Update LRU + worker_graphs_manager fwd info + apply stop_loops
         if self.enable_nvtx:
             range_push("worker.update_request_info", synchronize=False)
@@ -1517,25 +1560,25 @@ class Worker:
             completion_event=output.completion_event,
         )
 
-    def _slow_postprocess(
+    def _compute_slow_postprocess(
         self,
         batch: ScheduledBatch,
         node_batch: NodeBatch,
-        batch_partition: str | None,
         output: NodeOutput,
         routing_per_request: dict[str, NodeOutputRouting],
-    ) -> dict[str, set[str]]:
-        """D→H of new tokens, ZMQ send to conductor / api_server, and
-        check_stop. The `.cpu()` here syncs on default stream — with
-        async-scheduling that means it waits for the in-flight GPU(N+1)
-        to drain (since N+1 was queued after N's tokens on the same
-        stream). Returns ``{rid: {loop_name, ...}}`` from check_stop, to
-        be applied as deferred stops in the next iter's fast_postprocess.
+    ) -> SlowPostprocessResult:
+        """Background half of slow postprocessing.
+
+        Runs the event-gated D→H work and EOS / stop detection on a
+        dedicated postproc thread so the main loop can keep polling queues
+        while GPU(N+1) executes. It intentionally does *not* mutate
+        worker_graphs_manager or send messages; those finalization steps stay
+        on the main thread to avoid broad cross-thread state races.
         """
         from mminf.utils.profiler import range_pop, range_push
 
         if self.enable_nvtx:
-            range_push("worker.send_outputs", synchronize=False)
+            range_push("worker.postproc_compute", synchronize=False)
 
         prematerialized_per_rid: dict[str, dict[str, list[int]]] = {}
         collected: list[tuple[str, str, torch.Tensor]] = []
@@ -1566,19 +1609,6 @@ class Worker:
                 rid_map.setdefault(sig_name, []).extend(flat[off:off + n])
                 off += n
 
-        for request_id in batch.node_objects.keys():
-            self._send_outputs(
-                request_id, routing_per_request[request_id],
-                graph_walk=batch.graph_walk,
-                partition_name=batch_partition,
-                prematerialized_new_tokens=prematerialized_per_rid.get(
-                    request_id
-                ),
-            )
-
-        for _rid, req_info in node_batch.per_request_info.items():
-            req_info.dynamic_loop_stop_signals.clear()
-
         # Deferred-EOS check: run submodule.check_stop on the actual output
         # tensors. Stops returned here apply to the *next* iter's fast
         # postprocess (the in-flight GPU step has already been submitted
@@ -1598,7 +1628,48 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
-        return new_stops
+        return SlowPostprocessResult(
+            prematerialized_new_tokens=prematerialized_per_rid,
+            new_stops=new_stops,
+        )
+
+    def _finalize_slow_postprocess(
+        self,
+        batch: ScheduledBatch,
+        node_batch: NodeBatch,
+        batch_partition: str | None,
+        routing_per_request: dict[str, NodeOutputRouting],
+        result: SlowPostprocessResult,
+    ) -> dict[str, set[str]]:
+        """Main-thread half of slow postprocessing.
+
+        Called once the background postproc task finishes. Emits the delayed
+        worker/conductor/api_server messages using the prematerialized token
+        payloads, then returns the deferred stop signals to apply to the next
+        speculative iter.
+        """
+        from mminf.utils.profiler import range_pop, range_push
+
+        if self.enable_nvtx:
+            range_push("worker.send_outputs", synchronize=False)
+
+        for request_id in batch.node_objects.keys():
+            self._send_outputs(
+                request_id, routing_per_request[request_id],
+                graph_walk=batch.graph_walk,
+                partition_name=batch_partition,
+                prematerialized_new_tokens=result.prematerialized_new_tokens.get(
+                    request_id
+                ),
+            )
+
+        for _rid, req_info in node_batch.per_request_info.items():
+            req_info.dynamic_loop_stop_signals.clear()
+
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+
+        return result.new_stops
 
     def _apply_pending_stops_to_batch(
         self,
@@ -1632,29 +1703,60 @@ class Worker:
             self._pending_removes.discard(rid)
             self._remove_request(RemoveRequest(request_id=rid))
 
+    def _drain_completed_postprocess(
+        self,
+        pending_postproc: list[
+            tuple[
+                ScheduledBatch,
+                NodeBatch,
+                str | None,
+                dict[str, NodeOutputRouting],
+                Future,
+            ]
+        ],
+    ) -> None:
+        """Finalize any completed background slow-postprocess tasks in FIFO order."""
+        while pending_postproc and pending_postproc[0][4].done():
+            batch, node_batch, batch_partition, routing, future = pending_postproc.pop(0)
+            self._postproc_inflight_rids.difference_update(batch.node_objects.keys())
+            result: SlowPostprocessResult = future.result()
+            new_stops = self._finalize_slow_postprocess(
+                batch, node_batch, batch_partition, routing, result,
+            )
+            if new_stops:
+                for rid, stops in new_stops.items():
+                    self._pending_stops.setdefault(rid, set()).update(stops)
+
     def run(self) -> None:
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
 
-        # Same-thread async is the default: the engine runs on the main
-        # thread inside ``execute_with_max_batch_size``, returns once
-        # kernels are submitted (the in-engine sample sync is gated by an
-        # autotune-warmup budget — see sampling.py), and the main thread
-        # then post-processes N concurrently with GPU(N+1) executing on
-        # the default stream. Sync points use ``output.completion_event``
-        # so they wait for GPU(N) only, not for the queued GPU(N+1).
+        # The async worker path needs decode submission to return quickly so
+        # the main loop can overlap queue/tensor polling and post-processing
+        # with GPU execution. Run the engine on a dedicated 1-worker GPU
+        # thread by default; the old same-thread inline path is kept only as
+        # an opt-in debug fallback.
         #
-        # Set ``MMINF_USE_GPU_THREAD=1`` to fall back to the original
-        # ThreadPoolExecutor path (a single dedicated GPU thread). That
-        # path does not deliver real overlap on its own — see
-        # ASYNC_REDESIGN.md "What Phase 1' actually delivers" — but is
-        # kept as a debug toggle.
-        use_gpu_thread = os.environ.get("MMINF_USE_GPU_THREAD", "") == "1"
-        if use_gpu_thread:
+        # ``MMINF_INLINE_GPU_EXECUTOR=1`` restores the old inline behavior.
+        # Keep accepting the historical ``MMINF_USE_GPU_THREAD`` variable for
+        # compatibility, but it no longer changes behavior because the GPU
+        # thread is now the default.
+        use_inline_executor = os.environ.get("MMINF_INLINE_GPU_EXECUTOR", "") == "1"
+        if not use_inline_executor:
             gpu_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix=f"mminf-gpu-{self.worker_id}"
             )
-            logger.info("Worker %s: MMINF_USE_GPU_THREAD=1 — engine runs on dedicated GPU thread", self.worker_id)
+            if os.environ.get("MMINF_USE_GPU_THREAD", "") == "1":
+                logger.info(
+                    "Worker %s: MMINF_USE_GPU_THREAD=1 is now redundant; "
+                    "dedicated GPU thread is the default",
+                    self.worker_id,
+                )
+            logger.info(
+                "Worker %s: engine runs on dedicated GPU thread "
+                "(set MMINF_INLINE_GPU_EXECUTOR=1 to force inline mode)",
+                self.worker_id,
+            )
         else:
             class _InlineExecutor:
                 def submit(self, fn, *args, **kwargs):
@@ -1665,11 +1767,38 @@ class Worker:
                         fut.set_exception(exc)
                     return fut
             gpu_executor = _InlineExecutor()
+            logger.warning(
+                "Worker %s: MMINF_INLINE_GPU_EXECUTOR=1 enabled; "
+                "decode runs on the main thread and overlap will be limited",
+                self.worker_id,
+            )
+        # Background postprocessing is useful for overlap, but it touches CUDA
+        # tensors and tensor-manager state from a second thread. Keep it opt-in
+        # while the dedicated GPU thread path is being stabilized.
+        use_postproc_thread = os.environ.get("MMINF_USE_POSTPROC_THREAD", "") == "1"
+        postproc_executor = None
+        if use_postproc_thread:
+            postproc_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"mminf-postproc-{self.worker_id}"
+            )
+            logger.info(
+                "Worker %s: slow postprocess runs on dedicated postproc thread",
+                self.worker_id,
+            )
 
         # Cross-iter async-scheduling state lives on self (initialized in
         # __init__) so _remove_request can see it from message processing.
         # In-flight: (batch, node_batch, batch_partition, future) | None.
         pending: tuple[ScheduledBatch, NodeBatch, str | None, Future] | None = None
+        pending_postproc: list[
+            tuple[
+                ScheduledBatch,
+                NodeBatch,
+                str | None,
+                dict[str, NodeOutputRouting],
+                Future,
+            ]
+        ] = []
 
         def _set_pending(p):
             nonlocal pending
@@ -1711,6 +1840,12 @@ class Worker:
             from mminf.utils.profiler import range_pop, range_push
             try:
                 _iter_start = _time.perf_counter() if phase_period else 0.0
+                if postproc_executor is not None:
+                    self._drain_completed_postprocess(pending_postproc)
+                self._apply_pending_removes_safe_to_drop(
+                    self._in_flight_rids | self._postproc_inflight_rids
+                )
+
                 # 1. CPU preamble — overlaps with GPU(N).
                 # synchronize=False on every range so torch.cuda.synchronize()
                 # doesn't drain the in-flight GPU work and undo the overlap.
@@ -1774,7 +1909,9 @@ class Worker:
                         speculation = None
                         # No in-flight GPU work now; safe to apply all
                         # pending removes.
-                        self._apply_pending_removes_safe_to_drop(set())
+                        self._apply_pending_removes_safe_to_drop(
+                            set(self._postproc_inflight_rids)
+                        )
                         continue
 
                     spec_consumed: dict[str, set[str]] = {}
@@ -1823,21 +1960,32 @@ class Worker:
                     if phase_period:
                         _phase_record("fast_post", _time.perf_counter() - _t0)
                     _t0 = _time.perf_counter() if phase_period else 0.0
-                    new_stops = self._slow_postprocess(
-                        p_batch, p_node_batch, p_partition, output, routing,
-                    )
+                    if postproc_executor is not None:
+                        postproc_future = postproc_executor.submit(
+                            self._compute_slow_postprocess,
+                            p_batch, p_node_batch, output, routing,
+                        )
+                        self._postproc_inflight_rids.update(p_batch.node_objects.keys())
+                        pending_postproc.append(
+                            (p_batch, p_node_batch, p_partition, routing, postproc_future)
+                        )
+                    else:
+                        result = self._compute_slow_postprocess(
+                            p_batch, p_node_batch, output, routing,
+                        )
+                        new_stops = self._finalize_slow_postprocess(
+                            p_batch, p_node_batch, p_partition, routing, result,
+                        )
+                        if new_stops:
+                            for rid, stops in new_stops.items():
+                                self._pending_stops.setdefault(rid, set()).update(stops)
                     if phase_period:
                         _phase_record("slow_post", _time.perf_counter() - _t0)
-                    if new_stops:
-                        # These apply to the in-flight spec step's batch
-                        # (which is N+1) — applied at iter K+1's fast
-                        # postprocess. 1 wasted step per stop.
-                        for rid, stops in new_stops.items():
-                            self._pending_stops.setdefault(rid, set()).update(stops)
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
                     in_flight = set(spec_pending[0].node_objects.keys()) if spec_pending else set()
+                    in_flight |= self._postproc_inflight_rids
                     self._apply_pending_removes_safe_to_drop(in_flight)
 
                 if spec_pending is not None:
