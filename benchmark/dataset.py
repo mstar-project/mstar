@@ -315,10 +315,10 @@ class LibriSpeechDataset(BaseDataset):
         raw = raw.select(range(min(100, len(raw))))
 
         self.items: list[RequestInput] = []
-        
+
         for i, row in enumerate(raw):
             dec: AudioDecoder = row["audio"]
-            
+
             # Decode all frames → shape (num_channels, num_samples), float32
             frames = dec.get_all_samples()
             audio_data = frames.data  # torch.Tensor
@@ -326,7 +326,7 @@ class LibriSpeechDataset(BaseDataset):
 
             # Convert to int16 PCM for WAV
             audio_np = (audio_data.numpy() * 32767).clip(-32768, 32767).astype(np.int16)
-            
+
             # WAV expects interleaved (num_samples, num_channels), then flatten
             audio_interleaved = audio_np.T.flatten()
 
@@ -510,7 +510,7 @@ class UCF101Dataset(BaseDataset):
             dec = iter(dec)
 
             frames = []
-            
+
             while True:
                 try:
                     frame = next(dec)
@@ -522,7 +522,7 @@ class UCF101Dataset(BaseDataset):
                     break
             assert len(frames) > 0
             frames = torch.stack(frames)
-            
+
             video_path = os.path.join(self.local_file_dir, f"ucf101_{i:05d}.mp4")
 
             encoder = VideoEncoder(frames=frames, frame_rate=fps)
@@ -535,6 +535,285 @@ class UCF101Dataset(BaseDataset):
             ))
 
         self.items = self._resize_data(self.items)
+
+    @property
+    def num_requests(self) -> int:
+        return self._num_requests
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestInput:
+        return self.items[idx]
+
+
+# ---------------------------------------------------------------------------
+# Robotics – lerobot/droid_100 (DROID)
+#
+# DROID is a large-scale robot manipulation dataset with three cameras
+# (exterior + two wrists), 7-DOF actions, proprioceptive state, and per-
+# episode language instructions.  lerobot/droid_100 is a 100-episode subset
+# (~4 GB) suitable for smoke testing without a full download.
+#
+# Two tasks:
+#   "pi05"      – first frame per episode (3 images + state) for pi0.5 VLA.
+#   "vjepa2_ac" – video clip + action/state trajectory for V-JEPA 2-AC rollout.
+# ---------------------------------------------------------------------------
+
+_CAMERA_CANDIDATES = [
+    "observation.images.exterior_image_1_left",
+    "observation.images.wrist_image_1_left",
+    "observation.images.wrist_image_2_left",
+    "observation.images.cam_high",
+    "observation.images.cam_left_wrist",
+    "observation.images.cam_right_wrist",
+    "observation.image",
+]
+_STATE_CANDIDATES    = ["observation.state", "observation.joint_pos", "state"]
+_ACTION_CANDIDATES   = ["action", "actions"]
+_LANGUAGE_CANDIDATES = ["language_instruction", "task", "instruction"]
+
+
+def _detect_columns(features: dict) -> dict:
+    def _first(candidates):
+        for name in candidates:
+            if name in features:
+                return name
+        return None
+
+    return {
+        "cameras":  [c for c in _CAMERA_CANDIDATES if c in features],
+        "state":    _first(_STATE_CANDIDATES),
+        "action":   _first(_ACTION_CANDIDATES),
+        "language": _first(_LANGUAGE_CANDIDATES),
+    }
+
+
+def _extract_image_bytes(img) -> bytes:
+    """Convert whatever lerobot provides for an image column to PNG bytes."""
+    from PIL import Image as PILImage
+    import io as _io
+
+    if isinstance(img, PILImage.Image):
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    if isinstance(img, dict):
+        if img.get("bytes"):
+            return img["bytes"]
+        if img.get("path"):
+            return open(img["path"], "rb").read()
+    if isinstance(img, (bytes, bytearray)):
+        return bytes(img)
+    try:
+        arr = np.asarray(img)
+        if arr.dtype != np.uint8:
+            arr = (arr * 255).clip(0, 255).astype(np.uint8)
+        buf = _io.BytesIO()
+        PILImage.fromarray(arr).save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        pass
+    raise TypeError(f"Cannot convert image of type {type(img)} to bytes")
+
+
+def _to_float_list(raw, target_dim: int) -> list[float]:
+    """Pad or truncate raw state/action data to exactly target_dim floats."""
+    if raw is None:
+        return [0.0] * target_dim
+    try:
+        vals = raw.tolist() if hasattr(raw, "tolist") else [float(v) for v in raw]
+    except Exception:
+        return [0.0] * target_dim
+    if len(vals) >= target_dim:
+        return [float(v) for v in vals[:target_dim]]
+    return [float(v) for v in vals] + [0.0] * (target_dim - len(vals))
+
+
+class DROIDDataset(BaseDataset):
+    """DROID robotics dataset for evaluating pi0.5 and V-JEPA 2-AC.
+
+    Downloads ``lerobot/droid_100`` (~4 GB, 100 episodes) on first use via
+    the HuggingFace ``datasets`` library and caches it at ``cache_dir``.
+    Images and videos are extracted to ``local_file_dir`` as files so the
+    server can receive them as multipart uploads.
+
+    Args:
+        local_file_dir:  directory for extracted images/videos (created if absent).
+        num_requests:    number of episodes to use (capped at available).
+        task:            ``"pi05"`` – first frame per episode → 3 images + state.
+                         ``"vjepa2_ac"`` – video clip + action/state trajectory.
+        rollout_horizon: rollout horizon H for vjepa2_ac; actions/states are
+                         [H, action_dim].
+        video_frames:    frames written to the mp4 clip for vjepa2_ac (model
+                         subsamples to frames_per_clip=64 internally).
+        action_dim:      target dimensionality; DROID data is padded/truncated.
+                         Defaults to 32 for pi05 and 7 for vjepa2_ac.
+        cache_dir:       HuggingFace cache root (None → HF default).
+    """
+
+    HF_REPO = "lerobot/droid_100"
+
+    def __init__(
+        self,
+        local_file_dir: str,
+        num_requests: int = 10,
+        task: str = "pi05",
+        rollout_horizon: int = 4,
+        video_frames: int = 80,
+        action_dim: int | None = None,
+        cache_dir: str | None = None,
+    ):
+        assert task in ("pi05", "vjepa2_ac"), \
+            f"task must be 'pi05' or 'vjepa2_ac', got {task!r}"
+        from datasets import load_dataset
+
+        os.makedirs(local_file_dir, exist_ok=True)
+        self.local_file_dir = local_file_dir
+        self.task           = task
+        self._num_requests  = num_requests
+        self.action_dim     = action_dim if action_dim is not None else (32 if task == "pi05" else 7)
+        self.rollout_horizon = rollout_horizon
+        self.video_frames   = video_frames
+
+        print(f"Loading {self.HF_REPO} (first run downloads ~4 GB)...")
+        raw = load_dataset(
+            self.HF_REPO, split="train",
+            cache_dir=cache_dir, trust_remote_code=True,
+        )
+
+        cols = _detect_columns(raw.features)
+        if not cols["cameras"]:
+            raise RuntimeError(
+                f"No camera columns found in {self.HF_REPO}. "
+                f"Available: {list(raw.features.keys())}"
+            )
+        if cols["action"] is None:
+            raise RuntimeError(f"No action column found in {self.HF_REPO}")
+
+        print(f"  cameras : {cols['cameras']}")
+        print(f"  state   : {cols['state']}")
+        print(f"  action  : {cols['action']}")
+        print(f"  language: {cols['language']}")
+
+        ep_col    = "episode_index" if "episode_index" in raw.features else None
+        frame_col = "frame_index"   if "frame_index"   in raw.features else None
+
+        episodes: dict[int, list] = {}
+        for row in raw:
+            ep_id = int(row[ep_col]) if ep_col else 0
+            episodes.setdefault(ep_id, []).append(row)
+
+        if frame_col:
+            for ep_id in episodes:
+                episodes[ep_id].sort(key=lambda r: int(r[frame_col]))
+
+        ep_ids = sorted(episodes.keys())[:num_requests]
+        print(f"  using {len(ep_ids)} episodes (of {len(episodes)} available)")
+
+        self.items: list[RequestInput] = []
+        for i, ep_id in enumerate(ep_ids):
+            frames = episodes[ep_id]
+            try:
+                item = (self._make_pi05_request(i, ep_id, frames, cols)
+                        if task == "pi05"
+                        else self._make_vjepa2_ac_request(i, ep_id, frames, cols))
+            except Exception as exc:
+                print(f"  [warn] ep{ep_id}: {exc}")
+                item = None
+            if item is not None:
+                self.items.append(item)
+
+        self.items = self._resize_data(self.items)
+
+    # ------------------------------------------------------------------
+
+    def _make_pi05_request(self, idx, ep_id, frames, cols) -> RequestInput:
+        first = frames[0]
+
+        image_paths: list[str] = []
+        for cam_col in cols["cameras"][:3]:
+            img = first.get(cam_col)
+            if img is None:
+                continue
+            path = os.path.join(self.local_file_dir, f"ep{ep_id}_cam{len(image_paths)}.png")
+            with open(path, "wb") as f:
+                f.write(_extract_image_bytes(img))
+            image_paths.append(path)
+
+        if not image_paths:
+            raise ValueError("no camera images extracted")
+        while len(image_paths) < 3:
+            image_paths.append(image_paths[0])  # pad with first camera
+
+        language = ""
+        if cols["language"]:
+            language = str(first.get(cols["language"]) or "")
+        state = _to_float_list(
+            first.get(cols["state"]) if cols["state"] else None,
+            self.action_dim,
+        )
+
+        return RequestInput(
+            req_type=RequestType.VLA,
+            prompt=language or "manipulate the object",
+            image_path=image_paths[0],
+            extra_image_paths=image_paths[1:],
+            model_kwargs={"robot_state": state},
+        )
+
+    def _make_vjepa2_ac_request(self, idx, ep_id, frames, cols) -> RequestInput:
+        if len(frames) < self.rollout_horizon:
+            raise ValueError(
+                f"episode has {len(frames)} frames, need >= {self.rollout_horizon}"
+            )
+
+        n_video = min(self.video_frames, len(frames))
+        video_path = os.path.join(self.local_file_dir, f"ep{ep_id}.mp4")
+        self._save_video(frames[:n_video], cols["cameras"][0], video_path)
+
+        act_col = cols["action"]
+        st_col  = cols["state"]
+        actions = [_to_float_list(f.get(act_col), self.action_dim)
+                   for f in frames[:self.rollout_horizon]]
+        states  = [_to_float_list(f.get(st_col) if st_col else None, self.action_dim)
+                   for f in frames[:self.rollout_horizon]]
+
+        language = ""
+        if cols["language"]:
+            language = str(frames[0].get(cols["language"]) or "")
+
+        return RequestInput(
+            req_type=RequestType.V2V,
+            prompt=language or "world model rollout",
+            video_path=video_path,
+            model_kwargs={
+                "actions":          actions,
+                "states":           states,
+                "rollout_horizon":  self.rollout_horizon,
+            },
+        )
+
+    def _save_video(self, frames, cam_col: str, output_path: str) -> None:
+        import io as _io
+        import torch
+        from PIL import Image as PILImage
+        from torchcodec.encoders import VideoEncoder
+
+        tensors = []
+        for row in frames:
+            img = row.get(cam_col)
+            if img is None:
+                continue
+            pil = PILImage.open(_io.BytesIO(_extract_image_bytes(img))).convert("RGB")
+            tensors.append(torch.from_numpy(np.array(pil, dtype=np.uint8)))
+
+        if not tensors:
+            raise ValueError(f"no frames for camera column {cam_col!r}")
+
+        VideoEncoder(frames=torch.stack(tensors), frame_rate=15).to_file(output_path)
+
+    # ------------------------------------------------------------------
 
     @property
     def num_requests(self) -> int:

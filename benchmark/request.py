@@ -118,6 +118,9 @@ class RequestMetrics:
     _text_chunks: list[str] = field(default_factory=list, repr=False)
     _image_chunks: list[bytes] = field(default_factory=list, repr=False)
     _audio_pcm: io.BytesIO = field(default_factory=io.BytesIO, repr=False)
+    # Robotics outputs: raw float32 bytes per chunk
+    _action_chunks: list[bytes] = field(default_factory=list, repr=False)
+    _video_chunks: list[bytes] = field(default_factory=list, repr=False)
 
     def __post_init__(self):
         # `start_time` is intentionally NOT set here. The adapter must set it
@@ -155,6 +158,10 @@ class RequestMetrics:
             self._image_chunks.append(data)
         elif modality == "audio":
             self._audio_pcm.write(data)
+        elif modality == "action":
+            self._action_chunks.append(data)
+        elif modality == "video":
+            self._video_chunks.append(data)
 
     def record_token(self, modality: str, nbytes: int, arrival_time: float | None = None, n_tokens: int = 1):
         """
@@ -220,6 +227,7 @@ class RequestMetrics:
         self.status = Status.SUCCESS
 
     def write_files(self, output_dir: str):
+        import numpy as np
         n_outputs = 0
         if self._text_chunks:
             path = os.path.join(output_dir, f"req_{self.request_id}.txt")
@@ -239,7 +247,38 @@ class RequestMetrics:
             if output_path is not None:
                 _write_wav(pcm_bytes, output_path)
             n_outputs += 1
+        if self._action_chunks:
+            raw = b"".join(self._action_chunks)
+            arr = np.frombuffer(raw, dtype=np.float32)
+            path = os.path.join(output_dir, f"req_{self.request_id}_actions.npy")
+            np.save(path, arr)
+            n_outputs += 1
+        if self._video_chunks:
+            # World-model outputs are latent float32 tensors, not renderable video.
+            raw = b"".join(self._video_chunks)
+            arr = np.frombuffer(raw, dtype=np.float32)
+            path = os.path.join(output_dir, f"req_{self.request_id}_latents.npy")
+            np.save(path, arr)
+            n_outputs += 1
         return n_outputs
+
+    def decode_actions(self, action_dim: int = 32) -> "np.ndarray | None":
+        """Decode action chunks to a numpy array of shape [T, action_dim]."""
+        import numpy as np
+        if not self._action_chunks:
+            return None
+        raw = b"".join(self._action_chunks)
+        arr = np.frombuffer(raw, dtype=np.float32)
+        n_steps = arr.size // action_dim
+        return arr[: n_steps * action_dim].reshape(n_steps, action_dim)
+
+    def decode_latents(self) -> "np.ndarray | None":
+        """Decode world-model output chunks to a flat float32 array."""
+        import numpy as np
+        if not self._video_chunks:
+            return None
+        raw = b"".join(self._video_chunks)
+        return np.frombuffer(raw, dtype=np.float32)
 
     def record_error(self, msg: str):
         if self.start_time is None:
@@ -560,6 +599,15 @@ class RequestInput:
     audio_path: Optional[str] = None
     video_path: Optional[str] = None
 
+    # Additional image paths — used by pi0.5 (3 cameras: base, left, right).
+    # All paths are uploaded as separate "files" form fields alongside image_path.
+    extra_image_paths: list[str] = field(default_factory=list)
+
+    # Per-request model_kwargs merged into the JSON payload at send time.
+    # Use this for robotics-specific fields: robot_state, actions, states,
+    # rollout_horizon, etc.
+    model_kwargs: dict = field(default_factory=dict)
+
     # Fix 6 — pre-loaded media. Populated by `__post_init__` when paths are
     # provided so adapters never re-read or re-encode per request. Keeping
     # both raw bytes (for OurSystem multipart uploads) and base64 strings
@@ -570,6 +618,7 @@ class RequestInput:
     _image_b64: Optional[str] = field(default=None, repr=False)
     _audio_b64: Optional[str] = field(default=None, repr=False)
     _video_b64: Optional[str] = field(default=None, repr=False)
+    _extra_image_bytes: list[bytes] = field(default_factory=list, repr=False)
 
     def __post_init__(self):
         if self.image_path and self._image_bytes is None:
@@ -581,6 +630,8 @@ class RequestInput:
         if self.video_path and self._video_bytes is None:
             self._video_bytes = Path(self.video_path).read_bytes()
             self._video_b64 = base64.b64encode(self._video_bytes).decode()
+        if self.extra_image_paths and not self._extra_image_bytes:
+            self._extra_image_bytes = [Path(p).read_bytes() for p in self.extra_image_paths]
 
     def get_all_filepaths(self) -> dict[str, str]:
         res = {}
@@ -640,12 +691,6 @@ class OurSystem(InferenceSystem):
         additional_model_kwargs: dict = {},
     ) -> RequestMetrics:
         req_type = req_input.req_type
-        model_kwargs = json.dumps(
-            {
-                **model.get_model_kwargs(req_type),
-                **additional_model_kwargs,
-            }
-        )
         output_mod = req_type.get_output_modalities()
 
         metrics = RequestMetrics(
@@ -654,11 +699,27 @@ class OurSystem(InferenceSystem):
             expected_output_modalities=[output_mod],
         )
 
+        # Merge per-request model_kwargs (e.g. robot_state, actions, states)
+        # on top of model-level defaults.
+        model_kwargs = json.dumps(
+            {
+                **model.get_model_kwargs(req_type),
+                **req_input.model_kwargs,
+                **additional_model_kwargs,
+            }
+        )
+        output_mod = req_type.get_output_modalities()
+
         try:
             form = aiohttp.FormData()
             form.add_field("text", req_input.prompt)
             form.add_field("model_kwargs", model_kwargs)
             form.add_field("output_modalities", output_mod)
+            # VLA and other multi-modal input types require an explicit
+            # input_modalities field so the API server routes them correctly.
+            input_mod = req_type.get_input_modalities()
+            if "," in input_mod or input_mod not in ("text",):
+                form.add_field("input_modalities", input_mod)
 
             for modality in req_input.get_all_filepaths():
                 file_content = req_input.get_bytes(modality)
@@ -669,6 +730,14 @@ class OurSystem(InferenceSystem):
                     file_content,
                     filename=req_input.get_filename(modality),
                     content_type="application/octet-stream",
+                )
+            # Extra images (e.g. wrist cameras for pi0.5)
+            for path, content in zip(req_input.extra_image_paths, req_input._extra_image_bytes):
+                form.add_field(
+                    "files",
+                    content,
+                    filename=os.path.basename(path),
+                    content_type="image/png",
                 )
 
             metrics.start_time = time.monotonic()

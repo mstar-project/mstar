@@ -14,6 +14,10 @@ class RequestType(Enum):
     T2I = "text_to_image"
     T2S = "text_to_speech"
 
+    # Robotics
+    VLA = "vision_language_action"   # images + text → action  (pi0.5)
+    V2V = "video_to_video"           # video + metadata → video (world model)
+
     # Image inputs
     I2T = "image_to_text"
     I2I = "image_to_image"
@@ -32,15 +36,21 @@ class RequestType(Enum):
             return "image"
         if self in [RequestType.T2S, RequestType.I2S, RequestType.V2S, RequestType.A2S]:
             return "audio"
+        if self == RequestType.VLA:
+            return "action"
+        if self == RequestType.V2V:
+            return "video"
         return "text"
 
     def get_input_modalities(self):
         if self in [RequestType.I2I, RequestType.I2T, RequestType.I2S]:
             return "image"
-        if self in [RequestType.V2T, RequestType.V2S]:
+        if self in [RequestType.V2T, RequestType.V2S, RequestType.V2V]:
             return "video"
         if self in [RequestType.A2T, RequestType.A2S]:
             return "audio"
+        if self == RequestType.VLA:
+            return "image,text"
         return "text"
 
 
@@ -157,10 +167,62 @@ class Qwen3Omni(Model):
         }
 
 
+class Pi05(Model):
+    """Physical Intelligence Pi0.5 VLA model.
+
+    Input:  3 RGB images (base, left-wrist, right-wrist) + text task + robot state
+    Output: action trajectory [50, 32] as raw float32 bytes
+    """
+
+    def __init__(self, action_dim: int = 32, action_horizon: int = 50, **kwargs):
+        super().__init__(**kwargs)
+        self.action_dim = action_dim
+        self.action_horizon = action_horizon
+
+    def get_hf_url(self):
+        return "physical-intelligence/pi0.5"
+
+    def get_supported_modalities(self):
+        return {RequestType.VLA}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {}  # robot_state is per-request and lives on RequestInput.model_kwargs
+
+
+class VJepa2AC(Model):
+    """V-JEPA 2 action-conditioned world model.
+
+    Input:  video clip + per-step actions + states (in model_kwargs)
+    Output: predicted latent hidden states as raw float32 bytes
+    """
+
+    def __init__(
+        self,
+        rollout_horizon: int = 4,
+        action_dim: int = 7,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.rollout_horizon = rollout_horizon
+        self.action_dim = action_dim
+
+    def get_hf_url(self):
+        return "facebook/vjepa2-ac-vitg-256"
+
+    def get_supported_modalities(self):
+        return {RequestType.V2V}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        # actions/states/rollout_horizon are per-request and live on RequestInput.model_kwargs
+        return {}
+
+
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
     QWEN3OMNI = "qwen3omni"
+    PI05 = "pi05"
+    VJEPA2AC = "vjepa2ac"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -169,4 +231,8 @@ class ModelType(Enum):
             return Orpheus(**kwargs)
         if self == ModelType.QWEN3OMNI:
             return Qwen3Omni(**kwargs)
+        if self == ModelType.PI05:
+            return Pi05(**kwargs)
+        if self == ModelType.VJEPA2AC:
+            return VJepa2AC(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")
