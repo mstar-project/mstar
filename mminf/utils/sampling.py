@@ -15,6 +15,7 @@ Usage:
     tokens = sample_tokens(logits, temperature=0.7, top_p=0.9)
 """
 
+from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 
 import torch
@@ -195,10 +196,33 @@ class SamplingConfig:
     repetition_penalty: float = 1
 
 
+@dataclass
+class BaseSampler(ABC):
+    @abstractmethod
+    def sample(
+        self, request_ids: list[str], logits: torch.Tensor
+    ) -> torch.Tensor:
+        pass
+
+    @torch.compiler.disable
+    def sample_with_config(
+        self, logits: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        top_p: float = 1.0,
+    ):
+        import flashinfer
+        scaled = logits / temperature
+        probs = torch.softmax(scaled, dim=-1)
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, top_p, deterministic=True,
+        )
+        return samples.to(torch.int64)
+
 # TODO: add a method for adding prefill tokens to the _seen_token_mask,
 # if applying the repetition penalty to tokens from the prompt is desired
 @dataclass
-class Sampler:
+class Sampler(BaseSampler):
     # per request
     _sampling_config: dict[str, SamplingConfig] = field(default_factory=dict)
     _seen_token_mask: dict[str, torch.Tensor]= field(default_factory=dict)
@@ -418,7 +442,7 @@ def _to_tensor(
 
 
 # ---------------------------------------------------------------------------
-# Graph-safe depth sampler
+# Graph-safe sampler
 # ---------------------------------------------------------------------------
 #
 # Reads top_k / top_p / temperature from preallocated device tensors so the
@@ -429,8 +453,7 @@ def _to_tensor(
 # narrower path. ``deterministic=True`` disables the CPU-RNG-seeded path that
 # FlashInfer would otherwise take.
 
-
-def sample_depth_gpu(
+def sample_cuda_graphable_gpu(
     logits: torch.Tensor,
     temperature: torch.Tensor,
     top_k: torch.Tensor,
@@ -467,3 +490,134 @@ def sample_depth_gpu(
         seed=seed, offset=offset
     )
     return samples.to(torch.int64)
+
+
+@dataclass
+class CudaGraphableSampler(BaseSampler):
+    temperature_buf: torch.Tensor
+    top_k_buf: torch.Tensor
+    top_p_buf: torch.Tensor
+    seed_buf: torch.Tensor
+    offset_buf: torch.Tensor
+
+    @torch.compiler.disable
+    def sample(self, request_ids: list[str], logits: torch.Tensor):
+        codes = sample_cuda_graphable_gpu(
+            logits, self.temperature_buf,
+            self.top_k_buf, self.top_p_buf,
+            self.seed_buf, self.offset_buf
+        )
+        self.offset_buf += 1
+        return codes
+    
+    @torch.compiler.disable
+    def sample_with_config(
+        self, logits: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        top_p: float = 1.0,
+    ):
+        import flashinfer
+        scaled = logits / temperature
+        probs = torch.softmax(scaled, dim=-1)
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, top_p, deterministic=True,
+            seed=self.seed_buf, offset=self.offset_buf
+        )
+        self.offset_buf += 1
+        return samples.to(torch.int64)
+
+
+@dataclass
+class SamplerBuffers:
+    """Pre-allocated static buffers for graph-safe MTP sampling.
+
+    All tensors are sized to ``max_batch_size``. Slice with
+    ``slice_for_bs(bs)`` to get a view suitable for a specific batch.
+    """
+    max_batch_size: int
+    temperature_buf: torch.Tensor   # [max_bs], float32
+    top_k_buf: torch.Tensor         # [max_bs], int32
+    top_p_buf: torch.Tensor         # [max_bs], float32
+    seed_buf: torch.Tensor          # [max_bs], int64
+    offset_buf: torch.Tensor        # [max_bs], int64
+
+    @classmethod
+    def allocate(
+        cls,
+        max_batch_size: int,
+        device: torch.device,
+    ) -> "SamplerBuffers":
+        """Allocate zero-initialised sampling buffers for ``max_batch_size``.
+        """
+        temperature_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
+        top_k_buf = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
+        top_p_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
+        seed_buf = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+        offset_buf = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+        return cls(
+            max_batch_size=max_batch_size,
+            temperature_buf=temperature_buf,
+            top_k_buf=top_k_buf,
+            top_p_buf=top_p_buf,
+            seed_buf=seed_buf,
+            offset_buf=offset_buf,
+        )
+
+    def slice_for_bs(self, bs: int) -> dict[str, torch.Tensor]:
+        """Return bs-sized views into each buffer (zero-copy slices)."""
+        return {
+            "temperature_buf": self.temperature_buf[:bs],
+            "top_k_buf": self.top_k_buf[:bs],
+            "top_p_buf": self.top_p_buf[:bs],
+            "seed_buf": self.seed_buf[:bs],
+            "offset_buf": self.offset_buf[:bs],
+        }
+
+
+def _build_sampling_lists(
+    request_ids: list[str],
+    sampling_configs: dict[str, SamplingConfig],
+    padded_bs: int,
+    device: torch.device
+):
+    """Resolve per-request sampling config into flat Python lists of length ``padded_bs``.
+    """
+    temps = torch.ones(padded_bs, device=device)
+    # in the sampler, topk=0 maps to unrestricted top k
+    top_ks = torch.zeros(padded_bs, dtype=torch.int32, device=device)
+    top_ps = torch.ones(padded_bs, device=device)
+
+    for i, rid in enumerate(request_ids):
+        cfg = sampling_configs.get(rid, SamplingConfig())
+        if cfg.temperature > 0:
+            temps[i] = float(cfg.temperature)
+            top_ks[i] = int(cfg.top_k)
+            top_ps[i] = float(cfg.top_p) if cfg.top_p else 1.0
+        # otherwise, use defaults already filled in
+    return temps, top_ks, top_ps, \
+        torch.randint(0, 2**32, (padded_bs,), dtype=torch.long, device=device)
+
+
+def make_sampler_from_buffers(
+    bufs: SamplerBuffers,
+    request_ids: list[str],
+    sampling_configs: dict[str, SamplingConfig],
+    padded_bs: int,
+
+) -> CudaGraphableSampler:
+    assert padded_bs <= bufs.max_batch_size, (
+        f"padded_bs={padded_bs} exceeds MTPSamplerBuffers.max_batch_size={bufs.max_batch_size}"
+    )
+
+    temps, top_ks, top_ps, seed = _build_sampling_lists(
+        request_ids, sampling_configs, padded_bs,
+        device=bufs.temperature_buf.device
+    )
+    bufs.temperature_buf[:padded_bs].copy_(temps)
+    bufs.top_k_buf[:padded_bs].copy_(top_ks)
+    bufs.top_p_buf[:padded_bs].copy_(top_ps)
+    bufs.seed_buf[:padded_bs].copy_(seed)
+    bufs.offset_buf[:padded_bs].zero_()
+    slices = bufs.slice_for_bs(padded_bs)
+    return CudaGraphableSampler(**slices)

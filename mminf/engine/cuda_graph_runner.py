@@ -28,7 +28,7 @@ from mminf.engine.cuda_graph_config import BasicBatchedCudaGraphConfig, CudaGrap
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
 from mminf.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, ARNodeSubmodule, NodeSubmodule
 from mminf.utils.profiler import range_pop, range_push
-from mminf.utils.sampling import Sampler
+from mminf.utils.sampling import SamplerBuffers, Sampler, SamplingConfig, make_sampler_from_buffers
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +132,14 @@ class CudaGraphRunner:
         # (the actual torch.cuda.memory_allocated delta also covers KV cache /
         # model weights / FlashInfer workspaces, so it's noisier).
         self._capture_clone_bytes_naive = 0
+
+        self.max_bs = max(
+            [max(config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES)
+            for config in self.capture_configs] or [1]
+        )
+        self.sampler_buffer: SamplerBuffers = SamplerBuffers.allocate(
+            max_batch_size=self.max_bs, device=device
+        )
 
     def warmup_and_capture(self) -> None:
         """Capture graphs for all configs and batch sizes."""
@@ -338,7 +346,12 @@ class CudaGraphRunner:
         return ModelInputsFromEngine(
             request_ids=dummy_rids,
             per_request_info=dummy_metadata,
-            cache_manager=cache_manager
+            cache_manager=cache_manager,
+            sampler=make_sampler_from_buffers(
+                bufs=self.sampler_buffer,
+                request_ids=[], sampling_configs={},
+                padded_bs=len(dummy_rids)
+            ),
         )
     
     def _make_dummy_seq_lens(
@@ -711,6 +724,20 @@ class CudaGraphRunner:
             return None
         return sizes[idx]
 
+    def _get_sampler(
+        self, per_request_info: dict[str, CurrentForwardPassInfo],
+        request_ids: list[str], padded_bs: int
+    ):
+        return make_sampler_from_buffers(
+            bufs=self.sampler_buffer,
+            request_ids=request_ids,
+            sampling_configs={
+                rid: info.sampling_config.get(
+                    self.submodule_name, SamplingConfig()
+                ) for rid, info in per_request_info.items()
+            },
+            padded_bs=padded_bs,
+        )
 
     def run(
         self,
@@ -823,6 +850,11 @@ class CudaGraphRunner:
             request_ids=dummy_rids,
             per_request_info=real_metadata,
             cache_manager=static_cm,
+            sampler=self._get_sampler(
+                per_request_info=per_request_info,
+                request_ids=request_ids,
+                padded_bs=padded_bs
+            )
         )
         real_inputs = submodule.preprocess(
             graph_walk=key.graph_walk,
@@ -960,6 +992,11 @@ class CudaGraphRunner:
             request_ids=dummy_rids,
             per_request_info=real_metadata,
             cache_manager=static_cm,
+            sampler=self._get_sampler(
+                per_request_info=per_request_info,
+                request_ids=request_ids,
+                padded_bs=padded_bs
+            )
         )
         real_packed = submodule.preprocess(
             graph_walk=key.graph_walk,

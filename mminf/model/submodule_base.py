@@ -13,6 +13,7 @@ from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.kv_store import PositionInfo
+from mminf.utils.sampling import BaseSampler, CudaGraphableSampler
 
 
 @dataclass
@@ -130,6 +131,8 @@ class ModelInputsFromEngine:
     request_ids: list[str]
     per_request_info: dict[str, CurrentForwardPassInfo]
     cache_manager: BatchedCacheManager | None = None
+    preallocated_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
+    sampler: BaseSampler | None = None
 
     @property
     def single_request_info(self):
