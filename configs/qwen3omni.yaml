@@ -7,5 +7,5 @@ node_groups:
   - node_names: [Thinker]
     ranks: [1]
   
-  - node_names: [Talker_LLM, code_predictor]
+  - node_names: [Talker]
     ranks: [2]
