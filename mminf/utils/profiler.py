@@ -40,6 +40,11 @@ def range_pop(*, synchronize: bool = False) -> None:
     torch.cuda.nvtx.range_pop()
 
 
+def mark(name: str) -> None:
+    """Emit an instant NVTX marker without CUDA synchronization."""
+    torch.cuda.nvtx.mark(name)
+
+
 @contextmanager
 def nvtx_range(name: str, *, synchronize: bool = False) -> Iterator[None]:
     """Convenience context manager for `range_push`/`range_pop`."""

@@ -27,7 +27,7 @@ from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManag
 from mminf.engine.cuda_graph_config import BasicBatchedCudaGraphConfig, CudaGraphConfig, CudaGraphConfigType, FlashInferPackedCudaGraphConfig
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
 from mminf.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, ARNodeSubmodule, NodeSubmodule
-from mminf.utils.profiler import range_pop, range_push
+from mminf.utils.profiler import mark, range_pop, range_push
 from mminf.utils.sampling import Sampler
 
 logger = logging.getLogger(__name__)
@@ -789,6 +789,9 @@ class CudaGraphRunner:
 
         # --- Step 1: Swap real request states onto dummy slots ---
         if self.enable_nvtx:
+            mark("gpu_thread.preprocess_start")
+            range_push("gpu_thread.preprocess", synchronize=False)
+        if self.enable_nvtx:
             range_push("cg.swap_states", synchronize=False)
         for i, rid in enumerate(request_ids):
             dummy_rid = dummy_rids[i]
@@ -843,17 +846,26 @@ class CudaGraphRunner:
             static_buf[:real_val.shape[0]].copy_(real_val)
         if self.enable_nvtx:
             range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.preprocess_end")
 
         # --- Step 4: Replay ---
         if self.enable_nvtx:
-            range_push("cg.replay")
+            mark("gpu_thread.cuda_graph_start")
+            range_push("gpu_thread.cuda_graph", synchronize=False)
+            range_push("cg.replay", synchronize=False)
         graph.replay()
         if self.enable_nvtx:
-            range_pop()
+            range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.cuda_graph_end")
 
         # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
         # advance_seq_lens is not captured in the graph; we call it manually so
         # the real states (aliased onto dummy slots) move forward.
+        if self.enable_nvtx:
+            mark("gpu_thread.postprocess_start")
+            range_push("gpu_thread.postprocess", synchronize=False)
         if self.enable_nvtx:
             range_push("cg.advance_seq_lens", synchronize=False)
         for label in config_labels:
@@ -885,6 +897,9 @@ class CudaGraphRunner:
             config_labels=config_labels,
             static_cm=static_cm,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            mark("gpu_thread.postprocess_end")
 
         return outputs
 
@@ -920,6 +935,9 @@ class CudaGraphRunner:
         config_labels = graph_data.config.labels
 
         # --- Step 1: Swap real request states onto dummy slots ---
+        if self.enable_nvtx:
+            mark("gpu_thread.preprocess_start")
+            range_push("gpu_thread.preprocess", synchronize=False)
         if self.enable_nvtx:
             range_push("cg.swap_states", synchronize=False)
         for i, rid in enumerate(request_ids):
@@ -980,15 +998,24 @@ class CudaGraphRunner:
             static_buf[:real_val.shape[0]].copy_(real_val)
         if self.enable_nvtx:
             range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.preprocess_end")
 
         # --- Step 4: Replay ---
         if self.enable_nvtx:
-            range_push("cg.replay")
+            mark("gpu_thread.cuda_graph_start")
+            range_push("gpu_thread.cuda_graph", synchronize=False)
+            range_push("cg.replay", synchronize=False)
         graph.replay()
         if self.enable_nvtx:
-            range_pop()
+            range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.cuda_graph_end")
 
         # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
+        if self.enable_nvtx:
+            mark("gpu_thread.postprocess_start")
+            range_push("gpu_thread.postprocess", synchronize=False)
         if self.enable_nvtx:
             range_push("cg.advance_seq_lens", synchronize=False)
         for label in config_labels:
@@ -1020,6 +1047,9 @@ class CudaGraphRunner:
             config_labels=config_labels,
             static_cm=static_cm,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            mark("gpu_thread.postprocess_end")
 
         return outputs
 
@@ -1518,6 +1548,8 @@ class CodecCudaGraphRunner:
         )
 
         if self.enable_nvtx:
+            mark("gpu_thread.preprocess_start")
+            range_push("gpu_thread.preprocess", synchronize=False)
             range_push("codec_cg.preprocess", synchronize=False)
         packed = submodule.preprocess(
             graph_walk=graph_walk,
@@ -1540,12 +1572,18 @@ class CodecCudaGraphRunner:
             static_buf[:actual_bs].copy_(real_val)
         if self.enable_nvtx:
             range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.preprocess_end")
 
         if self.enable_nvtx:
-            range_push("codec_cg.replay")
+            mark("gpu_thread.cuda_graph_start")
+            range_push("gpu_thread.cuda_graph", synchronize=False)
+            range_push("codec_cg.replay", synchronize=False)
         self.graphs[key].replay()
         if self.enable_nvtx:
-            range_pop()
+            range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.cuda_graph_end")
 
         if not isinstance(static_output, dict):
             raise TypeError(
@@ -1553,10 +1591,18 @@ class CodecCudaGraphRunner:
                 f"(got {type(static_output).__name__}) so outputs can be split per request"
             )
 
-        return {
+        if self.enable_nvtx:
+            mark("gpu_thread.postprocess_start")
+            range_push("gpu_thread.postprocess", synchronize=False)
+        outputs = {
             rid: {
                 name: [
                     tensor.clone() for tensor in static_output[dummy_rids[i]][name]
                 ] for name in static_output[dummy_rids[i]]
             } for i, rid in enumerate(request_ids)
         }
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            mark("gpu_thread.postprocess_end")
+
+        return outputs

@@ -995,6 +995,9 @@ class Worker:
             node_batch.node_name, str(type(engine))
         )
         if self.enable_nvtx:
+            range_push("worker.gpu_thread_start", synchronize=False)
+            range_pop(synchronize=False)
+        if self.enable_nvtx:
             range_push(
                 f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
                 synchronize=False,
@@ -1941,6 +1944,13 @@ class Worker:
                                 self._execute_on_gpu_thread,
                                 spec_batch, spec_node_batch,
                             )
+                            if self.enable_nvtx:
+                                range_push("worker.gpu_submit_queued", synchronize=False)
+                                range_pop(synchronize=False)
+                            # Give the GPU executor thread a chance to enter
+                            # CUDA launch code before the main thread resumes
+                            # Python-heavy postprocess.
+                            sleep(0)
                             if phase_period:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
