@@ -551,71 +551,14 @@ class UCF101Dataset(BaseDataset):
 # ---------------------------------------------------------------------------
 # Robotics – lerobot/droid_100 (DROID)
 #
-# DROID is a large-scale robot manipulation dataset with three cameras
-# (exterior + two wrists), 7-DOF actions, proprioceptive state, and per-
-# episode language instructions.  lerobot/droid_100 is a 100-episode subset
-# (~4 GB) suitable for smoke testing without a full download.
-#
-# Two tasks:
-#   "pi05"      – first frame per episode (3 images + state) for pi0.5 VLA.
-#   "vjepa2_ac" – video clip + action/state trajectory for V-JEPA 2-AC rollout.
+# lerobot v2 format: images are NOT parquet columns.  Each episode's frames
+# for each camera are stored as a separate mp4 at:
+#   videos/{video_key}/episode_{episode_id:06d}.mp4
+# Camera keys and their dtypes are declared in meta/info.json.
+# Language instructions live in meta/tasks.jsonl, indexed by task_index.
+# The parquet only carries: action, observation.state, task_index,
+# episode_index, frame_index, timestamp.
 # ---------------------------------------------------------------------------
-
-_CAMERA_CANDIDATES = [
-    "observation.images.exterior_image_1_left",
-    "observation.images.wrist_image_1_left",
-    "observation.images.wrist_image_2_left",
-    "observation.images.cam_high",
-    "observation.images.cam_left_wrist",
-    "observation.images.cam_right_wrist",
-    "observation.image",
-]
-_STATE_CANDIDATES    = ["observation.state", "observation.joint_pos", "state"]
-_ACTION_CANDIDATES   = ["action", "actions"]
-_LANGUAGE_CANDIDATES = ["language_instruction", "task", "instruction"]
-
-
-def _detect_columns(features: dict) -> dict:
-    def _first(candidates):
-        for name in candidates:
-            if name in features:
-                return name
-        return None
-
-    return {
-        "cameras":  [c for c in _CAMERA_CANDIDATES if c in features],
-        "state":    _first(_STATE_CANDIDATES),
-        "action":   _first(_ACTION_CANDIDATES),
-        "language": _first(_LANGUAGE_CANDIDATES),
-    }
-
-
-def _extract_image_bytes(img) -> bytes:
-    """Convert whatever lerobot provides for an image column to PNG bytes."""
-    from PIL import Image as PILImage
-    import io as _io
-
-    if isinstance(img, PILImage.Image):
-        buf = _io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
-    if isinstance(img, dict):
-        if img.get("bytes"):
-            return img["bytes"]
-        if img.get("path"):
-            return open(img["path"], "rb").read()
-    if isinstance(img, (bytes, bytearray)):
-        return bytes(img)
-    try:
-        arr = np.asarray(img)
-        if arr.dtype != np.uint8:
-            arr = (arr * 255).clip(0, 255).astype(np.uint8)
-        buf = _io.BytesIO()
-        PILImage.fromarray(arr).save(buf, format="PNG")
-        return buf.getvalue()
-    except Exception:
-        pass
-    raise TypeError(f"Cannot convert image of type {type(img)} to bytes")
 
 
 def _to_float_list(raw, target_dim: int) -> list[float]:
@@ -631,25 +574,38 @@ def _to_float_list(raw, target_dim: int) -> list[float]:
     return [float(v) for v in vals] + [0.0] * (target_dim - len(vals))
 
 
+def _decode_first_frame_to_png(video_path: str, output_png: str) -> None:
+    """Decode frame 0 of an mp4 and save as PNG."""
+    from torchcodec.decoders import VideoDecoder
+    from PIL import Image as PILImage
+
+    dec = VideoDecoder(video_path)
+    frame = dec.get_frames_at(indices=[0])
+    tensor = frame.data[0]              # [C, H, W] uint8
+    arr = tensor.permute(1, 2, 0).numpy()   # [H, W, C]
+    PILImage.fromarray(arr).save(output_png)
+
+
 class DROIDDataset(BaseDataset):
     """DROID robotics dataset for evaluating pi0.5 and V-JEPA 2-AC.
 
-    Downloads ``lerobot/droid_100`` (~4 GB, 100 episodes) on first use via
-    the HuggingFace ``datasets`` library and caches it at ``cache_dir``.
-    Images and videos are extracted to ``local_file_dir`` as files so the
-    server can receive them as multipart uploads.
+    Uses ``lerobot/droid_100`` — a 100-episode subset (~4 GB) of the DROID
+    robot-manipulation dataset.  The dataset is in lerobot v2 format: images
+    are stored as per-episode mp4 files (one per camera), not as parquet
+    columns.  ``hf_hub_download`` is used to fetch individual episode videos
+    on demand; they are cached by HuggingFace and not re-downloaded.
+
+    For vjepa2_ac the downloaded mp4 is passed directly to the server — no
+    re-encoding.  For pi05 only the first frame of each camera video is
+    decoded to a PNG.
 
     Args:
-        local_file_dir:  directory for extracted images/videos (created if absent).
-        num_requests:    number of episodes to use (capped at available).
-        task:            ``"pi05"`` – first frame per episode → 3 images + state.
-                         ``"vjepa2_ac"`` – video clip + action/state trajectory.
-        rollout_horizon: rollout horizon H for vjepa2_ac; actions/states are
-                         [H, action_dim].
-        video_frames:    frames written to the mp4 clip for vjepa2_ac (model
-                         subsamples to frames_per_clip=64 internally).
-        action_dim:      target dimensionality; DROID data is padded/truncated.
-                         Defaults to 32 for pi05 and 7 for vjepa2_ac.
+        local_file_dir:  directory for extracted PNGs (created if absent).
+                         mp4s are kept in the HF cache, not copied here.
+        num_requests:    number of episodes to use.
+        task:            ``"pi05"`` or ``"vjepa2_ac"``.
+        rollout_horizon: H for vjepa2_ac; actions/states shape is [H, dim].
+        action_dim:      target dim; defaults to 32 (pi05) or 7 (vjepa2_ac).
         cache_dir:       HuggingFace cache root (None → HF default).
     """
 
@@ -661,64 +617,103 @@ class DROIDDataset(BaseDataset):
         num_requests: int = 10,
         task: str = "pi05",
         rollout_horizon: int = 4,
-        video_frames: int = 80,
         action_dim: int | None = None,
         cache_dir: str | None = None,
     ):
         assert task in ("pi05", "vjepa2_ac"), \
             f"task must be 'pi05' or 'vjepa2_ac', got {task!r}"
+        import json as _json
         from datasets import load_dataset
+        from huggingface_hub import hf_hub_download
 
         os.makedirs(local_file_dir, exist_ok=True)
-        self.local_file_dir = local_file_dir
-        self.task           = task
-        self._num_requests  = num_requests
-        self.action_dim     = action_dim if action_dim is not None else (32 if task == "pi05" else 7)
+        self.local_file_dir  = local_file_dir
+        self.task            = task
+        self._num_requests   = num_requests
+        self.action_dim      = action_dim if action_dim is not None else (32 if task == "pi05" else 7)
         self.rollout_horizon = rollout_horizon
-        self.video_frames   = video_frames
+        self.cache_dir       = cache_dir
 
-        print(f"Loading {self.HF_REPO} (first run downloads ~4 GB)...")
+        def _dl(filename):
+            return hf_hub_download(
+                self.HF_REPO, filename, repo_type="dataset", cache_dir=cache_dir
+            )
+
+        # Discover video keys from meta/info.json.
+        # In lerobot v2 features with dtype=="video" are camera streams.
+        with open(_dl("meta/info.json")) as f:
+            info = _json.load(f)
+        features_info = info.get("features", {})
+        camera_keys = [k for k, v in features_info.items()
+                       if isinstance(v, dict) and v.get("dtype") == "video"]
+        if not camera_keys:
+            # Fallback: top-level video_keys list used by some older repos
+            camera_keys = info.get("video_keys", [])
+        if not camera_keys:
+            raise RuntimeError(
+                f"No video keys found in {self.HF_REPO}/meta/info.json. "
+                f"Top-level keys: {list(info.keys())}"
+            )
+        print(f"  camera keys : {camera_keys}")
+
+        # Load language instructions from meta/tasks.jsonl.
+        tasks: dict[int, str] = {}
+        try:
+            with open(_dl("meta/tasks.jsonl")) as f:
+                for line in f:
+                    row = _json.loads(line.strip())
+                    tasks[int(row["task_index"])] = row["task"]
+            print(f"  tasks loaded: {len(tasks)}")
+        except Exception as e:
+            print(f"  [warn] could not load tasks.jsonl: {e}")
+
+        # Load tabular data (state, action, task_index, episode/frame indices).
+        print(f"Loading {self.HF_REPO} parquet...")
         raw = load_dataset(
             self.HF_REPO, split="train",
             cache_dir=cache_dir, trust_remote_code=True,
         )
+        feats = raw.features
+        state_col    = next((c for c in ["observation.state", "state"] if c in feats), None)
+        action_col   = next((c for c in ["action", "actions"]          if c in feats), None)
+        task_idx_col = "task_index"   if "task_index"   in feats else None
+        ep_col       = "episode_index" if "episode_index" in feats else None
+        frame_col    = "frame_index"   if "frame_index"   in feats else None
 
-        cols = _detect_columns(raw.features)
-        if not cols["cameras"]:
+        if action_col is None:
             raise RuntimeError(
-                f"No camera columns found in {self.HF_REPO}. "
-                f"Available: {list(raw.features.keys())}"
+                f"No action column in {self.HF_REPO}. Available: {list(feats.keys())}"
             )
-        if cols["action"] is None:
-            raise RuntimeError(f"No action column found in {self.HF_REPO}")
+        print(f"  state col  : {state_col}")
+        print(f"  action col : {action_col}")
 
-        print(f"  cameras : {cols['cameras']}")
-        print(f"  state   : {cols['state']}")
-        print(f"  action  : {cols['action']}")
-        print(f"  language: {cols['language']}")
-
-        ep_col    = "episode_index" if "episode_index" in raw.features else None
-        frame_col = "frame_index"   if "frame_index"   in raw.features else None
-
+        # Group rows by episode
         episodes: dict[int, list] = {}
         for row in raw:
             ep_id = int(row[ep_col]) if ep_col else 0
             episodes.setdefault(ep_id, []).append(row)
-
         if frame_col:
             for ep_id in episodes:
                 episodes[ep_id].sort(key=lambda r: int(r[frame_col]))
 
         ep_ids = sorted(episodes.keys())[:num_requests]
-        print(f"  using {len(ep_ids)} episodes (of {len(episodes)} available)")
+        print(f"  using {len(ep_ids)} of {len(episodes)} episodes")
 
         self.items: list[RequestInput] = []
         for i, ep_id in enumerate(ep_ids):
             frames = episodes[ep_id]
+            language = ""
+            if task_idx_col and tasks:
+                tidx = int(frames[0].get(task_idx_col, 0))
+                language = tasks.get(tidx, "")
             try:
-                item = (self._make_pi05_request(i, ep_id, frames, cols)
-                        if task == "pi05"
-                        else self._make_vjepa2_ac_request(i, ep_id, frames, cols))
+                item = (
+                    self._make_pi05(i, ep_id, frames, camera_keys, state_col,
+                                    action_col, language, _dl)
+                    if task == "pi05"
+                    else self._make_vjepa2_ac(i, ep_id, frames, camera_keys,
+                                              action_col, state_col, language, _dl)
+                )
             except Exception as exc:
                 print(f"  [warn] ep{ep_id}: {exc}")
                 item = None
@@ -729,32 +724,27 @@ class DROIDDataset(BaseDataset):
 
     # ------------------------------------------------------------------
 
-    def _make_pi05_request(self, idx, ep_id, frames, cols) -> RequestInput:
-        first = frames[0]
-
+    def _make_pi05(self, idx, ep_id, frames, camera_keys, state_col,
+                   action_col, language, download_fn) -> RequestInput:
         image_paths: list[str] = []
-        for cam_col in cols["cameras"][:3]:
-            img = first.get(cam_col)
-            if img is None:
-                continue
-            path = os.path.join(self.local_file_dir, f"ep{ep_id}_cam{len(image_paths)}.png")
-            with open(path, "wb") as f:
-                f.write(_extract_image_bytes(img))
-            image_paths.append(path)
+        for cam_key in camera_keys[:3]:
+            video_path = download_fn(
+                f"videos/{cam_key}/episode_{ep_id:06d}.mp4"
+            )
+            png_path = os.path.join(
+                self.local_file_dir, f"ep{ep_id}_cam{len(image_paths)}.png"
+            )
+            _decode_first_frame_to_png(video_path, png_path)
+            image_paths.append(png_path)
 
         if not image_paths:
-            raise ValueError("no camera images extracted")
+            raise ValueError("no camera videos found")
         while len(image_paths) < 3:
-            image_paths.append(image_paths[0])  # pad with first camera
+            image_paths.append(image_paths[0])  # pad to 3 cameras
 
-        language = ""
-        if cols["language"]:
-            language = str(first.get(cols["language"]) or "")
         state = _to_float_list(
-            first.get(cols["state"]) if cols["state"] else None,
-            self.action_dim,
+            frames[0].get(state_col) if state_col else None, self.action_dim
         )
-
         return RequestInput(
             req_type=RequestType.VLA,
             prompt=language or "manipulate the object",
@@ -763,56 +753,30 @@ class DROIDDataset(BaseDataset):
             model_kwargs={"robot_state": state},
         )
 
-    def _make_vjepa2_ac_request(self, idx, ep_id, frames, cols) -> RequestInput:
+    def _make_vjepa2_ac(self, idx, ep_id, frames, camera_keys, action_col,
+                        state_col, language, download_fn) -> RequestInput:
         if len(frames) < self.rollout_horizon:
             raise ValueError(
                 f"episode has {len(frames)} frames, need >= {self.rollout_horizon}"
             )
-
-        n_video = min(self.video_frames, len(frames))
-        video_path = os.path.join(self.local_file_dir, f"ep{ep_id}.mp4")
-        self._save_video(frames[:n_video], cols["cameras"][0], video_path)
-
-        act_col = cols["action"]
-        st_col  = cols["state"]
-        actions = [_to_float_list(f.get(act_col), self.action_dim)
+        # The downloaded mp4 is passed straight to the server — no re-encoding.
+        video_path = download_fn(
+            f"videos/{camera_keys[0]}/episode_{ep_id:06d}.mp4"
+        )
+        actions = [_to_float_list(f.get(action_col), self.action_dim)
                    for f in frames[:self.rollout_horizon]]
-        states  = [_to_float_list(f.get(st_col) if st_col else None, self.action_dim)
+        states  = [_to_float_list(f.get(state_col) if state_col else None, self.action_dim)
                    for f in frames[:self.rollout_horizon]]
-
-        language = ""
-        if cols["language"]:
-            language = str(frames[0].get(cols["language"]) or "")
-
         return RequestInput(
             req_type=RequestType.V2V,
             prompt=language or "world model rollout",
             video_path=video_path,
             model_kwargs={
-                "actions":          actions,
-                "states":           states,
-                "rollout_horizon":  self.rollout_horizon,
+                "actions":         actions,
+                "states":          states,
+                "rollout_horizon": self.rollout_horizon,
             },
         )
-
-    def _save_video(self, frames, cam_col: str, output_path: str) -> None:
-        import io as _io
-        import torch
-        from PIL import Image as PILImage
-        from torchcodec.encoders import VideoEncoder
-
-        tensors = []
-        for row in frames:
-            img = row.get(cam_col)
-            if img is None:
-                continue
-            pil = PILImage.open(_io.BytesIO(_extract_image_bytes(img))).convert("RGB")
-            tensors.append(torch.from_numpy(np.array(pil, dtype=np.uint8)))
-
-        if not tensors:
-            raise ValueError(f"no frames for camera column {cam_col!r}")
-
-        VideoEncoder(frames=torch.stack(tensors), frame_rate=15).to_file(output_path)
 
     # ------------------------------------------------------------------
 
