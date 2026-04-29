@@ -269,7 +269,7 @@ class AREngine(BaseEngine):
 
     def _execute_batched(
         self, batch: NodeBatch, submodule: ARNodeSubmodule,
-        inputs: list[ARNodeInputs]
+        inputs: list[ARNodeInputs], sampler: Sampler,
     ) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
         cache_manager = self._create_cache_manager(
@@ -278,7 +278,8 @@ class AREngine(BaseEngine):
         engine_inputs = ModelInputsFromEngine(
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
-            cache_manager=cache_manager
+            cache_manager=cache_manager,
+            sampler=sampler
         )
         if self.enable_nvtx:
             range_push("ar.batched.preprocess", synchronize=False)
@@ -340,7 +341,8 @@ class AREngine(BaseEngine):
     def _execute_sequential(
         self, batch: NodeBatch,
         submodule: ARNodeSubmodule,
-        inputs: list[ARNodeInputs]
+        inputs: list[ARNodeInputs],
+        sampler: Sampler,
     ) -> NodeOutput:
         """Original per-request execution with CacheHandle."""
         per_request_outputs = {}
@@ -353,7 +355,8 @@ class AREngine(BaseEngine):
                 per_request_info={
                     rid: batch.per_request_info[rid]
                 },
-                cache_manager=cache_manager
+                cache_manager=cache_manager,
+                sampler=sampler,
             )
 
             if self.enable_nvtx:
@@ -491,6 +494,10 @@ class AREngine(BaseEngine):
                     with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
                         # run prepare inputs
                         node_inputs: list[ARNodeInputs] = []
+                        if self.enable_nvtx:
+                            range_push(
+                                f"ar.prepare_inputs"
+                            )
                         for rid in batch.request_ids:
                             labels = cache_mgmt.alloc_manager.get_labels(rid)
                             pos_info = {
@@ -506,6 +513,8 @@ class AREngine(BaseEngine):
                                     pos_info=pos_info
                                 )
                             )
+                        if self.enable_nvtx:
+                            range_pop(synchronize=True)
 
                         # Priority: CUDA graph > batched > sequential
                         if self._can_use_cuda_graph(batch, node_inputs):
@@ -523,7 +532,8 @@ class AREngine(BaseEngine):
                                 range_push("ar.batched_path", synchronize=False)
                             try:
                                 output = self._execute_batched(
-                                    batch, submodule, node_inputs
+                                    batch, submodule, node_inputs,
+                                    sampler=submod_mgmt.sampler
                                 )
                             finally:
                                 if self.enable_nvtx:
@@ -533,7 +543,8 @@ class AREngine(BaseEngine):
                                 range_push("ar.sequential_path", synchronize=False)
                             try:
                                 output = self._execute_sequential(
-                                    batch, submodule, node_inputs
+                                    batch, submodule, node_inputs,
+                                    sampler=submod_mgmt.sampler
                                 )
                             finally:
                                 if self.enable_nvtx:
