@@ -32,7 +32,7 @@ class BaseDataset(ABC):
 
     def _resize_data(self, data: list[RequestInput]) -> list[RequestInput]:
         """Resize data to match num_prompts."""
-        if not self.num_requests:
+        if not self.num_requests or not data:
             return data
 
         if len(data) < self.num_requests:
@@ -574,16 +574,35 @@ def _to_float_list(raw, target_dim: int) -> list[float]:
     return [float(v) for v in vals] + [0.0] * (target_dim - len(vals))
 
 
-def _decode_first_frame_to_png(video_path: str, output_png: str) -> None:
-    """Decode frame 0 of an mp4 and save as PNG."""
+def _decode_frames_to_png_and_video(
+    video_path: str,
+    frame_indices: list[int],
+    png_path: str | None,
+    mp4_path: str | None,
+    fps: float = 15.0,
+) -> None:
+    """Decode specific frames from a chunk video.
+
+    If ``png_path`` is given, saves the FIRST decoded frame as a PNG.
+    If ``mp4_path`` is given, saves ALL decoded frames as a new mp4.
+    ``frame_indices`` are local positions within the chunk file (0-based).
+    """
+    import torch
     from torchcodec.decoders import VideoDecoder
     from PIL import Image as PILImage
 
     dec = VideoDecoder(video_path)
-    frame = dec.get_frames_at(indices=[0])
-    tensor = frame.data[0]              # [C, H, W] uint8
-    arr = tensor.permute(1, 2, 0).numpy()   # [H, W, C]
-    PILImage.fromarray(arr).save(output_png)
+    batch = dec.get_frames_at(indices=frame_indices)
+    tensors = batch.data  # [T, C, H, W] uint8
+
+    if png_path is not None:
+        arr = tensors[0].permute(1, 2, 0).numpy()  # [H, W, C]
+        PILImage.fromarray(arr).save(png_path)
+
+    if mp4_path is not None:
+        from torchcodec.encoders import VideoEncoder
+        # VideoEncoder expects [T, C, H, W] — same layout as get_frames_at output.
+        VideoEncoder(frames=tensors, frame_rate=fps).to_file(mp4_path)
 
 
 class DROIDDataset(BaseDataset):
@@ -639,40 +658,39 @@ class DROIDDataset(BaseDataset):
                 self.HF_REPO, filename, repo_type="dataset", cache_dir=cache_dir
             )
 
-        # Discover video keys from meta/info.json.
-        # In lerobot v2 features with dtype=="video" are camera streams.
+        # Read meta/info.json for camera keys and chunks_size.
+        # lerobot v2 layout: videos/{key}/chunk-{C:03d}/file-{F:03d}.mp4
+        # where C = episode_index // chunks_size, F = episode_index % chunks_size.
         with open(_dl("meta/info.json")) as f:
             info = _json.load(f)
         features_info = info.get("features", {})
         camera_keys = [k for k, v in features_info.items()
                        if isinstance(v, dict) and v.get("dtype") == "video"]
         if not camera_keys:
-            # Fallback: top-level video_keys list used by some older repos
             camera_keys = info.get("video_keys", [])
         if not camera_keys:
             raise RuntimeError(
                 f"No video keys found in {self.HF_REPO}/meta/info.json. "
                 f"Top-level keys: {list(info.keys())}"
             )
+        chunks_size: int = info.get("chunks_size", info.get("chunk_size", 1000))
         print(f"  camera keys : {camera_keys}")
+        print(f"  chunks_size : {chunks_size}")
 
-        # Load language instructions from meta/tasks.jsonl.
+        # Load language instructions from meta/tasks.parquet (lerobot v2).
         tasks: dict[int, str] = {}
         try:
-            with open(_dl("meta/tasks.jsonl")) as f:
-                for line in f:
-                    row = _json.loads(line.strip())
-                    tasks[int(row["task_index"])] = row["task"]
+            import pandas as _pd
+            tasks_df = _pd.read_parquet(_dl("meta/tasks.parquet"))
+            tasks = dict(zip(tasks_df["task_index"].astype(int),
+                             tasks_df["task"].astype(str)))
             print(f"  tasks loaded: {len(tasks)}")
         except Exception as e:
-            print(f"  [warn] could not load tasks.jsonl: {e}")
+            print(f"  [warn] could not load tasks.parquet: {e}")
 
         # Load tabular data (state, action, task_index, episode/frame indices).
         print(f"Loading {self.HF_REPO} parquet...")
-        raw = load_dataset(
-            self.HF_REPO, split="train",
-            cache_dir=cache_dir, trust_remote_code=True,
-        )
+        raw = load_dataset(self.HF_REPO, split="train", cache_dir=cache_dir)
         feats = raw.features
         state_col    = next((c for c in ["observation.state", "state"] if c in feats), None)
         action_col   = next((c for c in ["action", "actions"]          if c in feats), None)
@@ -709,10 +727,11 @@ class DROIDDataset(BaseDataset):
             try:
                 item = (
                     self._make_pi05(i, ep_id, frames, camera_keys, state_col,
-                                    action_col, language, _dl)
+                                    action_col, language, _dl, chunks_size)
                     if task == "pi05"
                     else self._make_vjepa2_ac(i, ep_id, frames, camera_keys,
-                                              action_col, state_col, language, _dl)
+                                              action_col, state_col, language,
+                                              _dl, chunks_size)
                 )
             except Exception as exc:
                 print(f"  [warn] ep{ep_id}: {exc}")
@@ -724,23 +743,38 @@ class DROIDDataset(BaseDataset):
 
     # ------------------------------------------------------------------
 
+    def _chunk_video_path(self, ep_id: int, cam_key: str, chunks_size: int) -> str:
+        """lerobot v2: videos/{key}/chunk-{C:03d}/file-000.mp4
+        Each chunk file contains chunks_size episodes concatenated."""
+        chunk = ep_id // chunks_size
+        return f"videos/{cam_key}/chunk-{chunk:03d}/file-000.mp4"
+
+    def _local_frame_indices(self, frames: list) -> list[int]:
+        """Convert global `index` values to positions within the chunk file.
+        The chunk file starts at min(index) for the first episode in the chunk."""
+        global_indices = [int(row["index"]) for row in frames]
+        chunk_start = global_indices[0] - int(frames[0].get("frame_index", 0))
+        return [g - chunk_start for g in global_indices]
+
     def _make_pi05(self, idx, ep_id, frames, camera_keys, state_col,
-                   action_col, language, download_fn) -> RequestInput:
+                   action_col, language, download_fn, chunks_size) -> RequestInput:
+        # Compute frame positions within the chunk video once
+        local_indices = self._local_frame_indices(frames)
+        first_local   = local_indices[0]
+
         image_paths: list[str] = []
         for cam_key in camera_keys[:3]:
-            video_path = download_fn(
-                f"videos/{cam_key}/episode_{ep_id:06d}.mp4"
+            chunk_video = download_fn(self._chunk_video_path(ep_id, cam_key, chunks_size))
+            png_path    = os.path.join(self.local_file_dir, f"ep{ep_id}_cam{len(image_paths)}.png")
+            _decode_frames_to_png_and_video(
+                chunk_video, [first_local], png_path=png_path, mp4_path=None
             )
-            png_path = os.path.join(
-                self.local_file_dir, f"ep{ep_id}_cam{len(image_paths)}.png"
-            )
-            _decode_first_frame_to_png(video_path, png_path)
             image_paths.append(png_path)
 
         if not image_paths:
             raise ValueError("no camera videos found")
         while len(image_paths) < 3:
-            image_paths.append(image_paths[0])  # pad to 3 cameras
+            image_paths.append(image_paths[0])
 
         state = _to_float_list(
             frames[0].get(state_col) if state_col else None, self.action_dim
@@ -754,23 +788,41 @@ class DROIDDataset(BaseDataset):
         )
 
     def _make_vjepa2_ac(self, idx, ep_id, frames, camera_keys, action_col,
-                        state_col, language, download_fn) -> RequestInput:
-        if len(frames) < self.rollout_horizon:
+                        state_col, language, download_fn, chunks_size) -> RequestInput:
+        # The model requires T_total >= t_ctx + rollout_horizon - 1 actions.
+        # t_ctx = grid_depth = frames_per_clip // tubelet_size = 64 // 2 = 32.
+        t_ctx     = 32
+        n_actions = t_ctx + self.rollout_horizon - 1
+        if len(frames) < n_actions:
             raise ValueError(
-                f"episode has {len(frames)} frames, need >= {self.rollout_horizon}"
+                f"episode has {len(frames)} frames, need >= {n_actions} "
+                f"(t_ctx={t_ctx} + rollout_horizon={self.rollout_horizon} - 1)"
             )
-        # The downloaded mp4 is passed straight to the server — no re-encoding.
-        video_path = download_fn(
-            f"videos/{camera_keys[0]}/episode_{ep_id:06d}.mp4"
+
+        # Extract the episode's own frames from the chunk video so the server
+        # subsamples from the right clip instead of the whole dataset.
+        local_indices = self._local_frame_indices(frames)
+        # Sample ~64 evenly-spaced frames from the episode for the video input.
+        n_video = min(64, len(local_indices))
+        step    = max(1, len(local_indices) // n_video)
+        video_local_indices = local_indices[::step][:n_video]
+
+        chunk_video = download_fn(
+            self._chunk_video_path(ep_id, camera_keys[0], chunks_size)
         )
+        mp4_path = os.path.join(self.local_file_dir, f"ep{ep_id}.mp4")
+        _decode_frames_to_png_and_video(
+            chunk_video, video_local_indices, png_path=None, mp4_path=mp4_path
+        )
+
         actions = [_to_float_list(f.get(action_col), self.action_dim)
-                   for f in frames[:self.rollout_horizon]]
+                   for f in frames[:n_actions]]
         states  = [_to_float_list(f.get(state_col) if state_col else None, self.action_dim)
-                   for f in frames[:self.rollout_horizon]]
+                   for f in frames[:n_actions]]
         return RequestInput(
             req_type=RequestType.V2V,
             prompt=language or "world model rollout",
-            video_path=video_path,
+            video_path=mp4_path,
             model_kwargs={
                 "actions":         actions,
                 "states":          states,
