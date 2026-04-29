@@ -55,6 +55,11 @@ class TensorStore:
         self.per_req_tensors.setdefault(
             request_id, {}
         )[uuid] = TensorAndReferenceInfo(tensor)
+    
+    def replace_tensor(self, request_id: str, uuid: str, tensor: torch.Tensor):
+        if not self.check_uuid_presence(request_id, uuid):
+            return
+        self.per_req_tensors[request_id][uuid].tensor = tensor
 
     def check_uuid_presence(self, request_id: str, uuid: str):
         return uuid in self.per_req_tensors.get(request_id, {})
@@ -145,9 +150,13 @@ class TensorTransferEngine(ABC):
 @dataclass
 class TransferReadInfo:
     source_session_id: str
-    local_ptr: int
     remote_ptr: int
     nbytes: int
+    uuid: str
+    local_ptr: int | None = None
+    dims: tuple | None = None
+    dtype: torch.dtype | None = None
+    stride: tuple | None = None
 
 
 class AsyncMooncakeReader:
@@ -159,15 +168,17 @@ class AsyncMooncakeReader:
     The default stream is never blocked by store writes.
     """
 
-    def __init__(self, engine, device, max_workers: int = 3, max_batch_size=500):
+    def __init__(self, engine, device, protocol, max_workers: int = 3, max_batch_size=500):
         self._engine = engine
         self.max_batch_size = max_batch_size
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._pending: list[Future] = []
+        self._device = device
         if device != "cpu":
             self._copy_stream = torch.cuda.Stream(device=device)
         else:
             self._copy_stream = torch.cuda.Stream()
+        self._protocol = protocol
 
     def submit(self, read_info: list[TransferReadInfo]) -> Future:
         """Non-blocking: enqueue a batch of READs.
@@ -184,15 +195,27 @@ class AsyncMooncakeReader:
         self._pending = [f for f in self._pending if not f.done()]
         return future
 
-    def _do_read(self, read_info: list["TransferReadInfo"], event: torch.cuda.Event):
+    def _do_read(self, read_info: list["TransferReadInfo"], event: torch.cuda.Event) -> dict[str, torch.Tensor]:
         """Worker thread: wait for GPU data via CUDA event, then PUT."""
         self._copy_stream.wait_event(event)
         self._copy_stream.synchronize()
 
         # group read_info by session id for batch read
         grouped_read = {}
+        out = {}
         for info in read_info:
             grouped_read.setdefault(info.source_session_id, []).append(info)
+
+            if info.local_ptr is None:
+                with torch.cuda.stream(self._copy_stream):
+                    buffer = torch.empty(
+                        info.dims, dtype=info.dtype, device=self._device
+                    ).as_strided(info.dims, stride=info.stride)
+                    out[info.uuid] = buffer
+                    info.local_ptr = buffer.data_ptr()
+                    if self._protocol == CommProtocol.RDMA:
+                        self._engine.register_memory(buffer.data_ptr(), info.nbytes)
+        self._copy_stream.synchronize()
 
         for (session_id, infos) in grouped_read.items():
             for start in range(0, len(infos), self.max_batch_size):
@@ -206,6 +229,7 @@ class AsyncMooncakeReader:
                 )
                 if status < 0:
                     raise RuntimeError(f"Mooncake read failed. Status: {status}")
+        return out
 
     def wait_all(self):
         """Block until all pending writes complete. Re-raises exceptions."""
@@ -256,6 +280,7 @@ class MooncakeTransferEngine(TensorTransferEngine):
             protocol.value.lower(),
             transfer_device,
         )
+        self._protocol = protocol
         self._session_id = f"{hostname}:{self._engine.get_rpc_port()}"
 
     def register_memory(self, ptr: int, nbytes: int) -> int:
@@ -265,7 +290,7 @@ class MooncakeTransferEngine(TensorTransferEngine):
         return self._engine.unregister_memory(ptr)
 
     def get_async_reader(self, device) -> AsyncMooncakeReader:
-        return AsyncMooncakeReader(self._engine, device=device)
+        return AsyncMooncakeReader(self._engine, protocol=self._protocol, device=device)
 
     def get_session_id(self) -> str:
         return self._session_id
@@ -433,7 +458,11 @@ class TensorCommunicationManager(ABC):
         for ep in self.pending:
             if ep.future is None or ep.future.done():
                 if ep.future is not None:
-                    ep.future.result()
+                    maybe_tensors: dict[str, torch.Tensor] = ep.future.result() or {}
+                    for uuid, tensor in maybe_tensors.items():
+                        self.tensor_store.replace_tensor(
+                            ep.request_id, uuid, tensor
+                        )
                 for edge in ep.graph_edges:
                     ready.setdefault(ep.request_id, []).append(edge)
                     logger.debug(
@@ -520,7 +549,8 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         )
         self.protocol = protocol
         self._async_reader = AsyncMooncakeReader(
-            engine._engine, device=device
+            engine._engine, device=device,
+            protocol=protocol
         )
 
     def register_for_send(self, request_id, uuids, skip_cuda_sync=False):
@@ -580,11 +610,8 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         request_id, info.uuid, 1
                     )
                     continue
-                buffer = torch.empty(
-                    info.dims, dtype=info.dtype, device=self.device
-                ).as_strided(info.dims, stride=info.stride)
                 self.tensor_store.put_tensor(
-                    request_id=request_id, uuid=info.uuid, tensor=buffer
+                    request_id=request_id, uuid=info.uuid, tensor=None
                 )
                 self.tensor_store.set_metadata(
                     request_id, info.uuid, mem_registered=True
@@ -595,14 +622,14 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     request_id, info.uuid, 2
                 )
 
-                if self.protocol == CommProtocol.RDMA:
-                    self.transfer_engine.register_memory(buffer.data_ptr(), info.nbytes)
-
                 read_info.append(TransferReadInfo(
                     source_session_id=info.source_session_id,
-                    local_ptr=buffer.data_ptr(),
                     remote_ptr=info.address,
                     nbytes=info.nbytes,
+                    uuid=info.uuid,
+                    dims=info.dims,
+                    dtype=info.dtype,
+                    stride=info.stride
                 ))
                 logger.debug("Started transfer read for uuid %s", info.uuid)
             fut = self._async_reader.submit(read_info)

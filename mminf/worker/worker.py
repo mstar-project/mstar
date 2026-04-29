@@ -447,8 +447,8 @@ class Worker:
             elif message.message_type == WorkerMessageType.STOP_LOOPS:
                 self._stop_loops(message.body)
 
-    def _process_messages(self) -> None:
-        self._process_message_list(self.communicator.get_all_new_messages())
+    def _process_messages(self, blocking=False) -> None:
+        self._process_message_list(self.communicator.get_all_new_messages(blocking))
 
     # ------------------------------------------------------------------
     # Tensor readiness
@@ -925,7 +925,7 @@ class Worker:
                 # 1. Process ZMQ messages (new requests, input signals, removals)
                 if self.enable_nvtx:
                     range_push("worker.process_messages", synchronize=True)
-                self._process_messages()
+                self._process_messages(blocking=False)
                 if self.enable_nvtx:
                     range_pop(synchronize=True)
 
