@@ -1359,6 +1359,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 hidden, cp.lm_head_weight[group_idx - 1].t()
             )
 
+            # TODO: allow setting the code predictor temperature
             tokens = injected_sampler.sample_with_config(
                 logits=logits, temperature=1.0, 
                 top_k=50, top_p=0.8
