@@ -44,11 +44,11 @@ from mminf.conductor.request_info import (
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, Sequential, TensorPointerInfo
-from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mminf.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mminf.graph.special_destinations import EMIT_TO_CLIENT
+from mminf.model.base import ForwardPassArgs, MAX_OUTPUT_TOKENS, Model, TensorAndMetadata
 from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
-from mminf.model.qwen3_omni.componentss.talker import Qwen3OmniCodePredictor
-from mminf.model.submodules_base import NodeSubmodule
+from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
+from mminf.model.submodule_base import NodeSubmodule
 from mminf.model.utils import Operation, WeightConverter
 from mminf.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -180,6 +180,9 @@ class Qwen3OmniModel(Model):
             "Talker": EngineType.AR,
             "Code2Wav": EngineType.AUDIO_CODEC,
         }
+    
+    def get_max_talker_output_tokens(self, **model_kwargs):
+        return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
 
     # -----------------------------------------------------------------------
     # Model ABC: graph walk definitions
@@ -533,7 +536,8 @@ class Qwen3OmniModel(Model):
                     "talker_prefill_done": False,
                     "num_thinker_prefill_steps": len(input_modalities),
                     "prefill_chunks_processed": 0,
-                    "voice": model_kwargs.get("voice", "Ethan")
+                    "voice": model_kwargs.get("voice", "Ethan"),
+                    "talker_max_tokens": self.get_max_talker_output_tokens(**model_kwargs),
                 },
             )
             return ForwardPassArgs(
@@ -542,7 +546,8 @@ class Qwen3OmniModel(Model):
                 unpersist_tensors=[],
                 request_done="audio" not in output_modalities,
                 step_metadata={
-                    "voice": model_kwargs.get("voice", "Ethan")
+                    "voice": model_kwargs.get("voice", "Ethan"),
+                    "talker_max_tokens": full_metadata.kwargs.get("talker_max_tokens")
                 }
             )
         elif partition_name == "Code2Wav":
@@ -865,7 +870,8 @@ class Qwen3OmniModel(Model):
                 step_metadata={
                     "is_prefill": True,
                     # voice is used for the last prefill
-                    "voice": metadata.kwargs.get("voice", "Ethan")
+                    "voice": metadata.kwargs.get("voice", "Ethan"),
+                    "talker_max_tokens": metadata.kwargs.get("talker_max_tokens")
                 },
             )
         elif metadata.graph_walk == "talker_last_prefill":
@@ -887,6 +893,7 @@ class Qwen3OmniModel(Model):
                 unpersist_tensors=unpersist_tensors,
                 step_metadata={
                     "is_prefill": False,
+                    "talker_max_tokens": metadata.kwargs.get("talker_max_tokens")
                 },
             )
 
