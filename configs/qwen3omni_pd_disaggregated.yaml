@@ -12,5 +12,5 @@ node_groups:
     ranks: [1]
     graph_walks: [thinker_decode]
   
-  - node_names: [Talker_LLM, code_predictor]
+  - node_names: [Talker]
     ranks: [2]
