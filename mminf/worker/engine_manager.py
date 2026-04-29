@@ -6,7 +6,6 @@ import torch
 from mminf.engine.ar_engine import AREngine
 from mminf.engine.audio_codec_engine import AudioCodecEngine
 from mminf.engine.base import BaseEngine
-from mminf.engine.code_predictor_engine import CodePredictorEngine
 from mminf.engine.enc_dec_engine import EncoderDecoderEngine
 from mminf.engine.flow_engine import FlowEngine
 from mminf.engine.kv_store import KVCacheConfig, TransferEngineInfo
@@ -14,7 +13,6 @@ from mminf.model.base import Model
 
 ENGINE_TYPE_TO_CLASS: dict[str, type[BaseEngine]] = {
     "ar": AREngine,
-    "code_predictor": CodePredictorEngine,
     "flow": FlowEngine,
     "enc_dec": EncoderDecoderEngine,
     "audio_codec": AudioCodecEngine,
@@ -100,14 +98,16 @@ class EngineManager:
         logger.info("All engines loaded on device %s", str(device))
 
         return cls(node_to_engine=node_to_engine)
+
     def warmup_all(self) -> None:
         """Call warmup() on all unique engines for CUDA graph capture."""
         seen = set()
-        for engine in self.node_to_engine.values():
-            eid = id(engine)
-            if eid not in seen:
-                seen.add(eid)
-                engine.warmup()
+        with torch.no_grad():
+            for engine in self.node_to_engine.values():
+                eid = id(engine)
+                if eid not in seen:
+                    seen.add(eid)
+                    engine.warmup()
 
     def get_engine(self, node_name: str) -> BaseEngine:
         return self.node_to_engine[node_name]
