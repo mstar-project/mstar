@@ -81,6 +81,8 @@ class BenchmarkConfig:
     # OFFLINE / ONLINE. Default 1 = sequential, matching sglang-omni's default.
     max_concurrency: Optional[int] = 1
     output_dir: Optional[str] = None  # Save outputs here (text files / images)
+    output_json: Optional[str] = None  # Write metrics JSON here
+    max_tokens: Optional[int] = None  # Max output tokens for text generation
     # VBench args
     vbench_cache_dir: str = "./vbench_cache"
 
@@ -146,6 +148,15 @@ class Benchmark:
         for request_id, error in errors:
             print(f"  [{request_id}] {error}")
 
+    def _max_tokens_kwargs(self) -> dict:
+        """Build additional_model_kwargs for max_tokens control."""
+        if self.config.max_tokens is None:
+            return {}
+        # mminf uses max_output_tokens; vllm/sglang use max_tokens
+        if self.config.inference_system == InferenceSystemType.OURS:
+            return {"max_output_tokens": self.config.max_tokens}
+        return {"max_tokens": self.config.max_tokens}
+
     async def _run_batch(
         self,
         session: aiohttp.ClientSession,
@@ -160,6 +171,7 @@ class Benchmark:
                     base_url=self.config.url,
                     request_id=i,
                     model=self.config.model,
+                    additional_model_kwargs=self._max_tokens_kwargs(),
                 )
             )
             for i, req in batch
@@ -204,6 +216,7 @@ class Benchmark:
                     base_url=self.config.url,
                     request_id=i,
                     model=self.config.model,
+                    additional_model_kwargs=self._max_tokens_kwargs(),
                 )
             )
             tasks.append(task)
@@ -236,6 +249,7 @@ class Benchmark:
                     base_url=self.config.url,
                     request_id=request_id,
                     model=self.config.model,
+                    additional_model_kwargs=self._max_tokens_kwargs(),
                 )
 
         tasks = [asyncio.create_task(_limited(i, r)) for i, r in enumerate(requests)]
@@ -329,8 +343,41 @@ class Benchmark:
         print(agg)
         self._print_errors(metrics)
         self._save_outputs(metrics)
+        self._save_json(metrics, agg, wall_time)
 
         return metrics, agg
+
+    def _save_json(self, metrics: list[RequestMetrics], agg: AggregateMetrics, wall_time: float) -> None:
+        if self.config.output_json is None:
+            return
+        import json as _json
+        result = {
+            "system": self.config.inference_system.value,
+            "model": self.config.model.get_hf_url(),
+            "task": self.config.request_type.value,
+            "batch_size": self.config.batch_size,
+            "num_requests": self.config.num_requests,
+            "num_warmup": self.config.num_warmup,
+            "max_tokens": self.config.max_tokens,
+            "wall_time": wall_time,
+            "n_success": agg.n_success,
+            "summary": {
+                "ttft": {mod: {"mean": s.mean, "p50": s.p50, "p95": s.p95, "p99": s.p99}
+                         for mod, s in agg.ttft.items()},
+                "e2e": {"mean": agg.e2e_latency.mean, "p50": agg.e2e_latency.p50,
+                        "p95": agg.e2e_latency.p95, "p99": agg.e2e_latency.p99},
+                "itl": {mod: {"mean": s.mean, "p50": s.p50, "p95": s.p95, "p99": s.p99}
+                        for mod, s in agg.itl.items()},
+                "throughput_req_s": agg.n_success / wall_time if wall_time > 0 else 0,
+                "throughput_tok_s": agg.total_text_tokens / wall_time if wall_time > 0 else 0,
+                "total_text_tokens": agg.total_text_tokens,
+                "mean_text_tokens": agg.mean_text_tokens,
+            },
+        }
+        os.makedirs(os.path.dirname(self.config.output_json) or ".", exist_ok=True)
+        with open(self.config.output_json, "w") as f:
+            _json.dump(result, f, indent=2)
+        print(f"\nResults saved to {self.config.output_json}")
 
 
 def parse_args() -> BenchmarkConfig:
@@ -354,6 +401,11 @@ def parse_args() -> BenchmarkConfig:
     parser.add_argument("--rate", type=float, default=1.0, help="Requests/sec (default: 1.0)")
     parser.add_argument(
         "--output-dir", default=None, help="Directory to save outputs (text files / images). Omit to skip."
+    )
+    parser.add_argument("--output-json", default=None, help="Write aggregate + per-request metrics to a JSON file.")
+    parser.add_argument(
+        "--max-tokens", type=int, default=None,
+        help="Max output tokens for text generation tasks. Passed as max_output_tokens to mminf and max_tokens to vllm/sglang.",
     )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--local-cache", default="./mminf-benchmark-cache/", type=str)
@@ -422,6 +474,8 @@ def parse_args() -> BenchmarkConfig:
         rate=args.rate,
         verbose=args.verbose,
         output_dir=args.output_dir,
+        output_json=args.output_json,
+        max_tokens=args.max_tokens,
         vbench_cache_dir=args.vbench_cache_dir,
         request_txt_file=txtfile,
         local_cache_dir=args.local_cache,

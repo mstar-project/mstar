@@ -29,7 +29,9 @@ python -m benchmark.runner \
     --num-requests "${NUM_REQUESTS:-10}" \
     --inference-system "${INF_SYS:-ours}" \
     --num-warmup "${WARMUP:-3}" \
-    ${DATASET:+--dataset "$dataset"} \
+    ${DATASET:+--dataset "$DATASET"} \
     ${BATCH_SIZE:+--batch-size "$BATCH_SIZE"} \
     ${RATE:+--rate "$RATE"} \
+    ${MAX_TOKENS:+--max-tokens "$MAX_TOKENS"} \
+    ${OUTPUT_JSON:+--output-json "$OUTPUT_JSON"} \
     ${EXTRA_ARGS:+"$EXTRA_ARGS"}
