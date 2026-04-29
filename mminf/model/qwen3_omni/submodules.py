@@ -1495,8 +1495,11 @@ class TalkerSubmodule(ARNodeSubmodule):
             return set()
         token = outputs["layer0_codes"][0].item()
         eos_token_id = self.config.talker.codec_eos_token_id
+        max_tokens = request_info.step_metadata.get(
+            "talker_max_tokens", request_info.max_tokens
+        )
         if (eos_token_id is not None and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= request_info.max_tokens):
+                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= max_tokens):
             return {"talker_decode_loop"}
         return set()
     

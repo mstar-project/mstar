@@ -34,6 +34,7 @@ from mminf.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+from mminf.utils.profiler import range_pop, range_push
 from mminf.worker.engine_manager import EngineManager
 from mminf.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mminf.worker.node_manager_utils import (
@@ -383,6 +384,8 @@ class Worker:
         )
         req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
 
+        if self.enable_nvtx:
+            range_push("process_new_inputs.routing_update")
         # Handle producer_done signal: mark all StreamBuffers for this request as done
         if body.producer_done:
             if req_info:
@@ -407,6 +410,9 @@ class Worker:
                 partition_name=body.partition_name
             )
 
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            range_push("process_new_inputs.start_read")
         # Start RDMA reads for non-streaming edges with tensor_info
         self.tensor_manager.start_read_tensors(
             body.request_id, non_streaming,
@@ -420,6 +426,9 @@ class Worker:
                 stream_buf = req_info.stream_buffers[edge.name]
                 for info in edge.tensor_info:
                     stream_buf.pre_read_register(info.uuid)
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            range_push("process_new_inputs.process_inputs")
 
         # Streaming signal-only edges: nothing to buffer (no tensor data)
         # This shouldn't normally happen for streaming edges
@@ -431,6 +440,8 @@ class Worker:
                 request_id=body.request_id,
                 inputs=signal_only,
             )
+        if self.enable_nvtx:
+            range_pop()
 
     def _unpersist_tensors(self, body: UnpersistTensors):
         for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
@@ -506,7 +517,10 @@ class Worker:
             tensor = self.tensor_manager.get_tensor(
                 request_id=request_id, uuid=info.uuid,
             )
-            stream_buf.put(info.uuid, tensor.clone())
+
+            # We were cloning the tensor previously, which appears unnecessary and
+            # adds a good amount of latency
+            stream_buf.put(info.uuid, tensor)
             self.tensor_manager.dereference(request_id, info.uuid)
 
     def _poll_stream_buffers(self) -> None:
@@ -565,13 +579,21 @@ class Worker:
             streaming = [e for e in edges if e.is_streaming]
             normal = [e for e in edges if not e.is_streaming]
 
+            if self.enable_nvtx:
+                range_push("check_ready-tensors.route_streaming")
             for edge in streaming:
                 self._route_streaming_tensor(request_id, edge)
+            
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_push("process_new_inputs.process_inputs")
 
             if normal:
                 self.worker_graphs_manager.process_new_inputs(
                     request_id=request_id, inputs=normal,
                 )
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
     # ------------------------------------------------------------------
     # CPU offloading
