@@ -77,18 +77,25 @@ class Bagel(Model):
         self.disable_cfg = disable_cfg
 
     def get_model_kwargs(self, request_type: RequestType):
+        # Force greedy on the thinker for cross-system parity. Without this,
+        # mminf falls back to mminf/model/bagel/config.py's temperature=0.6
+        # default while vllm-omni gets temperature=0 from request.py:952 — the
+        # two systems would generate different token sequences, mostly
+        # affecting I2T latency (variable EOS timing) but also leaking into
+        # T2I/I2I via the tokens emitted before the image-gen handoff.
+        kwargs = {"temperature": 0.0}
         if self.disable_cfg:
-            return {
+            kwargs.update({
                 "cfg_img_scale": 1.0,
                 "cfg_text_scale": 1.0,
-            }
-        if request_type == RequestType.I2I:
-            return {
+            })
+        elif request_type == RequestType.I2I:
+            kwargs.update({
                 "cfg_img_scale": 2.0,
                 "cfg_interval": [0.0, 1.0],
                 "cfg_renorm_type": "text_channel",
-            }
-        return {}
+            })
+        return kwargs
 
     def get_hf_url(self):
         return "ByteDance-Seed/BAGEL-7B-MoT"
