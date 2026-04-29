@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from enum import Enum
+from typing import Optional
 
 
 class Status(Enum):
@@ -51,6 +52,24 @@ class Model(ABC):
 
     def get_model_kwargs(self, request_type: RequestType):
         return {}
+
+    def get_openai_system_message(self) -> Optional[dict]:
+        """Return the OpenAI-format system message to prepend on /v1/chat/completions
+        requests, or None to send no system role.
+
+        Per-model because the right answer is model-specific:
+          - Qwen3-Omni (audio-output models in general): the official examples
+            (gradio_demo, openai_chat_completion_client_for_multimodal_generation,
+            seed_tts_dataset.SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT) all hardcode the
+            "You are Qwen…" preamble and the talker's behavior degrades without it.
+          - BAGEL: the model has its own `<|fim_middle|><|im_start|>…<|im_end|>`
+            template; an extra system role corrupts prompt handling and produces
+            off-prompt images. vllm-omni's own diffusion bench
+            (`benchmarks/diffusion/backends.py`) sends user-only messages for BAGEL.
+
+        Default: None (no system message). Override in subclasses that need one.
+        """
+        return None
 
     @abstractmethod
     def get_hf_url(self):
@@ -115,6 +134,24 @@ class Orpheus(Model):
 class Qwen3Omni(Model):
     def get_hf_url(self):
         return "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+
+    def get_openai_system_message(self) -> Optional[dict]:
+        # Verbatim text from vllm-omni's official Qwen3-Omni examples
+        # (gradio_demo, openai_chat_completion_client_for_multimodal_generation,
+        # benchmarks/data_modules/seed_tts_dataset.SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT).
+        # Required for correct talker behavior on /v1/chat/completions.
+        return {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+                        "capable of perceiving auditory and visual inputs, as well as generating text and speech."
+                    ),
+                }
+            ],
+        }
 
     def get_model_kwargs(self, request_type: RequestType):
         # Cap thinker output at 256 tokens for cross-system fairness. Matches
