@@ -946,15 +946,28 @@ class VLLMOmni(InferenceSystem):
             # the server to skip the talker.
             modalities_arg = [output_mod]
 
+            # Image outputs don't stream over /v1/chat/completions — vllm-omni's
+            # serving_chat.py:1464 explicitly bails on "Unsupported streaming
+            # final output type: image" and emits no SSE chunks. The image is
+            # instead returned as a single non-streaming JSON with the bytes
+            # embedded as a `data:image/png;base64,...` URL inside
+            # `choices[0].message.content`. Matches what vllm-omni's own bench
+            # does for `--backend vllm-omni` on diffusion tasks
+            # (benchmarks/diffusion/backends.py:async_request_chat_completions).
+            is_image_output = output_mod == "image"
+
             payload: dict = {
                 "model": model.get_hf_url(),
                 "messages": [_SYSTEM_MESSAGE, user_message],
                 "temperature": 0.0,  # match vllm-omni's bench (`patch.py:336`)
-                "stream": True,
-                "stream_options": {"include_usage": True},
                 **model.get_model_kwargs(req_type),
                 **additional_model_kwargs,
             }
+            if is_image_output:
+                payload["stream"] = False
+            else:
+                payload["stream"] = True
+                payload["stream_options"] = {"include_usage": True}
             payload["modalities"] = modalities_arg
 
             # Match vllm-omni bench headers (`patch.py:354-358`).
@@ -974,38 +987,63 @@ class VLLMOmni(InferenceSystem):
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status}: {await resp.text()}")
 
-                buffer = b""
-                async for raw_bytes in resp.content.iter_any():
-                    if not raw_bytes:
-                        continue
-                    buffer += raw_bytes
-                    while b"\n\n" in buffer:
-                        message, buffer = buffer.split(b"\n\n", 1)
-                        message = message.strip()
-                        if not message:
+                if is_image_output:
+                    response_json = await resp.json()
+                    arrival_time = time.monotonic()
+                    for choice in response_json.get("choices", []):
+                        content = choice.get("message", {}).get("content")
+                        if not isinstance(content, list):
                             continue
-                        chunk = _parse_sse_chunk(message)
-                        if chunk is None:
+                        for part in content:
+                            if part.get("type") != "image_url":
+                                continue
+                            url = part.get("image_url", {}).get("url", "")
+                            if url.startswith("data:image") and "," in url:
+                                b64_data = url.split(",", 1)[1]
+                                metrics.record_output_chunk(
+                                    modality="image",
+                                    data_b64=b64_data,
+                                    arrival_time=arrival_time,
+                                    n_tokens=1,
+                                )
+                    usage = response_json.get("usage") or {}
+                    if (ct := usage.get("completion_tokens")) is not None:
+                        metrics.output_text_tokens = ct
+                    if (pt := usage.get("prompt_tokens")) is not None:
+                        metrics.input_tokens = pt
+                else:
+                    buffer = b""
+                    async for raw_bytes in resp.content.iter_any():
+                        if not raw_bytes:
                             continue
-                        if chunk.get("_done"):
-                            # vllm-omni may emit data after [DONE]; keep reading
-                            # until the stream is naturally closed.
-                            continue
-                        _record_vllm_omni_chunk(chunk, metrics)
+                        buffer += raw_bytes
+                        while b"\n\n" in buffer:
+                            message, buffer = buffer.split(b"\n\n", 1)
+                            message = message.strip()
+                            if not message:
+                                continue
+                            chunk = _parse_sse_chunk(message)
+                            if chunk is None:
+                                continue
+                            if chunk.get("_done"):
+                                # vllm-omni may emit data after [DONE]; keep reading
+                                # until the stream is naturally closed.
+                                continue
+                            _record_vllm_omni_chunk(chunk, metrics)
 
-                # Trailing-buffer flush: catch a final chunk if the server
-                # closed without a final `\n\n`.
-                tail = buffer.strip()
-                if tail.startswith(b"data:"):
-                    payload_str = tail[len(b"data:") :].strip()
-                    if payload_str and payload_str != b"[DONE]":
-                        try:
-                            json.loads(payload_str)
-                            chunk = _parse_sse_chunk(tail)
-                            if chunk is not None and not chunk.get("_done"):
-                                _record_vllm_omni_chunk(chunk, metrics)
-                        except json.JSONDecodeError:
-                            pass
+                    # Trailing-buffer flush: catch a final chunk if the server
+                    # closed without a final `\n\n`.
+                    tail = buffer.strip()
+                    if tail.startswith(b"data:"):
+                        payload_str = tail[len(b"data:") :].strip()
+                        if payload_str and payload_str != b"[DONE]":
+                            try:
+                                json.loads(payload_str)
+                                chunk = _parse_sse_chunk(tail)
+                                if chunk is not None and not chunk.get("_done"):
+                                    _record_vllm_omni_chunk(chunk, metrics)
+                            except json.JSONDecodeError:
+                                pass
 
         except Exception as e:
             metrics.record_error(str(e))
