@@ -969,7 +969,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 # 4. TalkerSubmodule (ar engine) -- SECOND MOST COMPLEX
 # ===================================================================
 
-class TalkerLLMSubmodule(ARNodeSubmodule):
+class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 16
 
     def __init__(
