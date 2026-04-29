@@ -34,7 +34,7 @@ from mminf.engine.cuda_graph_config import (
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
 from mminf.utils.profiler import mark, range_pop, range_push
-from mminf.utils.sampling import Sampler
+from mminf.utils.sampling import SamplerBuffers, Sampler, SamplingConfig, make_sampler_from_buffers
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +169,14 @@ class CudaGraphRunner:
         # Phase 3 plan-overlap stream. Lazily created the first time pre_plan
         # is called from Worker.plan_executor.
         self._plan_stream: "torch.cuda.Stream | None" = None
+
+        self.max_bs = max(
+            [max(config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES)
+            for config in self.capture_configs] or [1]
+        )
+        self.sampler_buffer: SamplerBuffers = SamplerBuffers.allocate(
+            max_batch_size=self.max_bs, device=device
+        )
 
     def warmup_and_capture(self) -> None:
         """Capture graphs for all configs and batch sizes."""
@@ -394,7 +402,12 @@ class CudaGraphRunner:
         return ModelInputsFromEngine(
             request_ids=dummy_rids,
             per_request_info=dummy_metadata,
-            cache_manager=cache_manager
+            cache_manager=cache_manager,
+            sampler=make_sampler_from_buffers(
+                bufs=self.sampler_buffer,
+                request_ids=[], sampling_configs={},
+                padded_bs=len(dummy_rids)
+            ),
         )
 
     def _make_dummy_seq_lens(
@@ -777,6 +790,20 @@ class CudaGraphRunner:
             return None
         return sizes[idx]
 
+    def _get_sampler(
+        self, per_request_info: dict[str, CurrentForwardPassInfo],
+        request_ids: list[str], padded_bs: int
+    ):
+        return make_sampler_from_buffers(
+            bufs=self.sampler_buffer,
+            request_ids=request_ids,
+            sampling_configs={
+                rid: info.sampling_config.get(
+                    self.submodule_name, SamplingConfig()
+                ) for rid, info in per_request_info.items()
+            },
+            padded_bs=padded_bs,
+        )
 
     def reserve_slot(
         self,
@@ -1083,6 +1110,11 @@ class CudaGraphRunner:
             request_ids=dummy_rids,
             per_request_info=real_metadata,
             cache_manager=static_cm,
+            sampler=self._get_sampler(
+                per_request_info=per_request_info,
+                request_ids=request_ids,
+                padded_bs=padded_bs
+            )
         )
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -1270,6 +1302,11 @@ class CudaGraphRunner:
             request_ids=dummy_rids,
             per_request_info=real_metadata,
             cache_manager=static_cm,
+            sampler=self._get_sampler(
+                per_request_info=per_request_info,
+                request_ids=request_ids,
+                padded_bs=padded_bs
+            )
         )
         if self.enable_nvtx:
             range_pop(synchronize=False)
