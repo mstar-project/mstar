@@ -16,6 +16,7 @@ set -euo pipefail
 NUM_REQUESTS="${1:-4}"
 DEVICES="${2:-0}"
 PORT="${PORT:-20001}"
+export PORT
 USERNAME="${USER:-keisuke}"
 CACHE_DIR="/m-coriander/coriander/${USERNAME}/mminf_cache/orpheus/"
 SOCKET_PREFIX="/tmp/mminf_${USERNAME}/"
@@ -83,7 +84,7 @@ fi
 # Wait for model loading + warmup (CUDA graphs, torch.compile)
 echo "  Waiting for model loading and warmup..."
 for i in $(seq 1 300); do
-    if grep -q "torch.compile applied\|CUDA graphs captured" "$SERVER_LOG" 2>/dev/null; then
+    if grep -q "Worker worker_0: engine runs" "$SERVER_LOG" 2>/dev/null; then
         echo "  Model fully loaded and warmed up after ${i}s"
         break
     fi
@@ -100,8 +101,7 @@ echo "[3/4] Sending warmup request..."
 $PYTHON test/orpheus/tts_request.py \
     --text "Hello world." \
     --voice tara \
-    --output "${OUTPUT_DIR}/warmup.wav" \
-    --port "$PORT" 2>&1 | sed 's/^/  /' || echo "  (warmup request failed, continuing anyway)"
+    --output "${OUTPUT_DIR}/warmup.wav" 2>&1 | sed 's/^/  /' || echo "  (warmup request failed, continuing anyway)"
 
 echo "[4/4] Sending $NUM_REQUESTS concurrent requests..."
 
@@ -128,8 +128,7 @@ for i in $(seq 0 $((NUM_REQUESTS - 1))); do
     $PYTHON test/orpheus/tts_request.py \
         --text "$text" \
         --voice "$voice" \
-        --output "$outfile" \
-        --port "$PORT" &
+        --output "$outfile" &
     PIDS+=($!)
     echo "  Request $i (voice=$voice): PID $!"
 done

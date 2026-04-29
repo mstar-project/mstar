@@ -102,17 +102,34 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        cache_manager = engine_inputs.cache_manager
+        enable_nvtx = bool(getattr(cache_manager, "enable_nvtx", False))
+        if enable_nvtx:
+            from mminf.utils.profiler import range_pop, range_push
+
+            range_push("orpheus.preprocess.seq_lens", synchronize=False)
         seq_lens = [
             inp.input_seq_len for inp in inputs
         ]
-        cache_manager = engine_inputs.cache_manager
+        if enable_nvtx:
+            range_pop(synchronize=False)
         # Plan attention and rope for the main cache label
+        if enable_nvtx:
+            range_push("orpheus.preprocess.set_active_label", synchronize=False)
         cache_manager.set_active_label("main")
+        if enable_nvtx:
+            range_pop(synchronize=False)
         cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
         cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
-        return {
-            "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
-        }
+        if enable_nvtx:
+            range_push("orpheus.preprocess.pack_inputs", synchronize=False)
+        try:
+            return {
+                "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
+            }
+        finally:
+            if enable_nvtx:
+                range_pop(synchronize=False)
     
     def forward(
         self,

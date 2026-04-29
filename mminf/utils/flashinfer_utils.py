@@ -94,9 +94,11 @@ class FlashInferPrefillWrapper:
         max_num_pages: int | None = None,
         device: torch.device = torch.device("cuda"),
         use_cuda_graph: bool = False,
+        enable_nvtx: bool = False,
     ):
         self.device = device
         self.use_cuda_graph = use_cuda_graph
+        self.enable_nvtx = enable_nvtx
         self.batch_size = batch_size
         self.max_total_tokens = max_total_tokens
         self.num_qo_heads = num_qo_heads
@@ -304,9 +306,11 @@ class FlashInferDecodeWrapper:
         max_num_pages: int | None = None,
         device: torch.device = torch.device("cuda"),
         use_cuda_graph: bool = False,
+        enable_nvtx: bool = False,
     ):
         self.device = device
         self.use_cuda_graph = use_cuda_graph
+        self.enable_nvtx = enable_nvtx
         self.batch_size = batch_size
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
@@ -356,6 +360,7 @@ class FlashInferDecodeWrapper:
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
+        kv_cache_locations: torch.Tensor | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ):
         """Plan decode attention and compute KV write locations.
@@ -368,31 +373,68 @@ class FlashInferDecodeWrapper:
         """
         n_req = paged_kv_indptr.shape[0] - 1
 
-        self.attn_wrapper.plan(
-            indptr=paged_kv_indptr,
-            indices=paged_kv_indices,
-            last_page_len=paged_kv_last_page_len,
-            num_qo_heads=self.num_qo_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            page_size=self.page_size,
-            q_data_type=dtype,
-        )
+        if self.enable_nvtx:
+            from mminf.utils.profiler import range_pop, range_push
+
+            range_push("flashinfer.decode.plan_inner", synchronize=False)
+        try:
+            self.attn_wrapper.plan(
+                indptr=paged_kv_indptr,
+                indices=paged_kv_indices,
+                last_page_len=paged_kv_last_page_len,
+                num_qo_heads=self.num_qo_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                page_size=self.page_size,
+                q_data_type=dtype,
+            )
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
         # Async H2D before our own per-rid bookkeeping.
         if paged_kv_indptr.device.type != "cuda":
-            paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
-            paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
-            paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
+            if self.enable_nvtx:
+                range_push("flashinfer.decode.metadata_h2d", synchronize=False)
+            try:
+                paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
+                paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
+                paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
+            finally:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
 
-        # Compute KV write locations: page and position for each request's new token
-        page_idx = paged_kv_indices[paged_kv_indptr[1:] - 1]
-        pos_idx = paged_kv_last_page_len - 1
+        if kv_cache_locations is not None:
+            locations = kv_cache_locations
+            if locations.device.type != "cuda":
+                if self.enable_nvtx:
+                    range_push("flashinfer.decode.kv_location_h2d", synchronize=False)
+                try:
+                    locations = locations.to(self.device, non_blocking=True)
+                finally:
+                    if self.enable_nvtx:
+                        range_pop(synchronize=False)
+        else:
+            # Compute KV write locations: page and position for each request's new token
+            if self.enable_nvtx:
+                range_push("flashinfer.decode.kv_location_compute", synchronize=False)
+            try:
+                page_idx = paged_kv_indices[paged_kv_indptr[1:] - 1]
+                pos_idx = paged_kv_last_page_len - 1
 
-        locations = torch.stack([page_idx.to(torch.long), pos_idx.to(torch.long)], dim=1)
+                locations = torch.stack([page_idx.to(torch.long), pos_idx.to(torch.long)], dim=1)
+            finally:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
 
         if self.use_cuda_graph:
-            self.kv_cache_locations[:n_req].copy_(locations)
+            if self.enable_nvtx:
+                range_push("flashinfer.decode.kv_location_copy", synchronize=False)
+            try:
+                self.kv_cache_locations[:n_req].copy_(locations)
+            finally:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
         else:
             self.kv_cache_locations = locations
 

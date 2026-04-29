@@ -228,6 +228,7 @@ class CudaGraphRunner:
                     max_num_pages=cfg.max_num_pages,
                     device=self.device,
                     use_cuda_graph=True,
+                    enable_nvtx=self.enable_nvtx,
                 )
             else:
                 wrapper = FlashInferPrefillWrapper(
@@ -241,6 +242,7 @@ class CudaGraphRunner:
                     max_num_pages=cfg.max_num_pages,
                     device=self.device,
                     use_cuda_graph=True,
+                    enable_nvtx=self.enable_nvtx,
                 )
 
             # Static pos_ids buffer for RoPE
@@ -320,7 +322,8 @@ class CudaGraphRunner:
             kv_cache_config=self.kv_cache_config,
             device=self.device,
             cuda_graph_plan_states=plan_states,
-            auto_write_store=False
+            auto_write_store=False,
+            enable_nvtx=self.enable_nvtx,
         )
         # Build per-request metadata
         dummy_metadata = {
@@ -812,12 +815,18 @@ class CudaGraphRunner:
         # --- Step 2: Pad inputs to padded_bs and re-plan via preprocess ---
         if self.enable_nvtx:
             range_push("cg.preprocess_replan", synchronize=False)
+        if self.enable_nvtx:
+            range_push("cg.preprocess_replan.pad_inputs", synchronize=False)
         real_inputs = list(inputs)
         # Padding slots reuse the capture_template so submodule.preprocess sees the
         # same input shape it saw at capture time and doesn't crash on missing keys.
         for _i in range(real_bs, padded_bs):
             real_inputs.append(capture_template.clone())
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
 
+        if self.enable_nvtx:
+            range_push("cg.preprocess_replan.metadata", synchronize=False)
         real_metadata = self._build_replay_metadata(
             dummy_rids, request_ids, real_bs,
             per_request_info, static["dummy_metadata"],
@@ -827,11 +836,16 @@ class CudaGraphRunner:
             per_request_info=real_metadata,
             cache_manager=static_cm,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            range_push("cg.preprocess_replan.submodule_preprocess", synchronize=False)
         real_inputs = submodule.preprocess(
             graph_walk=key.graph_walk,
             engine_inputs=engine_inputs,
             inputs=real_inputs,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
@@ -957,6 +971,8 @@ class CudaGraphRunner:
         # --- Step 2: Build padded per-request inputs and re-plan via preprocess ---
         if self.enable_nvtx:
             range_push("cg.preprocess_replan", synchronize=False)
+        if self.enable_nvtx:
+            range_push("cg.preprocess_replan.pad_inputs", synchronize=False)
         # Unlike basic_matched, prefill captures don't expose a capture_template
         # ARNodeInputs (the config provides post-preprocess packed dicts instead).
         # Synthesize zero-length ARNodeInputs from the first real input's shape so
@@ -969,7 +985,11 @@ class CudaGraphRunner:
             else:
                 zero_padding_inp = zero_padding_inp.clone()
             padded_inputs.append(zero_padding_inp)
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
 
+        if self.enable_nvtx:
+            range_push("cg.preprocess_replan.metadata", synchronize=False)
         real_metadata = self._build_replay_metadata(
             dummy_rids, request_ids, real_bs,
             per_request_info, static["dummy_metadata"],
@@ -979,11 +999,16 @@ class CudaGraphRunner:
             per_request_info=real_metadata,
             cache_manager=static_cm,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            range_push("cg.preprocess_replan.submodule_preprocess", synchronize=False)
         real_packed = submodule.preprocess(
             graph_walk=key.graph_walk,
             engine_inputs=engine_inputs,
             inputs=padded_inputs,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
         if self.enable_nvtx:
             range_pop(synchronize=False)
 

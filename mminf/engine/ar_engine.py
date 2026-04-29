@@ -144,6 +144,7 @@ class AREngine(BaseEngine):
             kv_cache_config=cache_mgmt.kv_cache_config,
             device=self.device,
             auto_write_store=autowrite,
+            enable_nvtx=self.enable_nvtx,
         )
 
     def _compile_submodules(self) -> None:

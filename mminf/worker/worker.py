@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import time as _time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -1144,61 +1145,40 @@ class Worker:
             )
 
         # ── merge in fresh rids whose decode-loop node is ready right now ──
-        # Only consider rids whose ready_inputs match the spec batch's
-        # (node_name, graph_walk). When the scheduler returns a *non-
-        # matching* ready batch (e.g. a prefill batch is sitting in the
-        # queue while we want to speculate decode), we drop speculation
-        # entirely so the non-speculative path can run the prefill — left
-        # alone, the speculation chain would starve incoming prefills
-        # (their decode-loop never gets to start), regressing concurrent
-        # ttft to "wait for the current chain to finish". The 1 wasted
-        # speculation iter for the continuing rids is a smaller cost than
-        # delaying every new request by the full decode chain.
-        fresh_batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
+        # Speculation should only consume work compatible with the in-flight
+        # AR loop. In partitioned models, unrelated ready work (e.g. SNAC or a
+        # fresh prefill) must not cancel LLM decode speculation; it stays queued
+        # for the normal scheduler path.
+        fresh_batch = self.scheduler.get_next_batch(
+            self.worker_graphs_manager,
+            target_node_name=batch_N.node_name,
+            target_graph_walk=batch_N.graph_walk,
+        )
         if fresh_batch is not None:
-            same_target = (
-                fresh_batch.node_name == batch_N.node_name
-                and fresh_batch.graph_walk == batch_N.graph_walk
-            )
-            if same_target:
-                for rid, node in fresh_batch.node_objects.items():
-                    if rid in new_node_objects:
-                        # Shouldn't happen — continuing rids are held by the
-                        # in-flight step and shouldn't be in ready queues —
-                        # but if it does, the in-flight rid wins.
-                        wg_id = fresh_batch.request_to_worker_graph[rid]
-                        self.worker_graphs_manager.queues[wg_id].push_back_node(rid, node)
-                        continue
-                    tensors = {}
-                    for input_name in node.ready_inputs:
-                        tensors[input_name] = [
-                            self.tensor_manager.get_tensor(
-                                request_id=rid, uuid=info.uuid,
-                            )
-                            for info in node.ready_inputs[input_name].tensor_info
-                        ]
-                    per_request_inputs[rid] = tensors
-                    per_request_info[rid] = self.worker_graphs_manager.get_fwd_info(
-                        rid, partition_N
-                    )
-                    new_node_objects[rid] = node
-                    new_request_to_worker_graph[rid] = (
-                        fresh_batch.request_to_worker_graph[rid]
-                    )
-            else:
-                # Mismatched target (most common: a fresh prefill batch is
-                # ready while we want to speculate decode). Push the popped
-                # nodes back AND skip speculation this iter — without this,
-                # the speculation chain locks out new prefills indefinitely
-                # (round-robin always favors the in-flight decode walk over
-                # the just-bumped prefill counter), regressing concurrent
-                # ttft to "wait for the current decode chain to finish".
-                # The 1 wasted speculation iter for continuing rids is far
-                # cheaper than starving incoming requests.
-                for rid, node in fresh_batch.node_objects.items():
+            for rid, node in fresh_batch.node_objects.items():
+                if rid in new_node_objects:
+                    # Shouldn't happen — continuing rids are held by the
+                    # in-flight step and shouldn't be in ready queues —
+                    # but if it does, the in-flight rid wins.
                     wg_id = fresh_batch.request_to_worker_graph[rid]
                     self.worker_graphs_manager.queues[wg_id].push_back_node(rid, node)
-                return None
+                    continue
+                tensors = {}
+                for input_name in node.ready_inputs:
+                    tensors[input_name] = [
+                        self.tensor_manager.get_tensor(
+                            request_id=rid, uuid=info.uuid,
+                        )
+                        for info in node.ready_inputs[input_name].tensor_info
+                    ]
+                per_request_inputs[rid] = tensors
+                per_request_info[rid] = self.worker_graphs_manager.get_fwd_info(
+                    rid, partition_N
+                )
+                new_node_objects[rid] = node
+                new_request_to_worker_graph[rid] = (
+                    fresh_batch.request_to_worker_graph[rid]
+                )
 
         spec_batch = ScheduledBatch(
             node_name=batch_N.node_name,
@@ -1731,6 +1711,22 @@ class Worker:
                     self._pending_stops.setdefault(rid, set()).update(stops)
 
     def run(self) -> None:
+        switch_interval = os.environ.get("MMINF_PY_SWITCH_INTERVAL_SEC", "")
+        if switch_interval:
+            try:
+                sys.setswitchinterval(float(switch_interval))
+                logger.info(
+                    "Worker %s: Python thread switch interval set to %ss",
+                    self.worker_id,
+                    switch_interval,
+                )
+            except ValueError:
+                logger.warning(
+                    "Worker %s: ignoring invalid MMINF_PY_SWITCH_INTERVAL_SEC=%r",
+                    self.worker_id,
+                    switch_interval,
+                )
+
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
 
@@ -1802,6 +1798,9 @@ class Worker:
                 Future,
             ]
         ] = []
+        max_consecutive_spec = int(os.environ.get("MMINF_MAX_CONSECUTIVE_SPEC_STEPS", "1"))
+        consecutive_spec_steps = 0
+        yield_away_from_target: tuple[str, str] | None = None
 
         def _set_pending(p):
             nonlocal pending
@@ -1875,17 +1874,27 @@ class Worker:
                 # For non-AR or non-loop-body steps, falls through to the
                 # non-speculative path below (drain, then schedule).
                 speculation = None
-                if pending is not None and self._can_speculate(pending[0]):
-                    if self.enable_nvtx:
-                        range_push("worker.speculate", synchronize=False)
-                    _t0 = _time.perf_counter() if phase_period else 0.0
-                    speculation = self._try_speculate_next(
-                        pending[0], pending[2]
-                    )
-                    if phase_period:
-                        _phase_record("speculate", _time.perf_counter() - _t0)
-                    if self.enable_nvtx:
-                        range_pop(synchronize=False)
+                yield_away_from_target = None
+                if (
+                    pending is not None
+                    and self._can_speculate(pending[0])
+                ):
+                    if consecutive_spec_steps < max_consecutive_spec:
+                        if self.enable_nvtx:
+                            range_push("worker.speculate", synchronize=False)
+                        _t0 = _time.perf_counter() if phase_period else 0.0
+                        speculation = self._try_speculate_next(
+                            pending[0], pending[2]
+                        )
+                        if phase_period:
+                            _phase_record("speculate", _time.perf_counter() - _t0)
+                        if self.enable_nvtx:
+                            range_pop(synchronize=False)
+                    else:
+                        yield_away_from_target = (
+                            pending[0].node_name,
+                            pending[0].graph_walk,
+                        )
 
                 # 3. If pending: await GPU(N), submit speculated GPU(N+1)
                 # asap, then post-process N (fast then slow) overlapping
@@ -1999,18 +2008,27 @@ class Worker:
                     self._apply_pending_removes_safe_to_drop(in_flight)
 
                 if spec_pending is not None:
+                    consecutive_spec_steps += 1
                     if phase_period:
                         _phase_record("iter_total", _time.perf_counter() - _iter_start)
                         phase_iter[0] += 1
                         _phase_flush()
                     _set_pending(spec_pending)
                     continue
+                consecutive_spec_steps = 0
 
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
                 if self.enable_nvtx:
                     range_push("worker.schedule", synchronize=False)
-                batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
+                batch = None
+                if yield_away_from_target is not None:
+                    batch = self.scheduler.get_next_batch(
+                        self.worker_graphs_manager,
+                        exclude_target=yield_away_from_target,
+                    )
+                if batch is None:
+                    batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 if batch is None:
