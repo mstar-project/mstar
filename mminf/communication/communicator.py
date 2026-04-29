@@ -109,16 +109,20 @@ class ZMQCommunicator(BaseCommunicator):
             self.push_sockets[entity_id] = sock
         self.push_sockets[entity_id].send_pyobj(msg)
 
-    def get_all_new_messages(self) -> list:
+    def get_all_new_messages(self, blocking=False) -> list:
         messages = []
         while True:
             try:
-                # zmq.NOBLOCK means zmq doesn't wait for a new message to be
-                # available, it returns a message if it exists or raises an error
-                # if no messages are available (error is caught below)
-                messages.append(self.pull_socket.recv_pyobj(
-                    flags=zmq.NOBLOCK
-                ))
+                if blocking:
+                    messages.append(self.pull_socket.recv_pyobj())
+                    blocking = False
+                else:
+                    # zmq.NOBLOCK means zmq doesn't wait for a new message to be
+                    # available, it returns a message if it exists or raises an error
+                    # if no messages are available (error is caught below)
+                    messages.append(self.pull_socket.recv_pyobj(
+                        flags=zmq.NOBLOCK
+                    ))
                 logger.debug(
                     "%s to received message %s",
                     self.my_id, str(messages[-1])

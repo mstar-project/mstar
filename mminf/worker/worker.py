@@ -501,8 +501,8 @@ class Worker:
             elif message.message_type == WorkerMessageType.STOP_LOOPS:
                 self._stop_loops(message.body)
 
-    def _process_messages(self) -> None:
-        self._process_message_list(self.communicator.get_all_new_messages())
+    def _process_messages(self, blocking=False) -> None:
+        self._process_message_list(self.communicator.get_all_new_messages(blocking))
 
     # ------------------------------------------------------------------
     # Tensor readiness
