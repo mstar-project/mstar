@@ -1266,8 +1266,8 @@ class Qwen3OmniModel(Model):
         code_predictor.consolidate_stacked_weights()
         code_predictor.eval()
 
-        from mminf.model.qwen3_omni.submodules import TalkerLLMSubmodule
-        talker_sub = TalkerLLMSubmodule(
+        from mminf.model.qwen3_omni.submodules import TalkerSubmodule
+        talker_sub = TalkerSubmodule(
             talker_model=talker_model,
             code_predictor=code_predictor,
             config=self.config,
