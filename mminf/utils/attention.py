@@ -125,3 +125,66 @@ def decode_attn_nhd(q, k_cache, v_cache, cache_len, sm_scale=None):
     )
 
     return out.unsqueeze(1) if squeeze_qlen else out
+
+
+@triton.jit
+def _qk_norm_rope_kernel(
+    X_ptr, W_norm_ptr, Pos_ptr,
+    eps, rope_theta,
+    sx_m, sx_h, sx_d,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    base = X_ptr + pid_m * sx_m + pid_h * sx_h
+
+    offs_half = tl.arange(0, HALF_D)
+
+    # Load both halves — the compiler will coalesce these into one transaction
+    # since they're contiguous in the inner dim.
+    x_first  = tl.load(base + offs_half * sx_d).to(tl.float32)
+    x_second = tl.load(base + (offs_half + HALF_D) * sx_d).to(tl.float32)
+
+    # RMS computed from both halves
+    sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
+    inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
+
+    w_first  = tl.load(W_norm_ptr + offs_half).to(tl.float32)
+    w_second = tl.load(W_norm_ptr + offs_half + HALF_D).to(tl.float32)
+
+    x_first  = x_first  * inv_rms * w_first
+    x_second = x_second * inv_rms * w_second
+
+    pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
+    inv_freq = tl.exp(-tl.log(rope_theta) * (offs_half.to(tl.float32) * 2.0 / D))
+    angle = pos * inv_freq
+    cos = tl.cos(angle)
+    sin = tl.sin(angle)
+
+    out_first  = x_first * cos - x_second * sin
+    out_second = x_second * cos + x_first * sin
+
+    tl.store(base + offs_half * sx_d,             out_first)
+    tl.store(base + (offs_half + HALF_D) * sx_d,  out_second)
+
+
+def fused_qk_norm_rope(x, w_norm, pos, eps, rope_theta):
+    """
+    x:      (M, H, D)  fp32 — modified in place
+    w_norm: (D,)       fp32
+    pos:    (M,)       int32 positions
+    """
+    M, H, D = x.shape
+    assert D % 2 == 0
+    assert x.is_contiguous() or x.stride(-1) == 1
+
+    grid = (M, H)
+    _qk_norm_rope_kernel[grid](
+        x, w_norm, pos.to(torch.int32),
+        eps, rope_theta,
+        x.stride(0), x.stride(1), x.stride(2),
+        D=D, HALF_D=D // 2,
+        num_warps=4, num_stages=1,
+    )
+    return x
