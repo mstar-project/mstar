@@ -265,6 +265,7 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
         )
         self.post_attention_layernorm = Qwen3OmniRMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = Qwen3OmniMLP(hidden_size=hidden_size, intermediate_size=intermediate_size)
+        self._qkv_proj_weight: torch.Tensor | None = None
 
     def forward(self, hidden_states, cache_handle):
         residual = hidden_states
@@ -285,6 +286,16 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
+    
+    @torch.compiler.disable
+    def get_qkv_proj_weight(self) -> torch.Tensor:
+        if self._qkv_proj_weight is None:
+            attn = self.self_attn
+            self._qkv_proj_weight = torch.cat(
+                (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight),
+                dim=0,
+            ).contiguous()
+        return self._qkv_proj_weight
 
 
 class Qwen3OmniCodePredictorInnerModel(nn.Module):
@@ -502,9 +513,13 @@ class Qwen3OmniCodePredictor(nn.Module):
             hidden_states = hs_flat.view(bs, seq_len, hidden_size)
 
             total_tokens = bs * seq_len
-            q = attn.q_proj(hidden_states).view(total_tokens, n_q_heads, head_dim)
-            k = attn.k_proj(hidden_states).view(total_tokens, n_kv_heads, head_dim)
-            v = attn.v_proj(hidden_states).view(total_tokens, n_kv_heads, head_dim)
+            qkv = F.linear(hidden_states, layer.get_qkv_proj_weight())
+            q_size = n_q_heads * head_dim
+            kv_size = n_kv_heads * head_dim
+            q, k, v = qkv.split((q_size, kv_size, kv_size), dim=-1)
+            q = q.view(total_tokens, n_q_heads, head_dim)
+            k = k.view(total_tokens, n_kv_heads, head_dim)
+            v = v.view(total_tokens, n_kv_heads, head_dim)
 
             # Per-head QK-norm (matching the paged path in attention.py).
             q = run_rms_norm(

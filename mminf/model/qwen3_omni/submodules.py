@@ -1574,7 +1574,8 @@ class TalkerSubmodule(ARNodeSubmodule):
                         "text_hidden": self._tts_pad.clone()
                     }
                 ),
-                capture_batch_sizes=[1, 2, 4, 8, 16]
+                capture_batch_sizes=[1, 2, 4, 8, 16],
+                compile=True
             ),
             FlashInferPackedCudaGraphConfig(
                 capture_graph_walk="talker_prefill",
@@ -1582,9 +1583,9 @@ class TalkerSubmodule(ARNodeSubmodule):
                 packed_seq_len_to_inputs=talker_prefill_packed,
                 requires_cfg=False,
                 labels=["main"],
-                compile=True,
                 causal_attention=True,
                 capture_batch_sizes=self.TALKER_PREFILL_CAPTURE_BATCH_SIZES,
+                compile=True
             ),
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="talker_last_prefill",
@@ -1603,6 +1604,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                     }
                 ),
                 capture_batch_sizes=self.TALKER_LAST_PREFILL_CAPTURE_BATCH_SIZES,
+                compile=True
             ),
         ]
 
