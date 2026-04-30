@@ -246,10 +246,10 @@ class BatchedCacheManager:
         # synchronous default-stream sync that waits for the entire
         # outstanding stream — including the speculatively-queued next
         # decode step. By creating these on CPU directly, ``.to("cpu")``
-        # is a no-op and FlashInfer does its own async H2D
-        # (``non_blocking=True``) when it needs them on the device.
-        # Tensors are tiny (int32, batch-size length), so the H2D done
-        # inside ``plan()`` is inconsequential.
+        # is a no-op. FlashInfer later copies the tiny int32 metadata to
+        # the device when it needs it; the source is pageable CPU memory, so
+        # ``non_blocking=True`` does not make that H2D copy asynchronous, but
+        # the tensors are batch-size length and the cost is inconsequential.
         if self.enable_nvtx:
             range_push("cache.plan_attention.make_tensors", synchronize=False)
         try:
@@ -605,7 +605,7 @@ class BatchedCacheManager:
         """
         if layer_idx is None:
             layer_idx = self.layer_idx
-        
+
         orig_dtype = q.dtype
 
         labels = list(self.active_labels.values())

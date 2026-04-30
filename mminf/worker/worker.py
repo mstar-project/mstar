@@ -189,6 +189,9 @@ class Worker:
         # an isolated D→H, so the main thread only blocks on the copy.
         # Lazy-initialized — workers without CUDA never touch it.
         self._d2h_stream: "torch.cuda.Stream | None" = None
+        self._pinned_d2h_buffers: dict[
+            tuple[str, torch.dtype, tuple[int, ...]], list[torch.Tensor]
+        ] = defaultdict(list)
 
         # Streaming buffers: request_id -> edge_name -> list of tensors
         # (Legacy path — kept for models without PartitionTopology)
@@ -1473,13 +1476,27 @@ class Worker:
         side.wait_event(completion_event)
         with torch.cuda.stream(side):
             flat_gpu = torch.cat([t.flatten() for t in tensors])
-            flat_cpu = torch.empty(
-                flat_gpu.shape, dtype=flat_gpu.dtype,
-                device="cpu", pin_memory=True,
+            flat_cpu = self._get_pinned_d2h_buffer(
+                "new_tokens", flat_gpu.shape, flat_gpu.dtype,
             )
             flat_cpu.copy_(flat_gpu, non_blocking=True)
         side.synchronize()
         return flat_cpu.tolist()
+
+    def _get_pinned_d2h_buffer(
+        self,
+        purpose: str,
+        shape: torch.Size | tuple[int, ...],
+        dtype: torch.dtype,
+        index: int = 0,
+    ) -> torch.Tensor:
+        key = (purpose, dtype, tuple(shape))
+        buffers = self._pinned_d2h_buffers[key]
+        while len(buffers) <= index:
+            buffers.append(
+                torch.empty(key[2], dtype=dtype, device="cpu", pin_memory=True)
+            )
+        return buffers[index]
 
     def _prematerialize_for_check_stop(
         self,
@@ -1513,6 +1530,7 @@ class Worker:
         side.wait_event(output.completion_event)
 
         cpu_per_rid: dict = {}
+        buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)
         with torch.cuda.stream(side):
             for rid, name_to_list in output.per_request_output_tensors.items():
                 if not isinstance(name_to_list, dict):
@@ -1526,8 +1544,11 @@ class Worker:
                     new_list = []
                     for t in tensors:
                         if torch.is_tensor(t) and t.is_cuda:
-                            cpu_t = torch.empty_like(
-                                t, device="cpu", pin_memory=True,
+                            key = ("check_stop", t.dtype, tuple(t.shape))
+                            idx = buffer_indices[key]
+                            buffer_indices[key] += 1
+                            cpu_t = self._get_pinned_d2h_buffer(
+                                "check_stop", t.shape, t.dtype, idx,
                             )
                             cpu_t.copy_(t, non_blocking=True)
                             new_list.append(cpu_t)
