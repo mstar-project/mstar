@@ -19,3 +19,5 @@ traces/
 output.png
 output_edit.png
 mminf-benchmark-cache/
+output.wav
+.bench_outs/
