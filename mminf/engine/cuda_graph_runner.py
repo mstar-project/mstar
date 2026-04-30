@@ -596,7 +596,7 @@ class CudaGraphRunner:
                     mode="max-autotune-no-cudagraphs",
                     fullgraph=False,
                     dynamic=False,
-                )                
+                )
 
             def run_forward():
                 return forward(
