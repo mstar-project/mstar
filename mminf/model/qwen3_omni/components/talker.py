@@ -27,6 +27,7 @@ from mminf.model.qwen3_omni.components.attention import (
 )
 from mminf.model.qwen3_omni.components.moe import Qwen3OmniTalkerSparseMoeBlock
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig, TalkerTextConfig
+from mminf.utils.attention import decode_attn_nhd
 from mminf.utils.flashinfer_utils import run_rms_norm
 
 # ---------------------------------------------------------------------------
@@ -558,26 +559,13 @@ class Qwen3OmniCodePredictor(nn.Module):
 
             # Read K, V for all positions up to and including the new tokens.
             valid_len = cache_pos + seq_len
-            k_full = kv_cache[layer_idx, :, 0, :valid_len]
-            v_full = kv_cache[layer_idx, :, 1, :valid_len]
+            k_full = kv_cache[layer_idx, :, 0]
+            v_full = kv_cache[layer_idx, :, 1]
 
-            # SDPA expects (bs, n_heads, seq_len, head_dim).
-            q_sdpa = q.transpose(1, 2)
-            k_sdpa = k_full.transpose(1, 2)
-            v_sdpa = v_full.transpose(1, 2)
-
-            # GQA: repeat KV heads to match Q heads.
-            if n_groups > 1:
-                k_sdpa = k_sdpa.repeat_interleave(n_groups, dim=1)
-                v_sdpa = v_sdpa.repeat_interleave(n_groups, dim=1)
-
-            # is_causal=True for the 2-token prefill so the first token only
-            # attends to itself; is_causal=False for single-token decode
-            # where the lone query implicitly attends to all valid past K/V.
-            attn_out = F.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa, is_causal=(seq_len > 1),
+            attn_out = decode_attn_nhd(
+                q, k_full, v_full, valid_len
             )
-            attn_out = attn_out.transpose(1, 2).reshape(bs, seq_len, -1).contiguous()
+            attn_out = attn_out.reshape(bs, seq_len, -1)
             hidden_states = residual + attn.o_proj(attn_out)
 
             # Post-attention RMSNorm + dense MLP.
