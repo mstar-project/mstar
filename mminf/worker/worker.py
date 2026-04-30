@@ -522,9 +522,16 @@ class Worker:
                             tensor_info=[],
                         )
                     else:
-                        # Normal chunk — store tensor and create edge with tensor_info
+                        # Normal chunk — store tensor and create edge with tensor_info.
+                        # Local streaming tensors are routed from outputs that were
+                        # already gated on the producer completion event before being
+                        # stored, so avoid a default-stream sync here. If future
+                        # streaming producers bypass that path, StreamChunk should
+                        # carry producer events and this call site should wait on
+                        # those events before storing with skip_cuda_sync=True.
                         tensor_infos = self.tensor_manager.store_and_return_tensor_info(
                             request_id, {edge_name: [chunk_tensor]},
+                            skip_cuda_sync=True,
                         )
                         synthetic_edge = GraphEdge(
                             next_node=consumer_node,
