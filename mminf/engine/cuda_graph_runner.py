@@ -24,9 +24,14 @@ from torch import nn
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
-from mminf.engine.cuda_graph_config import BasicBatchedCudaGraphConfig, CudaGraphConfig, CudaGraphConfigType, FlashInferPackedCudaGraphConfig
+from mminf.engine.cuda_graph_config import (
+    BasicBatchedCudaGraphConfig,
+    CudaGraphConfig,
+    CudaGraphConfigType,
+    FlashInferPackedCudaGraphConfig,
+)
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
-from mminf.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, ARNodeSubmodule, NodeSubmodule
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
 from mminf.utils.profiler import mark, range_pop, range_push
 from mminf.utils.sampling import Sampler
 
@@ -256,7 +261,7 @@ class CudaGraphRunner:
             )
 
         return plan_states
-    
+
     def _make_dummy_rids(self, config: CudaGraphConfig, bs: int):
         dummy_rids = [f"__cg_{config.capture_graph_walk}_{config.requires_cfg}_{i}__"
                       for i in range(bs)]
@@ -265,12 +270,12 @@ class CudaGraphRunner:
         for rid in dummy_rids:
             self.alloc_manager.add_request(rid, labels=config.labels)
         return dummy_rids
-    
+
     def _free_dummy_rids(self, config: CudaGraphConfig, dummy_rids: list[str]):
         for rid in dummy_rids:
             for label in config.labels:
                 self.alloc_manager.reset_label(rid, label, free=True)
-    
+
     def _intern_static_buffer(
         self, config_idx: int, key: str, value: torch.Tensor,
     ) -> torch.Tensor:
@@ -307,7 +312,7 @@ class CudaGraphRunner:
         sliced = shared[:leading]
         sliced.copy_(value)
         return sliced
-    
+
     def _create_cache_mgr_and_dummy_engine_inputs(
         self, dummy_rids, plan_states,
         config: CudaGraphConfig
@@ -343,7 +348,7 @@ class CudaGraphRunner:
             per_request_info=dummy_metadata,
             cache_manager=cache_manager
         )
-    
+
     def _make_dummy_seq_lens(
         self, bs: int,
         total_tokens: int, # total tokens per batch
@@ -352,7 +357,7 @@ class CudaGraphRunner:
         seq_lens = [total_tokens // bs] * bs
         seq_lens[0] += total_tokens % bs
         return seq_lens
-    
+
     def _postprocess_cuda_graph_output(
         self, output, config: CudaGraphConfig,
         key: CudaGraphKey, graph, static_inputs,
@@ -461,7 +466,7 @@ class CudaGraphRunner:
                     mode="max-autotune-no-cudagraphs",
                     fullgraph=False,
                     dynamic=False,
-                )                
+                )
 
             def run_forward():
                 return forward(
@@ -469,7 +474,7 @@ class CudaGraphRunner:
                     engine_inputs=engine_inputs,
                     **templates
                 )
-            
+
             torch.cuda.set_device(self.device)
             # Warmup: 2 forward passes
             torch.cuda.synchronize()
@@ -505,7 +510,7 @@ class CudaGraphRunner:
             )
 
         finally:
-            self._free_dummy_rids(config, dummy_rids)   
+            self._free_dummy_rids(config, dummy_rids)
 
 
     def _capture_one_basic_batched(
@@ -538,7 +543,7 @@ class CudaGraphRunner:
                     self.submodule_name, config.capture_graph_walk,
                 )
                 return
-            
+
             dummy_inputs = [template.clone() for _ in dummy_rids]
 
             plan_states = self._create_persistent_wrappers(
@@ -586,7 +591,7 @@ class CudaGraphRunner:
                     mode="max-autotune-no-cudagraphs",
                     fullgraph=False,
                     dynamic=False,
-                )                
+                )
 
             def run_forward():
                 return forward(
@@ -633,7 +638,7 @@ class CudaGraphRunner:
                 },
                 cache_manager=cache_manager, bs=bs
             )
-           
+
         finally:
             self._free_dummy_rids(config, dummy_rids)
 
@@ -649,7 +654,7 @@ class CudaGraphRunner:
             batch_size, num_tokens,
             graph_walk, requires_cfg,
         ) is not None
-    
+
     def _get_key_for(
         self,
         batch_size: int,
@@ -700,7 +705,7 @@ class CudaGraphRunner:
         if idx >= len(sizes):
             return None
         return sizes[idx]
-    
+
     def _get_padded_num_tokens(
         self,
         num_tokens: int,
@@ -1478,7 +1483,7 @@ class CodecCudaGraphRunner:
                 )
             static_inputs[name] = torch.zeros(t.shape, dtype=t.dtype, device=self.device)
             static_inputs[name].copy_(t)
-        
+
         fwd = submodule.forward_batched
         if config.compile:
             fwd = torch.compile(

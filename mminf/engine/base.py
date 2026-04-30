@@ -56,7 +56,7 @@ class BaseEngine(ABC):
 
     def has_autocast(self):
         return True
-    
+
     def get_max_batch_size(self):
         return None
 
@@ -82,7 +82,7 @@ class BaseEngine(ABC):
     @abstractmethod
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         ...
-    
+
     def execute_with_max_batch_size(self, batch: NodeBatch) -> NodeOutput:
         bs = self.get_max_batch_size()
         n = len(batch.request_ids)
@@ -92,7 +92,7 @@ class BaseEngine(ABC):
         output = NodeOutput(
             per_request_output_tensors={}
         )
-       
+
         for i in range(0, n, bs):
             rids = batch.request_ids[i:min(i+bs, n)]
             minibatch_out = self.execute_batch(NodeBatch(

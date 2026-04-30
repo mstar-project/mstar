@@ -325,7 +325,10 @@ def _print_results(results: list[dict]) -> None:
     print("Qwen3-Omni Thinker prefill_text — eager vs CUDA graph (per-call latency, ms)")
     print("Note: total_tokens is the sum across the batch (split evenly per request).")
     print("=" * 88)
-    header = f"{'bs':>3}  {'total':>6}  {'eager p50':>10}  {'graph p50':>10}  {'speedup':>8}  {'eager p90':>10}  {'graph p90':>10}"
+    header = (
+        f"{'bs':>3}  {'total':>6}  {'eager p50':>10}  {'graph p50':>10}  "
+        f"{'speedup':>8}  {'eager p90':>10}  {'graph p90':>10}"
+    )
     print(header)
     print("-" * len(header))
     for r in results:
@@ -366,7 +369,7 @@ def main() -> None:
     args = parse_args()
     cache_dir = args.cache_dir or os.environ.get("QWEN3_OMNI_CACHE_DIR")
 
-    print(f"Bringing up Qwen3-Omni Thinker (this may take ~30-60s + ~50s capture)...")
+    print("Bringing up Qwen3-Omni Thinker (this may take ~30-60s + ~50s capture)...")
     engine, runner, submodule, device = _bring_up_thinker(cache_dir)
     print(f"Ready. {len(runner.graphs)} captured graphs.")
 

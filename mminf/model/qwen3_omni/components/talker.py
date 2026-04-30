@@ -426,7 +426,7 @@ class Qwen3OmniCodePredictor(nn.Module):
     def codec_embedding(self):
         """Alias for submodule access."""
         return self.model.codec_embedding
-    
+
     @torch.compiler.disable
     def _apply_rope(self, q_rot, k_rot, flat_pos, rope_theta):
         # moved to its own function for torch.compile purposes

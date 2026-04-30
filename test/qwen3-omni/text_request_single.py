@@ -5,9 +5,8 @@ import json
 import sys
 
 import requests
-
-
 from _env import get_server_url
+
 URL = get_server_url()
 
 

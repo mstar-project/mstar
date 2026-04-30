@@ -35,7 +35,7 @@ from mminf.model.qwen3_omni.components.rope import (
 )
 from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor, Qwen3OmniTalkerModel
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig
-from mminf.model.submodule_base import NodeSubmodule, ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class AudioEncoderSubmodule(NodeSubmodule):
         super().__init__()
         self.audio_encoder = audio_encoder
         self.config = config
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -127,7 +127,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.config = config
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -295,7 +295,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             elif role_token == self.config.assistant_token_id:
                 mask[im_start_index:segment_end_index] = 0
         return mask
-    
+
     def _wrap_audio_input(self, audio_embeds: torch.Tensor):
         # Wrap the audio span in ``<|audio_bos|>`` / ``<|audio_eos|>``
         # sentinel token embeddings so the Thinker sees the same
@@ -318,7 +318,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             audio_embeds,
             self._audio_eos_embed
         ], dim=0)
-    
+
     def _wrap_vision_input(self, vision_embeds: torch.Tensor):
         # Wrap the vision span in ``<|vision_bos|>`` / ``<|vision_eos|>``
         # sentinel token embeddings.
@@ -452,7 +452,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 ~mm_mask
             ])
 
-            wrapped_embeds = self._wrap_vision_input(vision_embeds)            
+            wrapped_embeds = self._wrap_vision_input(vision_embeds)
             total_len = vision_len + 2
             # Vision tokens use spatial 3D positions (temporal constant,
             # h/w from the spatial grid after merging).  If a proper
@@ -985,7 +985,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
         config: Qwen3OmniModelConfig
     ):
         super().__init__()
-        self.model = talker_model   
+        self.model = talker_model
         self.config = config
 
         # Pre-computed TTS special inputs.
@@ -1001,7 +1001,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
         # the text conditioning for this request. We use this flag to
         # inject tts_eos_embed for ONE step before falling back to pad.
         self._eos_embed_sent: set[str] = set()
-    
+
     def init_tts_embeds(self, thinker_embed_tokens: nn.Embedding) -> None:
         """Pre-compute TTS pad/bos/eos hidden states using the Thinker's
         embedding table + Talker text_projection
@@ -1030,7 +1030,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
             "TalkerSubmodule: pre-computed TTS special embeddings via "
             "Thinker embed_tokens + Talker text_projection"
         )
-    
+
     def _get_suppress_mask(self) -> torch.Tensor:
         """Return the bool mask of layer-0 logits to set to -inf.
 
@@ -1051,7 +1051,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
                 mask[eos] = False
             self._suppress_mask = mask
         return self._suppress_mask
-    
+
     def _get_talker_embeds(
         self, layer_0_embed: torch.Tensor, layer_n_hidden: torch.Tensor,
         multimodal_mask: torch.Tensor, text_inclusion_mask: torch.Tensor
@@ -1079,7 +1079,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
             )
 
         return projected
-    
+
     def _split_thinker_states(
         self, thinker_states: torch.Tensor
     ):
@@ -1087,7 +1087,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
         layer_0_embed = thinker_states[..., :thinker_hidden]
         layer_n_hidden = thinker_states[..., thinker_hidden:]
         return layer_0_embed, layer_n_hidden
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -1096,8 +1096,8 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
         pos_info: dict[str, PositionInfo] = {},
     ) -> ARNodeInputs:
         device = self.get_device()
-    
-        thinker_hidden = self.config.thinker_hidden_size    
+
+        thinker_hidden = self.config.thinker_hidden_size
         if graph_walk == "talker_prefill":
             thinker_states = inputs["thinker_states"][0].to(device)
             layer_0_embed, layer_n_hidden = self._split_thinker_states(thinker_states)
@@ -1157,7 +1157,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
         elif graph_walk == "talker_decode":
             dtype = self.model.text_projection.linear_fc1.weight.dtype
             input_embeds = inputs["talker_input_embeds"][0].to(dtype)
-            
+
             thinker_states = inputs.get("thinker_states", [])
             rid = fwd_info.request_id
             if thinker_states:
@@ -1176,7 +1176,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
             input_embeds=input_embeds,
             input_seq_len=seq_len
         )
-    
+
     def preprocess(
         self,
         graph_walk: str,
@@ -1207,7 +1207,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
             "input_embeds": input_embeds,
             **extra_args
         }
-    
+
     def _forward_prefill(
         self, cache_handle: BatchedCacheManager,
         input_embeds: torch.Tensor,
@@ -1250,7 +1250,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
             "last_hidden": [last_hidden],
             "logits": [logits]
         }
-    
+
     def forward(
         self,
         graph_walk: str,
@@ -1270,7 +1270,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
             suppress_mask=suppress_mask,
             is_batched_decode=(graph_walk == "talker_decode"),
         )
-    
+
     def forward_batched(
         self,
         graph_walk: str,
@@ -1348,7 +1348,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
         }
         outputs["__batched_logits__"] = fwd_out["logits"][0]
         return outputs
-    
+
     def postprocess(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
@@ -1379,7 +1379,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
         self._eos_embed_sent.discard(request_id)
-    
+
     def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk == "talker_decode"
 
@@ -1471,7 +1471,7 @@ class TalkerLLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.TALKER_LAST_PREFILL_CAPTURE_BATCH_SIZES,
             ),
         ]
-    
+
     def get_needed_cache_labels(
         self,
         graph_walk: str,
@@ -1516,13 +1516,13 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
             input_ids=inputs["layer0_codes"][0],
             input_embeds=inputs["last_hidden"][0]
         )
-    
+
     def get_num_code_groups(self):
         return self.num_codes
-    
+
     def get_kv_cache_dtype(self):
         return self.talker_code_emb.weight.dtype
-    
+
     def preprocess(
         self,
         graph_walk: str,
@@ -1603,7 +1603,7 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
                 "codec_tokens": [all_codes[i]],
             } for i, req_id in enumerate(engine_inputs.request_ids)
         }
-    
+
     def _get_dummy_inputs(self, device):
         return ARNodeInputs(
             input_embeds=torch.zeros(
@@ -1613,7 +1613,7 @@ class Qwen3OmniCodePredictorSubmodule(CodePredictorSubmodule):
             input_ids=torch.zeros((1,), device=device, dtype=torch.long),
             input_seq_len=1
         )
-    
+
     def get_cuda_graph_configs(self, device):
         return [
             BasicBatchedCudaGraphConfig(
@@ -1658,7 +1658,7 @@ class Code2WavSubmodule(NodeSubmodule):
         for r in self.config.code2wav.upsampling_ratios:
             total_upsample *= r
         self._total_upsample = total_upsample
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -1672,7 +1672,7 @@ class Code2WavSubmodule(NodeSubmodule):
         per_request_codec: list[torch.Tensor] = []
 
         codec_tokens = inputs["codec_tokens"][0]
-    
+
         # Reshape to (num_frames, num_code_groups) if flat
         if codec_tokens.dim() == 1:
             num_groups = self.config.num_code_groups  # 16 (Qwen3-Omni)
@@ -1696,7 +1696,7 @@ class Code2WavSubmodule(NodeSubmodule):
         return NodeInputs(tensor_inputs={
             "codec_tokens": codec_tokens
         })
-    
+
     def preprocess(
         self,
         graph_walk: str,
@@ -1714,7 +1714,7 @@ class Code2WavSubmodule(NodeSubmodule):
         # Stack into (bs, Q, T)
         batched_codec_tokens = torch.stack(all_codec_tokens, dim=0)
         return {"codec_tokens": batched_codec_tokens}
-    
+
     def forward_batched(
         self,
         graph_walk: str,

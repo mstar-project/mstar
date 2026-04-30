@@ -1,6 +1,6 @@
-from abc import ABC, abstractmethod
 import logging
 import queue
+from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -9,7 +9,12 @@ from typing import Any
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-from mminf.communication.tensors import LocalTransferEngine, MooncakeTransferEngine, TensorTransferEngine, TransferReadInfo
+from mminf.communication.tensors import (
+    LocalTransferEngine,
+    MooncakeTransferEngine,
+    TensorTransferEngine,
+    TransferReadInfo,
+)
 from mminf.conductor.request_info import SequenceInfo
 
 logger = logging.getLogger(__name__)
@@ -185,10 +190,10 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         self._async_reader = transfer_engine.get_async_reader(
             kv_cache.device
         )
-    
+
     def get_kv_transfer_info(self) -> MooncakeKVTransferInfo:
         return self._transfer_info
-    
+
     def _get_ptr_nbytes(
         self, kv_read_info: KVReadInfo,
         is_local: bool=True,
@@ -276,7 +281,7 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
 
         self._pending: list[Future] = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
-    
+
     def get_kv_transfer_info(self) -> CudaIpcKVTransferInfo:
         return self._transfer_info
 
@@ -316,7 +321,7 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         # it is ok that this is rebuilding the whole kv cache. What matters is that,
         # in the rest of the function, we are only copying the right pages to
         # self._device. In fact, in testing, we see it is faster to call
-        # rebuild_cuda_tensor on the whole KV cache instead of just the slice we need. 
+        # rebuild_cuda_tensor on the whole KV cache instead of just the slice we need.
         tensor = rebuild_cuda_tensor(
             torch.Tensor,
             remote_kv_info.size,
@@ -344,7 +349,7 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
                 info.layer_idx, info.local_page_idx,
                 info.token_start:info.token_end
             ] = slice
-    
+
     def shutdown(self):
         for fut in self._pending:
             fut.result()

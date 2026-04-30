@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -13,6 +13,9 @@ from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.kv_store import PositionInfo
+
+if TYPE_CHECKING:
+    from mminf.engine.cuda_graph_config import CudaGraphConfig
 
 
 @dataclass
@@ -105,7 +108,7 @@ class ARNodeInputs(NodeInputs):
                     out[k] = maybe_stack(v, stacking_method)
 
         return dict(out)
-    
+
     def clone(self):
         custom_pos_ids = self.custom_pos_ids
         if isinstance(custom_pos_ids, torch.Tensor):
@@ -203,7 +206,7 @@ class NodeSubmodule(torch.nn.Module):
         model_inputs: list[NodeInputs],
     ):
         return False # batching disabled by default
-    
+
     # Note: do not import CudaGraphConfig; it causes a circular import situation
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         """TODO: add cuda graph support for pi05.
@@ -294,7 +297,7 @@ class ARNodeSubmodule(NodeSubmodule):
 
     # We are setting preprocess to be abstract here when it was not abstract
     # in the base NodeSubmodule class because the default behavior for preprocess
-    # there is not valid in the AR case (batching should typically be enabled, and 
+    # there is not valid in the AR case (batching should typically be enabled, and
     # preprocess should be implemented). This "making a method abstract in the
     # subclass but not base class" behavior is supported by Python's abc module.
     @abstractmethod
@@ -317,7 +320,7 @@ class ARNodeSubmodule(NodeSubmodule):
         Override in subclasses that only need a subset of available labels.
         """
         return None
-    
+
     def filter_batched_output(
         self,
         request_info: CurrentForwardPassInfo,

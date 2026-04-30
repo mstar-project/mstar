@@ -33,22 +33,21 @@ Key design choices (see the phase-2 design doc in
 
 from __future__ import annotations
 
-from abc import abstractmethod
 import bisect
 import logging
-from dataclasses import asdict, dataclass
+from abc import abstractmethod
+from dataclasses import dataclass
 
 import torch
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
-from mminf.engine.ar_engine import AREngine
 from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
-from mminf.engine.kv_store import KVCacheConfig, PositionInfo, TransferEngineInfo
 from mminf.engine.cuda_graph_config import CudaGraphConfig
+from mminf.engine.kv_store import KVCacheConfig
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
 from mminf.utils.profiler import range_pop, range_push
-from mminf.utils.sampling import Sampler, SamplingConfig, sample_depth_gpu
+from mminf.utils.sampling import SamplingConfig, sample_depth_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +126,7 @@ class CodePredictorSubmodule(ARNodeSubmodule):
         return next(iter(
             self.forward_batched(*args, **kwargs).values()
         ))
-    
+
     def can_batch(self, batch: NodeBatch, model_inputs: list[ARNodeInputs]) -> bool:
         return True
 
@@ -137,7 +136,7 @@ class CodePredictorSubmodule(ARNodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
     ) -> list[str]:
         return ["main"]
-    
+
 
 @dataclass
 class UnrolledGraphData:
@@ -576,7 +575,7 @@ class CodePredictorEngine(BaseEngine):
 
     def has_autocast(self):
         return False
-    
+
     def load_model(
         self,
         submodules: dict[str, CodePredictorSubmodule],
@@ -589,7 +588,7 @@ class CodePredictorEngine(BaseEngine):
         for cfg in kv_cache_config:
             for node_name in cfg.nodes or submodules.keys():
                 node_name_to_kv_cfg[node_name] = cfg
-        
+
         self.submodules = submodules
         for node_name, submodule in submodules.items():
             kv_cfg = node_name_to_kv_cfg.get(node_name)
@@ -641,7 +640,7 @@ class CodePredictorEngine(BaseEngine):
                     per_request_info=batch.per_request_info
                 )
             )
-        
+
         if self.enable_nvtx:
             range_push("code_pred.batched.preprocesss", synchronize=False)
         bs = len(batch.request_ids)
@@ -673,7 +672,7 @@ class CodePredictorEngine(BaseEngine):
 
         if self.enable_nvtx:
             range_push("code_pred.batched.forward")
-        
+
         batched_output = submodule.forward_batched(
             graph_walk=batch.graph_walk,
             engine_inputs=engine_inputs,
@@ -694,7 +693,7 @@ class CodePredictorEngine(BaseEngine):
         submodule = self.submodules[batch.node_name]
         if self.enable_nvtx:
             range_push("code_pred.prepare_iputs", synchronize=False)
-        
+
         node_inputs: list[ARNodeInputs] = []
         for rid in batch.request_ids:
             node_inputs.append(

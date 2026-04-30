@@ -28,8 +28,8 @@ Text-only mode:
     partition runs.  Talker and Code2Wav are idle.
 """
 
-from copy import deepcopy
 import logging
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -44,7 +44,7 @@ from mminf.conductor.request_info import (
 from mminf.engine.base import EngineType
 from mminf.engine.code_predictor_engine import CodePredictorSubmodule
 from mminf.engine.kv_store import KVCacheConfig
-from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
+from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, Sequential, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
@@ -506,7 +506,7 @@ class Qwen3OmniModel(Model):
                 ),
             ],
         )
-    
+
     # -----------------------------------------------------------------------
     # Model ABC: sampling config
     # -----------------------------------------------------------------------

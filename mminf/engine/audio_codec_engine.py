@@ -202,7 +202,7 @@ class AudioCodecEngine(BaseEngine):
             )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
-    
+
             if self.enable_nvtx:
                 range_push(f"codec.forward.{i}")
             outputs[rid] = submodule.forward(

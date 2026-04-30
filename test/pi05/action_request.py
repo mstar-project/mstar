@@ -31,9 +31,8 @@ import sys
 
 import numpy as np
 import requests
-from PIL import Image
-
 from _env import get_server_url
+from PIL import Image
 
 ACTION_HORIZON = 50
 ACTION_DIM = 32

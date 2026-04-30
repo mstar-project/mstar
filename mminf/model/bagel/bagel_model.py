@@ -896,7 +896,7 @@ class BagelModel(Model):
             step_metadata=step_metadata,
             request_done=request_done
         )
-    
+
     def get_sampling_config(
         self, node_name: str,
         model_kwargs: dict | None = None,

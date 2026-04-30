@@ -46,13 +46,13 @@ from mminf.graph.base import (
 )
 from mminf.graph.special_destinations import EMIT_TO_CLIENT
 from mminf.model.base import ForwardPassArgs, Model
-from mminf.model.submodule_base import NodeSubmodule
 from mminf.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mminf.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mminf.model.pi05.components.siglip import Pi05SiglipEncoder
 from mminf.model.pi05.components.tokenization import Pi05Tokenizer
 from mminf.model.pi05.config import Pi05Config, load_pi05_config
 from mminf.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+from mminf.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
 

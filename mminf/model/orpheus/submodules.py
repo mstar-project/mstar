@@ -11,10 +11,8 @@ from mminf.engine.base import NodeBatch
 from mminf.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
 from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
-from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
-from mminf.model.submodule_base import NodeInputs
-from mminf.utils.profiler import range_pop, range_push
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +81,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
             ),
         ]
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -95,7 +93,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             input_ids=inputs["text_inputs"][0],
             input_seq_len=inputs["text_inputs"][0].shape[0]
         )
-    
+
     def preprocess(
         self,
         graph_walk: str,
@@ -130,7 +128,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         finally:
             if enable_nvtx:
                 range_pop(synchronize=False)
-    
+
     def forward(
         self,
         graph_walk: str,
@@ -151,7 +149,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             )
         else:
             raise ValueError(f"Unknown graph walk for OrpheusLLM: {graph_walk!r}")
-        
+
     def _forward_prefill(
         self,
         text_inputs: torch.Tensor,
@@ -261,7 +259,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         }
         out["__batched_logits__"] = logits
         return out
-    
+
     def postprocess(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
@@ -334,7 +332,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
                 capture_batch_sizes=[1, 2, 4, 8, 16],
             ),
         ]
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -356,7 +354,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             input_ids=self._tokens_to_codes(tokens),
             input_seq_len=tokens.shape[0]
         )
-    
+
     def can_batch(self, batch: NodeBatch, inputs: list[ARNodeInputs]) -> bool:
         return len({
             input.input_seq_len for input in inputs
@@ -379,7 +377,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             "codes_1": codes_1.reshape(B, N * 8),
             "codes_2": codes_2.reshape(B, N * 16),
         }
-    
+
     def forward(
         self,
         graph_walk: str,
@@ -394,7 +392,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         ]
         audio_int16 = (audio_slice.clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": audio_int16.squeeze(1)}
-    
+
     def forward_batched(
         self,
         graph_walk: str,

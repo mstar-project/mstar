@@ -1,9 +1,9 @@
 import time
-import zmq
+
 import torch
 import torch.multiprocessing as mp
+import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
-from random import randint
 
 PORT = 5555
 
@@ -55,7 +55,7 @@ def sender():
         }
 
         print(f"[Sender] Sending metadata for iter {i}...")
-    
+
         sock.send_pyobj((cuda_share, meta))
 
     print("[Sender] Done. Sleeping to keep storage alive...")

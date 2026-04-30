@@ -444,7 +444,7 @@ class AREngine(BaseEngine):
                     range_push("ar.sampler_config", synchronize=False)
                 for rid, info in batch.per_request_info.items():
                     sampling_config = info.sampling_config.get(batch.node_name)
-                    sampling_config = {} if sampling_config is None else asdict(sampling_config) 
+                    sampling_config = {} if sampling_config is None else asdict(sampling_config)
                     submod_mgmt.sampler.set_config(rid, **sampling_config)
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
