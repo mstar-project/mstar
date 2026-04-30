@@ -17,6 +17,7 @@ and PiecewiseCudaGraphRunner for capturing transformer block loops (VJepa2 predi
 
 import bisect
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -49,13 +50,18 @@ class DummyCaptureInput:
 
 
 @dataclass
-class CudaGraphData:
+class CudaGraphSlot:
+    """One captured graph + its private FlashInfer wrappers.
+
+    Phase 3 double-buffer: each (graph_walk, requires_cfg, bs, num_tokens)
+    key holds two of these in ``CudaGraphData.slots``. Replay alternates
+    between slots so plan(N+1) on the inactive slot's wrapper can run
+    concurrently with replay(N) on the active slot.
+    """
     graph: torch.cuda.CUDAGraph
     static_inputs: dict
     static_outputs: dict
     static_cache_manager: BatchedCacheManager
-    config: CudaGraphConfig
-    bs: int
     # Cached at capture time: True iff any dummy_rid in static_outputs has a
     # key besides "logits". When False, sample_and_remap can skip the
     # per-rid collection loop entirely.
@@ -70,6 +76,21 @@ class PiecewiseGraphData:
     static_cache_manager: BatchedCacheManager | None
     dummy_rids: list[str]
     bs: int
+
+@dataclass
+class CudaGraphData:
+    config: CudaGraphConfig
+    bs: int
+    # One CudaGraphSlot per double-buffer slot. Always length NUM_SLOTS.
+    # Each slot has its own captured graph + persistent FlashInfer wrappers
+    # so plan(N+1) on slot[(s+1)%2] runs concurrent with replay(N) on slot[s].
+    slots: list[CudaGraphSlot] = field(default_factory=list)
+    # Index of the slot the NEXT submission (replay or pre-plan) will use.
+    # Main thread reads-and-flips via ``CudaGraphRunner.reserve_slot`` so the
+    # GPU thread (replay) and plan_executor thread (pre-plan) always agree on
+    # which slot a given iter targets.
+    next_slot: int = 0
+
 
 @dataclass(frozen=True)
 class CudaGraphKey:
@@ -103,6 +124,14 @@ class CudaGraphRunner:
     """
 
     CAPTURE_BATCH_SIZES = DEFAULT_AR_CAPTURE_BATCH_SIZES
+    # Phase 3 double-buffer: capture two graphs + two FlashInfer wrapper sets
+    # per (graph_walk, requires_cfg, bs, num_tokens) key. Replay alternates so
+    # plan(N+1) on the inactive slot can run concurrent with replay(N) on the
+    # active slot. Override via MMINF_NUM_SLOTS=1 to disable double-buffer
+    # (e.g., for models where the second capture in the same memory pool
+    # races with torch.compile's autotune state — verify capture succeeds
+    # before claiming the perf win).
+    NUM_SLOTS = int(os.environ.get("MMINF_NUM_SLOTS", "2"))
 
     def __init__(
         self,
@@ -147,6 +176,9 @@ class CudaGraphRunner:
         # (the actual torch.cuda.memory_allocated delta also covers KV cache /
         # model weights / FlashInfer workspaces, so it's noisier).
         self._capture_clone_bytes_naive = 0
+        # Phase 3 plan-overlap stream. Lazily created the first time pre_plan
+        # is called from Worker.plan_executor.
+        self._plan_stream: "torch.cuda.Stream | None" = None
 
     def warmup_and_capture(self) -> None:
         """Capture graphs for all configs and batch sizes."""
@@ -211,11 +243,16 @@ class CudaGraphRunner:
 
     def _create_persistent_wrappers(
         self, bs: int, config: CudaGraphConfig,
-        total_tokens: int
+        total_tokens: int, slot_idx: int = 0,
     ) -> dict:
         """Create persistent FlashInfer wrappers for CUDA graph capture.
 
         Returns dict of label -> _PlanState with persistent wrappers.
+
+        ``slot_idx`` distinguishes the two double-buffer slots — each slot
+        gets its own FlashInfer workspace + index buffers so plan(slot 1)
+        can run on plan_stream concurrently with replay(slot 0) on
+        default_stream without racing on the wrapper's persistent state.
         """
         from mminf.engine.cache_manager import _PlanState
         from mminf.utils.flashinfer_utils import (
@@ -228,13 +265,16 @@ class CudaGraphRunner:
         cfg = self.kv_cache_config
 
         # Allocate workspace buffer for CUDA graph wrappers.
-        # Each label gets its own workspace to avoid conflicts during
-        # multi-pass captures (e.g., main + cfg_img in same graph).
+        # Each (label, slot) gets its own workspace — slots must NOT share
+        # workspace because plan() writes scheduling state there and the
+        # captured replay reads it; concurrent plan(slot B) + replay(slot A)
+        # would race on shared workspace addresses.
         plan_states = {}
         for label in config.labels:
+            ws_label = f"{label}_cugraph_slot{slot_idx}"
             if is_decode:
                 wrapper = FlashInferDecodeWrapper(
-                    workspace_buffer=self.buffer_manager.get(f"{label}_cugraph"),
+                    workspace_buffer=self.buffer_manager.get(ws_label),
                     num_qo_heads=cfg.num_qo_heads,
                     num_kv_heads=cfg.num_kv_heads,
                     head_dim=cfg.head_dim,
@@ -247,7 +287,7 @@ class CudaGraphRunner:
                 )
             else:
                 wrapper = FlashInferPrefillWrapper(
-                    workspace_buffer=self.buffer_manager.get(f"{label}_cugraph"),
+                    workspace_buffer=self.buffer_manager.get(ws_label),
                     num_qo_heads=cfg.num_qo_heads,
                     num_kv_heads=cfg.num_kv_heads,
                     head_dim=cfg.head_dim,
@@ -260,7 +300,11 @@ class CudaGraphRunner:
                     enable_nvtx=self.enable_nvtx,
                 )
 
-            # Static pos_ids buffer for RoPE
+            # Static pos_ids buffer for RoPE — also per-slot (captured into
+            # the slot's graph; both slots' graphs would otherwise read from
+            # the same buffer and the second slot's preprocess would clobber
+            # the first slot's view if any future change ran replays
+            # concurrently).
             static_pos_ids = torch.zeros(
                 total_tokens, dtype=torch.long, device=self.device
             )
@@ -272,9 +316,13 @@ class CudaGraphRunner:
 
         return plan_states
 
-    def _make_dummy_rids(self, config: CudaGraphConfig, bs: int):
-        dummy_rids = [f"__cg_{config.capture_graph_walk}_{config.requires_cfg}_{i}__"
-                      for i in range(bs)]
+    def _make_dummy_rids(
+        self, config: CudaGraphConfig, bs: int, slot_idx: int = 0,
+    ):
+        dummy_rids = [
+            f"__cg_{config.capture_graph_walk}_{config.requires_cfg}_slot{slot_idx}_{i}__"
+            for i in range(bs)
+        ]
 
         # Add dummy requests with all needed labels
         for rid in dummy_rids:
@@ -368,15 +416,10 @@ class CudaGraphRunner:
         seq_lens[0] += total_tokens % bs
         return seq_lens
 
-    def _postprocess_cuda_graph_output(
-        self, output, config: CudaGraphConfig,
-        key: CudaGraphKey, graph, static_inputs,
-        cache_manager, bs
-    ):
-        # Inspect per-rid output keys once at capture time so sample_and_remap
-        # can skip its per-rid collection loop when only logits are present.
-        # Skip only the __batched_logits__ sentinel — the per-rid entries
-        # (dummy_rids, also "__"-prefixed) ARE what we want to inspect.
+    def _build_slot_from_capture(
+        self, output, graph, static_inputs, cache_manager,
+    ) -> CudaGraphSlot:
+        """Wrap one slot's capture artifacts into a CudaGraphSlot."""
         has_non_logit = False
         if isinstance(output, dict):
             for k, v in output.items():
@@ -387,11 +430,32 @@ class CudaGraphRunner:
                 ):
                     has_non_logit = True
                     break
-        logger.info(
-            "CudaGraphRunner: captured graph %s has_non_logit_outputs=%s",
-            key, has_non_logit,
+        return CudaGraphSlot(
+            graph=graph,
+            static_inputs=static_inputs,
+            static_outputs=output,
+            static_cache_manager=cache_manager,
+            has_non_logit_outputs=has_non_logit,
         )
 
+    def _register_graph_data(
+        self,
+        key: CudaGraphKey,
+        config: CudaGraphConfig,
+        bs: int,
+        slots: list[CudaGraphSlot],
+    ) -> None:
+        """Register a populated CudaGraphData under all replay graph walks.
+
+        Phase 3 double-buffer: ``slots`` is the list of all NUM_SLOTS slots,
+        each with its own captured graph + persistent wrappers. Replay picks
+        the active slot via ``CudaGraphData.next_slot``; pre-plan targets
+        the slot the next replay will use.
+        """
+        logger.info(
+            "CudaGraphRunner: captured graph %s slots=%d has_non_logit_outputs=%s",
+            key, len(slots), [s.has_non_logit_outputs for s in slots],
+        )
         for graph_walk in config.replay_graph_walks:
             lookup_key = CudaGraphKey(
                 graph_walk=graph_walk,
@@ -400,127 +464,121 @@ class CudaGraphRunner:
                 num_tokens=key.num_tokens,
             )
             self.graphs[lookup_key] = CudaGraphData(
-                graph=graph,
-                static_inputs=static_inputs,
-                static_outputs=output,
-                static_cache_manager=cache_manager,
                 config=config,
                 bs=bs,
-                has_non_logit_outputs=has_non_logit,
+                slots=slots,
+                next_slot=0,
             )
-
-        logger.debug("Captured graph %s, output keys: %s", key,
-                        list(output.keys()) if isinstance(output, dict)
-                        else type(output))
 
     def _capture_one_flashinfer_packed(
         self, key: CudaGraphKey,
         config: FlashInferPackedCudaGraphConfig,
         submodule: ARNodeSubmodule,
     ):
-        """Capture one prefill graph for (bs, num_tokens) bucket.
+        """Capture NUM_SLOTS prefill graphs for (bs, num_tokens) bucket.
 
-        submodule.preprocess is NOT called at capture: config.num_token_to_inputs[num_tokens]
-        is the packed input already in the format forward_batched expects post-preprocess.
-        The runner plans FlashInfer attention/RoPE itself with synthetic seq_lens and
-        captures forward_batched directly. At replay (_run_flashinfer_packed), preprocess IS
-        called on real per-request inputs to fill the static buffers.
+        Phase 3 double-buffer mirrors the basic_batched path: each slot has
+        its own dummy_rids, FlashInfer wrappers, BatchedCacheManager, and
+        captured graph. Static input templates are shared across slots via
+        the per-config interned buffer pool.
         """
         bs = key.bs
+        template_dict = config.num_token_to_inputs[key.num_tokens]
+        config_idx = self.capture_configs.index(config)
+        captured_slots: list[CudaGraphSlot] = []
+        dummy_rids_to_free: list[list[str]] = []
 
-        # Create dummy request IDs
-        dummy_rids = self._make_dummy_rids(config, bs)
         try:
-            template_dict = config.num_token_to_inputs[key.num_tokens]
-            config_idx = self.capture_configs.index(config)
-            templates = {
-                k: (self._intern_static_buffer(config_idx, k, v)
-                    if isinstance(v, torch.Tensor) else v)
-                for k, v in template_dict.items()
-            }
+            for slot_idx in range(self.NUM_SLOTS):
+                dummy_rids = self._make_dummy_rids(config, bs, slot_idx)
+                dummy_rids_to_free.append(dummy_rids)
 
-            plan_states = self._create_persistent_wrappers(
-                bs, config, total_tokens=key.num_tokens
-            )
-            seq_lens = self._make_dummy_seq_lens(bs, key.num_tokens)
+                templates = {
+                    k: (self._intern_static_buffer(config_idx, k, v)
+                        if isinstance(v, torch.Tensor) else v)
+                    for k, v in template_dict.items()
+                }
 
-            # Build cache manager FIRST so plan_attention can close over it.
-            engine_inputs = self._create_cache_mgr_and_dummy_engine_inputs(
-                dummy_rids=dummy_rids,  plan_states=plan_states, config=config
-            )
-            cache_manager = engine_inputs.cache_manager
-
-            # manually plan attention
-            def plan_attention():
-                for label in config.labels:
-                    cache_manager.plan_attention(
-                        seq_lens=seq_lens,
-                        is_causal=config.causal_attention,
-                        label=label, write_store=False
-                    )
-                    cache_manager.plan_rope(
-                        seq_lens=seq_lens, label=label
-                    )
-
-            plan_attention()
-
-            static_input_keys = [
-                k for k, v in templates.items()
-                if isinstance(v, torch.Tensor)
-            ]
-
-            forward = submodule.forward_batched
-            if config.compile:
-                forward = torch.compile(
-                    forward,
-                    mode="max-autotune-no-cudagraphs",
-                    fullgraph=False,
-                    dynamic=False,
+                plan_states = self._create_persistent_wrappers(
+                    bs, config, total_tokens=key.num_tokens, slot_idx=slot_idx,
                 )
+                seq_lens = self._make_dummy_seq_lens(bs, key.num_tokens)
 
-            def run_forward():
-                return forward(
-                    graph_walk=config.capture_graph_walk,
-                    engine_inputs=engine_inputs,
-                    **templates
+                engine_inputs = self._create_cache_mgr_and_dummy_engine_inputs(
+                    dummy_rids=dummy_rids, plan_states=plan_states, config=config,
                 )
+                cache_manager = engine_inputs.cache_manager
 
-            torch.cuda.set_device(self.device)
-            # Warmup: 2 forward passes
-            torch.cuda.synchronize()
-            for _ in range(2):
-                with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                    output = run_forward()
-                # Reset seq_lens after warmup passes so capture starts clean
-                for rid in dummy_rids:
+                def plan_attention(_cache_manager=cache_manager, _seq_lens=seq_lens):
                     for label in config.labels:
-                        state = self.alloc_manager.get_state(rid, label)
-                        state.seq_len = 0
-                        state.position_id_start = 0
-                # Re-plan after reset
+                        _cache_manager.plan_attention(
+                            seq_lens=_seq_lens,
+                            is_causal=config.causal_attention,
+                            label=label, write_store=False,
+                        )
+                        _cache_manager.plan_rope(seq_lens=_seq_lens, label=label)
+
                 plan_attention()
-            torch.cuda.synchronize()
 
-            # Capture
-            graph = torch.cuda.CUDAGraph()
-            with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                with torch.cuda.graph(graph, pool=self.memory_pool):
-                    output = run_forward()
-            torch.cuda.synchronize()
+                static_input_keys = [
+                    k for k, v in templates.items()
+                    if isinstance(v, torch.Tensor)
+                ]
 
-            self._postprocess_cuda_graph_output(
-                output=output, config=config, key=key,
-                graph=graph, static_inputs={
-                    "preprocessed": templates,
-                    "static_input_keys": static_input_keys,
-                    "dummy_rids": dummy_rids,
-                    "dummy_metadata": engine_inputs.per_request_info,
-                },
-                cache_manager=cache_manager, bs=bs
+                forward = submodule.forward_batched
+                if config.compile:
+                    forward = torch.compile(
+                        forward,
+                        mode="max-autotune-no-cudagraphs",
+                        fullgraph=False,
+                        dynamic=False,
+                    )
+
+                def run_forward(_forward=forward, _engine_inputs=engine_inputs, _templates=templates):
+                    return _forward(
+                        graph_walk=config.capture_graph_walk,
+                        engine_inputs=_engine_inputs,
+                        **_templates,
+                    )
+
+                torch.cuda.set_device(self.device)
+                torch.cuda.synchronize()
+                for _ in range(2):
+                    with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                        output = run_forward()
+                    for rid in dummy_rids:
+                        for label in config.labels:
+                            state = self.alloc_manager.get_state(rid, label)
+                            state.seq_len = 0
+                            state.position_id_start = 0
+                    plan_attention()
+                torch.cuda.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                    with torch.cuda.graph(graph, pool=self.memory_pool):
+                        output = run_forward()
+                torch.cuda.synchronize()
+
+                slot = self._build_slot_from_capture(
+                    output=output,
+                    graph=graph,
+                    static_inputs={
+                        "preprocessed": templates,
+                        "static_input_keys": static_input_keys,
+                        "dummy_rids": dummy_rids,
+                        "dummy_metadata": engine_inputs.per_request_info,
+                    },
+                    cache_manager=cache_manager,
+                )
+                captured_slots.append(slot)
+
+            self._register_graph_data(
+                key=key, config=config, bs=bs, slots=captured_slots,
             )
-
         finally:
-            self._free_dummy_rids(config, dummy_rids)
+            for rids in dummy_rids_to_free:
+                self._free_dummy_rids(config, rids)
 
 
     def _capture_one_basic_batched(
@@ -528,129 +586,129 @@ class CudaGraphRunner:
         config: BasicBatchedCudaGraphConfig,
         submodule: ARNodeSubmodule,
     ) -> None:
-        """Capture one decode graph for (bs, single_request_inputs.input_seq_len * bs) bucket.
+        """Capture NUM_SLOTS decode graphs for (bs, single_request_inputs.input_seq_len * bs) bucket.
 
-        submodule.preprocess IS called at capture with bs cloned single_request_inputs;
-        its output gets captured as static buffers. This is the only path where preprocess
-        logic (including plan_attention/plan_rope) runs inside the captured region — at
-        replay those are re-planned outside the graph.
+        Phase 3 double-buffer: each slot gets its own dummy_rids, persistent
+        FlashInfer wrappers, BatchedCacheManager, and captured graph. Static
+        input buffers are SHARED across slots (preprocess writes them just
+        before replay; no race because replays serialize on the GPU thread).
         """
         bs = key.bs
-
-        # Create dummy request IDs
-        dummy_rids = self._make_dummy_rids(config, bs)
+        template = config.single_request_inputs
+        if template is None:
+            logger.warning(
+                "%s.get_cuda_graph_configs returned a BasicBatchedCudaGraphConfig "
+                "with single_request_inputs=None for walk=%s — skipping capture",
+                self.submodule_name, config.capture_graph_walk,
+            )
+            return
+        config_idx = self.capture_configs.index(config)
+        captured_slots: list[CudaGraphSlot] = []
+        dummy_rids_to_free: list[list[str]] = []
 
         try:
-            # Build dummy per-request inputs via the submodule's own
-            # capture-input generator. This lets each submodule declare what
-            # dummy tensors its preprocess() needs (e.g., Thinker decode needs
-            # a dummy token, Talker decode needs dummy all_codes).
-            template = config.single_request_inputs
-            if template is None:
-                logger.warning(
-                    "%s.get_cuda_graph_configs returned a BasicBatchedCudaGraphConfig "
-                    "with single_request_inputs=None for walk=%s — skipping capture",
-                    self.submodule_name, config.capture_graph_walk,
-                )
-                return
+            for slot_idx in range(self.NUM_SLOTS):
+                # Each slot gets disjoint dummy_rids so its alloc_manager
+                # bookkeeping doesn't bleed into the other slot's capture
+                # state (page indices, seq_lens). Wrappers and
+                # cache_manager are also per-slot.
+                dummy_rids = self._make_dummy_rids(config, bs, slot_idx)
+                dummy_rids_to_free.append(dummy_rids)
+                dummy_inputs = [template.clone() for _ in dummy_rids]
 
-            dummy_inputs = [template.clone() for _ in dummy_rids]
-
-            plan_states = self._create_persistent_wrappers(
-                bs, config, total_tokens=bs * template.input_seq_len
-            )
-
-            engine_inputs = self._create_cache_mgr_and_dummy_engine_inputs(
-                dummy_rids=dummy_rids,  plan_states=plan_states, config=config
-            )
-            cache_manager = engine_inputs.cache_manager
-
-            # Preprocess (plans attention+rope outside graph)
-            preprocessed = submodule.preprocess(
-                graph_walk=config.capture_graph_walk,
-                engine_inputs=engine_inputs,
-                inputs=dummy_inputs,
-            )
-
-            # Replace each tensor entry with a slice view into a per-(config, key)
-            # shared buffer (Step 5 buffer reuse). Largest-bs capture allocates the
-            # buffer at its preprocess output shape; smaller-bs captures slice into
-            # the same storage. The captured forward sees the slice view, so all
-            # bs buckets for this config share one tensor allocation per key
-            # instead of one full clone each. Non-tensor entries (lists, ints) are
-            # left alone — they're fixed at capture time and don't need a buffer.
-            config_idx = self.capture_configs.index(config)
-            for k in list(preprocessed.keys()):
-                v = preprocessed[k]
-                if isinstance(v, torch.Tensor):
-                    preprocessed[k] = self._intern_static_buffer(config_idx, k, v)
-
-            # Static input buffers for ALL tensor inputs in the preprocessed
-            # dict. These are the slots that will be overwritten with real
-            # inputs during replay. Non-tensor values (lists, ints) are kept
-            # in `preprocessed` as-is since they're fixed at capture time.
-            static_input_keys = [
-                k for k, v in preprocessed.items()
-                if isinstance(v, torch.Tensor)
-            ]
-
-            forward = submodule.forward_batched
-            if config.compile:
-                forward = torch.compile(
-                    forward,
-                    mode="max-autotune-no-cudagraphs",
-                    fullgraph=False,
-                    dynamic=False,
+                plan_states = self._create_persistent_wrappers(
+                    bs, config,
+                    total_tokens=bs * template.input_seq_len,
+                    slot_idx=slot_idx,
                 )
 
-            def run_forward():
-                return forward(
-                    graph_walk=config.capture_graph_walk,
-                    engine_inputs=engine_inputs,
-                    **preprocessed
+                engine_inputs = self._create_cache_mgr_and_dummy_engine_inputs(
+                    dummy_rids=dummy_rids, plan_states=plan_states, config=config,
                 )
+                cache_manager = engine_inputs.cache_manager
 
-            torch.cuda.set_device(self.device)
-            # Warmup: 2 forward passes
-            torch.cuda.synchronize()
-            for _ in range(2):
-                with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                    output = run_forward()
-                # Reset seq_lens after warmup passes so capture starts clean
-                for rid in dummy_rids:
-                    for label in config.labels:
-                        state = self.alloc_manager.get_state(rid, label)
-                        state.seq_len = 0
-                        state.position_id_start = 0
-                # Re-plan after reset
-                submodule.preprocess(
+                # Preprocess (plans attention+rope outside graph).
+                preprocessed = submodule.preprocess(
                     graph_walk=config.capture_graph_walk,
                     engine_inputs=engine_inputs,
                     inputs=dummy_inputs,
                 )
-            torch.cuda.synchronize()
 
-            # Capture
-            graph = torch.cuda.CUDAGraph()
-            with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                with torch.cuda.graph(graph, pool=self.memory_pool):
-                    output = run_forward()
-            torch.cuda.synchronize()
+                # Both slots share the same static input buffers (per
+                # config_idx, key) — the captured forward reads them after
+                # preprocess writes, and replays don't overlap. Slot 0's
+                # capture allocates; slot 1's capture re-interns the same
+                # buffer (re-copy is cheap, addresses stay stable).
+                for k in list(preprocessed.keys()):
+                    v = preprocessed[k]
+                    if isinstance(v, torch.Tensor):
+                        preprocessed[k] = self._intern_static_buffer(config_idx, k, v)
 
-            self._postprocess_cuda_graph_output(
-                output=output, config=config, key=key,
-                graph=graph, static_inputs={
-                    "preprocessed": preprocessed,
-                    "capture_template": template,
-                    "static_input_keys": static_input_keys,
-                    "dummy_rids": dummy_rids,
-                    "dummy_metadata": engine_inputs.per_request_info,
-                },
-                cache_manager=cache_manager, bs=bs
+                static_input_keys = [
+                    k for k, v in preprocessed.items()
+                    if isinstance(v, torch.Tensor)
+                ]
+
+                forward = submodule.forward_batched
+                if config.compile:
+                    forward = torch.compile(
+                        forward,
+                        mode="max-autotune-no-cudagraphs",
+                        fullgraph=False,
+                        dynamic=False,
+                    )
+
+                def run_forward(_forward=forward, _engine_inputs=engine_inputs, _preprocessed=preprocessed):
+                    return _forward(
+                        graph_walk=config.capture_graph_walk,
+                        engine_inputs=_engine_inputs,
+                        **_preprocessed,
+                    )
+
+                torch.cuda.set_device(self.device)
+                torch.cuda.synchronize()
+                for _ in range(2):
+                    with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                        output = run_forward()
+                    # Reset seq_lens so capture starts from a clean state.
+                    for rid in dummy_rids:
+                        for label in config.labels:
+                            state = self.alloc_manager.get_state(rid, label)
+                            state.seq_len = 0
+                            state.position_id_start = 0
+                    submodule.preprocess(
+                        graph_walk=config.capture_graph_walk,
+                        engine_inputs=engine_inputs,
+                        inputs=dummy_inputs,
+                    )
+                torch.cuda.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                    with torch.cuda.graph(graph, pool=self.memory_pool):
+                        output = run_forward()
+                torch.cuda.synchronize()
+
+                slot = self._build_slot_from_capture(
+                    output=output,
+                    graph=graph,
+                    static_inputs={
+                        "preprocessed": preprocessed,
+                        "capture_template": template,
+                        "static_input_keys": static_input_keys,
+                        "dummy_rids": dummy_rids,
+                        "dummy_metadata": engine_inputs.per_request_info,
+                    },
+                    cache_manager=cache_manager,
+                )
+                captured_slots.append(slot)
+
+            self._register_graph_data(
+                key=key, config=config, bs=bs, slots=captured_slots,
             )
-
         finally:
-            self._free_dummy_rids(config, dummy_rids)
+            for rids in dummy_rids_to_free:
+                self._free_dummy_rids(config, rids)
 
     def can_run(
         self,
@@ -730,6 +788,160 @@ class CudaGraphRunner:
         return sizes[idx]
 
 
+    def reserve_slot(
+        self,
+        graph_walk: str,
+        requires_cfg: bool,
+        batch_size: int,
+        num_tokens: int,
+    ) -> int | None:
+        """Allocate the next double-buffer slot for an upcoming submission.
+
+        Called by the Worker's main thread RIGHT BEFORE submitting a replay
+        (and, for speculation, the matching pre-plan) so both submissions
+        see the same slot. Increments the per-key ``next_slot`` counter so
+        the following submission picks the OTHER slot.
+
+        Returns the slot index, or ``None`` if no captured graph matches —
+        in which case the engine's eager fallback runs (no slot needed).
+        """
+        key = self._get_key_for(
+            batch_size=batch_size, num_tokens=num_tokens,
+            graph_walk=graph_walk, requires_cfg=requires_cfg,
+        )
+        if key is None:
+            return None
+        data = self.graphs[key]
+        if not data.slots:
+            return None
+        slot = data.next_slot
+        data.next_slot = (data.next_slot + 1) % len(data.slots)
+        return slot
+
+    def _get_or_make_plan_stream(self) -> "torch.cuda.Stream | None":
+        """Lazily allocate a dedicated CUDA stream for pre-planning.
+
+        Pre-plan must NOT submit its kernels to the default stream because
+        the order of submissions between the GPU thread (recording the
+        prev-batch completion_event) and plan_executor (submitting plan's
+        memcpys / CUB scan) is timing-dependent on Python thread scheduling.
+        If plan_executor sneaks its submissions in BEFORE the GPU thread
+        records the event, the event ends up firing AFTER plan's kernels
+        drain — which delays the slow_post side-stream D→H wait that's
+        gated on that event. The fix: pre-plan runs on its own stream,
+        gated by the prev-batch completion_event so wrapper buffer writes
+        never race with the in-flight replay's reads. The captured graph's
+        next replay then waits for plan_done_event on default stream.
+        """
+        if not torch.cuda.is_available():
+            return None
+        if self._plan_stream is None:
+            self._plan_stream = torch.cuda.Stream(device=self.device)
+        return self._plan_stream
+
+    def pre_plan_for_batch(
+        self,
+        graph_walk: str,
+        requires_cfg: bool,
+        request_ids: list[str],
+        per_request_info: dict[str, CurrentForwardPassInfo] | None = None,
+        prev_completion_event: "torch.cuda.Event | None" = None,
+        slot: int | None = None,
+    ) -> bool:
+        """Pre-plan FlashInfer attention into the inactive double-buffer slot.
+
+        Runs cache_manager.plan_attention against the slot's persistent
+        wrapper on a dedicated plan_stream, then sets the slot's
+        _skip_next_plan_attention flag and stashes a plan_done_event so the
+        captured graph's replay can wait on it before reading the wrapper.
+
+        Phase 3 double-buffer: the slot here is the OTHER slot from the one
+        currently being replayed — main thread reserves it via
+        ``reserve_slot`` before dispatching pre-plan, so plan(N+1) writes
+        slot[(s+1)%2]'s wrapper buffers while replay(N) on slot[s] continues
+        on the default stream. No prev_completion_event gating needed for
+        wrapper-buffer correctness because the slots are disjoint.
+        ``prev_completion_event`` is still accepted for API symmetry but
+        ignored — kept so callers can be slot-agnostic.
+
+        Returns True if pre-planning was applied; False otherwise (caller's
+        GPU thread plans inline).
+        """
+        from mminf.utils.profiler import range_pop, range_push
+
+        real_bs = len(request_ids)
+        # AR decode always emits 1 token per request.
+        real_num_tokens = real_bs
+
+        key = self._get_key_for(
+            batch_size=real_bs,
+            num_tokens=real_num_tokens,
+            graph_walk=graph_walk,
+            requires_cfg=requires_cfg,
+        )
+        if key is None:
+            return False
+
+        graph_data = self.graphs[key]
+        config = graph_data.config
+        if config.get_config_type() != CudaGraphConfigType.BASIC_BATCHED:
+            # Only decode-style basic_batched speculates / pre-plans.
+            return False
+        if not graph_data.slots:
+            return False
+        if slot is None:
+            slot = 0
+        slot %= len(graph_data.slots)
+        slot_data = graph_data.slots[slot]
+        static_cm = slot_data.static_cache_manager
+
+        if self.enable_nvtx:
+            range_push("plan_worker.pre_plan", synchronize=False)
+        # plan_stream lets plan(slot S+1)'s small kernels submit independently
+        # of the GPU thread's default-stream traffic. Disjoint wrapper buffers
+        # mean we DON'T gate plan_stream on prev_completion_event — that's
+        # the whole point of double-buffering: plan(N+1) overlaps with
+        # replay(N) on the GPU. plan_done_event still gates the eventual
+        # replay(N+1) (default stream) so it doesn't read buffers before
+        # plan(N+1)'s writes are visible.
+        plan_stream = self._get_or_make_plan_stream()
+        plan_done_event: torch.cuda.Event | None = None
+
+        # Temporarily alias real rids onto this slot's cache_manager so
+        # plan_attention reads real request states. The slot's static_cm
+        # will be aliased to the same real rids again at replay time
+        # (Step 1 swap_states in _run_basic_batched), so the wrapper
+        # buffers we write here stay valid for the matching replay.
+        saved_request_ids = static_cm.request_ids
+        saved_active_labels = static_cm.active_labels
+        try:
+            static_cm.request_ids = list(request_ids)
+            static_cm.active_labels = {rid: "main" for rid in request_ids}
+            seq_lens = [1] * real_bs
+            if plan_stream is not None:
+                with torch.cuda.stream(plan_stream):
+                    static_cm.plan_attention(
+                        seq_lens=seq_lens,
+                        dtype=self.autocast_dtype,
+                        label="main",
+                    )
+                plan_done_event = torch.cuda.Event()
+                plan_done_event.record(plan_stream)
+            else:
+                static_cm.plan_attention(
+                    seq_lens=seq_lens,
+                    dtype=self.autocast_dtype,
+                    label="main",
+                )
+            static_cm._skip_next_plan_attention = True
+            static_cm._plan_done_event = plan_done_event
+        finally:
+            static_cm.request_ids = saved_request_ids
+            static_cm.active_labels = saved_active_labels
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+        return True
+
     def run(
         self,
         graph_walk: str,
@@ -738,8 +950,17 @@ class CudaGraphRunner:
         inputs: list[ARNodeInputs],
         per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: ARNodeSubmodule,
+        slot: int | None = None,
+        advance_event: "object | None" = None,
     ) -> dict:
         """Look up the matching captured graph and dispatch on config type.
+
+        ``slot`` selects one of NUM_SLOTS captured graphs for this key.
+        When ``None``, the runner advances the per-key counter itself —
+        used by callers that didn't pre-reserve (e.g., non-speculative
+        replays where pre-plan isn't dispatched). Worker's speculation
+        path passes the slot it reserved before dispatching pre-plan so
+        replay(N) and pre-plan(N+1) target compatible slots.
 
         BasicBatched (decode-style): submodule.preprocess re-plans attention/rope
         and produces packed tensors written into static buffers — same call that
@@ -766,14 +987,30 @@ class CudaGraphRunner:
             )
 
         graph_data: CudaGraphData = self.graphs[key]
+        if not graph_data.slots:
+            raise RuntimeError(
+                f"CudaGraphData for {key} has no slots — capture failed silently?"
+            )
+        if slot is None:
+            # Caller didn't reserve. Advance the counter ourselves so the
+            # next reservation lands on the OTHER slot.
+            slot = graph_data.next_slot
+            graph_data.next_slot = (graph_data.next_slot + 1) % len(graph_data.slots)
+        slot %= len(graph_data.slots)
+        slot_data = graph_data.slots[slot]
+
         cfg_type = graph_data.config.get_config_type()
         if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
             return self._run_basic_batched(
-                key, graph_data, request_ids, inputs, per_request_info, submodule,
+                key, graph_data, slot_data,
+                request_ids, inputs, per_request_info, submodule,
+                advance_event=advance_event,
             )
         if cfg_type == CudaGraphConfigType.FLASH_INFER_PACKED:
             return self._run_flashinfer_packed(
-                key, graph_data, request_ids, inputs, per_request_info, submodule,
+                key, graph_data, slot_data,
+                request_ids, inputs, per_request_info, submodule,
+                advance_event=advance_event,
             )
         raise ValueError(f"Unknown CudaGraphConfigType: {cfg_type}")
 
@@ -781,23 +1018,29 @@ class CudaGraphRunner:
         self,
         key: CudaGraphKey,
         graph_data: CudaGraphData,
+        slot_data: CudaGraphSlot,
         request_ids: list[str],
         inputs: list[ARNodeInputs],
         per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: ARNodeSubmodule,
+        advance_event: "object | None" = None,
     ) -> dict:
         """Decode-style replay. Pads real inputs to padded_bs by cloning the capture
         template, then routes through submodule.preprocess (which re-plans attention
         and RoPE on the static cache manager) and copies the resulting packed tensors
         into the static buffers before replay.
+
+        Phase 3: ``slot_data`` is the chosen double-buffer slot (graph + persistent
+        wrappers + cache_manager). Same logic as before — we just look up the
+        slot's graph/cm instead of reading flat fields off ``graph_data``.
         """
         real_bs = len(request_ids)
         padded_bs = key.bs
 
-        graph = graph_data.graph
-        static = graph_data.static_inputs
-        static_cm = graph_data.static_cache_manager
-        static_output = graph_data.static_outputs
+        graph = slot_data.graph
+        static = slot_data.static_inputs
+        static_cm = slot_data.static_cache_manager
+        static_output = slot_data.static_outputs
 
         preprocessed = static["preprocessed"]
         dummy_rids = static["dummy_rids"]
@@ -879,6 +1122,13 @@ class CudaGraphRunner:
             mark("gpu_thread.preprocess_end")
 
         # --- Step 4: Replay ---
+        # Phase 3: if pre-plan was applied for this iter, the wrapper's
+        # static buffers were written on a side stream. Make the default
+        # stream wait on plan_done_event before replay reads them.
+        plan_done_event = getattr(static_cm, "_plan_done_event", None)
+        if plan_done_event is not None:
+            torch.cuda.default_stream(self.device).wait_event(plan_done_event)
+            static_cm._plan_done_event = None
         if self.enable_nvtx:
             mark("gpu_thread.cuda_graph_start")
             range_push("gpu_thread.cuda_graph", synchronize=False)
@@ -903,6 +1153,16 @@ class CudaGraphRunner:
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
+        # Phase 3: signal that alloc_manager state for batch_N is now
+        # post-advance. plan_executor's pre_plan(batch_(N+1)) waits on this
+        # event instead of prev_future, so plan() starts ~tens of µs into
+        # replay(N) (overlapping with replay(N)'s remaining GPU work) rather
+        # than after replay(N) fully completes. The event is also signaled
+        # in the GPU thread's outer try/finally so a failure path still
+        # wakes plan_executor.
+        if advance_event is not None:
+            advance_event.set()
+
         # --- Step 6: Sample logits and remap dummy → real outputs ---
         if self.enable_nvtx:
             range_push("cg.sample_and_remap", synchronize=False)
@@ -911,7 +1171,7 @@ class CudaGraphRunner:
             dummy_rids=dummy_rids,
             static_output=static_output,
             per_request_info=per_request_info,
-            graph_data=graph_data,
+            slot_data=slot_data,
             submodule=submodule,
             inputs=inputs,
         )
@@ -936,10 +1196,12 @@ class CudaGraphRunner:
         self,
         key: CudaGraphKey,
         graph_data: CudaGraphData,
+        slot_data: CudaGraphSlot,
         request_ids: list[str],
         inputs: list[ARNodeInputs],
         per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: ARNodeSubmodule,
+        advance_event: "object | None" = None,
     ) -> dict:
         """Prefill-style replay (vox-serve pattern).
 
@@ -949,14 +1211,19 @@ class CudaGraphRunner:
         slots [real_num_tokens : padded_num_tokens] keep their capture-time
         contents; non-attention compute over them is wasted work, not a correctness
         issue. State swap / advance_seq_lens / output remap mirror _run_basic_matched.
+
+        Phase 3: ``slot_data`` selects one of the captured double-buffer slots.
+        Prefill paths don't speculate or pre-plan today, so slot alternation
+        for these is just round-robin — perf-neutral but consistent with the
+        decode path's bookkeeping.
         """
         real_bs = len(request_ids)
         padded_bs = key.bs
 
-        graph = graph_data.graph
-        static = graph_data.static_inputs
-        static_cm = graph_data.static_cache_manager
-        static_output = graph_data.static_outputs
+        graph = slot_data.graph
+        static = slot_data.static_inputs
+        static_cm = slot_data.static_cache_manager
+        static_output = slot_data.static_outputs
 
         templates = static["preprocessed"]
         dummy_rids = static["dummy_rids"]
@@ -1064,6 +1331,9 @@ class CudaGraphRunner:
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
+        if advance_event is not None:
+            advance_event.set()
+
         # --- Step 6: Sample logits and remap dummy → real outputs ---
         if self.enable_nvtx:
             range_push("cg.sample_and_remap", synchronize=False)
@@ -1072,7 +1342,7 @@ class CudaGraphRunner:
             dummy_rids=dummy_rids,
             static_output=static_output,
             per_request_info=per_request_info,
-            graph_data=graph_data,
+            slot_data=slot_data,
             submodule=submodule,
             inputs=inputs,
         )
@@ -1194,7 +1464,7 @@ class CudaGraphRunner:
         dummy_rids: list[str],
         static_output: dict,
         per_request_info: dict[str, CurrentForwardPassInfo],
-        graph_data: CudaGraphData,
+        slot_data: CudaGraphSlot,
         submodule: ARNodeSubmodule,
         inputs: list[ARNodeInputs] | None = None,
     ) -> dict:
@@ -1233,7 +1503,7 @@ class CudaGraphRunner:
             # Collect non-logit per-rid outputs (e.g. hidden states) only when
             # the captured graph actually produced any — for most AR models
             # (Orpheus included) it only emits logits, so the loop is skipped.
-            if graph_data.has_non_logit_outputs:
+            if slot_data.has_non_logit_outputs:
                 for i, rid in enumerate(request_ids):
                     dummy_rid = dummy_rids[i]
                     if dummy_rid not in static_output:

@@ -94,6 +94,20 @@ class BatchedCacheManager:
             kv_cache_config.max_seq_len, dtype=torch.long, device=device
         )
 
+        # Phase 3: when set to True, the next plan_attention call short-circuits.
+        # The Worker's plan_executor calls plan_attention beforehand (with real
+        # request_ids and the same cuda_graph_plan_states) so the captured
+        # graph's preprocess can skip the heavy FlashInfer wrapper.plan() —
+        # which is GIL-contended with main thread's fast/slow post in the
+        # speculative path. Set by CudaGraphRunner.pre_plan_for_batch and
+        # cleared after the next plan_attention call.
+        self._skip_next_plan_attention = False
+        # CUDA event recorded on the plan-overlap stream after the pre-planned
+        # plan() call completed. The captured graph's replay must wait on this
+        # before reading the wrapper's static buffers (which the pre-plan
+        # wrote on a different stream). None when no pre-plan was applied.
+        self._plan_done_event: "torch.cuda.Event | None" = None
+
     @torch.compiler.disable
     def _get_state(self, request_id: str, label: str | None = None) -> KVRequestState:
         label = label or self.active_labels.get(request_id, "main")
@@ -157,6 +171,27 @@ class BatchedCacheManager:
         if self.enable_nvtx:
             range_push("cache.plan_attention", synchronize=False)
         try:
+            if self._skip_next_plan_attention:
+                # Phase 3 fast path: plan was pre-computed by Worker.plan_executor
+                # against the same persistent wrapper. The wrapper's static
+                # buffers and FlashInfer scheduling state are already correct
+                # for this iter's seq_lens. We only need to record ps.seq_lens
+                # / ps.write_store on the matching label so downstream
+                # run_attention sees them.
+                self._skip_next_plan_attention = False
+                effective_label = label
+                if effective_label is None:
+                    labels = list(self.active_labels.values())
+                    assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
+                    effective_label = next(iter(self.active_labels.values()))
+                ps = self._plan_states.get(effective_label)
+                if ps is not None:
+                    ps.seq_lens = seq_lens
+                    ps.write_store = write_store
+                if self.enable_nvtx:
+                    range_push("cache.plan_attention.skipped_pre_planned", synchronize=False)
+                    range_pop(synchronize=False)
+                return
             self._plan_attention_impl(
                 seq_lens=seq_lens,
                 dtype=dtype,

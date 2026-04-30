@@ -441,6 +441,8 @@ class AREngine(BaseEngine):
             inputs=inputs,
             per_request_info=batch.per_request_info,
             submodule=submodule,
+            slot=batch.metadata.get("cuda_graph_slot"),
+            advance_event=batch.metadata.get("advance_event"),
         )
 
         return NodeOutput(per_request_output_tensors=batched_output)
@@ -644,6 +646,70 @@ class AREngine(BaseEngine):
             if stops:
                 result[rid] = stops
         return result
+
+    def reserve_replay_slot(self, batch: NodeBatch) -> int | None:
+        """Allocate the next double-buffer slot for this batch and stash it
+        on ``batch.metadata['cuda_graph_slot']``.
+
+        Phase 3: Worker's main thread calls this on the speculative path
+        BEFORE submitting both pre-plan and replay so they target the same
+        slot (and the OPPOSITE slot from the in-flight replay). Returns the
+        slot index, or ``None`` if no captured graph matches (eager path).
+        """
+        runner = self.submodule_management[batch.node_name].cuda_graph_runner
+        if runner is None or not runner.graphs:
+            return None
+        has_cfg = any(
+            info.requires_cfg for info in batch.per_request_info.values()
+        )
+        bs = len(batch.request_ids)
+        # AR loop-back speculation always emits 1 token per request, so
+        # num_tokens == bs. Non-decode (prefill) batches don't speculate
+        # and don't pre-reserve, so they go through ``run`` which advances
+        # the per-key counter itself.
+        slot = runner.reserve_slot(
+            graph_walk=batch.graph_walk,
+            requires_cfg=has_cfg,
+            batch_size=bs,
+            num_tokens=bs,
+        )
+        if slot is not None:
+            batch.metadata["cuda_graph_slot"] = slot
+        return slot
+
+    def pre_plan_for_batch(
+        self,
+        batch: NodeBatch,
+        prev_completion_event: "torch.cuda.Event | None" = None,
+    ) -> bool:
+        """Phase 3: pre-plan FlashInfer attention for a batch on the
+        Worker.plan_executor thread, so the GPU thread's preprocess can skip
+        the GIL-contended plan() call.
+
+        With double-buffer, the slot has already been reserved by
+        ``reserve_replay_slot`` and lives on ``batch.metadata['cuda_graph_slot']``.
+        We forward it to the runner so plan() targets the inactive slot's
+        wrapper (the one replay(N) is NOT using).
+
+        Returns True if pre-planning was applied (caller's GPU thread should
+        wait on the plan future before running this batch). False if no
+        captured graph matches, in which case the GPU thread plans inline.
+        """
+        runner = self.submodule_management[batch.node_name].cuda_graph_runner
+        if runner is None or not runner.graphs:
+            return False
+        has_cfg = any(
+            info.requires_cfg for info in batch.per_request_info.values()
+        )
+        slot = batch.metadata.get("cuda_graph_slot")
+        return runner.pre_plan_for_batch(
+            graph_walk=batch.graph_walk,
+            requires_cfg=has_cfg,
+            request_ids=list(batch.request_ids),
+            per_request_info=batch.per_request_info,
+            prev_completion_event=prev_completion_event,
+            slot=slot,
+        )
 
     def add_request(
         self, request_id: str, cache_labels: list[str] | None = None,

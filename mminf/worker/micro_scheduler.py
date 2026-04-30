@@ -223,3 +223,41 @@ class MicroScheduler:
             node_objects=node_objects,
             request_to_worker_graph=request_to_worker_graph,
         )
+
+    def has_ready_excluding(
+        self,
+        worker_graphs_manager: WorkerGraphsManager,
+        exclude_target: tuple[str, str] | None,
+    ) -> bool:
+        """Cheap peek: any worker-graph queue ready with a (node, walk) other
+        than `exclude_target`? Used by the speculation path to decide whether
+        breaking the spec chain for fairness is actually warranted on this
+        worker — on single-walk workers (e.g. Orpheus LLM) the answer is
+        always False, so speculation can run every iter.
+
+        Does NOT pop or modify queue state. Mirrors the ready-scan in
+        get_next_batch but stops at the first match.
+        """
+        now = time.monotonic()
+        # Don't bother expiring held_until here — we only read it; the next
+        # get_next_batch call will refresh.
+        for _worker_graph_id, queue in worker_graphs_manager.queues.items():
+            ready_map = queue.get_ready_node_names()
+            for request_id, node_names in ready_map.items():
+                if request_id not in worker_graphs_manager.per_request_info:
+                    continue
+                if request_id in self.held_until and self.held_until[request_id] > now:
+                    continue
+                for sname in node_names:
+                    node_partition = worker_graphs_manager.get_partition_for_node(sname)
+                    graph_walk = worker_graphs_manager.get_graph_walk(
+                        request_id, node_partition,
+                    )
+                    if exclude_target is not None and (sname, graph_walk) == exclude_target:
+                        continue
+                    fwd_info = worker_graphs_manager.get_fwd_info(request_id, node_partition)
+                    engine = self.engine_manager.get_engine(sname)
+                    if not engine.check_ready(sname, request_id, fwd_info):
+                        continue
+                    return True
+        return False
