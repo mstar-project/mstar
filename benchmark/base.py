@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from enum import Enum
+from typing import Optional
 
 
 class Status(Enum):
@@ -52,6 +53,24 @@ class Model(ABC):
     def get_model_kwargs(self, request_type: RequestType):
         return {}
 
+    def get_openai_system_message(self) -> Optional[dict]:
+        """Return the OpenAI-format system message to prepend on /v1/chat/completions
+        requests, or None to send no system role.
+
+        Per-model because the right answer is model-specific:
+          - Qwen3-Omni (audio-output models in general): the official examples
+            (gradio_demo, openai_chat_completion_client_for_multimodal_generation,
+            seed_tts_dataset.SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT) all hardcode the
+            "You are Qwen…" preamble and the talker's behavior degrades without it.
+          - BAGEL: the model has its own `<|fim_middle|><|im_start|>…<|im_end|>`
+            template; an extra system role corrupts prompt handling and produces
+            off-prompt images. vllm-omni's own diffusion bench
+            (`benchmarks/diffusion/backends.py`) sends user-only messages for BAGEL.
+
+        Default: None (no system message). Override in subclasses that need one.
+        """
+        return None
+
     @abstractmethod
     def get_hf_url(self):
         pass
@@ -77,18 +96,25 @@ class Bagel(Model):
         self.disable_cfg = disable_cfg
 
     def get_model_kwargs(self, request_type: RequestType):
+        # Force greedy on the thinker for cross-system parity. Without this,
+        # mminf falls back to mminf/model/bagel/config.py's temperature=0.6
+        # default while vllm-omni gets temperature=0 from request.py:952 — the
+        # two systems would generate different token sequences, mostly
+        # affecting I2T latency (variable EOS timing) but also leaking into
+        # T2I/I2I via the tokens emitted before the image-gen handoff.
+        kwargs = {"temperature": 0.0}
         if self.disable_cfg:
-            return {
+            kwargs.update({
                 "cfg_img_scale": 1.0,
                 "cfg_text_scale": 1.0,
-            }
-        if request_type == RequestType.I2I:
-            return {
+            })
+        elif request_type == RequestType.I2I:
+            kwargs.update({
                 "cfg_img_scale": 2.0,
                 "cfg_interval": [0.0, 1.0],
                 "cfg_renorm_type": "text_channel",
-            }
-        return {}
+            })
+        return kwargs
 
     def get_hf_url(self):
         return "ByteDance-Seed/BAGEL-7B-MoT"
@@ -108,6 +134,24 @@ class Orpheus(Model):
 class Qwen3Omni(Model):
     def get_hf_url(self):
         return "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+
+    def get_openai_system_message(self) -> Optional[dict]:
+        # Verbatim text from vllm-omni's official Qwen3-Omni examples
+        # (gradio_demo, openai_chat_completion_client_for_multimodal_generation,
+        # benchmarks/data_modules/seed_tts_dataset.SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT).
+        # Required for correct talker behavior on /v1/chat/completions.
+        return {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+                        "capable of perceiving auditory and visual inputs, as well as generating text and speech."
+                    ),
+                }
+            ],
+        }
 
     def get_model_kwargs(self, request_type: RequestType):
         # Cap thinker output at 256 tokens for cross-system fairness. Matches

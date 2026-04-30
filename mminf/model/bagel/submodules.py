@@ -1028,6 +1028,8 @@ class LLMSubmodule(ARNodeSubmodule):
             **kwargs,
         )
 
+        projected = self.llm2vae(hidden[1:-1])
+
         # Output velocity. Main LLM also passes through latents/time_index
         # for the combine_cfg node.
         output_name = {
@@ -1036,7 +1038,7 @@ class LLMSubmodule(ARNodeSubmodule):
             "LLM_cfg_img": "v_cfg_img",
         }.get(self.node_name, "v_main")
 
-        result: NameToTensorList = {output_name: [hidden]}
+        result: NameToTensorList = {output_name: [projected]}
         if self.node_name == "LLM":
             result["time_index"] = [time_index]
         return result
@@ -1352,9 +1354,15 @@ class CombineCFGSubmodule(NodeSubmodule):
         dt = (timestep - timestep_next)[0]
 
         # Project to VAE space, strip BOI/EOI
-        v_m = self.llm2vae(v_main[1:-1])
-        v_ct = self.llm2vae(v_cfg_text[1:-1])
-        v_ci = self.llm2vae(v_cfg_img[1:-1])
+        # v_m = self.llm2vae(v_main[1:-1])
+        # v_ct = self.llm2vae(v_cfg_text[1:-1])
+        # v_ci = self.llm2vae(v_cfg_img[1:-1])
+        # Branches now project to VAE space themselves in
+        # _forward_image_gen_single_branch (avoids re-projecting the same
+        # hidden state on every CFG combine).
+        v_m = v_main
+        v_ct = v_cfg_text
+        v_ci = v_cfg_img
 
         # CFG interval
         cfg_lo, cfg_hi = cfg_interval
