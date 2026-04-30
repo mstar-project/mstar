@@ -18,3 +18,5 @@ traces/
 # output filenames
 output.png
 output_edit.png
+output.wav
+.bench_outs/
