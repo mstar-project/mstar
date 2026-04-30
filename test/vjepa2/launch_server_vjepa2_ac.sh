@@ -31,7 +31,7 @@
 set -euo pipefail
 
 USERNAME="${1:-${USER:-atindra}}"
-DEVICES="${2:-0}"
+DEVICES="${2:-2}"
 PORT="${PORT:-20003}"
 
 export LD_LIBRARY_PATH="${CONDA_PREFIX:-}/lib:${LD_LIBRARY_PATH:-}"
