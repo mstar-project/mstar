@@ -265,20 +265,13 @@ class Sampler:
             all_top_k_zero=all_top_k_zero,
         )
 
-        # TODO: make this scatter async. Currently runs 2 kernels per rid
-        # (broadcast-True + index_put) on the default stream, serializing N=bs
-        # small launches that add up (~500 µs at bs=8 for Orpheus with
-        # repetition_penalty=1.3). Two options to fix:
-        #   (a) Shared [max_concurrent, V] buffer with rid→slot mapping; replace
-        #       the loop with a single batched `buf[slots, tokens] = True`
-        #       scatter — one launch instead of N.
-        #   (b) Issue the updates on a side CUDA stream so the main stream
-        #       (next prefill/decode) doesn't wait. The next sample() for the
-        #       same rid would need to sync, but amortized over a full
-        #       generation this is cheap.
+        # Batched scatter: mark sampled tokens as seen in one kernel launch
+        # instead of 2*N serial launches. seen_mask is already [B, V] from
+        # the torch.stack above; scatter into it and split back.
         if any_rep_pen:
+            seen_mask.scatter_(1, tokens.unsqueeze(1), True)
             for i, rid in enumerate(request_ids):
-                self._seen_token_mask[rid][tokens[i:i+1]] = True
+                self._seen_token_mask[rid] = seen_mask[i]
 
         return tokens
 
