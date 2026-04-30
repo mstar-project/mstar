@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import threading
 import time as _time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -977,8 +978,81 @@ class Worker:
     # ASYNC_REDESIGN.md.
     # ------------------------------------------------------------------
 
+    def _pre_plan_for_speculative_batch(
+        self,
+        engine,
+        spec_node_batch: NodeBatch,
+        prev_advance_event: "threading.Event | None",
+    ) -> bool:
+        """Phase 3 double-buffer: dispatch entry point on plan_executor.
+
+        Waits on ``prev_advance_event`` — set by the GPU thread RIGHT AFTER
+        ``advance_seq_lens(prev)`` runs (~tens of µs into prev replay) —
+        rather than on the full prev_future. This is the key to overlap:
+        plan(N+1) starts as soon as alloc_manager state is post-(N), which
+        is well before replay(N)'s GPU work finishes. plan(N+1) runs
+        concurrent with the rest of replay(N)'s GPU kernels on the disjoint
+        slot's wrapper buffers. await_plan on the GPU thread should drop
+        to ~0 because plan(N+1) has finished long before replay(N+1)
+        begins.
+
+        Returns True if pre-planning was applied; False otherwise — the
+        caller submits the spec batch with plan_future regardless, so a
+        False return means the GPU thread will plan inline (no skip).
+        """
+        try:
+            if prev_advance_event is not None:
+                # Safety timeout — should fire well within 100ms in normal
+                # operation. If it doesn't (e.g., GPU thread crashed),
+                # bail out rather than block plan_executor forever.
+                if not prev_advance_event.wait(timeout=10.0):
+                    logger.warning(
+                        "Worker %s: plan_executor timed out waiting for "
+                        "prev advance_event; skipping pre-plan",
+                        self.worker_id,
+                    )
+                    self._reset_skip_plan_flags()
+                    return False
+            return engine.pre_plan_for_batch(
+                spec_node_batch,
+                prev_completion_event=None,
+            )
+        except Exception:
+            logger.exception("Worker %s: plan_executor pre-plan failed", self.worker_id)
+            self._reset_skip_plan_flags()
+            return False
+
+    def _reset_skip_plan_flags(self) -> None:
+        """Clear ``_skip_next_plan_attention`` on every captured graph's
+        cache_manager (every slot of every key). Used to recover from
+        speculation drops / failures where the pre-plan was dispatched but
+        the spec batch never reached the GPU thread — leaving the flag set
+        would cause the next real plan_attention call to short-circuit
+        incorrectly.
+
+        Phase 3 double-buffer: each slot has its own cache_manager with
+        its own flag, so we walk all slots.
+        """
+        for engine in set(self.engine_manager.node_to_engine.values()):
+            mgmt_dict = getattr(engine, "submodule_management", None)
+            if not mgmt_dict:
+                continue
+            for mgmt in mgmt_dict.values():
+                runner = getattr(mgmt, "cuda_graph_runner", None)
+                if runner is None:
+                    continue
+                for graph_data in runner.graphs.values():
+                    for slot in graph_data.slots:
+                        cm = slot.static_cache_manager
+                        cm._skip_next_plan_attention = False
+                        cm._plan_done_event = None
+
     def _execute_on_gpu_thread(
-        self, batch: ScheduledBatch, node_batch: NodeBatch
+        self,
+        batch: ScheduledBatch,
+        node_batch: NodeBatch,
+        plan_future: Future | None = None,
+        advance_event: "threading.Event | None" = None,
     ) -> NodeOutput:
         """Run the engine on the GPU executor thread.
 
@@ -1008,6 +1082,19 @@ class Worker:
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
+        # Phase 3: wait for the plan_executor's pre-planned wrapper.plan()
+        # call to finish before running this batch — its results land on the
+        # captured graph's persistent wrapper, and the next call to
+        # cache_manager.plan_attention will see _skip_next_plan_attention=True
+        # only because plan_executor set the flag. Wait releases the GIL.
+        if plan_future is not None:
+            if self.enable_nvtx:
+                range_push("worker.gpu_thread.await_plan", synchronize=False)
+            try:
+                plan_future.result()
+            finally:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
         if self.enable_nvtx:
             range_push(
                 f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
@@ -1021,6 +1108,13 @@ class Worker:
                 output.completion_event = event
             return output
         finally:
+            # Phase 3 safety net: ensure advance_event fires even if the
+            # engine raised before reaching ``advance_seq_lens`` inside
+            # ``_run_basic_batched``. Without this, a plan_executor waiting
+            # on prev_advance_event would block forever on the failure
+            # path.
+            if advance_event is not None:
+                advance_event.set()
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -1770,6 +1864,37 @@ class Worker:
             "Worker %s: engine runs on dedicated GPU thread",
             self.worker_id,
         )
+        # Phase 3 (single-buffer): dedicated thread that pre-plans FlashInfer
+        # attention for the speculatively-built next batch. Runs concurrent
+        # with main thread's await_gpu (which releases the GIL), so plan()'s
+        # Python work isn't contended by main thread's fast/slow post — that
+        # contention is what made the spec-path plan_attention 2.3× slower
+        # than the fall-through path.
+        #
+        # With double-buffered wrappers (CudaGraphRunner.NUM_SLOTS=2) and
+        # advance_event signaling, plan(N+1) runs concurrent with replay(N)
+        # on the disjoint slot — the actual GPU overlap that single-buffer
+        # Phase 3 couldn't deliver. plan_executor waits on
+        # prev_advance_event (signaled right after advance_seq_lens(N) on
+        # the GPU thread, ~tens of µs into replay) instead of prev_future
+        # (which only resolves after replay completes), so plan() starts
+        # early. See ASYNC_REDESIGN.md for the design.
+        #
+        # Default ON. Set MMINF_PRE_PLAN_SPEC=0 to fall back to the
+        # double-buffer-without-pre-plan baseline (slightly slower than
+        # single-buffer Phase 1'' due to alternation overhead with no
+        # offsetting plan-overlap win).
+        pre_plan_spec = os.environ.get("MMINF_PRE_PLAN_SPEC", "1") == "1"
+        plan_executor = None
+        if pre_plan_spec:
+            plan_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"mminf-plan-{self.worker_id}"
+            )
+            logger.info(
+                "Worker %s: plan_executor enabled — speculative plan() "
+                "pre-runs on a dedicated thread",
+                self.worker_id,
+            )
         # Background postprocessing is useful for overlap, but it touches CUDA
         # tensors and tensor-manager state from a second thread. Keep it opt-in
         # while the dedicated GPU thread path is being stabilized.
@@ -1797,7 +1922,27 @@ class Worker:
                 Future,
             ]
         ] = []
-        max_consecutive_spec = int(os.environ.get("MMINF_MAX_CONSECUTIVE_SPEC_STEPS", "1"))
+        # consecutive-spec cap: the original Phase 1' design caps consecutive
+        # speculative steps at 1 to give other (node, walk) pairs a turn at
+        # the scheduler — important on multi-walk workers (Qwen-Omni's
+        # Thinker+Talker on the same worker). On single-walk workers
+        # (Orpheus LLM, Orpheus SNAC) the cap forces every other iter
+        # through MicroScheduler+build for no fairness gain — see the trace
+        # analysis: spec/fall-through alternation is the source of the
+        # plan_attention variance flagged earlier.
+        #
+        # MMINF_SPEC_PEEK_FOR_FAIRNESS=1 (default) replaces the iter-counter
+        # heuristic with a peek-based check: only break the spec chain when
+        # MicroScheduler.has_ready_excluding finds another (node, walk)
+        # ready RIGHT NOW. Single-walk workers always speculate; multi-walk
+        # workers yield only when there's actual contention. The
+        # MMINF_MAX_CONSECUTIVE_SPEC_STEPS cap is still respected as a
+        # safety ceiling for pathological cases (default 1024 ≈ unbounded
+        # for any reasonable workload).
+        max_consecutive_spec = int(os.environ.get("MMINF_MAX_CONSECUTIVE_SPEC_STEPS", "1024"))
+        spec_peek_for_fairness = (
+            os.environ.get("MMINF_SPEC_PEEK_FOR_FAIRNESS", "1") == "1"
+        )
         consecutive_spec_steps = 0
         yield_away_from_target: tuple[str, str] | None = None
 
@@ -1874,11 +2019,28 @@ class Worker:
                 # non-speculative path below (drain, then schedule).
                 speculation = None
                 yield_away_from_target = None
+                spec_plan_future: Future | None = None
                 if (
                     pending is not None
                     and self._can_speculate(pending[0])
                 ):
-                    if consecutive_spec_steps < max_consecutive_spec:
+                    # Fairness check (peek-based, replaces the old iter-
+                    # counter cap): only break the spec chain when there's
+                    # another (node, walk) actually ready to schedule on
+                    # this worker. On single-walk workers (Orpheus LLM,
+                    # Orpheus SNAC) this returns False and we always speculate.
+                    must_yield_for_fairness = (
+                        spec_peek_for_fairness
+                        and consecutive_spec_steps >= 1
+                        and self.scheduler.has_ready_excluding(
+                            self.worker_graphs_manager,
+                            (pending[0].node_name, pending[0].graph_walk),
+                        )
+                    )
+                    if (
+                        consecutive_spec_steps < max_consecutive_spec
+                        and not must_yield_for_fairness
+                    ):
                         if self.enable_nvtx:
                             range_push("worker.speculate", synchronize=False)
                         _t0 = _time.perf_counter() if phase_period else 0.0
@@ -1889,6 +2051,50 @@ class Worker:
                             _phase_record("speculate", _time.perf_counter() - _t0)
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
+                        # Phase 3 double-buffer: reserve the slot for
+                        # batch_(N+1) NOW so both pre-plan and replay (queued
+                        # below) target the SAME slot — and the OPPOSITE
+                        # slot from batch_N's in-flight replay. The
+                        # reservation lives on spec_node_batch.metadata
+                        # ['cuda_graph_slot']; the engine forwards it to
+                        # the runner.
+                        if speculation is not None:
+                            spec_batch_for_plan, spec_node_batch_for_plan, *_ = speculation
+                            engine = self.engine_manager.get_engine(
+                                spec_batch_for_plan.node_name
+                            )
+                            if hasattr(engine, "reserve_replay_slot"):
+                                engine.reserve_replay_slot(spec_node_batch_for_plan)
+                        # Kick off pre-planning on the plan_executor NOW —
+                        # its Python work runs while the main thread is in
+                        # await_gpu (releases GIL). plan_executor waits on
+                        # prev's advance_event (signaled ~tens of µs into
+                        # replay(N), right after advance_seq_lens(N)) so
+                        # plan(N+1) starts WAY BEFORE replay(N) finishes —
+                        # the actual GPU overlap that single-buffer Phase 3
+                        # couldn't deliver. plan(N+1) writes the inactive
+                        # slot's wrapper buffers; replay(N) keeps running
+                        # uncontested on the active slot.
+                        if (
+                            speculation is not None
+                            and plan_executor is not None
+                        ):
+                            spec_batch_for_plan, spec_node_batch_for_plan, *_ = speculation
+                            engine = self.engine_manager.get_engine(
+                                spec_batch_for_plan.node_name
+                            )
+                            if hasattr(engine, "pre_plan_for_batch"):
+                                prev_advance_event_for_plan: threading.Event | None = None
+                                if pending is not None:
+                                    prev_advance_event_for_plan = (
+                                        pending[1].metadata.get("advance_event")
+                                    )
+                                spec_plan_future = plan_executor.submit(
+                                    self._pre_plan_for_speculative_batch,
+                                    engine,
+                                    spec_node_batch_for_plan,
+                                    prev_advance_event_for_plan,
+                                )
                     else:
                         yield_away_from_target = (
                             pending[0].node_name,
@@ -1918,6 +2124,15 @@ class Worker:
                         # Per design: discard speculation, retry batch_N.
                         self._handle_allocation_failure(p_batch, p_node_batch)
                         speculation = None
+                        # If a pre-plan was dispatched, wait for it to finish
+                        # so its wrapper.plan() side effects don't leak into
+                        # the next iter's batch (different rids/seq_lens).
+                        # Then clear the skip flag explicitly so the next real
+                        # plan_attention call recomputes from scratch.
+                        if spec_plan_future is not None:
+                            spec_plan_future.result()
+                            self._reset_skip_plan_flags()
+                            spec_plan_future = None
                         # No in-flight GPU work now; safe to apply all
                         # pending removes.
                         self._apply_pending_removes_safe_to_drop(
@@ -1948,9 +2163,30 @@ class Worker:
                             if self.enable_nvtx:
                                 range_push("worker.submit_spec", synchronize=False)
                             _t0 = _time.perf_counter() if phase_period else 0.0
+                            # If pre-plan was dispatched but the spec_batch
+                            # composition changed (rids dropped post thread-
+                            # through), the pre-planned wrapper buffers no
+                            # longer match — fall back to inline planning by
+                            # waiting on the future and clearing the flag.
+                            plan_future_for_submit = spec_plan_future
+                            if (
+                                spec_plan_future is not None
+                                and dropped
+                            ):
+                                spec_plan_future.result()
+                                self._reset_skip_plan_flags()
+                                plan_future_for_submit = None
+                            spec_plan_future = None  # ownership transferred
+                            # Phase 3: attach a fresh advance_event to this
+                            # batch so the NEXT iter's plan_executor can
+                            # gate on advance_seq_lens(THIS batch).
+                            spec_advance_event = threading.Event()
+                            spec_node_batch.metadata["advance_event"] = spec_advance_event
                             spec_future = gpu_executor.submit(
                                 self._execute_on_gpu_thread,
                                 spec_batch, spec_node_batch,
+                                plan_future_for_submit,
+                                spec_advance_event,
                             )
                             if self.enable_nvtx:
                                 range_push("worker.gpu_submit_queued", synchronize=False)
@@ -1967,6 +2203,16 @@ class Worker:
                                 spec_batch, spec_node_batch, p_partition,
                                 spec_future,
                             )
+
+                    # Cleanup: if pre-plan was dispatched but no spec was
+                    # submitted (spec_batch fully drained, or speculation
+                    # became invalid), drain the plan future and clear the
+                    # _skip_next_plan_attention flag so the next non-spec
+                    # path's plan_attention runs from scratch.
+                    if spec_plan_future is not None:
+                        spec_plan_future.result()
+                        self._reset_skip_plan_flags()
+                        spec_plan_future = None
 
                     # Post-process N — runs concurrently with GPU(N+1)
                     # if we submitted one above.
@@ -2055,8 +2301,23 @@ class Worker:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
+                # Phase 3 double-buffer: reserve the slot on the main
+                # thread before submission so the per-key counter advances
+                # in main-thread order. Without this, the GPU thread would
+                # advance the counter at run time and races with main-
+                # thread reservations from later iters.
+                fallthrough_engine = self.engine_manager.get_engine(batch.node_name)
+                if hasattr(fallthrough_engine, "reserve_replay_slot"):
+                    fallthrough_engine.reserve_replay_slot(node_batch)
+
+                # Phase 3: attach a fresh advance_event so the next iter's
+                # plan_executor (if it speculates) can wait on this batch's
+                # advance_seq_lens.
+                fallthrough_advance_event = threading.Event()
+                node_batch.metadata["advance_event"] = fallthrough_advance_event
                 future = gpu_executor.submit(
-                    self._execute_on_gpu_thread, batch, node_batch
+                    self._execute_on_gpu_thread, batch, node_batch,
+                    None, fallthrough_advance_event,
                 )
                 _set_pending((batch, node_batch, batch_partition, future))
             except Exception:

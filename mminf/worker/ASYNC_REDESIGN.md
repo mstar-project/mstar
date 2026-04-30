@@ -275,6 +275,158 @@ that work; it just doesn't deliver wins on its own.
 The phase-timing harness is left in place (env-var-gated) so future
 attempts can be measured directly rather than guessed at.
 
+## Phase 1'' — peek-based spec fairness (SHIPPED)
+
+The original Phase 1' set `MMINF_MAX_CONSECUTIVE_SPEC_STEPS=1` to force the
+worker to alternate spec / fall-through every iter. The motivation was
+fairness across multiple `(node_name, graph_walk)` pairs on a single
+worker. On single-walk workers (Orpheus LLM, Orpheus SNAC) this only
+created waste — the fall-through path's `MicroScheduler.get_next_batch`
+returned the same batch the spec path would have, but cost a re-build.
+
+Worse, the alternation produced the cache.plan_attention variance flagged
+in the user's review (300–700 µs swing per iter). nsys shows two clean
+populations once you partition by submission path:
+
+| path | n | p50 | p95 |
+|---|---|---|---|
+| fall-through | 851 | 333 µs | 400 µs |
+| spec-submitted | 849 | **732 µs** | 1335 µs |
+
+The 2.34× delta is GIL contention between the GPU thread's plan() Python
+preamble and the main thread's fast_post/slow_post Python work — they
+overlap on the spec path but not on the fall-through path (where the
+main thread already drained `.cpu()` reads before plan() runs). Confirmed
+by re-running under Python 3.13t free-threaded: both populations collapse
+to ~330 µs identical.
+
+The shipped fix is twofold:
+1. Default cap raised to 1024 (effectively unbounded). The cap is still
+   honored as a safety ceiling but doesn't kick in for normal workloads.
+2. New `MicroScheduler.has_ready_excluding(target)` peek. When the cap
+   would otherwise bite, the worker peeks for any non-target `(node,
+   walk)` ready right now. Only break the spec chain if peek returns
+   `True`. Single-walk workers always speculate; multi-walk workers
+   yield only when there's actual contention. Toggle with
+   `MMINF_SPEC_PEEK_FOR_FAIRNESS` (default `1`).
+
+### What Phase 1'' delivers (measured)
+
+Same Orpheus single-request workload, B200, RDMA transport, steady-state
+decode after autotune (median over 1000 iters in steady state, mid-
+sequence):
+
+| | Phase 1' (cap=1) | Phase 1'' (peek-based) | Δ |
+|---|---|---|---|
+| `iter_total` p50 | 5.10 ms | **4.51 ms** | **−590 µs (−11.5 %)** |
+| `await_gpu` p50 | 3.95 ms | 3.78 ms | −170 µs |
+| `submit_spec` p50 | 0.20 ms | 0.16 ms | −40 µs |
+| `slow_post` p50 | 0.27 ms | 0.28 ms | ~0 |
+| spec ratio | 50.0 % | 100 % | every iter speculates |
+
+The cap-removal and the spec/fall plan-attention variance fix come from
+the same change.
+
+## Phase 3 — double-buffered FlashInfer wrappers + plan_executor (SHIPPED)
+
+Each `(graph_walk, requires_cfg, bs, num_tokens)` key now captures TWO
+graphs and TWO wrapper sets (`CudaGraphRunner.NUM_SLOTS = 2`). Replay
+alternates between slots so plan(N+1) on slot[(s+1)%2] runs concurrent
+with replay(N) on slot[s]. The wrapper buffers, FlashInfer workspaces,
+and pos_ids buffers are disjoint between slots; static input buffers
+(model embeddings, etc.) remain shared because preprocess writes them
+sequentially on the GPU thread.
+
+### Slot reservation (main thread)
+
+`CudaGraphData.next_slot` is incremented on the main thread at submission
+time via `engine.reserve_replay_slot(node_batch)`, which stashes the
+slot on `node_batch.metadata['cuda_graph_slot']`. Both submission paths
+reserve:
+
+1. **Speculative path.** `Worker._run_loop` calls `reserve_replay_slot`
+   on `spec_node_batch` BEFORE submitting both `pre_plan` (to
+   `plan_executor`) and replay (to `gpu_executor`), so the two
+   submissions target the same slot. The slot is the OPPOSITE of the
+   in-flight replay's slot.
+2. **Fall-through path.** Same call after `_build_node_batch`. The GPU
+   thread then reads the slot from the node_batch metadata via
+   `engine.execute_with_max_batch_size → runner.run(slot=...)`. Without
+   main-thread reservation, the GPU thread would advance the counter at
+   run time and race with main-thread reservations from later iters.
+
+### `advance_event` signaling
+
+The key correctness/perf detail: plan(N+1) reads `alloc_manager`'s
+post-(N) seq_lens, which `_run_basic_batched` updates in step 5 (Python).
+plan_executor must wait for that point — but NOT for the rest of replay(N)
+(sample, restore, completion event), or plan(N+1) starts after replay(N)
+finishes and we lose the overlap.
+
+Mechanism:
+
+- Main thread allocates `threading.Event` for each batch and stashes on
+  `node_batch.metadata['advance_event']`.
+- `_run_basic_batched` calls `advance_event.set()` immediately after
+  `static_cm.advance_seq_lens()` (step 5).
+- `_pre_plan_for_speculative_batch` waits on `prev_advance_event.wait()`
+  with a 10s safety timeout, then calls `engine.pre_plan_for_batch`.
+- `_execute_on_gpu_thread`'s finally block also calls `advance_event.set()`
+  as a safety net for the failure path (alloc fails before step 5).
+
+This wakes plan_executor ~tens of µs into replay(N), so plan(N+1)'s
+~400 µs of Python+plan_inner work overlaps with the rest of replay(N)
+(sample_and_remap ~3 ms). By the time replay(N+1) is queued behind
+sample(N), `_skip_next_plan_attention=True` and `_plan_done_event` are
+already set on the slot's cache_manager; `await_plan` on the GPU thread
+drops to **2.1 µs p50** (was 800 µs in the single-buffer attempt).
+
+### What Phase 3 delivers (measured)
+
+Same Orpheus single-request workload, B200, RDMA transport, steady-state
+decode, default config (`MMINF_PRE_PLAN_SPEC=1`):
+
+| | Phase 1'' (single-buffer) | Phase 3 (double-buffer) | Δ |
+|---|---|---|---|
+| `iter_total` p50 | 4.51 ms | **3.95 ms** | **−560 µs (−12.4%)** |
+| `await_gpu` p50 | 3.78 ms | 2.76 ms | −1020 µs |
+| `await_plan` p50 | n/a | 0.002 ms | (was 0.8 ms in single-buffer Phase 3) |
+| `cache.plan_attention.skipped_pre_planned` p50 | n/a | 352 ns | replay's plan call short-circuits |
+| `slow_post` p50 | 0.27 ms | 0.76 ms | +490 µs (regression — see below) |
+| spec ratio | 100 % | 100 % | unchanged |
+
+Cumulative from the original Phase 1' (`iter_total` 5.10 ms):
+- Phase 1' → Phase 1'' (cap-lift + peek fairness): −590 µs
+- Phase 1'' → Phase 3 (double-buffer + advance_event): −560 µs
+- **Total: 5.10 ms → 3.95 ms = −1150 µs (−22.5%)**
+
+### Memory cost
+
+Two FlashInfer workspaces + two wrapper index buffer sets + two captured
+graphs per (bs, num_tokens) bucket. For Orpheus on B200 with the default
+batch-size sweep (1, 2, 4, 8, 16, 32, 64) and a few prefill buckets:
+roughly +7 GB resident on the LLM worker (warmup_and_capture's
+`memory_allocated` delta), well within the 80 GB B200 budget.
+
+### Open: `slow_post` regression
+
+`slow_post` p50 jumped from 0.27 → 0.76 ms (+490 µs). The win on
+`await_gpu` is so large that net `iter_total` still drops 560 µs, but
+the regression eats roughly half the theoretical budget. Hypothesis:
+plan_stream's CUB-scan kernels compete with sample(N)'s tail kernels
+for SMs, delaying `output.completion_event`. The slow_post side stream's
+`wait_event(completion_event)` then takes longer before its D→H copy
+can start. Worth investigating but not blocking — the win is real and
+ships.
+
+### Disable knob
+
+`MMINF_PRE_PLAN_SPEC=0` falls back to double-buffer-without-pre-plan
+(captures still doubled, replays alternate slots, but `plan()` runs
+inline on the GPU thread). Slightly slower than single-buffer Phase 1''
+(~190 µs) due to alternation overhead with no offsetting overlap; useful
+for A/B comparisons or as a regression escape hatch.
+
 ## Open follow-ons (still on the original plan)
 
 The doc below this line is the original staged plan. Phases 0/1 now
