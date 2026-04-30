@@ -27,6 +27,7 @@ from mminf.model.qwen3_omni.components.attention import (
 )
 from mminf.model.qwen3_omni.components.moe import Qwen3OmniTalkerSparseMoeBlock
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig, TalkerTextConfig
+from mminf.utils.attention import decode_attn_nhd, fused_qk_norm_rope
 from mminf.utils.flashinfer_utils import run_rms_norm
 
 # ---------------------------------------------------------------------------
@@ -265,6 +266,7 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
         )
         self.post_attention_layernorm = Qwen3OmniRMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = Qwen3OmniMLP(hidden_size=hidden_size, intermediate_size=intermediate_size)
+        self._qkv_proj_weight: torch.Tensor | None = None
 
     def forward(self, hidden_states, cache_handle):
         residual = hidden_states
@@ -285,6 +287,16 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
+    
+    @torch.compiler.disable
+    def get_qkv_proj_weight(self) -> torch.Tensor:
+        if self._qkv_proj_weight is None:
+            attn = self.self_attn
+            self._qkv_proj_weight = torch.cat(
+                (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight),
+                dim=0,
+            ).contiguous()
+        return self._qkv_proj_weight
 
 
 class Qwen3OmniCodePredictorInnerModel(nn.Module):
@@ -482,7 +494,6 @@ class Qwen3OmniCodePredictor(nn.Module):
         n_kv_heads = first_attn.num_kv_heads
         n_q_heads = first_attn.num_heads
         head_dim = first_attn.head_dim
-        n_groups = n_q_heads // n_kv_heads
 
         # FlashInfer's rope kernels require bf16; the rest of the code
         # predictor runs at the weights' native dtype (fp32 for quality per
@@ -502,36 +513,26 @@ class Qwen3OmniCodePredictor(nn.Module):
             hidden_states = hs_flat.view(bs, seq_len, hidden_size)
 
             total_tokens = bs * seq_len
-            q = attn.q_proj(hidden_states).view(total_tokens, n_q_heads, head_dim)
-            k = attn.k_proj(hidden_states).view(total_tokens, n_kv_heads, head_dim)
-            v = attn.v_proj(hidden_states).view(total_tokens, n_kv_heads, head_dim)
+            qkv = F.linear(hidden_states, layer.get_qkv_proj_weight())
+            q_size = n_q_heads * head_dim
+            kv_size = n_kv_heads * head_dim
+            q, k, v = qkv.split((q_size, kv_size, kv_size), dim=-1)
+            q = q.view(total_tokens, n_q_heads, head_dim)
+            k = k.view(total_tokens, n_kv_heads, head_dim)
 
-            # Per-head QK-norm (matching the paged path in attention.py).
-            q = run_rms_norm(
-                q.reshape(-1, head_dim),
-                attn.q_norm.weight,
+            rope_theta = float(attn.rope_theta)
+            q = fused_qk_norm_rope(
+                q, attn.q_norm.weight,
+                pos=flat_pos,
                 eps=attn.q_norm.variance_epsilon,
-            ).view(total_tokens, n_q_heads, head_dim)
-            k = run_rms_norm(
-                k.reshape(-1, head_dim),
-                attn.k_norm.weight,
-                eps=attn.k_norm.variance_epsilon,
-            ).view(total_tokens, n_kv_heads, head_dim)
-
-            # RoPE. FlashInfer's rope kernels need bf16 input, so cast at the
-            # boundary and cast back afterwards (same pattern as
-            # BatchedCacheManager.apply_rope).
-            qk_dtype = q.dtype
-            q_rot = q.to(torch.bfloat16) if qk_dtype != torch.bfloat16 else q
-            k_rot = k.to(torch.bfloat16) if qk_dtype != torch.bfloat16 else k
-            q_rot, k_rot = self._apply_rope(
-                q_rot, k_rot, flat_pos, attn.rope_theta
+                rope_theta=rope_theta
             )
-            if qk_dtype != torch.bfloat16:
-                q = q_rot.to(qk_dtype)
-                k = k_rot.to(qk_dtype)
-            else:
-                q, k = q_rot, k_rot
+            k = fused_qk_norm_rope(
+                k, attn.k_norm.weight,
+                pos=flat_pos,
+                eps=attn.k_norm.variance_epsilon,
+                rope_theta=rope_theta
+            )
 
             q = q.view(bs, seq_len, n_q_heads, head_dim)
             k = k.view(bs, seq_len, n_kv_heads, head_dim)
@@ -543,26 +544,13 @@ class Qwen3OmniCodePredictor(nn.Module):
 
             # Read K, V for all positions up to and including the new tokens.
             valid_len = cache_pos + seq_len
-            k_full = kv_cache[layer_idx, :, 0, :valid_len]
-            v_full = kv_cache[layer_idx, :, 1, :valid_len]
+            k_full = kv_cache[layer_idx, :, 0]
+            v_full = kv_cache[layer_idx, :, 1]
 
-            # SDPA expects (bs, n_heads, seq_len, head_dim).
-            q_sdpa = q.transpose(1, 2)
-            k_sdpa = k_full.transpose(1, 2)
-            v_sdpa = v_full.transpose(1, 2)
-
-            # GQA: repeat KV heads to match Q heads.
-            if n_groups > 1:
-                k_sdpa = k_sdpa.repeat_interleave(n_groups, dim=1)
-                v_sdpa = v_sdpa.repeat_interleave(n_groups, dim=1)
-
-            # is_causal=True for the 2-token prefill so the first token only
-            # attends to itself; is_causal=False for single-token decode
-            # where the lone query implicitly attends to all valid past K/V.
-            attn_out = F.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa, is_causal=(seq_len > 1),
+            attn_out = decode_attn_nhd(
+                q, k_full, v_full, valid_len
             )
-            attn_out = attn_out.transpose(1, 2).reshape(bs, seq_len, -1).contiguous()
+            attn_out = attn_out.reshape(bs, seq_len, -1)
             hidden_states = residual + attn.o_proj(attn_out)
 
             # Post-attention RMSNorm + dense MLP.
