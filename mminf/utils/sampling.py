@@ -16,6 +16,7 @@ Usage:
 """
 
 from dataclasses import asdict, dataclass, field
+from typing import Callable
 
 import torch
 import triton
@@ -202,6 +203,7 @@ class Sampler:
     # per request
     _sampling_config: dict[str, SamplingConfig] = field(default_factory=dict)
     _seen_token_mask: dict[str, torch.Tensor]= field(default_factory=dict)
+    _autotune_sync_budget_remaining: int = 64
 
     def add_request(self, request_id: str):
         self._sampling_config[request_id] = SamplingConfig()
@@ -263,6 +265,7 @@ class Sampler:
             any_greedy=any_greedy,
             any_top_k_zero=any_top_k_zero,
             all_top_k_zero=all_top_k_zero,
+            consume_autotune_sync_budget=self._consume_autotune_sync_budget,
         )
 
         # TODO: make this scatter async. Currently runs 2 kernels per rid
@@ -281,6 +284,12 @@ class Sampler:
                 self._seen_token_mask[rid][tokens[i:i+1]] = True
 
         return tokens
+
+    def _consume_autotune_sync_budget(self) -> None:
+        if self._autotune_sync_budget_remaining <= 0:
+            return
+        torch.cuda.current_stream().synchronize()
+        self._autotune_sync_budget_remaining -= 1
 
 
 @torch.compiler.disable
@@ -328,6 +337,7 @@ def sample_tokens(
     any_greedy: bool | None = None,
     any_top_k_zero: bool | None = None,
     all_top_k_zero: bool | None = None,
+    consume_autotune_sync_budget: Callable[[], None] | None = None,
 ) -> torch.Tensor:
     """Sample tokens from logits with temperature, top-k, top-p, and repetition penalty.
 
@@ -373,7 +383,19 @@ def sample_tokens(
             seen_mask=seen_token_mask,
             include_greedy=run_greedy,
         )
-        torch.cuda.current_stream().synchronize()
+        # Budgeted current-stream sync between fused-softmax and FlashInfer
+        # top-p sampling. The original unconditional sync was added to fix
+        # a Qwen sampling issue caused by Triton-autotune timing on first
+        # calls (see git history of this file). After autotune warms up
+        # both kernels run on the same default stream and stream ordering
+        # already serializes them — at that point the sync is pure overhead
+        # AND it blocks the same-thread async path from overlapping
+        # post-processing with the just-submitted GPU(N+1) work (see
+        # worker.run + ASYNC_REDESIGN.md). The budget is owned by each
+        # Sampler instance so co-located Thinker/Talker/code-predictor
+        # samplers cannot consume one another's warmup protection.
+        if consume_autotune_sync_budget is not None:
+            consume_autotune_sync_budget()
         result = flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
         return result[0] if isinstance(result, tuple) else result
 

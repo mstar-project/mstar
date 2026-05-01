@@ -1,8 +1,8 @@
 import glob
 import json
 import os
-from abc import ABC, abstractmethod
 import wave
+from abc import ABC, abstractmethod
 
 import numpy as np
 import requests
@@ -315,10 +315,10 @@ class LibriSpeechDataset(BaseDataset):
         raw = raw.select(range(min(100, len(raw))))
 
         self.items: list[RequestInput] = []
-        
+
         for i, row in enumerate(raw):
             dec: AudioDecoder = row["audio"]
-            
+
             # Decode all frames → shape (num_channels, num_samples), float32
             frames = dec.get_all_samples()
             audio_data = frames.data  # torch.Tensor
@@ -326,7 +326,7 @@ class LibriSpeechDataset(BaseDataset):
 
             # Convert to int16 PCM for WAV
             audio_np = (audio_data.numpy() * 32767).clip(-32768, 32767).astype(np.int16)
-            
+
             # WAV expects interleaved (num_samples, num_channels), then flatten
             audio_interleaved = audio_np.T.flatten()
 
@@ -427,7 +427,8 @@ class Food101Dataset(BaseDataset):
                 )
             else:
                 # Save image to a temp file so downstream code has a stable path
-                import os, tempfile
+                import os
+                import tempfile
                 tmp_dir = tempfile.mkdtemp(prefix="food101_")
                 img_path = os.path.join(tmp_dir, f"{label}_{len(self.items)}.jpg")
                 image.save(img_path)
@@ -486,10 +487,10 @@ class UCF101Dataset(BaseDataset):
         assert req_type.get_input_modalities() == "video", (
             f"UCF101Dataset requires a video input RequestType, got {req_type}"
         )
+        import torch
         from datasets import load_dataset
         from torchcodec.decoders import VideoDecoder
         from torchcodec.encoders import VideoEncoder
-        import torch
 
         self._num_requests = num_requests
         self.prompt = prompt
@@ -510,7 +511,7 @@ class UCF101Dataset(BaseDataset):
             dec = iter(dec)
 
             frames = []
-            
+
             while True:
                 try:
                     frame = next(dec)
@@ -522,7 +523,7 @@ class UCF101Dataset(BaseDataset):
                     break
             assert len(frames) > 0
             frames = torch.stack(frames)
-            
+
             video_path = os.path.join(self.local_file_dir, f"ucf101_{i:05d}.mp4")
 
             encoder = VideoEncoder(frames=frames, frame_rate=fps)

@@ -1,6 +1,5 @@
 import struct
 
-
 SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
 SAMPLE_WIDTH = 2  # int16 = 2 bytes

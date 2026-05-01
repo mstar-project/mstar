@@ -21,6 +21,7 @@ branch.
 from __future__ import annotations
 
 import logging
+
 import torch
 
 from mminf.communication.tensors import NameToTensorList
@@ -120,7 +121,7 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
             tuple(inp.tensor_inputs["video_frames"].shape) for inp in model_inputs
         }
         return len(shapes) == 1
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -471,7 +472,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
             len(enc_shapes) == 1
             and len(iters) == 1
         )
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -490,7 +491,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
-        
+
         return {
             "encoder_hidden": torch.cat([
                 inp.input_embeds for inp in inputs
@@ -539,7 +540,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         request_info = engine_inputs.single_request_info
 
         iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
-        
+
         logger.info(
             "VJepa2RolloutPredictorSubmodule.forward: iter=%d encoder_hidden=%s",
             iter_idx,
@@ -570,7 +571,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
             "encoder_hidden": [next_encoder_hidden],
             "predicted_hidden": [predicted],
         }
-    
+
     def forward_batched(
         self,
         graph_walk: str,
@@ -664,13 +665,13 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> ARNodeInputs:
-        
+
         encoder_hidden = _ensure_lead_batch_dim(inputs["encoder_hidden"][0], 3)
-        
+
         tensor_inputs = {}
         tensor_inputs["actions"] = _ensure_lead_batch_dim(inputs["actions"][0], 3)
         tensor_inputs["states"] = _ensure_lead_batch_dim(inputs["states"][0], 3)
-        
+
         if "extrinsics" in inputs:
             tensor_inputs["extrinsics"] = _ensure_lead_batch_dim(inputs["extrinsics"][0], 3)
 
@@ -678,7 +679,7 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
             input_embeds=encoder_hidden,
             tensor_inputs=tensor_inputs
         )
-    
+
     def preprocess(
         self,
         graph_walk: str,
@@ -722,7 +723,7 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
             extrinsics = extrinsics.unsqueeze(0)
         predicted = self.predictor(encoder_hidden, actions, states, extrinsics=extrinsics)
         return {"predicted_hidden": [predicted]}
-    
+
     def forward_batched(
         self,
         graph_walk: str,
@@ -734,7 +735,7 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
         **kwargs, # coming from preprocess output
     )  -> dict[str, NameToTensorList]:
         request_ids = engine_inputs.request_ids
-        
+
         if encoder_hidden.size(0) != len(request_ids):
             raise ValueError(
                 f"encoder_hidden batch dim {encoder_hidden.size(0)} does not "
@@ -868,7 +869,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             and len(ext_shapes) == 1
             and len(iters) == 1
         )
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -876,13 +877,13 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> ARNodeInputs:
-        
+
         encoder_hidden = _ensure_lead_batch_dim(inputs["encoder_hidden"][0], 3)
-        
+
         tensor_inputs = {}
         tensor_inputs["actions"] = _ensure_lead_batch_dim(inputs["actions"][0], 3)
         tensor_inputs["states"] = _ensure_lead_batch_dim(inputs["states"][0], 3)
-        
+
         if "extrinsics" in inputs:
             tensor_inputs["extrinsics"] = _ensure_lead_batch_dim(inputs["extrinsics"][0], 3)
 
@@ -890,7 +891,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             input_embeds=encoder_hidden,
             tensor_inputs=tensor_inputs
         )
-    
+
     def preprocess(
         self,
         graph_walk: str,
@@ -913,7 +914,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 inp.tensor_inputs["extrinsics"] for inp in inputs
             ], dim=0)
         return out
-    
+
     def _rollout_step(
         self,
         encoder_hidden: torch.Tensor,   # [B, N, D]
@@ -1042,7 +1043,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         extrinsics: torch.Tensor | None = None,
         **kwargs, # coming from preprocess output
     )  -> dict[str, NameToTensorList]:
-        
+
         request_ids = engine_inputs.request_ids
         per_request_info = engine_inputs.per_request_info
 
@@ -1138,23 +1139,23 @@ class VJepa2MPCPredictorSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> ARNodeInputs:
-        
+
         enc = inputs["encoder_hidden"][0]
         actions = inputs["actions"][0]
         states = inputs["states"][0]
-        
+
         tensor_inputs: dict[str, torch.Tensor] = {
             "actions": actions,
             "states": states,
         }
         if "extrinsics" in inputs:
             tensor_inputs["extrinsics"] = inputs["extrinsics"][0]
-        
+
         return ARNodeInputs(
             input_embeds=enc,
             tensor_inputs=tensor_inputs
         )
-    
+
     def preprocess(
         self,
         graph_walk: str,
@@ -1246,7 +1247,7 @@ class VJepa2MPCScorerSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        
+
         return NodeInputs(
             tensor_inputs={
                 "predicted_hidden": inputs["predicted_hidden"][0],
@@ -1288,7 +1289,7 @@ class VJepa2MPCScorerSubmodule(NodeSubmodule):
         raise ValueError(
             f"Unknown mpc_cost_fn {fn!r}; expected one of 'l1', 'l2', 'cosine'."
         )
-        
+
     def forward(
         self,
         graph_walk: str,

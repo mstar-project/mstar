@@ -43,9 +43,8 @@ from pathlib import Path
 import numpy as np
 import requests
 import torch
-from PIL import Image
-
 from _env import get_server_url
+from PIL import Image
 
 # These constants must match Pi0.5's defaults / lerobot/pi05_base.
 ACTION_HORIZON = 50

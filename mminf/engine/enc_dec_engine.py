@@ -110,7 +110,7 @@ class EncoderDecoderEngine(BaseEngine):
             with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
                 with torch.no_grad():
                     if self.enable_nvtx:
-                        range_push("engine.enc_dec.prepare_inputs", synchronize=True)
+                        range_push("engine.enc_dec.prepare_inputs", synchronize=False)
                     node_inputs: list[NodeInputs] = []
                     for rid in batch.request_ids:
                         node_inputs.append(
@@ -121,7 +121,7 @@ class EncoderDecoderEngine(BaseEngine):
                             )
                         )
                     if self.enable_nvtx:
-                        range_pop(synchronize=True)
+                        range_pop(synchronize=False)
 
                     if submodule.can_batch(batch, node_inputs):
                         output = self._execute_batched(batch, node_inputs, submodule)

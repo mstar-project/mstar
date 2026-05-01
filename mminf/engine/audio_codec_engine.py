@@ -159,7 +159,7 @@ class AudioCodecEngine(BaseEngine):
         )
 
         if self.enable_nvtx:
-            range_push("codec.batched.preprocess", synchronize=True)
+            range_push("codec.batched.preprocess", synchronize=False)
         packed = submodule.preprocess(
             graph_walk=batch.graph_walk,
             engine_inputs=engine_inputs,
@@ -185,7 +185,7 @@ class AudioCodecEngine(BaseEngine):
         """Execute each request individually."""
         outputs = {}
         for i, rid in enumerate(batch.request_ids):
-            inputs = batch.per_request_input_tensors.get(rid, {})
+            node_input = inputs[i]
 
             fwd_info = batch.per_request_info[rid]
             engine_inputs = ModelInputsFromEngine(
@@ -194,15 +194,15 @@ class AudioCodecEngine(BaseEngine):
             )
 
             if self.enable_nvtx:
-                range_push(f"codec.preprocess.{i}", synchronize=True)
+                range_push(f"codec.preprocess.{i}", synchronize=False)
             preprocessed = submodule.preprocess(
                 batch.graph_walk,
                 engine_inputs=engine_inputs,
-                inputs=inputs,
+                inputs=[node_input],
             )
             if self.enable_nvtx:
-                range_pop(synchronize=True)
-    
+                range_pop(synchronize=False)
+
             if self.enable_nvtx:
                 range_push(f"codec.forward.{i}")
             outputs[rid] = submodule.forward(

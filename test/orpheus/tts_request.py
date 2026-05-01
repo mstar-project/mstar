@@ -13,9 +13,9 @@ import io
 import json
 import struct
 import sys
-from _env import get_server_url
 
 import requests
+from _env import get_server_url
 
 SAMPLE_RATE = 24000
 NUM_CHANNELS = 1

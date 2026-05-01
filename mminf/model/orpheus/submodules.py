@@ -11,10 +11,8 @@ from mminf.engine.base import NodeBatch
 from mminf.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
 from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
-from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
-from mminf.model.submodule_base import NodeInputs
-from mminf.utils.profiler import range_pop, range_push
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +81,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
             ),
         ]
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -95,25 +93,42 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             input_ids=inputs["text_inputs"][0],
             input_seq_len=inputs["text_inputs"][0].shape[0]
         )
-    
+
     def preprocess(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        cache_manager = engine_inputs.cache_manager
+        enable_nvtx = bool(getattr(cache_manager, "enable_nvtx", False))
+        if enable_nvtx:
+            from mminf.utils.profiler import range_pop, range_push
+
+            range_push("orpheus.preprocess.seq_lens", synchronize=False)
         seq_lens = [
             inp.input_seq_len for inp in inputs
         ]
-        cache_manager = engine_inputs.cache_manager
+        if enable_nvtx:
+            range_pop(synchronize=False)
         # Plan attention and rope for the main cache label
+        if enable_nvtx:
+            range_push("orpheus.preprocess.set_active_label", synchronize=False)
         cache_manager.set_active_label("main")
+        if enable_nvtx:
+            range_pop(synchronize=False)
         cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
         cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
-        return {
-            "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
-        }
-    
+        if enable_nvtx:
+            range_push("orpheus.preprocess.pack_inputs", synchronize=False)
+        try:
+            return {
+                "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
+            }
+        finally:
+            if enable_nvtx:
+                range_pop(synchronize=False)
+
     def forward(
         self,
         graph_walk: str,
@@ -134,7 +149,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             )
         else:
             raise ValueError(f"Unknown graph walk for OrpheusLLM: {graph_walk!r}")
-        
+
     def _forward_prefill(
         self,
         text_inputs: torch.Tensor,
@@ -244,21 +259,32 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         }
         out["__batched_logits__"] = logits
         return out
-    
+
     def postprocess(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
+        # Metadata-only: rebind output name for graph routing. EOS check
+        # moved to check_stop so the GPU thread doesn't sync on .item() here.
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
+
+    def check_stop(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> set[str]:
+        if "new_token" not in outputs:
+            return set()
         token = outputs["new_token"][0].item()
         eos_token_id = self.config.stop_token_id
         if (eos_token_id is not None and eos_token_id == token) or \
                 (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
-            request_info.register_loop_stop("decode_loop")
+            return {"decode_loop"}
+        return set()
 
 
 class SNACDecoderSubmodule(NodeSubmodule):
@@ -306,7 +332,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
                 capture_batch_sizes=[1, 2, 4, 8, 16],
             ),
         ]
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -328,7 +354,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             input_ids=self._tokens_to_codes(tokens),
             input_seq_len=tokens.shape[0]
         )
-    
+
     def can_batch(self, batch: NodeBatch, inputs: list[ARNodeInputs]) -> bool:
         return len({
             input.input_seq_len for input in inputs
@@ -351,7 +377,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             "codes_1": codes_1.reshape(B, N * 8),
             "codes_2": codes_2.reshape(B, N * 16),
         }
-    
+
     def forward(
         self,
         graph_walk: str,
@@ -366,7 +392,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         ]
         audio_int16 = (audio_slice.clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": audio_int16.squeeze(1)}
-    
+
     def forward_batched(
         self,
         graph_walk: str,

@@ -61,6 +61,14 @@ class GraphEdge:
     output_modality: str = field(default="")  # text | image | video | audio
     _persist_for_loop: bool = field(default=False)
 
+    def clone_for_next_iter(self) -> "GraphEdge":
+        """Fresh copy with empty tensor_info; same routing/flags. Preserves
+        subclass type (e.g. StreamingGraphEdge). Used by the worker's async-
+        scheduling path to build the next loop-iter's GraphNode without
+        sharing output edge state with the in-flight step."""
+        import dataclasses
+        return dataclasses.replace(self, tensor_info=[])
+
 
 # Two different ways of defining graph edges
 DestToGraphEdges = dict[str, list[GraphEdge]]
@@ -156,6 +164,7 @@ class GraphNode(GraphSection):
     # submodule).  Must be disjoint from ``input_ids``.
     optional_input_ids: set[str] = field(default_factory=set)
     consumes_stream: bool = field(default=False)
+    enable_async_scheduling: bool = True
     _streaming_inputs: set[str] = field(default_factory=set)
     _split_off_for_streaming: bool = field(default=False)
 
@@ -247,6 +256,22 @@ class GraphNode(GraphSection):
     def clear_outputs(self):
         for edge in self.outputs:
             edge.tensor_info.clear()
+
+    def clone_for_next_iter(self) -> "GraphNode":
+        """Fresh GraphNode for the next loop iter — same shape, no
+        ready_inputs, fresh output edges (with empty tensor_info). Used by
+        the worker's async-scheduling path to speculatively build batch_N+1
+        while batch_N is still in flight on the GPU thread."""
+        clone = GraphNode(
+            name=self.name,
+            input_ids=set(self.input_ids),
+            outputs=[edge.clone_for_next_iter() for edge in self.outputs],
+            optional_input_ids=set(self.optional_input_ids),
+            consumes_stream=self.consumes_stream,
+            enable_async_scheduling=self.enable_async_scheduling,
+        )
+        clone._streaming_inputs = set(self._streaming_inputs)
+        return clone
 
 
 @dataclass

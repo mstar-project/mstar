@@ -4,7 +4,7 @@ from enum import Enum
 
 import torch
 
-from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule
+from mminf.model.submodule_base import ARNodeInputs
 
 
 class CudaGraphConfigType(Enum):
@@ -33,7 +33,7 @@ class CudaGraphConfig(ABC):
         self.labels = labels or ["main"]
         self.compile = compile
         self.capture_batch_sizes = capture_batch_sizes
-    
+
     @abstractmethod
     def get_config_type(self) -> CudaGraphConfigType:
         pass
@@ -63,10 +63,10 @@ class BasicBatchedCudaGraphConfig(CudaGraphConfig):
             capture_batch_sizes=capture_batch_sizes
         )
         self.single_request_inputs = single_request_inputs
-    
+
     def get_config_type(self) -> CudaGraphConfigType:
         return CudaGraphConfigType.BASIC_BATCHED
-    
+
     def get_total_tokens(self, bs: int) -> list[int]:
         return [self.single_request_inputs.input_seq_len * bs]
 

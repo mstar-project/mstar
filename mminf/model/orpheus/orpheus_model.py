@@ -33,8 +33,8 @@ from mminf.engine.base import EngineType
 from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, GraphSection, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model
-from mminf.model.submodule_base import NodeSubmodule
 from mminf.model.orpheus.config import OrpheusModelConfig
+from mminf.model.submodule_base import NodeSubmodule
 from mminf.streaming.chunk_policy import SlidingWindowChunkPolicy
 from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 from mminf.utils.sampling import SamplingConfig
@@ -365,7 +365,7 @@ class OrpheusModel(Model):
                 unpersist_tensors=[],
             )
         raise ValueError(f"Unknown partition: {partition_name!r}")
-    
+
     def get_sampling_config(
         self, node_name: str,
         model_kwargs: dict | None = None,

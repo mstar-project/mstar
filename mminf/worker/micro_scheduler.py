@@ -121,6 +121,9 @@ class MicroScheduler:
         self,
         worker_graphs_manager: WorkerGraphsManager,
         max_batch_size: int | None = None,
+        target_node_name: str | None = None,
+        target_graph_walk: str | None = None,
+        exclude_target: tuple[str, str] | None = None,
     ) -> ScheduledBatch | None:
         """
         Scans all worker graph queues for ready nodes.
@@ -129,6 +132,9 @@ class MicroScheduler:
         Args:
             max_batch_size: If set, limit the number of requests in the batch.
                 Useful for CUDA graph compatibility (must match captured sizes).
+            target_node_name: If set, only schedule this node name.
+            target_graph_walk: If set, only schedule this graph walk.
+            exclude_target: If set, skip this (node_name, graph_walk) pair.
         """
         # Collect all ready (node_name, request_id, graph_walk) tuples
         # grouped by node name
@@ -149,8 +155,14 @@ class MicroScheduler:
                 if request_id in self.held_until:
                     continue
                 for sname in node_names:
+                    if target_node_name is not None and sname != target_node_name:
+                        continue
                     node_partition = worker_graphs_manager.get_partition_for_node(sname)
                     graph_walk = worker_graphs_manager.get_graph_walk(request_id, node_partition)
+                    if target_graph_walk is not None and graph_walk != target_graph_walk:
+                        continue
+                    if exclude_target is not None and (sname, graph_walk) == exclude_target:
+                        continue
                     fwd_info = worker_graphs_manager.get_fwd_info(request_id, node_partition)
                     # check if the node is ready on the engine level
                     # (e.g., for AR, whether the kv cache is read in)

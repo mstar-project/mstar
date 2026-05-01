@@ -24,10 +24,15 @@ from torch import nn
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
-from mminf.engine.cuda_graph_config import BasicBatchedCudaGraphConfig, CudaGraphConfig, CudaGraphConfigType, FlashInferPackedCudaGraphConfig
+from mminf.engine.cuda_graph_config import (
+    BasicBatchedCudaGraphConfig,
+    CudaGraphConfig,
+    CudaGraphConfigType,
+    FlashInferPackedCudaGraphConfig,
+)
 from mminf.engine.kv_store import KVCacheConfig, PagedAllocationManager
-from mminf.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, ARNodeSubmodule, NodeSubmodule
-from mminf.utils.profiler import range_pop, range_push
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
+from mminf.utils.profiler import mark, range_pop, range_push
 from mminf.utils.sampling import Sampler
 
 logger = logging.getLogger(__name__)
@@ -228,6 +233,7 @@ class CudaGraphRunner:
                     max_num_pages=cfg.max_num_pages,
                     device=self.device,
                     use_cuda_graph=True,
+                    enable_nvtx=self.enable_nvtx,
                 )
             else:
                 wrapper = FlashInferPrefillWrapper(
@@ -241,6 +247,7 @@ class CudaGraphRunner:
                     max_num_pages=cfg.max_num_pages,
                     device=self.device,
                     use_cuda_graph=True,
+                    enable_nvtx=self.enable_nvtx,
                 )
 
             # Static pos_ids buffer for RoPE
@@ -254,7 +261,7 @@ class CudaGraphRunner:
             )
 
         return plan_states
-    
+
     def _make_dummy_rids(self, config: CudaGraphConfig, bs: int):
         dummy_rids = [f"__cg_{config.capture_graph_walk}_{config.requires_cfg}_{i}__"
                       for i in range(bs)]
@@ -263,12 +270,12 @@ class CudaGraphRunner:
         for rid in dummy_rids:
             self.alloc_manager.add_request(rid, labels=config.labels)
         return dummy_rids
-    
+
     def _free_dummy_rids(self, config: CudaGraphConfig, dummy_rids: list[str]):
         for rid in dummy_rids:
             for label in config.labels:
                 self.alloc_manager.reset_label(rid, label, free=True)
-    
+
     def _intern_static_buffer(
         self, config_idx: int, key: str, value: torch.Tensor,
     ) -> torch.Tensor:
@@ -305,7 +312,7 @@ class CudaGraphRunner:
         sliced = shared[:leading]
         sliced.copy_(value)
         return sliced
-    
+
     def _create_cache_mgr_and_dummy_engine_inputs(
         self, dummy_rids, plan_states,
         config: CudaGraphConfig
@@ -320,7 +327,8 @@ class CudaGraphRunner:
             kv_cache_config=self.kv_cache_config,
             device=self.device,
             cuda_graph_plan_states=plan_states,
-            auto_write_store=False
+            auto_write_store=False,
+            enable_nvtx=self.enable_nvtx,
         )
         # Build per-request metadata
         dummy_metadata = {
@@ -340,7 +348,7 @@ class CudaGraphRunner:
             per_request_info=dummy_metadata,
             cache_manager=cache_manager
         )
-    
+
     def _make_dummy_seq_lens(
         self, bs: int,
         total_tokens: int, # total tokens per batch
@@ -349,7 +357,7 @@ class CudaGraphRunner:
         seq_lens = [total_tokens // bs] * bs
         seq_lens[0] += total_tokens % bs
         return seq_lens
-    
+
     def _postprocess_cuda_graph_output(
         self, output, config: CudaGraphConfig,
         key: CudaGraphKey, graph, static_inputs,
@@ -458,7 +466,7 @@ class CudaGraphRunner:
                     mode="max-autotune-no-cudagraphs",
                     fullgraph=False,
                     dynamic=False,
-                )                
+                )
 
             def run_forward():
                 return forward(
@@ -466,7 +474,7 @@ class CudaGraphRunner:
                     engine_inputs=engine_inputs,
                     **templates
                 )
-            
+
             torch.cuda.set_device(self.device)
             # Warmup: 2 forward passes
             torch.cuda.synchronize()
@@ -502,7 +510,7 @@ class CudaGraphRunner:
             )
 
         finally:
-            self._free_dummy_rids(config, dummy_rids)   
+            self._free_dummy_rids(config, dummy_rids)
 
 
     def _capture_one_basic_batched(
@@ -535,7 +543,7 @@ class CudaGraphRunner:
                     self.submodule_name, config.capture_graph_walk,
                 )
                 return
-            
+
             dummy_inputs = [template.clone() for _ in dummy_rids]
 
             plan_states = self._create_persistent_wrappers(
@@ -583,7 +591,7 @@ class CudaGraphRunner:
                     mode="max-autotune-no-cudagraphs",
                     fullgraph=False,
                     dynamic=False,
-                )                
+                )
 
             def run_forward():
                 return forward(
@@ -630,7 +638,7 @@ class CudaGraphRunner:
                 },
                 cache_manager=cache_manager, bs=bs
             )
-           
+
         finally:
             self._free_dummy_rids(config, dummy_rids)
 
@@ -646,7 +654,7 @@ class CudaGraphRunner:
             batch_size, num_tokens,
             graph_walk, requires_cfg,
         ) is not None
-    
+
     def _get_key_for(
         self,
         batch_size: int,
@@ -697,7 +705,7 @@ class CudaGraphRunner:
         if idx >= len(sizes):
             return None
         return sizes[idx]
-    
+
     def _get_padded_num_tokens(
         self,
         num_tokens: int,
@@ -789,7 +797,10 @@ class CudaGraphRunner:
 
         # --- Step 1: Swap real request states onto dummy slots ---
         if self.enable_nvtx:
-            range_push("cg.swap_states", synchronize=True)
+            mark("gpu_thread.preprocess_start")
+            range_push("gpu_thread.preprocess", synchronize=False)
+        if self.enable_nvtx:
+            range_push("cg.swap_states", synchronize=False)
         for i, rid in enumerate(request_ids):
             dummy_rid = dummy_rids[i]
             for label in config_labels:
@@ -804,17 +815,23 @@ class CudaGraphRunner:
             for label in config_labels:
                 self.alloc_manager.get_state(dummy_rid, label)
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
         # --- Step 2: Pad inputs to padded_bs and re-plan via preprocess ---
         if self.enable_nvtx:
-            range_push("cg.preprocess_replan", synchronize=True)
+            range_push("cg.preprocess_replan", synchronize=False)
+        if self.enable_nvtx:
+            range_push("cg.preprocess_replan.pad_inputs", synchronize=False)
         real_inputs = list(inputs)
         # Padding slots reuse the capture_template so submodule.preprocess sees the
         # same input shape it saw at capture time and doesn't crash on missing keys.
         for _i in range(real_bs, padded_bs):
             real_inputs.append(capture_template.clone())
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
 
+        if self.enable_nvtx:
+            range_push("cg.preprocess_replan.metadata", synchronize=False)
         real_metadata = self._build_replay_metadata(
             dummy_rids, request_ids, real_bs,
             per_request_info, static["dummy_metadata"],
@@ -824,17 +841,22 @@ class CudaGraphRunner:
             per_request_info=real_metadata,
             cache_manager=static_cm,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            range_push("cg.preprocess_replan.submodule_preprocess", synchronize=False)
         real_inputs = submodule.preprocess(
             graph_walk=key.graph_walk,
             engine_inputs=engine_inputs,
             inputs=real_inputs,
         )
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
 
         # --- Step 3: Copy real packed tensors into static buffers ---
         if self.enable_nvtx:
-            range_push("cg.copy_inputs", synchronize=True)
+            range_push("cg.copy_inputs", synchronize=False)
         for k in static_input_keys:
             real_val = real_inputs.get(k)
             if real_val is None or not isinstance(real_val, torch.Tensor):
@@ -842,29 +864,38 @@ class CudaGraphRunner:
             static_buf = preprocessed[k]
             static_buf[:real_val.shape[0]].copy_(real_val)
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.preprocess_end")
 
         # --- Step 4: Replay ---
         if self.enable_nvtx:
-            range_push("cg.replay")
+            mark("gpu_thread.cuda_graph_start")
+            range_push("gpu_thread.cuda_graph", synchronize=False)
+            range_push("cg.replay", synchronize=False)
         graph.replay()
         if self.enable_nvtx:
-            range_pop()
+            range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.cuda_graph_end")
 
         # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
         # advance_seq_lens is not captured in the graph; we call it manually so
         # the real states (aliased onto dummy slots) move forward.
         if self.enable_nvtx:
-            range_push("cg.advance_seq_lens", synchronize=True)
+            mark("gpu_thread.postprocess_start")
+            range_push("gpu_thread.postprocess", synchronize=False)
+        if self.enable_nvtx:
+            range_push("cg.advance_seq_lens", synchronize=False)
         for label in config_labels:
             static_cm.set_active_label(label)
             static_cm.advance_seq_lens()
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
         # --- Step 6: Sample logits and remap dummy → real outputs ---
         if self.enable_nvtx:
-            range_push("cg.sample_and_remap", synchronize=True)
+            range_push("cg.sample_and_remap", synchronize=False)
         outputs = self._sample_and_remap(
             request_ids=request_ids,
             dummy_rids=dummy_rids,
@@ -875,7 +906,7 @@ class CudaGraphRunner:
             inputs=inputs,
         )
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
         # --- Step 7: Restore dummy states ---
         self._restore_dummy_states(
@@ -885,6 +916,9 @@ class CudaGraphRunner:
             config_labels=config_labels,
             static_cm=static_cm,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            mark("gpu_thread.postprocess_end")
 
         return outputs
 
@@ -921,7 +955,10 @@ class CudaGraphRunner:
 
         # --- Step 1: Swap real request states onto dummy slots ---
         if self.enable_nvtx:
-            range_push("cg.swap_states", synchronize=True)
+            mark("gpu_thread.preprocess_start")
+            range_push("gpu_thread.preprocess", synchronize=False)
+        if self.enable_nvtx:
+            range_push("cg.swap_states", synchronize=False)
         for i, rid in enumerate(request_ids):
             dummy_rid = dummy_rids[i]
             for label in config_labels:
@@ -934,11 +971,13 @@ class CudaGraphRunner:
             for label in config_labels:
                 self.alloc_manager.get_state(dummy_rid, label)
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
         # --- Step 2: Build padded per-request inputs and re-plan via preprocess ---
         if self.enable_nvtx:
-            range_push("cg.preprocess_replan", synchronize=True)
+            range_push("cg.preprocess_replan", synchronize=False)
+        if self.enable_nvtx:
+            range_push("cg.preprocess_replan.pad_inputs", synchronize=False)
         # Unlike basic_matched, prefill captures don't expose a capture_template
         # ARNodeInputs (the config provides post-preprocess packed dicts instead).
         # Synthesize zero-length ARNodeInputs from the first real input's shape so
@@ -951,7 +990,11 @@ class CudaGraphRunner:
             else:
                 zero_padding_inp = zero_padding_inp.clone()
             padded_inputs.append(zero_padding_inp)
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
 
+        if self.enable_nvtx:
+            range_push("cg.preprocess_replan.metadata", synchronize=False)
         real_metadata = self._build_replay_metadata(
             dummy_rids, request_ids, real_bs,
             per_request_info, static["dummy_metadata"],
@@ -961,17 +1004,22 @@ class CudaGraphRunner:
             per_request_info=real_metadata,
             cache_manager=static_cm,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            range_push("cg.preprocess_replan.submodule_preprocess", synchronize=False)
         real_packed = submodule.preprocess(
             graph_walk=key.graph_walk,
             engine_inputs=engine_inputs,
             inputs=padded_inputs,
         )
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
 
         # --- Step 3: Copy real packed tensors into static buffers ---
         if self.enable_nvtx:
-            range_push("cg.copy_inputs", synchronize=True)
+            range_push("cg.copy_inputs", synchronize=False)
         for k in static_input_keys:
             real_val = real_packed.get(k)
             if real_val is None or not isinstance(real_val, torch.Tensor):
@@ -979,27 +1027,36 @@ class CudaGraphRunner:
             static_buf = templates[k]
             static_buf[:real_val.shape[0]].copy_(real_val)
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.preprocess_end")
 
         # --- Step 4: Replay ---
         if self.enable_nvtx:
-            range_push("cg.replay")
+            mark("gpu_thread.cuda_graph_start")
+            range_push("gpu_thread.cuda_graph", synchronize=False)
+            range_push("cg.replay", synchronize=False)
         graph.replay()
         if self.enable_nvtx:
-            range_pop()
+            range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.cuda_graph_end")
 
         # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
         if self.enable_nvtx:
-            range_push("cg.advance_seq_lens", synchronize=True)
+            mark("gpu_thread.postprocess_start")
+            range_push("gpu_thread.postprocess", synchronize=False)
+        if self.enable_nvtx:
+            range_push("cg.advance_seq_lens", synchronize=False)
         for label in config_labels:
             static_cm.set_active_label(label)
             static_cm.advance_seq_lens()
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
         # --- Step 6: Sample logits and remap dummy → real outputs ---
         if self.enable_nvtx:
-            range_push("cg.sample_and_remap", synchronize=True)
+            range_push("cg.sample_and_remap", synchronize=False)
         outputs = self._sample_and_remap(
             request_ids=request_ids,
             dummy_rids=dummy_rids,
@@ -1010,7 +1067,7 @@ class CudaGraphRunner:
             inputs=inputs,
         )
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
         # --- Step 7: Restore dummy states ---
         self._restore_dummy_states(
@@ -1020,6 +1077,9 @@ class CudaGraphRunner:
             config_labels=config_labels,
             static_cm=static_cm,
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            mark("gpu_thread.postprocess_end")
 
         return outputs
 
@@ -1104,7 +1164,7 @@ class CudaGraphRunner:
         """Reset every dummy slot's per-label state and flush real-request KV
         writes to the store for any label whose plan_state had write_store enabled."""
         if self.enable_nvtx:
-            range_push("cg.restore_states", synchronize=True)
+            range_push("cg.restore_states", synchronize=False)
         for i, rid in enumerate(dummy_rids):
             for label in config_labels:
                 self.alloc_manager.reset_label(
@@ -1116,7 +1176,7 @@ class CudaGraphRunner:
                 if ps is not None and ps.write_store:
                     self.alloc_manager.flush_to_store(rid, label)
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
     def _sample_and_remap(
         self,
@@ -1423,7 +1483,7 @@ class CodecCudaGraphRunner:
                 )
             static_inputs[name] = torch.zeros(t.shape, dtype=t.dtype, device=self.device)
             static_inputs[name].copy_(t)
-        
+
         fwd = submodule.forward_batched
         if config.compile:
             fwd = torch.compile(
@@ -1518,17 +1578,19 @@ class CodecCudaGraphRunner:
         )
 
         if self.enable_nvtx:
-            range_push("codec_cg.preprocess", synchronize=True)
+            mark("gpu_thread.preprocess_start")
+            range_push("gpu_thread.preprocess", synchronize=False)
+            range_push("codec_cg.preprocess", synchronize=False)
         packed = submodule.preprocess(
             graph_walk=graph_walk,
             engine_inputs=engine_inputs,
             inputs=inputs,
         )
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
         if self.enable_nvtx:
-            range_push("codec_cg.copy_inputs", synchronize=True)
+            range_push("codec_cg.copy_inputs", synchronize=False)
         for name, real_val in packed.items():
             static_buf = static_inputs.get(name)
             if static_buf is None:
@@ -1539,13 +1601,19 @@ class CodecCudaGraphRunner:
             static_buf.zero_()
             static_buf[:actual_bs].copy_(real_val)
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.preprocess_end")
 
         if self.enable_nvtx:
-            range_push("codec_cg.replay")
+            mark("gpu_thread.cuda_graph_start")
+            range_push("gpu_thread.cuda_graph", synchronize=False)
+            range_push("codec_cg.replay", synchronize=False)
         self.graphs[key].replay()
         if self.enable_nvtx:
-            range_pop()
+            range_pop(synchronize=False)
+            range_pop(synchronize=False)
+            mark("gpu_thread.cuda_graph_end")
 
         if not isinstance(static_output, dict):
             raise TypeError(
@@ -1553,10 +1621,18 @@ class CodecCudaGraphRunner:
                 f"(got {type(static_output).__name__}) so outputs can be split per request"
             )
 
-        return {
+        if self.enable_nvtx:
+            mark("gpu_thread.postprocess_start")
+            range_push("gpu_thread.postprocess", synchronize=False)
+        outputs = {
             rid: {
                 name: [
                     tensor.clone() for tensor in static_output[dummy_rids[i]][name]
                 ] for name in static_output[dummy_rids[i]]
             } for i, rid in enumerate(request_ids)
         }
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            mark("gpu_thread.postprocess_end")
+
+        return outputs

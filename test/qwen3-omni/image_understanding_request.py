@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 import requests
-
 from _env import get_server_url
+
 URL = get_server_url()
 
 IMAGE_PATH = "test/bagel/bagel.png"

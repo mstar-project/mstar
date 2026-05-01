@@ -63,7 +63,8 @@ class BatchedCacheManager:
         kv_cache_config: KVCacheConfig,
         device,
         cuda_graph_plan_states: dict[str, _PlanState] | None = None,
-        auto_write_store: bool=False
+        auto_write_store: bool=False,
+        enable_nvtx: bool=False,
     ):
         self.request_ids = request_ids
         self.active_labels = active_labels_per_request  # {req_id: label}
@@ -73,6 +74,7 @@ class BatchedCacheManager:
         self.kv_cache_config = kv_cache_config
         self.device = device
         self.layer_idx = 0
+        self.enable_nvtx = enable_nvtx
 
         self.auto_write_store = auto_write_store
 
@@ -150,6 +152,32 @@ class BatchedCacheManager:
             is_causal: whether attention is causal.
             label: cache label to plan for. If None, uses the current active label.
         """
+        from mminf.utils.profiler import range_pop, range_push
+
+        if self.enable_nvtx:
+            range_push("cache.plan_attention", synchronize=False)
+        try:
+            self._plan_attention_impl(
+                seq_lens=seq_lens,
+                dtype=dtype,
+                is_causal=is_causal,
+                write_store=write_store,
+                label=label,
+            )
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+
+    def _plan_attention_impl(
+        self,
+        seq_lens: list[int] | None = None,
+        dtype: torch.dtype | None = None,
+        is_causal=True,
+        write_store: bool=True,
+        label: str | None = None,
+    ):
+        from mminf.utils.profiler import range_pop, range_push
+
         assert self.kv_cache is not None
 
         # Default the FlashInfer wrapper's dtype to whatever dtype the KV
@@ -180,32 +208,63 @@ class BatchedCacheManager:
         # We only need the four int32 tensors the FlashInfer wrapper consumes,
         # so do the arithmetic in pure Python and send them over in one H2D
         # each.
-        qo_indptr_list = [0]
-        kv_indptr_list = [0]
-        all_page_indices = []
-        kv_last_page_lens = []
+        if self.enable_nvtx:
+            range_push("cache.plan_attention.build_lists", synchronize=False)
+        try:
+            qo_indptr_list = [0]
+            kv_indptr_list = [0]
+            all_page_indices = []
+            kv_last_page_lens = []
+            kv_cache_locations_list = []
 
-        for i, rid in enumerate(self.request_ids):
-            state = self._get_state(rid, effective_label)
-            sl = seq_lens[i]
-            total_len = state.seq_len + sl
+            for i, rid in enumerate(self.request_ids):
+                state = self._get_state(rid, effective_label)
+                sl = seq_lens[i]
+                total_len = state.seq_len + sl
 
-            self.alloc_manager.alloc(
-                rid, label=effective_label, seq_len=total_len
+                self.alloc_manager.alloc(
+                    rid, label=effective_label, seq_len=total_len
+                )
+
+                qo_indptr_list.append(qo_indptr_list[-1] + sl)
+                all_page_indices.extend(state.page_indices)
+                kv_indptr_list.append(kv_indptr_list[-1] + len(state.page_indices))
+
+                last_page_len = total_len % page_size or page_size
+                kv_last_page_lens.append(last_page_len)
+                if sl == 1:
+                    kv_cache_locations_list.append([state.page_indices[-1], last_page_len - 1])
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+
+        # Build batched FlashInfer index tensors on CPU so wrapper.plan()
+        # doesn't trigger a synchronous D→H inside its body. FlashInfer
+        # calls ``indptr.to("cpu")`` / ``last_page_len.to("cpu")`` near the
+        # top of ``plan()`` to get host views of those metadata tensors;
+        # if we hand them GPU tensors that ``.to("cpu")`` becomes a
+        # synchronous default-stream sync that waits for the entire
+        # outstanding stream — including the speculatively-queued next
+        # decode step. By creating these on CPU directly, ``.to("cpu")``
+        # is a no-op. FlashInfer later copies the tiny int32 metadata to
+        # the device when it needs it; the source is pageable CPU memory, so
+        # ``non_blocking=True`` does not make that H2D copy asynchronous, but
+        # the tensors are batch-size length and the cost is inconsequential.
+        if self.enable_nvtx:
+            range_push("cache.plan_attention.make_tensors", synchronize=False)
+        try:
+            qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
+            paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
+            paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
+            paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
+            kv_cache_locations = (
+                torch.tensor(kv_cache_locations_list, dtype=torch.long)
+                if len(kv_cache_locations_list) == len(self.request_ids)
+                else None
             )
-
-            qo_indptr_list.append(qo_indptr_list[-1] + sl)
-            all_page_indices.extend(state.page_indices)
-            kv_indptr_list.append(kv_indptr_list[-1] + len(state.page_indices))
-
-            last_page_len = total_len % page_size or page_size
-            kv_last_page_lens.append(last_page_len)
-
-        # Build batched FlashInfer index tensors (one H2D per tensor).
-        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32, device=device)
-        paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32, device=device)
-        paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32, device=device)
-        paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32, device=device)
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
 
         is_decode = all([sl == 1 for sl in seq_lens])
@@ -219,7 +278,8 @@ class BatchedCacheManager:
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
                 page_size=page_size,
-                device=self.device
+                device=self.device,
+                enable_nvtx=self.enable_nvtx,
             )
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[effective_label] = ps
@@ -230,7 +290,8 @@ class BatchedCacheManager:
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
                 page_size=page_size,
-                device=self.device
+                device=self.device,
+                enable_nvtx=self.enable_nvtx,
             )
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[effective_label] = ps
@@ -273,22 +334,29 @@ class BatchedCacheManager:
         #   * If sample(N) ever runs shorter than plan(N+1) (short prefill,
         #     very small batch), the main thread waits. Still no worse than
         #     today.
-        if isinstance(wrapper, FlashInferDecodeWrapper):
-            wrapper.plan(
-                paged_kv_indptr=paged_kv_indptr,
-                paged_kv_indices=paged_kv_indices,
-                paged_kv_last_page_len=paged_kv_last_page_len,
-                dtype=dtype,
-            )
-        else:
-            wrapper.plan(
-                qo_indptr=qo_indptr,
-                paged_kv_indptr=paged_kv_indptr,
-                paged_kv_indices=paged_kv_indices,
-                paged_kv_last_page_len=paged_kv_last_page_len,
-                causal=is_causal,
-                dtype=dtype,
-            )
+        if self.enable_nvtx:
+            range_push("cache.plan_attention.wrapper_plan", synchronize=False)
+        try:
+            if isinstance(wrapper, FlashInferDecodeWrapper):
+                wrapper.plan(
+                    paged_kv_indptr=paged_kv_indptr,
+                    paged_kv_indices=paged_kv_indices,
+                    paged_kv_last_page_len=paged_kv_last_page_len,
+                    kv_cache_locations=kv_cache_locations,
+                    dtype=dtype,
+                )
+            else:
+                wrapper.plan(
+                    qo_indptr=qo_indptr,
+                    paged_kv_indptr=paged_kv_indptr,
+                    paged_kv_indices=paged_kv_indices,
+                    paged_kv_last_page_len=paged_kv_last_page_len,
+                    causal=is_causal,
+                    dtype=dtype,
+                )
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
         # seq_lens is read by the flush_to_store path; write_store by
         # run_attention. The page_indices / page_offsets / token_offsets /
         # per_req_page_indices fields were legacy bookkeeping and had no
@@ -313,6 +381,24 @@ class BatchedCacheManager:
                 each request's position_id_start.
             label: cache label. If None, uses the current active label.
         """
+        from mminf.utils.profiler import range_pop, range_push
+
+        if self.enable_nvtx:
+            range_push("cache.plan_rope", synchronize=False)
+        try:
+            self._plan_rope_impl(seq_lens=seq_lens, pos_ids=pos_ids, label=label)
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+
+    def _plan_rope_impl(
+        self,
+        seq_lens: list[int],
+        pos_ids: torch.Tensor | None = None,
+        label: str | None = None,
+    ):
+        from mminf.utils.profiler import range_pop, range_push
+
         effective_label = label
         if effective_label is None:
             labels = list(self.active_labels.values())
@@ -327,20 +413,32 @@ class BatchedCacheManager:
             # CPU-accumulate the position list (1 int per output token) and
             # do a single H2D at the end. The old `torch.cat([torch.arange(...)
             # + start for ...])` launched 2 GPU kernels per request.
-            pos_ids_list: list[int] = []
-            for rid, sl in zip(self.request_ids, seq_lens, strict=True):
-                start = self._get_state(rid, effective_label).position_id_start
-                pos_ids_list.extend(range(start, start + sl))
-            computed_pos_ids = torch.tensor(
-                pos_ids_list, dtype=torch.long, device=self.device,
-            )
+            if self.enable_nvtx:
+                range_push("cache.plan_rope.build_pos_ids", synchronize=False)
+            try:
+                pos_ids_list: list[int] = []
+                for rid, sl in zip(self.request_ids, seq_lens, strict=True):
+                    start = self._get_state(rid, effective_label).position_id_start
+                    pos_ids_list.extend(range(start, start + sl))
+                computed_pos_ids = torch.tensor(
+                    pos_ids_list, dtype=torch.long, device=self.device,
+                )
+            finally:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
 
         if self._cuda_graph_mode:
             # Update static buffer via .copy_() for CUDA graph compatibility
             ps = self._plan_states[effective_label]
             if ps.pos_ids is not None:
                 n = computed_pos_ids.shape[0]
-                ps.pos_ids[:n].copy_(computed_pos_ids)
+                if self.enable_nvtx:
+                    range_push("cache.plan_rope.copy_pos_ids", synchronize=False)
+                try:
+                    ps.pos_ids[:n].copy_(computed_pos_ids)
+                finally:
+                    if self.enable_nvtx:
+                        range_pop(synchronize=False)
             else:
                 ps.pos_ids = computed_pos_ids
         else:
@@ -403,18 +501,14 @@ class BatchedCacheManager:
                 kv_last_page_lens.append(last_page_len)
                 combined_seq_lens.append(sl)
 
-        qo_indptr = torch.tensor(
-            qo_indptr_list, dtype=torch.int32, device=device
-        )
-        paged_kv_indptr = torch.tensor(
-            kv_indptr_list, dtype=torch.int32, device=device
-        )
-        paged_kv_indices = torch.tensor(
-            all_page_indices, dtype=torch.int32, device=device
-        )
-        paged_kv_last_page_len = torch.tensor(
-            kv_last_page_lens, dtype=torch.int32, device=device
-        )
+        # CPU tensors — see comment in ``plan_attention`` above. FlashInfer
+        # async-H2Ds these inside ``plan()``; passing GPU tensors would
+        # trigger a synchronous default-stream sync via the internal
+        # ``.to("cpu")`` call.
+        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
+        paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
+        paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
+        paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
 
         wrapper = FlashInferPrefillWrapper(
             workspace_buffer=self.buffer_manager.get(combined_label),
@@ -422,6 +516,7 @@ class BatchedCacheManager:
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             page_size=page_size,
+            enable_nvtx=self.enable_nvtx,
         )
 
         wrapper.plan(
@@ -510,7 +605,7 @@ class BatchedCacheManager:
         """
         if layer_idx is None:
             layer_idx = self.layer_idx
-        
+
         orig_dtype = q.dtype
 
         labels = list(self.active_labels.values())

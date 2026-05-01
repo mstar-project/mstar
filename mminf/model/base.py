@@ -263,7 +263,7 @@ class Model(ABC):
         model_kwargs: dict | None = None,
     )  -> SamplingConfig | None:
         return SamplingConfig()
-        
+
 
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

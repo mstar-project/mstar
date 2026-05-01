@@ -144,6 +144,7 @@ class AREngine(BaseEngine):
             kv_cache_config=cache_mgmt.kv_cache_config,
             device=self.device,
             auto_write_store=autowrite,
+            enable_nvtx=self.enable_nvtx,
         )
 
     def _compile_submodules(self) -> None:
@@ -244,14 +245,14 @@ class AREngine(BaseEngine):
             cache_manager=cache_manager
         )
         if self.enable_nvtx:
-            range_push("ar.batched.preprocess", synchronize=True)
+            range_push("ar.batched.preprocess", synchronize=False)
         preprocessed = submodule.preprocess(
             graph_walk=batch.graph_walk,
             engine_inputs=engine_inputs,
             inputs=inputs,
         )
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
         if self.enable_nvtx:
             range_push("ar.batched.forward")
@@ -272,7 +273,7 @@ class AREngine(BaseEngine):
         batched_logits = batched_output.pop("__batched_logits__", None)
 
         if self.enable_nvtx:
-            range_push("ar.batched.sample", synchronize=True)
+            range_push("ar.batched.sample", synchronize=False)
         if batched_logits is not None:
             sampler = self.submodule_management[batch.node_name].sampler
             sampled = sampler.sample(batch.request_ids, batched_logits)
@@ -285,7 +286,7 @@ class AREngine(BaseEngine):
             output = NodeOutput(per_request_output_tensors=batched_output)
             output = self._sample_decode_outputs(batch.node_name, output)
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
         # Apply per-rid output filter so submodules that emit a static set
         # of keys for CUDA-graph capture compat (e.g. Qwen3-Omni Thinker
@@ -320,14 +321,14 @@ class AREngine(BaseEngine):
             )
 
             if self.enable_nvtx:
-                range_push("ar.seq.preprocess", synchronize=True)
+                range_push("ar.seq.preprocess", synchronize=False)
             preprocessed = submodule.preprocess(
                 batch.graph_walk,
                 engine_inputs=engine_inputs,
                 inputs=[node_inputs],
             )
             if self.enable_nvtx:
-                range_pop(synchronize=True)
+                range_pop(synchronize=False)
 
             if self.enable_nvtx:
                 range_push("ar.seq.forward")
@@ -343,13 +344,13 @@ class AREngine(BaseEngine):
             per_request_outputs[rid] = output
 
         if self.enable_nvtx:
-            range_push("ar.seq.sample", synchronize=True)
+            range_push("ar.seq.sample", synchronize=False)
         output = NodeOutput(per_request_output_tensors=per_request_outputs)
         output = self._sample_decode_outputs(
             batch.node_name, output
         )
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
         return output
 
     def _can_use_cuda_graph(self, batch: NodeBatch, inputs: list[ARNodeInputs]) -> bool:
@@ -428,7 +429,7 @@ class AREngine(BaseEngine):
             cache_mgmt.alloc_manager.alloc_status.reset()
             try:
                 if self.enable_nvtx:
-                    range_push("ar.kv_sync_retrieve", synchronize=True)
+                    range_push("ar.kv_sync_retrieve", synchronize=False)
                 for req_id, info in batch.per_request_info.items():
                     for label, seq_info in info.per_label_seq_info.get(kv_cache_string).items():
                         if needed_labels is not None and label not in needed_labels:
@@ -437,16 +438,16 @@ class AREngine(BaseEngine):
                             req_id, label, seq_info
                         )
                 if self.enable_nvtx:
-                    range_pop(synchronize=True)
+                    range_pop(synchronize=False)
 
                 if self.enable_nvtx:
-                    range_push("ar.sampler_config", synchronize=True)
+                    range_push("ar.sampler_config", synchronize=False)
                 for rid, info in batch.per_request_info.items():
                     sampling_config = info.sampling_config.get(batch.node_name)
-                    sampling_config = {} if sampling_config is None else asdict(sampling_config) 
+                    sampling_config = {} if sampling_config is None else asdict(sampling_config)
                     submod_mgmt.sampler.set_config(rid, **sampling_config)
                 if self.enable_nvtx:
-                    range_pop(synchronize=True)
+                    range_pop(synchronize=False)
 
                 with torch.no_grad():
                     with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
@@ -471,34 +472,34 @@ class AREngine(BaseEngine):
                         # Priority: CUDA graph > batched > sequential
                         if self._can_use_cuda_graph(batch, node_inputs):
                             if self.enable_nvtx:
-                                range_push("ar.cuda_graph_path", synchronize=True)
+                                range_push("ar.cuda_graph_path", synchronize=False)
                             try:
                                 output = self._execute_with_cuda_graph(
                                     batch, submodule, node_inputs
                                 )
                             finally:
                                 if self.enable_nvtx:
-                                    range_pop(synchronize=True)
+                                    range_pop(synchronize=False)
                         elif submodule.can_batch(batch, node_inputs):
                             if self.enable_nvtx:
-                                range_push("ar.batched_path", synchronize=True)
+                                range_push("ar.batched_path", synchronize=False)
                             try:
                                 output = self._execute_batched(
                                     batch, submodule, node_inputs
                                 )
                             finally:
                                 if self.enable_nvtx:
-                                    range_pop(synchronize=True)
+                                    range_pop(synchronize=False)
                         else:
                             if self.enable_nvtx:
-                                range_push("ar.sequential_path", synchronize=True)
+                                range_push("ar.sequential_path", synchronize=False)
                             try:
                                 output = self._execute_sequential(
                                     batch, submodule, node_inputs
                                 )
                             finally:
                                 if self.enable_nvtx:
-                                    range_pop(synchronize=True)
+                                    range_pop(synchronize=False)
                         for rid, info in batch.per_request_info.items():
                             submodule.postprocess(
                                 request_id=rid,
@@ -590,6 +591,28 @@ class AREngine(BaseEngine):
         if not ar_ready:
             return False
         return super().check_ready(node_name, request_id, request_info)
+
+    def check_stop_for_batch(
+        self, batch: NodeBatch, output: NodeOutput
+    ) -> dict[str, set[str]]:
+        """Delegate to each rid's submodule.check_stop. Worker calls this on
+        the slow-postprocess path so the .item() / .cpu() reads no longer
+        block ``execute_batch`` on the GPU thread."""
+        if batch.node_name not in self.submodule_management:
+            return {}
+        submodule = self.submodule_management[batch.node_name].submodule
+        result: dict[str, set[str]] = {}
+        for rid in batch.request_ids:
+            req_outputs = output.per_request_output_tensors.get(rid, {})
+            if not req_outputs:
+                continue
+            req_info = batch.per_request_info.get(rid)
+            if req_info is None:
+                continue
+            stops = submodule.check_stop(rid, req_info, req_outputs)
+            if stops:
+                result[rid] = stops
+        return result
 
     def add_request(
         self, request_id: str, cache_labels: list[str] | None = None,

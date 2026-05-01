@@ -21,12 +21,12 @@ from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.cuda_graph_config import BasicBatchedCudaGraphConfig, FlashInferPackedCudaGraphConfig
-from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mminf.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mminf.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mminf.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mminf.model.pi05.components.siglip import Pi05SiglipEncoder
 from mminf.model.pi05.config import Pi05Config
+from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
@@ -287,10 +287,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
     ) -> list[str] | None:
         return ["main"]
 
-    # ------------------------------------------------------------------
-    # preprocess
-    # ------------------------------------------------------------------
-
     def _get_timestep_emb_fraction(self) -> torch.Tensor:
         if self._fraction is not None:
             return self._fraction
@@ -307,33 +303,10 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         )
         return self._fraction
 
-    def preprocess(
-        self,
-        graph_walk: str,
-        per_request_inputs: list[NameToTensorList],
-        request_ids: list[str],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        cache_manager: BatchedCacheManager,
-    ) -> dict[str, torch.Tensor]:
-        if graph_walk == "prefill":
-            return self._preprocess_prefill(
-                per_request_inputs=per_request_inputs,
-                request_ids=request_ids,
-                cache_manager=cache_manager,
-            )
-        if graph_walk == "action_gen":
-            return self._preprocess_action_gen(
-                per_request_inputs=per_request_inputs,
-                request_ids=request_ids,
-                per_request_info=per_request_info,
-                cache_manager=cache_manager,
-            )
-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
-
     def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
         emb = self.embed_tokens(ids)
         return emb * self._text_embed_scale
-    
+
     def get_cuda_graph_configs(
         self, device: torch.device,
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
@@ -369,7 +342,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
             ),
         ]
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -387,7 +360,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                 fwd_info=fwd_info,
             )
         raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
-    
+
     def _prepare_inputs_prefill(
         self,
         inputs: NameToTensorList,
@@ -417,7 +390,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         seq_len = prefix_emb.shape[0]
 
         return ARNodeInputs(input_embeds=prefix_emb, input_seq_len=seq_len)
-    
+
     def _prepare_inputs_action_gen(
         self,
         fwd_info: CurrentForwardPassInfo,
@@ -439,12 +412,12 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             ts = inputs["timestep_index"][0]
 
         seq_len = action_horizon
-        return ARNodeInputs(input_seq_len=seq_len, 
+        return ARNodeInputs(input_seq_len=seq_len,
                             tensor_inputs={
                                 "noisy_actions": noisy,
                                 "ts": ts
                             })
-    
+
 
     def preprocess(
         self,
@@ -452,7 +425,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        
+
         if graph_walk == "prefill":
             return self._preprocess_prefill(
                 inputs=inputs,
@@ -463,7 +436,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                 inputs=inputs,
                 cache_manager=engine_inputs.cache_manager,
             )
-        
+
     def _preprocess_prefill(
         self,
         inputs: list[ARNodeInputs],
@@ -472,7 +445,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         per_request_seqs = [inp.input_embeds for inp in inputs]
         prefix_embs = torch.cat(per_request_seqs, dim=0)
         seq_lens = [inp.input_seq_len for inp in inputs]
-        
+
         # Bidirectional attention over the prefix; PaliGemma is a prefix-LM.
         cache_manager.plan_attention(
             seq_lens=seq_lens, is_causal=False, label="main", dtype=torch.bfloat16
@@ -599,7 +572,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, NameToTensorList]:
         """Batched action_gen: single action expert forward, then split per-request."""
 
-        horizon = self.config.action_horizon        
+        horizon = self.config.action_horizon
 
         next_actions, next_index = self._euler_step(
             noisy_actions, timestep_index,

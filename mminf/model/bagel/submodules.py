@@ -3,12 +3,9 @@
 # ---------------------------------------------------------------------------
 
 
-from dataclasses import asdict
 import logging
 from typing import Any
 
-from mminf.engine.kv_store import PositionInfo
-from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, StackingMethod
 import torch
 from torch import nn
 
@@ -18,6 +15,7 @@ from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
 from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
+from mminf.engine.kv_store import PositionInfo
 from mminf.model.bagel.components.language_model import BagelForCausalLM
 from mminf.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -27,7 +25,14 @@ from mminf.model.bagel.components.modeling_utils import (
     patchify,
 )
 from mminf.model.bagel.config import BagelModelConfig
-from mminf.model.submodule_base import NodeSubmodule
+from mminf.model.submodule_base import (
+    ARNodeInputs,
+    ARNodeSubmodule,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+    StackingMethod,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +63,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
         self.transform = ImageTransform(980, 224, 14)
         self.vae_transform = ImageTransform(1024, 512, 16)
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -109,7 +114,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         }
         return NodeInputs(tensor_inputs=tensor_inputs, kwargs=kwargs)
 
-    
+
     def forward(
         self,
         engine_inputs: ModelInputsFromEngine,
@@ -483,7 +488,7 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         pos_info: dict[str, PositionInfo] = {},
     ) -> ARNodeInputs:
-        
+
         device = self.get_device()
         node_inputs = ARNodeInputs(input_seq_len=0)
 
@@ -502,7 +507,7 @@ class LLMSubmodule(ARNodeSubmodule):
             node_inputs.input_seq_len = seq_len
 
             labels = ["main", "cfg_text", "cfg_img"] # just return all labels since it is cheap
-            
+
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
                 labels, pos_info, device, seq_len
             )
@@ -544,16 +549,16 @@ class LLMSubmodule(ARNodeSubmodule):
                 **tensor_inputs,
                 **self._get_text_vae_idxs(seq_len, device)
             }
-        
+
         return node_inputs
-    
+
     def preprocess(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        
+
         """Data transform + plan attention/rope for all relevant labels.
 
         When cache_handle is provided (sequential execution), calls
@@ -577,12 +582,12 @@ class LLMSubmodule(ARNodeSubmodule):
                     if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
             ] for label in labels
         }
-        
+
         result = {}
 
 
         if graph_walk in ("image_gen", "image_gen_cfg"):
-            assert len(inputs) == 1 , "Batching not supported for image gen" 
+            assert len(inputs) == 1 , "Batching not supported for image gen"
 
         if graph_walk == "image_gen" and requires_cfg:
             # Batched CFG: plan a single FlashInfer batch across all 3 labels
@@ -645,14 +650,14 @@ class LLMSubmodule(ARNodeSubmodule):
             )
 
     def forward(
-        self, 
+        self,
         graph_walk: str,
-        engine_inputs: ModelInputsFromEngine, 
+        engine_inputs: ModelInputsFromEngine,
         **kwargs
     ) -> NameToTensorList:
 
         request_info = engine_inputs.single_request_info
-        cache_handle = engine_inputs.cache_manager 
+        cache_handle = engine_inputs.cache_manager
         kwargs.update(request_info.step_metadata)
 
         logger.debug("Running BAGEL LLM for graph walk %s", graph_walk)
@@ -1050,9 +1055,9 @@ class LLMSubmodule(ARNodeSubmodule):
         )
 
     def forward_batched(
-        self, 
+        self,
         graph_walk: str,
-        engine_inputs: ModelInputsFromEngine, 
+        engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor,
         requires_cfg: bool=False,
         **kwargs
@@ -1184,13 +1189,22 @@ class LLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
+
+    def check_stop(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> set[str]:
+        if "new_token" not in outputs:
+            return set()
         token = outputs["new_token"][0].item()
         if (self.eos_token_id is not None and self.eos_token_id == token) or \
                 (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
-            request_info.register_loop_stop("decode_loop")
+            return {"decode_loop"}
+        return set()
 
 
-class VAEDecoderSubmodule(NodeSubmodule): 
+class VAEDecoderSubmodule(NodeSubmodule):
     """VAE decoder: latent grid -> pixel image."""
 
     def __init__(
@@ -1205,7 +1219,7 @@ class VAEDecoderSubmodule(NodeSubmodule):
         self.latent_patch_size = latent_patch_size
         self.latent_channel = latent_channel
         self.latent_downsample = latent_downsample
-    
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -1260,7 +1274,7 @@ class VAEDecoderSubmodule(NodeSubmodule):
         return {"image_output": [image]}
 
 
-class CombineCFGSubmodule(NodeSubmodule): 
+class CombineCFGSubmodule(NodeSubmodule):
     """Lightweight node: applies CFG formula + Euler step.
 
     Receives 3 velocity tensors (v_main, v_cfg_text, v_cfg_img) plus
@@ -1315,7 +1329,7 @@ class CombineCFGSubmodule(NodeSubmodule):
             tensor_inputs=result,
             kwargs=kwargs
         )
-        
+
     def forward(
         self,
         graph_walk: str,

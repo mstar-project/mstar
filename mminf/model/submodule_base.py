@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -13,6 +13,9 @@ from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.kv_store import PositionInfo
+
+if TYPE_CHECKING:
+    from mminf.engine.cuda_graph_config import CudaGraphConfig
 
 
 @dataclass
@@ -105,7 +108,7 @@ class ARNodeInputs(NodeInputs):
                     out[k] = maybe_stack(v, stacking_method)
 
         return dict(out)
-    
+
     def clone(self):
         custom_pos_ids = self.custom_pos_ids
         if isinstance(custom_pos_ids, torch.Tensor):
@@ -203,7 +206,7 @@ class NodeSubmodule(torch.nn.Module):
         model_inputs: list[NodeInputs],
     ):
         return False # batching disabled by default
-    
+
     # Note: do not import CudaGraphConfig; it causes a circular import situation
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         """TODO: add cuda graph support for pi05.
@@ -234,19 +237,48 @@ class NodeSubmodule(torch.nn.Module):
         **kwargs
     ):
         """
-        Performs any required postprocessing (after sampling from logits, if applicable)
-        on the submodule outputs (e.g., checking for EOS to stop the decode loop, as this
-        python-level control flow cannot happen in a cuda graph section).
+        Metadata-only postprocessing on the submodule outputs.
 
-        E.g., submodules that always emit a static set of keys for capture
-        compatibility can override this to drop keys on a per-request basis
-        (e.g. the Qwen3-Omni Thinker always emits ``thinker_states`` inside
-        the graph, then drops it here for requests that don't need audio).
+        Runs on the GPU thread inside ``execute_batch``. **Must not read tensor
+        values** — no ``.item()`` / ``.cpu()`` / ``.tolist()`` etc. — because
+        any sync here blocks the GPU thread and forfeits the worker's async-
+        scheduling overlap. Stop-condition decisions that need token values
+        (e.g. EOS) belong in ``check_stop``.
 
-        This function modifies the `outputs` dict in-place and returns nothing.
+        Typical uses:
+          - rebind output names for graph routing (``outputs["text_inputs"] =
+            outputs["new_token"]``);
+          - drop keys on a per-request basis for static-capture submodules
+            (e.g. Qwen3-Omni Thinker dropping ``thinker_states`` for requests
+            that don't need audio).
+
+        Modifies ``outputs`` in-place; returns nothing.
         """
         return
-    
+
+    def check_stop(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> set[str]:
+        """
+        Return the set of dynamic-loop names that should stop after this step.
+
+        Runs on the worker's slow-postprocess path *after* ``execute_batch``
+        returns — never inside ``execute_batch``. **Allowed** to read tensor
+        values (``.item()`` / ``.cpu()``) because by this point the GPU
+        thread is no longer blocked by it.
+
+        Stops returned here are deferred by one step: they apply to the
+        worker's *next* iter's fast postprocess. The current in-flight step
+        (already submitted under the assumption that the rid continues)
+        will run for that rid and its output discarded — the standard
+        1-wasted-step cost for any stop signal.
+
+        Default: no stops.
+        """
+        return set()
+
     def cleanup_request(self, request_id: str):
         """Remove per-request state when a request completes."""
         return
@@ -265,7 +297,7 @@ class ARNodeSubmodule(NodeSubmodule):
 
     # We are setting preprocess to be abstract here when it was not abstract
     # in the base NodeSubmodule class because the default behavior for preprocess
-    # there is not valid in the AR case (batching should typically be enabled, and 
+    # there is not valid in the AR case (batching should typically be enabled, and
     # preprocess should be implemented). This "making a method abstract in the
     # subclass but not base class" behavior is supported by Python's abc module.
     @abstractmethod
@@ -288,7 +320,7 @@ class ARNodeSubmodule(NodeSubmodule):
         Override in subclasses that only need a subset of available labels.
         """
         return None
-    
+
     def filter_batched_output(
         self,
         request_info: CurrentForwardPassInfo,

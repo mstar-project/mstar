@@ -6,7 +6,7 @@ class ChunkPolicy(ABC):
     def __init__(self):
         self.first_chunk_read = False
         self.items_consumed = 0
-    
+
     def register_chunk(self, chunk_size: int):
         self.first_chunk_read = True
         self.items_consumed += chunk_size
