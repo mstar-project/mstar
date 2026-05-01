@@ -128,16 +128,12 @@ class ZMQCommunicator(BaseCommunicator):
         messages = []
         while True:
             try:
-                if blocking:
-                    messages.append(self.pull_socket.recv_pyobj())
-                    blocking = False
-                else:
-                    # zmq.NOBLOCK means zmq doesn't wait for a new message to be
-                    # available, it returns a message if it exists or raises an error
-                    # if no messages are available (error is caught below)
-                    messages.append(self.pull_socket.recv_pyobj(
-                        flags=zmq.NOBLOCK
-                    ))
+                # zmq.NOBLOCK means zmq doesn't wait for a new message to be
+                # available, it returns a message if it exists or raises an error
+                # if no messages are available (error is caught below)
+                messages.append(self.pull_socket.recv_pyobj(
+                    flags=zmq.NOBLOCK
+                ))
                 logger.debug(
                     "%s to received message %s",
                     self.my_id, str(messages[-1])
