@@ -1,6 +1,6 @@
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from mminf.engine.base import EngineType
@@ -27,6 +27,91 @@ class ScheduledBatch:
     node_objects: dict[str,GraphNode]
     # request_id -> worker_graph_id (for push-back on OOM)
     request_to_worker_graph: dict[str, str] = None
+
+
+# ----------------------------------------------------------------------
+# Phase 2: chunked-prefill mixed-batch packing.
+#
+# Decode-first packing under a per-step token budget. Each decode is 1
+# token; prefill chunks fill remaining budget. If a prefill's remaining
+# tokens fit in budget, that chunk is "terminal" — the request transitions
+# to decode after this step, so we sample its output. Non-terminal chunks
+# skip lm_head + sampling.
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DecodeReadyRequest:
+    """A request that has 1 token to decode this step."""
+
+    rid: str
+
+
+@dataclass(frozen=True)
+class PrefillReadyRequest:
+    """A request with chunked prefill in progress."""
+
+    rid: str
+    tokens_remaining: int
+
+
+@dataclass
+class ChunkedStepPlan:
+    """The scheduler's verdict for one mixed-batch step.
+
+    decode_rids: requests that should each contribute 1 token (decode).
+    prefill_allocations: rid → number of tokens to feed this step.
+    terminal_prefills: rids whose prefill completes this step (last chunk).
+        These need lm_head + sampling to produce the first decode token.
+    """
+
+    decode_rids: list[str] = field(default_factory=list)
+    prefill_allocations: dict[str, int] = field(default_factory=dict)
+    terminal_prefills: set[str] = field(default_factory=set)
+
+    @property
+    def total_tokens(self) -> int:
+        return len(self.decode_rids) + sum(self.prefill_allocations.values())
+
+
+def plan_chunked_step(
+    ready_decodes: list[DecodeReadyRequest],
+    ready_prefills: list[PrefillReadyRequest],
+    max_step_tokens: int,
+) -> ChunkedStepPlan:
+    """Pack one step under the token budget.
+
+    Decode-first because each decode is 1 token; running them keeps tail
+    latency stable. Prefill fills remaining budget. If a prefill request's
+    remaining tokens fit in the budget, the chunk is terminal (transitions
+    the request to decode after this step).
+    """
+    if max_step_tokens <= 0:
+        raise ValueError(f"max_step_tokens must be positive, got {max_step_tokens}")
+
+    plan = ChunkedStepPlan()
+    budget = max_step_tokens
+
+    # Decodes first.
+    for req in ready_decodes:
+        if budget <= 0:
+            break
+        plan.decode_rids.append(req.rid)
+        budget -= 1
+
+    # Prefill fills remaining budget.
+    for req in ready_prefills:
+        if budget <= 0:
+            break
+        if req.tokens_remaining <= 0:
+            continue
+        chunk = min(req.tokens_remaining, budget)
+        plan.prefill_allocations[req.rid] = chunk
+        if chunk == req.tokens_remaining:
+            plan.terminal_prefills.add(req.rid)
+        budget -= chunk
+
+    return plan
 
 
 # Priority: lower value = higher priority

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
-from mminf.worker.chunked_prefill_scheduler import (
+from mminf.worker.micro_scheduler import (
     DecodeReadyRequest,
     PrefillReadyRequest,
     plan_chunked_step,
