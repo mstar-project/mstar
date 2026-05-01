@@ -50,6 +50,7 @@ class AREngine(BaseEngine):
         autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
         max_prefill_chunk_size: int | None = None,
+        scheduler_owns_chunking: bool = False,
     ):
         super().__init__(enable_nvtx=enable_nvtx)
 
@@ -59,6 +60,7 @@ class AREngine(BaseEngine):
         self.device = None
         self.autocast_dtype = autocast_dtype
         self.max_prefill_chunk_size = max_prefill_chunk_size
+        self.scheduler_owns_chunking = scheduler_owns_chunking
 
     def engine_type(self) -> EngineType:
         return EngineType.AR
@@ -427,6 +429,10 @@ class AREngine(BaseEngine):
         v0 only chunks single-request batches. Per-request chunking inside
         a multi-request batch is Phase 2 (scheduler-driven).
         """
+        if self.scheduler_owns_chunking:
+            # Phase 2: scheduler is orchestrating chunks. Engine doesn't
+            # intervene — it just runs whatever (mixed) batch arrives.
+            return False
         if self.max_prefill_chunk_size is None:
             return False
         if not submodule.supports_chunked_prefill():

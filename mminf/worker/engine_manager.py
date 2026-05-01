@@ -73,6 +73,9 @@ class EngineManager:
                 engine_kwargs["max_prefill_chunk_size"] = model_config.get(
                     "max_prefill_chunk_size"
                 )
+                engine_kwargs["scheduler_owns_chunking"] = model_config.get(
+                    "scheduler_owns_chunking", False
+                )
             engine = engine_cls(**engine_kwargs)
 
             # Extract submodules from the Model for this engine's nodes

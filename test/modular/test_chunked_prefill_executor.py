@@ -173,3 +173,41 @@ def test_dispatch_one_pass_method_exists():
     """
     eng = _ar_engine_with_chunk_size(None)
     assert hasattr(eng, "_dispatch_one_pass")
+
+
+def test_scheduler_owns_chunking_default_off():
+    """Default off — engine continues to chunk single-request batches per Phase 1."""
+    eng = AREngine(max_prefill_chunk_size=512)
+    assert eng.scheduler_owns_chunking is False
+
+
+def test_scheduler_owns_chunking_disables_engine_chunking():
+    """When scheduler owns chunking, engine's _should_chunk_prefill returns False
+    even for batches that would otherwise be chunked."""
+    eng = AREngine(max_prefill_chunk_size=512, scheduler_owns_chunking=True)
+    batch, inputs = _make_batch(seq_len=4096)
+    sub = _make_submodule(supports=True)
+    assert eng._should_chunk_prefill(batch, inputs, sub) is False
+
+
+def test_node_batch_terminal_flag_defaults_empty():
+    """Backwards compat: existing batches don't set is_terminal_per_request,
+    and default empty dict means 'all terminal' (existing single-walk behavior)."""
+    batch = NodeBatch(
+        node_name="LLM", graph_walk="prefill_text",
+        request_ids=["a"], per_request_input_tensors={"a": {}},
+        per_request_info={},
+    )
+    assert batch.is_terminal_per_request == {}
+
+
+def test_node_batch_terminal_flag_explicit():
+    """Constructor accepts an explicit is_terminal_per_request dict."""
+    batch = NodeBatch(
+        node_name="LLM", graph_walk="thinker_step",
+        request_ids=["a", "b"],
+        per_request_input_tensors={"a": {}, "b": {}},
+        per_request_info={},
+        is_terminal_per_request={"a": True, "b": False},
+    )
+    assert batch.is_terminal_per_request == {"a": True, "b": False}
