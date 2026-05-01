@@ -1489,11 +1489,20 @@ class CudaGraphRunner:
         batched_logits = static_output.get("__batched_logits__")
         if batched_logits is not None:
             stacked_logits = batched_logits[:len(request_ids)]
-            # Sampler.sample returns the raw [B] tokens tensor. FlashInfer
-            # allocates a fresh output each call (not captured in the CUDA
-            # graph), so the per-rid views are valid for the lifetime of the
-            # Python reference — no .clone() needed.
-            sampled = self.sampler.sample(request_ids, stacked_logits)
+            # FlashInfer's top-p / top-k sampling reuses an internal output
+            # buffer across calls, so iter-N's ``sampled`` tensor address
+            # equals iter-(N+k)'s for some small k. With speculation,
+            # iter-N's sampled view is held in the routing path (read by
+            # slow_post for emit_to_client + check_stop) past the time
+            # iter-(N+k) overwrites the buffer — slow_post then reads
+            # iter-(N+k)'s token as if it were iter-N's, emitting the same
+            # token twice and producing the mid-sequence "X X Y Y Z Z"
+            # duplication seen on Qwen3-Omni audio output.
+            #
+            # The .clone() snapshots the sampled value into a fresh
+            # allocation that lives as long as the Python view, breaking
+            # the alias.
+            sampled = self.sampler.sample(request_ids, stacked_logits).clone()
             sampled_views = sampled.split(1)
             outputs = {
                 rid: {"new_token": [view]}
@@ -1547,7 +1556,11 @@ class CudaGraphRunner:
 
         if all_logits:
             stacked_logits = torch.cat(all_logits, dim=0)
-            sampled = self.sampler.sample(request_ids, stacked_logits)
+            # See clone() rationale in the fast path above — FlashInfer
+            # reuses the sampling output buffer across calls, so the view
+            # held in routing aliases iter-(N+k)'s value once that iter
+            # samples.
+            sampled = self.sampler.sample(request_ids, stacked_logits).clone()
             for i, rid in enumerate(request_ids):
                 outputs[rid] = {"new_token": [sampled[i:i+1]]}
         else:
