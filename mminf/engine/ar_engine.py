@@ -437,6 +437,43 @@ class AREngine(BaseEngine):
             return False
         return True
 
+    def _dispatch_one_pass(
+        self,
+        batch: NodeBatch,
+        submodule: ARNodeSubmodule,
+        node_inputs: list[ARNodeInputs],
+        allow_cuda_graph: bool = True,
+    ) -> NodeOutput:
+        """Run one forward pass via the existing CUDA-graph / batched / sequential priority.
+
+        Extracted so the chunked-prefill orchestrator can call it once per
+        chunk. ``allow_cuda_graph=False`` is used for chunked-path callers
+        (v0): chunk-size CUDA-graph capture is Phase 1.1.
+        """
+        if allow_cuda_graph and self._can_use_cuda_graph(batch, node_inputs):
+            if self.enable_nvtx:
+                range_push("ar.cuda_graph_path", synchronize=False)
+            try:
+                return self._execute_with_cuda_graph(batch, submodule, node_inputs)
+            finally:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
+        if submodule.can_batch(batch, node_inputs):
+            if self.enable_nvtx:
+                range_push("ar.batched_path", synchronize=False)
+            try:
+                return self._execute_batched(batch, submodule, node_inputs)
+            finally:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
+        if self.enable_nvtx:
+            range_push("ar.sequential_path", synchronize=False)
+        try:
+            return self._execute_sequential(batch, submodule, node_inputs)
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+
     def _execute_with_cuda_graph(
         self, batch: NodeBatch, submodule: ARNodeSubmodule,
         inputs: list[ARNodeInputs]
@@ -523,37 +560,28 @@ class AREngine(BaseEngine):
                                 )
                             )
 
-                        # Priority: CUDA graph > batched > sequential
-                        if self._can_use_cuda_graph(batch, node_inputs):
+                        if self._should_chunk_prefill(batch, node_inputs, submodule):
                             if self.enable_nvtx:
-                                range_push("ar.cuda_graph_path", synchronize=False)
+                                range_push("ar.chunked_prefill_path", synchronize=False)
                             try:
-                                output = self._execute_with_cuda_graph(
-                                    batch, submodule, node_inputs
+                                from mminf.engine.chunked_prefill import (
+                                    execute_chunked_prefill,
                                 )
-                            finally:
-                                if self.enable_nvtx:
-                                    range_pop(synchronize=False)
-                        elif submodule.can_batch(batch, node_inputs):
-                            if self.enable_nvtx:
-                                range_push("ar.batched_path", synchronize=False)
-                            try:
-                                output = self._execute_batched(
-                                    batch, submodule, node_inputs
+                                output = execute_chunked_prefill(
+                                    batch=batch,
+                                    node_inputs=node_inputs,
+                                    chunk_size=self.max_prefill_chunk_size,
+                                    inner_pass=lambda b, ins: self._dispatch_one_pass(
+                                        b, submodule, ins, allow_cuda_graph=False
+                                    ),
                                 )
                             finally:
                                 if self.enable_nvtx:
                                     range_pop(synchronize=False)
                         else:
-                            if self.enable_nvtx:
-                                range_push("ar.sequential_path", synchronize=False)
-                            try:
-                                output = self._execute_sequential(
-                                    batch, submodule, node_inputs
-                                )
-                            finally:
-                                if self.enable_nvtx:
-                                    range_pop(synchronize=False)
+                            output = self._dispatch_one_pass(
+                                batch, submodule, node_inputs, allow_cuda_graph=True
+                            )
                         for rid, info in batch.per_request_info.items():
                             submodule.postprocess(
                                 request_id=rid,

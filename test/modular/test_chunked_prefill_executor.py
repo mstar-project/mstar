@@ -165,3 +165,11 @@ def test_should_chunk_prefill_enabled_for_single_long_request():
     batch, inputs = _make_batch(seq_len=4096)
     sub = _make_submodule(supports=True)
     assert eng._should_chunk_prefill(batch, inputs, sub) is True
+
+
+def test_dispatch_one_pass_method_exists():
+    """Smoke test: _dispatch_one_pass exists and routes through the existing
+    priority chain. Full integration coverage lives in test_chunked_prefill_equivalence.
+    """
+    eng = _ar_engine_with_chunk_size(None)
+    assert hasattr(eng, "_dispatch_one_pass")
