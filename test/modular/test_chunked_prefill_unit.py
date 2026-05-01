@@ -111,3 +111,14 @@ def test_plan_chunks_rejects_non_positive_seq_len(seq_len):
 def test_plan_chunks_rejects_non_positive_chunk_size(chunk_size):
     with pytest.raises(ValueError):
         _plan_chunks(seq_len=8, chunk_size=chunk_size)
+
+
+def test_qwen3_omni_thinker_opts_into_chunked_prefill():
+    # Imported lazily because qwen3_omni instantiation may pull in heavy deps;
+    # we only need the class.
+    from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
+    # Override is on the class, not the instance — verify class-level method
+    # returns True. We can't always instantiate without weights, so use a
+    # dummy unbound-method check.
+    instance = ThinkerSubmodule.__new__(ThinkerSubmodule)
+    assert instance.supports_chunked_prefill() is True

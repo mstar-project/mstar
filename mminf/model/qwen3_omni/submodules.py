@@ -229,6 +229,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
     # Default MRoPE section for head_dim=128: [24, 20, 20]
     MROPE_SECTION = [24, 20, 20]
 
+    def supports_chunked_prefill(self) -> bool:
+        return True
+
     def __init__(
         self,
         thinker_model: nn.Module,
