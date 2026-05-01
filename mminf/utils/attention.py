@@ -2,7 +2,16 @@ import torch
 import triton
 import triton.language as tl
 
-
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 16},  num_warps=4,  num_stages=2),
+        triton.Config({"BLOCK_SIZE": 32},  num_warps=4,  num_stages=2),
+        triton.Config({"BLOCK_SIZE": 64},  num_warps=8,  num_stages=2),
+        triton.Config({"BLOCK_SIZE": 128},  num_warps=8,  num_stages=2),
+        triton.Config({"BLOCK_SIZE": 256},  num_warps=8,  num_stages=2),
+    ],
+    key=["V", "APPLY_PENALTY", "INCLUDE_GREEDY"],
+)
 @triton.jit
 def _decode_attn_nhd_kernel(
     Q_ptr,          # (B, H_q, D)        - query, q_len=1 squeezed out
@@ -100,7 +109,8 @@ def decode_attn_nhd(q, k_cache, v_cache, cache_len, sm_scale=None):
     _, _, H_kv, _ = k_cache.shape
     assert H_q % H_kv == 0, "H_q must be divisible by H_kv"
     assert D in (16, 32, 64, 128, 256), f"head_dim {D} should be a power of 2"
-    assert q.is_contiguous() or True  # strides are passed explicitly; contiguity not required
+    assert cache_len > 0, "Attention not well-define with empty KV"
+    assert q.is_contiguous() or q.stride(-1) == 1
 
     if sm_scale is None:
         sm_scale = 1.0 / (D ** 0.5)
@@ -108,9 +118,6 @@ def decode_attn_nhd(q, k_cache, v_cache, cache_len, sm_scale=None):
     out = torch.empty_like(q)
 
     GROUP = H_q // H_kv
-    # BLOCK_N tuning: 64 or 128 is usually a good default for decode.
-    # TODO: do an autotune instead
-    BLOCK_N = 64
 
     grid = (B, H_q)
     _decode_attn_nhd_kernel[grid](
@@ -120,8 +127,7 @@ def decode_attn_nhd(q, k_cache, v_cache, cache_len, sm_scale=None):
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
         out.stride(0), out.stride(1), out.stride(2),
-        H_q=H_q, H_kv=H_kv, GROUP=GROUP, D=D, BLOCK_N=BLOCK_N,
-        num_warps=4, num_stages=2,
+        H_q=H_q, H_kv=H_kv, GROUP=GROUP, D=D,
     )
 
     return out.unsqueeze(1) if squeeze_qlen else out
