@@ -2,6 +2,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from enum import Enum
+import time
 
 import zmq
 
@@ -80,11 +81,7 @@ class ZMQCommunicator(BaseCommunicator):
         self.event = event
     
     def wait_for_work(self, timeout_ms=50):
-        logger.debug("Waiting for work...")
-        tic = time.perf_counter()
         events = dict(self.poller.poll(timeout=timeout_ms))
-        toc = time.perf_counter()
-        logger.debug(f"Waited {(toc - tic)}ms and got {len(events)} events.")
         if self.event.fd in events:
             self.event.drain()
 
@@ -131,16 +128,12 @@ class ZMQCommunicator(BaseCommunicator):
         messages = []
         while True:
             try:
-                if blocking:
-                    messages.append(self.pull_socket.recv_pyobj())
-                    blocking = False
-                else:
-                    # zmq.NOBLOCK means zmq doesn't wait for a new message to be
-                    # available, it returns a message if it exists or raises an error
-                    # if no messages are available (error is caught below)
-                    messages.append(self.pull_socket.recv_pyobj(
-                        flags=zmq.NOBLOCK
-                    ))
+                # zmq.NOBLOCK means zmq doesn't wait for a new message to be
+                # available, it returns a message if it exists or raises an error
+                # if no messages are available (error is caught below)
+                messages.append(self.pull_socket.recv_pyobj(
+                    flags=zmq.NOBLOCK
+                ))
                 logger.debug(
                     "%s to received message %s",
                     self.my_id, str(messages[-1])
