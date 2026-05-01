@@ -235,6 +235,11 @@ class AREngine(BaseEngine):
         # are baked into the graphs.
         self._compile_submodules()
 
+    def get_max_batch_size(self, node_name, graph_walk):
+        if node_name not in self.submodule_management:
+            return
+        return self.submodule_management[node_name].submodule.max_batch_size(graph_walk)
+
     def _sample_decode_outputs(
         self,
         node_name: str,

@@ -980,7 +980,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 # ===================================================================
 
 class TalkerSubmodule(ARNodeSubmodule):
-    MAX_BATCH_SIZE = 16
+    MAX_BATCH_SIZE = 32
 
     def __init__(
         self,
@@ -1000,10 +1000,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         self._tts_pad_embed_cached: torch.Tensor | None = None
         self._tts_bos_embed_cached: torch.Tensor | None = None
         self._tts_eos_embed_cached: torch.Tensor | None = None
-
-        self._tts_eos: torch.Tensor | None = None
-        self._tts_pad: torch.Tensor | None = None
-        self._tts_bos: torch.Tensor | None = None
 
         # Lazy-built suppress mask for layer-0 logits.  Shape (vocab_size,)
         # with True at positions to suppress.  Cached on first forward.
@@ -1053,10 +1049,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             self._tts_pad_embed_cached = self.model.text_projection(pad_raw).squeeze(0)
             self._tts_bos_embed_cached = self.model.text_projection(bos_raw).squeeze(0)
             self._tts_eos_embed_cached = self.model.text_projection(eos_raw).squeeze(0)
-
-            self._tts_pad = pad_raw
-            self._tts_eos = eos_raw
-            self._tts_bos = bos_raw
 
         logger.info(
             "TalkerSubmodule: pre-computed TTS special embeddings via "
@@ -1130,13 +1122,13 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Text part of assistant prefix
         # W3: pad and bos embeddings use Thinker embed -> text_projection
         # (via pre-computed cached values from init_tts_embeds)
-        pad = self._tts_pad.expand(4, -1)  # 4 pad tokens
-        bos_text = self._tts_bos # 1 bos token
+        pad = self._tts_pad_embed_cached.expand(4, -1)  # 4 pad tokens
+        bos_text = self._tts_bos_embed_cached.unsqueeze(0) # 1 bos token
 
         return torch.cat([
             pad,          # pad * 4   (4 tokens)
             bos_text,     # bos       (1 token)
-            thinker_hidden, #  (1 token)
+            self.model.text_projection(thinker_hidden), #  (1 token)
         ], dim=0)  # (9, talker_hidden)
     
     def _get_last_prefill_codec_hidden(
@@ -1152,14 +1144,14 @@ class TalkerSubmodule(ARNodeSubmodule):
             speaker_id = tc.codec_pad_id
 
         # Codec part of assistant prefix
-        return torch.tensor([
+        return self.talker_code_emb(torch.tensor([
             tc.codec_nothink_id,
             tc.codec_think_bos_id,
             tc.codec_think_eos_id,
             speaker_id,
             tc.codec_pad_id,
             tc.codec_bos_id,
-        ], device=self.get_device(), dtype=torch.long)
+        ], device=self.get_device(), dtype=torch.long))
 
 
     def prepare_inputs(
@@ -1183,23 +1175,15 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
             seq_len = input_embeds.shape[0]
 
-            return ARNodeInputs(
-                input_embeds=input_embeds,
-                input_seq_len=seq_len
-            )
-
-        input_ids = None
-        input_embeds = None
         if graph_walk == "talker_last_prefill":
             rid = fwd_info.request_id
             thinker_states = inputs["thinker_states"][0].to(device)
             layer_0_embed, _ = self._split_thinker_states(thinker_states)
 
-            input_ids = self._get_last_prefill_codec_hidden(
+            input_embeds = self._get_last_prefill_codec_hidden(
                 fwd_info.step_metadata.get("voice", "Ethan")
-            )
-            text_hidden = self._get_last_prefill_talker_hidden(layer_0_embed)
-            seq_len = input_ids.shape[0]
+            ) + self._get_last_prefill_talker_hidden(layer_0_embed)
+            seq_len = input_embeds.shape[0]
 
         elif graph_walk == "talker_decode":
             dtype = self.model.text_projection.linear_fc1.weight.dtype
@@ -1209,21 +1193,20 @@ class TalkerSubmodule(ARNodeSubmodule):
             rid = fwd_info.request_id
             if thinker_states:
                 thinker_hidden_size = self.config.thinker_hidden_size
-                text_hidden = thinker_states[0][..., :thinker_hidden_size].to(dtype)
+                text_hidden = self.model.text_projection(
+                    thinker_states[0][..., :thinker_hidden_size].to(dtype)
+                )
             elif rid not in self._eos_embed_sent:
-                text_hidden = self._tts_eos
+                text_hidden = self._tts_eos_embed_cached
                 self._eos_embed_sent.add(rid)
             else:
-                text_hidden = self._tts_pad
+                text_hidden = self._tts_pad_embed_cached
+            input_embeds += text_hidden
             seq_len = 1
 
         return ARNodeInputs(
-            input_ids=input_ids,
             input_embeds=input_embeds,
             input_seq_len=seq_len,
-            tensor_inputs={
-                "text_hidden": text_hidden
-            }
         )
 
     def preprocess(
@@ -1246,27 +1229,16 @@ class TalkerSubmodule(ARNodeSubmodule):
             seq_lens=seq_lens, pos_ids=None, label="main"
         )
 
-        input_embeds = None
-        input_ids = None
-        if inputs[0].input_embeds is not None:
-            input_embeds = torch.cat([
-                inp.input_embeds for inp in inputs
-            ], dim=0)
-        if inputs[0].input_ids is not None:
-            input_ids = torch.cat([
-                inp.input_ids for inp in inputs
-            ], dim=0)
+        input_embeds = torch.cat([
+            inp.input_embeds for inp in inputs
+        ], dim=0)
         device = self.get_device()
 
         extra_args = {}
         if graph_walk != "talker_prefill":
             extra_args["suppress_mask"] = self._get_suppress_mask()
-            extra_args["text_hidden"] = torch.cat([
-                inp.tensor_inputs["text_hidden"] for inp in inputs
-            ], dim=0)
         return {
             "input_embeds": input_embeds,
-            "input_ids": input_ids,
             "all_codes": torch.zeros(
                 (len(inputs), self.num_codes),
                 device=device, dtype=torch.long
@@ -1289,14 +1261,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         self, request_ids: list[str],
         cache_handle: BatchedCacheManager,
         injected_sampler: CudaGraphableSampler,
-        text_hidden: torch.Tensor,
         suppress_mask: torch.Tensor,
         all_codes: torch.Tensor,
         codec_emb_sum: torch.Tensor,
         pos_buf: torch.Tensor,
         is_batched_decode: bool,
-        input_embeds: torch.Tensor | None = None,
-        input_ids: torch.Tensor | None = None,
+        input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor | None = None,
         **kwargs
     ):
@@ -1312,10 +1282,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         is already ``(bs, hidden)``) and non-batched (``hidden[-1:, :]``)
         branches.
         """
-        if input_ids is not None:
-            input_embeds = self.model.model.codec_embedding(input_ids)
-        input_embeds += self.model.text_projection(text_hidden)
-
         hidden = self.model(
             input_embeds=input_embeds, cache_handle=cache_handle
         )
@@ -1509,7 +1475,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         self._eos_embed_sent.discard(request_id)
 
     def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
-        return batch.graph_walk == "talker_decode"
+        return batch.graph_walk in [
+            "talker_decode", "talker_last_prefill"
+        ] and len(model_inputs) <= self.MAX_BATCH_SIZE
 
     TALKER_PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024]
     TALKER_PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
