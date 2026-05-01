@@ -518,9 +518,7 @@ class Worker:
                 request_id=request_id, uuid=info.uuid,
             )
 
-            # We were cloning the tensor previously, which appears unnecessary and
-            # adds a good amount of latency
-            stream_buf.put(info.uuid, tensor)
+            stream_buf.put(info.uuid, tensor.clone())
             self.tensor_manager.dereference(request_id, info.uuid)
 
     def _poll_stream_buffers(self) -> None:
