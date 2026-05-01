@@ -404,7 +404,7 @@ class TensorCommunicationManager(ABC):
         ...
 
     @abstractmethod
-    def start_read_tensors(self, request_id: str, graph_edges: list[GraphEdge]):
+    def start_read_tensors(self, request_id: str, graph_edges: list[GraphEdge]) -> list[Future]:
         ...
 
     @abstractmethod
@@ -572,7 +572,8 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 
     def start_read_tensors(
         self, request_id: str, graph_edges: list[GraphEdge],
-    ):
+    ) -> list[Future]:
+        futures = []
         for graph_edge in graph_edges:
             if len(graph_edge.tensor_info) == 0:
                 continue
@@ -617,12 +618,15 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 ))
                 logger.debug("Started transfer read for uuid %s", info.uuid)
             fut = self._async_reader.submit(read_info)
+            if fut is not None:
+                futures.append(fut)
             self.pending.append(
                 FutureAndPointers(
                     future=fut, graph_edges=[graph_edge],
                     request_id=request_id
                 )
             )
+        return futures
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +794,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     request_id=request_id,
                 )
             )
+        return []
 
     def _cleanup_by_uuid(self, request_id: str, uuid: str):
         logger.debug("SHM: cleaning up tensor uuid %s", uuid)

@@ -13,6 +13,7 @@ import torch
 
 from mminf.api_server.request_types import APIServerMessage, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
+from mminf.communication.event import EventWakeup
 from mminf.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
@@ -105,6 +106,9 @@ class Worker:
             push_ids=worker_ids + ["conductor", "api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
         )
+        self.wakeup_event = EventWakeup()
+        self.communicator.register_event_for_poll(self.wakeup_event)
+
         self.tensor_manager = create_tensor_communication_manager(
             protocol=tensor_comm_protocol,
             my_entity_id=worker_id,
@@ -331,9 +335,10 @@ class Worker:
             )
 
         # Start RDMA reads for tensors that have tensor_info
-        self.tensor_manager.start_read_tensors(
+        futures = self.tensor_manager.start_read_tensors(
             body.request_id, body.initial_inputs,
         )
+        self.wakeup_event.register_futures(futures)
 
         # Signal-only edges (tensor_info is None) can be processed immediately
         signal_only = [
@@ -414,14 +419,16 @@ class Worker:
             range_pop(synchronize=False)
             range_push("process_new_inputs.start_read")
         # Start RDMA reads for non-streaming edges with tensor_info
-        self.tensor_manager.start_read_tensors(
+        futures = self.tensor_manager.start_read_tensors(
             body.request_id, non_streaming,
         )
+        self.wakeup_event.register_futures(futures)
         # Start RDMA reads for streaming edges with tensor_info (will be routed to buffer in _check_ready_tensors)
         if streaming_with_tensors:
-            self.tensor_manager.start_read_tensors(
+            futures = self.tensor_manager.start_read_tensors(
                 body.request_id, streaming_with_tensors,
             )
+            self.wakeup_event.register_futures(futures)
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
                 for info in edge.tensor_info:
