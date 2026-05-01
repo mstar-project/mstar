@@ -47,6 +47,13 @@ class PerRequestNodeQueues:
         new_ready, new_waiting = self.waiting.split_off_ready()
         self.ready += new_ready
         self.waiting = new_waiting
+    
+    def update_for_spec(self, spec_node_name):
+        if self.waiting is None:
+            return
+        _, new_waiting = self.waiting.split_off_for_spec(spec_node_name)
+        # Don't update new ready: the speculative node is already scheduled and running!
+        self.waiting = new_waiting
 
     def process_streaming_input(self, new_inputs: list[GraphEdge]) -> ProcessedInputs:
         if self.waiting is None:

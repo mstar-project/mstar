@@ -838,10 +838,12 @@ class Conductor:
                 for request_id, partition_name, p_done in done_partition_forwards:
                     if request_id not in self.requests:
                         continue  # already completed by another partition in this cycle
+                    print("HELLO", partition_name, p_done)
                     all_done = self._process_done_forward(
                         request_id, partition_name,
                         partition_done_from_worker=p_done,
                     )
+                    print("ALL DONE=", all_done)
                     if all_done:
                         completed_requests.append(request_id)
 

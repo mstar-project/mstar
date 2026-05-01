@@ -127,6 +127,13 @@ class GraphSection(ABC):
     @abstractmethod
     def split_off_ready_for_streaming(self) -> list["GraphNode"]:
         pass
+    
+    @abstractmethod
+    def split_off_for_spec(self, spec_node_name: str) -> tuple[bool, "GraphSection | None"]:
+        """
+        Returns whether a node was split off, and the new waiting
+        """
+        pass
 
     @abstractmethod
     def cache_outputs(
@@ -228,6 +235,11 @@ class GraphNode(GraphSection):
         if self.is_ready():
             return [self], None
         return [], self
+
+    def split_off_for_spec(self, spec_node_name: str) -> tuple[bool, "GraphSection | None"]:
+        if self.name == spec_node_name:
+            return True, None
+        return False, self
 
     def split_off_ready_for_streaming(self):
         if self._split_off_for_streaming:
@@ -337,6 +349,17 @@ class Sequential(GraphSection):
 
     def split_off_ready_for_streaming(self):
         return self.sections[0].split_off_ready_for_streaming()
+    
+    def split_off_for_spec(self, spec_node_name: str):
+        split, first_waiting = self.sections[0].split_off_for_spec(spec_node_name)
+        if first_waiting:
+            waiting = [first_waiting] + self.sections[1:]
+        else:
+            waiting = self.sections[1:]
+
+        if len(waiting) == 0:
+            return split, None
+        return split, Sequential(sections=waiting)
 
     def cache_outputs(
         self,
@@ -408,6 +431,17 @@ class Parallel(GraphSection):
 
     def split_off_ready_for_streaming(self):
         return sum([sec.split_off_ready_for_streaming() for sec in self.sections], start=[])
+    
+    def split_off_for_spec(self, spec_node_name: str):
+        sections = []
+        any_split = split
+        for section in self.sections:
+            split, new_waiting = section.split_off_for_spec(spec_node_name)
+            any_split &= split
+            sections.append(new_waiting)
+        if not sections:
+            return any_split, None
+        return any_split, Parallel(sections)
 
     def cache_outputs(
         self,
@@ -648,7 +682,7 @@ class Loop(GraphSection):
         self.section = new_curr
         self.curr_iter += 1
 
-        logger.debug(
+        logger.info(
             "Advancing loop with nodes %s from iter %d -> %d (out of %d)",
             str(self.section.get_node_names()),
             self.curr_iter,
@@ -675,6 +709,17 @@ class Loop(GraphSection):
         self._waiting_for_execution.update([node.name for node in first_ready])
         self._curr_iter_section = first_waiting
         return first_ready, self
+    
+    def split_off_for_spec(self, spec_node_name):
+        if self._iter_done():
+            if self._is_done():
+                return [], None
+            self._advance_one_iter()
+        elif self._curr_iter_section is None:
+            return [], self
+        split, new_waiting = self._curr_iter_section.split_off_for_spec(spec_node_name)
+        self._curr_iter_section = new_waiting
+        return split, self
 
     def split_off_ready_for_streaming(self):
         return (
@@ -719,7 +764,7 @@ class Loop(GraphSection):
 
         return LoopCompletionOutput(
             new_waiting=None, outputs=output_signals, loop_back_name_dests_to_remove=loop_back_name_dests
-        )
+        )        
 
     def reset(self):
         self.section.reset()

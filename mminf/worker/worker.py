@@ -53,6 +53,25 @@ class SlowPostprocessResult:
     new_stops: dict[str, set[str]]
 
 
+@dataclass
+class PendingPostproc:
+    """In-flight slow-postprocess task awaiting finalization on the main thread.
+
+    ``advanced_loops`` records, per request, the dynamic-loop names whose
+    iter counter advanced during this batch's fast postprocess. Combined
+    with ``new_stops`` from the slow postprocess, it lets
+    ``_finalize_slow_postprocess`` clear ``_curr_iter_section`` on loops
+    that both stopped and advanced — so the eventual ``register_finished``
+    (via ``_pending_stops``) actually marks the loop done.
+    """
+    batch: "ScheduledBatch"
+    node_batch: NodeBatch
+    partition: str | None
+    routing: dict[str, NodeOutputRouting]
+    future: Future
+    advanced_loops: dict[str, set[str]]
+
+
 class EvictionPolicy(Enum):
     """Strategy for choosing which request to offload to CPU on OOM."""
     LRU = "lru"              # least-recently-used (by execution time)
@@ -1422,6 +1441,7 @@ class Worker:
         batch_partition: str | None,
         output: NodeOutput,
         speculation_consumed_loop_back: dict[str, set[str]] | None = None,
+        spec_node_name: str | None = None
     ) -> dict[str, NodeOutputRouting]:
         """Pure-Python routing / queue updates / register_for_send. No tensor
         value reads — safe to run while GPU(N+1) is in flight. Returns the
@@ -1552,7 +1572,8 @@ class Worker:
             else:
                 kept_for_routing = kept
             routing = self.worker_graphs_manager.process_node_outputs(
-                request_id, kept_for_routing, graph_walk=batch.graph_walk
+                request_id, kept_for_routing, graph_walk=batch.graph_walk,
+                spec_node_name=spec_node_name if consumed_names else None
             )
             routing_per_request[request_id] = routing
         if self.enable_nvtx:
@@ -1793,6 +1814,7 @@ class Worker:
         batch_partition: str | None,
         routing_per_request: dict[str, NodeOutputRouting],
         result: SlowPostprocessResult,
+        advanced_loops: dict[str, set[str]] | None = None,
     ) -> dict[str, set[str]]:
         """Main-thread half of slow postprocessing.
 
@@ -1800,6 +1822,17 @@ class Worker:
         worker/conductor/api_server messages using the prematerialized token
         payloads, then returns the deferred stop signals to apply to the next
         speculative iter.
+
+        ``advanced_loops`` (rid -> {loop_name, ...}) names the dynamic loops
+        whose iter counter advanced during this batch's fast postprocess.
+        For any loop that BOTH advanced this iter AND was just stopped (in
+        ``result.new_stops``), the next iter ingested a loop-back into a
+        body it should never run. We clear that loop's ``_curr_iter_section``
+        so when ``register_finished`` is later called via ``_pending_stops``,
+        ``_iter_done()`` returns True and the worker graph is marked done
+        — otherwise no ``WORKER_GRAPHS_DONE`` is ever emitted and the
+        partition stalls (e.g. Qwen Talker waits forever for Thinker's
+        hidden states).
         """
         from mminf.utils.profiler import range_pop, range_push
 
@@ -1818,6 +1851,18 @@ class Worker:
 
         for _rid, req_info in node_batch.per_request_info.items():
             req_info.dynamic_loop_stop_signals.clear()
+
+        if advanced_loops:
+            for rid, stops in result.new_stops.items():
+                advanced = advanced_loops.get(rid)
+                if not advanced:
+                    continue
+                to_clear = stops & advanced
+                print("HELLO", stops, to_clear)
+                if to_clear:
+                    self.worker_graphs_manager.clear_dyn_loop_curr_iter_section(
+                        rid, partition=batch_partition, loop_names=to_clear,
+                    )
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -1890,28 +1935,21 @@ class Worker:
 
     def _drain_completed_postprocess(
         self,
-        pending_postproc: list[
-            tuple[
-                ScheduledBatch,
-                NodeBatch,
-                str | None,
-                dict[str, NodeOutputRouting],
-                Future,
-            ]
-        ],
+        pending_postproc: list[PendingPostproc],
     ) -> None:
         """Finalize any completed background slow-postprocess tasks in FIFO order."""
-        while pending_postproc and pending_postproc[0][4].done():
-            batch, node_batch, batch_partition, routing, future = pending_postproc.pop(0)
-            self._postproc_inflight_rids.difference_update(batch.node_objects.keys())
-            result: SlowPostprocessResult = future.result()
+        while pending_postproc and pending_postproc[0].future.done():
+            pp = pending_postproc.pop(0)
+            self._postproc_inflight_rids.difference_update(pp.batch.node_objects.keys())
+            result: SlowPostprocessResult = pp.future.result()
             new_stops = self._finalize_slow_postprocess(
-                batch, node_batch, batch_partition, routing, result,
+                pp.batch, pp.node_batch, pp.partition, pp.routing, result,
+                advanced_loops=pp.advanced_loops,
             )
             if new_stops:
                 for rid, stops in new_stops.items():
                     self._pending_stops.setdefault(
-                        (rid, batch_partition), set()
+                        (rid, pp.partition), set()
                     ).update(stops)
 
     def run(self) -> None:
@@ -1994,15 +2032,7 @@ class Worker:
         # __init__) so _remove_request can see it from message processing.
         # In-flight: (batch, node_batch, batch_partition, future) | None.
         pending: tuple[ScheduledBatch, NodeBatch, str | None, Future] | None = None
-        pending_postproc: list[
-            tuple[
-                ScheduledBatch,
-                NodeBatch,
-                str | None,
-                dict[str, NodeOutputRouting],
-                Future,
-            ]
-        ] = []
+        pending_postproc: list[PendingPostproc] = []
         # consecutive-spec cap: the original Phase 1' design caps consecutive
         # speculative steps at 1 to give other (node, walk) pairs a turn at
         # the scheduler — important on multi-walk workers (Qwen-Omni's
@@ -2222,6 +2252,7 @@ class Worker:
                         continue
 
                     spec_consumed: dict[str, set[str]] = {}
+                    spec_node_name = None
                     if speculation is not None:
                         spec_batch, spec_node_batch, loop_back_inputs, continuing_rids = speculation
                         threaded_continuing, dropped = self._thread_outputs_to_speculative(
@@ -2235,6 +2266,7 @@ class Worker:
                             spec_batch.node_objects.pop(rid, None)
                             spec_batch.request_to_worker_graph.pop(rid, None)
                         if spec_batch.node_objects:
+                            spec_node_name = spec_batch.node_name
                             # Only continuing rids consumed loop-back from
                             # batch_N — fresh rids' loop-back doesn't exist
                             # in batch_N's output dict, so fast_postprocess
@@ -2302,13 +2334,28 @@ class Worker:
                     routing = self._fast_postprocess(
                         p_batch, p_node_batch, p_partition, output,
                         speculation_consumed_loop_back=spec_consumed,
+                        spec_node_name=spec_node_name
                     )
+                    advanced_loops: dict[str, set[str]] = {}
                     for rid, req_info in p_node_batch.per_request_info.items():
-                        req_info.dynamic_loop_iter_counts.update(
-                            self.worker_graphs_manager.get_dynamic_loop_iters(
-                                rid, partition=p_partition,
-                            )
+                        prev_iters = dict(req_info.dynamic_loop_iter_counts)
+                        if self.worker_id == "worker_1":
+                            print("prev iters", prev_iters)
+                        new_iters = self.worker_graphs_manager.get_dynamic_loop_iters(
+                            rid, partition=p_partition,
                         )
+                        if self.worker_id == "worker_1":
+                            print("new iters", new_iters)
+                        req_info.dynamic_loop_iter_counts.update(new_iters)
+                        advanced = {
+                            loop_name for loop_name, count in new_iters.items()
+                            if loop_name in prev_iters and count > prev_iters[loop_name]
+                        }
+                        if advanced:
+                            advanced_loops[rid] = advanced
+                        if self.worker_id == "worker_1":
+                            print("advanced", advanced)
+                            print()
                     if phase_period:
                         _phase_record("fast_post", _time.perf_counter() - _t0)
                     _t0 = _time.perf_counter() if phase_period else 0.0
@@ -2320,7 +2367,14 @@ class Worker:
                         self.wakeup_event.register_future(postproc_future)
                         self._postproc_inflight_rids.update(p_batch.node_objects.keys())
                         pending_postproc.append(
-                            (p_batch, p_node_batch, p_partition, routing, postproc_future)
+                            PendingPostproc(
+                                batch=p_batch,
+                                node_batch=p_node_batch,
+                                partition=p_partition,
+                                routing=routing,
+                                future=postproc_future,
+                                advanced_loops=advanced_loops,
+                            )
                         )
                     else:
                         result = self._compute_slow_postprocess(
@@ -2328,6 +2382,7 @@ class Worker:
                         )
                         new_stops = self._finalize_slow_postprocess(
                             p_batch, p_node_batch, p_partition, routing, result,
+                            advanced_loops=advanced_loops,
                         )
                         if new_stops:
                             for rid, stops in new_stops.items():

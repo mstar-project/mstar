@@ -155,6 +155,33 @@ class WorkerGraphQueues:
                 _stop_loops(section._curr_iter_section)
         _stop_loops(self.per_request_queues[request_id].waiting)
 
+    def clear_dyn_loop_curr_iter_section(
+        self, request_id: str, loop_names: set[str]
+    ):
+        """Set ``_curr_iter_section = None`` on matching dynamic loops.
+
+        Called from ``_finalize_slow_postprocess`` when a stop has been
+        detected for a loop whose iter ALSO advanced during the same batch's
+        fast postprocess. Without this, the eventual ``register_finished``
+        leaves the loop in a state where ``_iter_done()`` is False
+        (because ``_curr_iter_section`` still points at the just-started
+        next-iter body), so the worker graph never reports done.
+        """
+        def _clear(section: GraphSection):
+            if section is None:
+                return
+            if isinstance(section, Sequential) or isinstance(section, Parallel):
+                for sec in section.sections:
+                    _clear(sec)
+                return
+            if isinstance(section, Loop):
+                # Recurse first to handle nested dynamic loops; mutating an
+                # outer loop's _curr_iter_section here would lose the path.
+                _clear(section._curr_iter_section)
+                if isinstance(section, DynamicLoop) and section.name in loop_names:
+                    section._curr_iter_section = None
+        _clear(self.per_request_queues[request_id].waiting)
+
     def get_dynamic_loop_iters(self, request_id: str) -> dict[str, int]:
         iter_dict = {}
         def _get_iters(section: GraphSection):
@@ -352,6 +379,7 @@ class WorkerGraphsManager:
         self, request_id: str,
         outputs: list[GraphEdge],
         graph_walk: str,
+        spec_node_name: str | None = None
     ) -> NodeOutputRouting:
         """
         After a node has finished processing, use its outputs to update
@@ -362,6 +390,12 @@ class WorkerGraphsManager:
         worker, and directs external outputs to worker graphs on the appropriate
         (different) worker.
         """
+        # (-1) if spec node name, update graph accordingly
+        if spec_node_name is not None:
+            wg_id = self.get_worker_graph_id_for_node(request_id, spec_node_name)
+            queue = self.queues[wg_id].per_request_queues[request_id]
+            queue.update_for_spec(spec_node_name)
+
         # (0) separate streaming edges — they bypass the queue system
         streaming_edges = [edge for edge in outputs if edge.is_streaming]
         non_streaming_outputs = [edge for edge in outputs if not edge.is_streaming]
@@ -513,6 +547,19 @@ class WorkerGraphsManager:
                 self.queues[worker_graph_id].get_dynamic_loop_iters(request_id)
             )
         return iter_counts
+
+    def clear_dyn_loop_curr_iter_section(
+        self, request_id: str,
+        partition: str,
+        loop_names: set[str],
+    ):
+        print("CLEARING", loop_names)
+        part_info = self.per_request_info[request_id].per_partition_info[partition]
+        worker_graph_ids = part_info.graph_walk_worker_graph_ids
+        for worker_graph_id in worker_graph_ids:
+            self.queues[worker_graph_id].clear_dyn_loop_curr_iter_section(
+                request_id, loop_names
+            )
 
     def add_request(
         self, request_id: str,
