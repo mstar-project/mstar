@@ -65,10 +65,15 @@ class EngineManager:
         for engine_type_str, engine_node_names in type_to_nodes.items():
             engine_cls = ENGINE_TYPE_TO_CLASS[engine_type_str]
 
-            engine = engine_cls(
+            engine_kwargs = dict(
                 autocast_dtype=autocast_dtype,
                 enable_nvtx=enable_nvtx,
             )
+            if engine_cls is AREngine:
+                engine_kwargs["max_prefill_chunk_size"] = model_config.get(
+                    "max_prefill_chunk_size"
+                )
+            engine = engine_cls(**engine_kwargs)
 
             # Extract submodules from the Model for this engine's nodes
             submodules: dict[str, torch.nn.Module] = {}

@@ -6,9 +6,12 @@ N times." A callable stub is sufficient to exercise it.
 """
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 
+from mminf.engine.ar_engine import AREngine
 from mminf.engine.base import NodeBatch, NodeOutput
 from mminf.engine.chunked_prefill import execute_chunked_prefill
 from mminf.model.submodule_base import ARNodeInputs
@@ -100,3 +103,65 @@ def test_rejects_multi_request_batch():
 
     with pytest.raises(ValueError, match="single-request"):
         execute_chunked_prefill(batch, inputs, chunk_size=4, inner_pass=lambda b, i: None)
+
+
+def _ar_engine_with_chunk_size(chunk_size):
+    return AREngine(max_prefill_chunk_size=chunk_size)
+
+
+def _make_submodule(supports: bool):
+    sub = MagicMock()
+    sub.supports_chunked_prefill.return_value = supports
+    return sub
+
+
+def test_should_chunk_prefill_disabled_when_chunk_size_none():
+    eng = _ar_engine_with_chunk_size(None)
+    batch, inputs = _make_batch(seq_len=4096)
+    sub = _make_submodule(supports=True)
+    assert eng._should_chunk_prefill(batch, inputs, sub) is False
+
+
+def test_should_chunk_prefill_disabled_when_submodule_does_not_opt_in():
+    eng = _ar_engine_with_chunk_size(512)
+    batch, inputs = _make_batch(seq_len=4096)
+    sub = _make_submodule(supports=False)
+    assert eng._should_chunk_prefill(batch, inputs, sub) is False
+
+
+def test_should_chunk_prefill_disabled_for_short_prompts():
+    eng = _ar_engine_with_chunk_size(512)
+    batch, inputs = _make_batch(seq_len=100)
+    sub = _make_submodule(supports=True)
+    assert eng._should_chunk_prefill(batch, inputs, sub) is False
+
+
+def test_should_chunk_prefill_disabled_when_prompt_equals_chunk_size():
+    """Pin the `<=` boundary: a prompt of exactly chunk_size is not chunked."""
+    eng = _ar_engine_with_chunk_size(512)
+    batch, inputs = _make_batch(seq_len=512)
+    sub = _make_submodule(supports=True)
+    assert eng._should_chunk_prefill(batch, inputs, sub) is False
+
+
+def test_should_chunk_prefill_disabled_for_multi_request_batches():
+    eng = _ar_engine_with_chunk_size(512)
+    batch = NodeBatch(
+        node_name="LLM", graph_walk="prefill_text",
+        request_ids=["a", "b"],
+        per_request_input_tensors={"a": {}, "b": {}},
+        per_request_info={},
+    )
+    inputs = [
+        ARNodeInputs(input_seq_len=4096, input_ids=torch.arange(4096).unsqueeze(0)),
+        ARNodeInputs(input_seq_len=4096, input_ids=torch.arange(4096).unsqueeze(0)),
+    ]
+    sub = _make_submodule(supports=True)
+    assert eng._should_chunk_prefill(batch, inputs, sub) is False
+
+
+def test_should_chunk_prefill_enabled_for_single_long_request():
+    eng = _ar_engine_with_chunk_size(512)
+    batch, inputs = _make_batch(seq_len=4096)
+    sub = _make_submodule(supports=True)
+    assert eng._should_chunk_prefill(batch, inputs, sub) is True

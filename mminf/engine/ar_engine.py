@@ -49,6 +49,7 @@ class AREngine(BaseEngine):
         self,
         autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
+        max_prefill_chunk_size: int | None = None,
     ):
         super().__init__(enable_nvtx=enable_nvtx)
 
@@ -57,6 +58,7 @@ class AREngine(BaseEngine):
 
         self.device = None
         self.autocast_dtype = autocast_dtype
+        self.max_prefill_chunk_size = max_prefill_chunk_size
 
     def engine_type(self) -> EngineType:
         return EngineType.AR
@@ -413,6 +415,27 @@ class AREngine(BaseEngine):
             graph_walk=batch.graph_walk,
             requires_cfg=has_cfg,
         )
+
+    def _should_chunk_prefill(
+        self,
+        batch: NodeBatch,
+        inputs: list[ARNodeInputs],
+        submodule: ARNodeSubmodule,
+    ) -> bool:
+        """Decide whether to route this batch through the chunked-prefill path.
+
+        v0 only chunks single-request batches. Per-request chunking inside
+        a multi-request batch is Phase 2 (scheduler-driven).
+        """
+        if self.max_prefill_chunk_size is None:
+            return False
+        if not submodule.supports_chunked_prefill():
+            return False
+        if len(batch.request_ids) != 1:
+            return False
+        if inputs[0].input_seq_len <= self.max_prefill_chunk_size:
+            return False
+        return True
 
     def _execute_with_cuda_graph(
         self, batch: NodeBatch, submodule: ARNodeSubmodule,
