@@ -532,12 +532,18 @@ class ThinkerSubmodule(ARNodeSubmodule):
             target_dtype=input_embeds.dtype,
         )
 
-        # Plan FlashInfer attention and rope for the main cache label
+        # Plan FlashInfer attention and rope for the main cache label.
+        # Pass explicit mode so the chunked-prefill last chunk (seq_len=1 per
+        # request) doesn't get misclassified as decode by the seq_lens
+        # heuristic; that misclassification picks the FlashInfer decode
+        # wrapper for what is logically still prefill, producing different
+        # numerics at prompt_len = N*chunk_size + 1.
         cache_manager = engine_inputs.cache_manager
         cache_manager.set_active_label("main")
         assert cache_manager is not None
+        mode = "decode" if graph_walk == "thinker_decode" else "prefill"
         cache_manager.plan_attention(
-            seq_lens=seq_lens, is_causal=True, label="main"
+            seq_lens=seq_lens, is_causal=True, label="main", mode=mode
         )
         cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
 

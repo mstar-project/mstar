@@ -134,6 +134,7 @@ class BatchedCacheManager:
         is_causal=True,
         write_store: bool=True,
         label: str | None = None,
+        mode: str | None = None,
     ):
         """Pre-compute FlashInfer plan and page positions for a cache label.
 
@@ -151,6 +152,12 @@ class BatchedCacheManager:
             dtype: query data type for FlashInfer.
             is_causal: whether attention is causal.
             label: cache label to plan for. If None, uses the current active label.
+            mode: Optional explicit "prefill" or "decode" hint. When None
+                (legacy callers), fall back to the seq_lens heuristic
+                (``all(sl == 1)`` -> decode). The chunked-prefill path's
+                last chunk can have seq_len=1 even though it's logically
+                still prefill, so the heuristic is unreliable; explicit
+                mode is the source of truth when provided.
         """
         from mminf.utils.profiler import range_pop, range_push
 
@@ -163,6 +170,7 @@ class BatchedCacheManager:
                 is_causal=is_causal,
                 write_store=write_store,
                 label=label,
+                mode=mode,
             )
         finally:
             if self.enable_nvtx:
@@ -175,6 +183,7 @@ class BatchedCacheManager:
         is_causal=True,
         write_store: bool=True,
         label: str | None = None,
+        mode: str | None = None,
     ):
         from mminf.utils.profiler import range_pop, range_push
 
@@ -267,7 +276,18 @@ class BatchedCacheManager:
                 range_pop(synchronize=False)
 
 
-        is_decode = all([sl == 1 for sl in seq_lens])
+        if mode is not None:
+            if mode not in ("prefill", "decode"):
+                raise ValueError(
+                    f"plan_attention mode must be 'prefill' or 'decode', got {mode!r}"
+                )
+            is_decode = (mode == "decode")
+        else:
+            # Legacy heuristic for callers that don't pass explicit mode.
+            # Note: unreliable for chunked-prefill last chunks of 1 token
+            # (the chunk is logically still prefill but every seq_len is 1,
+            # so the heuristic would incorrectly pick the decode wrapper).
+            is_decode = all([sl == 1 for sl in seq_lens])
         ps = self._plan_states.get(effective_label)
         if ps is not None and ps.wrapper is not None:
             wrapper = ps.wrapper
