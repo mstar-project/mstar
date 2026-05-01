@@ -1538,9 +1538,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                         device=device, dtype=torch.bfloat16
                     ),
                     input_seq_len=1,
-                    tensor_inputs={
-                        "text_hidden": self._tts_pad.clone()
-                    }
                 ),
                 capture_batch_sizes=[1, 2, 4, 8, 16],
                 compile=True
@@ -1560,16 +1557,11 @@ class TalkerSubmodule(ARNodeSubmodule):
                 requires_cfg=False,
                 labels=["main"],
                 single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(
-                        self.TALKER_LAST_PREFILL_TOKENS_PER_REQ,
-                        device=device, dtype=torch.long,
+                    input_embeds=torch.zeros(
+                        (self.TALKER_LAST_PREFILL_TOKENS_PER_REQ, self.config.talker_hidden_size),
+                        device=device, dtype=torch.bfloat16
                     ),
                     input_seq_len=self.TALKER_LAST_PREFILL_TOKENS_PER_REQ,
-                    tensor_inputs={
-                        "text_hidden": self._get_last_prefill_talker_hidden(
-                            self._tts_pad.clone()
-                        )
-                    }
                 ),
                 capture_batch_sizes=self.TALKER_LAST_PREFILL_CAPTURE_BATCH_SIZES,
                 compile=True

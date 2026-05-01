@@ -4,13 +4,13 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_SIZE": 16},  num_warps=4,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 32},  num_warps=4,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 64},  num_warps=8,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 128},  num_warps=8,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 256},  num_warps=8,  num_stages=2),
+        triton.Config({"BLOCK_N": 16},  num_warps=4,  num_stages=2),
+        triton.Config({"BLOCK_N": 32},  num_warps=4,  num_stages=2),
+        triton.Config({"BLOCK_N": 64},  num_warps=8,  num_stages=2),
+        triton.Config({"BLOCK_N": 128},  num_warps=8,  num_stages=2),
+        triton.Config({"BLOCK_N": 256},  num_warps=8,  num_stages=2),
     ],
-    key=["V", "APPLY_PENALTY", "INCLUDE_GREEDY"],
+    key=["cache_len"],
 )
 @triton.jit
 def _decode_attn_nhd_kernel(
