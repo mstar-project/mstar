@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import asdict, dataclass, field
 
 import torch
@@ -109,7 +110,8 @@ class AREngine(BaseEngine):
                 ),
                 cpu_page_pool=cpu_page_pool,
                 buffer_manager = WorkspaceBufferManager(
-                    256 * 1024 * 1024, device=device
+                    int(os.environ.get("MMINF_WORKSPACE_BUFFER_MB", "512")) * 1024 * 1024,
+                    device=device,
                 ),
             )
             self.kv_management[cfg.get_node_str()] = kv_mgmt
@@ -222,10 +224,13 @@ class AREngine(BaseEngine):
             if not isinstance(tensors, dict) or "logits" not in tensors:
                 continue
             logits = tensors["logits"][0]  # [1, vocab_size]
+            # Clone for the same reason as the cuda_graph_runner sampler
+            # paths: FlashInfer's sampling reuses the output buffer and
+            # speculation chains expose the alias as token doubling.
             tensors["new_token"] = [
                 self.submodule_management[node_name].sampler.sample(
                     request_ids=[rid], logits=logits
-                )
+                ).clone()
             ]
             del tensors["logits"]
 

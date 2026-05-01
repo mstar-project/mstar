@@ -286,10 +286,21 @@ class Sampler:
         return tokens
 
     def _consume_autotune_sync_budget(self) -> None:
-        if self._autotune_sync_budget_remaining <= 0:
-            return
+        # Sync between Triton's fused_temperature_softmax (writes probs)
+        # and FlashInfer's sampling kernel (reads probs). They live on
+        # different CUDA streams in some configurations — verified by
+        # speculation-duplication regressions on Qwen3-Omni Thinker that
+        # vanish only when the sync is unconditional. The earlier
+        # "autotune budget" hack that limited sync to the first 64 calls
+        # was based on the assumption that after Triton autotune both
+        # kernels land on the default stream; that assumption holds for
+        # Orpheus (single shape bucket) but not for Q3-Omni (multiple
+        # bs/num_tokens × Thinker/Talker combinations triggering distinct
+        # autotunes), which causes mid-sequence token doubling once the
+        # budget runs out. Keep the sync unconditional — its cost is
+        # ~10 µs per sample, well below the iter budget (3-5 ms), so it
+        # does not regress the spec/Phase 3 perf wins.
         torch.cuda.current_stream().synchronize()
-        self._autotune_sync_budget_remaining -= 1
 
 
 @torch.compiler.disable
