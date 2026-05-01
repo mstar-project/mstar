@@ -1478,6 +1478,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         return batch.graph_walk in [
             "talker_decode", "talker_last_prefill"
         ] and len(model_inputs) <= self.MAX_BATCH_SIZE
+    
+    def max_batch_size(self, graph_walk):
+        return self.MAX_BATCH_SIZE
 
     TALKER_PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024]
     TALKER_PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
