@@ -19,6 +19,7 @@ import torch
 
 from mminf.engine.base import NodeBatch, NodeOutput
 from mminf.model.submodule_base import ARNodeInputs
+from mminf.utils.profiler import range_pop, range_push
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,8 @@ def execute_chunked_prefill(
     node_inputs: list[ARNodeInputs],
     chunk_size: int,
     inner_pass: InnerPass,
+    *,
+    enable_nvtx: bool = False,
 ) -> NodeOutput:
     """Drive a single-request prefill as N forward passes of ``chunk_size`` tokens.
 
@@ -125,6 +128,10 @@ def execute_chunked_prefill(
     are discarded. This matches the semantics of an unchunked prefill,
     where the model produces sampled tokens / final-position logits only
     once per request.
+
+    ``enable_nvtx`` controls whether NVTX range markers are emitted.  Set
+    to ``True`` when the engine is running under ``nsys`` to get per-chunk
+    timing in the profile.
     """
     if len(batch.request_ids) != 1:
         raise ValueError(
@@ -140,10 +147,31 @@ def execute_chunked_prefill(
     inp = node_inputs[0]
     plans = _plan_chunks(seq_len=inp.input_seq_len, chunk_size=chunk_size)
 
-    last_output: NodeOutput | None = None
-    for plan in plans:
-        chunk_inputs = [_slice_ar_inputs(inp, plan.start, plan.end)]
-        last_output = inner_pass(batch, chunk_inputs)
+    if enable_nvtx:
+        range_push(
+            f"chunked_prefill rid={batch.request_ids[0]} "
+            f"walk={batch.graph_walk} total={inp.input_seq_len} "
+            f"chunks={len(plans)}",
+            synchronize=False,
+        )
+    try:
+        last_output: NodeOutput | None = None
+        for plan in plans:
+            if enable_nvtx:
+                range_push(
+                    f"chunk {plan.index}/{len(plans) - 1} "
+                    f"[{plan.start}:{plan.end}] last={plan.is_last}",
+                    synchronize=False,
+                )
+            try:
+                chunk_inputs = [_slice_ar_inputs(inp, plan.start, plan.end)]
+                last_output = inner_pass(batch, chunk_inputs)
+            finally:
+                if enable_nvtx:
+                    range_pop(synchronize=False)
+    finally:
+        if enable_nvtx:
+            range_pop(synchronize=False)
 
     assert last_output is not None  # plans is always non-empty
     return last_output

@@ -574,6 +574,7 @@ class AREngine(BaseEngine):
                                     inner_pass=lambda b, ins: self._dispatch_one_pass(
                                         b, submodule, ins, allow_cuda_graph=False
                                     ),
+                                    enable_nvtx=self.enable_nvtx,
                                 )
                             finally:
                                 if self.enable_nvtx:
