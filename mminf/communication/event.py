@@ -10,6 +10,8 @@ class EventWakeup:
         os.eventfd_write(self.event, 1) # one syscall, thread-safe, async-signal-safe
     
     def register_future(self, future: Future):
+        if future.done():
+            return
         future.add_done_callback(self._wake)
     
     def register_futures(self, futures):
@@ -20,4 +22,7 @@ class EventWakeup:
         return self.event
     
     def drain(self):
-        os.eventfd_read(self.event)
+        try:
+            os.eventfd_read(self.event)
+        except BlockingIOError:
+            pass
