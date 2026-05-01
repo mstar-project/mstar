@@ -344,3 +344,123 @@ def test_chunked_prefill_matches_unchunked(thinker_engine, prompt_len: int, chun
             engine.remove_request(rid_unchunked)
     finally:
         capture.restore()
+
+
+@pytest.mark.parametrize(
+    "prompt_len, chunk_size",
+    [
+        (1, 512),       # Degenerate single-token prompt — should bypass chunking via guard.
+        (511, 512),     # Just under chunk_size — should bypass chunking via guard.
+        (512, 512),     # Exactly chunk_size — bypasses chunking (the `<=` boundary).
+        (513, 512),     # One token over — chunked path: 2 chunks, last is 1 token.
+        (1024, 512),    # Even multiple — chunked path: 2 chunks of 512 each.
+        (1025, 512),    # Even multiple plus one — chunked path: 3 chunks, last is 1 token.
+    ],
+)
+def test_chunked_prefill_edge_cases(thinker_engine, prompt_len: int, chunk_size: int):
+    """Edge-case parametrizations of the chunking logic.
+
+    The first three cases (prompt_len <= chunk_size) exercise the guard's
+    ``<=`` boundary — they should fall through to the unchunked path even
+    when chunking is enabled, producing identical outputs trivially.
+
+    The last three cases (prompt_len > chunk_size) exercise actual chunking
+    with last-chunk shapes that are: 1 token (most fragile boundary),
+    full chunk (clean boundary), and 1 token after a full multiple.
+    """
+    engine, device = thinker_engine
+
+    text_ids = _make_text_input_ids(prompt_len, device, seed=prompt_len)
+
+    rid_unchunked = f"unchunked_edge_{uuid.uuid4().hex[:8]}"
+    rid_chunked = f"chunked_edge_{uuid.uuid4().hex[:8]}"
+
+    sampler = engine.submodule_management["Thinker"].sampler
+    capture = _LogitCaptureSampler(sampler)
+    try:
+        # ---- Unchunked baseline ----
+        engine.max_prefill_chunk_size = None
+        engine.add_request(rid_unchunked, ["main"])
+        try:
+            batch_a = _make_prefill_text_batch(rid_unchunked, text_ids)
+            out_a = engine.execute_batch(batch_a)
+            assert not out_a.allocation_failed
+            assert capture.last_logits is not None, (
+                "sampler.sample never invoked — is_last_prefill flag dropped?"
+            )
+            logits_a = capture.last_logits.flatten().clone()
+            tok_a = out_a.per_request_output_tensors[rid_unchunked]["new_token"][0].flatten()[0].clone()
+            kv_a = _extract_request_kv(engine, rid_unchunked).clone()
+
+            # ---- Chunked ----
+            capture.last_logits = None
+            engine.max_prefill_chunk_size = chunk_size
+            engine.add_request(rid_chunked, ["main"])
+            try:
+                batch_b = _make_prefill_text_batch(rid_chunked, text_ids)
+                out_b = engine.execute_batch(batch_b)
+                assert not out_b.allocation_failed
+                assert capture.last_logits is not None, (
+                    "sampler.sample not invoked on chunked path"
+                )
+                logits_b = capture.last_logits.flatten().clone()
+                tok_b = out_b.per_request_output_tensors[rid_chunked]["new_token"][0].flatten()[0].clone()
+                kv_b = _extract_request_kv(engine, rid_chunked).clone()
+
+                # ---- Asserts ----
+                assert kv_a.shape == kv_b.shape, (
+                    f"KV shape mismatch: unchunked {tuple(kv_a.shape)} "
+                    f"vs chunked {tuple(kv_b.shape)}"
+                )
+                kv_max_abs = (kv_a - kv_b).abs().max().item()
+                kv_a_scale = max(kv_a.abs().max().item(), 1e-6)
+                kv_rel = kv_max_abs / kv_a_scale
+
+                assert logits_a.shape == logits_b.shape, (
+                    f"logits shape mismatch: {tuple(logits_a.shape)} vs "
+                    f"{tuple(logits_b.shape)}"
+                )
+                logits_max_abs = (logits_a - logits_b).abs().max().item()
+                logits_a_scale = max(logits_a.abs().max().item(), 1e-6)
+                logits_rel = logits_max_abs / logits_a_scale
+
+                print(
+                    f"\nprompt_len={prompt_len} chunk_size={chunk_size}: "
+                    f"logits max_abs={logits_max_abs:.4e} rel={logits_rel:.4e}; "
+                    f"KV max_abs={kv_max_abs:.4e} rel={kv_rel:.4e}; "
+                    f"tok unchunked={tok_a.item()} chunked={tok_b.item()}"
+                )
+
+                torch.testing.assert_close(
+                    logits_a, logits_b, atol=1e-2, rtol=1e-2,
+                )
+                assert torch.equal(tok_a, tok_b), (
+                    f"greedy token differs: unchunked={tok_a.item()} "
+                    f"vs chunked={tok_b.item()}"
+                )
+                torch.testing.assert_close(
+                    kv_a, kv_b, atol=1e-2, rtol=1e-2,
+                )
+            finally:
+                engine.remove_request(rid_chunked)
+        finally:
+            engine.remove_request(rid_unchunked)
+    finally:
+        capture.restore()
+
+
+def test_chunked_prefill_does_not_engage_for_audio_walk_yet():
+    """v0 only enables chunking for prefill_text. prefill_audio / prefill_vision
+    paths are not numerically verified yet and therefore should not be
+    chunked even though the Thinker submodule itself opts in.
+
+    v0 relies on caller-side discipline (the model's graph walks routing
+    audio/vision through this engine path produce single-walk batches
+    where the test doesn't exercise chunking yet). Walk-level gating —
+    i.e. extending supports_chunked_prefill(self, graph_walk: str) — is
+    a Phase 1.3 follow-up.
+    """
+    pytest.skip(
+        "v0: walk-level gating not implemented; rely on test coverage to "
+        "limit chunking to prefill_text. Track in TODO."
+    )
