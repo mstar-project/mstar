@@ -1,9 +1,10 @@
 """Unit tests for chunked prefill primitives. CPU-only, no model weights."""
 from __future__ import annotations
 
+import pytest
 import torch
 
-from mminf.engine.chunked_prefill import _slice_ar_inputs
+from mminf.engine.chunked_prefill import ChunkSlice, _plan_chunks, _slice_ar_inputs
 from mminf.model.submodule_base import ARNodeInputs, NodeSubmodule
 
 
@@ -71,3 +72,42 @@ def test_slice_dict_custom_pos_ids():
     assert sliced.input_seq_len == 6
     assert torch.equal(sliced.custom_pos_ids["a"], torch.arange(4, 10))
     assert torch.equal(sliced.custom_pos_ids["b"], torch.arange(4, 10) * 2)
+
+
+def test_plan_chunks_evenly_divisible():
+    plans = _plan_chunks(seq_len=8, chunk_size=4)
+    assert plans == [
+        ChunkSlice(index=0, start=0, end=4, is_last=False),
+        ChunkSlice(index=1, start=4, end=8, is_last=True),
+    ]
+
+
+def test_plan_chunks_with_remainder():
+    plans = _plan_chunks(seq_len=10, chunk_size=4)
+    assert plans == [
+        ChunkSlice(index=0, start=0, end=4, is_last=False),
+        ChunkSlice(index=1, start=4, end=8, is_last=False),
+        ChunkSlice(index=2, start=8, end=10, is_last=True),
+    ]
+
+
+def test_plan_chunks_seq_smaller_than_chunk():
+    plans = _plan_chunks(seq_len=3, chunk_size=8)
+    assert plans == [ChunkSlice(index=0, start=0, end=3, is_last=True)]
+
+
+def test_plan_chunks_seq_equals_chunk():
+    plans = _plan_chunks(seq_len=4, chunk_size=4)
+    assert plans == [ChunkSlice(index=0, start=0, end=4, is_last=True)]
+
+
+@pytest.mark.parametrize("seq_len", [0, -1])
+def test_plan_chunks_rejects_non_positive_seq_len(seq_len):
+    with pytest.raises(ValueError):
+        _plan_chunks(seq_len=seq_len, chunk_size=4)
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_plan_chunks_rejects_non_positive_chunk_size(chunk_size):
+    with pytest.raises(ValueError):
+        _plan_chunks(seq_len=8, chunk_size=chunk_size)

@@ -12,9 +12,42 @@ CUDA-graph dispatch) and drives it once per chunk.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from mminf.model.submodule_base import ARNodeInputs
+
+
+@dataclass(frozen=True)
+class ChunkSlice:
+    """One chunk of a single-request prefill, in token-axis coordinates."""
+    index: int
+    start: int
+    end: int
+    is_last: bool
+
+
+def _plan_chunks(seq_len: int, chunk_size: int) -> list[ChunkSlice]:
+    """Return the list of chunks covering [0, seq_len) at ``chunk_size`` granularity.
+
+    The last chunk may be shorter than ``chunk_size``. Pure: no torch
+    dependency, easy to test and reason about.
+    """
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    plans: list[ChunkSlice] = []
+    n_chunks = (seq_len + chunk_size - 1) // chunk_size
+    for i in range(n_chunks):
+        start = i * chunk_size
+        end = min(start + chunk_size, seq_len)
+        plans.append(
+            ChunkSlice(index=i, start=start, end=end, is_last=(i == n_chunks - 1))
+        )
+    return plans
 
 
 def _slice_ar_inputs(inp: ARNodeInputs, start: int, end: int) -> ARNodeInputs:
