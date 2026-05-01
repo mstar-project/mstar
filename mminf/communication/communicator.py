@@ -2,6 +2,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from enum import Enum
+import time
 
 import zmq
 
@@ -80,11 +81,7 @@ class ZMQCommunicator(BaseCommunicator):
         self.event = event
     
     def wait_for_work(self, timeout_ms=50):
-        logger.debug("Waiting for work...")
-        tic = time.perf_counter()
         events = dict(self.poller.poll(timeout=timeout_ms))
-        toc = time.perf_counter()
-        logger.debug(f"Waited {(toc - tic)}ms and got {len(events)} events.")
         if self.event.fd in events:
             self.event.drain()
 

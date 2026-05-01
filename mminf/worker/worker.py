@@ -566,6 +566,7 @@ class Worker:
 
     def _check_ready_tensors(self) -> None:
         """Poll for completed RDMA transfers, feed ready graph edges to worker graph queues."""
+        self.wakeup_event.drain()
         ready = self.tensor_manager.get_ready_tensors()
         for request_id, edges in ready.items():
             # Separate streaming edges from normal edges
@@ -2248,6 +2249,7 @@ class Worker:
                                 plan_future_for_submit,
                                 spec_advance_event,
                             )
+                            self.wakeup_event.register_future(spec_future)
                             if self.enable_nvtx:
                                 range_push("worker.gpu_submit_queued", synchronize=False)
                                 range_pop(synchronize=False)
@@ -2295,6 +2297,7 @@ class Worker:
                             self._compute_slow_postprocess,
                             p_batch, p_node_batch, output, routing,
                         )
+                        self.wakeup_event.register_future(postproc_future)
                         self._postproc_inflight_rids.update(p_batch.node_objects.keys())
                         pending_postproc.append(
                             (p_batch, p_node_batch, p_partition, routing, postproc_future)
@@ -2345,7 +2348,7 @@ class Worker:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 if batch is None:
-                    sleep(0.001)
+                    self.communicator.wait_for_work(10)
                     continue
 
                 if self.enable_nvtx:
@@ -2381,6 +2384,7 @@ class Worker:
                     self._execute_on_gpu_thread, batch, node_batch,
                     None, fallthrough_advance_event,
                 )
+                self.wakeup_event.register_future(future)
                 _set_pending((batch, node_batch, batch_partition, future))
             except Exception:
                 logger.exception("Worker %s error in main loop", self.worker_id)
