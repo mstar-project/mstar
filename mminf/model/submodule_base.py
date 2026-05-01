@@ -293,6 +293,19 @@ class NodeSubmodule(torch.nn.Module):
         """Remove per-request state when a request completes."""
         return
 
+    def supports_chunked_prefill(self) -> bool:
+        """Whether this submodule's forward tolerates a partial token stream.
+
+        When True, AREngine may split a single-request prefill into multiple
+        forward passes of ``max_prefill_chunk_size`` tokens each, with KV
+        cache state carried across via the existing paged cache manager.
+
+        Default False — submodules must opt in. Encoder-style submodules
+        whose inputs aren't sliceable along the token axis (e.g. fixed
+        image-token blocks) should leave this False.
+        """
+        return False
+
 
 class ARNodeSubmodule(NodeSubmodule):
     @abstractmethod
