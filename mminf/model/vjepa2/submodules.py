@@ -278,8 +278,8 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
         encoder_hidden = _ensure_lead_batch_dim(inputs["encoder_hidden"][0], 3)
         tensor_inputs = {}
 
-        context_mask = tensor_inputs.get("context_mask")
-        target_mask = tensor_inputs.get("target_mask")
+        context_mask = inputs.get("context_mask")
+        target_mask = inputs.get("target_mask")
 
         if context_mask:
             tensor_inputs["context_mask"] = _ensure_lead_batch_dim(context_mask[0], 2)
@@ -1095,7 +1095,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 x=x,
                 pos_bufs=pos_bufs,
                 request_ids=request_ids,
-                cache_manager=cache_handle,
             )
             # advance_seq_len already called by runner; skip it in _decode_sequence
             return p._decode_sequence(x, cond_tokens, b, t)
@@ -1181,16 +1180,19 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         # TODO: this no longer needs to be the case.
         iter_idx = engine_inputs.first_request_info.dynamic_loop_iter_counts.get(
             "rollout_loop", 0)
-        outputs = self.forward(
-            graph_walk,
-            engine_inputs,
-            encoder_hidden,
-            actions,
-            states,
-            extrinsics,
+
+        new_tg = self._rollout_step(
+            encoder_hidden, actions, states,
             t_0=iter_idx,
-            cache_handle=engine_inputs.cache_manager
+            cache_handle=engine_inputs.cache_manager,
+            extrinsics=extrinsics,
+            request_ids=engine_inputs.request_ids,
         )
+
+        outputs: NameToTensorList = {
+            "encoder_hidden": [new_tg],
+            "predicted_hidden": [new_tg],
+        }
 
         per_rid = {
             rid: {

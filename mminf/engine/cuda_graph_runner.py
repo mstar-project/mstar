@@ -1851,8 +1851,7 @@ class PiecewiseCudaGraphRunner:
         x: torch.Tensor,                                    # [real_bs, seq_len, D]
         pos_bufs: dict[str, torch.Tensor] | None = None,   # updated into static buffers
         request_ids: list[str] | None = None,
-        cache_manager: BatchedCacheManager | None = None,   # real engine cache manager
-    ) -> torch.Tensor:
+        ) -> torch.Tensor:
         """Replay the captured graph for the given input.
 
         Steps (mirroring CudaGraphRunner._run_basic_batched):

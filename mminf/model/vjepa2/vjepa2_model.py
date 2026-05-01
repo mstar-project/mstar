@@ -700,7 +700,7 @@ class VJepa2Model(Model):
                 # for ACrollouut, only use the first 2 video frames as context,
                 # consistent with the vjepa2 repo notebooks/utils/mpc_utils.py cem fn
                 if "video_frames" in out:
-                    out["video_frames"] = [frames[:2] for frames in out["video_frames"]]
+                    out["video_frames"] = [frames[:self.config.ac_predictor.tubelet_size] for frames in out["video_frames"]]
 
 
             # Phase 3.B: MPC walk requires a pre-encoded goal latent.  When
