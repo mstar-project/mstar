@@ -931,6 +931,13 @@ class VLLMOmni(InferenceSystem):
         output_mod = req_type.get_output_modalities()  # "text", "audio", "image"
         input_mod = req_type.get_input_modalities()  # "text", "image", "audio", "video"
 
+        # vllm-omni serves image generation via /v1/images/generations (not
+        # chat/completions), so dispatch to a dedicated path for T2I/I2I.
+        if output_mod == "image":
+            return await self._send_image_gen_request(
+                session, req_input, base_url, request_id, model, additional_model_kwargs,
+            )
+
         metrics = RequestMetrics(
             request_id=request_id,
             type=req_type,
@@ -1002,6 +1009,58 @@ class VLLMOmni(InferenceSystem):
                                 _record_vllm_omni_chunk(chunk, metrics)
                         except json.JSONDecodeError:
                             pass
+
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+
+        return metrics
+
+    async def _send_image_gen_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        """Image generation via vllm-omni's /v1/images/generations endpoint."""
+        metrics = RequestMetrics(
+            request_id=request_id,
+            type=req_input.req_type,
+            expected_output_modalities=["image"],
+        )
+
+        try:
+            payload: dict = {
+                "model": model.get_hf_url(),
+                "prompt": req_input.prompt,
+                "n": 1,
+                **additional_model_kwargs,
+            }
+
+            metrics.start_time = time.monotonic()
+            async with session.post(
+                f"{base_url}/v1/images/generations",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
+            ) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+
+                result = await resp.json()
+                data_list = result.get("data", [])
+                if data_list:
+                    img_b64 = data_list[0].get("b64_json", "")
+                    if img_b64:
+                        metrics.record_output_chunk(
+                            modality="image",
+                            data_b64=img_b64,
+                            arrival_time=time.monotonic(),
+                            n_tokens=1,
+                        )
 
         except Exception as e:
             metrics.record_error(str(e))
