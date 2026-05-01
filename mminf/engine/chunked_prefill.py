@@ -13,9 +13,11 @@ CUDA-graph dispatch) and drives it once per chunk.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 
+from mminf.engine.base import NodeBatch, NodeOutput
 from mminf.model.submodule_base import ARNodeInputs
 
 
@@ -79,3 +81,49 @@ def _slice_ar_inputs(inp: ARNodeInputs, start: int, end: int) -> ARNodeInputs:
         tensor_inputs=inp.tensor_inputs,
         kwargs=inp.kwargs,
     )
+
+
+InnerPass = Callable[[NodeBatch, list[ARNodeInputs]], NodeOutput]
+
+
+def execute_chunked_prefill(
+    batch: NodeBatch,
+    node_inputs: list[ARNodeInputs],
+    chunk_size: int,
+    inner_pass: InnerPass,
+) -> NodeOutput:
+    """Drive a single-request prefill as N forward passes of ``chunk_size`` tokens.
+
+    The orchestrator is stateless. ``inner_pass`` is the engine's existing
+    one-pass dispatch (batched / sequential / CUDA-graph). It is called
+    once per chunk with a sliced ARNodeInputs whose ``input_seq_len``
+    equals the chunk's token count. The KV-cache manager (read inside
+    ``inner_pass``) carries state across calls via its existing
+    ``plan_attention(seq_lens=...)`` semantics.
+
+    Only the final chunk's NodeOutput is returned; intermediate outputs
+    are discarded. This matches the semantics of an unchunked prefill,
+    where the model produces sampled tokens / final-position logits only
+    once per request.
+    """
+    if len(batch.request_ids) != 1:
+        raise ValueError(
+            f"execute_chunked_prefill requires a single-request batch, "
+            f"got {len(batch.request_ids)}"
+        )
+    if len(node_inputs) != 1:
+        raise ValueError(
+            f"execute_chunked_prefill requires len(node_inputs) == 1, "
+            f"got {len(node_inputs)}"
+        )
+
+    inp = node_inputs[0]
+    plans = _plan_chunks(seq_len=inp.input_seq_len, chunk_size=chunk_size)
+
+    last_output: NodeOutput | None = None
+    for plan in plans:
+        chunk_inputs = [_slice_ar_inputs(inp, plan.start, plan.end)]
+        last_output = inner_pass(batch, chunk_inputs)
+
+    assert last_output is not None  # plans is always non-empty
+    return last_output
