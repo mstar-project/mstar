@@ -51,7 +51,7 @@ class BaseEngine(ABC):
     def has_autocast(self):
         return True
     
-    def get_max_batch_size(self):
+    def get_max_batch_size(self, node_name: str, graph_walk: str):
         return None
 
     @abstractmethod
@@ -78,7 +78,7 @@ class BaseEngine(ABC):
         ...
     
     def execute_with_max_batch_size(self, batch: NodeBatch) -> NodeOutput:
-        bs = self.get_max_batch_size()
+        bs = self.get_max_batch_size(batch.node_name, batch.graph_walk)
         n = len(batch.request_ids)
         if bs is None or n <= bs:
             return self.execute_batch(batch)

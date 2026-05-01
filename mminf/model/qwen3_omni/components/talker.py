@@ -266,7 +266,6 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
         )
         self.post_attention_layernorm = Qwen3OmniRMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = Qwen3OmniMLP(hidden_size=hidden_size, intermediate_size=intermediate_size)
-        self._qkv_proj_weight: torch.Tensor | None = None
 
     def forward(self, hidden_states, cache_handle):
         residual = hidden_states
@@ -288,15 +287,17 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states
     
-    @torch.compiler.disable
-    def get_qkv_proj_weight(self) -> torch.Tensor:
-        if self._qkv_proj_weight is None:
+    def set_qkv_proj_weight(self) -> torch.Tensor:
+        if self.self_attn.q_proj is not None:
             attn = self.self_attn
-            self._qkv_proj_weight = torch.cat(
+            qkv_proj_weight = torch.cat(
                 (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight),
                 dim=0,
             ).contiguous()
-        return self._qkv_proj_weight
+            self.register_buffer("qkv_proj_weight", qkv_proj_weight, persistent=False)
+            attn.q_proj = None
+            attn.k_proj = None
+            attn.v_proj = None
 
 
 class Qwen3OmniCodePredictorInnerModel(nn.Module):
@@ -422,6 +423,10 @@ class Qwen3OmniCodePredictor(nn.Module):
         # place (see nn.Module.__setattr__); this replaces the meta
         # placeholder created in __init__ with the real device tensor.
         self.lm_head_weight = stacked
+    
+    def set_qkv_proj_weights(self):
+        for layer in self.model.layers:
+            layer.set_qkv_proj_weight()
 
     def forward(self, *args):
         return self.model(*args)
@@ -513,7 +518,7 @@ class Qwen3OmniCodePredictor(nn.Module):
             hidden_states = hs_flat.view(bs, seq_len, hidden_size)
 
             total_tokens = bs * seq_len
-            qkv = F.linear(hidden_states, layer.get_qkv_proj_weight())
+            qkv = F.linear(hidden_states, layer.qkv_proj_weight)
             q_size = n_q_heads * head_dim
             kv_size = n_kv_heads * head_dim
             q, k, v = qkv.split((q_size, kv_size, kv_size), dim=-1)

@@ -1270,6 +1270,7 @@ class Qwen3OmniModel(Model):
             device=device,
         )
         code_predictor.consolidate_stacked_weights()
+        code_predictor.set_qkv_proj_weights()
         code_predictor.eval()
 
         from mminf.model.qwen3_omni.submodules import TalkerSubmodule

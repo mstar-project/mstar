@@ -207,6 +207,9 @@ class NodeSubmodule(torch.nn.Module):
     ):
         return False # batching disabled by default
     
+    def max_batch_size(self, graph_walk: str):
+        return None
+    
     # Note: do not import CudaGraphConfig; it causes a circular import situation
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         """TODO: add cuda graph support for pi05.
