@@ -5,6 +5,8 @@ from enum import Enum
 
 import zmq
 
+from mminf.communication.event import EventWakeup
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +71,22 @@ class ZMQCommunicator(BaseCommunicator):
             self.push_sockets[id] = self.context.socket(zmq.PUSH)
             self.push_sockets[id].connect(self._endpoint(id))
             self.push_sockets[id].setsockopt(zmq.LINGER, 0)
+        self.poller = zmq.Poller()
+        self.poller.register(self.pull_socket, zmq.POLLIN)
+        self.event = None
+    
+    def register_event_for_poll(self, event: EventWakeup):
+        self.poller.register(event.fd,  zmq.POLLIN)
+        self.event = event
+    
+    def wait_for_work(self, timeout_ms=50):
+        logger.debug("Waiting for work...")
+        tic = time.perf_counter()
+        events = dict(self.poller.poll(timeout=timeout_ms))
+        toc = time.perf_counter()
+        logger.debug(f"Waited {(toc - tic)}ms and got {len(events)} events.")
+        if self.event.fd in events:
+            self.event.drain()
 
     def _endpoint(self, entity_id: str) -> str:
         if self.protocol == CommProtocol.IPC:
