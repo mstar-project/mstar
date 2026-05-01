@@ -12,6 +12,7 @@ import aiohttp
 from benchmark.base import Model, ModelType, RequestType
 from benchmark.dataset import (
     BaseDataset,
+    DROIDDataset,
     Food101Dataset,
     LibriSpeechDataset,
     TxtFileDataset,
@@ -37,6 +38,7 @@ class DatasetType(Enum):
     LIBRI = "libri"
     FOOD = "food101"
     UCF = "ucf101"
+    DROID = "droid"
 
 
 class InferenceSystemType(Enum):
@@ -87,6 +89,11 @@ class BenchmarkConfig:
     # text dataset args
     request_txt_file: str = "benchmark/assets/simple_text_queries.txt"
 
+    # DROID (robotics) args — used by DROIDDataset for pi05 / vjepa2_ac.
+    # rollout_horizon is only consumed by the vjepa2_ac task.
+    droid_rollout_horizon: int = 4
+    droid_hf_cache: Optional[str] = None
+
 
 class Benchmark:
     def __init__(self, config: BenchmarkConfig):
@@ -123,6 +130,27 @@ class Benchmark:
                 req_type=self.config.request_type,
                 local_file_dir=self.config.local_cache_dir,
             )
+        elif self.config.dataset == DatasetType.DROID:
+            # DROID supports pi0.5 (VLA → first frames + state) and
+            # vjepa2_ac (V2V → video clip + action/state trajectory).
+            # The dataset is shared with our HF / openpi baseline scripts so
+            # they consume identical inputs.
+            task_for_dataset = {
+                RequestType.VLA: "pi05",
+                RequestType.V2V: "vjepa2_ac",
+            }.get(self.config.request_type)
+            if task_for_dataset is None:
+                raise ValueError(
+                    f"DROID dataset only supports VLA (pi05) and V2V (vjepa2_ac) "
+                    f"request types; got {self.config.request_type}"
+                )
+            return DROIDDataset(
+                local_file_dir=self.config.local_cache_dir,
+                num_requests=self.config.num_requests,
+                task=task_for_dataset,
+                rollout_horizon=self.config.droid_rollout_horizon,
+                cache_dir=self.config.droid_hf_cache,
+            )
         raise ValueError(f"Unknown dataset: {self.config.dataset}")
 
     def _save_outputs(self, metrics: list[RequestMetrics]) -> None:
@@ -145,6 +173,69 @@ class Benchmark:
         print(f"\n--- Errors ({len(errors)}/{len(metrics)}) ---")
         for request_id, error in errors:
             print(f"  [{request_id}] {error}")
+
+    def _write_results_json(
+        self,
+        metrics: list[RequestMetrics],
+        agg: AggregateMetrics,
+        wall_time: float,
+    ) -> None:
+        """Persist a baseline-script-compatible results.json for compare_robotics.py.
+
+        Mirrors the schema produced by ``benchmark/hf_vjepa2_ac.py`` and
+        ``benchmark/openpi_pi05.py`` so ``compare_robotics.py`` can read all
+        three system outputs uniformly. Only writes when ``--output-dir`` is
+        set; opt-in to keep existing benchmark runs unchanged.
+        """
+        import json
+        output_dir = self.config.output_dir
+        if output_dir is None:
+            return
+
+        ok_metrics = [m for m in metrics if m.error is None and m.e2e_latency is not None]
+        jcts_ms = sorted(m.e2e_latency * 1000.0 for m in ok_metrics)
+
+        def _pct(values, p):
+            if not values:
+                return 0.0
+            if len(values) == 1:
+                return values[0]
+            k = (len(values) - 1) * (p / 100.0)
+            lo = int(k)
+            hi = min(lo + 1, len(values) - 1)
+            return values[lo] * (1 - (k - lo)) + values[hi] * (k - lo)
+
+        per_request = []
+        for m in ok_metrics:
+            per_request.append({
+                "request_id": m.request_id,
+                "jct_ms": (m.e2e_latency or 0.0) * 1000.0,
+                "type": m.type.value if hasattr(m.type, "value") else str(m.type),
+                "output_bytes": dict(m.output_bytes),
+            })
+
+        payload = {
+            "system": "ours",
+            "model": getattr(self.config.model, "__class__", type(self.config.model)).__name__,
+            "request_type": self.config.request_type.value,
+            "profiling_type": self.config.profiling_type.value,
+            "num_requests": self.config.num_requests,
+            "num_warmup": self.config.num_warmup,
+            "completed": len(ok_metrics),
+            "failed": len(metrics) - len(ok_metrics),
+            "wall_time_s": wall_time,
+            "jct_mean_ms": (sum(jcts_ms) / len(jcts_ms)) if jcts_ms else 0.0,
+            "jct_median_ms": jcts_ms[len(jcts_ms) // 2] if jcts_ms else 0.0,
+            "jct_p90_ms": _pct(jcts_ms, 90),
+            "jct_p95_ms": _pct(jcts_ms, 95),
+            "jct_p99_ms": _pct(jcts_ms, 99),
+            "request_throughput": (agg.request_throughput or 0.0),
+            "per_request": per_request,
+        }
+
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "results.json"), "w") as f:
+            json.dump(payload, f, indent=2)
 
     async def _run_batch(
         self,
@@ -329,6 +420,7 @@ class Benchmark:
         print(agg)
         self._print_errors(metrics)
         self._save_outputs(metrics)
+        self._write_results_json(metrics, agg, wall_time)
 
         return metrics, agg
 
@@ -377,6 +469,20 @@ def parse_args() -> BenchmarkConfig:
         help="Text file with one line per prompt",
     )
 
+    # DROID (robotics) dataset args
+    droid = parser.add_argument_group("droid")
+    droid.add_argument(
+        "--droid-rollout-horizon",
+        type=int,
+        default=4,
+        help="Rollout horizon H for vjepa2_ac (V2V request type). Ignored for pi05.",
+    )
+    droid.add_argument(
+        "--droid-hf-cache",
+        default=None,
+        help="HuggingFace cache directory for lerobot/droid_100 (default: HF default).",
+    )
+
     args = parser.parse_args()
 
     dataset = args.dataset
@@ -406,11 +512,22 @@ def parse_args() -> BenchmarkConfig:
             else:
                 # thinker-talker type model that speaks its answer
                 txtfile = "benchmark/assets/simple_text_queries.txt"
+        elif request_type in {RequestType.VLA, RequestType.V2V}:
+            dataset = DatasetType.DROID
+            txtfile = None
         print(f"Dataset not specified, setting it to {dataset.value}, txtfile={txtfile}")
+
+    # disable_cfg is Bagel-specific; only pass it when the target model accepts
+    # it so robotics models (Pi05, VJepa2AC) don't see a stray kwarg.
+    model_type = ModelType(args.model)
+    if model_type == ModelType.BAGEL:
+        model = model_type.inst(disable_cfg=args.disable_cfg)
+    else:
+        model = model_type.inst()
 
     return BenchmarkConfig(
         url=args.url,
-        model=ModelType(args.model).inst(disable_cfg=args.disable_cfg),
+        model=model,
         dataset=dataset,
         num_requests=args.num_requests,
         request_type=request_type,
@@ -425,6 +542,8 @@ def parse_args() -> BenchmarkConfig:
         vbench_cache_dir=args.vbench_cache_dir,
         request_txt_file=txtfile,
         local_cache_dir=args.local_cache,
+        droid_rollout_horizon=args.droid_rollout_horizon,
+        droid_hf_cache=args.droid_hf_cache,
     )
 
 
