@@ -11,9 +11,8 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from mminf.engine.ar_engine import AREngine
+from mminf.engine.ar_engine import AREngine, execute_chunked_prefill
 from mminf.engine.base import NodeBatch, NodeOutput
-from mminf.engine.ar_engine import execute_chunked_prefill
 from mminf.model.submodule_base import ARNodeInputs
 
 

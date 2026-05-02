@@ -359,6 +359,7 @@ def test_chunked_step_returns_none_when_no_ar_requests_ready():
     """With an empty WorkerGraphsManager, _get_chunked_step_batch returns
     None so callers fall through to the legacy scheduling path."""
     from dataclasses import dataclass, field
+
     from mminf.engine.base import EngineType
     from mminf.worker.engine_manager import EngineManager
     from mminf.worker.micro_scheduler import MicroScheduler
