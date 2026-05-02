@@ -682,7 +682,7 @@ class Loop(GraphSection):
         self.section = new_curr
         self.curr_iter += 1
 
-        logger.info(
+        logger.debug(
             "Advancing loop with nodes %s from iter %d -> %d (out of %d)",
             str(self.section.get_node_names()),
             self.curr_iter,
