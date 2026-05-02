@@ -7,7 +7,11 @@
 #   bash test/pi05/launch_server_pi05.sh keisuke 2,3         # custom user + GPU(s)
 #
 # Required local files:
-#   * configs/pi05.yaml  (vit_encoder + LLM colocated on rank 0)
+#   * configs/pi05.yaml         default — base pi0.5 (action_horizon=50)
+#   * configs/pi05_droid.yaml   DROID benchmark variant (action_horizon=15)
+#
+# Override which yaml is used via the PI05_CONFIG env var:
+#   PI05_CONFIG=configs/pi05_droid.yaml bash test/pi05/launch_server_pi05.sh
 #
 # Notes:
 #   * Pi0.5 weights live at lerobot/pi05_base on HuggingFace as a single
@@ -39,14 +43,19 @@ fi
 
 mkdir -p "${PI05_CACHE_DIR}"
 
+# Pick the yaml: default to base pi05.yaml; override with PI05_CONFIG env var
+# to swap in a variant (e.g. configs/pi05_droid.yaml for the DROID benchmark).
+PI05_CONFIG_PATH="${PI05_CONFIG:-configs/pi05.yaml}"
+
 echo "[pi05] launching server"
 echo "  user:    ${WHO}"
 echo "  devices: ${DEVICES}"
 echo "  port:    ${PORT}"
 echo "  cache:   ${PI05_CACHE_DIR}"
+echo "  config:  ${PI05_CONFIG_PATH}"
 
 CUDA_VISIBLE_DEVICES="${DEVICES}" python mminf/api_server/entrypoint.py \
-    --config configs/pi05.yaml \
+    --config "${PI05_CONFIG_PATH}" \
     --port "${PORT}" \
     --cache-dir "${PI05_CACHE_DIR}" \
     --socket-path-prefix "/tmp/mminf_${WHO}/" \
