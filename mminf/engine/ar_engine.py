@@ -247,14 +247,15 @@ class AREngine(BaseEngine):
         Called AFTER the model forward (and outside CUDA graph capture).
         Replaces 'logits' with 'new_token' in each request's output.
         """
+        # Remove the __batched_logits__ sentinel if present (emitted by
+        # _execute_batched as a CUDA-graph fast-path hint). Its value is a
+        # raw torch.Tensor, not a per-rid dict, so leaving it in would
+        # confuse the loop below. Popping here makes this function robust
+        # under future refactors that may call it from other code paths.
+        output.per_request_output_tensors.pop("__batched_logits__", None)
 
         for rid, tensors in output.per_request_output_tensors.items():
-            # Guard against non-per-rid keys (e.g. the __batched_logits__
-            # sentinel used as a CUDA-graph fast-path hint): their value is
-            # a torch.Tensor, not a dict, so the `"logits" not in tensors`
-            # check below would raise TypeError (Tensor.__contains__ calls
-            # torch.eq on strings).
-            if not isinstance(tensors, dict) or "logits" not in tensors:
+            if "logits" not in tensors:
                 continue
             logits = tensors["logits"][0]  # [1, vocab_size]
             tensors["new_token"] = [

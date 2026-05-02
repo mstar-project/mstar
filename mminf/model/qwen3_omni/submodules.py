@@ -374,15 +374,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
     def _prepare_text_input(
         self, inputs: NameToTensorList, start_pos: float, device: torch.device,
     ) -> ARNodeInputs:
-        # Per-request, the input is either a prefill-chunk slice of text
-        # tokens (seq_len>=1) or a single decode token (seq_len==1, used
-        # by ``thinker_step``). Both cases share the same per-request prep
-        # with prefill_text since they read ``text_inputs`` and embed via
-        # the same embed_tokens path; the position-id math also matches
-        # (text-only span starting at start_pos). The decode case
-        # (seq_len==1) reduces to a single position ``start_pos`` for all
-        # 3 RoPE components, which is exactly what
-        # ``get_rope_index_text(1, start_pos, ...)`` produces.
+        # Embed a text-only token span (prefill chunk or single decode token)
+        # and compute 3D MRoPE position IDs starting at start_pos.
         text_ids = inputs["text_inputs"][0].to(device)  # (seq_len,)
         embeds = self.model.model.embed_tokens(text_ids)
         seq_len = text_ids.shape[0]
