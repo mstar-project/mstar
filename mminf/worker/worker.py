@@ -1859,6 +1859,12 @@ class Worker:
         effects (queue updates, complete_loops) are visible to the next
         iter's speculation.
 
+        Stops for rids NOT in this batch are handled by
+        ``_drain_orphan_pending_stops`` at the top of the worker loop —
+        without that, a pending stop whose loop has no further body to
+        run (e.g. Talker after EOS, no spec) sits forever and the
+        partition never reports done.
+
         Returns a ``{rid: {loop_back_input_name, ...}}`` map of loop-back
         input names that should be EXCLUDED from this iter's output routing
         — when a loop is stopped, its loop-back outputs MUST NOT be re-
@@ -1901,6 +1907,113 @@ class Worker:
                 edge.name for edge in node.outputs if edge.next_node == node.name
             }
         return stopped_loop_backs
+
+    def _drain_orphan_pending_stops(
+        self,
+        pending: tuple[ScheduledBatch, NodeBatch, str | None, Future] | None,
+        pending_postproc: list[PendingPostproc],
+    ) -> None:
+        """Apply stops for ``(rid, partition)`` keys that have no in-flight
+        batch, no scheduled batch, and no body sitting in ``ready`` waiting
+        to be popped — those stops would otherwise sit forever.
+
+        Stops covered by an in-flight or scheduled batch are left alone;
+        the standard ``_apply_pending_stops_to_batch`` call inside that
+        batch's fast_postprocess will consume them.
+        """
+        if not self._pending_stops:
+            return
+
+        in_flight_keys: set[tuple[str, str | None]] = set()
+        if pending is not None:
+            p_batch, _, p_partition, _ = pending
+            for rid in p_batch.node_objects:
+                in_flight_keys.add((rid, p_partition))
+        for pp in pending_postproc:
+            for rid in pp.batch.node_objects:
+                in_flight_keys.add((rid, pp.partition))
+
+        for key in list(self._pending_stops.keys()):
+            if key in in_flight_keys:
+                continue
+            rid, partition = key
+            per_request_info = self.worker_graphs_manager.per_request_info.get(rid)
+            if per_request_info is None:
+                self._pending_stops.pop(key)
+                continue
+            part_info = per_request_info.per_partition_info.get(partition)
+            if part_info is None:
+                self._pending_stops.pop(key)
+                continue
+            # If a body is in `ready` for this rid+partition, the
+            # scheduler will pop it next and a fast_postprocess will
+            # fire — let the standard path handle the stop there.
+            has_ready_body = any(
+                rid in self.worker_graphs_manager.queues[wg].per_request_queues
+                and len(self.worker_graphs_manager.queues[wg].per_request_queues[rid].ready) > 0
+                for wg in part_info.graph_walk_worker_graph_ids
+            )
+            if has_ready_body:
+                continue
+            loop_names = self._pending_stops.pop(key)
+            fwd_info = self.worker_graphs_manager.get_fwd_info(rid, partition)
+            self.worker_graphs_manager.stop_loops(
+                rid, partition=partition, loop_names=loop_names,
+                req_info=fwd_info, last_node_run=None,
+            )
+            self._finalize_orphan_stop(rid, partition)
+
+    def _finalize_orphan_stop(self, rid: str, partition: str | None) -> None:
+        """Force-complete loops for an orphan stop and emit
+        WORKER_GRAPHS_DONE for any worker graph that became done.
+        Called from ``_apply_pending_stops_to_batch`` for rids whose
+        stop isn't covered by the current batch. ``stop_loops`` has
+        already been called at this point (so ``_finished=True``); this
+        method drives complete_loops for the bodies sitting in `ready`
+        — calling it with each ready body's name removes that name from
+        the loop's ``_waiting_for_execution``, after which ``_is_done``
+        returns True and the loop emits its accumulated outputs.
+        """
+        per_request_info = self.worker_graphs_manager.per_request_info.get(rid)
+        if per_request_info is None:
+            return
+        part_info = per_request_info.per_partition_info.get(partition)
+        if part_info is None:
+            return
+        print("HELLO ORPHAN STOP", rid, partition)
+        completed_wg_ids: list[str] = []
+        for wg_id in part_info.graph_walk_worker_graph_ids:
+            queue = self.worker_graphs_manager.queues[wg_id]
+            per_req_q = queue.per_request_queues.get(rid)
+            if per_req_q is None:
+                continue
+            per_req_q.ready.clear()
+
+            # TODO this is hacky, just trying to get something working
+            for name in per_req_q.waiting.get_node_names():
+                out = per_req_q.waiting.complete_loops(name)
+                per_req_q.waiting = out.new_waiting
+            print(wg_id, queue.is_done(rid))
+            print(queue)
+            print()
+            if queue.is_done(rid):
+                completed_wg_ids.append(wg_id)
+                queue.reset(rid)
+
+        if not completed_wg_ids:
+            return
+        graph_walk = self.worker_graphs_manager.get_graph_walk(rid, partition)
+        routing = NodeOutputRouting(
+            routed_to_this_worker_graph=[],
+            persist=[],
+            to_workers={},
+            completed_worker_graph_ids=completed_wg_ids,
+        )
+        self._send_outputs(
+            rid, routing,
+            graph_walk=graph_walk,
+            partition_name=partition,
+        )
 
     def _apply_pending_removes_safe_to_drop(
         self, in_flight_rids: set[str]
@@ -2082,6 +2195,18 @@ class Worker:
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids | self._postproc_inflight_rids
                 )
+
+                # Drain pending stops with no in-flight batch, scheduled
+                # batch, or ready body to consume them. Required for non-
+                # spec loops where iter N's split_off_ready put body N+1
+                # in `ready`, but EOS was detected in slow_postprocess(N)
+                # and the scheduler later popped body N+1 (running it as
+                # the wasted step) — once body N+1 enters the pending
+                # batch, fast_postprocess(N+1) will consume the stop, but
+                # for stops detected after the queue is fully drained
+                # (loop ended without a wasted step), no batch fires and
+                # the stop sits forever. This drain catches that case.
+                self._drain_orphan_pending_stops(pending, pending_postproc)
 
                 # 1. CPU preamble — overlaps with GPU(N).
                 # synchronize=False on every range so torch.cuda.synchronize()
