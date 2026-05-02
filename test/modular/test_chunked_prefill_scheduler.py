@@ -347,12 +347,12 @@ def test_scheduled_batch_carries_terminal_and_chunk_size_fields():
     assert batch.is_terminal_per_request == {"a": True, "b": False}
     assert batch.prefill_chunk_sizes == {"b": 2048}
 
-    # Backwards compat — both default to None.
+    # Backwards compat — both default to empty dict.
     legacy = ScheduledBatch(
         node_name="Thinker", graph_walk="thinker_decode", node_objects={},
     )
-    assert legacy.is_terminal_per_request is None
-    assert legacy.prefill_chunk_sizes is None
+    assert legacy.is_terminal_per_request == {}
+    assert legacy.prefill_chunk_sizes == {}
 
 
 def test_chunked_step_returns_none_when_no_ar_requests_ready():

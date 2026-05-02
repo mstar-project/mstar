@@ -34,14 +34,14 @@ class ScheduledBatch:
     # by `MicroScheduler._get_chunked_step_batch` for thinker_step batches;
     # propagated to ``NodeBatch.is_terminal_per_request`` at build time.
     # Empty dict (default) means "all terminal" — Phase 1 behavior.
-    is_terminal_per_request: dict[str, bool] = None
+    is_terminal_per_request: dict[str, bool] = field(default_factory=dict)
 
     # Phase 2 chunked-prefill: per-request chunk size for prefill chunks.
     # Populated alongside ``is_terminal_per_request`` for thinker_step
     # batches. Used by the worker to (a) slice prompt token tensors and
-    # (b) advance ``prefill_tokens_consumed`` after the step. None /
-    # empty means "no chunked-prefill in this batch".
-    prefill_chunk_sizes: dict[str, int] = None
+    # (b) advance ``prefill_tokens_consumed`` after the step. Empty dict
+    # (default) means "no chunked-prefill in this batch".
+    prefill_chunk_sizes: dict[str, int] = field(default_factory=dict)
 
 
 # ----------------------------------------------------------------------
@@ -168,9 +168,8 @@ class MicroScheduler:
         # Phase 2 chunked-prefill: max tokens per step (decode + prefill).
         # Only consulted when an AR engine has scheduler_owns_chunking=True;
         # otherwise the existing single-walk batching path is used.
-        # TODO(Phase 2 Task 8): surface this in YAML model_config; for now
-        # the worker passes it through from model_config["max_step_tokens"]
-        # if set, else this default.
+        # Wired from model_config["max_step_tokens"] by Worker.__init__ (see
+        # worker.py); models that want a custom budget set it in their YAML.
         self.max_step_tokens = max_step_tokens
 
     def _select_node_priority(
