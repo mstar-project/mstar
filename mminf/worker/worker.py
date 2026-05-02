@@ -836,12 +836,21 @@ class Worker:
         # block until GPU(N+1) drains too, undoing the overlap. The event
         # was recorded right after GPU(N), so syncing on it waits only for
         # GPU(N).
+        if self.enable_nvtx:
+            from mminf.utils.profiler import range_pop, range_push
+            range_push("worker.route_outputs.store.cuda_sync", synchronize=False)
         if torch.cuda.is_available() and batch.node_objects:
             if output.completion_event is not None:
+                if self.enable_nvtx:
+                    range_push("worker.route_outputs.store.completion_event_sync", synchronize=False)
                 output.completion_event.synchronize()
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
             else:
                 torch.cuda.default_stream().synchronize()
-
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            range_push("worker.route_outputs.store.register", synchronize=False)
 
         for request_id, node in batch.node_objects.items():
             # output name to list of tensors
@@ -884,6 +893,8 @@ class Worker:
                 for info in edge.tensor_info:
                     self.tensor_manager.dereference(request_id, info.uuid)
 
+        if self.enable_nvtx:
+            range_pop(synchronize=False)  # worker.route_outputs.store.register
         return output_edges
 
 
@@ -1633,6 +1644,9 @@ class Worker:
                 e for e in node.outputs if e.name in request_output_tensors
             ]
             filtered_outputs_per_request[request_id] = filtered_outputs
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            range_push("worker.route_outputs.store", synchronize=False)
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
