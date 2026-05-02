@@ -351,7 +351,9 @@ class AREngine(BaseEngine):
     def warmup(self) -> None:
         """Compile submodules and capture CUDA graphs."""
         from mminf.engine.cuda_graph_runner import (
-            CudaGraphRunner, PiecewiseCudaGraphRunner, DEFAULT_AR_CAPTURE_BATCH_SIZES,
+            DEFAULT_AR_CAPTURE_BATCH_SIZES,
+            CudaGraphRunner,
+            PiecewiseCudaGraphRunner,
         )
 
         for node_name, submodule_mgmt in self.submodule_management.items():

@@ -149,7 +149,7 @@ class ModelInputsFromEngine:
         """
         assert len(self.per_request_info) == 1
         return self.per_request_info[self.request_ids[0]]
-    
+
     @property
     def first_request_info(self):
         """
