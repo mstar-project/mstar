@@ -516,6 +516,7 @@ class AREngine(BaseEngine):
             inputs=inputs,
             per_request_info=batch.per_request_info,
             submodule=submodule,
+            is_terminal_per_request=batch.is_terminal_per_request,
         )
 
         return NodeOutput(per_request_output_tensors=batched_output)
