@@ -148,7 +148,14 @@ class Worker:
             node_to_partition=node_to_partition,
         )
 
-        self.scheduler = MicroScheduler(self.engine_manager)
+        # Phase 2 chunked-prefill: pull the per-step token budget from
+        # model_config (TODO: surface in YAML in Task 8). Defaults to 2048
+        # to match plan_chunked_step's typical decode + prefill window.
+        # Only consulted when an AR engine has scheduler_owns_chunking=True.
+        max_step_tokens = model_config.get("max_step_tokens", 2048) if model_config else 2048
+        self.scheduler = MicroScheduler(
+            self.engine_manager, max_step_tokens=max_step_tokens
+        )
 
         # Determine store write policy based on worker graph topology
         node_engine_types = model.get_node_engine_types() if model is not None else {}
@@ -302,6 +309,26 @@ class Worker:
         if ar_engine is not None:
             for node_name in ar_engine.submodule_management.keys():
                 self._last_active[(body.request_id, node_name)] = _time.monotonic()
+
+        # Phase 2 chunked-prefill: when the AR engine has opted into
+        # scheduler-driven chunking, prime ``prefill_tokens_total`` from
+        # the prompt tensor's leading dimension so the MicroScheduler's
+        # mixed-batch packer can classify this request as prefill-ready.
+        # ``text_inputs`` is the AR prefill walks' canonical input name
+        # (prefill_text + thinker_step). When chunking is disabled, total
+        # stays 0 and ``is_prefill_complete`` returns True trivially —
+        # Phase 1 path unchanged.
+        if (
+            ar_engine is not None
+            and getattr(ar_engine, "scheduler_owns_chunking", False)
+        ):
+            for edge in body.initial_inputs:
+                if edge.name == "text_inputs" and edge.tensor_info:
+                    prompt_len = edge.tensor_info[0].dims[0] if edge.tensor_info[0].dims else 0
+                    if prompt_len > 0:
+                        body.request_info.prefill_tokens_total = int(prompt_len)
+                        body.request_info.prefill_tokens_consumed = 0
+                    break
 
         self.worker_graphs_manager.add_request(
             request_id=body.request_id,
@@ -684,12 +711,17 @@ class Worker:
             per_request_inputs[request_id] = tensors
             per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
 
+        # Phase 2 chunked-prefill: surface the per-request terminal flags
+        # from the scheduler. Empty dict ⇒ "all terminal" (Phase 1 path).
+        is_terminal_per_request = batch.is_terminal_per_request or {}
+
         return NodeBatch(
             node_name=batch.node_name,
             graph_walk=batch.graph_walk,
             request_ids=list(batch.node_objects.keys()),
             per_request_input_tensors=per_request_inputs,
-            per_request_info=per_request_info
+            per_request_info=per_request_info,
+            is_terminal_per_request=is_terminal_per_request,
         )
 
     # ------------------------------------------------------------------
@@ -1361,6 +1393,21 @@ class Worker:
                 per_label_seq_info=req_info.per_label_seq_info,
                 partition_name=batch_partition,
             )
+
+        # Phase 2 chunked-prefill: advance prefill_tokens_consumed for each
+        # prefill chunk that just completed. Only fires when the scheduler
+        # populated ``prefill_chunk_sizes`` on the batch (i.e., this was a
+        # thinker_step batch from _get_chunked_step_batch). Phase 1 batches
+        # have ``prefill_chunk_sizes is None`` and skip this entirely.
+        if batch.prefill_chunk_sizes:
+            for rid, chunk in batch.prefill_chunk_sizes.items():
+                if rid not in node_batch.per_request_info:
+                    continue
+                fwd_info = self.worker_graphs_manager.get_fwd_info(rid, batch_partition)
+                fwd_info.prefill_tokens_consumed = min(
+                    fwd_info.prefill_tokens_total,
+                    fwd_info.prefill_tokens_consumed + int(chunk),
+                )
         if self.enable_nvtx:
             range_pop(synchronize=False)
 

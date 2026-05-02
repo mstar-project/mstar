@@ -287,3 +287,155 @@ def test_thinker_step_per_request_gating_uses_terminal_dict():
     assert "lm_head" in src
     # 3. Conditionally emit logits.
     assert "logits" in src
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Task 5: MicroScheduler chunked-step packing hook + worker bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def test_micro_scheduler_accepts_max_step_tokens_param():
+    """MicroScheduler.__init__ accepts max_step_tokens with default 2048."""
+    import inspect
+
+    from mminf.worker.micro_scheduler import MicroScheduler
+
+    sig = inspect.signature(MicroScheduler.__init__)
+    assert "max_step_tokens" in sig.parameters
+    assert sig.parameters["max_step_tokens"].default == 2048
+
+
+def test_micro_scheduler_exposes_chunked_step_method():
+    """The new private packing method is in place on MicroScheduler.
+
+    Source-level check; full behavioral coverage requires a real
+    WorkerGraphsManager (Task 6). The method must:
+      1. classify ready AR requests via ``is_prefill_complete``,
+      2. call ``plan_chunked_step``,
+      3. produce a ``ScheduledBatch`` with ``graph_walk='thinker_step'``
+         and ``is_terminal_per_request`` populated.
+    """
+    import inspect
+
+    from mminf.worker.micro_scheduler import MicroScheduler
+
+    assert hasattr(MicroScheduler, "_get_chunked_step_batch")
+    src = inspect.getsource(MicroScheduler._get_chunked_step_batch)
+    assert "is_prefill_complete" in src
+    assert "plan_chunked_step" in src
+    assert '"thinker_step"' in src or "'thinker_step'" in src
+    assert "is_terminal_per_request" in src
+    assert "prefill_chunk_sizes" in src
+
+
+def test_get_next_batch_short_circuits_when_owner_is_scheduler():
+    """get_next_batch dispatches to the chunked-step path when
+    ``scheduler_owns_chunking=True`` is set on the AR engine."""
+    import inspect
+
+    from mminf.worker.micro_scheduler import MicroScheduler
+
+    src = inspect.getsource(MicroScheduler.get_next_batch)
+    # Must check the flag and call the new method.
+    assert "_ar_engine_owns_chunking" in src
+    assert "_get_chunked_step_batch" in src
+    # The flag check must come before the legacy node_name_to_requests dict
+    # is built (so the new path takes precedence when active).
+    flag_idx = src.index("_ar_engine_owns_chunking")
+    legacy_idx = src.index("node_name_to_requests")
+    assert flag_idx < legacy_idx
+
+
+def test_scheduled_batch_carries_terminal_and_chunk_size_fields():
+    """ScheduledBatch was extended with the chunked-step metadata fields."""
+    from mminf.worker.micro_scheduler import ScheduledBatch
+
+    batch = ScheduledBatch(
+        node_name="Thinker",
+        graph_walk="thinker_step",
+        node_objects={},
+        is_terminal_per_request={"a": True, "b": False},
+        prefill_chunk_sizes={"b": 2048},
+    )
+    assert batch.is_terminal_per_request == {"a": True, "b": False}
+    assert batch.prefill_chunk_sizes == {"b": 2048}
+
+    # Backwards compat — both default to None.
+    legacy = ScheduledBatch(
+        node_name="Thinker", graph_walk="thinker_decode", node_objects={},
+    )
+    assert legacy.is_terminal_per_request is None
+    assert legacy.prefill_chunk_sizes is None
+
+
+def test_chunked_step_returns_none_when_no_ar_requests_ready():
+    """With an empty WorkerGraphsManager, _get_chunked_step_batch returns
+    None so callers fall through to the legacy scheduling path."""
+    from dataclasses import dataclass, field
+    from mminf.engine.base import EngineType
+    from mminf.worker.engine_manager import EngineManager
+    from mminf.worker.micro_scheduler import MicroScheduler
+
+    @dataclass
+    class _StubAR:
+        scheduler_owns_chunking: bool = True
+
+        def engine_type(self):
+            return EngineType.AR
+
+        def check_ready(self, *args, **kwargs):
+            return True
+
+    em = EngineManager(node_to_engine={"Thinker": _StubAR()})
+    sched = MicroScheduler(em, max_step_tokens=2048)
+
+    @dataclass
+    class _StubWGM:
+        queues: dict = field(default_factory=dict)
+        per_request_info: dict = field(default_factory=dict)
+
+        def get_partition_for_node(self, name):
+            return "Thinker"
+
+    out = sched._get_chunked_step_batch(_StubWGM())
+    assert out is None
+
+
+def test_worker_admission_initializes_prefill_total():
+    """When scheduler_owns_chunking is on, _add_new_request primes
+    prefill_tokens_total from the prompt tensor's leading dimension.
+
+    Source-level check; behavioral coverage with real workers in Task 6.
+    """
+    import inspect
+
+    from mminf.worker.worker import Worker
+
+    src = inspect.getsource(Worker._add_new_request)
+    # Must check the engine flag and read text_inputs.dims[0].
+    assert "scheduler_owns_chunking" in src
+    assert "text_inputs" in src
+    assert "prefill_tokens_total" in src
+
+
+def test_worker_advances_prefill_tokens_consumed_after_step():
+    """The worker's post-step bookkeeping advances prefill_tokens_consumed
+    for each prefill rid in the executed batch by the chunk size."""
+    import inspect
+
+    from mminf.worker.worker import Worker
+
+    src = inspect.getsource(Worker._fast_postprocess)
+    assert "prefill_chunk_sizes" in src
+    assert "prefill_tokens_consumed" in src
+
+
+def test_worker_propagates_is_terminal_per_request_into_node_batch():
+    """_build_node_batch carries ScheduledBatch.is_terminal_per_request
+    into NodeBatch so the AR engine + ThinkerSubmodule can gate lm_head."""
+    import inspect
+
+    from mminf.worker.worker import Worker
+
+    src = inspect.getsource(Worker._build_node_batch)
+    assert "is_terminal_per_request" in src

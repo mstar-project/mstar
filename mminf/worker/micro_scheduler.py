@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 
+from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphNode
 from mminf.worker.engine_manager import EngineManager
@@ -27,6 +28,20 @@ class ScheduledBatch:
     node_objects: dict[str,GraphNode]
     # request_id -> worker_graph_id (for push-back on OOM)
     request_to_worker_graph: dict[str, str] = None
+
+    # Phase 2 chunked-prefill: per-request flag indicating whether this
+    # request's slice should produce sampled output this step. Populated
+    # by `MicroScheduler._get_chunked_step_batch` for thinker_step batches;
+    # propagated to ``NodeBatch.is_terminal_per_request`` at build time.
+    # Empty dict (default) means "all terminal" — Phase 1 behavior.
+    is_terminal_per_request: dict[str, bool] = None
+
+    # Phase 2 chunked-prefill: per-request chunk size for prefill chunks.
+    # Populated alongside ``is_terminal_per_request`` for thinker_step
+    # batches. Used by the worker to (a) slice prompt token tensors and
+    # (b) advance ``prefill_tokens_consumed`` after the step. None /
+    # empty means "no chunked-prefill in this batch".
+    prefill_chunk_sizes: dict[str, int] = None
 
 
 # ----------------------------------------------------------------------
@@ -140,7 +155,8 @@ class MicroScheduler:
 
     def __init__(
         self, engine_manager: EngineManager,
-        sched_type=SchedulingType.ROUND_ROBIN
+        sched_type=SchedulingType.ROUND_ROBIN,
+        max_step_tokens: int = 2048,
     ):
         self.engine_manager = engine_manager
         self.batch_number = 0
@@ -148,6 +164,14 @@ class MicroScheduler:
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[str, float] = {}
+
+        # Phase 2 chunked-prefill: max tokens per step (decode + prefill).
+        # Only consulted when an AR engine has scheduler_owns_chunking=True;
+        # otherwise the existing single-walk batching path is used.
+        # TODO(Phase 2 Task 8): surface this in YAML model_config; for now
+        # the worker passes it through from model_config["max_step_tokens"]
+        # if set, else this default.
+        self.max_step_tokens = max_step_tokens
 
     def _select_node_priority(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
@@ -202,6 +226,159 @@ class MicroScheduler:
         for rid in request_ids:
             self.held_until[rid] = deadline
 
+    # ------------------------------------------------------------------
+    # Phase 2 chunked-prefill: mixed batch packing.
+    # ------------------------------------------------------------------
+
+    def _ar_engine_owns_chunking(self) -> bool:
+        """True iff this scheduler should pack mixed thinker_step batches.
+
+        The flag lives on the AREngine. We only consult it when an AR
+        engine is present on this worker; non-AR-only workers (e.g.,
+        Talker / Code2Wav) preserve Phase 1 behavior.
+        """
+        ar_engine = self.engine_manager.get_ar_engine()
+        if ar_engine is None:
+            return False
+        return getattr(ar_engine, "scheduler_owns_chunking", False)
+
+    def _get_chunked_step_batch(
+        self,
+        worker_graphs_manager: WorkerGraphsManager,
+        target_node_name: str | None = None,
+        exclude_target: tuple[str, str] | None = None,
+    ) -> ScheduledBatch | None:
+        """Pack a single ``thinker_step`` batch from ready AR-engine requests.
+
+        Walks every ready AR node, classifying each request as decode-ready
+        (``is_prefill_complete=True``) or prefill-ready (mid-chunked-prefill).
+        Calls ``plan_chunked_step`` with the worker's max-step budget, then
+        pops the popped nodes' GraphNodes and returns a single ``ScheduledBatch``
+        whose ``graph_walk`` is ``thinker_step`` and whose
+        ``is_terminal_per_request`` map encodes the plan.
+
+        Returns None when no AR requests are ready (caller falls back to the
+        non-chunked scheduling path).
+
+        Caveat (Phase 2 Task 5 scope): the per-request prompt-token slicing
+        for prefill chunks and the post-step ``prefill_tokens_consumed``
+        advance are wired separately on the worker side — this method only
+        produces the batch + metadata. Behavioral coverage of the full
+        round-trip lives in Task 6 (qwen3_omni weights).
+        """
+        now = time.monotonic()
+        # Expire stale hold entries (mirrors get_next_batch).
+        self.held_until = {
+            rid: t for rid, t in self.held_until.items() if t > now
+        }
+
+        # rid -> (worker_graph_id, node_name, graph_walk, fwd_info)
+        ready: dict[str, tuple[str, str, str, CurrentForwardPassInfo]] = {}
+
+        for worker_graph_id, queue in worker_graphs_manager.queues.items():
+            ready_map = queue.get_ready_node_names()
+            for request_id, node_names in ready_map.items():
+                if request_id not in worker_graphs_manager.per_request_info:
+                    continue
+                if request_id in self.held_until:
+                    continue
+                for sname in node_names:
+                    if target_node_name is not None and sname != target_node_name:
+                        continue
+                    if sname not in self.engine_manager.node_to_engine:
+                        continue
+                    engine = self.engine_manager.get_engine(sname)
+                    if engine.engine_type() != EngineType.AR:
+                        continue
+                    node_partition = worker_graphs_manager.get_partition_for_node(sname)
+                    graph_walk = worker_graphs_manager.get_graph_walk(
+                        request_id, node_partition
+                    )
+                    if exclude_target is not None and (sname, graph_walk) == exclude_target:
+                        continue
+                    fwd_info = worker_graphs_manager.get_fwd_info(request_id, node_partition)
+                    if not engine.check_ready(sname, request_id, fwd_info):
+                        continue
+                    # Take the first eligible (rid, node_name) pair per request.
+                    if request_id not in ready:
+                        ready[request_id] = (worker_graph_id, sname, graph_walk, fwd_info)
+
+        if not ready:
+            return None
+
+        # Classify each ready request.
+        decode_ready: list[DecodeReadyRequest] = []
+        prefill_ready: list[PrefillReadyRequest] = []
+        for rid, (_wg_id, _sname, _walk, fwd_info) in ready.items():
+            if fwd_info.is_prefill_complete:
+                decode_ready.append(DecodeReadyRequest(rid=rid))
+            else:
+                tokens_remaining = max(
+                    0,
+                    fwd_info.prefill_tokens_total - fwd_info.prefill_tokens_consumed,
+                )
+                prefill_ready.append(
+                    PrefillReadyRequest(rid=rid, tokens_remaining=tokens_remaining)
+                )
+
+        plan = plan_chunked_step(decode_ready, prefill_ready, self.max_step_tokens)
+        if plan.total_tokens == 0:
+            return None
+
+        # Build the unified batch. Order: decodes first, then prefills.
+        batch_rids = list(plan.decode_rids) + list(plan.prefill_allocations.keys())
+        node_objects: dict[str, GraphNode] = {}
+        request_to_worker_graph: dict[str, str] = {}
+        is_terminal_per_request: dict[str, bool] = {}
+        prefill_chunk_sizes: dict[str, int] = {}
+
+        # Pop ready nodes for each rid; choose the same node name across rids
+        # (the scheduler's _select_node helpers normally enforce this; here we
+        # accept whatever node was ready since all are AR. In practice on a
+        # qwen3-omni-style worker the AR node is "Thinker" for all rids.)
+        node_name_for_batch: str | None = None
+        for rid in batch_rids:
+            wg_id, sname, _walk, _fwd = ready[rid]
+            queue = worker_graphs_manager.queues[wg_id]
+            popped = queue.pop_ready_nodes(rid, [sname])
+            if not popped:
+                continue
+            assert len(popped) == 1
+            node_objects[rid] = popped[0]
+            request_to_worker_graph[rid] = wg_id
+            if node_name_for_batch is None:
+                node_name_for_batch = sname
+
+            if rid in plan.decode_rids:
+                is_terminal_per_request[rid] = True
+            else:
+                # prefill chunk: terminal iff this is the last chunk
+                is_terminal_per_request[rid] = rid in plan.terminal_prefills
+                prefill_chunk_sizes[rid] = plan.prefill_allocations[rid]
+
+        if not node_objects or node_name_for_batch is None:
+            return None
+
+        logger.debug(
+            "MicroScheduler chunked-step: node=%s rids=%d decodes=%d prefills=%d budget=%d",
+            node_name_for_batch, len(node_objects),
+            len(plan.decode_rids), len(plan.prefill_allocations),
+            self.max_step_tokens,
+        )
+        self.batch_number += 1
+        self.node_and_walk_to_last_batch_num[(
+            node_name_for_batch, "thinker_step"
+        )] = self.batch_number
+
+        return ScheduledBatch(
+            node_name=node_name_for_batch,
+            graph_walk="thinker_step",
+            node_objects=node_objects,
+            request_to_worker_graph=request_to_worker_graph,
+            is_terminal_per_request=is_terminal_per_request,
+            prefill_chunk_sizes=prefill_chunk_sizes,
+        )
+
     def get_next_batch(
         self,
         worker_graphs_manager: WorkerGraphsManager,
@@ -221,6 +398,29 @@ class MicroScheduler:
             target_graph_walk: If set, only schedule this graph walk.
             exclude_target: If set, skip this (node_name, graph_walk) pair.
         """
+        # Phase 2 chunked-prefill: when the AR engine on this worker has
+        # opted into scheduler-driven chunking, dispatch through the
+        # mixed-batch packer first. If it produces a batch, return it; if
+        # no AR requests are ready (None), fall through to the existing
+        # path so non-AR engines continue to schedule normally. The flag
+        # defaults to False so Phase 1 behavior is preserved.
+        # ``target_graph_walk`` overrides this path so callers explicitly
+        # asking for a specific walk (e.g., a non-thinker walk on a
+        # multi-engine worker) still get the legacy semantics.
+        if (
+            target_graph_walk is None
+            and self._ar_engine_owns_chunking()
+        ):
+            chunked = self._get_chunked_step_batch(
+                worker_graphs_manager,
+                target_node_name=target_node_name,
+                exclude_target=exclude_target,
+            )
+            if chunked is not None:
+                return chunked
+            # Fall through: AR queue empty this tick, but other engines
+            # (e.g., Talker) may still have ready work.
+
         # Collect all ready (node_name, request_id, graph_walk) tuples
         # grouped by node name
         node_name_to_requests: dict[str, list[ReadyNodeEntry]] = {}
