@@ -79,6 +79,15 @@ def _conductor_process_target(
     with open(config_path, "r") as _f:
         _yaml_cfg = _yaml.safe_load(_f) or {}
     yaml_model_kwargs = _yaml_cfg.get("model_kwargs", {}) or {}
+    if yaml_model_kwargs:
+        logging.getLogger(__name__).info(
+            "yaml model_kwargs from %s: %s (forwarded to %s.__init__)",
+            config_path, yaml_model_kwargs, model_name,
+        )
+    else:
+        logging.getLogger(__name__).info(
+            "yaml %s has no model_kwargs section; using model defaults", config_path
+        )
 
     model = get_model_class(model_name)(
         model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),

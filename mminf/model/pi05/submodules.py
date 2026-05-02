@@ -310,6 +310,20 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device,
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
+        # Visibility check: log the shape that's about to be captured so it's
+        # easy to confirm yaml-level Pi05Config overrides (e.g. action_horizon
+        # for the DROID variant) flowed all the way through. The values here
+        # are read directly from self.config — same source as the nn.Linear
+        # weight shapes — so they're guaranteed consistent.
+        logger.info(
+            "Pi05LLMSubmodule.get_cuda_graph_configs: capturing 'action_gen' "
+            "graph with input_seq_len=%d, noisy_actions=(%d, %d), batch_sizes=[1,2,4] "
+            "(num_flow_steps=%d denoising iters runs INSIDE this captured graph; "
+            "denoising count is independent of horizon)",
+            self.config.action_horizon,
+            self.config.action_horizon, self.config.action_dim,
+            self.config.num_flow_steps,
+        )
         prefill_packed = {
             num_tokens: {
                 "prefix_embs": torch.zeros(num_tokens, self.config.hidden_size, device=device)
