@@ -267,6 +267,12 @@ class AREngine(BaseEngine):
 
         if self.enable_nvtx:
             range_push("ar.batched.forward")
+        # Signal the main thread that we're about to enter CUDA launch
+        # code. PyTorch drops the GIL inside the C++ kernel-launch path,
+        # so main can resume Python-heavy postprocess in parallel.
+        launch_started_event = batch.metadata.get("launch_started_event")
+        if launch_started_event is not None:
+            launch_started_event.set()
         batched_output = submodule.forward_batched(
             graph_walk=batch.graph_walk,
             engine_inputs=engine_inputs,
@@ -345,6 +351,11 @@ class AREngine(BaseEngine):
 
             if self.enable_nvtx:
                 range_push("ar.seq.forward")
+            # Signal on the first rid only — subsequent forwards for
+            # other rids continue to release the GIL inside PyTorch C++.
+            launch_started_event = batch.metadata.get("launch_started_event")
+            if launch_started_event is not None and not launch_started_event.is_set():
+                launch_started_event.set()
             output = submodule.forward(
                 graph_walk=batch.graph_walk,
                 engine_inputs=engine_inputs,
@@ -425,6 +436,7 @@ class AREngine(BaseEngine):
             submodule=submodule,
             slot=batch.metadata.get("cuda_graph_slot"),
             advance_event=batch.metadata.get("advance_event"),
+            launch_started_event=batch.metadata.get("launch_started_event"),
         )
 
         return NodeOutput(per_request_output_tensors=batched_output)
