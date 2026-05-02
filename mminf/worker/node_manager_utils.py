@@ -352,6 +352,7 @@ class WorkerGraphsManager:
         self, request_id: str,
         outputs: list[GraphEdge],
         graph_walk: str,
+        worker_graph_id_hint: str | None = None,
     ) -> NodeOutputRouting:
         """
         After a node has finished processing, use its outputs to update
@@ -361,6 +362,13 @@ class WorkerGraphsManager:
         I.e., it updates ready/waiting queues for worker graphs on this current
         worker, and directs external outputs to worker graphs on the appropriate
         (different) worker.
+
+        ``worker_graph_id_hint``: when provided, the caller knows exactly which
+        worker_graph the popped GraphNode came from (e.g., the chunked-prefill
+        scheduler relabels ``batch.graph_walk`` to ``thinker_step`` but pops
+        the GraphNode from a different walk's worker_graph). Use the hint
+        directly instead of filtering by ``graph_walk``, which would route to
+        the wrong queue.
         """
         # (0) separate streaming edges — they bypass the queue system
         streaming_edges = [edge for edge in outputs if edge.is_streaming]
@@ -371,11 +379,14 @@ class WorkerGraphsManager:
         new_token_outputs = [edge for edge in non_streaming_outputs if edge.conductor_new_token]
 
         # (2) process all internal-facing outputs
-        worker_graph_ids = [
-            gid
-            for gid in self.per_request_info[request_id].worker_graph_ids
-            if graph_walk in self.all_worker_graph_ids_to_graph_walks[gid]
-        ]
+        if worker_graph_id_hint is not None:
+            worker_graph_ids = [worker_graph_id_hint]
+        else:
+            worker_graph_ids = [
+                gid
+                for gid in self.per_request_info[request_id].worker_graph_ids
+                if graph_walk in self.all_worker_graph_ids_to_graph_walks[gid]
+            ]
 
         completed_worker_graph_ids = []
         routed_to_this_worker: list[GraphEdge] = [] # list of graph edges

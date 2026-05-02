@@ -851,7 +851,21 @@ class Worker:
             )
 
             if not request_output_tensors:
-                continue  # Node produced no outputs (e.g., KV-cache-only prefill step)
+                # Node produced no outputs (e.g., KV-cache-only prefill step,
+                # Talker non-last prefill). For non-terminal chunked-prefill
+                # rids, the popped GraphNode must be re-queued so the next
+                # chunk can run on it; otherwise the rid's ready queue stays
+                # empty and the scheduler can't pick it up next step,
+                # hanging the request. Empty is_terminal_per_request dict
+                # (legacy path) ⇒ treat all rids as terminal, preserving
+                # the prior skip-only behavior for Talker etc.
+                if not batch.is_terminal_per_request.get(request_id, True):
+                    worker_graph_id = batch.request_to_worker_graph.get(request_id)
+                    if worker_graph_id is not None:
+                        self.worker_graphs_manager.queues[worker_graph_id].push_back_node(
+                            request_id, node,
+                        )
+                continue
 
             output_tensor_info = self.tensor_manager.store_and_populate_graph_edges(
                 request_id=request_id,
@@ -1515,8 +1529,19 @@ class Worker:
                 ]
             else:
                 kept_for_routing = kept
+            # When the chunked-prefill scheduler relabels the batch's
+            # graph_walk (e.g. ``thinker_step``), filtering by graph_walk
+            # would route outputs to the wrong worker_graph. The scheduler
+            # populates ``request_to_worker_graph`` with the actual id the
+            # GraphNode was popped from — pass that as a hint.
+            wg_id_hint = (
+                batch.request_to_worker_graph.get(request_id)
+                if batch.request_to_worker_graph else None
+            )
             routing = self.worker_graphs_manager.process_node_outputs(
-                request_id, kept_for_routing, graph_walk=batch.graph_walk
+                request_id, kept_for_routing,
+                graph_walk=batch.graph_walk,
+                worker_graph_id_hint=wg_id_hint,
             )
             routing_per_request[request_id] = routing
         if self.enable_nvtx:
