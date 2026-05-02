@@ -61,9 +61,10 @@ def _slice_ar_inputs(inp: ARNodeInputs, start: int, end: int) -> ARNodeInputs:
     non-token-axis state (e.g. flags) that the chunked path must not mutate.
 
     Per-tensor token-axis convention:
-      - ``input_ids``: token axis is dim 0 if 1D, else dim 1.
-      - ``input_embeds``: token axis is dim 0 if 2D (``[seq_len, hidden]``),
-        else dim 1 (``[bs, seq_len, hidden]``).
+      - ``input_ids``: shape ``(batch, seq)`` — slice dim 1.
+      - ``input_embeds``: shape varies by model (``[seq_len, hidden]`` for
+        qwen3_omni, ``[bs, seq_len, hidden]`` for others) — locate the seq
+        axis by matching ``inp.input_seq_len``; assert it is found.
       - ``custom_pos_ids``: ``inp.input_seq_len`` lives on whichever axis
         matches its size.  qwen3_omni packs MRoPE as ``[3, seq_len]`` so
         the token axis is the LAST one; plain text models use 1D.
@@ -71,21 +72,38 @@ def _slice_ar_inputs(inp: ARNodeInputs, start: int, end: int) -> ARNodeInputs:
     chunk_len = end - start
     seq_len = inp.input_seq_len
 
+    if inp.input_ids is not None:
+        # input_ids: (batch, seq) — slice dim 1.
+        input_ids = inp.input_ids[:, start:end]
+    else:
+        input_ids = None
+
+    if inp.input_embeds is not None:
+        # input_embeds: shape varies; locate the seq axis by matching input_seq_len.
+        seq_axis = next(
+            (d for d in range(inp.input_embeds.dim()) if inp.input_embeds.shape[d] == seq_len),
+            None,
+        )
+        assert seq_axis is not None, (
+            f"input_embeds shape {tuple(inp.input_embeds.shape)} has no axis "
+            f"matching input_seq_len={seq_len}"
+        )
+        input_embeds = inp.input_embeds.narrow(seq_axis, start, chunk_len)
+    else:
+        input_embeds = None
+
     def _slice_token(t: torch.Tensor) -> torch.Tensor:
         # Pick the axis whose size equals seq_len. If multiple axes match
         # (degenerate seq_len=1 inputs), fall back to the LAST axis as a
         # convention — chunking a seq_len==1 prefill makes no sense anyway.
-        token_axis = -1
-        for dim in range(t.dim()):
-            if t.shape[dim] == seq_len:
-                token_axis = dim
-                break
+        token_axis = next(
+            (dim for dim in range(t.dim()) if t.shape[dim] == seq_len),
+            None,
+        )
+        assert token_axis is not None, (
+            f"tensor shape {tuple(t.shape)} has no axis matching input_seq_len={seq_len}"
+        )
         return t.narrow(token_axis, start, chunk_len)
-
-    input_ids = _slice_token(inp.input_ids) if inp.input_ids is not None else None
-    input_embeds = (
-        _slice_token(inp.input_embeds) if inp.input_embeds is not None else None
-    )
 
     custom_pos_ids = inp.custom_pos_ids
     if isinstance(custom_pos_ids, torch.Tensor):

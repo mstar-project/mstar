@@ -703,10 +703,13 @@ class Worker:
     ) -> NameToTensorList:
         """Return a new ``NameToTensorList`` with token-axis tensors sliced to ``[start, end)``.
 
-        Identifies the token axis dynamically as the first axis whose length
-        equals ``prefill_total`` (the request's full prompt length). Tensors
-        without such an axis (e.g. a fixed-size image embedding sized by hidden
-        dim) pass through unchanged.
+        Per-key token-axis rules (explicit, not dynamic):
+          - ``text_inputs``: 1D ``(seq_len,)`` — slice dim 0.
+          - All other keys: pass through unchanged. Worker-side non-token
+            tensors (e.g. fixed-size image or audio embeddings) are already
+            sized by modality length, not prompt_total; the engine-side
+            ``_slice_ar_inputs`` in ``chunked_prefill.py`` handles their
+            sequence axis after ``prepare_inputs`` constructs ARNodeInputs.
 
         This mirrors ``mminf.engine.chunked_prefill._slice_ar_inputs`` but
         operates on raw worker-side tensors (before they become
@@ -720,17 +723,13 @@ class Worker:
                 if not isinstance(t, torch.Tensor):
                     new_list.append(t)
                     continue
-                token_axis = -1
-                for dim in range(t.dim()):
-                    if t.shape[dim] == prefill_total:
-                        token_axis = dim
-                        break
-                if token_axis == -1:
-                    # No axis matches the prompt length — non-token tensor,
-                    # pass through unchanged.
-                    new_list.append(t)
+                if name == "text_inputs":
+                    # text_inputs: (seq_len,) — matches _prepare_text_input expectation.
+                    new_list.append(t[start:end])
                 else:
-                    new_list.append(t.narrow(token_axis, start, chunk_len))
+                    # Non-token-axis tensors propagate unchanged; the engine-side
+                    # _slice_ar_inputs handles any sequence-axis slicing post-prepare_inputs.
+                    new_list.append(t)
             sliced[name] = new_list
         return sliced
 
