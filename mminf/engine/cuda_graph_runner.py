@@ -932,9 +932,9 @@ class CudaGraphRunner:
         saved_request_ids = static_cm.request_ids
         saved_active_labels = static_cm.active_labels
         try:
-            static_cm.request_ids = list(request_ids)
+            static_cm.request_ids = list(request_ids) + saved_request_ids[len(request_ids):]
             static_cm.active_labels = {rid: "main" for rid in request_ids}
-            seq_lens = [1] * real_bs
+            seq_lens = [1] * len(saved_request_ids)
             if plan_stream is not None:
                 with torch.cuda.stream(plan_stream):
                     static_cm.plan_attention(
