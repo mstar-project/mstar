@@ -598,7 +598,6 @@ class Worker:
         req_info = self.worker_graphs_manager.per_request_info.get(request_id)
         if req_info is None:
             return []
-        result[request_id] = []
         for edge_name, sbuf in req_info.stream_buffers.items():
             consumer_node = self._consumer_node_cache.get(edge_name, "")
             if consumer_node != node_name:
@@ -1358,7 +1357,7 @@ class Worker:
             has_streaming_ready = []
             for rid in continuing:
                 streaming_edges[rid] = self._poll_stream_buffers_for_speculation(
-                    rid, batch_N.node_name, partition_N
+                    rid, batch_N.node_name
                 )
                 if len(streaming_edges[rid]) < len(sample_node._streaming_inputs):
                     for edge in streaming_edges[rid]:
@@ -1372,7 +1371,6 @@ class Worker:
                             )
                             for info in edge.tensor_info
                         ]
-                batch_N.node_objects[rid].ready_inputs.update(streaming_edges[rid])  
             continuing = has_streaming_ready
             if not continuing:
                 return None
@@ -1640,7 +1638,24 @@ class Worker:
         for request_id, node in batch.node_objects.items():
             kept = node_outputs[request_id].kept
             consumed_names = speculation_consumed_loop_back.get(request_id, set())
-            if consumed_names:
+            if request_id in stopped_loop_backs:
+                # Wasted speculative iter: this body ran AFTER EOS was
+                # detected (stop sat in _pending_stops while the
+                # speculatively-built batch was already on the GPU), so
+                # every output it produced is post-termination garbage.
+                # Drop them all — including streaming edges to downstream
+                # partitions (e.g. codec_tokens → Code2Wav, which would
+                # otherwise tack a final junk frame onto the audio) — and
+                # dereference the tensors that ``store_outputs_and_finish_loops``
+                # already allocated UUIDs for. We still call
+                # ``process_node_outputs`` with empty kept so the queue's
+                # is_done check fires and ``WORKER_GRAPHS_DONE`` gets
+                # emitted.
+                for edge in kept:
+                    for info in edge.tensor_info:
+                        self.tensor_manager.dereference(request_id, info.uuid)
+                kept_for_routing = []
+            elif consumed_names:
                 # Dereference the loop-back UUIDs that store_outputs_and_finish_loops
                 # allocated; speculation already holds the tensor via Python ref.
                 for edge in kept:
