@@ -103,6 +103,12 @@ class Pi05Model(Model):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
+        # Yaml-driven Pi05Config overrides forwarded by the entrypoint
+        # (e.g. {"action_horizon": 15} for the DROID benchmark variant).
+        # Applied inside _load_config() *before* weights or CUDA graphs
+        # are materialized so weight shapes and graph captures use
+        # consistent values.
+        self._yaml_config_overrides: dict = dict(kwargs)
 
         self.config: Pi05Config = self._load_config()
         self.tokenizer: Pi05Tokenizer | None = self._load_tokenizer()
@@ -126,22 +132,38 @@ class Pi05Model(Model):
 
     def _load_config(self) -> Pi05Config:
         if self.skip_weight_loading:
-            return Pi05Config()
-        try:
-            from huggingface_hub import hf_hub_download
+            cfg = Pi05Config()
+        else:
+            try:
+                from huggingface_hub import hf_hub_download
 
-            config_path = hf_hub_download(
-                repo_id=self.model_path_hf,
-                filename="config.json",
-                cache_dir=self.cache_dir,
-            )
-            with open(config_path) as f:
-                return load_pi05_config(json.load(f))
-        except Exception as exc:
-            logger.warning(
-                "Could not load Pi0.5 config from HF (%s); using defaults.", exc
-            )
-            return Pi05Config()
+                config_path = hf_hub_download(
+                    repo_id=self.model_path_hf,
+                    filename="config.json",
+                    cache_dir=self.cache_dir,
+                )
+                with open(config_path) as f:
+                    cfg = load_pi05_config(json.load(f))
+            except Exception as exc:
+                logger.warning(
+                    "Could not load Pi0.5 config from HF (%s); using defaults.", exc
+                )
+                cfg = Pi05Config()
+
+        # Overlay yaml-driven overrides (e.g. action_horizon for DROID).
+        # Applied last so they win over both HF config.json and Pi05Config
+        # defaults. Unknown keys are warned and ignored — common typo trap.
+        if self._yaml_config_overrides:
+            valid = {f.name for f in Pi05Config.__dataclass_fields__.values()}
+            for k, v in self._yaml_config_overrides.items():
+                if k in valid:
+                    setattr(cfg, k, v)
+                else:
+                    logger.warning(
+                        "Pi05Model: yaml model_kwargs key %r is not a Pi05Config "
+                        "field; ignored. Valid fields: %s", k, sorted(valid),
+                    )
+        return cfg
 
     def _load_tokenizer(self) -> Pi05Tokenizer | None:
         if self.skip_weight_loading:
