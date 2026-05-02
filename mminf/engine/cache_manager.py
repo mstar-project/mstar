@@ -154,10 +154,7 @@ class BatchedCacheManager:
             label: cache label to plan for. If None, uses the current active label.
             mode: Optional explicit "prefill" or "decode" hint. When None
                 (legacy callers), fall back to the seq_lens heuristic
-                (``all(sl == 1)`` -> decode). The chunked-prefill path's
-                last chunk can have seq_len=1 even though it's logically
-                still prefill, so the heuristic is unreliable; explicit
-                mode is the source of truth when provided.
+                (``all(sl == 1)`` -> decode). 
         """
         from mminf.utils.profiler import range_pop, range_push
 

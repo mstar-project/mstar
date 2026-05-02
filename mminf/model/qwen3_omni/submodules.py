@@ -229,8 +229,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
     # Default MRoPE section for head_dim=128: [24, 20, 20]
     MROPE_SECTION = [24, 20, 20]
 
-    def supports_chunked_prefill(self) -> bool:
-        return True
+    def get_chunked_prefill_walks(self) -> list[str]:
+        return ["prefill_text"]
 
     def __init__(
         self,
@@ -518,7 +518,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             return self._prepare_decode_input(inputs, start_pos, device)
 
         if graph_walk == "thinker_step":
-            # Phase 2.1b: ``thinker_step`` is the mixed-batch walk where
+            # ``thinker_step`` is the mixed-batch walk where
             # each rid contributes a slice of its own modality
             # (text-prefill chunk, decode token, or atomic audio/vision
             # prefill). Dispatch by per-rid input keys to the right
@@ -572,17 +572,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
         )
 
         # Plan FlashInfer attention and rope for the main cache label.
-        # Pass explicit mode so the chunked-prefill last chunk (seq_len=1 per
-        # request) doesn't get misclassified as decode by the seq_lens
-        # heuristic; that misclassification picks the FlashInfer decode
-        # wrapper for what is logically still prefill, producing different
-        # numerics at prompt_len = N*chunk_size + 1.
-        #
-        # ``thinker_step`` is the Phase 2 mixed-batch walk: it carries both
-        # decode tokens (seq_len=1) and prefill chunks (seq_len>=1) in the
-        # same batch. Routed to mode="prefill" because FlashInfer's prefill
-        # wrapper handles arbitrary per-request seq_lens correctly — including
-        # the seq_len=1 decode case, given that explicit mode is provided.
+        # Explicit mode prevents the chunked-prefill last chunk (seq_len=1
+        # per request) from being misclassified as decode by the seq_lens
+        # heuristic. ``thinker_step`` mixes decode (seq_len=1) and prefill
+        # (seq_len>=1) rids in one batch; routing to mode="prefill" picks
+        # FlashInfer's prefill wrapper, which handles arbitrary per-request
+        # seq_lens including seq_len=1.
         cache_manager = engine_inputs.cache_manager
         cache_manager.set_active_label("main")
         assert cache_manager is not None
@@ -694,16 +689,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
     # ---- batching ----
     def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
-        # ``thinker_step`` is the Phase 2 mixed-batch walk that always packs
-        # multiple requests' slices into a single forward pass.
         return batch.graph_walk in ("thinker_decode", "thinker_step")
 
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
-    # bs=8 added in Phase 2.1a so thinker_step mixed batches (typically 4-7
-    # decode rids + 1 prefill chunk = bs 5-8) round up to a captured bucket
-    # instead of falling through to eager. Pre-fix this helped marginally
-    # because the can_use_cuda_graphs replay-walk bug was rejecting graphs
-    # regardless; post-fix this should deliver real in-window speedup.
+    # bs=8 covers the typical thinker_step mixed-batch shape (4-7 decodes
+    # + 1 prefill chunk); below it batches fall through to eager.
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
 
     def _build_prefill_text_packed(
@@ -865,7 +855,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
           ``visual_pos_masks`` / ``mrope_pos_advance`` extras that the model
           forward also consumes; it is kept on the eager path.
 
-        ``thinker_step`` (Phase 2 mixed-batch walk, eager-only):
+        ``thinker_step`` (mixed-batch walk, eager-only):
           The batch carries a mix of decode tokens (seq_len=1) and prefill
           chunks (seq_len>=1). Emits ``__batched_logits__`` (single
           ``(bs, V)`` tensor) at the top level regardless of terminal-flag

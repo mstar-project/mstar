@@ -134,7 +134,7 @@ class ModelInputsFromEngine:
     per_request_info: dict[str, CurrentForwardPassInfo]
     cache_manager: BatchedCacheManager | None = None
 
-    # Phase 2 chunked-prefill: per-request terminal flag carried over from
+    # Chunked-prefill: per-request terminal flag carried over from
     # ``NodeBatch.is_terminal_per_request``. True means this request's slice
     # should produce sampled output this step (decode token OR final prefill
     # chunk that transitions to decode); False means it's a non-terminal
@@ -310,18 +310,21 @@ class NodeSubmodule(torch.nn.Module):
         """Remove per-request state when a request completes."""
         return
 
-    def supports_chunked_prefill(self) -> bool:
-        """Whether this submodule's forward tolerates a partial token stream.
+    def get_chunked_prefill_walks(self) -> list[str]:
+        """Return the graph walks for which this submodule's forward tolerates chunking.
 
-        When True, AREngine may split a single-request prefill into multiple
-        forward passes of ``max_prefill_chunk_size`` tokens each, with KV
-        cache state carried across via the existing paged cache manager.
+        For each walk in the returned list, AREngine may split a
+        single-request prefill into multiple forward passes of
+        ``max_prefill_chunk_size`` tokens each, with KV cache state carried
+        across via the existing paged cache manager.
 
-        Default False — submodules must opt in. Encoder-style submodules
-        whose inputs aren't sliceable along the token axis (e.g. fixed
-        image-token blocks) should leave this False.
+        Default empty list — submodules must opt in per walk. Walks whose
+        inputs aren't sliceable along the token axis (e.g. fixed image-token
+        blocks emitted by an encoder, sentinel-wrapped audio/vision embeds)
+        must be omitted. Mirrors the per-walk eligibility pattern used by
+        ``can_use_cuda_graphs`` / ``get_cuda_graph_configs``.
         """
-        return False
+        return []
 
 
 class ARNodeSubmodule(NodeSubmodule):

@@ -343,7 +343,7 @@ class Qwen3OmniModel(Model):
             outputs=[],
         )
 
-        # -- Phase 2 mixed-batch walk: handles both prefill chunks and decode
+        # -- mixed-batch walk: handles both prefill chunks and decode
         #    tokens of different requests in a single forward pass.  The
         #    ThinkerSubmodule routes attention planning to FlashInfer's
         #    prefill wrapper (which handles arbitrary per-request seq_lens,

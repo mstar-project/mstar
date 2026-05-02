@@ -461,18 +461,3 @@ def test_chunked_prefill_edge_cases(thinker_engine, prompt_len: int, chunk_size:
         capture.restore()
 
 
-def test_chunked_prefill_does_not_engage_for_audio_walk_yet():
-    """v0 only enables chunking for prefill_text. prefill_audio / prefill_vision
-    paths are not numerically verified yet and therefore should not be
-    chunked even though the Thinker submodule itself opts in.
-
-    v0 relies on caller-side discipline (the model's graph walks routing
-    audio/vision through this engine path produce single-walk batches
-    where the test doesn't exercise chunking yet). Walk-level gating —
-    i.e. extending supports_chunked_prefill(self, graph_walk: str) — is
-    a Phase 1.3 follow-up.
-    """
-    pytest.skip(
-        "v0: walk-level gating not implemented; rely on test coverage to "
-        "limit chunking to prefill_text. Track in TODO."
-    )

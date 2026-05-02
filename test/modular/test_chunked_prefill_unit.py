@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mminf.engine.chunked_prefill import ChunkSlice, _plan_chunks, _slice_ar_inputs
+from mminf.engine.ar_engine import ChunkSlice, _plan_chunks, _slice_ar_inputs
 from mminf.model.submodule_base import ARNodeInputs, NodeSubmodule
 
 
@@ -17,9 +17,9 @@ class _DummySubmodule(NodeSubmodule):
         raise NotImplementedError
 
 
-def test_supports_chunked_prefill_default_false():
+def test_get_chunked_prefill_walks_default_empty():
     sub = _DummySubmodule()
-    assert sub.supports_chunked_prefill() is False
+    assert sub.get_chunked_prefill_walks() == []
 
 
 def _make_inputs(seq_len: int) -> ARNodeInputs:
@@ -118,7 +118,7 @@ def test_qwen3_omni_thinker_opts_into_chunked_prefill():
     # we only need the class.
     from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
     # Override is on the class, not the instance — verify class-level method
-    # returns True. We can't always instantiate without weights, so use a
-    # dummy unbound-method check.
+    # returns the expected walks. We can't always instantiate without weights,
+    # so use a dummy unbound-method check.
     instance = ThinkerSubmodule.__new__(ThinkerSubmodule)
-    assert instance.supports_chunked_prefill() is True
+    assert instance.get_chunked_prefill_walks() == ["prefill_text"]

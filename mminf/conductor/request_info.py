@@ -77,11 +77,11 @@ class CurrentForwardPassInfo:
     loop_stop_times: dict[str, IterIndexTree] = field(default_factory=dict)
     dynamic_loop_iter_counts: dict[str, int] = field(default_factory=dict)
 
-    # Phase 2 chunked prefill progress.
+    # chunked prefill progress.
     # Set at request admission; advanced by the MicroScheduler each step
     # as chunks complete. Derived `is_prefill_complete` gates the
     # prefill→decode transition. Default values (0, 0) mean a request not
-    # in chunked-prefill mode (Phase 1 path).
+    # in chunked-prefill mode.
     prefill_tokens_total: int = 0
     prefill_tokens_consumed: int = 0
 

@@ -148,9 +148,6 @@ class Worker:
             node_to_partition=node_to_partition,
         )
 
-        # Phase 2 chunked-prefill: pull the per-step token budget from
-        # model_config (TODO: surface in YAML in Task 8). Defaults to 2048
-        # to match plan_chunked_step's typical decode + prefill window.
         # Only consulted when an AR engine has scheduler_owns_chunking=True.
         max_step_tokens = model_config.get("max_step_tokens", 2048) if model_config else 2048
         self.scheduler = MicroScheduler(
@@ -310,15 +307,13 @@ class Worker:
             for node_name in ar_engine.submodule_management.keys():
                 self._last_active[(body.request_id, node_name)] = _time.monotonic()
 
-        # Phase 2 chunked-prefill: when the AR engine has opted into
-        # scheduler-driven chunking, prime ``prefill_tokens_total`` from
-        # the prompt tensor's leading dimension so the MicroScheduler's
+        # When scheduler-driven chunking is on, prime ``prefill_tokens_total``
+        # from the prompt tensor's leading dimension so the MicroScheduler's
         # mixed-batch packer can classify this request as prefill-ready.
-        # Handles text + audio + vision. Audio/vision use embed_len + 2 to
-        # account for the start/end sentinel tokens added by the Thinker's
-        # _wrap_audio_input / _wrap_vision_input helpers. When chunking is
-        # disabled, total stays 0 and ``is_prefill_complete`` returns True
-        # trivially — Phase 1 path unchanged.
+        # Audio/vision use embed_len + 2 to account for the start/end
+        # sentinels added by the Thinker's _wrap_audio_input / _wrap_vision_input
+        # helpers. When chunking is off, total stays 0 and
+        # ``is_prefill_complete`` is trivially True.
         if (
             ar_engine is not None
             and getattr(ar_engine, "scheduler_owns_chunking", False)
@@ -718,12 +713,8 @@ class Worker:
           - All other keys: pass through unchanged. Worker-side non-token
             tensors (e.g. fixed-size image or audio embeddings) are already
             sized by modality length, not prompt_total; the engine-side
-            ``_slice_ar_inputs`` in ``chunked_prefill.py`` handles their
-            sequence axis after ``prepare_inputs`` constructs ARNodeInputs.
-
-        This mirrors ``mminf.engine.chunked_prefill._slice_ar_inputs`` but
-        operates on raw worker-side tensors (before they become
-        ``ARNodeInputs`` inside the submodule's ``prepare_inputs``).
+            ``_slice_ar_inputs`` in ``ar_engine.py`` handles their sequence
+            axis after ``prepare_inputs`` constructs ARNodeInputs.
         """
         chunk_len = end - start
         sliced: NameToTensorList = {}
@@ -749,11 +740,10 @@ class Worker:
         per_request_info: dict[CurrentForwardPassInfo] = {}
         batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
-        # Phase 2 chunked-prefill: when the scheduler populated
-        # ``prefill_chunk_sizes``, slice each prefill rid's token-axis
-        # tensors to ``[consumed : consumed + chunk_size]`` so the engine
-        # only sees this step's slice. Decode rids (not in the dict) and
-        # all rids in Phase 1 batches (dict empty) pass through unchanged.
+        # When ``prefill_chunk_sizes`` is populated, slice each prefill
+        # rid's token-axis tensors to ``[consumed : consumed + chunk_size]``
+        # so the engine only sees this step's slice. Decode rids (absent
+        # from the dict) and empty-dict batches pass through unchanged.
         chunk_sizes = batch.prefill_chunk_sizes or {}
 
         for request_id, node in batch.node_objects.items():
@@ -781,8 +771,7 @@ class Worker:
             per_request_inputs[request_id] = tensors
             per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
 
-        # Phase 2 chunked-prefill: surface the per-request terminal flags
-        # from the scheduler. Empty dict ⇒ "all terminal" (Phase 1 path).
+        # Empty dict ⇒ "all terminal" — preserves single-walk batch behavior.
         is_terminal_per_request = batch.is_terminal_per_request or {}
 
         return NodeBatch(
@@ -1464,11 +1453,10 @@ class Worker:
                 partition_name=batch_partition,
             )
 
-        # Phase 2 chunked-prefill: advance prefill_tokens_consumed for each
-        # prefill chunk that just completed. Only fires when the scheduler
-        # populated ``prefill_chunk_sizes`` on the batch (i.e., this was a
-        # thinker_step batch from _get_chunked_step_batch). Phase 1 batches
-        # have ``prefill_chunk_sizes is None`` and skip this entirely.
+        # Advance prefill_tokens_consumed for each prefill chunk that just
+        # completed. Only fires when the scheduler populated
+        # ``prefill_chunk_sizes`` on the batch; non-chunked batches skip
+        # this entirely.
         if batch.prefill_chunk_sizes:
             for rid, chunk in batch.prefill_chunk_sizes.items():
                 if rid not in node_batch.per_request_info:

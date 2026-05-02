@@ -29,23 +29,18 @@ class ScheduledBatch:
     # request_id -> worker_graph_id (for push-back on OOM)
     request_to_worker_graph: dict[str, str] = None
 
-    # Phase 2 chunked-prefill: per-request flag indicating whether this
-    # request's slice should produce sampled output this step. Populated
-    # by `MicroScheduler._get_chunked_step_batch` for thinker_step batches;
-    # propagated to ``NodeBatch.is_terminal_per_request`` at build time.
-    # Empty dict (default) means "all terminal" — Phase 1 behavior.
+    # Per-rid: should this request's slice produce sampled output this
+    # step? Empty dict means "all terminal" (no mid-prefill rids in batch).
     is_terminal_per_request: dict[str, bool] = field(default_factory=dict)
 
-    # Phase 2 chunked-prefill: per-request chunk size for prefill chunks.
-    # Populated alongside ``is_terminal_per_request`` for thinker_step
-    # batches. Used by the worker to (a) slice prompt token tensors and
-    # (b) advance ``prefill_tokens_consumed`` after the step. Empty dict
-    # (default) means "no chunked-prefill in this batch".
+    # Per-rid chunk size for in-flight prefill chunks. Empty dict means
+    # "no chunked prefill in this batch" — slicing and consumed-token
+    # advancement are skipped on the worker side.
     prefill_chunk_sizes: dict[str, int] = field(default_factory=dict)
 
 
 # ----------------------------------------------------------------------
-# Phase 2: chunked-prefill mixed-batch packing.
+# Chunked-prefill mixed-batch packing.
 #
 # Decode-first packing under a per-step token budget. Each decode is 1
 # token; prefill chunks fill remaining budget. If a prefill's remaining
@@ -174,11 +169,8 @@ class MicroScheduler:
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[str, float] = {}
 
-        # Phase 2 chunked-prefill: max tokens per step (decode + prefill).
         # Only consulted when an AR engine has scheduler_owns_chunking=True;
         # otherwise the existing single-walk batching path is used.
-        # Wired from model_config["max_step_tokens"] by Worker.__init__ (see
-        # worker.py); models that want a custom budget set it in their YAML.
         self.max_step_tokens = max_step_tokens
 
     def _select_node_priority(
@@ -235,15 +227,14 @@ class MicroScheduler:
             self.held_until[rid] = deadline
 
     # ------------------------------------------------------------------
-    # Phase 2 chunked-prefill: mixed batch packing.
+    # Chunked-prefill mixed-batch packing.
     # ------------------------------------------------------------------
 
     def _ar_engine_owns_chunking(self) -> bool:
         """True iff this scheduler should pack mixed thinker_step batches.
 
-        The flag lives on the AREngine. We only consult it when an AR
-        engine is present on this worker; non-AR-only workers (e.g.,
-        Talker / Code2Wav) preserve Phase 1 behavior.
+        The flag lives on the AREngine. Non-AR-only workers (e.g. Talker /
+        Code2Wav) return False and use the single-walk batching path.
         """
         ar_engine = self.engine_manager.get_ar_engine()
         if ar_engine is None:
@@ -268,11 +259,9 @@ class MicroScheduler:
         Returns None when no AR requests are ready (caller falls back to the
         non-chunked scheduling path).
 
-        Caveat (Phase 2 Task 5 scope): the per-request prompt-token slicing
-        for prefill chunks and the post-step ``prefill_tokens_consumed``
-        advance are wired separately on the worker side — this method only
-        produces the batch + metadata. Behavioral coverage of the full
-        round-trip lives in Task 6 (qwen3_omni weights).
+        The per-request prompt-token slicing and post-step
+        ``prefill_tokens_consumed`` advance are handled separately on the
+        worker side; this method only produces the batch + metadata.
         """
         now = time.monotonic()
         # Expire stale hold entries (mirrors get_next_batch).
@@ -412,15 +401,11 @@ class MicroScheduler:
             target_graph_walk: If set, only schedule this graph walk.
             exclude_target: If set, skip this (node_name, graph_walk) pair.
         """
-        # Phase 2 chunked-prefill: when the AR engine on this worker has
-        # opted into scheduler-driven chunking, dispatch through the
-        # mixed-batch packer first. If it produces a batch, return it; if
-        # no AR requests are ready (None), fall through to the existing
-        # path so non-AR engines continue to schedule normally. The flag
-        # defaults to False so Phase 1 behavior is preserved.
-        # ``target_graph_walk`` overrides this path so callers explicitly
-        # asking for a specific walk (e.g., a non-thinker walk on a
-        # multi-engine worker) still get the legacy semantics.
+        # When the AR engine has opted into scheduler-driven chunking,
+        # dispatch through the mixed-batch packer first. None ⇒ AR queue
+        # empty this tick — fall through so non-AR engines still schedule.
+        # ``target_graph_walk`` skips this path so callers explicitly
+        # asking for a specific walk get the single-walk batching semantics.
         if (
             target_graph_walk is None
             and self._ar_engine_owns_chunking()

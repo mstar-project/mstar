@@ -13,7 +13,7 @@ import torch
 
 from mminf.engine.ar_engine import AREngine
 from mminf.engine.base import NodeBatch, NodeOutput
-from mminf.engine.chunked_prefill import execute_chunked_prefill
+from mminf.engine.ar_engine import execute_chunked_prefill
 from mminf.model.submodule_base import ARNodeInputs
 
 
@@ -109,30 +109,30 @@ def _ar_engine_with_chunk_size(chunk_size):
     return AREngine(max_prefill_chunk_size=chunk_size)
 
 
-def _make_submodule(supports: bool):
+def _make_submodule(walks: list[str]):
     sub = MagicMock()
-    sub.supports_chunked_prefill.return_value = supports
+    sub.get_chunked_prefill_walks.return_value = walks
     return sub
 
 
 def test_should_chunk_prefill_disabled_when_chunk_size_none():
     eng = _ar_engine_with_chunk_size(None)
     batch, inputs = _make_batch(seq_len=4096)
-    sub = _make_submodule(supports=True)
+    sub = _make_submodule(walks=["prefill_text"])
     assert eng._should_chunk_prefill(batch, inputs, sub) is False
 
 
 def test_should_chunk_prefill_disabled_when_submodule_does_not_opt_in():
     eng = _ar_engine_with_chunk_size(512)
     batch, inputs = _make_batch(seq_len=4096)
-    sub = _make_submodule(supports=False)
+    sub = _make_submodule(walks=[])
     assert eng._should_chunk_prefill(batch, inputs, sub) is False
 
 
 def test_should_chunk_prefill_disabled_for_short_prompts():
     eng = _ar_engine_with_chunk_size(512)
     batch, inputs = _make_batch(seq_len=100)
-    sub = _make_submodule(supports=True)
+    sub = _make_submodule(walks=["prefill_text"])
     assert eng._should_chunk_prefill(batch, inputs, sub) is False
 
 
@@ -140,7 +140,7 @@ def test_should_chunk_prefill_disabled_when_prompt_equals_chunk_size():
     """Pin the `<=` boundary: a prompt of exactly chunk_size is not chunked."""
     eng = _ar_engine_with_chunk_size(512)
     batch, inputs = _make_batch(seq_len=512)
-    sub = _make_submodule(supports=True)
+    sub = _make_submodule(walks=["prefill_text"])
     assert eng._should_chunk_prefill(batch, inputs, sub) is False
 
 
@@ -156,28 +156,30 @@ def test_should_chunk_prefill_disabled_for_multi_request_batches():
         ARNodeInputs(input_seq_len=4096, input_ids=torch.arange(4096).unsqueeze(0)),
         ARNodeInputs(input_seq_len=4096, input_ids=torch.arange(4096).unsqueeze(0)),
     ]
-    sub = _make_submodule(supports=True)
+    sub = _make_submodule(walks=["prefill_text"])
     assert eng._should_chunk_prefill(batch, inputs, sub) is False
 
 
 def test_should_chunk_prefill_enabled_for_single_long_request():
     eng = _ar_engine_with_chunk_size(512)
     batch, inputs = _make_batch(seq_len=4096)
-    sub = _make_submodule(supports=True)
+    sub = _make_submodule(walks=["prefill_text"])
     assert eng._should_chunk_prefill(batch, inputs, sub) is True
 
 
-def test_should_chunk_prefill_disabled_for_non_text_walks():
-    """Phase 1 engine-internal chunking is text-only. Audio/vision prefill
-    walks are atomic (sentinel-wrapped) and must not be chunked.
+def test_should_chunk_prefill_respects_submodule_walk_declaration():
+    """Engine routes to the chunked path only for walks the submodule
+    declared as chunkable. The Thinker declares ``prefill_text`` only;
+    multimodal walks (atomic, sentinel-wrapped) and decode walks must not
+    be chunked.
     """
     eng = _ar_engine_with_chunk_size(512)
-    sub = _make_submodule(supports=True)
+    sub = _make_submodule(walks=["prefill_text"])
     for walk in ("prefill_audio", "prefill_vision", "thinker_decode", "thinker_step"):
         batch, inputs = _make_batch(seq_len=4096)
         batch.graph_walk = walk
         assert eng._should_chunk_prefill(batch, inputs, sub) is False, (
-            f"_should_chunk_prefill returned True for non-text walk {walk!r}"
+            f"_should_chunk_prefill returned True for undeclared walk {walk!r}"
         )
 
 
@@ -200,7 +202,7 @@ def test_scheduler_owns_chunking_disables_engine_chunking():
     even for batches that would otherwise be chunked."""
     eng = AREngine(max_prefill_chunk_size=512, scheduler_owns_chunking=True)
     batch, inputs = _make_batch(seq_len=4096)
-    sub = _make_submodule(supports=True)
+    sub = _make_submodule(walks=["prefill_text"])
     assert eng._should_chunk_prefill(batch, inputs, sub) is False
 
 

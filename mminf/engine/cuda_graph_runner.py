@@ -1233,9 +1233,8 @@ class CudaGraphRunner:
             # Python reference — no .clone() needed.
             sampled = self.sampler.sample(request_ids, stacked_logits)
             sampled_views = sampled.split(1)
-            # Phase 2: skip new_token assignment for non-terminal prefill chunks.
-            # Default empty/None is_terminal_per_request → all terminal (Phase 1
-            # / single-walk batches preserve their existing behavior).
+            # skip new_token assignment for non-terminal prefill chunks.
+            # Default empty/None is_terminal_per_request → all terminal
             terminal = is_terminal_per_request or {}
             outputs = {
                 rid: ({"new_token": [view]} if terminal.get(rid, True) else {})

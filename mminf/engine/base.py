@@ -31,7 +31,7 @@ class NodeBatch:
     # unused for now
     metadata: dict = field(default_factory=dict)
 
-    # Phase 2: per-request flag indicating whether this request's slice
+    # per-request flag indicating whether this request's slice
     # should produce sampled output this step. True for: decode tokens,
     # last-chunk prefill (transitions to decode). False for: non-terminal
     # prefill chunks (mid-prefill, skip lm_head + sampling). Default empty
