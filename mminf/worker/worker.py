@@ -1209,6 +1209,12 @@ class Worker:
             # path.
             if advance_event is not None:
                 advance_event.set()
+            # Same idea for launch_started_event: if the engine raised
+            # before reaching the deep set site, release the main-thread
+            # waiter early instead of making it eat the full timeout.
+            launch_started_event = node_batch.metadata.get("launch_started_event")
+            if launch_started_event is not None:
+                launch_started_event.set()
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -2515,6 +2521,14 @@ class Worker:
                             # gate on advance_seq_lens(THIS batch).
                             spec_advance_event = threading.Event()
                             spec_node_batch.metadata["advance_event"] = spec_advance_event
+
+                            # Block the main thread until the GPU executor
+                            # thread is about to launch CUDA kernels (set
+                            # deep in the engine: before graph.replay() in
+                            # CudaGraphRunner, or before forward/forward_batched
+                            # in the eager AR path).
+                            spec_launch_started_event = threading.Event()
+                            spec_node_batch.metadata["launch_started_event"] = spec_launch_started_event
                             spec_future = gpu_executor.submit(
                                 self._execute_on_gpu_thread,
                                 spec_batch, spec_node_batch,
@@ -2525,10 +2539,7 @@ class Worker:
                             if self.enable_nvtx:
                                 range_push("worker.gpu_submit_queued", synchronize=False)
                                 range_pop(synchronize=False)
-                            # Give the GPU executor thread a chance to enter
-                            # CUDA launch code before the main thread resumes
-                            # Python-heavy postprocess.
-                            sleep(0.001)
+                            spec_launch_started_event.wait(timeout=0.005)
                             if phase_period:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
