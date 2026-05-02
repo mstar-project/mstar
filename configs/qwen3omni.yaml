@@ -4,6 +4,12 @@ max_seq_len: 32768
 # Set to null (or remove) to disable. Only applies to qwen3_omni Thinker
 # (the LLM submodule) — other submodules opt in individually.
 max_prefill_chunk_size: 512
+# Phase 2: scheduler-driven chunked prefill. When true, the MicroScheduler
+# packs mixed batches (decodes + prefill chunks across requests) up to
+# max_step_tokens. When false (default), the engine handles single-request
+# chunking internally (Phase 1).
+scheduler_owns_chunking: false
+max_step_tokens: 2048
 node_groups:
   - node_names: [audio_encoder, vision_encoder, Code2Wav]
     ranks: [0]
