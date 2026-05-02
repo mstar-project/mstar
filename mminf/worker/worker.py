@@ -78,7 +78,7 @@ class Speculation:
     node_batch: NodeBatch
     loop_back_inputs: set[str]
     continuing_rids: set[str]
-    streaming_edges: dict[str, list[GraphEdge]] = field(default_factor=list)
+    streaming_edges: dict[str, list[GraphEdge]] = field(default_factory=list)
     dropped: set[str] = field(default_factory=set)
 
 class EvictionPolicy(Enum):
@@ -1438,7 +1438,7 @@ class Worker:
 
         return Speculation(
             scheduled_batch=spec_batch,
-            spec_node_batch=spec_node_batch,
+            node_batch=spec_node_batch,
             loop_back_inputs=loop_back_inputs,
             continuing_rids=set(continuing),
             streaming_edges=streaming_edges
