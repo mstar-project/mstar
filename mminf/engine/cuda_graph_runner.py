@@ -1079,6 +1079,7 @@ class CudaGraphRunner:
         submodule: ARNodeSubmodule,
         slot: int | None = None,
         advance_event: "object | None" = None,
+        launch_started_event: "object | None" = None,
     ) -> dict:
         """Look up the matching captured graph and dispatch on config type.
 
@@ -1132,12 +1133,14 @@ class CudaGraphRunner:
                 key, graph_data, slot_data,
                 request_ids, inputs, per_request_info, submodule,
                 advance_event=advance_event,
+                launch_started_event=launch_started_event,
             )
         if cfg_type == CudaGraphConfigType.FLASH_INFER_PACKED:
             return self._run_flashinfer_packed(
                 key, graph_data, slot_data,
                 request_ids, inputs, per_request_info, submodule,
                 advance_event=advance_event,
+                launch_started_event=launch_started_event,
             )
         raise ValueError(f"Unknown CudaGraphConfigType: {cfg_type}")
 
@@ -1151,6 +1154,7 @@ class CudaGraphRunner:
         per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: ARNodeSubmodule,
         advance_event: "object | None" = None,
+        launch_started_event: "object | None" = None,
     ) -> dict:
         """Decode-style replay. Pads real inputs to padded_bs by cloning the capture
         template, then routes through submodule.preprocess (which re-plans attention
@@ -1265,6 +1269,11 @@ class CudaGraphRunner:
             mark("gpu_thread.cuda_graph_start")
             range_push("gpu_thread.cuda_graph", synchronize=False)
             range_push("cg.replay", synchronize=False)
+        # Release the main thread now that all CPU-side prep is done and
+        # we're about to enter the CUDA driver. graph.replay() drops the
+        # GIL inside C++, so main-thread postprocess can overlap.
+        if launch_started_event is not None:
+            launch_started_event.set()
         graph.replay()
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -1334,6 +1343,7 @@ class CudaGraphRunner:
         per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: ARNodeSubmodule,
         advance_event: "object | None" = None,
+        launch_started_event: "object | None" = None,
     ) -> dict:
         """Prefill-style replay (vox-serve pattern).
 
@@ -1450,6 +1460,11 @@ class CudaGraphRunner:
             mark("gpu_thread.cuda_graph_start")
             range_push("gpu_thread.cuda_graph", synchronize=False)
             range_push("cg.replay", synchronize=False)
+        # Release the main thread now that all CPU-side prep is done and
+        # we're about to enter the CUDA driver. graph.replay() drops the
+        # GIL inside C++, so main-thread postprocess can overlap.
+        if launch_started_event is not None:
+            launch_started_event.set()
         graph.replay()
         if self.enable_nvtx:
             range_pop(synchronize=False)
