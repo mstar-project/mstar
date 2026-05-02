@@ -219,7 +219,9 @@ def test_thinker_step_emits_batched_logits_for_cuda_graph_compat():
     logits) so output shape is fixed across terminal-flag distributions —
     a precondition for CUDA graph capture."""
     import inspect
+
     from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
+
     src = inspect.getsource(ThinkerSubmodule.forward_batched)
     assert "__batched_logits__" in src
     assert 'graph_walk == "thinker_step"' in src or "thinker_step" in src
@@ -266,7 +268,9 @@ def test_thinker_step_per_request_gating_at_engine_level():
     batched-logits sampling fast path in Phase 2.1a (CUDA graph compat).
     """
     import inspect
+
     from mminf.engine.ar_engine import AREngine
+
     src = inspect.getsource(AREngine._execute_batched)
     assert "is_terminal_per_request" in src
     assert "new_token" in src

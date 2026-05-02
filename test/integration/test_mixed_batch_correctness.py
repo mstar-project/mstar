@@ -400,21 +400,21 @@ def test_mixed_batch_decode_plus_nonterminal_prefill_chunk(thinker_engine):
 
         # (c) Decode logits numerically match the isolated baseline.
         assert "last" in captured, "sampler.sample not invoked on mixed batch"
-        # The mixed-batch sampler may receive logits for both rids if they
-        # are batched, but only the terminal decode rid's logits should
-        # appear (per-rid gating). Check that captured logits has shape
-        # (n_terminal, vocab) where n_terminal=1.
+        # Phase 2.1a: thinker_step now emits __batched_logits__ (shape
+        # (bs, V)) regardless of terminal-flag distribution, so the engine's
+        # batched-logits sampling fast path receives logits for ALL rids in
+        # the batch. The per-rid gating happens AFTER sampling: non-terminal
+        # rids' new_token assignment is skipped, but their logits row was
+        # passed to the sampler. We extract the row for rid_decode by
+        # matching the captured request_ids order.
         mixed_logits_all = captured["last"]
         captured_rids = captured["request_ids"]
-        # Find the row corresponding to rid_decode in the captured order.
-        if mixed_logits_all.dim() == 2 and mixed_logits_all.shape[0] >= 1:
-            # Per-rid sampler.sample is called once per rid in
-            # _sample_decode_outputs, so the last call's logits is for the
-            # last terminal rid sampled — which is rid_decode in our setup
-            # (only terminal). We rely on the per-rid sampling path.
-            mixed_decode_logits = mixed_logits_all.flatten().clone()
-        else:
-            mixed_decode_logits = mixed_logits_all.flatten().clone()
+        assert rid_decode in captured_rids, (
+            f"rid_decode {rid_decode} missing from sampled batch "
+            f"(got {captured_rids})"
+        )
+        decode_row_idx = captured_rids.index(rid_decode)
+        mixed_decode_logits = mixed_logits_all[decode_row_idx].flatten().clone()
 
         iso_flat = iso_logits.flatten()
         assert mixed_decode_logits.shape == iso_flat.shape, (

@@ -315,8 +315,13 @@ class AREngine(BaseEngine):
             sampled = sampler.sample(batch.request_ids, batched_logits)
             for rid, view in zip(batch.request_ids, sampled.split(1), strict=True):
                 rid_out = batched_output[rid]
-                rid_out["new_token"] = [view]
-                del rid_out["logits"]
+                # Phase 2: skip new_token for non-terminal prefill chunks. Default
+                # empty is_terminal_per_request → all terminal (Phase 1 / single-walk
+                # batches preserve their existing behavior).
+                if batch.is_terminal_per_request.get(rid, True):
+                    rid_out["new_token"] = [view]
+                    if "logits" in rid_out:
+                        del rid_out["logits"]
             output = NodeOutput(per_request_output_tensors=batched_output)
         else:
             output = NodeOutput(per_request_output_tensors=batched_output)
