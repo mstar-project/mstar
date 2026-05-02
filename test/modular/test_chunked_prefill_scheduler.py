@@ -426,3 +426,16 @@ def test_worker_propagates_is_terminal_per_request_into_node_batch():
 
     src = inspect.getsource(Worker._build_node_batch)
     assert "is_terminal_per_request" in src
+
+
+def test_thinker_step_replays_prefill_text_capture():
+    """thinker_step should be listed as a replay_graph_walks target of the
+    existing prefill_text capture, so CUDA graphs apply to mixed batches."""
+    import inspect
+
+    from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    src = inspect.getsource(ThinkerSubmodule.get_cuda_graph_configs)
+    assert '"prefill_text"' in src
+    assert '"prefill_audio"' in src
+    assert '"thinker_step"' in src

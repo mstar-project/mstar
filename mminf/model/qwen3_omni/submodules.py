@@ -757,7 +757,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             ),
             FlashInferPackedCudaGraphConfig(
                 capture_graph_walk="prefill_text",
-                replay_graph_walks=["prefill_text", "prefill_audio"],
+                replay_graph_walks=["prefill_text", "prefill_audio", "thinker_step"],
                 packed_seq_len_to_inputs=prefill_text_packed,
                 requires_cfg=False,
                 labels=["main"],
