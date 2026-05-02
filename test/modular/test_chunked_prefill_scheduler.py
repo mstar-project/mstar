@@ -214,24 +214,15 @@ def test_thinker_step_routed_to_prefill_mode():
     )
 
 
-def test_thinker_step_per_request_lm_head_gating_in_source():
-    """ThinkerSubmodule.forward_batched gates lm_head per-request for thinker_step.
-
-    Verify the source contains the per-request terminal gating logic so
-    non-terminal prefill chunks skip lm_head and emit no logits, while
-    terminal requests (decode token OR final prefill chunk) get logits
-    and are routed through the engine's per-rid sampling path.
-    """
+def test_thinker_step_emits_batched_logits_for_cuda_graph_compat():
+    """The thinker_step branch must emit __batched_logits__ (not per-rid
+    logits) so output shape is fixed across terminal-flag distributions —
+    a precondition for CUDA graph capture."""
     import inspect
-
     from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
-
     src = inspect.getsource(ThinkerSubmodule.forward_batched)
-    assert "thinker_step" in src, "forward_batched has no thinker_step branch"
-    assert "is_terminal_per_request" in src, (
-        "forward_batched does not consult is_terminal_per_request for "
-        "per-request lm_head gating"
-    )
+    assert "__batched_logits__" in src
+    assert 'graph_walk == "thinker_step"' in src or "thinker_step" in src
 
 
 def test_thinker_step_can_batch():
@@ -270,23 +261,15 @@ def test_model_inputs_from_engine_carries_terminal_dict():
     assert default_inp.is_terminal_per_request == {}
 
 
-def test_thinker_step_per_request_gating_uses_terminal_dict():
-    """Verify forward_batched's thinker_step branch reads is_terminal_per_request
-    and emits logits only for terminal rids. Source-level check; full behavioral
-    coverage comes via test_mixed_batch_correctness.py (Task 6)."""
+def test_thinker_step_per_request_gating_at_engine_level():
+    """is_terminal_per_request gating moved from submodule to AREngine's
+    batched-logits sampling fast path in Phase 2.1a (CUDA graph compat).
+    """
     import inspect
-
-    from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
-
-    src = inspect.getsource(ThinkerSubmodule.forward_batched)
-    # The gating loop must:
-    # 1. Read engine_inputs.is_terminal_per_request.
+    from mminf.engine.ar_engine import AREngine
+    src = inspect.getsource(AREngine._execute_batched)
     assert "is_terminal_per_request" in src
-    assert ".get(rid, True)" in src or "engine_inputs.is_terminal_per_request" in src
-    # 2. Conditionally call lm_head.
-    assert "lm_head" in src
-    # 3. Conditionally emit logits.
-    assert "logits" in src
+    assert "new_token" in src
 
 
 # ---------------------------------------------------------------------------

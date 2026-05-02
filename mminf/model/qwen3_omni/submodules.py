@@ -833,13 +833,15 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         ``thinker_step`` (Phase 2 mixed-batch walk, eager-only):
           The batch carries a mix of decode tokens (seq_len=1) and prefill
-          chunks (seq_len>=1). lm_head is gated PER-REQUEST based on
-          ``engine_inputs.is_terminal_per_request`` — terminal requests
-          (decode token OR final prefill chunk) get logits computed and
-          emitted; non-terminal prefill chunks skip lm_head and emit no
-          logits (the engine's per-rid path then skips sampling for them).
-          Emits per-rid output (no ``__batched_logits__`` sentinel) so the
-          AR engine routes through the per-rid sampling path.
+          chunks (seq_len>=1). Emits ``__batched_logits__`` (single
+          ``(bs, V)`` tensor) at the top level regardless of terminal-flag
+          distribution so the output dict shape is fixed across batches —
+          a precondition for CUDA graph capture. Per-rid dicts contain
+          ONLY ``thinker_states`` (and optionally ``thinker_mask``);
+          per-rid ``new_token`` assignment + non-terminal filtering moved
+          to ``AREngine._execute_batched``'s batched-logits sampling fast
+          path, which consults ``is_terminal_per_request`` to skip
+          sampling for non-terminal prefill chunks.
         """
         assert graph_walk in (
             "thinker_decode", "prefill_text", "prefill_audio", "thinker_step",
@@ -888,9 +890,14 @@ class ThinkerSubmodule(ARNodeSubmodule):
             }
 
         if is_thinker_step:
-            # Mixed prefill + decode batch. Gate lm_head per-request based on
-            # is_terminal_per_request. seq_lens comes from preprocess (one
-            # entry per request, each request's contiguous slice in `hidden`).
+            # Mixed prefill + decode batch. Emit __batched_logits__ at the
+            # top level regardless of terminal-flag distribution so the
+            # output shape is fixed (CUDA graph capture precondition).
+            # Per-request gating of new_token assignment moves to the
+            # engine's batched-logits sampling fast path.
+            #
+            # seq_lens comes from preprocess (one entry per request, each
+            # request's contiguous slice in `hidden`).
             assert seq_lens is not None, (
                 "thinker_step requires seq_lens from preprocess to compute "
                 "per-request last-token indices."
@@ -900,11 +907,22 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 f"thinker_step: request_ids ({len(request_ids)}) and "
                 f"seq_lens ({len(seq_lens)}) length mismatch"
             )
-            terminal = engine_inputs.is_terminal_per_request
 
-            # Pack thinker_states once for the whole batch (per-request slicing
-            # happens outside this function; non-audio rids are filtered out
-            # there as well).
+            # Compute last-token-per-request indices from cumulative seq_lens
+            # and run lm_head on the gathered last-token hidden states. This
+            # mirrors the prefill branch's qo_indptr-based gather pattern but
+            # uses the engine-provided seq_lens (thinker_step is eager-only;
+            # no qo_indptr_buf static buffer is required here).
+            seq_lens_t = torch.as_tensor(
+                seq_lens, dtype=torch.long, device=hidden.device,
+            )
+            last_token_indices = torch.cumsum(seq_lens_t, dim=0) - 1
+            last_hidden = hidden.index_select(0, last_token_indices)
+            batched_logits = self.model.lm_head(last_hidden)  # (bs, vocab)
+
+            # Pack thinker_states once for the whole batch (per-request
+            # slicing happens outside this function; non-audio rids are
+            # filtered out there as well).
             if layer_n_hidden is not None:
                 thinker_states = torch.cat(
                     [layer_0_embed, layer_n_hidden], dim=-1,
@@ -921,17 +939,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 cum = slice_end
 
                 req_out: NameToTensorList = {}
-                # Default True (terminal) for backwards compat: an empty
-                # is_terminal_per_request dict means all requests are
-                # terminal, matching the existing single-walk behavior.
-                if terminal.get(rid, True):
-                    last_h = hidden[slice_end - 1 : slice_end]  # (1, hidden)
-                    logits = self.model.lm_head(last_h)  # (1, vocab)
-                    req_out["logits"] = [logits]
-
                 # Always emit thinker_states per-rid (Talker conditioning is
                 # independent of sampling — it consumes the full slice for
-                # every request, terminal or not).
+                # every request, terminal or not). NEVER emit per-rid
+                # logits or new_token here — the engine's batched-logits
+                # sampling fast path owns that, gated on
+                # is_terminal_per_request.
                 req_out["thinker_states"] = [
                     thinker_states[slice_start:slice_end]
                 ]
@@ -941,9 +954,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                         req_out["thinker_mask"] = [mask]
 
                 outputs[rid] = req_out
-            # No __batched_logits__ sentinel: terminal/non-terminal mix means
-            # the AR engine must use the per-rid sampling path (which skips
-            # rids with no "logits" key — see ar_engine._sample_decode_outputs).
+            outputs["__batched_logits__"] = batched_logits
             return outputs
 
         # thinker_decode (existing behavior)
