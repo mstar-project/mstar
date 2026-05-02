@@ -73,10 +73,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # ``_make_vjepa2_ac_model`` defaults (img_size=256, num_frames=64,
 # tubelet_size=2). ``MAX_T`` is the predictor's grid_depth — the attention
 # mask is sized for this many frames, so the rollout cannot exceed it.
+#
+# DEFAULT_NUM_FRAMES=8 matches upstream's published DROID training config
+# (configs/train/vitg16/droid-256px-8f.yaml: dataset_fpcs: 8). Each frame is
+# encoded independently via the self-tubelet replication trick (matches the
+# `forward_target` pattern in app/vjepa_droid/train.py:408-415 and notebook
+# Cell 5). Override via the --num-frames CLI flag if you want a different
+# encoder workload (e.g. --num-frames 64 reproduces the energy_landscape
+# notebook's default).
 CROP_SIZE = 256
-NUM_FRAMES = 64
+DEFAULT_NUM_FRAMES = 8
 TUBELET_SIZE = 2
-MAX_T = NUM_FRAMES // TUBELET_SIZE     # = 32; rollout_horizon must be < MAX_T
+MAX_T = 32     # = predictor grid_depth (architecture default num_frames=64 // tubelet=2)
+               # rollout_horizon must be < MAX_T
 
 
 @dataclass
@@ -157,14 +166,14 @@ def _check_env_or_exit(repo_path: str) -> None:
         )
 
 
-def _load_video_clip(video_path: str, num_frames: int = NUM_FRAMES) -> np.ndarray:
+def _load_video_clip(video_path: str, num_frames: int = DEFAULT_NUM_FRAMES) -> np.ndarray:
     """Decode the mp4 to a [num_frames, H, W, 3] uint8 numpy array.
 
-    DROIDDataset(task='vjepa2_ac') already produces an episode-clipped mp4
-    with up to 64 evenly-sampled frames per episode (see
-    ``benchmark/dataset.py:_make_vjepa2_ac``). We just decode it here and
-    pad/sample to exactly ``num_frames`` so the encoder always sees the
-    architecture-fixed frame count.
+    DROIDDataset(task='vjepa2_ac') produces an episode-clipped mp4 with
+    ``num_video_frames`` evenly-sampled frames per episode (default 8 for the
+    DROID-config-aligned comparison; see ``benchmark/dataset.py:_make_vjepa2_ac``).
+    We resample to exactly ``num_frames`` here so the encoder always sees a
+    deterministic frame count regardless of decoder rounding.
     """
     from torchcodec.decoders import VideoDecoder
     dec = VideoDecoder(video_path)
@@ -201,6 +210,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rollout-horizon", type=int, default=4,
                    help=f"Number of AC rollout steps. Must be < {MAX_T} "
                         f"(predictor attention mask is sized for {MAX_T} frames).")
+    p.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES,
+                   help=f"Number of video frames per request to feed the encoder via "
+                        f"self-tubelet replication. Default {DEFAULT_NUM_FRAMES} matches "
+                        f"upstream's published DROID training config "
+                        f"(configs/train/vitg16/droid-256px-8f.yaml: dataset_fpcs: 8).")
     p.add_argument("--vjepa2-repo",
                    default=os.environ.get("VJEPA2_REPO", str(Path.home() / "vjepa2")),
                    help="Path to the upstream vjepa2 repo clone (default $VJEPA2_REPO or ~/vjepa2).")
@@ -232,9 +246,11 @@ def main() -> None:
         sys.exit(
             f"\n[ERROR] --rollout-horizon must be in [1, {MAX_T - 1}]; "
             f"got {args.rollout_horizon}. The AC predictor's attention mask "
-            f"is sized for grid_depth={MAX_T} (num_frames={NUM_FRAMES}, "
+            f"is sized for grid_depth={MAX_T} (architecture default num_frames=64, "
             f"tubelet_size={TUBELET_SIZE}).\n"
         )
+    if args.num_frames < 1:
+        sys.exit(f"\n[ERROR] --num-frames must be >= 1; got {args.num_frames}.\n")
 
     _check_env_or_exit(args.vjepa2_repo)
     upstream_sha = _capture_upstream_commit(args.vjepa2_repo, args.upstream_commit)
@@ -259,6 +275,7 @@ def main() -> None:
     print(f"  num_requests : {args.num_requests}")
     print(f"  num_warmup   : {args.num_warmup}")
     print(f"  rollout_H    : {args.rollout_horizon}")
+    print(f"  num_frames   : {args.num_frames}  (encoder workload per request)")
 
     # ------------------------------------------------------------------
     # Model + transform load (mirrors notebook Cell 2)
@@ -320,13 +337,15 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Dataset (same DROIDDataset as our HTTP harness)
     # ------------------------------------------------------------------
-    print(f"\nBuilding DROIDDataset (task=vjepa2_ac, n={args.num_requests})...")
+    print(f"\nBuilding DROIDDataset (task=vjepa2_ac, n={args.num_requests}, "
+          f"num_video_frames={args.num_frames})...")
     dataset = DROIDDataset(
         local_file_dir=args.local_cache,
         num_requests=args.num_requests,
         task="vjepa2_ac",
         rollout_horizon=args.rollout_horizon,
         cache_dir=args.hf_cache,
+        num_video_frames=args.num_frames,
     )
     requests = dataset.get_requests() if hasattr(dataset, "get_requests") else list(dataset)
     if not requests:
@@ -350,7 +369,7 @@ def main() -> None:
     # along dim=2, so a/s must have the same T as x at every step.
     # =========================================================================
     def _prepare_request_inputs(req):
-        np_clip = _load_video_clip(req.video_path, num_frames=NUM_FRAMES)
+        np_clip = _load_video_clip(req.video_path, num_frames=args.num_frames)
         # Cell 3 verbatim: transform(np_clip).unsqueeze(0) → [1, C, T, H, W]
         clip_t = transform(np_clip).unsqueeze(0).to(args.device, non_blocking=True)
         actions_t = torch.tensor(
