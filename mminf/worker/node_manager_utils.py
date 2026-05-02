@@ -553,7 +553,6 @@ class WorkerGraphsManager:
         partition: str,
         loop_names: set[str],
     ):
-        print("CLEARING", loop_names)
         part_info = self.per_request_info[request_id].per_partition_info[partition]
         worker_graph_ids = part_info.graph_walk_worker_graph_ids
         for worker_graph_id in worker_graph_ids:

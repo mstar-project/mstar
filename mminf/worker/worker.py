@@ -1838,7 +1838,6 @@ class Worker:
                 if not advanced:
                     continue
                 to_clear = stops & advanced
-                print("HELLO", stops, to_clear)
                 if to_clear:
                     self.worker_graphs_manager.clear_dyn_loop_curr_iter_section(
                         rid, partition=batch_partition, loop_names=to_clear,
@@ -1980,7 +1979,6 @@ class Worker:
         part_info = per_request_info.per_partition_info.get(partition)
         if part_info is None:
             return
-        print("HELLO ORPHAN STOP", rid, partition)
         completed_wg_ids: list[str] = []
         for wg_id in part_info.graph_walk_worker_graph_ids:
             queue = self.worker_graphs_manager.queues[wg_id]
@@ -1993,9 +1991,6 @@ class Worker:
             for name in per_req_q.waiting.get_node_names():
                 out = per_req_q.waiting.complete_loops(name)
                 per_req_q.waiting = out.new_waiting
-            print(wg_id, queue.is_done(rid))
-            print(queue)
-            print()
             if queue.is_done(rid):
                 completed_wg_ids.append(wg_id)
                 queue.reset(rid)
@@ -2444,13 +2439,9 @@ class Worker:
                     advanced_loops: dict[str, set[str]] = {}
                     for rid, req_info in p_node_batch.per_request_info.items():
                         prev_iters = dict(req_info.dynamic_loop_iter_counts)
-                        if self.worker_id == "worker_1":
-                            print("prev iters", prev_iters)
                         new_iters = self.worker_graphs_manager.get_dynamic_loop_iters(
                             rid, partition=p_partition,
                         )
-                        if self.worker_id == "worker_1":
-                            print("new iters", new_iters)
                         req_info.dynamic_loop_iter_counts.update(new_iters)
                         advanced = {
                             loop_name for loop_name, count in new_iters.items()
@@ -2458,9 +2449,6 @@ class Worker:
                         }
                         if advanced:
                             advanced_loops[rid] = advanced
-                        if self.worker_id == "worker_1":
-                            print("advanced", advanced)
-                            print()
                     if phase_period:
                         _phase_record("fast_post", _time.perf_counter() - _t0)
                     _t0 = _time.perf_counter() if phase_period else 0.0
