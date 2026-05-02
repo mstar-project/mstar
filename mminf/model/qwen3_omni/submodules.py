@@ -670,7 +670,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
         return batch.graph_walk in ("thinker_decode", "thinker_step")
 
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    # bs=8 added in Phase 2.1a so thinker_step mixed batches (typically 4-7
+    # decode rids + 1 prefill chunk = bs 5-8) round up to a captured bucket
+    # instead of falling through to eager. Pre-fix this helped marginally
+    # because the can_use_cuda_graphs replay-walk bug was rejecting graphs
+    # regardless; post-fix this should deliver real in-window speedup.
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
 
     def _build_prefill_text_packed(
         self, num_tokens: int, device: torch.device,
