@@ -2528,6 +2528,7 @@ class Worker:
                             # Give the GPU executor thread a chance to enter
                             # CUDA launch code before the main thread resumes
                             # Python-heavy postprocess.
+                            sleep(0.001)
                             if phase_period:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:

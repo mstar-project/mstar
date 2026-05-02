@@ -442,12 +442,22 @@ class BatchedCacheManager:
 
         if effective_label not in self._plan_states:
             self._plan_states[effective_label] = _PlanState()
+        ps = self._plan_states[effective_label]
+
+        # Fast path: cuda-graph mode with the static pos_ids buffer already
+        # allocated and no caller-supplied pos_ids. Build the position list on
+        # CPU and copy straight into the static buffer — skipping the
+        # intermediate device-side allocation + GPU→GPU copy the eager path
+        # would do.
+        static_copy_from_cpu = (
+            self._cuda_graph_mode and ps.pos_ids is not None and pos_ids is None
+        )
 
         computed_pos_ids = pos_ids
         if computed_pos_ids is None:
-            # CPU-accumulate the position list (1 int per output token) and
-            # do a single H2D at the end. The old `torch.cat([torch.arange(...)
-            # + start for ...])` launched 2 GPU kernels per request.
+            # CPU-accumulate the position list (1 int per output token). The
+            # old `torch.cat([torch.arange(...) + start for ...])` launched
+            # 2 GPU kernels per request.
             if self.enable_nvtx:
                 range_push("cache.plan_rope.build_pos_ids", synchronize=False)
             try:
@@ -456,28 +466,34 @@ class BatchedCacheManager:
                     start = self._get_state(rid, effective_label).position_id_start
                     pos_ids_list.extend(range(start, start + sl))
                 computed_pos_ids = torch.tensor(
-                    pos_ids_list, dtype=torch.long, device=self.device,
+                    pos_ids_list,
+                    dtype=torch.long,
+                    device=None if static_copy_from_cpu else self.device,
                 )
             finally:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
         if self._cuda_graph_mode:
-            # Update static buffer via .copy_() for CUDA graph compatibility
-            ps = self._plan_states[effective_label]
             if ps.pos_ids is not None:
                 n = computed_pos_ids.shape[0]
                 if self.enable_nvtx:
                     range_push("cache.plan_rope.copy_pos_ids", synchronize=False)
                 try:
-                    ps.pos_ids[:n].copy_(computed_pos_ids)
+                    # CPU→GPU when static_copy_from_cpu, else GPU→GPU. Both
+                    # are stream-ordered before any subsequent graph replay.
+                    ps.pos_ids[:n].copy_(computed_pos_ids, non_blocking=True)
                 finally:
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
             else:
+                # First plan_rope on this label: adopt the just-built tensor
+                # as the static buffer. Must live on the device.
+                if computed_pos_ids.device != self.device:
+                    computed_pos_ids = computed_pos_ids.to(self.device)
                 ps.pos_ids = computed_pos_ids
         else:
-            self._plan_states[effective_label].pos_ids = computed_pos_ids
+            ps.pos_ids = computed_pos_ids
 
     @torch.compiler.disable
     def plan_attention_batched_cfg(
