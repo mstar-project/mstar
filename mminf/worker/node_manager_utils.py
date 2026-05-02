@@ -176,14 +176,24 @@ class WorkerGraphQueues:
     def clear_dyn_loop_curr_iter_section(
         self, request_id: str, loop_names: set[str]
     ):
-        """Set ``_curr_iter_section = None`` on matching dynamic loops.
+        """Set ``_curr_iter_section = None`` AND ``register_finished`` on
+        matching dynamic loops.
 
         Called from ``_finalize_slow_postprocess`` when a stop has been
         detected for a loop whose iter ALSO advanced during the same batch's
-        fast postprocess. Without this, the eventual ``register_finished``
-        leaves the loop in a state where ``_iter_done()`` is False
-        (because ``_curr_iter_section`` still points at the just-started
-        next-iter body), so the worker graph never reports done.
+        fast postprocess. Two effects matter:
+
+        1. Clearing ``_curr_iter_section`` so the eventual ``stop_loops``
+           call (via ``_pending_stops``) doesn't leave ``_iter_done`` False
+           and prevent the worker graph from reporting done.
+        2. Marking ``_finished=True`` immediately. Without this, anything
+           that triggers ``_update_ready_waiting`` between now and the
+           next ``fast_postprocess`` (e.g. ``_poll_stream_buffers``
+           ingesting a streaming chunk for a downstream partition) sees
+           ``_iter_done=True`` + ``_is_done=False`` and calls
+           ``_advance_one_iter`` — quietly bumping the iter past where
+           the loop is meant to terminate, leaving the queue's view of
+           the loop one step ahead of reality.
         """
         def _clear(section: GraphSection):
             if section is None:
@@ -198,6 +208,7 @@ class WorkerGraphQueues:
                 _clear(section._curr_iter_section)
                 if isinstance(section, DynamicLoop) and section.name in loop_names:
                     section._curr_iter_section = None
+                    section.register_finished()
         _clear(self.per_request_queues[request_id].waiting)
 
     def get_dynamic_loop_iters(self, request_id: str) -> dict[str, int]:
