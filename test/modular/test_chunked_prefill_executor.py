@@ -167,6 +167,20 @@ def test_should_chunk_prefill_enabled_for_single_long_request():
     assert eng._should_chunk_prefill(batch, inputs, sub) is True
 
 
+def test_should_chunk_prefill_disabled_for_non_text_walks():
+    """Phase 1 engine-internal chunking is text-only. Audio/vision prefill
+    walks are atomic (sentinel-wrapped) and must not be chunked.
+    """
+    eng = _ar_engine_with_chunk_size(512)
+    sub = _make_submodule(supports=True)
+    for walk in ("prefill_audio", "prefill_vision", "thinker_decode", "thinker_step"):
+        batch, inputs = _make_batch(seq_len=4096)
+        batch.graph_walk = walk
+        assert eng._should_chunk_prefill(batch, inputs, sub) is False, (
+            f"_should_chunk_prefill returned True for non-text walk {walk!r}"
+        )
+
+
 def test_dispatch_one_pass_method_exists():
     """Smoke test: _dispatch_one_pass exists and routes through the existing
     priority chain. Full integration coverage lives in test_chunked_prefill_equivalence.

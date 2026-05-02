@@ -443,6 +443,14 @@ class AREngine(BaseEngine):
             # Phase 2: scheduler is orchestrating chunks. Engine doesn't
             # intervene — it just runs whatever (mixed) batch arrives.
             return False
+        if batch.graph_walk != "prefill_text":
+            # Phase 1 chunked prefill is text-only. Multimodal walks
+            # (prefill_audio / prefill_vision) are atomic — sentinel-wrapped
+            # by the Thinker's _prepare_*_input helpers, so token-axis slicing
+            # would break the wrappers. thinker_decode is decode-style (1 token).
+            # thinker_step is the Phase 2 walk and bypasses Phase 1 via
+            # scheduler_owns_chunking, but we exclude it defensively.
+            return False
         if self.max_prefill_chunk_size is None:
             return False
         if not submodule.supports_chunked_prefill():
