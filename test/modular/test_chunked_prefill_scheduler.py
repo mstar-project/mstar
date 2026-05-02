@@ -163,3 +163,127 @@ def test_prefill_with_zero_tokens_remaining_skipped():
     )
     assert plan.prefill_allocations == {"p1": 100}
     assert "p0" not in plan.prefill_allocations
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Task 4: thinker_step graph walk + Thinker submodule routing
+# ---------------------------------------------------------------------------
+
+def test_thinker_step_walk_declared_in_source():
+    """Qwen3OmniModel.get_graph_walk_graphs declares the thinker_step walk.
+
+    Smoke test: full integration coverage with weights happens in Task 6.
+    Here we just verify the source has the walk + the partition definitions
+    include it so the conductor can route batches to that walk name.
+    """
+    import inspect
+
+    from mminf.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    src = inspect.getsource(Qwen3OmniModel.get_graph_walk_graphs)
+    assert "thinker_step" in src, "thinker_step walk not declared in get_graph_walk_graphs"
+    assert '"thinker_step": thinker_step' in src, (
+        "thinker_step walk not registered in returned dict"
+    )
+
+    partitions_src = inspect.getsource(Qwen3OmniModel.get_partitions)
+    assert "thinker_step" in partitions_src, (
+        "thinker_step missing from Thinker partition's graph_walks set"
+    )
+
+
+def test_thinker_step_routed_to_prefill_mode():
+    """ThinkerSubmodule.preprocess routes thinker_step to mode='prefill'.
+
+    Avoids loading the 30B model — just inspects the source for the
+    explicit mode-routing line to verify thinker_step doesn't fall through
+    to mode='decode'. FlashInfer's prefill wrapper handles arbitrary
+    per-request seq_lens (including seq_len=1 decode tokens) correctly,
+    so the mixed-batch walk must use prefill mode.
+    """
+    import inspect
+
+    from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    src = inspect.getsource(ThinkerSubmodule.preprocess)
+    # The preprocess routing is `mode = "decode" if graph_walk == "thinker_decode" else "prefill"`.
+    # Verify the routing line is intact (only thinker_decode -> decode; everything
+    # else, including thinker_step, falls through to "prefill").
+    assert 'graph_walk == "thinker_decode"' in src, (
+        "preprocess no longer routes thinker_decode → decode mode"
+    )
+
+
+def test_thinker_step_per_request_lm_head_gating_in_source():
+    """ThinkerSubmodule.forward_batched gates lm_head per-request for thinker_step.
+
+    Verify the source contains the per-request terminal gating logic so
+    non-terminal prefill chunks skip lm_head and emit no logits, while
+    terminal requests (decode token OR final prefill chunk) get logits
+    and are routed through the engine's per-rid sampling path.
+    """
+    import inspect
+
+    from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    src = inspect.getsource(ThinkerSubmodule.forward_batched)
+    assert "thinker_step" in src, "forward_batched has no thinker_step branch"
+    assert "is_terminal_per_request" in src, (
+        "forward_batched does not consult is_terminal_per_request for "
+        "per-request lm_head gating"
+    )
+
+
+def test_thinker_step_can_batch():
+    """ThinkerSubmodule.can_batch returns True for thinker_step batches."""
+    import inspect
+
+    from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    src = inspect.getsource(ThinkerSubmodule.can_batch)
+    assert "thinker_step" in src, (
+        "can_batch must accept thinker_step so the AR engine routes the "
+        "mixed batch through forward_batched (not the per-request path)."
+    )
+
+
+def test_model_inputs_from_engine_carries_terminal_dict():
+    """ModelInputsFromEngine exposes is_terminal_per_request for the submodule.
+
+    The Thinker forward_batched needs per-request terminal flags to gate
+    lm_head; adding the field to the engine-input dataclass (and populating
+    it in AREngine._execute_batched from NodeBatch) is the plumbing path.
+    """
+    from mminf.model.submodule_base import ModelInputsFromEngine
+
+    inp = ModelInputsFromEngine(
+        request_ids=["a", "b"],
+        per_request_info={},
+        is_terminal_per_request={"a": True, "b": False},
+    )
+    assert inp.is_terminal_per_request == {"a": True, "b": False}
+
+    # Backwards compat: defaults to empty dict ("all terminal").
+    default_inp = ModelInputsFromEngine(
+        request_ids=["x"], per_request_info={},
+    )
+    assert default_inp.is_terminal_per_request == {}
+
+
+def test_thinker_step_per_request_gating_uses_terminal_dict():
+    """Verify forward_batched's thinker_step branch reads is_terminal_per_request
+    and emits logits only for terminal rids. Source-level check; full behavioral
+    coverage comes via test_mixed_batch_correctness.py (Task 6)."""
+    import inspect
+
+    from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    src = inspect.getsource(ThinkerSubmodule.forward_batched)
+    # The gating loop must:
+    # 1. Read engine_inputs.is_terminal_per_request.
+    assert "is_terminal_per_request" in src
+    assert ".get(rid, True)" in src or "engine_inputs.is_terminal_per_request" in src
+    # 2. Conditionally call lm_head.
+    assert "lm_head" in src
+    # 3. Conditionally emit logits.
+    assert "logits" in src

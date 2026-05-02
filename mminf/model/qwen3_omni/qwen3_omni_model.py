@@ -343,6 +343,41 @@ class Qwen3OmniModel(Model):
             outputs=[],
         )
 
+        # -- Phase 2 mixed-batch walk: handles both prefill chunks and decode
+        #    tokens of different requests in a single forward pass.  The
+        #    ThinkerSubmodule routes attention planning to FlashInfer's
+        #    prefill wrapper (which handles arbitrary per-request seq_lens,
+        #    including seq_len=1) and gates lm_head per-request based on
+        #    ``NodeBatch.is_terminal_per_request`` so non-terminal prefill
+        #    chunks skip sampling.  The walk-level wiring mirrors prefill_text:
+        #    a single GraphNode targeting the Thinker that consumes
+        #    ``text_inputs`` and emits the same outputs (new_token +
+        #    streaming thinker_states/thinker_mask) — the difference between
+        #    walks lives entirely inside the submodule's preprocess +
+        #    forward_batched.
+        thinker_step = GraphNode(
+            name="Thinker",
+            input_ids=["text_inputs"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="new_token",
+                    output_modality="text",
+                    persist=True,
+                ),
+                StreamingGraphEdge(
+                    next_node="Talker_LLM",
+                    name="thinker_states",
+                    target_partition="Talker",
+                ),
+                StreamingGraphEdge(
+                    next_node="Talker_LLM",
+                    name="thinker_mask",
+                    target_partition="Talker",
+                ),
+            ],
+        )
+
         # -- Talker prefill: receives thinker_states + talker_trigger --
         # Dual-input gating: both thinker_states from streaming and
         # talker_trigger from conductor cross-partition trigger must be
@@ -444,6 +479,7 @@ class Qwen3OmniModel(Model):
             "prefill_audio": prefill_audio,
             "prefill_vision": prefill_vision,
             "thinker_decode": thinker_decode,
+            "thinker_step": thinker_step,
             "talker_prefill": talker_prefill,
             "talker_last_prefill": talker_last_prefill,
             "talker_decode": talker_decode,
@@ -461,6 +497,7 @@ class Qwen3OmniModel(Model):
                 graph_walks={
                     "prefill_text", "prefill_audio",
                     "prefill_vision", "thinker_decode",
+                    "thinker_step",
                 },
                 initial_walk="prefill_text",
                 producer_partitions=[],

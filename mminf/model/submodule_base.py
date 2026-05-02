@@ -134,6 +134,14 @@ class ModelInputsFromEngine:
     per_request_info: dict[str, CurrentForwardPassInfo]
     cache_manager: BatchedCacheManager | None = None
 
+    # Phase 2 chunked-prefill: per-request terminal flag carried over from
+    # ``NodeBatch.is_terminal_per_request``. True means this request's slice
+    # should produce sampled output this step (decode token OR final prefill
+    # chunk that transitions to decode); False means it's a non-terminal
+    # prefill chunk and lm_head/sampling should be skipped. Default empty
+    # dict means "all terminal" — backwards compat with non-mixed batches.
+    is_terminal_per_request: dict[str, bool] = field(default_factory=dict)
+
     @property
     def single_request_info(self):
         """

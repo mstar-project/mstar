@@ -277,7 +277,8 @@ class AREngine(BaseEngine):
         engine_inputs = ModelInputsFromEngine(
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
-            cache_manager=cache_manager
+            cache_manager=cache_manager,
+            is_terminal_per_request=batch.is_terminal_per_request,
         )
         if self.enable_nvtx:
             range_push("ar.batched.preprocess", synchronize=False)
@@ -352,7 +353,10 @@ class AREngine(BaseEngine):
                 per_request_info={
                     rid: batch.per_request_info[rid]
                 },
-                cache_manager=cache_manager
+                cache_manager=cache_manager,
+                is_terminal_per_request={
+                    rid: batch.is_terminal_per_request.get(rid, True)
+                } if batch.is_terminal_per_request else {},
             )
 
             if self.enable_nvtx:
