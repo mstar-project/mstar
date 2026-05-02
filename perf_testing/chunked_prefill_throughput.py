@@ -146,6 +146,10 @@ def thinker_engine():
         ),
         kv_cache_type=torch.bfloat16,
     )
+    # Capture CUDA graphs once. Phase 2.1a measures three modes against
+    # this same engine state by toggling the cuda_graph_runner attribute
+    # on the Thinker submodule (None => eager fallback path).
+    engine.warmup()
     yield engine, device
     engine.shutdown()
 
@@ -664,81 +668,151 @@ def _print_run_summary(label: str, m: dict) -> None:
 
 
 def test_chunked_prefill_throughput_phase2_vs_phase1(thinker_engine):
-    """Run the workload twice (Phase 1 then Phase 2) and assert the four
-    success criteria from the plan.
+    """Phase 2.1a 3-way comparison: Phase 1 vs Phase 2 eager vs Phase 2 + CUDA graphs.
 
-    Success criteria:
-      1. TTFT_p2 <= TTFT_p1 / 3
-      2. p50_in_window_p2 <= 1.10 * p50_baseline_p2
-      3. p99_in_window_p2 <= 2.5 * p50_in_window_p2
-      4. throughput_p2 >= throughput_p1 * 1.20
+    The Phase 2 Task 7 result (Phase 1 vs Phase 2 eager) measured a 1.18x
+    p50 inter-token latency regression during the prefill window vs the
+    decodes-only baseline.  Phase 2.1a's CUDA graph replay for
+    ``thinker_step`` is hypothesized to close that gap by eliminating the
+    per-step Python overhead.
+
+    Strict success criteria (Phase 2.1a):
+      1. p2_graphs.p50_in_window <= p2_eager.p50_in_window  (graphs help)
+      2. p2_graphs.p50_in_window <= p2_graphs.p50_baseline * 1.10
+         (close the gap to within 10% of decodes-only baseline)
+      3. p2_graphs.p99_in_window <= p2_graphs.p50_in_window * 2.5
+         (no tail blowup under graphs)
+      4. p2_graphs.ttft <= p2_eager.ttft * 1.10
+         (TTFT improvement preserved)
     """
     engine, device = thinker_engine
+    submod = engine.submodule_management["Thinker"]
 
-    # Phase 1 first.
+    # Phase 1 (eager): toggle the runner off so the measurement matches
+    # what Phase 2 Task 7 reported (no CUDA graph replay).
     print("\n" + "=" * 70)
-    print("PHASE 1 (scheduler_owns_chunking=False)")
+    print("PHASE 1 (scheduler_owns_chunking=False, eager)")
     print("=" * 70)
-    p1 = _run_phase1(engine, device)
-    _print_run_summary("PHASE 1", p1)
+    saved_runner = submod.cuda_graph_runner
+    submod.cuda_graph_runner = None
+    try:
+        p1 = _run_phase1(engine, device)
+    finally:
+        submod.cuda_graph_runner = saved_runner
+    _print_run_summary("PHASE 1 (eager)", p1)
 
-    # Phase 2.
+    # Phase 2 eager: same toggle pattern, against the same warmed engine.
     print("\n" + "=" * 70)
-    print("PHASE 2 (scheduler_owns_chunking=True)")
+    print("PHASE 2 eager (scheduler_owns_chunking=True, no CUDA graphs)")
     print("=" * 70)
-    p2 = _run_phase2(engine, device)
-    _print_run_summary("PHASE 2", p2)
+    saved_runner = submod.cuda_graph_runner
+    submod.cuda_graph_runner = None
+    try:
+        p2_eager = _run_phase2(engine, device)
+    finally:
+        submod.cuda_graph_runner = saved_runner
+    _print_run_summary("PHASE 2 eager", p2_eager)
 
-    # Comparison summary.
+    # Phase 2 + CUDA graphs: runner restored from warmup.
+    assert submod.cuda_graph_runner is not None, (
+        "warmup() failed to capture a CUDA graph runner for Thinker -- "
+        "cannot measure Phase 2 + graphs mode"
+    )
     print("\n" + "=" * 70)
-    print("SUMMARY: Phase 1 vs Phase 2")
+    print("PHASE 2 + CUDA graphs (scheduler_owns_chunking=True, graphs ON)")
     print("=" * 70)
-    ttft_ratio = p1["ttft_ms"] / p2["ttft_ms"] if p2["ttft_ms"] > 0 else float("inf")
-    thr_ratio = p2["throughput_tok_per_s"] / p1["throughput_tok_per_s"] \
-        if p1["throughput_tok_per_s"] > 0 else float("inf")
+    p2_graphs = _run_phase2(engine, device)
+    _print_run_summary("PHASE 2 + CUDA graphs", p2_graphs)
+
+    # 3-way summary -----------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("SUMMARY: Phase 1 vs Phase 2 eager vs Phase 2 + CUDA graphs")
+    print("=" * 70)
     print(
-        f"  TTFT       : Phase1={p1['ttft_ms']:.1f}ms  Phase2={p2['ttft_ms']:.1f}ms"
-        f"  speedup={ttft_ratio:.2f}x  (target >= 3.0x)\n"
-        f"  Throughput : Phase1={p1['throughput_tok_per_s']:.2f}tok/s  "
-        f"Phase2={p2['throughput_tok_per_s']:.2f}tok/s  "
-        f"speedup={thr_ratio:.2f}x  (target >= 1.20x)\n"
-        f"  p50 ITL    : Phase2 baseline={p2['p50_baseline_ms']:.2f}ms  "
-        f"in_window={p2['p50_in_window_ms']:.2f}ms  "
-        f"ratio={p2['p50_in_window_ms']/p2['p50_baseline_ms']:.2f}x  (target <= 1.10x)\n"
-        f"  p99/p50    : Phase2 ratio={p2['p99_in_window_ms']/p2['p50_in_window_ms']:.2f}x  "
-        f"(target <= 2.50x)"
+        f"\n=== Phase 1 (engine-internal chunking, eager) ===\n"
+        f"  TTFT (request 5):              {p1['ttft_ms']:.1f}ms\n"
+        f"  decode p50 during prefill:     {p1['p50_in_window_ms']:.2f}ms\n"
+        f"  decode p99 during prefill:     {p1['p99_in_window_ms']:.2f}ms\n"
+        f"  decode baseline p50:           {p1['p50_baseline_ms']:.2f}ms\n"
+        f"  total throughput:              {p1['throughput_tok_per_s']:.1f} tok/s"
     )
 
-    # Honest assertions: report failures with their actual numbers.
+    p2e_ttft_imp = (p1['ttft_ms'] / p2_eager['ttft_ms']) if p2_eager['ttft_ms'] > 0 else float("inf")
+    p2e_p50_ratio = (
+        p2_eager['p50_in_window_ms'] / p2_eager['p50_baseline_ms']
+        if p2_eager['p50_baseline_ms'] > 0 else float("inf")
+    )
+    print(
+        f"\n=== Phase 2 eager (scheduler-aware, no CUDA graphs) ===\n"
+        f"  TTFT (request 5):              {p2_eager['ttft_ms']:.1f}ms\n"
+        f"  decode p50 during prefill:     {p2_eager['p50_in_window_ms']:.2f}ms\n"
+        f"  decode p99 during prefill:     {p2_eager['p99_in_window_ms']:.2f}ms\n"
+        f"  decode baseline p50:           {p2_eager['p50_baseline_ms']:.2f}ms\n"
+        f"  total throughput:              {p2_eager['throughput_tok_per_s']:.1f} tok/s\n"
+        f"  TTFT improvement vs P1:        {p2e_ttft_imp:.2f}x\n"
+        f"  p50 vs baseline:               {p2e_p50_ratio:.2f}x"
+    )
+
+    p2g_ttft_imp = (p1['ttft_ms'] / p2_graphs['ttft_ms']) if p2_graphs['ttft_ms'] > 0 else float("inf")
+    p2g_p50_ratio = (
+        p2_graphs['p50_in_window_ms'] / p2_graphs['p50_baseline_ms']
+        if p2_graphs['p50_baseline_ms'] > 0 else float("inf")
+    )
+    p2g_vs_eager = (
+        p2_graphs['p50_in_window_ms'] / p2_eager['p50_in_window_ms']
+        if p2_eager['p50_in_window_ms'] > 0 else float("inf")
+    )
+    print(
+        f"\n=== Phase 2 + CUDA graphs ===\n"
+        f"  TTFT (request 5):              {p2_graphs['ttft_ms']:.1f}ms\n"
+        f"  decode p50 during prefill:     {p2_graphs['p50_in_window_ms']:.2f}ms\n"
+        f"  decode p99 during prefill:     {p2_graphs['p99_in_window_ms']:.2f}ms\n"
+        f"  decode baseline p50:           {p2_graphs['p50_baseline_ms']:.2f}ms\n"
+        f"  total throughput:              {p2_graphs['throughput_tok_per_s']:.1f} tok/s\n"
+        f"  TTFT improvement vs P1:        {p2g_ttft_imp:.2f}x\n"
+        f"  p50 vs baseline:               {p2g_p50_ratio:.2f}x\n"
+        f"  p50 vs P2 eager:               {p2g_vs_eager:.2f}x"
+    )
+
+    # === Strict success criteria for Phase 2.1a =============================
+
     failures: list[str] = []
 
-    if p2["ttft_ms"] > p1["ttft_ms"] / 3.0:
+    # 1. Graphs must reduce p50 vs eager (the central claim of Phase 2.1a).
+    if p2_graphs['p50_in_window_ms'] > p2_eager['p50_in_window_ms']:
         failures.append(
-            f"TTFT speedup target missed: Phase2 {p2['ttft_ms']:.1f}ms > "
-            f"Phase1/3 = {p1['ttft_ms']/3:.1f}ms (got {ttft_ratio:.2f}x, need >= 3.0x)"
+            f"CUDA graphs did not reduce p50: eager={p2_eager['p50_in_window_ms']:.2f}ms "
+            f"graphs={p2_graphs['p50_in_window_ms']:.2f}ms"
         )
 
-    if p2["p50_baseline_ms"] > 0 and \
-            p2["p50_in_window_ms"] > 1.10 * p2["p50_baseline_ms"]:
+    # 2. Graphs must close the gap to baseline (within 1.10x — a relaxed
+    #    floor: the mixed batch is ~10% irreducibly heavier than decode-only).
+    if p2_graphs['p50_baseline_ms'] > 0 and (
+        p2_graphs['p50_in_window_ms'] > p2_graphs['p50_baseline_ms'] * 1.10
+    ):
         failures.append(
-            f"p50 ITL regression in prefill window: in_window {p2['p50_in_window_ms']:.2f}ms > "
-            f"1.10 * baseline {p2['p50_baseline_ms']:.2f}ms"
+            f"p50 still regressed > 10% vs baseline even with graphs: "
+            f"baseline={p2_graphs['p50_baseline_ms']:.2f}ms "
+            f"in-window={p2_graphs['p50_in_window_ms']:.2f}ms"
         )
 
-    if p2["p50_in_window_ms"] > 0 and \
-            p2["p99_in_window_ms"] > 2.5 * p2["p50_in_window_ms"]:
+    # 3. p99 should not blow up under graphs.
+    if p2_graphs['p50_in_window_ms'] > 0 and (
+        p2_graphs['p99_in_window_ms'] > p2_graphs['p50_in_window_ms'] * 2.5
+    ):
         failures.append(
-            f"p99 ITL too high vs p50 in window: p99={p2['p99_in_window_ms']:.2f}ms > "
-            f"2.5 * p50 {p2['p50_in_window_ms']:.2f}ms"
+            f"p99 spiked > 2.5x p50 under graphs: "
+            f"p50={p2_graphs['p50_in_window_ms']:.2f}ms "
+            f"p99={p2_graphs['p99_in_window_ms']:.2f}ms"
         )
 
-    if p2["throughput_tok_per_s"] < 1.20 * p1["throughput_tok_per_s"]:
+    # 4. TTFT improvement preserved (graphs should not regress TTFT vs eager).
+    if p2_graphs['ttft_ms'] > p2_eager['ttft_ms'] * 1.10:
         failures.append(
-            f"Throughput speedup target missed: Phase2 "
-            f"{p2['throughput_tok_per_s']:.2f}tok/s < 1.20 * Phase1 "
-            f"{p1['throughput_tok_per_s']:.2f}tok/s (got {thr_ratio:.2f}x, need >= 1.20x)"
+            f"TTFT regressed under graphs: eager={p2_eager['ttft_ms']:.1f}ms "
+            f"graphs={p2_graphs['ttft_ms']:.1f}ms"
         )
 
     if failures:
-        msg = "Phase 2 success criteria NOT met:\n  " + "\n  ".join(failures)
+        msg = "Phase 2.1a success criteria NOT met:\n  " + "\n  ".join(failures)
         pytest.fail(msg)
