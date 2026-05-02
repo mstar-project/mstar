@@ -368,14 +368,25 @@ class MicroScheduler:
             len(plan.decode_rids), len(plan.prefill_allocations),
             self.max_step_tokens,
         )
+        # Pure-decode batches use the dedicated ``thinker_decode`` walk so
+        # the existing ``(bs, num_tokens=bs)`` decode CUDA-graph captures
+        # fire. ``thinker_step`` captures are prefill-shaped
+        # (num_tokens >= 128) and don't match a pure-decode batch's
+        # num_tokens=bs*1 — falling back to eager would cost ~2x per-token
+        # latency vs the decode captures.  Mixed batches (decodes +
+        # prefill chunks) keep the ``thinker_step`` walk, which is where
+        # Phase 2's mixed-batch packing actually pays off.
+        is_pure_decode = bool(plan.decode_rids) and not plan.prefill_allocations
+        batch_graph_walk = "thinker_decode" if is_pure_decode else "thinker_step"
+
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(
-            node_name_for_batch, "thinker_step"
+            node_name_for_batch, batch_graph_walk
         )] = self.batch_number
 
         return ScheduledBatch(
             node_name=node_name_for_batch,
-            graph_walk="thinker_step",
+            graph_walk=batch_graph_walk,
             node_objects=node_objects,
             request_to_worker_graph=request_to_worker_graph,
             is_terminal_per_request=is_terminal_per_request,
