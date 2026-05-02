@@ -314,20 +314,30 @@ class Worker:
         # scheduler-driven chunking, prime ``prefill_tokens_total`` from
         # the prompt tensor's leading dimension so the MicroScheduler's
         # mixed-batch packer can classify this request as prefill-ready.
-        # ``text_inputs`` is the AR prefill walks' canonical input name
-        # (prefill_text + thinker_step). When chunking is disabled, total
-        # stays 0 and ``is_prefill_complete`` returns True trivially —
-        # Phase 1 path unchanged.
+        # Handles text + audio + vision. Audio/vision use embed_len + 2 to
+        # account for the start/end sentinel tokens added by the Thinker's
+        # _wrap_audio_input / _wrap_vision_input helpers. When chunking is
+        # disabled, total stays 0 and ``is_prefill_complete`` returns True
+        # trivially — Phase 1 path unchanged.
         if (
             ar_engine is not None
             and getattr(ar_engine, "scheduler_owns_chunking", False)
         ):
             for edge in body.initial_inputs:
+                total: int | None = None
                 if edge.name == "text_inputs" and edge.tensor_info:
                     prompt_len = edge.tensor_info[0].dims[0] if edge.tensor_info[0].dims else 0
-                    if prompt_len > 0:
-                        body.request_info.prefill_tokens_total = int(prompt_len)
-                        body.request_info.prefill_tokens_consumed = 0
+                    total = int(prompt_len) if prompt_len > 0 else None
+                elif edge.name == "audio_embeds" and edge.tensor_info:
+                    audio_len = edge.tensor_info[0].dims[0] if edge.tensor_info[0].dims else 0
+                    # +2 for the start/end sentinel tokens added at Thinker prefill time.
+                    total = int(audio_len) + 2 if audio_len > 0 else None
+                elif edge.name == "vision_embeds" and edge.tensor_info:
+                    vision_len = edge.tensor_info[0].dims[0] if edge.tensor_info[0].dims else 0
+                    total = int(vision_len) + 2 if vision_len > 0 else None
+                if total is not None:
+                    body.request_info.prefill_tokens_total = total
+                    body.request_info.prefill_tokens_consumed = 0
                     break
 
         self.worker_graphs_manager.add_request(

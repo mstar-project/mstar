@@ -68,6 +68,10 @@ class PrefillReadyRequest:
 
     rid: str
     tokens_remaining: int
+    # If True, must be packed in full this step or deferred to the next step.
+    # Audio and vision prefills are atomic — sentinel wrappers prevent slicing
+    # through the embedding block. False (default) for chunkable text prefills.
+    atomic: bool = False
 
 
 @dataclass
@@ -119,6 +123,11 @@ def plan_chunked_step(
         if budget <= 0:
             break
         if req.tokens_remaining <= 0:
+            continue
+        if req.atomic and req.tokens_remaining > budget:
+            # Atomic prefill doesn't fit this step's remaining budget;
+            # defer to a later step. Don't partial-chunk (would break
+            # multimodal sentinel wrappers).
             continue
         chunk = min(req.tokens_remaining, budget)
         plan.prefill_allocations[req.rid] = chunk
@@ -308,7 +317,7 @@ class MicroScheduler:
         # Classify each ready request.
         decode_ready: list[DecodeReadyRequest] = []
         prefill_ready: list[PrefillReadyRequest] = []
-        for rid, (_wg_id, _sname, _walk, fwd_info) in ready.items():
+        for rid, (_wg_id, _sname, walk, fwd_info) in ready.items():
             if fwd_info.is_prefill_complete:
                 decode_ready.append(DecodeReadyRequest(rid=rid))
             else:
@@ -316,8 +325,14 @@ class MicroScheduler:
                     0,
                     fwd_info.prefill_tokens_total - fwd_info.prefill_tokens_consumed,
                 )
+                # Audio/vision prefills can't be chunked safely (sentinel-wrapped
+                # blocks). Mark them atomic so the planner skips them when budget
+                # is too small instead of partial-chunking.
+                atomic = walk in ("prefill_audio", "prefill_vision")
                 prefill_ready.append(
-                    PrefillReadyRequest(rid=rid, tokens_remaining=tokens_remaining)
+                    PrefillReadyRequest(
+                        rid=rid, tokens_remaining=tokens_remaining, atomic=atomic
+                    )
                 )
 
         plan = plan_chunked_step(decode_ready, prefill_ready, self.max_step_tokens)
