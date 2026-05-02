@@ -694,20 +694,81 @@ class Worker:
     # Batch building
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _slice_prompt_chunk(
+        tensors: NameToTensorList,
+        prefill_total: int,
+        start: int,
+        end: int,
+    ) -> NameToTensorList:
+        """Return a new ``NameToTensorList`` with token-axis tensors sliced to ``[start, end)``.
+
+        Identifies the token axis dynamically as the first axis whose length
+        equals ``prefill_total`` (the request's full prompt length). Tensors
+        without such an axis (e.g. a fixed-size image embedding sized by hidden
+        dim) pass through unchanged.
+
+        This mirrors ``mminf.engine.chunked_prefill._slice_ar_inputs`` but
+        operates on raw worker-side tensors (before they become
+        ``ARNodeInputs`` inside the submodule's ``prepare_inputs``).
+        """
+        chunk_len = end - start
+        sliced: NameToTensorList = {}
+        for name, tensor_list in tensors.items():
+            new_list: list[torch.Tensor] = []
+            for t in tensor_list:
+                if not isinstance(t, torch.Tensor):
+                    new_list.append(t)
+                    continue
+                token_axis = -1
+                for dim in range(t.dim()):
+                    if t.shape[dim] == prefill_total:
+                        token_axis = dim
+                        break
+                if token_axis == -1:
+                    # No axis matches the prompt length — non-token tensor,
+                    # pass through unchanged.
+                    new_list.append(t)
+                else:
+                    new_list.append(t.narrow(token_axis, start, chunk_len))
+            sliced[name] = new_list
+        return sliced
+
     def _build_node_batch(self, batch: ScheduledBatch) -> NodeBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
         per_request_inputs: dict[str, NameToTensorList] = {}
         per_request_info: dict[CurrentForwardPassInfo] = {}
         batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
+        # Phase 2 chunked-prefill: when the scheduler populated
+        # ``prefill_chunk_sizes``, slice each prefill rid's token-axis
+        # tensors to ``[consumed : consumed + chunk_size]`` so the engine
+        # only sees this step's slice. Decode rids (not in the dict) and
+        # all rids in Phase 1 batches (dict empty) pass through unchanged.
+        chunk_sizes = batch.prefill_chunk_sizes or {}
+
         for request_id, node in batch.node_objects.items():
-            tensors = {}
+            tensors: NameToTensorList = {}
             for input_name in node.ready_inputs:
                 tensors[input_name] = [
                     self.tensor_manager.get_tensor(
                         request_id=request_id, uuid=info.uuid
                     ) for info in node.ready_inputs[input_name].tensor_info
                 ]
+
+            if request_id in chunk_sizes:
+                fwd_info = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+                consumed = fwd_info.prefill_tokens_consumed
+                total = fwd_info.prefill_tokens_total
+                chunk = int(chunk_sizes[request_id])
+                # Defensive: clamp end to total so the last chunk's narrow()
+                # never overruns the prompt tensor.
+                end = min(consumed + chunk, total)
+                if total > 0 and end > consumed:
+                    tensors = self._slice_prompt_chunk(
+                        tensors, prefill_total=total, start=consumed, end=end,
+                    )
+
             per_request_inputs[request_id] = tensors
             per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
 
