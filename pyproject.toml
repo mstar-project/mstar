@@ -47,6 +47,7 @@ bagel = [
 
 qwen3_omni = [
     "einops",
+    "flash-attn",
     "flashinfer-python",
     "huggingface-hub",
     "mooncake-transfer-engine",
