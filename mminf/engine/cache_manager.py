@@ -17,11 +17,23 @@ class _PlanState:
     In CUDA graph mode, wrapper is a persistent FlashInferPrefillWrapper or
     FlashInferDecodeWrapper created once during capture. plan_attention()
     calls wrapper.plan() which updates static buffers via .copy_().
+
+    ``mrope_pos_advance`` is an out-of-band channel for prefill walks whose
+    MRoPE position-id span differs from the seq_len being prefilled (today:
+    only ``prefill_vision``, where the 3D-grid position span is larger than
+    the number of tokens). The submodule's preprocess writes a per-request
+    list here; ``advance_seq_lens`` reads it when ``pos_id_ns`` is None and
+    advances ``position_id_start`` by these values instead of by ``seq_len``.
+    Auto-cleared by ``advance_seq_lens`` so it doesn't leak across calls.
+    The CUDA-graph runner's post-replay ``advance_seq_lens()`` call is what
+    actually consumes this — the model's inner ``advance_seq_lens(pos_id_ns=...)``
+    runs at capture time only and is not replayed.
     """
     wrapper: FlashInferPrefillWrapper | FlashInferDecodeWrapper | None = None
     pos_ids: torch.Tensor | None = None
     seq_lens: list[int] | None = None
     write_store: bool = True
+    mrope_pos_advance: list[int] | None = None
 
 
 class WorkspaceBufferManager:
@@ -763,17 +775,32 @@ class BatchedCacheManager:
 
     @torch.compiler.disable
     def advance_seq_lens(self, pos_id_ns: list[int] | int | None = None) -> None:
-        """Advance seq_len for each request by different amounts."""
+        """Advance seq_len for each request by different amounts.
+
+        When ``pos_id_ns`` is None, falls back to a per-label side-channel
+        (``_PlanState.mrope_pos_advance``) populated by submodule.preprocess
+        for walks whose MRoPE position span differs from seq_len (today:
+        prefill_vision). The side-channel is auto-cleared after use so it
+        doesn't leak across calls.
+        """
         for i, rid in enumerate(self.request_ids):
-            n = self._plan_states[self.active_labels[rid]].seq_lens[i]
+            ps = self._plan_states[self.active_labels[rid]]
+            n = ps.seq_lens[i]
             state = self._get_state(rid)
             state.seq_len += n
             if pos_id_ns is None:
-                state.position_id_start += n
+                if ps.mrope_pos_advance is not None:
+                    state.position_id_start += ps.mrope_pos_advance[i]
+                else:
+                    state.position_id_start += n
             elif isinstance(pos_id_ns, int):
                 state.position_id_start += pos_id_ns
             else:
                 state.position_id_start += pos_id_ns[i]
+        # Clear the side-channel on every consumer so a stale value from a
+        # prior prefill_vision step can't bleed into a subsequent walk.
+        for ps in self._plan_states.values():
+            ps.mrope_pos_advance = None
 
     @torch.compiler.disable
     def snapshot_all(
