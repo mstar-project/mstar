@@ -515,9 +515,12 @@ def sample_cuda_graphable_gpu(
     """
     import flashinfer
 
-    scaled = logits / temperature.unsqueeze(-1).to(logits.dtype)
-    probs = torch.softmax(scaled, dim=-1)
-    top_k = torch.where(top_k > 0, top_k, logits.shape[1])
+    probs = fused_temperature_softmax(
+        logits, temperature,
+        # penalty=repetition_penalty if seen_token_mask is not None else None,
+        # seen_mask=seen_token_mask,
+        include_greedy=True,
+    )
     samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         probs, top_k, top_p, deterministic=True,
         seed=seed, offset=offset
@@ -532,6 +535,8 @@ class CudaGraphableSampler(BaseSampler):
     top_p_buf: torch.Tensor
     seed_buf: torch.Tensor
     offset_buf: torch.Tensor
+
+    w_config_temperature_buf: torch.Tensor
 
     @torch.compiler.disable
     def sample(self, request_ids: list[str], logits: torch.Tensor):
@@ -550,9 +555,14 @@ class CudaGraphableSampler(BaseSampler):
         top_k: int,
         top_p: float = 1.0,
     ):
+        self.w_config_temperature_buf.fill_(temperature)
+        probs = fused_temperature_softmax(
+            logits, self.w_config_temperature_buf,
+            # penalty=repetition_penalty if seen_token_mask is not None else None,
+            # seen_mask=seen_token_mask,
+            include_greedy=True,
+        )
         import flashinfer
-        scaled = logits / temperature
-        probs = torch.softmax(scaled, dim=-1)
         samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
             probs, top_k, top_p, deterministic=True,
             seed=self.seed_buf, offset=self.offset_buf
@@ -570,6 +580,7 @@ class SamplerBuffers:
     """
     max_batch_size: int
     temperature_buf: torch.Tensor   # [max_bs], float32
+    w_config_temperature_buf: torch.Tensor
     top_k_buf: torch.Tensor         # [max_bs], int32
     top_p_buf: torch.Tensor         # [max_bs], float32
     seed_buf: torch.Tensor          # [max_bs], int64
@@ -584,6 +595,7 @@ class SamplerBuffers:
         """Allocate zero-initialised sampling buffers for ``max_batch_size``.
         """
         temperature_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
+        w_config_temperature_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
         top_k_buf = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
         top_p_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
         seed_buf = torch.zeros(max_batch_size, dtype=torch.long, device=device)
@@ -591,6 +603,7 @@ class SamplerBuffers:
         return cls(
             max_batch_size=max_batch_size,
             temperature_buf=temperature_buf,
+            w_config_temperature_buf=w_config_temperature_buf,
             top_k_buf=top_k_buf,
             top_p_buf=top_p_buf,
             seed_buf=seed_buf,
@@ -600,6 +613,7 @@ class SamplerBuffers:
     def slice_for_bs(self, bs: int) -> dict[str, torch.Tensor]:
         """Return bs-sized views into each buffer (zero-copy slices)."""
         return {
+            "w_config_temperature_buf": self.w_config_temperature_buf[:bs],
             "temperature_buf": self.temperature_buf[:bs],
             "top_k_buf": self.top_k_buf[:bs],
             "top_p_buf": self.top_p_buf[:bs],
