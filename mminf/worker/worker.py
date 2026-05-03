@@ -1368,6 +1368,11 @@ class Worker:
                 if len(streaming_edges[rid]) < len(sample_node._streaming_inputs):
                     for edge in streaming_edges[rid]:
                         self._return_speculative_streaming_edge(rid, edge)
+                    
+                    new_node_objects.pop(rid, None)
+                    per_request_inputs.pop(rid, None)
+                    per_request_info.pop(rid, None)
+                    new_request_to_worker_graph.pop(rid, None)
                 else:
                     has_streaming_ready.append(rid)
                     for edge in streaming_edges[rid]:
