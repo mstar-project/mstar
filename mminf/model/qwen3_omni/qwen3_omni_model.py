@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
     """Download (or locate) a HuggingFace snapshot and return the local path."""
     from huggingface_hub import snapshot_download
@@ -1387,8 +1388,15 @@ class Qwen3OmniModel(Model):
         # This should be a Qwen3OmniMoeConfig
         audio_config = config.thinker_config.audio_config
 
-        # Build the audio encoder from config
-        audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(audio_config)
+        # Build the audio encoder from config.
+        # IMPORTANT: pass attn_implementation="flash_attention_2" so the
+        # encoder uses the cu_seqlens FA2 path. With the HF default
+        # (which resolves to "sdpa"), Qwen3OmniMoeAudioAttention runs
+        # SDPA on the full packed sequence (no per-segment fusion),
+        # which is significantly slower than FA2's varlen path.
+        audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(
+            audio_config, attn_implementation="flash_attention_2"
+        )
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
@@ -1419,8 +1427,19 @@ class Qwen3OmniModel(Model):
         # Extract the vision sub-config
         vision_config = config.thinker_config.vision_config
 
-        # Build the vision encoder
-        vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(vision_config)
+        # Build the vision encoder.
+        # CRITICAL: pass attn_implementation="flash_attention_2". Without
+        # this, vision_config._attn_implementation defaults to None and is
+        # resolved to "sdpa" at runtime (modeling_utils.py:1889). With
+        # "sdpa", Qwen3OmniMoeVisionAttention.forward falls into the
+        # per-segment Python loop (modeling_qwen3_omni_moe.py:892-913),
+        # which issues N sequential attention calls per layer for an
+        # N-frame video. This causes the 10× V2T/V2S TTFT regression vs
+        # vllm-omni. With "flash_attention_2", a single varlen FA2 call
+        # per layer handles all frames at once via cu_seqlens.
+        vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(
+            vision_config, attn_implementation="flash_attention_2"
+        )
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
