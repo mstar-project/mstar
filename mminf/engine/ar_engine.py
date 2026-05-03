@@ -238,7 +238,21 @@ class AREngine(BaseEngine):
     def get_max_batch_size(self, node_name, graph_walk):
         if node_name not in self.submodule_management:
             return
-        return self.submodule_management[node_name].submodule.max_batch_size(graph_walk)
+        submod_max_bs = self.submodule_management[node_name].submodule.max_batch_size(graph_walk)
+        submod_mg = self.submodule_management[node_name]
+        if submod_mg.cuda_graph_runner is None:
+            return submod_max_bs
+        
+        runner = submod_mg.cuda_graph_runner
+        configs = [
+            cfg for cfg in runner.capture_configs \
+                if graph_walk in cfg.replay_graph_walks
+        ]
+        if not configs:
+            return submod_max_bs
+        return max([
+                max(cfg.capture_batch_sizes or runner.CAPTURE_BATCH_SIZES) for cfg in configs
+        ]) # it wouldn't make sense for this value to be less than submod_max_bs
 
     def _sample_decode_outputs(
         self,
