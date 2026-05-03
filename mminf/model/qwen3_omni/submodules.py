@@ -544,12 +544,48 @@ class ThinkerSubmodule(ARNodeSubmodule):
             assert len(inputs) == 1, \
                 "Batching not implemented for Thinker vision prefill"
             inp = inputs[0]
-            extra_inputs["deepstack"] = inp.tensor_inputs.get("deepstack", torch.tensor([]))
+            # Q3(b): emit deepstack as separate keys ``deepstack_<i>`` so each
+            # tensor gets its own static buffer in the captured config (the
+            # runner's static-buffer interning is per-key and tensor-typed;
+            # passing a list-of-tensors under one key would not get interned
+            # and addresses captured into the graph would be stale at replay).
+            # ``forward_batched``/``forward`` reassemble the list from kwargs.
+            num_deepstack = len(self.config.vision.deepstack_visual_indexes)
+            deepstack_list = inp.tensor_inputs.get("deepstack")
+            if deepstack_list is None or (
+                isinstance(deepstack_list, torch.Tensor) and deepstack_list.numel() == 0
+            ):
+                # Eager fallback / missing deepstack (shouldn't happen in
+                # normal vision prefill, but keep the path robust).
+                empty = torch.zeros(
+                    (0, self.config.thinker_hidden_size),
+                    dtype=input_embeds.dtype, device=device,
+                )
+                for i in range(num_deepstack):
+                    extra_inputs[f"deepstack_{i}"] = empty
+            else:
+                assert len(deepstack_list) == num_deepstack, (
+                    f"deepstack list length ({len(deepstack_list)}) does not match "
+                    f"vision.deepstack_visual_indexes ({num_deepstack})."
+                )
+                for i, t in enumerate(deepstack_list):
+                    extra_inputs[f"deepstack_{i}"] = t
             extra_inputs["visual_pos_masks"] = inp.tensor_inputs.get(
-                "visual_pos_masks", torch.tensor([]))
-            extra_inputs["mrope_pos_advance"] = [
+                "visual_pos_masks", torch.zeros(0, dtype=torch.bool, device=device))
+            mrope_pos_advance = [
                 inp.tensor_inputs.get("mrope_pos_advance", 0)
             ]
+            extra_inputs["mrope_pos_advance"] = mrope_pos_advance
+            # Side-channel: stash on the cache_manager's plan state so the
+            # CUDA-graph runner's post-replay ``advance_seq_lens()`` (which
+            # is called with no args) advances ``position_id_start`` by the
+            # MRoPE 3D-grid span instead of by ``seq_len``. The eager path
+            # consumes ``mrope_pos_advance`` from the dict via model.forward
+            # → cache_handle.advance_seq_lens(pos_id_ns=...); both paths
+            # converge on the same per-request advance.
+            ps = cache_manager._plan_states.get("main")
+            if ps is not None:
+                ps.mrope_pos_advance = list(mrope_pos_advance)
 
         return {
             "input_embeds": input_embeds,
@@ -566,6 +602,33 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
     # ---- forward ----
 
+    def _collect_deepstack_kwargs(
+        self, kwargs: dict[str, Any]
+    ) -> list[torch.Tensor] | None:
+        """Reassemble the deepstack list from per-layer ``deepstack_<i>`` keys.
+
+        ``preprocess`` emits one key per ``vision.deepstack_visual_indexes``
+        entry so each layer's visual feature gets its own static buffer in
+        the captured prefill_vision config. Both the eager ``forward`` and
+        the captured ``forward_batched`` call this helper to put the list
+        back together before invoking ``Qwen3OmniThinkerModel.forward``.
+
+        Returns None when no ``deepstack_*`` keys are present (e.g. for
+        prefill_text / prefill_audio / thinker_decode), so the inner model
+        receives ``deepstack_visual_embeds=None`` and skips the deepstack
+        splice entirely.
+        """
+        num_deepstack = len(self.config.vision.deepstack_visual_indexes)
+        if not any(f"deepstack_{i}" in kwargs for i in range(num_deepstack)):
+            return None
+        out: list[torch.Tensor] = []
+        for i in range(num_deepstack):
+            t = kwargs.get(f"deepstack_{i}")
+            if t is None:
+                return None
+            out.append(t)
+        return out
+
     def forward(
         self,
         graph_walk: str,
@@ -576,7 +639,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         mrope_section: list[int] | None = None,
         mrope_pos_advance: list[int] | None = None,
         masks_for_talker: dict[str, torch.Tensor] | None = None,
-        deepstack: list[torch.Tensor] | None = None,
         visual_pos_masks: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
@@ -587,7 +649,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
         saves cross-partition bandwidth for text-only requests. Defaults to
         ``True`` for backwards compatibility with callers that do not set
         the flag (e.g. unit tests).
+
+        ``deepstack`` (used by prefill_vision) is reassembled from per-layer
+        ``deepstack_<i>`` kwargs — see ``_collect_deepstack_kwargs``.
         """
+        deepstack = self._collect_deepstack_kwargs(kwargs)
         request_info = engine_inputs.single_request_info
         audio_output = request_info.step_metadata.get(
             "audio_output", True,
@@ -640,6 +706,16 @@ class ThinkerSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
+    # prefill_vision buckets are larger than text/audio because video
+    # produces many vision tokens per request (UCF101 ≈ 1k–4k tokens; 8192
+    # gives headroom for VideoMME-style longer clips). Capture only bs=1
+    # because mminf's eager prefill_vision asserts a single request per step
+    # (``preprocess`` line in this file), and V2T runs at concurrency 1
+    # today. Costs ~4 captures × persistent FlashInfer wrappers + static
+    # buffers for the 30B Thinker; revisit if memory becomes a constraint.
+    PREFILL_VISION_TOKEN_BUCKETS = [1024, 2048, 4096, 8192]
+    PREFILL_VISION_CAPTURE_BATCH_SIZES = [1]
+
     def _build_prefill_text_packed(
         self, num_tokens: int, device: torch.device,
     ) -> dict[str, torch.Tensor]:
@@ -678,6 +754,62 @@ class ThinkerSubmodule(ARNodeSubmodule):
             "sin_3d": sin_3d,
         }
 
+    def _build_prefill_vision_packed(
+        self, num_tokens: int, device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Synthesize a tensor-only post-preprocess packed dict for prefill_vision.
+
+        Mirrors ``_build_prefill_text_packed`` and additionally provides
+        ``deepstack_<i>`` (one tensor per ``vision.deepstack_visual_indexes``
+        entry) and ``visual_pos_masks``. Non-tensor extras (``mrope_section``,
+        ``seq_lens``, ``mrope_pos_advance``, ``masks_for_talker``) are
+        intentionally absent: the runner's static-buffer interning is
+        tensor-only, so non-tensors come back from ``submodule.preprocess``
+        at replay time. ``mrope_pos_advance`` flows through the
+        ``_PlanState`` side-channel (see ``cache_manager._PlanState``).
+
+        Visual_pos_masks is a length-``num_tokens`` bool tensor; at capture
+        time we set it to all-False so the inner ``_deepstack_process``
+        becomes a no-op on the captured-bucket trailing slack tokens. At
+        replay, ``preprocess`` writes the real per-request mask (which has
+        True at the per-frame token positions and False at the sentinel /
+        padding positions).
+        """
+        hidden_size = self.config.thinker_hidden_size
+        num_deepstack = len(self.config.vision.deepstack_visual_indexes)
+
+        pos_ids = torch.arange(
+            num_tokens, dtype=torch.float, device=device,
+        ).unsqueeze(0).expand(3, -1).contiguous()
+        inv_freq = self._get_inv_freq(device)
+        cos_3d, sin_3d = compute_3d_cos_sin(
+            pos_ids, inv_freq,
+            mrope_section=self.MROPE_SECTION,
+            target_dtype=torch.bfloat16,
+        )
+
+        packed: dict[str, torch.Tensor] = {
+            "input_embeds": torch.zeros(
+                (num_tokens, hidden_size),
+                dtype=torch.bfloat16, device=device,
+            ),
+            "cos_3d": cos_3d,
+            "sin_3d": sin_3d,
+            "visual_pos_masks": torch.zeros(
+                num_tokens, dtype=torch.bool, device=device,
+            ),
+        }
+        # Per-layer deepstack tensors. Each has shape (num_tokens, hidden) and
+        # is summed into the post-attention hidden state at the matching
+        # ``deepstack_visual_indexes`` layer. Empty contents at capture
+        # (visual_pos_masks=all-False) make the splice a no-op.
+        for i in range(num_deepstack):
+            packed[f"deepstack_{i}"] = torch.zeros(
+                (num_tokens, hidden_size),
+                dtype=torch.bfloat16, device=device,
+            )
+        return packed
+
     def get_cuda_graph_configs(self, device: torch.device):
         """Declare CUDA graph captures for ``thinker_decode`` and the prefill walks.
 
@@ -699,6 +831,32 @@ class ThinkerSubmodule(ARNodeSubmodule):
         prefill_text_packed = {
             num_tokens: self._build_prefill_text_packed(num_tokens, device)
             for num_tokens in self.PREFILL_TOKEN_BUCKETS
+        }
+        prefill_vision_packed = {
+            num_tokens: self._build_prefill_vision_packed(num_tokens, device)
+            for num_tokens in self.PREFILL_VISION_TOKEN_BUCKETS
+        }
+        num_deepstack = len(self.config.vision.deepstack_visual_indexes)
+        # zero_padding for prefill_vision must include empty entries for the
+        # vision-specific tensor inputs (deepstack_<i>, visual_pos_masks) so
+        # ``preprocess`` doesn't trip over missing keys when the runner pads
+        # to padded_bs. We only capture bs=[1] today, so this padding is a
+        # belt-and-suspenders safety net rather than a hot path.
+        prefill_vision_zero_padding_tensor_inputs = {
+            "masks_for_talker": torch.zeros(
+                (2, 0), dtype=torch.float, device=device,
+            ),
+            "visual_pos_masks": torch.zeros(0, dtype=torch.bool, device=device),
+            # Use a list (matches eager prepare_inputs) — preprocess turns it
+            # into per-layer ``deepstack_<i>`` keys.
+            "deepstack": [
+                torch.zeros(
+                    (0, self.config.thinker_hidden_size),
+                    dtype=torch.bfloat16, device=device,
+                )
+                for _ in range(num_deepstack)
+            ],
+            "mrope_pos_advance": 0,
         }
         return [
             BasicBatchedCudaGraphConfig(
@@ -752,6 +910,34 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     }
                 ),
             ),
+            # prefill_vision: separate capture because its post-preprocess
+            # tensor signature has extras (deepstack_<i>, visual_pos_masks)
+            # that prefill_text/audio don't. mrope_pos_advance flows
+            # out-of-band via the _PlanState side-channel — see
+            # ``cache_manager._PlanState.mrope_pos_advance``.
+            FlashInferPackedCudaGraphConfig(
+                capture_graph_walk="prefill_vision",
+                replay_graph_walks=["prefill_vision"],
+                packed_seq_len_to_inputs=prefill_vision_packed,
+                requires_cfg=False,
+                labels=["main"],
+                compile=True,
+                causal_attention=True,
+                capture_batch_sizes=self.PREFILL_VISION_CAPTURE_BATCH_SIZES,
+                zero_padding_input=ARNodeInputs(
+                    input_seq_len=0,
+                    input_embeds=torch.zeros(
+                        (0, self.config.thinker_hidden_size),
+                        device=device, dtype=torch.bfloat16,
+                    ),
+                    custom_pos_ids=torch.zeros(
+                        (3, 0),
+                        dtype=torch.float,
+                        device=device,
+                    ),
+                    tensor_inputs=prefill_vision_zero_padding_tensor_inputs,
+                ),
+            ),
         ]
 
     def forward_batched(
@@ -764,6 +950,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         mrope_section: list[int] | None = None,
         mrope_pos_advance: list[int] | None = None,
         masks_for_talker: dict[str, torch.Tensor] | None = None,
+        visual_pos_masks: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         """Batched Thinker forward shared between ``thinker_decode`` and the prefill walks.
@@ -776,7 +963,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
           requests) happens OUTSIDE the captured region via
           ``filter_batched_output``.
 
-        Prefill paths (``prefill_text``, ``prefill_audio``;
+        Prefill paths (``prefill_text``, ``prefill_audio``, ``prefill_vision``;
         multi-token-per-request, ``hidden`` shape ``(total_tokens, hidden)``):
           Last-token-per-request indices come from the persistent
           ``qo_indptr_buf`` on the FlashInfer prefill wrapper — the buffer is
@@ -791,23 +978,38 @@ class ThinkerSubmodule(ARNodeSubmodule):
           slice ends depend on real per-request seq_lens, which the
           captured region cannot honor with fixed shapes.
 
-          ``prefill_text`` and ``prefill_audio`` share this dispatch because
-          their post-preprocess tensor signature is identical
-          (``input_embeds`` + ``cos_3d`` + ``sin_3d``). ``prefill_vision`` is
-          NOT included — its preprocess emits ``deepstack`` /
-          ``visual_pos_masks`` / ``mrope_pos_advance`` extras that the model
-          forward also consumes; it is kept on the eager path.
+          ``prefill_text`` / ``prefill_audio`` share one capture (their
+          post-preprocess tensor signature is identical: ``input_embeds`` +
+          ``cos_3d`` + ``sin_3d``). ``prefill_vision`` has its own capture
+          because it adds ``visual_pos_masks`` and per-layer ``deepstack_<i>``
+          tensors. ``mrope_pos_advance`` flows out-of-band via the
+          ``_PlanState`` side-channel that ``preprocess`` populates — see
+          ``cache_manager._PlanState.mrope_pos_advance``. The model's inner
+          ``cache_handle.advance_seq_lens(pos_id_ns=mrope_pos_advance)`` call
+          executes only at capture time (it's a ``@torch.compiler.disable``'d
+          Python op so it's not replayed); the runner's post-replay
+          ``advance_seq_lens()`` is what advances the real state, and that
+          path reads the side-channel.
         """
-        assert graph_walk in ("thinker_decode", "prefill_text", "prefill_audio")
+        assert graph_walk in (
+            "thinker_decode", "prefill_text", "prefill_audio", "prefill_vision"
+        )
 
         # Packed dict from FlashInferPackedCudaGraphConfig is tensor-only by
         # design (the runner's static-buffer interning skips non-tensor
         # entries), so for prefill walks we recover mrope_section from the
         # class constant when the kwarg is missing. Decode goes through
         # preprocess which does pass it explicitly.
-        is_prefill = graph_walk in ("prefill_text", "prefill_audio")
+        is_prefill = graph_walk in (
+            "prefill_text", "prefill_audio", "prefill_vision",
+        )
         if mrope_section is None and is_prefill:
             mrope_section = self.MROPE_SECTION
+
+        # prefill_vision: reassemble per-layer deepstack tensors from
+        # ``deepstack_<i>`` kwargs into the list shape ``model.forward``
+        # expects. None for non-vision walks → model skips the splice.
+        deepstack = self._collect_deepstack_kwargs(kwargs)
 
         cos_sin_3d = (cos_3d, sin_3d) if cos_3d is not None else None
         cache_manager = engine_inputs.cache_manager
@@ -817,12 +1019,14 @@ class ThinkerSubmodule(ARNodeSubmodule):
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
             mrope_pos_advance=mrope_pos_advance,
+            deepstack_visual_embeds=deepstack,
+            visual_pos_masks=visual_pos_masks,
         )
 
         if is_prefill:
             qo_indptr_buf = cache_manager.get_qo_indptr_buf("main")
             assert qo_indptr_buf is not None, (
-                "prefill_text forward_batched requires a CUDA-graph "
+                f"{graph_walk} forward_batched requires a CUDA-graph "
                 "FlashInferPrefillWrapper (qo_indptr static buffer); got None."
             )
             last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
