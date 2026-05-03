@@ -30,6 +30,7 @@ tested without instantiating any heavy modules.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 
 import torch
@@ -39,6 +40,48 @@ _PALIGEMMA_PREFIX = "paligemma_with_expert.paligemma.model."
 _GEMMA_EXPERT_PREFIX = "paligemma_with_expert.gemma_expert.model."
 _PALIGEMMA_LM_HEAD = "paligemma_with_expert.paligemma.lm_head.weight"
 _GEMMA_EXPERT_LM_HEAD = "paligemma_with_expert.gemma_expert.lm_head.weight"
+
+
+_Q_PROJ_RE = re.compile(r"^(.+)\.q_proj\.weight$")
+
+
+def _fuse_qkv_weights(bucket: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Merge separate q/k/v_proj weights into a single qkv_proj weight.
+
+    Pi05PaliGemmaAttention uses a fused ``qkv_proj`` Linear instead of three
+    separate projections.  The checkpoint still stores them separately under
+    ``<prefix>.q_proj.weight``, ``<prefix>.k_proj.weight``, and
+    ``<prefix>.v_proj.weight``.  This function detects those triples and cats
+    them (in q-k-v order, along dim 0) into ``<prefix>.qkv_proj.weight``.
+
+    Any key that is not part of such a triple is passed through unchanged.
+    """
+    # Find every prefix that has all three projections present.
+    fused_prefixes: set[str] = set()
+    for key in bucket:
+        m = _Q_PROJ_RE.match(key)
+        if m:
+            prefix = m.group(1)
+            if f"{prefix}.k_proj.weight" in bucket and f"{prefix}.v_proj.weight" in bucket:
+                fused_prefixes.add(prefix)
+
+    if not fused_prefixes:
+        return bucket
+
+    skip: set[str] = set()
+    fused: dict[str, torch.Tensor] = {}
+    for prefix in fused_prefixes:
+        q_key = f"{prefix}.q_proj.weight"
+        k_key = f"{prefix}.k_proj.weight"
+        v_key = f"{prefix}.v_proj.weight"
+        skip.update((q_key, k_key, v_key))
+        fused[f"{prefix}.qkv_proj.weight"] = torch.cat(
+            [bucket[q_key], bucket[k_key], bucket[v_key]], dim=0
+        )
+
+    result = {k: v for k, v in bucket.items() if k not in skip}
+    result.update(fused)
+    return result
 
 
 def remap_lerobot_state_dict(
@@ -128,6 +171,10 @@ def remap_lerobot_state_dict(
             continue
 
         # Anything else (e.g. unrelated buffers) is dropped silently.
+
+    # Fuse separate q/k/v_proj weights into qkv_proj for Pi05PaliGemmaAttention.
+    buckets["paligemma"] = _fuse_qkv_weights(buckets["paligemma"])
+    buckets["action_expert"] = _fuse_qkv_weights(buckets["action_expert"])
 
     return buckets
 

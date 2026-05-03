@@ -25,6 +25,7 @@ from mminf.model.pi05.components.paligemma import (
     Pi05PaliGemmaAttention,
 )
 from mminf.model.pi05.config import Pi05Config
+from mminf.model.pi05.kernels.adarms_norm import adarms_norm_fused
 
 
 class Pi05AdaRMSNorm(nn.Module):
@@ -48,33 +49,19 @@ class Pi05AdaRMSNorm(nn.Module):
         nn.init.zeros_(self.dense.weight)
         nn.init.zeros_(self.dense.bias)
 
-    def _rms_normalize(self, x: torch.Tensor) -> torch.Tensor:
-        # Compute RMS normalization in float32 (matches openpi's _norm).
-        orig_dtype = x.dtype
-        var = torch.mean(x.to(torch.float32).square(), dim=-1, keepdim=True)
-        normed = x.to(torch.float32) * torch.rsqrt(var + self.variance_epsilon)
-        return normed.to(orig_dtype)
-
     def forward(
         self, x: torch.Tensor, cond: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # reshape instead of flattening early
         BS = cond.shape[0]
-        AH = x.shape[0] // BS
-        x = x.view(BS, AH, -1)
+        x_flat = x.view(BS * (x.shape[0] // BS), -1).contiguous()
 
-        normed = self._rms_normalize(x)
+        modulation = self.dense(cond)  # [BS, 3*H]
+        H = self.hidden_size
+        scale = modulation[:, :H]
+        shift = modulation[:, H:2 * H]
+        gate_mod = modulation[:, 2 * H:]
 
-        modulation = self.dense(cond)[:, None, :]  # [BS, 1, 3*emb_dim]
-        scale, shift, gate = modulation.chunk(3, dim=-1)
-
-        normed = normed * (1.0 + scale) + shift
-
-        # flatten back if needed
-        normed = normed.view(BS * AH, -1)
-        gate = gate.expand(BS, AH, -1).reshape(BS * AH, -1)
-
-        return normed, gate
+        return adarms_norm_fused(x_flat, scale, shift, gate_mod, self.variance_epsilon)
 
 
 def _gated_residual(

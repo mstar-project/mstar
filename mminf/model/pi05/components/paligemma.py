@@ -46,9 +46,8 @@ class Pi05PaliGemmaAttention(nn.Module):
         )
         self.rope_theta = config.rope_theta
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        qkv_out_dim = (self.num_heads + 2 * self.num_kv_heads) * self.head_dim
+        self.qkv_proj = nn.Linear(self.hidden_size, qkv_out_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
     def forward(
@@ -56,9 +55,13 @@ class Pi05PaliGemmaAttention(nn.Module):
         query_sequence: torch.Tensor,
         cache_handle: BatchedCacheManager,
     ) -> torch.Tensor:
-        q = self.q_proj(query_sequence).view(-1, self.num_heads, self.head_dim)
-        k = self.k_proj(query_sequence).view(-1, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(query_sequence).view(-1, self.num_kv_heads, self.head_dim)
+        qkv = self.qkv_proj(query_sequence)
+        q_dim = self.num_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
 
         q, k = cache_handle.apply_rope(q, k, rope_theta=self.rope_theta)
         attn_output = cache_handle.run_attention(q=q, k=k, v=v)

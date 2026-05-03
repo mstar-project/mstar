@@ -26,6 +26,7 @@ from mminf.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mminf.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mminf.model.pi05.components.siglip import Pi05SiglipEncoder
 from mminf.model.pi05.config import Pi05Config
+from mminf.model.pi05.kernels.image_normalize import normalize_float_images
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -98,18 +99,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
             # uint8 [0, 255] → float32 [-1, 1]
             images = images.to(torch.float32) / 127.5 - 1.0
         else:
-            images = images.to(torch.float32)
-            # The data_worker passes images as float32 in [0, 1] (after
-            # dividing decoded uint8 frames by 255). Detect that case and
-            # remap to [-1, 1] so SigLIP sees the openpi-normalized range.
-            # If the image is already in [-1, 1] (e.g. when test code feeds
-            # the submodule directly), the min will be < 0 and we leave it
-            # alone.
-            if images.numel() > 0:
-                img_min = float(images.min())
-                img_max = float(images.max())
-                if img_min >= -1e-4 and img_max <= 1.0 + 1e-4:
-                    images = images * 2.0 - 1.0
+            # normalize_float_images detects [0,1] vs [-1,1] and rescales
+            # entirely on the GPU — no CPU–GPU sync (replaces the two
+            # float(images.min()) / float(images.max()) calls that were here).
+            images = normalize_float_images(images.to(torch.float32))
 
         target_h = target_w = self.config.vit_image_size
         _, _, cur_h, cur_w = images.shape
@@ -134,6 +127,55 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
             resized, (pad_w0, pad_w1, pad_h0, pad_h1), mode="constant", value=-1.0
         )
 
+    def can_batch(
+        self,
+        batch: NodeBatch,
+        model_inputs: list[NodeInputs],
+    ) -> bool:
+        """Batch when all requests share the same number of cameras.
+
+        If camera counts differ, fall back to sequential execution.
+        """
+        if not model_inputs:
+            return False
+        first_num_cameras = model_inputs[0].tensor_inputs["pixel_values"].shape[0]
+        return all(
+            inp.tensor_inputs["pixel_values"].shape[0] == first_num_cameras
+            for inp in model_inputs
+        )
+
+    def get_cuda_graph_configs(self, device: torch.device) -> list:
+        """CUDA graph capture config for the SigLIP encoder.
+
+        Captures the batched encoder forward for bs ∈ [1, 2, 4] during the
+        'prefill' walk. Each capture slot holds one request's pixel_values:
+        (num_cameras, 3, H, W). preprocess() stacks them to (bs, num_cameras,
+        3, H, W) so shape[0] == bs, satisfying CodecCudaGraphRunner's
+        leading-dim == bs requirement.
+
+        compile=False because warmup() already applies torch.compile to
+        forward_batched; _capture_one captures the compiled callable directly.
+        """
+        from mminf.engine.cuda_graph_config import BasicBatchedCudaGraphConfig
+        H = W = self.config.vit_image_size
+        num_cameras = self.config.num_cameras
+        return [
+            BasicBatchedCudaGraphConfig(
+                capture_graph_walk="prefill",
+                single_request_inputs=ARNodeInputs(
+                    input_seq_len=0,  # not used by CodecCudaGraphRunner
+                    tensor_inputs={
+                        "pixel_values": torch.zeros(
+                            num_cameras, 3, H, W,
+                            device=device, dtype=torch.float32,
+                        )
+                    },
+                ),
+                capture_batch_sizes=[1],
+                compile=False,
+            )
+        ]
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -151,11 +193,11 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        # Stack images across requests into a single batch dimension.
-        all_images = []
-        for inp in inputs:
-            all_images.append(inp.tensor_inputs["pixel_values"])
-        pixel_values = torch.cat(all_images, dim=0)
+        # Stack images across requests: (bs, num_cameras, 3, H, W).
+        # Leading dim == bs satisfies CodecCudaGraphRunner's shape validation,
+        # and forward_batched flattens it back before the encoder call.
+        all_images = [inp.tensor_inputs["pixel_values"] for inp in inputs]
+        pixel_values = torch.stack(all_images, dim=0)
         return {"pixel_values": pixel_values}
 
     @torch.amp.autocast("cuda", enabled=False)
@@ -166,15 +208,50 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         pixel_values: torch.Tensor,
         **kwargs # coming from preprocess output
     ) -> NameToTensorList:
+        # pixel_values: (1, num_cameras, 3, H, W) from stacked preprocess
+        # (sequential path always has bs=1). Flatten to (num_cameras, 3, H, W)
+        # before the encoder.
         # Disable autocast so SigLIP runs in fp32, matching lerobot's
         # to_bfloat16_for_selected_params which keeps vision_tower +
         # multi_modal_projector in float32.
-        features = self.encoder(pixel_values.float())
-        # features: [num_cameras_total, tokens_per_image, hidden]
+        pv = pixel_values.flatten(0, 1)
+        features = self.encoder(pv.float())
+        # features: [num_cameras, tokens_per_image, hidden]
         # Flatten the camera dimension into the token sequence so the LLM sees
         # a single contiguous sequence of image tokens per request.
         flat = features.reshape(-1, features.shape[-1])
         return {"img_emb": [flat]}
+
+    @torch.amp.autocast("cuda", enabled=False)
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        pixel_values: torch.Tensor,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        """Batched SigLIP encode for a homogeneous-camera-count batch.
+
+        Args:
+            pixel_values: (bs, num_cameras, 3, H, W) — stacked by preprocess().
+
+        Returns:
+            Per-request dict: {rid: {"img_emb": [features_for_this_request]}}.
+            Each ``img_emb`` tensor has shape (num_cameras * tokens_per_image, hidden_size).
+        """
+        bs, num_cameras = pixel_values.shape[:2]
+        # Flatten to (bs * num_cameras, 3, H, W) for the HF encoder.
+        pv = pixel_values.flatten(0, 1)
+        features = self.encoder(pv.float())
+        # features: (bs * num_cameras, tokens_per_image, hidden_size)
+        tokens_per_image, hidden = features.shape[1], features.shape[2]
+        # Reshape to (bs, num_cameras * tokens_per_image, hidden_size) so
+        # each request gets a single contiguous image-token sequence.
+        features = features.reshape(bs, num_cameras * tokens_per_image, hidden)
+        return {
+            rid: {"img_emb": [features[i]]}
+            for i, rid in enumerate(engine_inputs.request_ids)
+        }
 
 
 class Pi05LLMSubmodule(ARNodeSubmodule):
@@ -247,8 +324,11 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         self._image_embed_scale = math.sqrt(config.hidden_size)
         self._text_embed_scale = float(config.hidden_size)
 
-        # cached on first action Euler step
+        # Lazily allocated on first action Euler step, sized for the largest
+        # captured batch. sincos_timestep_embedding fully overwrites this buffer
+        # every step, so torch.empty suffices (no zeroing needed).
         self._fraction: torch.Tensor | None = None
+        self._time_emb_buffer: torch.Tensor | None = None
 
     def to(self, *args, **kwargs):
         """Apply standard ``to()`` then upcast norm parameters back to fp32.
@@ -302,6 +382,22 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             dtype=torch.float64
         )
         return self._fraction
+
+    def _get_time_emb_buffer(self, bs: int) -> torch.Tensor:
+        """Return a pre-allocated slice of shape (bs, action_hidden_size).
+
+        Allocated once at the largest capture batch size (float32, matching
+        noisy_actions dtype). sincos_timestep_embedding fully overwrites it
+        every step, so no zeroing is needed — torch.empty suffices.
+        """
+        max_bs = max(self.PREFILL_CAPTURE_BATCH_SIZES)
+        if self._time_emb_buffer is None:
+            self._time_emb_buffer = torch.empty(
+                max_bs, self.config.action_hidden_size,
+                device=self.get_device(),
+                dtype=torch.float32,
+            )
+        return self._time_emb_buffer[:bs]
 
     def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
         emb = self.embed_tokens(ids)
@@ -504,11 +600,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             "timestep_index": all_ts,
             "seq_lens": seq_lens,
             "fraction": self._get_timestep_emb_fraction(),
-            "time_emb_buffer": torch.zeros(
-                (len(inputs), self.config.action_hidden_size),
-                device=self.get_device(),
-                dtype=cat_noisy.dtype
-            )
+            "time_emb_buffer": self._get_time_emb_buffer(len(inputs))
         }
 
     # ------------------------------------------------------------------
