@@ -60,7 +60,7 @@ class AudioCodecEngine(BaseEngine):
                 per_request_output_tensors={rid: {} for rid in batch.request_ids}
             )
             if self.enable_nvtx:
-                range_pop()
+                range_pop(synchronize=False)
             return output
 
         try:
@@ -100,7 +100,7 @@ class AudioCodecEngine(BaseEngine):
                 return output
         finally:
             if self.enable_nvtx:
-                range_pop()
+                range_pop(synchronize=False)
 
     def _dispatch(
         self, batch: NodeBatch,
@@ -193,7 +193,7 @@ class AudioCodecEngine(BaseEngine):
             submodule=submodule,
         )
         if self.enable_nvtx:
-            range_pop()
+            range_pop(synchronize=False)
         return NodeOutput(per_request_output_tensors=per_rid)
 
     def _execute_batched(
@@ -214,6 +214,8 @@ class AudioCodecEngine(BaseEngine):
             engine_inputs=engine_inputs,
             inputs=inputs
         )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
 
         if self.enable_nvtx:
             range_push("codec.batched.forward")
@@ -223,7 +225,7 @@ class AudioCodecEngine(BaseEngine):
             **packed
         )
         if self.enable_nvtx:
-            range_pop()
+            range_pop(synchronize=False)
         return NodeOutput(per_request_output_tensors=outputs)
 
     def _execute_sequential(
@@ -260,7 +262,7 @@ class AudioCodecEngine(BaseEngine):
                 **preprocessed
             )
             if self.enable_nvtx:
-                range_pop()
+                range_pop(synchronize=False)
         return NodeOutput(per_request_output_tensors=outputs)
 
     def warmup(self) -> None:
@@ -293,6 +295,25 @@ class AudioCodecEngine(BaseEngine):
                     "AudioCodecEngine: CUDA graphs captured for %s (%d graphs)",
                     node_name, len(runner.graphs),
                 )
+
+        # Disabling for now due to compilation delay overhead being too high
+        # for node_name, submodule in self.submodules.items():
+        #     try:
+        #         if hasattr(submodule, 'forward'):
+        #             submodule.forward = torch.compile(
+        #                 submodule.forward,
+        #                 fullgraph=False,
+        #             )
+        #             logger.info("AudioCodecEngine: torch.compile applied to %s.forward", node_name)
+        #         if hasattr(submodule, 'forward_batched'):
+        #             submodule.forward_batched = torch.compile(
+        #                 submodule.forward_batched,
+        #                 fullgraph=False,
+        #             )
+        #             logger.info("AudioCodecEngine: torch.compile applied to %s.forward_batched", node_name)
+        #     except Exception:
+        #         logger.warning("AudioCodecEngine: torch.compile failed for %s, using eager mode",
+        #                        node_name, exc_info=True)
 
     def add_request(self, request_id: str) -> None:
         pass  # stateless
