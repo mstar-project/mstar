@@ -637,11 +637,19 @@ def _build_sampling_lists(
 
     for i, rid in enumerate(request_ids):
         cfg = sampling_configs.get(rid, SamplingConfig())
+        # Propagate temperature unconditionally (including 0). The fused
+        # softmax kernel's INCLUDE_GREEDY path keys off ``temp == 0`` to emit a
+        # one-hot at the argmax; if we left temps[i] at the init value of 1.0
+        # for greedy requests the kernel would never see 0 and would fall
+        # through to full-distribution sampling with top_k=0 (unrestricted) —
+        # which is what was happening when callers passed temperature=0.
+        temps[i] = float(cfg.temperature)
         if cfg.temperature > 0:
-            temps[i] = float(cfg.temperature)
             top_ks[i] = int(cfg.top_k)
             top_ps[i] = float(cfg.top_p) if cfg.top_p else 1.0
-        # otherwise, use defaults already filled in
+        # When cfg.temperature == 0, top_k/top_p don't matter — the kernel
+        # produces a one-hot distribution and multinomial sampling from it
+        # returns the argmax regardless.
     return temps, top_ks, top_ps, \
         torch.randint(0, 2**32, (padded_bs,), dtype=torch.long, device=device)
 
