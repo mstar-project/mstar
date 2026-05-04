@@ -8,11 +8,12 @@ import math
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import nn
+import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
 from mminf.model.qwen3_omni.config import Code2WavConfig
+from mminf.utils.attention import apply_rope_pos_ids, rms_norm, sliding_window_attn
 
 logger = logging.getLogger(__name__)
 
@@ -214,21 +215,21 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         key_states = k.view(bsz, seq_len, -1, self.head_dim).transpose(1, 2)
         value_states = v.view(bsz, seq_len, -1, self.head_dim).transpose(1, 2)
 
-        # HF Code2Wav uses Identity for q_norm/k_norm — no QK normalization.
-        # RoPE in fp32 (HF reference path).
-        cos, sin = _build_rope_cos_sin(
-            position_ids, self.head_dim, self.rope_theta,
-            dtype=query_states.dtype, device=query_states.device,
+        q_flat = query_states.view(bsz * seq_len, -1, self.head_dim)
+        k_flat = key_states.view(bsz * seq_len, -1, self.head_dim)
+
+        flat_pos = position_ids.reshape(-1).to(torch.int32)
+        apply_rope_pos_ids(
+            q_flat, k_flat, flat_pos,
+            rope_theta=self.rope_theta,
         )
         query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # Causal attention. SWA is a no-op for our chunk sizes (input ≤ 50 frames,
-        # sliding_window=72), so we just rely on `is_causal=True`.
-        attn_output = F.scaled_dot_product_attention(
+        attn_output = sliding_window_attn(
             query_states,
             key_states,
             value_states,
-            is_causal=True,
+            window=self.sliding_window ,
             scale=self.scaling,
         )
 
@@ -264,11 +265,13 @@ class Qwen3OmniMoeCode2WavRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        orig_shape = hidden_states.shape
+        out = rms_norm(
+            hidden_states.reshape(-1, orig_shape[-1]),
+            self.weight,
+            eps=self.variance_epsilon,
+        )
+        return out.view(orig_shape)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -364,7 +367,13 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
                 **kwargs,
             )
 
-        return self.norm(hidden_states)
+        orig_shape = hidden_states.shape
+        hidden_states = rms_norm(
+            hidden_states.reshape(-1, orig_shape[-1]),
+            self.norm.weight,
+            eps=self.norm.variance_epsilon
+        ).reshape(orig_shape)
+        return hidden_states
 
 
 class SnakeBeta(nn.Module):
