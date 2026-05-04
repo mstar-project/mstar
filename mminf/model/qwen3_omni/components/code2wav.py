@@ -16,8 +16,7 @@ from transformers.activations import ACT2FN
 
 from mminf.model.qwen3_omni.components.attention import Qwen3OmniRMSNorm
 from mminf.model.qwen3_omni.config import Code2WavConfig
-from mminf.utils.attention import fused_qk_norm_rope
-from mminf.utils.flashinfer_utils import apply_rope, run_rms_norm
+from mminf.utils.flashinfer_utils import run_rms_norm
 
 logger = logging.getLogger(__name__)
 
@@ -156,8 +155,6 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         self.k_proj = None
         self.v_proj = None
 
-        dummy_qk_norm_weight = torch.ones(self.head_dim)
-        self.register_buffer("dummy_qk_norm_weight", dummy_qk_norm_weight, persistent=False)
         self.rope_theta = float(self.rope_theta)
 
     def forward(
@@ -176,30 +173,28 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
 
         # flashinfer rope is in-place and expects (nnz, n_heads, head_dim) + flat positions.
         # The flat views share storage with query_states/key_states, so the rotation lands
-        # back in the (bs, seq_len, ...) tensors we pass to attention.
-    
+        # back in the (bs, seq_len, ...) tensors we pass to attention. HF Code2Wav uses
+        # nn.Identity() for q_norm/k_norm — no QK normalization, only RoPE.
         q_flat = query_states.view(bsz * seq_len, -1, self.head_dim)
         k_flat = key_states.view(bsz * seq_len, -1, self.head_dim)
 
-        fused_qk_norm_rope(
-            x=q_flat, w_norm=self.dummy_qk_norm_weight,
-            pos=position_ids.reshape(-1),
-            eps=1e-6, rope_theta=self.rope_theta
-        )
-        fused_qk_norm_rope(
-            x=k_flat, w_norm=self.dummy_qk_norm_weight,
-            pos=position_ids.reshape(-1),
-            eps=1e-6, rope_theta=self.rope_theta
+        flat_pos = position_ids.reshape(-1).to(torch.int32)
+        flashinfer.rope.apply_rope_pos_ids_inplace(
+            q_flat, k_flat, flat_pos,
+            interleave=False,
+            rope_theta=self.rope_theta,
         )
 
-        # Causal sliding-window attention; no explicit mask needed.
+        # Causal sliding-window attention; no explicit mask needed. HF defines
+        # ``sliding_window`` as the total window size including the current token,
+        # whereas flash-attn's ``window_size=(W, 0)`` allows ``W+1`` positions.
         orig_dtype = query_states.dtype
         attn_output = flash_attn_func(
             query_states.to(torch.bfloat16),
             key_states.to(torch.bfloat16),
             value_states.to(torch.bfloat16),
             causal=True,
-            window_size=(self.sliding_window, 0),
+            window_size=(self.sliding_window - 1, 0),
             softmax_scale=self.scaling,
         ).to(orig_dtype)
 
