@@ -59,6 +59,10 @@ class AREngine(BaseEngine):
         self.device = None
         self.autocast_dtype = autocast_dtype
 
+        # Dedup set for "cuda graphs captured but not usable for this shape"
+        # warnings — each unique miss shape is logged at most once.
+        self._logged_graph_misses: set[tuple] = set()
+
     def engine_type(self) -> EngineType:
         return EngineType.AR
 
@@ -434,8 +438,6 @@ class AREngine(BaseEngine):
         submodule = submod_mgmt.submodule
         if submodule is None:
             return False
-        if not submodule.can_use_cuda_graphs(batch, inputs):
-            return False
         runner = submod_mgmt.cuda_graph_runner
         if runner is None:
             return False
@@ -444,12 +446,67 @@ class AREngine(BaseEngine):
             batch.per_request_info[rid].requires_cfg
             for rid in batch.request_ids
         )
+        bs = len(batch.request_ids)
+        #TODO: Remove in production
         num_tokens = sum(inp.input_seq_len for inp in inputs)
-        return runner.can_run(
-            batch_size=len(batch.request_ids),
+
+        if not submodule.can_use_cuda_graphs(batch, inputs):
+            self._log_graph_miss(
+                node_name=batch.node_name,
+                graph_walk=batch.graph_walk,
+                bs=bs, num_tokens=num_tokens, requires_cfg=has_cfg,
+                runner=runner,
+                reason="submodule.can_use_cuda_graphs() returned False",
+            )
+            return False
+
+        if not runner.can_run(
+            batch_size=bs,
             num_tokens=num_tokens,
             graph_walk=batch.graph_walk,
             requires_cfg=has_cfg,
+        ):
+            self._log_graph_miss(
+                node_name=batch.node_name,
+                graph_walk=batch.graph_walk,
+                bs=bs, num_tokens=num_tokens, requires_cfg=has_cfg,
+                runner=runner,
+                reason="no captured graph matches this (bs, num_tokens, graph_walk, requires_cfg)",
+            )
+            return False
+        return True
+
+    def _log_graph_miss(
+        self,
+        node_name: str,
+        graph_walk: str,
+        bs: int,
+        num_tokens: int,
+        requires_cfg: bool,
+        runner: CudaGraphRunner,
+        reason: str,
+    ) -> None:
+        """Warn (once per unique miss shape) when a runner exists but the
+        current request can't use a captured graph. Helps diagnose decode
+        slowness from unexpected eager fallbacks.
+        """
+        if not runner.graphs:
+            return  # nothing was ever captured — not actionable, skip noise
+        miss_key = (node_name, graph_walk, bs, num_tokens, requires_cfg, reason)
+        if miss_key in self._logged_graph_misses:
+            return
+        self._logged_graph_misses.add(miss_key)
+
+        captured_for_walk = sorted(
+            {(k.bs, k.num_tokens) for k in runner.graphs.keys()
+             if k.graph_walk == graph_walk and k.requires_cfg == requires_cfg}
+        )
+        captured_walks = sorted({k.graph_walk for k in runner.graphs.keys()})
+        logger.warning(
+            "[cuda-graph miss] node=%s graph_walk=%s requested=(bs=%d, num_tokens=%d, requires_cfg=%s) "
+            "reason='%s' captured_shapes_for_walk=%s captured_walks=%s — falling back to eager.",
+            node_name, graph_walk, bs, num_tokens, requires_cfg,
+            reason, captured_for_walk or "<none>", captured_walks,
         )
 
     def _execute_with_cuda_graph(

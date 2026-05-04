@@ -711,7 +711,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     # (``preprocess`` line in this file), and V2T runs at concurrency 1
     # today. Costs ~4 captures × persistent FlashInfer wrappers + static
     # buffers for the 30B Thinker; revisit if memory becomes a constraint.
-    PREFILL_VISION_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192]
+    PREFILL_VISION_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
     PREFILL_VISION_CAPTURE_BATCH_SIZES = [1]
 
     def _build_prefill_text_packed(
