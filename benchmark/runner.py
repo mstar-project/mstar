@@ -14,6 +14,7 @@ from benchmark.dataset import (
     BaseDataset,
     Food101Dataset,
     LibriSpeechDataset,
+    SeedTTSDataset,
     TxtFileDataset,
     UCF101Dataset,
     VBenchDataset,
@@ -39,6 +40,7 @@ class DatasetType(Enum):
     FOOD = "food101"
     UCF = "ucf101"
     VIDEO_MME = "video_mme"
+    SEED_TTS = "seed_tts"
 
 
 class InferenceSystemType(Enum):
@@ -91,6 +93,12 @@ class BenchmarkConfig:
     # auto-downloads from HuggingFace into local_cache_dir.
     video_mme_dir: Optional[str] = None
 
+    # Seed-TTS args
+    # Override with a local copy (same layout as BytedanceSpeech/seed-tts-eval);
+    # if None, the dataset auto-downloads from HuggingFace into local_cache_dir.
+    seed_tts_dir: Optional[str] = None
+    seed_tts_locale: str = "en"  # "en" or "zh"
+
     # text dataset args
     request_txt_file: str = "benchmark/assets/simple_text_queries.txt"
 
@@ -135,6 +143,14 @@ class Benchmark:
                 num_requests=self.config.num_requests,
                 req_type=self.config.request_type,
                 data_dir=self.config.video_mme_dir,
+                cache_dir=self.config.local_cache_dir,
+            )
+        elif self.config.dataset == DatasetType.SEED_TTS:
+            return SeedTTSDataset(
+                num_requests=self.config.num_requests,
+                req_type=self.config.request_type,
+                locale=self.config.seed_tts_locale,
+                data_dir=self.config.seed_tts_dir,
                 cache_dir=self.config.local_cache_dir,
             )
         raise ValueError(f"Unknown dataset: {self.config.dataset}")
@@ -395,6 +411,25 @@ def parse_args() -> BenchmarkConfig:
         ),
     )
 
+    # Seed-TTS args
+    seed_tts = parser.add_argument_group("seed_tts")
+    seed_tts.add_argument(
+        "--seed-tts-dir",
+        default=None,
+        help=(
+            "Path to a local Seed-TTS copy (same layout as "
+            "BytedanceSpeech/seed-tts-eval: <root>/{en,zh}/meta.lst). "
+            "If omitted, the dataset auto-downloads from HuggingFace into "
+            "--local-cache."
+        ),
+    )
+    seed_tts.add_argument(
+        "--seed-tts-locale",
+        default="en",
+        choices=["en", "zh"],
+        help="Which Seed-TTS locale subdir to read.",
+    )
+
     # Text dataset args
     text_dataset = parser.add_argument_group("text_dataset")
     text_dataset.add_argument(
@@ -406,6 +441,8 @@ def parse_args() -> BenchmarkConfig:
     args = parser.parse_args()
 
     dataset = args.dataset
+    if dataset is not None:
+        dataset = DatasetType(dataset)
     txtfile = args.request_txt_file
     request_type = RequestType(args.request_type)
     if dataset is None:
@@ -450,6 +487,8 @@ def parse_args() -> BenchmarkConfig:
         output_dir=args.output_dir,
         vbench_cache_dir=args.vbench_cache_dir,
         video_mme_dir=args.video_mme_dir,
+        seed_tts_dir=args.seed_tts_dir,
+        seed_tts_locale=args.seed_tts_locale,
         request_txt_file=txtfile,
         local_cache_dir=args.local_cache,
     )
