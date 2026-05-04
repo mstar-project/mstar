@@ -25,6 +25,7 @@ from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
 from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
+from mminf.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mminf.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
     compute_rope_freqs,
@@ -1793,7 +1794,7 @@ class Code2WavSubmodule(NodeSubmodule):
     vocoder, trims overlap context, and returns the PCM audio chunk.
     """
 
-    def __init__(self, code2wav_model: nn.Module, config: Qwen3OmniModelConfig):
+    def __init__(self, code2wav_model: Qwen3OmniMoeCode2Wav, config: Qwen3OmniModelConfig):
         super().__init__()
         self.code2wav = code2wav_model
         self.config = config
@@ -1814,7 +1815,28 @@ class Code2WavSubmodule(NodeSubmodule):
             total_upsample *= r
         for r in self.config.code2wav.upsampling_ratios:
             total_upsample *= r
-        self._total_upsample = total_upsample
+        self.total_upsample = total_upsample
+
+        self.full_seqlen = self.config.code2wav.codec_left_context_frames + \
+            self.config.code2wav.codec_chunk_frames
+    
+    def get_cuda_graph_configs(self, device):
+        num_quantizers = self.config.code2wav.num_quantizers
+        return [
+            BasicBatchedCudaGraphConfig(
+                capture_graph_walk="code2wav_chunk",
+                single_request_inputs=ARNodeInputs(
+                    tensor_inputs={
+                        "codec_tokens": torch.zeros((
+                            num_quantizers, self.full_seqlen,
+                        ), dtype=torch.long, device=device),
+                        "position_ids": torch.arange(self.full_seqlen, device=device)
+                    },
+                ),
+                capture_batch_sizes=[1, 2, 4, 8, 16],
+                compile=False
+            ),
+        ]
 
     def prepare_inputs(
         self,
@@ -1825,9 +1847,6 @@ class Code2WavSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         num_quantizers = self.config.code2wav.num_quantizers  # 16
         codec_eos = self.config.talker.codec_eos_token_id
-
-        per_request_codec: list[torch.Tensor] = []
-
         codec_tokens = inputs["codec_tokens"][0]
 
         # Reshape to (num_frames, num_code_groups) if flat
@@ -1851,7 +1870,8 @@ class Code2WavSubmodule(NodeSubmodule):
         # Transpose to (Q, T)
         codec_tokens = codec_tokens.T  # (Q, T)
         return NodeInputs(tensor_inputs={
-            "codec_tokens": codec_tokens
+            "codec_tokens": codec_tokens,
+            "position_ids": torch.arange(codec_tokens.shape[1], device=codec_tokens.device)
         })
 
     def preprocess(
@@ -1870,13 +1890,17 @@ class Code2WavSubmodule(NodeSubmodule):
         )
         # Stack into (bs, Q, T)
         batched_codec_tokens = torch.stack(all_codec_tokens, dim=0)
-        return {"codec_tokens": batched_codec_tokens}
+        position_ids = torch.stack([
+            inp.tensor_inputs["position_ids"] for inp in inputs
+        ], dim=0)
+        return {"codec_tokens": batched_codec_tokens, "position_ids": position_ids}
 
     def forward_batched(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         codec_tokens: torch.Tensor,
+        position_ids: torch.Tensor,
         **kwargs
     ) -> dict[str, NameToTensorList]:
         """Run the streaming vocoder with per-request left-context trim.
@@ -1902,21 +1926,15 @@ class Code2WavSubmodule(NodeSubmodule):
         if codec_tokens is None or codec_tokens.numel() == 0:
             return {rid: {} for rid in request_ids}
 
-        cfg_ctx = self.config.code2wav.codec_left_context_frames
-        left_context_size = [
-            0 if rid not in self._first_chunk_emitted else cfg_ctx
-            for rid in request_ids
-        ]
-
-        wavs = self.code2wav.chunked_decode_streaming(
-            codec_tokens, left_context_size=left_context_size
+        wavs = self.code2wav(
+            codec_tokens, position_ids
         )
 
         results: dict[str, NameToTensorList] = {}
-        for rid, wav in zip(request_ids, wavs, strict=True):
+        for i, rid in enumerate(request_ids):
+            wav = wavs[i]
             audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16).squeeze()
             results[rid] = {"audio_chunk": [audio_int16]}
-            self._first_chunk_emitted.add(rid)
         return results
 
     def forward(
@@ -1924,6 +1942,7 @@ class Code2WavSubmodule(NodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         codec_tokens: torch.Tensor,
+        position_ids: torch.Tensor,
         **kwargs
     ) -> NameToTensorList:
         """Raw vocoder forward -- returns int16 PCM without any trim.
@@ -1935,7 +1954,7 @@ class Code2WavSubmodule(NodeSubmodule):
         if codec_tokens is None or codec_tokens.numel() == 0:
             return {}
 
-        wav = self.code2wav(codec_tokens)
+        wav = self.code2wav(codec_tokens, position_ids)
         audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": [audio_int16]}
 
@@ -1944,3 +1963,24 @@ class Code2WavSubmodule(NodeSubmodule):
             inputs.tensor_inputs["codec_tokens"].numel() \
                 for inputs in model_inputs
         }) == 1
+    
+    def can_use_cuda_graphs(self, batch, model_inputs: list[NodeInputs]):
+        return super().can_use_cuda_graphs(batch, model_inputs) \
+            and self.can_batch(batch, model_inputs) \
+                and model_inputs[0].tensor_inputs["codec_tokens"].shape[1] == self.full_seqlen
+            
+    
+    def postprocess(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        **kwargs
+    ):
+        if "audio_chunk" not in outputs:
+            return
+        cfg_ctx = self.config.code2wav.codec_left_context_frames
+        left_context_size = 0 if request_id not in self._first_chunk_emitted else cfg_ctx
+        trim = left_context_size * self.total_upsample
+        self._first_chunk_emitted.add(request_id)
+        outputs["audio_chunk"][0] = outputs["audio_chunk"][0][trim:]
+
