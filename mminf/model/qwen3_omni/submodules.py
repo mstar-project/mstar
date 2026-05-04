@@ -712,7 +712,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     # (``preprocess`` line in this file), and V2T runs at concurrency 1
     # today. Costs ~4 captures × persistent FlashInfer wrappers + static
     # buffers for the 30B Thinker; revisit if memory becomes a constraint.
-    PREFILL_VISION_TOKEN_BUCKETS = [1024, 2048, 4096, 8192]
+    PREFILL_VISION_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192]
     PREFILL_VISION_CAPTURE_BATCH_SIZES = [1]
 
     def _build_prefill_text_packed(
@@ -1688,7 +1688,7 @@ class TalkerSubmodule(ARNodeSubmodule):
 
     # Fixed assistant prefix per request: pad*4 + bos + projected_thinker = 6.
     TALKER_LAST_PREFILL_TOKENS_PER_REQ = 6
-    TALKER_LAST_PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    TALKER_LAST_PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
     def _build_talker_prefill_packed(
         self, num_tokens: int, device: torch.device,
