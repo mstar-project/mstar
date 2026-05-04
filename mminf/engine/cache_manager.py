@@ -18,12 +18,13 @@ class _PlanState:
     FlashInferDecodeWrapper created once during capture. plan_attention()
     calls wrapper.plan() which updates static buffers via .copy_().
 
-    ``mrope_pos_advance`` is an out-of-band channel for prefill walks whose
-    MRoPE position-id span differs from the seq_len being prefilled (today:
-    only ``prefill_vision``, where the 3D-grid position span is larger than
-    the number of tokens). The submodule's preprocess writes a per-request
-    list here; ``advance_seq_lens`` reads it when ``pos_id_ns`` is None and
-    advances ``position_id_start`` by these values instead of by ``seq_len``.
+    ``custom_pos_advance`` is a generic out-of-band channel for prefill
+    walks whose position-id span differs from the seq_len being prefilled
+    (e.g. Qwen3-Omni's ``prefill_vision``, where the 3D-grid MRoPE span is
+    larger than the number of tokens). The submodule writes a per-request
+    list here via ``BatchedCacheManager.set_custom_pos_advance``;
+    ``advance_seq_lens`` reads it when ``pos_id_ns`` is None and advances
+    ``position_id_start`` by these values instead of by ``seq_len``.
     Auto-cleared by ``advance_seq_lens`` so it doesn't leak across calls.
     The CUDA-graph runner's post-replay ``advance_seq_lens()`` call is what
     actually consumes this — the model's inner ``advance_seq_lens(pos_id_ns=...)``
@@ -33,7 +34,7 @@ class _PlanState:
     pos_ids: torch.Tensor | None = None
     seq_lens: list[int] | None = None
     write_store: bool = True
-    mrope_pos_advance: list[int] | None = None
+    custom_pos_advance: list[int] | None = None
 
 
 class WorkspaceBufferManager:
@@ -774,14 +775,48 @@ class BatchedCacheManager:
             state.position_id_start += (pos_id_n if pos_id_n is not None else n)
 
     @torch.compiler.disable
+    def set_custom_pos_advance(
+        self, pos_advance: list[int] | None, label: str | None = None,
+    ) -> None:
+        """Stash a per-request position-id advance for the next
+        ``advance_seq_lens()`` call to consume.
+
+        Resolves ``label`` the same way ``plan_attention`` does: explicit
+        label wins; otherwise the (single) currently-active label is used.
+
+        Used by submodules whose forward advances ``position_id_start`` by
+        something other than ``seq_len`` (e.g. Qwen3-Omni's prefill_vision
+        passes the MRoPE 3D-grid span here). Auto-cleared by
+        ``advance_seq_lens`` after use, so it does not leak across calls.
+
+        Pass ``pos_advance=None`` to clear an earlier set explicitly.
+        """
+        effective_label = label
+        if effective_label is None:
+            labels = list(self.active_labels.values())
+            if not labels:
+                return
+            assert len(set(labels)) == 1, (
+                f"All active labels must be the same to omit ``label``, got {labels}"
+            )
+            effective_label = labels[0]
+        ps = self._plan_states.get(effective_label)
+        if ps is None:
+            return
+        ps.custom_pos_advance = (
+            list(pos_advance) if pos_advance is not None else None
+        )
+
+    @torch.compiler.disable
     def advance_seq_lens(self, pos_id_ns: list[int] | int | None = None) -> None:
         """Advance seq_len for each request by different amounts.
 
         When ``pos_id_ns`` is None, falls back to a per-label side-channel
-        (``_PlanState.mrope_pos_advance``) populated by submodule.preprocess
-        for walks whose MRoPE position span differs from seq_len (today:
-        prefill_vision). The side-channel is auto-cleared after use so it
-        doesn't leak across calls.
+        (``_PlanState.custom_pos_advance``, set via
+        ``set_custom_pos_advance``) for walks whose position-id span
+        differs from seq_len (e.g. Qwen3-Omni prefill_vision). The
+        side-channel is auto-cleared after use so it doesn't leak across
+        calls.
         """
         for i, rid in enumerate(self.request_ids):
             ps = self._plan_states[self.active_labels[rid]]
@@ -789,18 +824,18 @@ class BatchedCacheManager:
             state = self._get_state(rid)
             state.seq_len += n
             if pos_id_ns is None:
-                if ps.mrope_pos_advance is not None:
-                    state.position_id_start += ps.mrope_pos_advance[i]
+                if ps.custom_pos_advance is not None:
+                    state.position_id_start += ps.custom_pos_advance[i]
                 else:
                     state.position_id_start += n
             elif isinstance(pos_id_ns, int):
                 state.position_id_start += pos_id_ns
             else:
                 state.position_id_start += pos_id_ns[i]
-        # Clear the side-channel on every consumer so a stale value from a
-        # prior prefill_vision step can't bleed into a subsequent walk.
+        # Clear the side-channel on every consumer so a stale value can't
+        # bleed into a subsequent walk.
         for ps in self._plan_states.values():
-            ps.mrope_pos_advance = None
+            ps.custom_pos_advance = None
 
     @torch.compiler.disable
     def snapshot_all(
