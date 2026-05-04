@@ -738,6 +738,7 @@ class CudaGraphRunner:
         inputs: list[ARNodeInputs],
         per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: ARNodeSubmodule,
+        is_terminal_per_request: dict[str, bool] | None = None,
     ) -> dict:
         """Look up the matching captured graph and dispatch on config type.
 
@@ -770,10 +771,12 @@ class CudaGraphRunner:
         if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
             return self._run_basic_batched(
                 key, graph_data, request_ids, inputs, per_request_info, submodule,
+                is_terminal_per_request=is_terminal_per_request,
             )
         if cfg_type == CudaGraphConfigType.FLASH_INFER_PACKED:
             return self._run_flashinfer_packed(
                 key, graph_data, request_ids, inputs, per_request_info, submodule,
+                is_terminal_per_request=is_terminal_per_request,
             )
         raise ValueError(f"Unknown CudaGraphConfigType: {cfg_type}")
 
@@ -785,6 +788,7 @@ class CudaGraphRunner:
         inputs: list[ARNodeInputs],
         per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: ARNodeSubmodule,
+        is_terminal_per_request: dict[str, bool] | None = None,
     ) -> dict:
         """Decode-style replay. Pads real inputs to padded_bs by cloning the capture
         template, then routes through submodule.preprocess (which re-plans attention
@@ -914,6 +918,7 @@ class CudaGraphRunner:
             graph_data=graph_data,
             submodule=submodule,
             inputs=inputs,
+            is_terminal_per_request=is_terminal_per_request,
         )
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -940,6 +945,7 @@ class CudaGraphRunner:
         inputs: list[ARNodeInputs],
         per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: ARNodeSubmodule,
+        is_terminal_per_request: dict[str, bool] | None = None,
     ) -> dict:
         """Prefill-style replay (vox-serve pattern).
 
@@ -1075,6 +1081,7 @@ class CudaGraphRunner:
             graph_data=graph_data,
             submodule=submodule,
             inputs=inputs,
+            is_terminal_per_request=is_terminal_per_request,
         )
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -1197,6 +1204,7 @@ class CudaGraphRunner:
         graph_data: CudaGraphData,
         submodule: ARNodeSubmodule,
         inputs: list[ARNodeInputs] | None = None,
+        is_terminal_per_request: dict[str, bool] | None = None,
     ) -> dict:
         """Sample logits + copy non-logit per-rid outputs, remapping dummy → real rids.
 
@@ -1225,8 +1233,11 @@ class CudaGraphRunner:
             # Python reference — no .clone() needed.
             sampled = self.sampler.sample(request_ids, stacked_logits)
             sampled_views = sampled.split(1)
+            # skip new_token assignment for non-terminal prefill chunks.
+            # Default empty/None is_terminal_per_request → all terminal
+            terminal = is_terminal_per_request or {}
             outputs = {
-                rid: {"new_token": [view]}
+                rid: ({"new_token": [view]} if terminal.get(rid, True) else {})
                 for rid, view in zip(request_ids, sampled_views, strict=True)
             }
 
@@ -1278,8 +1289,11 @@ class CudaGraphRunner:
         if all_logits:
             stacked_logits = torch.cat(all_logits, dim=0)
             sampled = self.sampler.sample(request_ids, stacked_logits)
+            terminal = is_terminal_per_request or {}
             for i, rid in enumerate(request_ids):
-                outputs[rid] = {"new_token": [sampled[i:i+1]]}
+                outputs[rid] = (
+                    {"new_token": [sampled[i:i+1]]} if terminal.get(rid, True) else {}
+                )
         else:
             for rid in request_ids:
                 outputs[rid] = {}

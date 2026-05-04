@@ -1,5 +1,6 @@
 import logging
 from dataclasses import asdict, dataclass, field
+from typing import Callable
 
 import torch
 
@@ -34,6 +35,173 @@ class SubmoduleManagement:
     cuda_graph_runner: CudaGraphRunner | None = None
 
 
+# ----------------------------------------------------------------------
+# Chunked-prefill orchestrator.
+#
+# Splits a single-request prefill batch into back-to-back forward passes
+# of ``chunk_size`` tokens. The paged KV cache carries state across chunks
+# via ``plan_attention(seq_lens=...)`` — no cache-side changes needed.
+# Pure orchestration: stateless, depends only on ARNodeInputs and a
+# caller-supplied ``inner_pass`` callable.
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ChunkSlice:
+    """One chunk of a single-request prefill, in token-axis coordinates."""
+    index: int
+    start: int
+    end: int
+    is_last: bool
+
+
+def _plan_chunks(seq_len: int, chunk_size: int) -> list[ChunkSlice]:
+    """Cover [0, seq_len) at ``chunk_size`` granularity. Last chunk may be shorter."""
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    plans: list[ChunkSlice] = []
+    n_chunks = (seq_len + chunk_size - 1) // chunk_size
+    for i in range(n_chunks):
+        start = i * chunk_size
+        end = min(start + chunk_size, seq_len)
+        plans.append(
+            ChunkSlice(index=i, start=start, end=end, is_last=(i == n_chunks - 1))
+        )
+    return plans
+
+
+def _slice_ar_inputs(inp: ARNodeInputs, start: int, end: int) -> ARNodeInputs:
+    """Return a new ARNodeInputs covering token range [start, end).
+
+    Slices token-axis tensors (input_ids, input_embeds, custom_pos_ids).
+    tensor_inputs and kwargs are passed through by reference — they hold
+    non-token-axis state (e.g. flags) that the chunked path must not mutate.
+
+    Per-tensor token-axis convention:
+      - ``input_ids``: shape ``(batch, seq)`` — slice dim 1.
+      - ``input_embeds``: shape varies by model (``[seq_len, hidden]`` for
+        qwen3_omni, ``[bs, seq_len, hidden]`` for others) — locate the seq
+        axis by matching ``inp.input_seq_len``; assert it is found.
+      - ``custom_pos_ids``: ``inp.input_seq_len`` lives on whichever axis
+        matches its size.  qwen3_omni packs MRoPE as ``[3, seq_len]`` so
+        the token axis is the LAST one; plain text models use 1D.
+    """
+    chunk_len = end - start
+    seq_len = inp.input_seq_len
+
+    if inp.input_ids is not None:
+        input_ids = inp.input_ids[:, start:end]
+    else:
+        input_ids = None
+
+    if inp.input_embeds is not None:
+        seq_axis = next(
+            (d for d in range(inp.input_embeds.dim()) if inp.input_embeds.shape[d] == seq_len),
+            None,
+        )
+        assert seq_axis is not None, (
+            f"input_embeds shape {tuple(inp.input_embeds.shape)} has no axis "
+            f"matching input_seq_len={seq_len}"
+        )
+        input_embeds = inp.input_embeds.narrow(seq_axis, start, chunk_len)
+    else:
+        input_embeds = None
+
+    def _slice_token(t: torch.Tensor) -> torch.Tensor:
+        token_axis = next(
+            (dim for dim in range(t.dim()) if t.shape[dim] == seq_len),
+            None,
+        )
+        assert token_axis is not None, (
+            f"tensor shape {tuple(t.shape)} has no axis matching input_seq_len={seq_len}"
+        )
+        return t.narrow(token_axis, start, chunk_len)
+
+    custom_pos_ids = inp.custom_pos_ids
+    if isinstance(custom_pos_ids, torch.Tensor):
+        custom_pos_ids = _slice_token(custom_pos_ids)
+    elif isinstance(custom_pos_ids, dict):
+        custom_pos_ids = {k: _slice_token(v) for k, v in custom_pos_ids.items()}
+
+    return ARNodeInputs(
+        input_seq_len=chunk_len,
+        input_ids=input_ids,
+        input_embeds=input_embeds,
+        custom_pos_ids=custom_pos_ids,
+        # Aliased (not cloned): downstream must not mutate.
+        tensor_inputs=inp.tensor_inputs,
+        kwargs=inp.kwargs,
+    )
+
+
+def execute_chunked_prefill(
+    batch: NodeBatch,
+    node_inputs: list[ARNodeInputs],
+    chunk_size: int,
+    inner_pass: Callable[[NodeBatch, list[ARNodeInputs]], NodeOutput],
+    *,
+    enable_nvtx: bool = False,
+) -> NodeOutput:
+    """Drive a single-request prefill as N forward passes of ``chunk_size`` tokens.
+
+    ``inner_pass`` is the engine's existing one-pass dispatch (batched /
+    sequential / CUDA-graph). It is called once per chunk with a sliced
+    ARNodeInputs whose ``input_seq_len`` equals the chunk's token count.
+    The KV-cache manager (read inside ``inner_pass``) carries state across
+    calls via its existing ``plan_attention(seq_lens=...)`` semantics.
+
+    Only the final chunk's NodeOutput is returned; intermediate outputs
+    are discarded. This matches the semantics of an unchunked prefill,
+    where the model produces sampled tokens / final-position logits only
+    once per request.
+    """
+    if len(batch.request_ids) != 1:
+        raise ValueError(
+            f"execute_chunked_prefill requires a single-request batch, "
+            f"got {len(batch.request_ids)}"
+        )
+    if len(node_inputs) != 1:
+        raise ValueError(
+            f"execute_chunked_prefill requires len(node_inputs) == 1, "
+            f"got {len(node_inputs)}"
+        )
+
+    inp = node_inputs[0]
+    plans = _plan_chunks(seq_len=inp.input_seq_len, chunk_size=chunk_size)
+
+    if enable_nvtx:
+        range_push(
+            f"chunked_prefill rid={batch.request_ids[0]} "
+            f"walk={batch.graph_walk} total={inp.input_seq_len} "
+            f"chunks={len(plans)}",
+            synchronize=False,
+        )
+    try:
+        last_output: NodeOutput | None = None
+        for plan in plans:
+            if enable_nvtx:
+                range_push(
+                    f"chunk {plan.index}/{len(plans) - 1} "
+                    f"[{plan.start}:{plan.end}] last={plan.is_last}",
+                    synchronize=False,
+                )
+            try:
+                chunk_inputs = [_slice_ar_inputs(inp, plan.start, plan.end)]
+                last_output = inner_pass(batch, chunk_inputs)
+            finally:
+                if enable_nvtx:
+                    range_pop(synchronize=False)
+    finally:
+        if enable_nvtx:
+            range_pop(synchronize=False)
+
+    assert last_output is not None
+    return last_output
+
+
 class AREngine(BaseEngine):
     """
     Autoregressive engine with paged KV cache.
@@ -49,6 +217,8 @@ class AREngine(BaseEngine):
         self,
         autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
+        max_prefill_chunk_size: int | None = None,
+        scheduler_owns_chunking: bool = False,
     ):
         super().__init__(enable_nvtx=enable_nvtx)
 
@@ -57,6 +227,8 @@ class AREngine(BaseEngine):
 
         self.device = None
         self.autocast_dtype = autocast_dtype
+        self.max_prefill_chunk_size = max_prefill_chunk_size
+        self.scheduler_owns_chunking = scheduler_owns_chunking
 
     def engine_type(self) -> EngineType:
         return EngineType.AR
@@ -179,7 +351,9 @@ class AREngine(BaseEngine):
     def warmup(self) -> None:
         """Compile submodules and capture CUDA graphs."""
         from mminf.engine.cuda_graph_runner import (
-            CudaGraphRunner, PiecewiseCudaGraphRunner, DEFAULT_AR_CAPTURE_BATCH_SIZES,
+            DEFAULT_AR_CAPTURE_BATCH_SIZES,
+            CudaGraphRunner,
+            PiecewiseCudaGraphRunner,
         )
 
         for node_name, submodule_mgmt in self.submodule_management.items():
@@ -273,7 +447,8 @@ class AREngine(BaseEngine):
         engine_inputs = ModelInputsFromEngine(
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
-            cache_manager=cache_manager
+            cache_manager=cache_manager,
+            is_terminal_per_request=batch.is_terminal_per_request,
         )
         if self.enable_nvtx:
             range_push("ar.batched.preprocess", synchronize=False)
@@ -310,8 +485,13 @@ class AREngine(BaseEngine):
             sampled = sampler.sample(batch.request_ids, batched_logits)
             for rid, view in zip(batch.request_ids, sampled.split(1), strict=True):
                 rid_out = batched_output[rid]
-                rid_out["new_token"] = [view]
-                del rid_out["logits"]
+                # skip new_token for non-terminal prefill chunks. Default
+                # empty is_terminal_per_request → all terminal (single-walk
+                # batches preserve their existing behavior).
+                if batch.is_terminal_per_request.get(rid, True):
+                    rid_out["new_token"] = [view]
+                    if "logits" in rid_out:
+                        del rid_out["logits"]
             output = NodeOutput(per_request_output_tensors=batched_output)
         else:
             output = NodeOutput(per_request_output_tensors=batched_output)
@@ -348,7 +528,10 @@ class AREngine(BaseEngine):
                 per_request_info={
                     rid: batch.per_request_info[rid]
                 },
-                cache_manager=cache_manager
+                cache_manager=cache_manager,
+                is_terminal_per_request={
+                    rid: batch.is_terminal_per_request.get(rid, True)
+                } if batch.is_terminal_per_request else {},
             )
 
             if self.enable_nvtx:
@@ -414,6 +597,63 @@ class AREngine(BaseEngine):
             requires_cfg=has_cfg,
         )
 
+    def _should_chunk_prefill(
+        self,
+        batch: NodeBatch,
+        inputs: list[ARNodeInputs],
+        submodule: ARNodeSubmodule,
+    ) -> bool:
+        """Decide whether to route this batch through the chunked-prefill path."""
+        if self.scheduler_owns_chunking:
+            # scheduler is orchestrating chunks. Engine doesn't
+            # intervene — it just runs whatever (mixed) batch arrives.
+            return False
+        if self.max_prefill_chunk_size is None:
+            return False
+        if batch.graph_walk not in submodule.get_chunked_prefill_walks():
+            return False
+        if len(batch.request_ids) != 1:
+            return False
+        if inputs[0].input_seq_len <= self.max_prefill_chunk_size:
+            return False
+        return True
+
+    def _dispatch_one_pass(
+        self,
+        batch: NodeBatch,
+        submodule: ARNodeSubmodule,
+        node_inputs: list[ARNodeInputs],
+        allow_cuda_graph: bool = True,
+    ) -> NodeOutput:
+        """Run one forward pass via the existing CUDA-graph / batched / sequential priority.
+
+        Extracted so the chunked-prefill orchestrator can call it once per
+        chunk. ``allow_cuda_graph=False`` is used for chunked-path callers.
+        """
+        if allow_cuda_graph and self._can_use_cuda_graph(batch, node_inputs):
+            if self.enable_nvtx:
+                range_push("ar.cuda_graph_path", synchronize=False)
+            try:
+                return self._execute_with_cuda_graph(batch, submodule, node_inputs)
+            finally:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
+        if submodule.can_batch(batch, node_inputs):
+            if self.enable_nvtx:
+                range_push("ar.batched_path", synchronize=False)
+            try:
+                return self._execute_batched(batch, submodule, node_inputs)
+            finally:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
+        if self.enable_nvtx:
+            range_push("ar.sequential_path", synchronize=False)
+        try:
+            return self._execute_sequential(batch, submodule, node_inputs)
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+
     def _execute_with_cuda_graph(
         self, batch: NodeBatch, submodule: ARNodeSubmodule,
         inputs: list[ARNodeInputs]
@@ -441,6 +681,7 @@ class AREngine(BaseEngine):
             inputs=inputs,
             per_request_info=batch.per_request_info,
             submodule=submodule,
+            is_terminal_per_request=batch.is_terminal_per_request,
         )
 
         return NodeOutput(per_request_output_tensors=batched_output)
@@ -500,37 +741,26 @@ class AREngine(BaseEngine):
                                 )
                             )
 
-                        # Priority: CUDA graph > batched > sequential
-                        if self._can_use_cuda_graph(batch, node_inputs):
+                        if self._should_chunk_prefill(batch, node_inputs, submodule):
                             if self.enable_nvtx:
-                                range_push("ar.cuda_graph_path", synchronize=False)
+                                range_push("ar.chunked_prefill_path", synchronize=False)
                             try:
-                                output = self._execute_with_cuda_graph(
-                                    batch, submodule, node_inputs
-                                )
-                            finally:
-                                if self.enable_nvtx:
-                                    range_pop(synchronize=False)
-                        elif submodule.can_batch(batch, node_inputs):
-                            if self.enable_nvtx:
-                                range_push("ar.batched_path", synchronize=False)
-                            try:
-                                output = self._execute_batched(
-                                    batch, submodule, node_inputs
+                                output = execute_chunked_prefill(
+                                    batch=batch,
+                                    node_inputs=node_inputs,
+                                    chunk_size=self.max_prefill_chunk_size,
+                                    inner_pass=lambda b, ins: self._dispatch_one_pass(
+                                        b, submodule, ins, allow_cuda_graph=False
+                                    ),
+                                    enable_nvtx=self.enable_nvtx,
                                 )
                             finally:
                                 if self.enable_nvtx:
                                     range_pop(synchronize=False)
                         else:
-                            if self.enable_nvtx:
-                                range_push("ar.sequential_path", synchronize=False)
-                            try:
-                                output = self._execute_sequential(
-                                    batch, submodule, node_inputs
-                                )
-                            finally:
-                                if self.enable_nvtx:
-                                    range_pop(synchronize=False)
+                            output = self._dispatch_one_pass(
+                                batch, submodule, node_inputs, allow_cuda_graph=True
+                            )
                         for rid, info in batch.per_request_info.items():
                             submodule.postprocess(
                                 request_id=rid,

@@ -229,6 +229,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
     # Default MRoPE section for head_dim=128: [24, 20, 20]
     MROPE_SECTION = [24, 20, 20]
 
+    def get_chunked_prefill_walks(self) -> list[str]:
+        return ["prefill_text"]
+
     def __init__(
         self,
         thinker_model: nn.Module,
@@ -341,6 +344,167 @@ class ThinkerSubmodule(ARNodeSubmodule):
             self._vision_eos_embed
         ], dim=0)
 
+    def _prepare_decode_input(
+        self, inputs: NameToTensorList, start_pos: float, device: torch.device,
+    ) -> ARNodeInputs:
+        # Get previous token ID from text_inputs
+        token_id = inputs["text_inputs"][0].to(device)  # (1,) or scalar
+        if token_id.dim() == 0:
+            token_id = token_id.unsqueeze(0)
+        embeds = self.model.model.embed_tokens(token_id)
+
+        # Next MRoPE position for all 3 components: read from the
+        # per-request cache-manager state (kept in sync by the
+        # post-forward ``advance_seq_lens`` call in ``thinker.py``).
+        pos_ids = torch.tensor(
+            [[start_pos], [start_pos], [start_pos]],
+            dtype=torch.float,
+            device=device,
+        )  # (3, 1)
+
+        return ARNodeInputs(
+            input_seq_len=1,
+            input_embeds=embeds,
+            custom_pos_ids=pos_ids,
+            tensor_inputs={
+                "masks_for_talker": self._get_decode_thinker_mask(device)
+            }  # no additional tensors for decode step
+        )
+
+    def _prepare_text_input(
+        self, inputs: NameToTensorList, start_pos: float, device: torch.device,
+    ) -> ARNodeInputs:
+        # Embed a text-only token span (prefill chunk or single decode token)
+        # and compute 3D MRoPE position IDs starting at start_pos.
+        text_ids = inputs["text_inputs"][0].to(device)  # (seq_len,)
+        embeds = self.model.model.embed_tokens(text_ids)
+        seq_len = text_ids.shape[0]
+
+        # Compute 3D MRoPE position IDs for a pure-text span.  Each
+        # prefill graph walk is single-modality so we use the simple
+        # per-modality helper instead of the full HF parser.
+        #
+        # ``start_pos`` is the next MRoPE position for this request,
+        # carried forward across walks by ``state.position_id_start``
+        # (advanced post-forward by ``advance_seq_lens``).
+        pos_ids = get_rope_index_text(seq_len, start_pos, device)
+        masks_for_talker = torch.stack([
+            torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
+            self._get_talker_text_mask(text_ids) # text inclusion
+        ])
+        return ARNodeInputs(
+            input_seq_len=seq_len,
+            input_embeds=embeds,
+            custom_pos_ids=pos_ids,
+            tensor_inputs={
+                "masks_for_talker": masks_for_talker
+            }
+        )
+
+    def _prepare_audio_input(
+        self, inputs: NameToTensorList, start_pos: float, device: torch.device,
+    ) -> ARNodeInputs:
+        audio_embeds = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
+        audio_len = audio_embeds.shape[0]
+
+        mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
+        mm_mask[[0, -1]] = 0
+        masks_for_talker = torch.stack([
+            mm_mask,
+            ~mm_mask
+        ])
+
+        wrapped_embeds = self._wrap_audio_input(audio_embeds)
+        seq_len = audio_len + 2
+        # Position IDs:
+        #   - audio_start_token: text-like position at start_pos
+        #   - audio tokens:      temporal increments per frame,
+        #                        h/w = start_pos (handled by helper)
+        #   - audio_end_token:   text-like position right after
+        start_pos_ids = get_rope_index_text(1, start_pos, device)
+        audio_pos_ids = get_rope_index_audio(
+            audio_len,
+            start_pos + 1,
+            device,
+            self.config.thinker.position_id_per_seconds,
+        )
+        end_pos_ids = get_rope_index_text(
+            1, start_pos + 1 + audio_len, device
+        )
+        pos_ids = torch.cat(
+            [start_pos_ids, audio_pos_ids, end_pos_ids], dim=1
+        )
+        return ARNodeInputs(
+            input_seq_len=seq_len,
+            input_embeds=wrapped_embeds,
+            custom_pos_ids=pos_ids,
+            tensor_inputs={
+                "masks_for_talker": masks_for_talker
+            }
+        )
+
+    def _prepare_vision_input(
+        self, inputs: NameToTensorList, start_pos: float, device: torch.device,
+    ) -> ARNodeInputs:
+        vision_embeds = inputs["vision_embeds"][0].to(device)
+        vision_len = vision_embeds.shape[0]
+
+        mm_mask = torch.ones(vision_len + 2, dtype=torch.bool, device=device)
+        mm_mask[[0, -1]] = 0
+        masks_for_talker = torch.stack([
+            mm_mask,
+            ~mm_mask
+        ])
+
+        wrapped_embeds = self._wrap_vision_input(vision_embeds)
+        total_len = vision_len + 2
+        # Vision tokens use spatial 3D positions (temporal constant,
+        # h/w from the spatial grid after merging).  If a proper
+        # ``image_grid_thw`` is available, use ``get_rope_index_vision``;
+        # otherwise fall back to a 1-D sequence (test path without
+        # AutoImageProcessor).
+        grid_thw = inputs.get("image_grid_thw", [None])[0]
+        seconds_per_grid = inputs.get("video_second_per_grid", [])
+        seconds_per_grid = seconds_per_grid[0].item() if seconds_per_grid else None
+        vision_pos_ids = get_rope_index_vision(
+            grid_thw.to(device),
+            start_pos + 1,  # leave room for the BOS token
+            position_id_per_seconds=self.config.thinker.position_id_per_seconds,
+            device=device,
+            spatial_merge_size=self.config.vision.spatial_merge_size,
+            seconds_per_grid=seconds_per_grid
+        )
+
+        # Sentinel token positions (text-like).
+        start_pos_ids = get_rope_index_text(1, start_pos, device)
+        end_pos_base = float(vision_pos_ids.max().item()) + 1
+        end_pos_ids = get_rope_index_text(1, end_pos_base, device)
+
+        pos_ids = torch.cat(
+            [start_pos_ids, vision_pos_ids, end_pos_ids], dim=1
+        )
+
+        # Next MRoPE position after this vision block is ``end_pos_base
+        # + 1`` (one past the EOS token).  ``advance_seq_lens`` by
+        # default advances ``position_id_start`` by ``seq_len``, which
+        # for vision (= vision_len + 2) is typically smaller than the
+        # 3D-grid span.  Emit the correct per-request advance so the
+        # Thinker forward can pass ``pos_id_ns`` through.
+        mrope_pos_advance = int(end_pos_base + 1 - start_pos)
+        deepstack = inputs["deepstack"]
+
+        return ARNodeInputs(
+            input_seq_len=total_len,
+            input_embeds=wrapped_embeds,
+            custom_pos_ids=pos_ids,
+            tensor_inputs={
+                "masks_for_talker": masks_for_talker,
+                "mrope_pos_advance": mrope_pos_advance,
+                "deepstack": deepstack,
+                "visual_pos_masks": mm_mask
+            }
+        )
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -351,155 +515,33 @@ class ThinkerSubmodule(ARNodeSubmodule):
         device = self.get_device()
         start_pos = pos_info.get("main", PositionInfo()).position_id_start
         if graph_walk == "thinker_decode":
-            # Get previous token ID from text_inputs
-            token_id = inputs["text_inputs"][0].to(device)  # (1,) or scalar
-            if token_id.dim() == 0:
-                token_id = token_id.unsqueeze(0)
-            embeds = self.model.model.embed_tokens(token_id)
+            return self._prepare_decode_input(inputs, start_pos, device)
 
-            # Next MRoPE position for all 3 components: read from the
-            # per-request cache-manager state (kept in sync by the
-            # post-forward ``advance_seq_lens`` call in ``thinker.py``).
-            pos_ids = torch.tensor(
-                [[start_pos], [start_pos], [start_pos]],
-                dtype=torch.float,
-                device=device,
-            )  # (3, 1)
-
-            return ARNodeInputs(
-                input_seq_len=1,
-                input_embeds=embeds,
-                custom_pos_ids=pos_ids,
-                tensor_inputs={
-                    "masks_for_talker": self._get_decode_thinker_mask(device)
-                }  # no additional tensors for decode step
-            )
+        if graph_walk == "thinker_step":
+            # ``thinker_step`` is the mixed-batch walk where
+            # each rid contributes a slice of its own modality
+            # (text-prefill chunk, decode token, or atomic audio/vision
+            # prefill). Dispatch by per-rid input keys to the right
+            # modality prep helper. ``forward_batched`` still routes the
+            # whole batch through its ``is_thinker_step`` branch — only
+            # the per-rid input embedding/position-id construction differs
+            # by modality. Audio/vision prefills cannot be chunked (their
+            # start/end sentinel wrappers are atomic), so they appear as
+            # a single non-chunked rid in the batch.
+            if "audio_embeds" in inputs:
+                return self._prepare_audio_input(inputs, start_pos, device)
+            if "vision_embeds" in inputs:
+                return self._prepare_vision_input(inputs, start_pos, device)
+            return self._prepare_text_input(inputs, start_pos, device)
 
         if graph_walk == "prefill_text":
-            text_ids = inputs["text_inputs"][0].to(device)  # (seq_len,)
-            embeds = self.model.model.embed_tokens(text_ids)
-            seq_len = text_ids.shape[0]
-
-            # Compute 3D MRoPE position IDs for a pure-text span.  Each
-            # prefill graph walk is single-modality so we use the simple
-            # per-modality helper instead of the full HF parser.
-            #
-            # ``start_pos`` is the next MRoPE position for this request,
-            # carried forward across walks by ``state.position_id_start``
-            # (advanced post-forward by ``advance_seq_lens``).
-            pos_ids = get_rope_index_text(seq_len, start_pos, device)
-            masks_for_talker = torch.stack([
-                torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
-                self._get_talker_text_mask(text_ids) # text inclusion
-            ])
-            return ARNodeInputs(
-                input_seq_len=seq_len,
-                input_embeds=embeds,
-                custom_pos_ids=pos_ids,
-                tensor_inputs={
-                    "masks_for_talker": masks_for_talker
-                }
-            )
+            return self._prepare_text_input(inputs, start_pos, device)
 
         if graph_walk == "prefill_audio":
-            audio_embeds = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
-            audio_len = audio_embeds.shape[0]
-
-            mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
-            mm_mask[[0, -1]] = 0
-            masks_for_talker = torch.stack([
-                mm_mask,
-                ~mm_mask
-            ])
-
-            wrapped_embeds = self._wrap_audio_input(audio_embeds)
-            seq_len = audio_len + 2
-            # Position IDs:
-            #   - audio_start_token: text-like position at start_pos
-            #   - audio tokens:      temporal increments per frame,
-            #                        h/w = start_pos (handled by helper)
-            #   - audio_end_token:   text-like position right after
-            start_pos_ids = get_rope_index_text(1, start_pos, device)
-            audio_pos_ids = get_rope_index_audio(
-                audio_len,
-                start_pos + 1,
-                device,
-                self.config.thinker.position_id_per_seconds,
-            )
-            end_pos_ids = get_rope_index_text(
-                1, start_pos + 1 + audio_len, device
-            )
-            pos_ids = torch.cat(
-                [start_pos_ids, audio_pos_ids, end_pos_ids], dim=1
-            )
-            return ARNodeInputs(
-                input_seq_len=seq_len,
-                input_embeds=wrapped_embeds,
-                custom_pos_ids=pos_ids,
-                tensor_inputs={
-                    "masks_for_talker": masks_for_talker
-                }
-            )
+            return self._prepare_audio_input(inputs, start_pos, device)
 
         if graph_walk == "prefill_vision":
-            vision_embeds = inputs["vision_embeds"][0].to(device)
-            vision_len = vision_embeds.shape[0]
-
-            mm_mask = torch.ones(vision_len + 2, dtype=torch.bool, device=device)
-            mm_mask[[0, -1]] = 0
-            masks_for_talker = torch.stack([
-                mm_mask,
-                ~mm_mask
-            ])
-
-            wrapped_embeds = self._wrap_vision_input(vision_embeds)
-            total_len = vision_len + 2
-            # Vision tokens use spatial 3D positions (temporal constant,
-            # h/w from the spatial grid after merging).  If a proper
-            # ``image_grid_thw`` is available, use ``get_rope_index_vision``;
-            # otherwise fall back to a 1-D sequence (test path without
-            # AutoImageProcessor).
-            grid_thw = inputs.get("image_grid_thw", [None])[0]
-            seconds_per_grid = inputs.get("video_second_per_grid", [])
-            seconds_per_grid = seconds_per_grid[0].item() if seconds_per_grid else None
-            vision_pos_ids = get_rope_index_vision(
-                grid_thw.to(device),
-                start_pos + 1,  # leave room for the BOS token
-                position_id_per_seconds=self.config.thinker.position_id_per_seconds,
-                device=device,
-                spatial_merge_size=self.config.vision.spatial_merge_size,
-                seconds_per_grid=seconds_per_grid
-            )
-
-            # Sentinel token positions (text-like).
-            start_pos_ids = get_rope_index_text(1, start_pos, device)
-            end_pos_base = float(vision_pos_ids.max().item()) + 1
-            end_pos_ids = get_rope_index_text(1, end_pos_base, device)
-
-            pos_ids = torch.cat(
-                [start_pos_ids, vision_pos_ids, end_pos_ids], dim=1
-            )
-
-            # Next MRoPE position after this vision block is ``end_pos_base
-            # + 1`` (one past the EOS token).  ``advance_seq_lens`` by
-            # default advances ``position_id_start`` by ``seq_len``, which
-            # for vision (= vision_len + 2) is typically smaller than the
-            # 3D-grid span.  Emit the correct per-request advance so the
-            # Thinker forward can pass ``pos_id_ns`` through.
-            mrope_pos_advance = int(end_pos_base + 1 - start_pos)
-            deepstack = inputs["deepstack"]
-
-            return ARNodeInputs(
-                input_seq_len=total_len,
-                input_embeds=wrapped_embeds,
-                custom_pos_ids=pos_ids,
-                tensor_inputs={
-                    "masks_for_talker": masks_for_talker,
-                    "mrope_pos_advance": mrope_pos_advance,
-                    "deepstack": deepstack,
-                    "visual_pos_masks": mm_mask
-                }
-            )
+            return self._prepare_vision_input(inputs, start_pos, device)
 
     def preprocess(
         self,
@@ -529,12 +571,19 @@ class ThinkerSubmodule(ARNodeSubmodule):
             target_dtype=input_embeds.dtype,
         )
 
-        # Plan FlashInfer attention and rope for the main cache label
+        # Plan FlashInfer attention and rope for the main cache label.
+        # Explicit mode prevents the chunked-prefill last chunk (seq_len=1
+        # per request) from being misclassified as decode by the seq_lens
+        # heuristic. ``thinker_step`` mixes decode (seq_len=1) and prefill
+        # (seq_len>=1) rids in one batch; routing to mode="prefill" picks
+        # FlashInfer's prefill wrapper, which handles arbitrary per-request
+        # seq_lens including seq_len=1.
         cache_manager = engine_inputs.cache_manager
         cache_manager.set_active_label("main")
         assert cache_manager is not None
+        mode = "decode" if graph_walk == "thinker_decode" else "prefill"
         cache_manager.plan_attention(
-            seq_lens=seq_lens, is_causal=True, label="main"
+            seq_lens=seq_lens, is_causal=True, label="main", mode=mode
         )
         cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
 
@@ -587,6 +636,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
         ``True`` for backwards compatibility with callers that do not set
         the flag (e.g. unit tests).
         """
+        assert graph_walk != "thinker_step", (
+            "thinker_step walk should always go through forward_batched, never "
+            "the eager path. If can_batch returns False for thinker_step in the "
+            "future, extend forward to mirror forward_batched's per-rid lm_head "
+            "gating logic."
+        )
         request_info = engine_inputs.single_request_info
         audio_output = request_info.step_metadata.get(
             "audio_output", True,
@@ -634,10 +689,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
     # ---- batching ----
     def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
-        return batch.graph_walk == "thinker_decode"
+        return batch.graph_walk in ("thinker_decode", "thinker_step")
 
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    # bs=8 covers the typical thinker_step mixed-batch shape (4-7 decodes
+    # + 1 prefill chunk); below it batches fall through to eager.
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
 
     def _build_prefill_text_packed(
         self, num_tokens: int, device: torch.device,
@@ -724,7 +781,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             ),
             FlashInferPackedCudaGraphConfig(
                 capture_graph_walk="prefill_text",
-                replay_graph_walks=["prefill_text", "prefill_audio"],
+                replay_graph_walks=["prefill_text", "prefill_audio", "thinker_step"],
                 packed_seq_len_to_inputs=prefill_text_packed,
                 requires_cfg=False,
                 labels=["main"],
@@ -763,6 +820,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         mrope_section: list[int] | None = None,
         mrope_pos_advance: list[int] | None = None,
         masks_for_talker: dict[str, torch.Tensor] | None = None,
+        seq_lens: list[int] | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         """Batched Thinker forward shared between ``thinker_decode`` and the prefill walks.
@@ -796,8 +854,22 @@ class ThinkerSubmodule(ARNodeSubmodule):
           NOT included — its preprocess emits ``deepstack`` /
           ``visual_pos_masks`` / ``mrope_pos_advance`` extras that the model
           forward also consumes; it is kept on the eager path.
+
+        ``thinker_step`` (mixed-batch walk, eager-only):
+          The batch carries a mix of decode tokens (seq_len=1) and prefill
+          chunks (seq_len>=1). Emits ``__batched_logits__`` (single
+          ``(bs, V)`` tensor) at the top level regardless of terminal-flag
+          distribution so the output dict shape is fixed across batches —
+          a precondition for CUDA graph capture. Per-rid dicts contain
+          ONLY ``thinker_states`` (and optionally ``thinker_mask``);
+          per-rid ``new_token`` assignment + non-terminal filtering moved
+          to ``AREngine._execute_batched``'s batched-logits sampling fast
+          path, which consults ``is_terminal_per_request`` to skip
+          sampling for non-terminal prefill chunks.
         """
-        assert graph_walk in ("thinker_decode", "prefill_text", "prefill_audio")
+        assert graph_walk in (
+            "thinker_decode", "prefill_text", "prefill_audio", "thinker_step",
+        )
 
         # Packed dict from FlashInferPackedCudaGraphConfig is tensor-only by
         # design (the runner's static-buffer interning skips non-tensor
@@ -805,7 +877,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # class constant when the kwarg is missing. Decode goes through
         # preprocess which does pass it explicitly.
         is_prefill = graph_walk in ("prefill_text", "prefill_audio")
-        if mrope_section is None and is_prefill:
+        is_thinker_step = graph_walk == "thinker_step"
+        if mrope_section is None and (is_prefill or is_thinker_step):
             mrope_section = self.MROPE_SECTION
 
         cos_sin_3d = (cos_3d, sin_3d) if cos_3d is not None else None
@@ -839,6 +912,74 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 "__batched_logits__": logits,
                 "__batched_thinker_states__": thinker_states,
             }
+
+        if is_thinker_step:
+            # Mixed prefill + decode batch. Emit __batched_logits__ at the
+            # top level regardless of terminal-flag distribution so the
+            # output shape is fixed (CUDA graph capture precondition).
+            # Per-request gating of new_token assignment moves to the
+            # engine's batched-logits sampling fast path.
+            #
+            # seq_lens comes from preprocess (one entry per request, each
+            # request's contiguous slice in `hidden`).
+            assert seq_lens is not None, (
+                "thinker_step requires seq_lens from preprocess to compute "
+                "per-request last-token indices."
+            )
+            request_ids = cache_manager.request_ids
+            assert len(request_ids) == len(seq_lens), (
+                f"thinker_step: request_ids ({len(request_ids)}) and "
+                f"seq_lens ({len(seq_lens)}) length mismatch"
+            )
+
+            # Compute last-token-per-request indices from cumulative seq_lens
+            # and run lm_head on the gathered last-token hidden states. This
+            # mirrors the prefill branch's qo_indptr-based gather pattern but
+            # uses the engine-provided seq_lens (thinker_step is eager-only;
+            # no qo_indptr_buf static buffer is required here).
+            seq_lens_t = torch.as_tensor(
+                seq_lens, dtype=torch.long, device=hidden.device,
+            )
+            last_token_indices = torch.cumsum(seq_lens_t, dim=0) - 1
+            last_hidden = hidden.index_select(0, last_token_indices)
+            batched_logits = self.model.lm_head(last_hidden)  # (bs, vocab)
+
+            # Pack thinker_states once for the whole batch (per-request
+            # slicing happens outside this function; non-audio rids are
+            # filtered out there as well).
+            if layer_n_hidden is not None:
+                thinker_states = torch.cat(
+                    [layer_0_embed, layer_n_hidden], dim=-1,
+                )
+            else:
+                thinker_states = torch.cat(
+                    [layer_0_embed, layer_0_embed], dim=-1,
+                )
+
+            outputs: dict[str, NameToTensorList] = {}
+            cum = 0
+            for rid, sl in zip(request_ids, seq_lens, strict=True):
+                slice_start, slice_end = cum, cum + sl
+                cum = slice_end
+
+                req_out: NameToTensorList = {}
+                # Always emit thinker_states per-rid (Talker conditioning is
+                # independent of sampling — it consumes the full slice for
+                # every request, terminal or not). NEVER emit per-rid
+                # logits or new_token here — the engine's batched-logits
+                # sampling fast path owns that, gated on
+                # is_terminal_per_request.
+                req_out["thinker_states"] = [
+                    thinker_states[slice_start:slice_end]
+                ]
+                if masks_for_talker is not None and rid in masks_for_talker:
+                    mask = masks_for_talker[rid]
+                    if mask is not None:
+                        req_out["thinker_mask"] = [mask]
+
+                outputs[rid] = req_out
+            outputs["__batched_logits__"] = batched_logits
+            return outputs
 
         # thinker_decode (existing behavior)
         logits = self.model.lm_head(hidden)  # (batch, vocab)

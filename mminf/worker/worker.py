@@ -148,7 +148,11 @@ class Worker:
             node_to_partition=node_to_partition,
         )
 
-        self.scheduler = MicroScheduler(self.engine_manager)
+        # Only consulted when an AR engine has scheduler_owns_chunking=True.
+        max_step_tokens = model_config.get("max_step_tokens", 2048) if model_config else 2048
+        self.scheduler = MicroScheduler(
+            self.engine_manager, max_step_tokens=max_step_tokens
+        )
 
         # Determine store write policy based on worker graph topology
         node_engine_types = model.get_node_engine_types() if model is not None else {}
@@ -302,6 +306,34 @@ class Worker:
         if ar_engine is not None:
             for node_name in ar_engine.submodule_management.keys():
                 self._last_active[(body.request_id, node_name)] = _time.monotonic()
+
+        # When scheduler-driven chunking is on, prime ``prefill_tokens_total``
+        # from the prompt tensor's leading dimension so the MicroScheduler's
+        # mixed-batch packer can classify this request as prefill-ready.
+        # Audio/vision use embed_len + 2 to account for the start/end
+        # sentinels added by the Thinker's _wrap_audio_input / _wrap_vision_input
+        # helpers. When chunking is off, total stays 0 and
+        # ``is_prefill_complete`` is trivially True.
+        if (
+            ar_engine is not None
+            and getattr(ar_engine, "scheduler_owns_chunking", False)
+        ):
+            for edge in body.initial_inputs:
+                total: int | None = None
+                if edge.name == "text_inputs" and edge.tensor_info:
+                    prompt_len = edge.tensor_info[0].dims[0] if edge.tensor_info[0].dims else 0
+                    total = int(prompt_len) if prompt_len > 0 else None
+                elif edge.name == "audio_embeds" and edge.tensor_info:
+                    audio_len = edge.tensor_info[0].dims[0] if edge.tensor_info[0].dims else 0
+                    # +2 for the start/end sentinel tokens added at Thinker prefill time.
+                    total = int(audio_len) + 2 if audio_len > 0 else None
+                elif edge.name == "vision_embeds" and edge.tensor_info:
+                    vision_len = edge.tensor_info[0].dims[0] if edge.tensor_info[0].dims else 0
+                    total = int(vision_len) + 2 if vision_len > 0 else None
+                if total is not None:
+                    body.request_info.prefill_tokens_total = total
+                    body.request_info.prefill_tokens_consumed = 0
+                    break
 
         self.worker_graphs_manager.add_request(
             request_id=body.request_id,
@@ -667,29 +699,88 @@ class Worker:
     # Batch building
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _slice_prompt_chunk(
+        tensors: NameToTensorList,
+        prefill_total: int,
+        start: int,
+        end: int,
+    ) -> NameToTensorList:
+        """Return a new ``NameToTensorList`` with token-axis tensors sliced to ``[start, end)``.
+
+        Per-key token-axis rules (explicit, not dynamic):
+          - ``text_inputs``: 1D ``(seq_len,)`` — slice dim 0.
+          - All other keys: pass through unchanged. Worker-side non-token
+            tensors (e.g. fixed-size image or audio embeddings) are already
+            sized by modality length, not prompt_total; the engine-side
+            ``_slice_ar_inputs`` in ``ar_engine.py`` handles their sequence
+            axis after ``prepare_inputs`` constructs ARNodeInputs.
+        """
+        chunk_len = end - start
+        sliced: NameToTensorList = {}
+        for name, tensor_list in tensors.items():
+            new_list: list[torch.Tensor] = []
+            for t in tensor_list:
+                if not isinstance(t, torch.Tensor):
+                    new_list.append(t)
+                    continue
+                if name == "text_inputs":
+                    # text_inputs: (seq_len,) — matches _prepare_text_input expectation.
+                    new_list.append(t[start:end])
+                else:
+                    # Non-token-axis tensors propagate unchanged; the engine-side
+                    # _slice_ar_inputs handles any sequence-axis slicing post-prepare_inputs.
+                    new_list.append(t)
+            sliced[name] = new_list
+        return sliced
+
     def _build_node_batch(self, batch: ScheduledBatch) -> NodeBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
         per_request_inputs: dict[str, NameToTensorList] = {}
         per_request_info: dict[CurrentForwardPassInfo] = {}
         batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
+        # When ``prefill_chunk_sizes`` is populated, slice each prefill
+        # rid's token-axis tensors to ``[consumed : consumed + chunk_size]``
+        # so the engine only sees this step's slice. Decode rids (absent
+        # from the dict) and empty-dict batches pass through unchanged.
+        chunk_sizes = batch.prefill_chunk_sizes or {}
+
         for request_id, node in batch.node_objects.items():
-            tensors = {}
+            tensors: NameToTensorList = {}
             for input_name in node.ready_inputs:
                 tensors[input_name] = [
                     self.tensor_manager.get_tensor(
                         request_id=request_id, uuid=info.uuid
                     ) for info in node.ready_inputs[input_name].tensor_info
                 ]
+
+            if request_id in chunk_sizes:
+                fwd_info = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+                consumed = fwd_info.prefill_tokens_consumed
+                total = fwd_info.prefill_tokens_total
+                chunk = int(chunk_sizes[request_id])
+                # Defensive: clamp end to total so the last chunk's narrow()
+                # never overruns the prompt tensor.
+                end = min(consumed + chunk, total)
+                if total > 0 and end > consumed:
+                    tensors = self._slice_prompt_chunk(
+                        tensors, prefill_total=total, start=consumed, end=end,
+                    )
+
             per_request_inputs[request_id] = tensors
             per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+
+        # Empty dict ⇒ "all terminal" — preserves single-walk batch behavior.
+        is_terminal_per_request = batch.is_terminal_per_request or {}
 
         return NodeBatch(
             node_name=batch.node_name,
             graph_walk=batch.graph_walk,
             request_ids=list(batch.node_objects.keys()),
             per_request_input_tensors=per_request_inputs,
-            per_request_info=per_request_info
+            per_request_info=per_request_info,
+            is_terminal_per_request=is_terminal_per_request,
         )
 
     # ------------------------------------------------------------------
@@ -760,7 +851,21 @@ class Worker:
             )
 
             if not request_output_tensors:
-                continue  # Node produced no outputs (e.g., KV-cache-only prefill step)
+                # Node produced no outputs (e.g., KV-cache-only prefill step,
+                # Talker non-last prefill). For non-terminal chunked-prefill
+                # rids, the popped GraphNode must be re-queued so the next
+                # chunk can run on it; otherwise the rid's ready queue stays
+                # empty and the scheduler can't pick it up next step,
+                # hanging the request. Empty is_terminal_per_request dict
+                # (legacy path) ⇒ treat all rids as terminal, preserving
+                # the prior skip-only behavior for Talker etc.
+                if not batch.is_terminal_per_request.get(request_id, True):
+                    worker_graph_id = batch.request_to_worker_graph.get(request_id)
+                    if worker_graph_id is not None:
+                        self.worker_graphs_manager.queues[worker_graph_id].push_back_node(
+                            request_id, node,
+                        )
+                continue
 
             output_tensor_info = self.tensor_manager.store_and_populate_graph_edges(
                 request_id=request_id,
@@ -1361,6 +1466,20 @@ class Worker:
                 per_label_seq_info=req_info.per_label_seq_info,
                 partition_name=batch_partition,
             )
+
+        # Advance prefill_tokens_consumed for each prefill chunk that just
+        # completed. Only fires when the scheduler populated
+        # ``prefill_chunk_sizes`` on the batch; non-chunked batches skip
+        # this entirely.
+        if batch.prefill_chunk_sizes:
+            for rid, chunk in batch.prefill_chunk_sizes.items():
+                if rid not in node_batch.per_request_info:
+                    continue
+                fwd_info = self.worker_graphs_manager.get_fwd_info(rid, batch_partition)
+                fwd_info.prefill_tokens_consumed = min(
+                    fwd_info.prefill_tokens_total,
+                    fwd_info.prefill_tokens_consumed + int(chunk),
+                )
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
@@ -1410,8 +1529,19 @@ class Worker:
                 ]
             else:
                 kept_for_routing = kept
+            # When the chunked-prefill scheduler relabels the batch's
+            # graph_walk (e.g. ``thinker_step``), filtering by graph_walk
+            # would route outputs to the wrong worker_graph. The scheduler
+            # populates ``request_to_worker_graph`` with the actual id the
+            # GraphNode was popped from — pass that as a hint.
+            wg_id_hint = (
+                batch.request_to_worker_graph.get(request_id)
+                if batch.request_to_worker_graph else None
+            )
             routing = self.worker_graphs_manager.process_node_outputs(
-                request_id, kept_for_routing, graph_walk=batch.graph_walk
+                request_id, kept_for_routing,
+                graph_walk=batch.graph_walk,
+                worker_graph_id_hint=wg_id_hint,
             )
             routing_per_request[request_id] = routing
         if self.enable_nvtx:

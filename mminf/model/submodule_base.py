@@ -134,6 +134,14 @@ class ModelInputsFromEngine:
     per_request_info: dict[str, CurrentForwardPassInfo]
     cache_manager: BatchedCacheManager | None = None
 
+    # Chunked-prefill: per-request terminal flag carried over from
+    # ``NodeBatch.is_terminal_per_request``. True means this request's slice
+    # should produce sampled output this step (decode token OR final prefill
+    # chunk that transitions to decode); False means it's a non-terminal
+    # prefill chunk and lm_head/sampling should be skipped. Default empty
+    # dict means "all terminal" — backwards compat with non-mixed batches.
+    is_terminal_per_request: dict[str, bool] = field(default_factory=dict)
+
     @property
     def single_request_info(self):
         """
@@ -141,7 +149,7 @@ class ModelInputsFromEngine:
         """
         assert len(self.per_request_info) == 1
         return self.per_request_info[self.request_ids[0]]
-    
+
     @property
     def first_request_info(self):
         """
@@ -230,14 +238,23 @@ class NodeSubmodule(torch.nn.Module):
         """Return True if this submodule supports CUDA graphs for ``batch``.
 
         Default: derives from ``get_cuda_graph_configs`` — if the submodule
-        declared a capture for this batch's graph_walk, CUDA graphs are
-        supported. Subclasses can override to reject on batch shape /
-        metadata (e.g. codec submodules that need homogeneous frame counts).
+        declared a capture (or replay alias) for this batch's graph_walk,
+        CUDA graphs are supported. Subclasses can override to reject on
+        batch shape / metadata (e.g. codec submodules that need
+        homogeneous frame counts).
+
+        Walk eligibility: a walk is eligible if it appears in EITHER
+        ``capture_graph_walk`` (the walk a graph was captured under) OR
+        ``replay_graph_walks`` (additional walks that share the same
+        captured graph — e.g. ``prefill_audio`` and ``thinker_step``
+        replay the ``prefill_text`` capture).
         """
         if not hasattr(self, "_cached_cuda_graph_walks"):
-            self._cached_cuda_graph_walks = {
-                cfg.capture_graph_walk for cfg in self.get_cuda_graph_configs(device=torch.device("cpu"))
-            }
+            walks: set[str] = set()
+            for cfg in self.get_cuda_graph_configs(device=torch.device("cpu")):
+                walks.add(cfg.capture_graph_walk)
+                walks.update(cfg.replay_graph_walks)
+            self._cached_cuda_graph_walks = walks
         return batch.graph_walk in self._cached_cuda_graph_walks
 
     def postprocess(
@@ -292,6 +309,22 @@ class NodeSubmodule(torch.nn.Module):
     def cleanup_request(self, request_id: str):
         """Remove per-request state when a request completes."""
         return
+
+    def get_chunked_prefill_walks(self) -> list[str]:
+        """Return the graph walks for which this submodule's forward tolerates chunking.
+
+        For each walk in the returned list, AREngine may split a
+        single-request prefill into multiple forward passes of
+        ``max_prefill_chunk_size`` tokens each, with KV cache state carried
+        across via the existing paged cache manager.
+
+        Default empty list — submodules must opt in per walk. Walks whose
+        inputs aren't sliceable along the token axis (e.g. fixed image-token
+        blocks emitted by an encoder, sentinel-wrapped audio/vision embeds)
+        must be omitted. Mirrors the per-walk eligibility pattern used by
+        ``can_use_cuda_graphs`` / ``get_cuda_graph_configs``.
+        """
+        return []
 
 
 class ARNodeSubmodule(NodeSubmodule):
