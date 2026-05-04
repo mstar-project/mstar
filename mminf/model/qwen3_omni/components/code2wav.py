@@ -6,19 +6,61 @@ from __future__ import annotations
 import logging
 import math
 
-import flashinfer
 import numpy as np
 import torch
-from torch import nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_func
+from torch import nn
 from transformers.activations import ACT2FN
 
-from mminf.model.qwen3_omni.components.attention import Qwen3OmniRMSNorm
 from mminf.model.qwen3_omni.config import Code2WavConfig
-from mminf.utils.flashinfer_utils import run_rms_norm
 
 logger = logging.getLogger(__name__)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """HF GPT-NeoX-style rotate-half: split last dim, swap halves with sign flip."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply HF-style RoPE to q, k of shape (bs, num_heads, seq_len, head_dim).
+
+    cos, sin have shape (bs, seq_len, head_dim); unsqueeze for the heads axis.
+    """
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _build_rope_cos_sin(
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rope_theta: float,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute RoPE cos/sin in fp32 (HF reference convention) for the given positions.
+
+    Returns cos/sin of shape (bs, seq_len, head_dim) cast to ``dtype``.
+    """
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    inv_freq = 1.0 / (
+        rope_theta
+        ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+    )
+    freqs = position_ids.to(torch.float32).unsqueeze(-1) * inv_freq  # (bs, seq, head_dim/2)
+    emb = torch.cat([freqs, freqs], dim=-1)  # (bs, seq, head_dim)
+    return emb.cos().to(dtype), emb.sin().to(dtype)
 
 
 class Qwen3OmniMoeCausalConvNet(nn.Module):
@@ -167,42 +209,30 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
 
         qkv = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
         q, k, v = qkv.split((self.q_size, self.kv_size, self.kv_size), dim=-1)
-        query_states = q.view(bsz, seq_len, -1, self.head_dim)
-        key_states = k.view(bsz, seq_len, -1, self.head_dim)
-        value_states = v.view(bsz, seq_len, -1, self.head_dim)
+        # Use HF layout: (bs, num_heads, seq_len, head_dim) for SDPA + apply_rotary_pos_emb.
+        query_states = q.view(bsz, seq_len, -1, self.head_dim).transpose(1, 2)
+        key_states = k.view(bsz, seq_len, -1, self.head_dim).transpose(1, 2)
+        value_states = v.view(bsz, seq_len, -1, self.head_dim).transpose(1, 2)
 
-        # flashinfer's RoPE kernel and flash_attn_func only dispatch to fp16/bf16.
-        # Cast Q/K/V here once so RoPE can run in-place on the bf16 tensors and
-        # the result feeds straight into flash_attn. HF Code2Wav uses
-        # nn.Identity() for q_norm/k_norm — no QK normalization, only RoPE.
-        orig_dtype = query_states.dtype
-        query_states = query_states.to(torch.bfloat16)
-        key_states = key_states.to(torch.bfloat16)
-        value_states = value_states.to(torch.bfloat16)
-
-        q_flat = query_states.view(bsz * seq_len, -1, self.head_dim)
-        k_flat = key_states.view(bsz * seq_len, -1, self.head_dim)
-
-        flat_pos = position_ids.reshape(-1).to(torch.int32)
-        flashinfer.rope.apply_rope_pos_ids_inplace(
-            q_flat, k_flat, flat_pos,
-            interleave=False,
-            rope_theta=self.rope_theta,
+        # HF Code2Wav uses Identity for q_norm/k_norm — no QK normalization.
+        # RoPE in fp32 (HF reference path).
+        cos, sin = _build_rope_cos_sin(
+            position_ids, self.head_dim, self.rope_theta,
+            dtype=query_states.dtype, device=query_states.device,
         )
+        query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # Causal sliding-window attention; no explicit mask needed. HF defines
-        # ``sliding_window`` as the total window size including the current token,
-        # whereas flash-attn's ``window_size=(W, 0)`` allows ``W+1`` positions.
-        attn_output = flash_attn_func(
+        # Causal attention. SWA is a no-op for our chunk sizes (input ≤ 50 frames,
+        # sliding_window=72), so we just rely on `is_causal=True`.
+        attn_output = F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            causal=True,
-            window_size=(self.sliding_window - 1, 0),
-            softmax_scale=self.scaling,
-        ).to(orig_dtype)
+            is_causal=True,
+            scale=self.scaling,
+        )
 
-        attn_output = attn_output.reshape(bsz, seq_len, -1)
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, seq_len, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, None
 
@@ -226,21 +256,19 @@ class Qwen3OmniMoeCode2WavMlp(nn.Module):
 class Qwen3OmniMoeCode2WavRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
         """
-        Qwen3OmniMoeCode2WavRMSNorm is equivalent to T5LayerNorm
+        Qwen3OmniMoeCode2WavRMSNorm is equivalent to T5LayerNorm. HF reference
+        computes the variance in fp32 to preserve precision.
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # flashinfer rmsnorm only accepts 2D input.
-        orig_shape = hidden_states.shape
-        out = run_rms_norm(
-            hidden_states.reshape(-1, orig_shape[-1]),
-            self.weight,
-            eps=self.variance_epsilon,
-        )
-        return out.view(orig_shape)
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -310,7 +338,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3OmniMoeCode2WavTransformerLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3OmniRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3OmniMoeCode2WavRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope_theta = config.rope_theta
         self.gradient_checkpointing = False
         self.window_size = config.sliding_window
@@ -336,13 +364,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
                 **kwargs,
             )
 
-        orig_dtype = hidden_states.dtype
-        hidden_states = run_rms_norm(
-            hidden_states.to(torch.bfloat16),
-            self.norm.weight,
-            eps=self.norm.variance_epsilon
-        ).to(orig_dtype)
-        return hidden_states
+        return self.norm(hidden_states)
 
 
 class SnakeBeta(nn.Module):
