@@ -1805,6 +1805,7 @@ class Code2WavSubmodule(NodeSubmodule):
         # left_context_size if start_index - left_context_size > 0 else start_index``
         # logic, where the first iteration has context_size=0.
         self._first_chunk_emitted: set[str] = set()
+        self._latest_seq_len: dict[str, int] = {}
 
         # Pre-compute the total upsample factor. HF defines this as
         # ``np.prod(upsample_rates + upsampling_ratios)`` — both tuples
@@ -1866,6 +1867,17 @@ class Code2WavSubmodule(NodeSubmodule):
         # Select first num_quantizers codebook layers
         if codec_tokens.shape[-1] > num_quantizers:
             codec_tokens = codec_tokens[..., :num_quantizers]
+        
+        # pad sequence to full_seqlen with codec_pad_id for batching
+        orig_seq_len = codec_tokens.shape[0]
+        pad_len = self.full_seqlen - codec_tokens.shape[0]
+        if pad_len > 0:
+            pad = torch.zeros((
+                pad_len, codec_tokens.shape[1]
+            ),dtype=codec_tokens.dtype,
+            device=codec_tokens.device)
+            codec_tokens = torch.cat([codec_tokens, pad], dim=0)
+        self._latest_seq_len[fwd_info.request_id] = orig_seq_len
 
         # Transpose to (Q, T)
         codec_tokens = codec_tokens.T  # (Q, T)
@@ -1965,10 +1977,10 @@ class Code2WavSubmodule(NodeSubmodule):
         }) == 1
     
     def can_use_cuda_graphs(self, batch, model_inputs: list[NodeInputs]):
-        return super().can_use_cuda_graphs(batch, model_inputs) \
+        res = super().can_use_cuda_graphs(batch, model_inputs) \
             and self.can_batch(batch, model_inputs) \
                 and model_inputs[0].tensor_inputs["codec_tokens"].shape[1] == self.full_seqlen
-            
+        return res            
     
     def postprocess(
         self, request_id: str,
@@ -1978,9 +1990,11 @@ class Code2WavSubmodule(NodeSubmodule):
     ):
         if "audio_chunk" not in outputs:
             return
+        
+        orig_seq_len = self._latest_seq_len[request_id]
         cfg_ctx = self.config.code2wav.codec_left_context_frames
         left_context_size = 0 if request_id not in self._first_chunk_emitted else cfg_ctx
         trim = left_context_size * self.total_upsample
         self._first_chunk_emitted.add(request_id)
-        outputs["audio_chunk"][0] = outputs["audio_chunk"][0][trim:]
+        outputs["audio_chunk"][0] = outputs["audio_chunk"][0][trim:orig_seq_len*self.total_upsample]
 

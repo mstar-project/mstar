@@ -794,16 +794,31 @@ class CudaGraphRunner:
         self, per_request_info: dict[str, CurrentForwardPassInfo],
         request_ids: list[str], padded_bs: int
     ):
-        return make_sampler_from_buffers(
-            bufs=self.sampler_buffer,
-            request_ids=request_ids,
-            sampling_configs={
-                rid: info.sampling_config.get(
-                    self.submodule_name, SamplingConfig()
-                ) for rid, info in per_request_info.items()
-            },
-            padded_bs=padded_bs,
+        # Per-request sampling configs are pre-staged on master GPU buffers
+        # (see ``register_request`` / ``update_request_config`` from AREngine);
+        # the per-step path is just a slot-index gather + index_select. The
+        # ``per_request_info`` argument is unused here but kept on the
+        # signature for symmetry with the older callers.
+        del per_request_info
+        return self.sampler_buffer.gather_for_request_ids(
+            request_ids=request_ids, padded_bs=padded_bs,
         )
+
+    def register_request(
+        self, request_id: str, sampling_config: SamplingConfig | None = None,
+    ) -> None:
+        """Allocate a SamplerBuffers slot for ``request_id`` if not present."""
+        self.sampler_buffer.register_request(request_id, sampling_config)
+
+    def unregister_request(self, request_id: str) -> None:
+        """Release the SamplerBuffers slot for ``request_id``."""
+        self.sampler_buffer.unregister_request(request_id)
+
+    def update_request_config(
+        self, request_id: str, sampling_config: SamplingConfig,
+    ) -> None:
+        """Change-detect update for ``request_id``'s master sampling row."""
+        self.sampler_buffer.update_request_config(request_id, sampling_config)
 
     def reserve_slot(
         self,
