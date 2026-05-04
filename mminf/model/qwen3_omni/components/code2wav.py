@@ -193,14 +193,15 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         )
 
         # Causal sliding-window attention; no explicit mask needed.
+        orig_dtype = query_states.dtype
         attn_output = flash_attn_func(
-            query_states,
-            key_states,
-            value_states,
+            query_states.to(torch.bfloat16),
+            key_states.to(torch.bfloat16),
+            value_states.to(torch.bfloat16),
             causal=True,
-            window_size=(self.sliding_window - 1, 0),
+            window_size=(self.sliding_window, 0),
             softmax_scale=self.scaling,
-        )
+        ).to(orig_dtype)
 
         attn_output = attn_output.reshape(bsz, seq_len, -1)
         attn_output = self.o_proj(attn_output)
