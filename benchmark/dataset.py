@@ -546,3 +546,106 @@ class UCF101Dataset(BaseDataset):
 
     def __getitem__(self, idx: int) -> RequestInput:
         return self.items[idx]
+
+
+class VideoMMEDataset(BaseDataset):
+    """
+    Dataset loader for Video-MME (https://video-mme.github.io/).
+
+    Auto-downloads from the HuggingFace dataset ``zhaochenyang20/Video_MME`` on
+    first use, matching the load-from-HF pattern used by Food101/LibriSpeech/
+    UCF101. This particular mirror is used because it ships the videos as
+    individual mp4s plus per-chunk metadata jsonl, whereas the canonical
+    ``lmms-lab/Video-MME`` distributes a single parquet plus 20 video zip
+    archives that would need extraction. Caller may override with a local
+    path via ``data_dir``.
+
+    Expected layout (matches the HF repo):
+        <root>/data/test_part_*.jsonl
+        <root>/videos/<videoID>.mp4
+
+    Each jsonl row is one MCQ over a video. The prompt sent to the server
+    is the question with its multiple-choice options appended, asking the
+    model to answer with a single letter.
+    """
+
+    HF_REPO = "zhaochenyang20/Video_MME"
+
+    def __init__(
+        self,
+        num_requests: int = 100,
+        req_type: RequestType = RequestType.V2T,
+        data_dir: str | None = None,
+        cache_dir: str | None = None,
+        jsonl_glob: str = "data/*.jsonl",
+    ):
+        assert req_type.get_input_modalities() == "video", (
+            f"VideoMMEDataset requires a video input RequestType, got {req_type}"
+        )
+        self._num_requests = num_requests
+
+        if data_dir is None:
+            data_dir = self._auto_download(cache_dir)
+        self.data_dir = data_dir
+
+        jsonl_paths = sorted(glob.glob(os.path.join(data_dir, jsonl_glob)))
+        if not jsonl_paths:
+            raise FileNotFoundError(
+                f"No Video-MME jsonl files matched {os.path.join(data_dir, jsonl_glob)}"
+            )
+
+        rows: list[dict] = []
+        for p in jsonl_paths:
+            with open(p) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rows.append(json.loads(line))
+
+        self.items: list[RequestInput] = []
+        for row in rows:
+            video_path = os.path.join(data_dir, row["video_path"])
+            if not os.path.exists(video_path):
+                continue
+            options = "\n".join(row.get("options", []))
+            prompt = (
+                f"{row['question']}\n{options}\n"
+                "Answer with the letter (A, B, C, or D) of the correct option."
+            )
+            self.items.append(RequestInput(
+                req_type=req_type,
+                prompt=prompt,
+                video_path=video_path,
+            ))
+
+        if not self.items:
+            raise RuntimeError(
+                f"VideoMMEDataset loaded 0 usable rows from {data_dir} -- "
+                f"check that videos/ contains the .mp4 files referenced by the jsonl."
+            )
+
+        self.items = self._resize_data(self.items)
+
+    @classmethod
+    def _auto_download(cls, cache_dir: str | None) -> str:
+        from huggingface_hub import snapshot_download
+        print(f"Downloading Video-MME from HuggingFace ({cls.HF_REPO})...")
+        path = snapshot_download(
+            repo_id=cls.HF_REPO,
+            repo_type="dataset",
+            cache_dir=cache_dir,
+            allow_patterns=["data/*.jsonl", "videos/*.mp4"],
+        )
+        print(f"Video-MME ready at {path}")
+        return path
+
+    @property
+    def num_requests(self) -> int:
+        return self._num_requests
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestInput:
+        return self.items[idx]

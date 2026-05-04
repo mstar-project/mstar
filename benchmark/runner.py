@@ -17,6 +17,7 @@ from benchmark.dataset import (
     TxtFileDataset,
     UCF101Dataset,
     VBenchDataset,
+    VideoMMEDataset,
 )
 from benchmark.request import (
     AggregateMetrics,
@@ -37,6 +38,7 @@ class DatasetType(Enum):
     LIBRI = "libri"
     FOOD = "food101"
     UCF = "ucf101"
+    VIDEO_MME = "video_mme"
 
 
 class InferenceSystemType(Enum):
@@ -84,6 +86,11 @@ class BenchmarkConfig:
     # VBench args
     vbench_cache_dir: str = "./vbench_cache"
 
+    # Video-MME args
+    # Override with a local copy of the Video-MME dataset; if None, the dataset
+    # auto-downloads from HuggingFace into local_cache_dir.
+    video_mme_dir: Optional[str] = None
+
     # text dataset args
     request_txt_file: str = "benchmark/assets/simple_text_queries.txt"
 
@@ -122,6 +129,13 @@ class Benchmark:
                 num_requests=self.config.num_requests,
                 req_type=self.config.request_type,
                 local_file_dir=self.config.local_cache_dir,
+            )
+        elif self.config.dataset == DatasetType.VIDEO_MME:
+            return VideoMMEDataset(
+                num_requests=self.config.num_requests,
+                req_type=self.config.request_type,
+                data_dir=self.config.video_mme_dir,
+                cache_dir=self.config.local_cache_dir,
             )
         raise ValueError(f"Unknown dataset: {self.config.dataset}")
 
@@ -369,6 +383,18 @@ def parse_args() -> BenchmarkConfig:
         help="Directory to cache downloaded VBench data (default: ./vbench_cache)",
     )
 
+    # Video-MME args
+    video_mme = parser.add_argument_group("video_mme")
+    video_mme.add_argument(
+        "--video-mme-dir",
+        default=None,
+        help=(
+            "Path to a local Video-MME copy with data/ and videos/ subfolders. "
+            "If omitted, the dataset auto-downloads from HuggingFace into "
+            "--local-cache."
+        ),
+    )
+
     # Text dataset args
     text_dataset = parser.add_argument_group("text_dataset")
     text_dataset.add_argument(
@@ -390,7 +416,7 @@ def parse_args() -> BenchmarkConfig:
             dataset = DatasetType.FOOD
             txtfile = None
         elif request_type in {RequestType.V2T, RequestType.V2S}:
-            dataset = DatasetType.UCF
+            dataset = DatasetType.VIDEO_MME
             txtfile = None
         elif request_type in {RequestType.A2T, RequestType.A2S}:
             dataset = DatasetType.LIBRI
@@ -423,6 +449,7 @@ def parse_args() -> BenchmarkConfig:
         verbose=args.verbose,
         output_dir=args.output_dir,
         vbench_cache_dir=args.vbench_cache_dir,
+        video_mme_dir=args.video_mme_dir,
         request_txt_file=txtfile,
         local_cache_dir=args.local_cache,
     )
