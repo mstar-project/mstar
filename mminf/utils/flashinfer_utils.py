@@ -39,6 +39,11 @@ def run_rms_norm(
         # Unsupported dtype; must recast
         input = input.to(torch.bfloat16)
 
+    # flashinfer.norm.rmsnorm requires matching input/weight dtypes; cast weight
+    # to match whatever input ended up as.
+    if weight.dtype != input.dtype:
+        weight = weight.to(input.dtype)
+
     import flashinfer
     return flashinfer.norm.rmsnorm(
         input, weight, eps=eps
