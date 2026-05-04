@@ -577,16 +577,15 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 inp.tensor_inputs.get("mrope_pos_advance", 0)
             ]
             extra_inputs["mrope_pos_advance"] = mrope_pos_advance
-            # Side-channel: stash on the cache_manager's plan state so the
-            # CUDA-graph runner's post-replay ``advance_seq_lens()`` (which
-            # is called with no args) advances ``position_id_start`` by the
-            # MRoPE 3D-grid span instead of by ``seq_len``. The eager path
-            # consumes ``mrope_pos_advance`` from the dict via model.forward
-            # → cache_handle.advance_seq_lens(pos_id_ns=...); both paths
-            # converge on the same per-request advance.
-            ps = cache_manager._plan_states.get("main")
-            if ps is not None:
-                ps.mrope_pos_advance = list(mrope_pos_advance)
+            # Side-channel: stash on the cache_manager's plan state via the
+            # public setter so the CUDA-graph runner's post-replay
+            # ``advance_seq_lens()`` (which is called with no args) advances
+            # ``position_id_start`` by the MRoPE 3D-grid span instead of by
+            # ``seq_len``. The eager path consumes ``mrope_pos_advance`` from
+            # the dict via model.forward → cache_handle.advance_seq_lens(
+            # pos_id_ns=...); both paths converge on the same per-request
+            # advance.
+            cache_manager.set_custom_pos_advance(mrope_pos_advance, label="main")
 
         return {
             "input_embeds": input_embeds,
@@ -907,8 +906,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # prefill_vision: separate capture because its post-preprocess
             # tensor signature has extras (deepstack_<i>)
             # that prefill_text/audio don't. mrope_pos_advance flows
-            # out-of-band via the _PlanState side-channel — see
-            # ``cache_manager._PlanState.mrope_pos_advance``.
+            # out-of-band via ``BatchedCacheManager.set_custom_pos_advance``
+            # — see ``cache_manager._PlanState.custom_pos_advance``.
             FlashInferPackedCudaGraphConfig(
                 capture_graph_walk="prefill_vision",
                 replay_graph_walks=["prefill_vision"],
@@ -975,9 +974,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
           post-preprocess tensor signature is identical: ``input_embeds`` +
           ``cos_3d`` + ``sin_3d``). ``prefill_vision`` has its own capture
           because it adds  per-layer ``deepstack_<i>``
-          tensors. ``mrope_pos_advance`` flows out-of-band via the
-          ``_PlanState`` side-channel that ``preprocess`` populates — see
-          ``cache_manager._PlanState.mrope_pos_advance``. The model's inner
+          tensors. ``mrope_pos_advance`` flows out-of-band via
+          ``BatchedCacheManager.set_custom_pos_advance``, which
+          ``preprocess`` populates — see
+          ``cache_manager._PlanState.custom_pos_advance``. The model's inner
           ``cache_handle.advance_seq_lens(pos_id_ns=mrope_pos_advance)`` call
           executes only at capture time (it's a ``@torch.compiler.disable``'d
           Python op so it's not replayed); the runner's post-replay
