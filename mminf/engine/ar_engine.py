@@ -571,10 +571,16 @@ class AREngine(BaseEngine):
 
                 if self.enable_nvtx:
                     range_push("ar.sampler_config", synchronize=False)
+                runner = submod_mgmt.cuda_graph_runner
                 for rid, info in batch.per_request_info.items():
                     sampling_config = info.sampling_config.get(batch.node_name)
-                    sampling_config = {} if sampling_config is None else asdict(sampling_config)
-                    submod_mgmt.sampler.set_config(rid, **sampling_config)
+                    sampling_kwargs = {} if sampling_config is None else asdict(sampling_config)
+                    submod_mgmt.sampler.set_config(rid, **sampling_kwargs)
+                    # Mirror into the cuda-graph runner's master GPU buffers.
+                    # update_request_config is change-detected, so steady-state
+                    # requests pay only a dict comparison here — no GPU work.
+                    if runner is not None and sampling_config is not None:
+                        runner.update_request_config(rid, sampling_config)
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
@@ -841,6 +847,11 @@ class AREngine(BaseEngine):
         for submodule_mgmt in self.submodule_management.values():
             submodule_mgmt.kv_management.alloc_manager.add_request(request_id, cache_labels or ["main"])
             submodule_mgmt.sampler.add_request(request_id)
+            # Mirror into the cuda-graph runner's master sampler buffers so
+            # the per-step path can index_select instead of rebuilding from
+            # Python (see ``SamplerBuffers.gather_for_request_ids``).
+            if submodule_mgmt.cuda_graph_runner is not None:
+                submodule_mgmt.cuda_graph_runner.register_request(request_id)
 
     def remove_request(self, request_id: str) -> None:
         for submodule_mgmt in self.submodule_management.values():
@@ -849,6 +860,8 @@ class AREngine(BaseEngine):
                 cache_mgmt.cpu_page_pool.remove_request(request_id)
             cache_mgmt.alloc_manager.remove_request(request_id)
             submodule_mgmt.sampler.remove_request(request_id)
+            if submodule_mgmt.cuda_graph_runner is not None:
+                submodule_mgmt.cuda_graph_runner.unregister_request(request_id)
 
     def pause_request(
         self, request_id: str, cache_label: str = "main",

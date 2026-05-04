@@ -19,7 +19,7 @@ else
 fi
 
 CUDA_VISIBLE_DEVICES=$DEVICES python mminf/api_server/entrypoint.py \
-    --config configs/qwen3omni.yaml \
+    --config configs/qwen3omni_2gpu.yaml \
     --cache-dir $QWEN3OMNI_CACHE_DIR \
     --socket-path-prefix /tmp/mminf_${WHO}/ \
     --upload-dir /tmp/mminf_uploads_${WHO}/ \

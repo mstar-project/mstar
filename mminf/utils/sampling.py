@@ -433,33 +433,44 @@ def sample_tokens(
             consume_autotune_sync_budget()
         result = flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
         return result[0] if isinstance(result, tuple) else result
-
-    # Slow path: apply rep-penalty the old way (short-circuit on mask=None to
-    # avoid the `(rep != 1.0).any()` CPU sync when penalty is inactive).
-    if seen_token_mask is not None and (repetition_penalty != 1.0).any():
-        logits = _apply_repetition_penalty(logits, seen_token_mask, repetition_penalty)
-
-    if run_greedy:
-        greedy_tokens = torch.argmax(logits, dim=-1)
-        greedy_mask = (temperature == 0).squeeze(-1)
-        # For greedy requests, set temperature=1 to avoid division by zero
-        # (their results are masked out by torch.where at the end).
-        safe_temperature = temperature.masked_fill(temperature == 0, 1.0).unsqueeze(-1)
-    else:
-        safe_temperature = temperature.unsqueeze(-1)
-
-    scaled_logits = logits / safe_temperature
-
-    safe_top_k = top_k.masked_fill(top_k == 0, vocab_size) if run_top_k_zero_fix else top_k
-
-    result = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-        scaled_logits, safe_top_k, top_p, filter_apply_order="joint",
+    
+    probs = fused_temperature_softmax(
+        logits, temperature,
+        penalty=repetition_penalty if seen_token_mask is not None else None,
+        seen_mask=seen_token_mask,
+        include_greedy=run_greedy,
     )
-    sampled_tokens = result[0] if isinstance(result, tuple) else result
+    if consume_autotune_sync_budget is not None:
+        consume_autotune_sync_budget()
+    result = flashinfer.sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
+    return result[0] if isinstance(result, tuple) else result
 
-    if run_greedy:
-        return torch.where(greedy_mask, greedy_tokens, sampled_tokens)
-    return sampled_tokens
+    # # Slow path: apply rep-penalty the old way (short-circuit on mask=None to
+    # # avoid the `(rep != 1.0).any()` CPU sync when penalty is inactive).
+    # if seen_token_mask is not None and (repetition_penalty != 1.0).any():
+    #     logits = _apply_repetition_penalty(logits, seen_token_mask, repetition_penalty)
+
+    # if run_greedy:
+    #     greedy_tokens = torch.argmax(logits, dim=-1)
+    #     greedy_mask = (temperature == 0).squeeze(-1)
+    #     # For greedy requests, set temperature=1 to avoid division by zero
+    #     # (their results are masked out by torch.where at the end).
+    #     safe_temperature = temperature.masked_fill(temperature == 0, 1.0).unsqueeze(-1)
+    # else:
+    #     safe_temperature = temperature.unsqueeze(-1)
+
+    # scaled_logits = logits / safe_temperature
+
+    # safe_top_k = top_k.masked_fill(top_k == 0, vocab_size) if run_top_k_zero_fix else top_k
+
+    # result = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+    #     scaled_logits, safe_top_k, top_p, filter_apply_order="joint",
+    # )
+    # sampled_tokens = result[0] if isinstance(result, tuple) else result
+
+    # if run_greedy:
+    #     return torch.where(greedy_mask, greedy_tokens, sampled_tokens)
+    # return sampled_tokens
 
 
 def _to_tensor(
@@ -515,14 +526,10 @@ def sample_cuda_graphable_gpu(
     """
     import flashinfer
 
-    probs = fused_temperature_softmax(
-        logits, temperature,
-        # penalty=repetition_penalty if seen_token_mask is not None else None,
-        # seen_mask=seen_token_mask,
-        include_greedy=True,
-    )
-    samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-        probs, top_k, top_p, deterministic=True,
+    scaled = logits / temperature.unsqueeze(-1).to(logits.dtype)
+    top_k = torch.where(top_k > 0, top_k, logits.shape[1])
+    samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        scaled, top_k, top_p, deterministic=True,
         seed=seed, offset=offset
     )
     return samples.to(torch.int64)
@@ -535,8 +542,6 @@ class CudaGraphableSampler(BaseSampler):
     top_p_buf: torch.Tensor
     seed_buf: torch.Tensor
     offset_buf: torch.Tensor
-
-    w_config_temperature_buf: torch.Tensor
 
     @torch.compiler.disable
     def sample(self, request_ids: list[str], logits: torch.Tensor):
@@ -555,16 +560,10 @@ class CudaGraphableSampler(BaseSampler):
         top_k: int,
         top_p: float = 1.0,
     ):
-        self.w_config_temperature_buf.fill_(temperature)
-        probs = fused_temperature_softmax(
-            logits, self.w_config_temperature_buf,
-            # penalty=repetition_penalty if seen_token_mask is not None else None,
-            # seen_mask=seen_token_mask,
-            include_greedy=True,
-        )
         import flashinfer
-        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            probs, top_k, top_p, deterministic=True,
+        scaled = logits / temperature
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            scaled, top_k, top_p, deterministic=True,
             seed=self.seed_buf, offset=self.offset_buf
         )
         self.offset_buf += 1
@@ -575,16 +574,59 @@ class CudaGraphableSampler(BaseSampler):
 class SamplerBuffers:
     """Pre-allocated static buffers for graph-safe MTP sampling.
 
-    All tensors are sized to ``max_batch_size``. Slice with
-    ``slice_for_bs(bs)`` to get a view suitable for a specific batch.
+    Owns two tiers of GPU state:
+
+    1. **Per-step buffers** (``temperature_buf``, ``top_k_buf``, ``top_p_buf``,
+       ``seed_buf``, ``offset_buf``) — sized ``[max_batch_size]``, sliced to
+       ``padded_bs`` on each call and consumed by ``CudaGraphableSampler``.
+    2. **Master buffers** (``_master_temperature``, ``_master_top_k``,
+       ``_master_top_p``) — sized ``[max_batch_size]`` and indexed by a stable
+       per-request slot. Each active request occupies one slot.
+
+    The per-step path (``gather_for_request_ids``) builds a small slot-index
+    tensor on a pinned CPU buffer, async-copies it to GPU, and runs three
+    ``torch.index_select`` calls into the per-step buffers. This replaces the
+    old per-step Python loop that issued ``temps[i] = float(...)``-style
+    item-assignments (one tiny H2D + kernel launch per element), which
+    competed with the async-engine pipeline for host-side throughput.
+
+    Seeds are kept GPU-local: ``seed_buf`` is refilled per step via
+    ``torch.randint`` on device, preserving step-to-step randomization
+    without any CPU sync.
     """
     max_batch_size: int
     temperature_buf: torch.Tensor   # [max_bs], float32
-    w_config_temperature_buf: torch.Tensor
     top_k_buf: torch.Tensor         # [max_bs], int32
     top_p_buf: torch.Tensor         # [max_bs], float32
     seed_buf: torch.Tensor          # [max_bs], int64
     offset_buf: torch.Tensor        # [max_bs], int64
+    # Master cache: one row per active request, indexed by slot. Grown
+    # dynamically (doubling) when more than ``max_batch_size`` requests are
+    # in-flight simultaneously — the master is decoupled from the per-step
+    # buffer size so registered-but-not-batched requests don't constrain the
+    # cuda-graph capture batch sizes.
+    _master_temperature: torch.Tensor = field(default=None, repr=False)
+    _master_top_k: torch.Tensor = field(default=None, repr=False)
+    _master_top_p: torch.Tensor = field(default=None, repr=False)
+    _master_capacity: int = field(default=0, repr=False)
+    # Per-step slot-index staging. ``_slot_idx_cpu`` is pinned so the H2D
+    # copy can be issued non-blocking; ``_slot_idx_gpu`` is the device-side
+    # index tensor that ``index_select`` reads from.
+    _slot_idx_cpu: torch.Tensor = field(default=None, repr=False)
+    _slot_idx_gpu: torch.Tensor = field(default=None, repr=False)
+    # Single-row pinned staging used by ``register_request`` /
+    # ``update_request_config`` to push (temperature, top_k, top_p) for one
+    # slot via a single async H2D per buffer (rather than 3 elementwise
+    # item-assignments on the GPU master buffers).
+    _row_temp_cpu: torch.Tensor = field(default=None, repr=False)
+    _row_top_k_cpu: torch.Tensor = field(default=None, repr=False)
+    _row_top_p_cpu: torch.Tensor = field(default=None, repr=False)
+    # Slot bookkeeping (CPU-only).
+    _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
+    _free_slots: list[int] = field(default_factory=list, repr=False)
+    # Last-known config per rid — change-detect for ``update_request_config``
+    # so steady-state per-step calls do zero GPU work.
+    _cached_config: dict[str, SamplingConfig] = field(default_factory=dict, repr=False)
 
     @classmethod
     def allocate(
@@ -595,25 +637,48 @@ class SamplerBuffers:
         """Allocate zero-initialised sampling buffers for ``max_batch_size``.
         """
         temperature_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
-        w_config_temperature_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
         top_k_buf = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
         top_p_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
         seed_buf = torch.zeros(max_batch_size, dtype=torch.long, device=device)
         offset_buf = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+
+        # Master cache initialised to the same defaults as a SamplingConfig()
+        # row would produce (temp=1, top_k=0, top_p=1) — these defaults are
+        # what an unregistered slot would surface if accidentally indexed.
+        master_temperature = torch.ones(max_batch_size, dtype=torch.float32, device=device)
+        master_top_k = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
+        master_top_p = torch.ones(max_batch_size, dtype=torch.float32, device=device)
+
+        # Pinned CPU staging — small, allocated once, reused every step.
+        pinned = torch.cuda.is_available() and device.type == "cuda"
+        slot_idx_cpu = torch.zeros(max_batch_size, dtype=torch.long, pin_memory=pinned)
+        slot_idx_gpu = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+        row_temp_cpu = torch.zeros(1, dtype=torch.float32, pin_memory=pinned)
+        row_top_k_cpu = torch.zeros(1, dtype=torch.int32, pin_memory=pinned)
+        row_top_p_cpu = torch.zeros(1, dtype=torch.float32, pin_memory=pinned)
+
         return cls(
             max_batch_size=max_batch_size,
             temperature_buf=temperature_buf,
-            w_config_temperature_buf=w_config_temperature_buf,
             top_k_buf=top_k_buf,
             top_p_buf=top_p_buf,
             seed_buf=seed_buf,
             offset_buf=offset_buf,
+            _master_temperature=master_temperature,
+            _master_top_k=master_top_k,
+            _master_top_p=master_top_p,
+            _master_capacity=max_batch_size,
+            _slot_idx_cpu=slot_idx_cpu,
+            _slot_idx_gpu=slot_idx_gpu,
+            _row_temp_cpu=row_temp_cpu,
+            _row_top_k_cpu=row_top_k_cpu,
+            _row_top_p_cpu=row_top_p_cpu,
+            _free_slots=list(range(max_batch_size)),
         )
 
     def slice_for_bs(self, bs: int) -> dict[str, torch.Tensor]:
         """Return bs-sized views into each buffer (zero-copy slices)."""
         return {
-            "w_config_temperature_buf": self.w_config_temperature_buf[:bs],
             "temperature_buf": self.temperature_buf[:bs],
             "top_k_buf": self.top_k_buf[:bs],
             "top_p_buf": self.top_p_buf[:bs],
@@ -621,37 +686,154 @@ class SamplerBuffers:
             "offset_buf": self.offset_buf[:bs],
         }
 
+    # ------------------------------------------------------------------
+    # Master-cache lifecycle: register / unregister / update per request
+    # ------------------------------------------------------------------
 
-def _build_sampling_lists(
-    request_ids: list[str],
-    sampling_configs: dict[str, SamplingConfig],
-    padded_bs: int,
-    device: torch.device
-):
-    """Resolve per-request sampling config into flat Python lists of length ``padded_bs``.
-    """
-    temps = torch.ones(padded_bs, device=device)
-    # in the sampler, topk=0 maps to unrestricted top k
-    top_ks = torch.zeros(padded_bs, dtype=torch.int32, device=device)
-    top_ps = torch.ones(padded_bs, device=device)
+    def _write_master_row(self, slot: int, cfg: SamplingConfig) -> None:
+        """Push one config row into the master GPU buffers via pinned H2D.
 
-    for i, rid in enumerate(request_ids):
-        cfg = sampling_configs.get(rid, SamplingConfig())
-        # Propagate temperature unconditionally (including 0). The fused
-        # softmax kernel's INCLUDE_GREEDY path keys off ``temp == 0`` to emit a
-        # one-hot at the argmax; if we left temps[i] at the init value of 1.0
-        # for greedy requests the kernel would never see 0 and would fall
-        # through to full-distribution sampling with top_k=0 (unrestricted) —
-        # which is what was happening when callers passed temperature=0.
-        temps[i] = float(cfg.temperature)
+        Three async non-blocking copies, one per master tensor. Cheap; only
+        runs on register or actual config change (change-detection lives in
+        ``update_request_config``).
+        """
         if cfg.temperature > 0:
-            top_ks[i] = int(cfg.top_k)
-            top_ps[i] = float(cfg.top_p) if cfg.top_p else 1.0
-        # When cfg.temperature == 0, top_k/top_p don't matter — the kernel
-        # produces a one-hot distribution and multinomial sampling from it
-        # returns the argmax regardless.
-    return temps, top_ks, top_ps, \
-        torch.randint(0, 2**32, (padded_bs,), dtype=torch.long, device=device)
+            t = float(cfg.temperature)
+            k = int(cfg.top_k)
+            p = float(cfg.top_p) if cfg.top_p else 1.0
+        else:
+            # Greedy: kernel takes the one-hot/argmax branch regardless of
+            # top_k/top_p, so park them at the disabled defaults.
+            t, k, p = 1.0, 0, 1.0
+
+        self._row_temp_cpu[0] = t
+        self._row_top_k_cpu[0] = k
+        self._row_top_p_cpu[0] = p
+        self._master_temperature[slot:slot + 1].copy_(self._row_temp_cpu, non_blocking=True)
+        self._master_top_k[slot:slot + 1].copy_(self._row_top_k_cpu, non_blocking=True)
+        self._master_top_p[slot:slot + 1].copy_(self._row_top_p_cpu, non_blocking=True)
+
+    def _grow_master(self, new_capacity: int) -> None:
+        """Double-and-copy the master buffers up to at least ``new_capacity``.
+
+        Triggered when the number of concurrently-registered requests exceeds
+        the current master capacity. Per-step buffers (sized to the cuda-graph
+        max_bs) are NOT resized — the gather only reads ``padded_bs`` rows
+        from master, which always fits within the per-step buffer.
+        """
+        device = self._master_temperature.device
+        new_temp = torch.ones(new_capacity, dtype=torch.float32, device=device)
+        new_top_k = torch.zeros(new_capacity, dtype=torch.int32, device=device)
+        new_top_p = torch.ones(new_capacity, dtype=torch.float32, device=device)
+        new_temp[: self._master_capacity].copy_(self._master_temperature)
+        new_top_k[: self._master_capacity].copy_(self._master_top_k)
+        new_top_p[: self._master_capacity].copy_(self._master_top_p)
+        self._master_temperature = new_temp
+        self._master_top_k = new_top_k
+        self._master_top_p = new_top_p
+        self._free_slots.extend(range(self._master_capacity, new_capacity))
+        self._master_capacity = new_capacity
+
+    def register_request(
+        self, rid: str, sampling_config: SamplingConfig | None = None,
+    ) -> None:
+        """Allocate a slot for ``rid`` and seed its master row."""
+        if rid in self._rid_to_slot:
+            # Re-registration: just refresh the config in place.
+            if sampling_config is not None:
+                self.update_request_config(rid, sampling_config)
+            return
+        if not self._free_slots:
+            self._grow_master(self._master_capacity * 2)
+        slot = self._free_slots.pop()
+        self._rid_to_slot[rid] = slot
+        cfg = sampling_config if sampling_config is not None else SamplingConfig()
+        self._cached_config[rid] = cfg
+        self._write_master_row(slot, cfg)
+
+    def unregister_request(self, rid: str) -> None:
+        """Free the slot owned by ``rid`` (no GPU writes)."""
+        slot = self._rid_to_slot.pop(rid, None)
+        if slot is None:
+            return
+        self._cached_config.pop(rid, None)
+        self._free_slots.append(slot)
+
+    def update_request_config(
+        self, rid: str, sampling_config: SamplingConfig,
+    ) -> None:
+        """Update the master row for ``rid`` only when its config changed.
+
+        AR engine calls this every step (mirroring the existing
+        ``Sampler.set_config`` per-step pattern). Steady-state requests have
+        identical configs across steps, so the change-check skips the H2D
+        path entirely.
+        """
+        slot = self._rid_to_slot.get(rid)
+        if slot is None:
+            # Request not yet registered for this submodule (e.g. ar_engine
+            # may invoke set_config for a node that doesn't own a runner /
+            # SamplerBuffers). Silently no-op.
+            return
+        prev = self._cached_config.get(rid)
+        if prev == sampling_config:
+            return
+        self._cached_config[rid] = sampling_config
+        self._write_master_row(slot, sampling_config)
+
+    # ------------------------------------------------------------------
+    # Per-step gather: pinned-H2D slot-index → index_select into per-step bufs
+    # ------------------------------------------------------------------
+
+    def gather_for_request_ids(
+        self, request_ids: list[str], padded_bs: int,
+    ) -> "CudaGraphableSampler":
+        """Materialise the per-step sampling tensors for ``request_ids``.
+
+        Padding slots (``i >= len(request_ids)``) reuse slot 0's row — the
+        captured graph forwards them through the same kernels as real slots,
+        but their outputs are discarded by the runner's dummy-rid remap, so
+        the row contents don't matter as long as they're well-formed.
+        """
+        assert padded_bs <= self.max_batch_size, (
+            f"padded_bs={padded_bs} exceeds SamplerBuffers.max_batch_size="
+            f"{self.max_batch_size}"
+        )
+
+        # CPU-only fill of the pinned slot-index buffer. Unregistered rids
+        # fall back to slot 0 (matches the old code's defaults — temp=1,
+        # top_k=0, top_p=1 — for any rid the AR engine forgot to register).
+        for i, rid in enumerate(request_ids):
+            self._slot_idx_cpu[i] = self._rid_to_slot.get(rid, 0)
+        for i in range(len(request_ids), padded_bs):
+            self._slot_idx_cpu[i] = 0
+
+        # Single async H2D (pinned) of the slot indices.
+        idx_view = self._slot_idx_gpu[:padded_bs]
+        idx_view.copy_(self._slot_idx_cpu[:padded_bs], non_blocking=True)
+
+        # Three GPU index_select kernels, writing directly into the
+        # cuda-graph-friendly per-step buffers.
+        torch.index_select(
+            self._master_temperature, 0, idx_view,
+            out=self.temperature_buf[:padded_bs],
+        )
+        torch.index_select(
+            self._master_top_k, 0, idx_view, out=self.top_k_buf[:padded_bs],
+        )
+        torch.index_select(
+            self._master_top_p, 0, idx_view, out=self.top_p_buf[:padded_bs],
+        )
+
+        # Fresh seeds + zeroed offsets, both GPU-side (no host sync).
+        torch.randint(
+            0, 2**32, (padded_bs,), dtype=torch.long,
+            device=self.seed_buf.device, out=self.seed_buf[:padded_bs],
+        )
+        self.offset_buf[:padded_bs].zero_()
+
+        slices = self.slice_for_bs(padded_bs)
+        return CudaGraphableSampler(**slices)
 
 
 def make_sampler_from_buffers(
@@ -659,20 +841,12 @@ def make_sampler_from_buffers(
     request_ids: list[str],
     sampling_configs: dict[str, SamplingConfig],
     padded_bs: int,
-
 ) -> CudaGraphableSampler:
-    assert padded_bs <= bufs.max_batch_size, (
-        f"padded_bs={padded_bs} exceeds MTPSamplerBuffers.max_batch_size={bufs.max_batch_size}"
-    )
+    """Compatibility shim. Prefer ``bufs.gather_for_request_ids`` directly.
 
-    temps, top_ks, top_ps, seed = _build_sampling_lists(
-        request_ids, sampling_configs, padded_bs,
-        device=bufs.temperature_buf.device
-    )
-    bufs.temperature_buf[:padded_bs].copy_(temps)
-    bufs.top_k_buf[:padded_bs].copy_(top_ks)
-    bufs.top_p_buf[:padded_bs].copy_(top_ps)
-    bufs.seed_buf[:padded_bs].copy_(seed)
-    bufs.offset_buf[:padded_bs].zero_()
-    slices = bufs.slice_for_bs(padded_bs)
-    return CudaGraphableSampler(**slices)
+    ``sampling_configs`` is no longer consulted — per-request configs live
+    on ``bufs`` (set via ``register_request`` / ``update_request_config``).
+    The argument is kept for source-level compatibility with older callers.
+    """
+    del sampling_configs
+    return bufs.gather_for_request_ids(request_ids, padded_bs)
