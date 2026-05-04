@@ -1409,43 +1409,60 @@ class Qwen3OmniModel(Model):
         return AudioEncoderSubmodule(audio_encoder=audio_encoder, config=self.config)
 
     def _create_vision_encoder_submodule(self, device: str) -> NodeSubmodule:
-        """Load the vision encoder (SigLIP2 ViT) from HF weights."""
-        # Reuse HF vision encoder directly
-        from transformers import AutoConfig
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-            Qwen3OmniMoeVisionEncoder,
-        )
+        """Load the vision encoder from HF weights into mminf's hand-rolled
+        ``Qwen3OmniVisionEncoder``.
 
+        We construct the full HF AutoConfig only to grab the vision
+        sub-config (which carries ``patch_size``, ``temporal_patch_size``,
+        ``in_channels``, ``num_position_embeddings``, ``intermediate_size``,
+        ``hidden_act`` — fields not currently mirrored in
+        ``mminf.model.qwen3_omni.config.VisionEncoderConfig``). The
+        encoder reads attribute names that match HF, so weight loading
+        with ``thinker.visual`` prefix works directly with no
+        ``WeightConverter``.
+
+        Why we don't use HF's reference encoder anymore:
+
+        * HF's defensive code (``attention_interface`` registry lookup,
+          ``try/except RuntimeError`` for AMD/RDNA3 fallbacks, etc.)
+          fights ``torch.compile(fullgraph=False)`` — graph breaks +
+          shape-specialized recompiles per video.
+        * Even with ``attn_implementation="flash_attention_2"`` the FA2
+          path still goes through HF's wrapper layer that we don't need.
+        * vllm-omni demonstrates the lean from-scratch implementation
+          runs faster eager. ``mminf/model/qwen3_omni/components/vision.py``
+          is the mminf-native equivalent, calling
+          ``flash_attn_varlen_func`` directly.
+        """
+        from transformers import AutoConfig
+
+        from mminf.model.qwen3_omni.components.vision import Qwen3OmniVisionEncoder
         from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
-        # Load full config (no weights)
-        config = AutoConfig.from_pretrained(
+        # Load full config to get vision-config attributes that mminf's
+        # simplified ``VisionEncoderConfig`` doesn't mirror.
+        hf_config = AutoConfig.from_pretrained(
             self.local_dir,
             trust_remote_code=True,
         )
+        vision_config = hf_config.thinker_config.vision_config
 
-        # Extract the vision sub-config
-        vision_config = config.thinker_config.vision_config
-
-        # Build the vision encoder.
-        # CRITICAL: pass attn_implementation="flash_attention_2". Without
-        # this, vision_config._attn_implementation defaults to None and is
-        # resolved to "sdpa" at runtime (modeling_utils.py:1889). With
-        # "sdpa", Qwen3OmniMoeVisionAttention.forward falls into the
-        # per-segment Python loop (modeling_qwen3_omni_moe.py:892-913),
-        # which issues N sequential attention calls per layer for an
-        # N-frame video. This causes the 10× V2T/V2S TTFT regression vs
-        # vllm-omni. With "flash_attention_2", a single varlen FA2 call
-        # per layer handles all frames at once via cu_seqlens.
-        vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(
-            vision_config, attn_implementation="flash_attention_2"
-        )
+        # No meta-device construction — the vision encoder is ~1B params
+        # (small relative to the 30B thinker), and our
+        # ``Qwen3OmniVisionRotaryEmbedding.inv_freq`` is a non-persistent
+        # buffer that ``load_state_dict(assign=True)`` leaves untouched;
+        # under meta that buffer would be stuck on meta and break the
+        # first forward. We allocate on default device, replace
+        # parameters via the load path, then ``.to(device)`` to move the
+        # non-persistent buffer with everything else.
+        vision_encoder = Qwen3OmniVisionEncoder(vision_config)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
             modules=[ModuleAndPrefix(vision_encoder, prefix="thinker.visual")],
             device=device,
         )
+        vision_encoder = vision_encoder.to(device)
         vision_encoder.eval()
 
         from mminf.model.qwen3_omni.submodules import VisionEncoderSubmodule
