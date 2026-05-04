@@ -171,10 +171,15 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         key_states = k.view(bsz, seq_len, -1, self.head_dim)
         value_states = v.view(bsz, seq_len, -1, self.head_dim)
 
-        # flashinfer rope is in-place and expects (nnz, n_heads, head_dim) + flat positions.
-        # The flat views share storage with query_states/key_states, so the rotation lands
-        # back in the (bs, seq_len, ...) tensors we pass to attention. HF Code2Wav uses
+        # flashinfer's RoPE kernel and flash_attn_func only dispatch to fp16/bf16.
+        # Cast Q/K/V here once so RoPE can run in-place on the bf16 tensors and
+        # the result feeds straight into flash_attn. HF Code2Wav uses
         # nn.Identity() for q_norm/k_norm — no QK normalization, only RoPE.
+        orig_dtype = query_states.dtype
+        query_states = query_states.to(torch.bfloat16)
+        key_states = key_states.to(torch.bfloat16)
+        value_states = value_states.to(torch.bfloat16)
+
         q_flat = query_states.view(bsz * seq_len, -1, self.head_dim)
         k_flat = key_states.view(bsz * seq_len, -1, self.head_dim)
 
@@ -188,11 +193,10 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         # Causal sliding-window attention; no explicit mask needed. HF defines
         # ``sliding_window`` as the total window size including the current token,
         # whereas flash-attn's ``window_size=(W, 0)`` allows ``W+1`` positions.
-        orig_dtype = query_states.dtype
         attn_output = flash_attn_func(
-            query_states.to(torch.bfloat16),
-            key_states.to(torch.bfloat16),
-            value_states.to(torch.bfloat16),
+            query_states,
+            key_states,
+            value_states,
             causal=True,
             window_size=(self.sliding_window - 1, 0),
             softmax_scale=self.scaling,
