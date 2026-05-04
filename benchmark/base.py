@@ -173,30 +173,33 @@ class Qwen3Omni(Model):
         # comparison becomes "whose EOS detection terminates earlier?"
         # rather than "whose decode is faster per token?".
         #
-        # Force greedy on every sub-model that participates so cross-system
-        # runs see deterministic tokens for the same prompt. mminf's
-        # qwen3_omni_model.py:521-540 defaults are thinker=0.7, talker=0.9,
-        # cp=1.0, which would otherwise make output length (and therefore
-        # RTF / audio duration / text token count) vary across runs.
-        # Send both `max_tokens` (OpenAI convention — vllm-omni / sglang-omni)
-        # and `max_output_tokens` (mminf's own kwarg, read in
-        # mminf/model/base.py:372-373; default MAX_OUTPUT_TOKENS=2048). Without
-        # the second key, mminf silently ignores the cap and runs to natural
-        # EOS, which on T2T was observed at ~361 tokens/req vs vllm-omni's 256.
-        kwargs = {
+        # Force greedy on the Thinker (text decoding) so cross-system runs
+        # see deterministic text for the same prompt. Send both `max_tokens`
+        # (OpenAI convention — vllm-omni / sglang-omni) and `max_output_tokens`
+        # (mminf's own kwarg, read in mminf/model/base.py:372-373; default
+        # MAX_OUTPUT_TOKENS=2048). Without the second key, mminf silently
+        # ignores the cap and runs to natural EOS, which on T2T was observed
+        # at ~361 tokens/req vs vllm-omni's 256.
+        #
+        # talker_temperature / cp_temperature intentionally NOT set: vllm-omni's
+        # ``serving_chat._build_sampling_params_list_from_request`` only applies
+        # the request's ``temperature`` to Stage 0 (Thinker) and clones YAML
+        # defaults for Stage 1 (Talker) — ``temperature=0.9, top_k=50,
+        # repetition_penalty=1.05`` per ``vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml``.
+        # vllm-omni's own benchmark (``vllm_omni/benchmarks/patch/patch.py:335``)
+        # sends ``temperature: 0.0`` over the wire just like we do, but the
+        # vllm-omni server quietly drops it for the Talker stage. vllm-omni even
+        # warns explicitly that ``temperature=0`` on Talker may cause repetitive
+        # output. Forcing greedy on mminf's Talker here was a false equivalence —
+        # mminf has no stage isolation, so it actually applied talker_temperature=0,
+        # collapsing the Talker to a degenerate "mee mee mee" repetition attractor.
+        # Letting mminf use its own model default (talker_temperature=0.9) restores
+        # apples-to-apples behavior with vllm-omni's effective Talker sampling.
+        return {
             "max_tokens": 256,
             "max_output_tokens": 256,
             "thinker_temperature": 0.0,
         }
-        if request_type in (
-            RequestType.T2S,
-            RequestType.I2S,
-            RequestType.A2S,
-            RequestType.V2S,
-        ):
-            kwargs["talker_temperature"] = 0.0
-            kwargs["cp_temperature"] = 0.0
-        return kwargs
 
     def get_supported_modalities(self):
         return {
