@@ -18,52 +18,6 @@ from mminf.utils.attention import apply_rope_pos_ids, rms_norm, sliding_window_a
 logger = logging.getLogger(__name__)
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """HF GPT-NeoX-style rotate-half: split last dim, swap halves with sign flip."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply HF-style RoPE to q, k of shape (bs, num_heads, seq_len, head_dim).
-
-    cos, sin have shape (bs, seq_len, head_dim); unsqueeze for the heads axis.
-    """
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def _build_rope_cos_sin(
-    position_ids: torch.Tensor,
-    head_dim: int,
-    rope_theta: float,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute RoPE cos/sin in fp32 (HF reference convention) for the given positions.
-
-    Returns cos/sin of shape (bs, seq_len, head_dim) cast to ``dtype``.
-    """
-    if position_ids.dim() == 1:
-        position_ids = position_ids.unsqueeze(0)
-    inv_freq = 1.0 / (
-        rope_theta
-        ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
-    )
-    freqs = position_ids.to(torch.float32).unsqueeze(-1) * inv_freq  # (bs, seq, head_dim/2)
-    emb = torch.cat([freqs, freqs], dim=-1)  # (bs, seq, head_dim)
-    return emb.cos().to(dtype), emb.sin().to(dtype)
-
-
 class Qwen3OmniMoeCausalConvNet(nn.Module):
     def __init__(
         self,
@@ -210,30 +164,25 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
 
         qkv = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
         q, k, v = qkv.split((self.q_size, self.kv_size, self.kv_size), dim=-1)
-        # Use HF layout: (bs, num_heads, seq_len, head_dim) for SDPA + apply_rotary_pos_emb.
-        query_states = q.view(bsz, seq_len, -1, self.head_dim).transpose(1, 2)
-        key_states = k.view(bsz, seq_len, -1, self.head_dim).transpose(1, 2)
-        value_states = v.view(bsz, seq_len, -1, self.head_dim).transpose(1, 2)
+        q = q.view(bsz, seq_len, self.config.num_attention_heads, self.head_dim)
+        k = k.view(bsz, seq_len, self.config.num_key_value_heads, self.head_dim)
+        v = v.view(bsz, seq_len, self.config.num_key_value_heads, self.head_dim)
 
-        q_flat = query_states.view(bsz * seq_len, -1, self.head_dim)
-        k_flat = key_states.view(bsz * seq_len, -1, self.head_dim)
+        q_flat = q.view(bsz * seq_len, -1, self.head_dim)
+        k_flat = k.view(bsz * seq_len, -1, self.head_dim)
 
         flat_pos = position_ids.reshape(-1).to(torch.int32)
         apply_rope_pos_ids(
             q_flat, k_flat, flat_pos,
             rope_theta=self.rope_theta,
         )
-        query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         attn_output = sliding_window_attn(
-            query_states,
-            key_states,
-            value_states,
-            window=self.sliding_window ,
+            q, k, v,
+            window=self.sliding_window,
             scale=self.scaling,
-        )
+        ).reshape(bsz, seq_len, -1)
 
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, seq_len, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, None
 
