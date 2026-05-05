@@ -367,9 +367,10 @@ class BatchedCacheManager:
         #   issue plan() while the main thread submits sample(N).
         #
         # Risks / prerequisites:
-        #   * PagedAllocationManager mutation (.alloc, .reset_label) is not
-        #     currently thread-safe — needs a per-manager mutex, or the
-        #     worker must operate on a snapshot captured at "end of step N".
+        #   * PagedAllocationManager mutation (.alloc, .reset_label, etc.)
+        #     is now guarded by a per-manager RLock; the underlying
+        #     PageAllocator's queue compound-ops are guarded by their own
+        #     Lock so qsize-then-get cannot race with concurrent free.
         #   * advance_seq_lens() inside a captured CUDA graph updates state
         #     via .copy_(); the worker must wait on a real cudaEvent, not a
         #     torch stream sync, before reading page indices.

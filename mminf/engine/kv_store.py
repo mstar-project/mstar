@@ -1,5 +1,6 @@
 import logging
 import queue
+import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -21,31 +22,44 @@ logger = logging.getLogger(__name__)
 
 
 class PageAllocator:
-    """Simple page allocator using a FIFO queue of free page indices."""
+    """Simple page allocator using a FIFO queue of free page indices.
+
+    Thread-safe: a ``threading.Lock`` makes the qsize-then-get sequence in
+    ``allocate``/``try_allocate`` atomic against concurrent ``free`` calls.
+    Required by the Phase 3 spec/pre-plan path, where the plan thread runs
+    ``try_allocate`` while the GPU thread runs ``free`` from
+    ``reset_label`` — the unlocked qsize/get pair could false-negative
+    (return None when pages are about to be freed) or partially fill the
+    output list under multi-consumer contention.
+    """
 
     def __init__(self, max_num_pages: int):
         self.max_num_pages = max_num_pages
         self.free_pages: queue.Queue[int] = queue.Queue()
+        self._lock = threading.Lock()
         for i in range(max_num_pages):
             self.free_pages.put(i)
 
     def allocate(self, n: int) -> list[int]:
-        if self.free_pages.qsize() < n:
-            raise RuntimeError(
-                f"Not enough free pages: requested {n}, "
-                f"available {self.free_pages.qsize()}"
-            )
-        return [self.free_pages.get() for _ in range(n)]
+        with self._lock:
+            if self.free_pages.qsize() < n:
+                raise RuntimeError(
+                    f"Not enough free pages: requested {n}, "
+                    f"available {self.free_pages.qsize()}"
+                )
+            return [self.free_pages.get() for _ in range(n)]
 
     def try_allocate(self, n: int) -> list[int] | None:
         """Like allocate() but returns None instead of raising on failure."""
-        if self.free_pages.qsize() < n:
-            return None
-        return [self.free_pages.get() for _ in range(n)]
+        with self._lock:
+            if self.free_pages.qsize() < n:
+                return None
+            return [self.free_pages.get() for _ in range(n)]
 
     def free(self, pages: list[int]) -> None:
-        for page in pages:
-            self.free_pages.put(page)
+        with self._lock:
+            for page in pages:
+                self.free_pages.put(page)
 
     @property
     def num_free(self) -> int:
@@ -367,6 +381,12 @@ class PagedAllocationManager:
         self.request_states: dict[str, LabelToState] = {}
         self.kv_cache = kv_cache
         self.write_policy = StoreWritePolicy.ALWAYS
+        # RLock guards request_states mutation against concurrent
+        # plan-thread alloc vs GPU-thread reset_label/remove_request.
+        # RLock (not Lock) so a future caller that nests another guarded
+        # method inside ``alloc``/``reset_label`` (e.g. wrapping
+        # ``start_async_retrieve``) doesn't self-deadlock.
+        self._lock = threading.RLock()
 
         if isinstance(
             transfer_engine_info.transfer_engine, MooncakeTransferEngine
@@ -425,23 +445,24 @@ class PagedAllocationManager:
     def alloc(
         self, request_id: str, label: str, seq_len: int
     ):
-        state = self.request_states[request_id][label]
-        num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
-        num_new_pages = num_pages_needed - len(state.page_indices)
-        if num_new_pages > 0:
-            new_pages = self.page_allocator.try_allocate(num_new_pages)
-            if new_pages is None:
-                self.alloc_status = AllocationStatus(
-                    success=False,
-                    pages_short=num_new_pages - self.page_allocator.num_free,
-                    request_id=request_id,
-                    label=label,
-                )
-                raise RuntimeError(
-                    f"Not enough free pages: requested {num_new_pages}, "
-                    f"available {self.page_allocator.num_free}"
-                )
-            state.page_indices.extend(new_pages)
+        with self._lock:
+            state = self.request_states[request_id][label]
+            num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
+            num_new_pages = num_pages_needed - len(state.page_indices)
+            if num_new_pages > 0:
+                new_pages = self.page_allocator.try_allocate(num_new_pages)
+                if new_pages is None:
+                    self.alloc_status = AllocationStatus(
+                        success=False,
+                        pages_short=num_new_pages - self.page_allocator.num_free,
+                        request_id=request_id,
+                        label=label,
+                    )
+                    raise RuntimeError(
+                        f"Not enough free pages: requested {num_new_pages}, "
+                        f"available {self.page_allocator.num_free}"
+                    )
+                state.page_indices.extend(new_pages)
 
     def wait_for_retrieves(
         self, request_id: str, label: str
@@ -545,10 +566,11 @@ class PagedAllocationManager:
 
     def reset_label(self, request_id: str, label: str, free: bool=True):
         self.wait_for_retrieves(request_id, label)
-        if label in self.request_states[request_id] and free:
-            state = self.request_states[request_id][label]
-            self.page_allocator.free(state.page_indices)
-        self.request_states[request_id][label] = self._new_state()
+        with self._lock:
+            if label in self.request_states[request_id] and free:
+                state = self.request_states[request_id][label]
+                self.page_allocator.free(state.page_indices)
+            self.request_states[request_id][label] = self._new_state()
 
     def cleanup(self):
         self._kv_transfer_engine.shutdown()
@@ -556,20 +578,23 @@ class PagedAllocationManager:
     def add_request(self, request_id: str, labels: list[str]=None):
         if labels is None:
             labels = []
-        self.request_states[request_id] = {
-            label: self._new_state() for label in labels
-        }
-        self.pending_reads[request_id] = {
-            label: [] for label in labels
-        }
+        with self._lock:
+            self.request_states[request_id] = {
+                label: self._new_state() for label in labels
+            }
+            self.pending_reads[request_id] = {
+                label: [] for label in labels
+            }
 
     def remove_request(self, request_id: str):
         for label in self.request_states[request_id]:
             self.wait_for_retrieves(request_id, label)
-            state = self.request_states[request_id][label]
-            self.page_allocator.free(state.page_indices)
-        del self.request_states[request_id]
-        del self.pending_reads[request_id]
+        with self._lock:
+            for label in self.request_states[request_id]:
+                state = self.request_states[request_id][label]
+                self.page_allocator.free(state.page_indices)
+            del self.request_states[request_id]
+            del self.pending_reads[request_id]
 
     # ----- CPU offloading helpers -----
 
@@ -579,7 +604,13 @@ class PagedAllocationManager:
         Returns the total number of GPU pages freed.
         """
         freed = 0
-        for label, state in self.request_states[request_id].items():
+        # wait_for_retrieves can BLOCK on future.result(); release the
+        # manager lock around it so the plan thread can still acquire
+        # the lock for ``alloc`` while we wait. cpu_pool.offload_pages
+        # also touches GPU streams and is best left outside the lock.
+        with self._lock:
+            labels = list(self.request_states[request_id].items())
+        for label, state in labels:
             if not state.page_indices:
                 continue
             self.wait_for_retrieves(request_id, label)
@@ -587,24 +618,26 @@ class PagedAllocationManager:
                 request_id, label, self.kv_cache,
                 state.page_indices, state.seq_len, state.position_id_start,
             )
-            freed += len(state.page_indices)
-            self.page_allocator.free(state.page_indices)
-            state.page_indices = []
-            state.seq_len = 0
+            with self._lock:
+                freed += len(state.page_indices)
+                self.page_allocator.free(state.page_indices)
+                state.page_indices = []
+                state.seq_len = 0
         return freed
 
     def reload_request(self, request_id: str, cpu_pool) -> None:
         """Reload all labels for a request from *cpu_pool* back to GPU."""
-        for label in list(cpu_pool.offloaded.get(request_id, {}).keys()):
-            offloaded = cpu_pool.offloaded[request_id][label]
-            n_pages = len(offloaded.cpu_page_indices)
-            gpu_pages = self.page_allocator.allocate(n_pages)
-            state = self.get_state(request_id, label)
-            state.page_indices = gpu_pages
-            seq_len, pos_id = cpu_pool.reload_pages(
-                request_id, label, self.kv_cache, gpu_pages,
-            )
-            state.seq_len = seq_len
-            state.position_id_start = pos_id
+        with self._lock:
+            for label in list(cpu_pool.offloaded.get(request_id, {}).keys()):
+                offloaded = cpu_pool.offloaded[request_id][label]
+                n_pages = len(offloaded.cpu_page_indices)
+                gpu_pages = self.page_allocator.allocate(n_pages)
+                state = self.get_state(request_id, label)
+                state.page_indices = gpu_pages
+                seq_len, pos_id = cpu_pool.reload_pages(
+                    request_id, label, self.kv_cache, gpu_pages,
+                )
+                state.seq_len = seq_len
+                state.position_id_start = pos_id
         cpu_pool.sync()
 
