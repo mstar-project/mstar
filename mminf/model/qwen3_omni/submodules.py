@@ -873,7 +873,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     }
                 ),
                 compile=True,
-                capture_batch_sizes=[1, 2, 4, 8, 16],
+                capture_batch_sizes=[1, 2, 4, 8, 16, 32],
             ),
             FlashInferPackedCudaGraphConfig(
                 capture_graph_walk="prefill_text",
@@ -1698,7 +1698,7 @@ class TalkerSubmodule(ARNodeSubmodule):
 
     # Fixed assistant prefix per request: pad*4 + bos + projected_thinker = 6.
     TALKER_LAST_PREFILL_TOKENS_PER_REQ = 6
-    TALKER_LAST_PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    TALKER_LAST_PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     def _build_talker_prefill_packed(
         self, num_tokens: int, device: torch.device,
@@ -1753,7 +1753,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                     ),
                     input_seq_len=1,
                 ),
-                capture_batch_sizes=[1, 2, 4, 8, 16],
+                capture_batch_sizes=[1, 2, 4, 8, 16, 32],
                 compile=True
             ),
             FlashInferPackedCudaGraphConfig(
@@ -1843,7 +1843,7 @@ class Code2WavSubmodule(NodeSubmodule):
                         "position_ids": torch.arange(self.full_seqlen, device=device)
                     },
                 ),
-                capture_batch_sizes=[1, 2, 4, 8, 16],
+                capture_batch_sizes=[1, 2, 4, 8, 16, 32],
                 compile=False
             ),
         ]

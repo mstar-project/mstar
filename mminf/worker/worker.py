@@ -2525,7 +2525,7 @@ class Worker:
                     if self.enable_nvtx:
                         range_push("worker.await_gpu", synchronize=False)
                     _t0 = _time.perf_counter() if phase_period else 0.0
-                    output = p_future.result()
+                    output: NodeOutput = p_future.result()
                     if phase_period:
                         _phase_record("await_gpu", _time.perf_counter() - _t0)
                     if self.enable_nvtx:

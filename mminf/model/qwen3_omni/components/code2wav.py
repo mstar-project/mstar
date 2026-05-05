@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import math
 
 import numpy as np
 import torch
@@ -29,6 +28,12 @@ class Qwen3OmniMoeCausalConvNet(nn.Module):
         groups=1,
     ):
         super().__init__()
+        if stride != 1:
+            raise NotImplementedError(
+                "Qwen3OmniMoeCausalConvNet inference path assumes stride=1; "
+                f"got stride={stride}. Re-add the runtime extra-padding calc "
+                "if you need stride>1."
+            )
         self.conv = nn.Conv1d(
             in_channels,
             out_channels,
@@ -40,33 +45,33 @@ class Qwen3OmniMoeCausalConvNet(nn.Module):
         self.stride = stride
         self.kernel_size = (kernel_size - 1) * dilation + 1
         self.dilation = dilation
+        # For stride=1 the original ``_get_extra_padding_for_conv1d`` always
+        # returns 0, so we only need a constant left pad.
         self.padding = self.kernel_size - self.stride
 
-    def _get_extra_padding_for_conv1d(self, hidden_state: torch.Tensor) -> int:
-        length = hidden_state.shape[-1]
-        n_frames = (length - self.kernel_size + self.padding) / self.stride + 1
-        ideal_length = (math.ceil(n_frames) - 1) * self.stride + (self.kernel_size - self.padding)
-        return ideal_length - length
-
     def forward(self, hidden_state):
-        extra_padding = self._get_extra_padding_for_conv1d(hidden_state)
-        hidden_state = F.pad(hidden_state, (self.padding, extra_padding), mode="constant", value=0)
-        return self.conv(hidden_state).contiguous()
+        hidden_state = F.pad(hidden_state, (self.padding, 0))
+        return self.conv(hidden_state)
 
 
 class Qwen3OmniMoeCausalTransConvNet(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1):
         super().__init__()
-        self.conv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride=stride)
-
+        # Original implementation ran a no-padding ConvTranspose1d and then
+        # sliced ``[pad : L - pad]`` off the temporal dim, which produced a
+        # non-contiguous view that had to be ``.contiguous()``'d (a full
+        # memcpy of the upsampled tensor — hundreds of MB on the deeper
+        # decoder blocks). ConvTranspose1d's own ``padding`` arg crops the
+        # output symmetrically by the same amount, mathematically
+        # identical, with no extra kernel.
         pad = kernel_size - stride
-        self.left_pad = math.ceil(pad)
-        self.right_pad = pad = self.left_pad
+        self.conv = nn.ConvTranspose1d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=pad,
+        )
 
     def forward(self, hidden_state):
-        hidden_state = self.conv(hidden_state)
-        hidden_state = hidden_state[..., self.left_pad : hidden_state.shape[-1] - self.right_pad]
-        return hidden_state.contiguous()
+        return self.conv(hidden_state)
 
 
 class Qwen3OmniMoeConvNeXtBlock(nn.Module):
@@ -458,6 +463,12 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         for module in self.modules():
             if isinstance(module, SnakeBeta):
                 module.consolidate_snake_params()
+        # Compile the forward to fuse the SnakeBeta + Conv1d + F.pad
+        # element-wise chains in the upsample/decoder stacks (the dominant
+        # cost). The pre_transformer carries ``@torch.compiler.disable`` so
+        # it remains an eager graph break and its custom RoPE/RMSNorm/SDPA
+        # kernels are unaffected.
+        self.forward = torch.compile(self.forward, dynamic=False)
 
     def forward(
         self, codes: torch.Tensor,
