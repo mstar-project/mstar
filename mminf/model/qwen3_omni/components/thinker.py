@@ -196,6 +196,10 @@ class Qwen3OmniThinkerModel(nn.Module):
         # and zero where we do not have visual tokens!!
         hidden_states += visual_embeds
         return hidden_states
+    
+    def set_qkv_proj_weights(self):
+        for layer in self.model.layers:
+            layer.self_attn.set_qkv_proj_weight()
 
     def forward(
         self,

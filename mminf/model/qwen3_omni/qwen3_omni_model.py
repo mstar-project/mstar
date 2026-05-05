@@ -1233,6 +1233,7 @@ class Qwen3OmniModel(Model):
         )
 
         thinker_model.eval()
+        thinker_model.set_qkv_proj_weights()
 
         # Return a placeholder -- the actual ThinkerSubmodule class will be
         # implemented in a separate submodules.py file.
@@ -1273,6 +1274,8 @@ class Qwen3OmniModel(Model):
         code_predictor.consolidate_stacked_weights()
         code_predictor.set_qkv_proj_weights()
         code_predictor.eval()
+
+        talker_model.set_qkv_proj_weights()
 
         from mminf.model.qwen3_omni.submodules import TalkerSubmodule
         talker_sub = TalkerSubmodule(
