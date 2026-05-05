@@ -409,6 +409,10 @@ class Food101Dataset(BaseDataset):
             cache_dir=cache_dir,
             trust_remote_code=True,
         )
+        # Shuffle with a fixed seed so we get class-diverse images while
+        # remaining deterministic across runs (so the same N images appear in
+        # the same order on every benchmark invocation).
+        raw = raw.shuffle(seed=42)
         raw = raw.select(range(min(100, len(raw))))
 
         # Build label lookup (int -> class name string)
