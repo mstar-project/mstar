@@ -1135,6 +1135,30 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # drop thinker_states and thinker_match
             outputs.pop("thinker_states", None)
             outputs.pop("thinker_mask", None)
+        else:
+            # Pick layer-0 for text positions and layer-N for multimodal,
+            # drop positions the Talker won't consume (system prompt /
+            # previous-assistant), and emit a 1D multimodal mask aligned to
+            # the kept tokens. This used to happen inside the Talker, which
+            # forced the Thinker to ship both hidden states for every token.
+            ts_list = outputs.get("thinker_states")
+            mask_list = outputs.get("thinker_mask")
+            if ts_list and mask_list:
+                ts = ts_list[0]                # (seq_len, 2*hidden)
+                mask = mask_list[0]            # (2, seq_len)
+                thinker_hidden = self.config.thinker_hidden_size
+                layer_0 = ts[..., :thinker_hidden]
+                layer_n = ts[..., thinker_hidden:]
+                multimodal_mask = mask[0].bool()
+                text_inclusion_mask = mask[1].bool()
+                text_mask = text_inclusion_mask & ~multimodal_mask
+                inclusion_mask = text_mask | multimodal_mask
+
+                selected = torch.where(
+                    multimodal_mask.unsqueeze(-1), layer_n, layer_0,
+                )                              # (seq_len, hidden)
+                outputs["thinker_states"] = [selected[inclusion_mask]]
+                outputs["thinker_mask"] = [multimodal_mask[inclusion_mask]]
 
         if "new_token" not in outputs:
             return
@@ -1279,41 +1303,28 @@ class TalkerSubmodule(ARNodeSubmodule):
         return self._suppress_mask
 
     def _get_talker_embeds(
-        self, layer_0_embed: torch.Tensor, layer_n_hidden: torch.Tensor,
-        multimodal_mask: torch.Tensor, text_inclusion_mask: torch.Tensor
+        self, selected_hidden: torch.Tensor, multimodal_mask: torch.Tensor,
     ):
-        text_mask = text_inclusion_mask & (~multimodal_mask)
-        inclusion_mask = text_mask | multimodal_mask
-        device = layer_0_embed.device
-
-        projected = torch.zeros(
-            inclusion_mask.sum(), self.config.talker_hidden_size,
-            device=device, dtype=layer_0_embed.dtype,
+        # ``selected_hidden`` is layer-0 embed for text positions and
+        # layer-N hidden for multimodal positions (the Thinker's
+        # postprocess already did that selection and dropped positions
+        # the Talker won't consume). ``multimodal_mask`` is 1D, aligned
+        # to the kept tokens, and tells us which projection to apply.
+        text_mask = ~multimodal_mask
+        projected = torch.empty(
+            selected_hidden.shape[0], self.config.talker_hidden_size,
+            device=selected_hidden.device, dtype=selected_hidden.dtype,
         )
-
-        # Compute sub-masks relative to the included positions
-        included_text_mask = text_mask[inclusion_mask]
-        included_multimodal_mask = multimodal_mask[inclusion_mask]
-
-        if included_text_mask.any():
-            projected[included_text_mask] = self.model.text_projection(
-                layer_0_embed[text_mask]
+        if text_mask.any():
+            projected[text_mask] = self.model.text_projection(
+                selected_hidden[text_mask]
             )
-        if included_multimodal_mask.any():
-            projected[included_multimodal_mask] = self.model.hidden_projection(
-                layer_n_hidden[multimodal_mask]
+        if multimodal_mask.any():
+            projected[multimodal_mask] = self.model.hidden_projection(
+                selected_hidden[multimodal_mask]
             )
-
         return projected
 
-    def _split_thinker_states(
-        self, thinker_states: torch.Tensor
-    ):
-        thinker_hidden = self.config.thinker_hidden_size
-        layer_0_embed = thinker_states[..., :thinker_hidden]
-        layer_n_hidden = thinker_states[..., thinker_hidden:]
-        return layer_0_embed, layer_n_hidden
-    
     def _get_last_prefill_talker_hidden(
         self, thinker_hidden: torch.Tensor
     ):
@@ -1365,26 +1376,24 @@ class TalkerSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         device = self.get_device()
 
-        thinker_hidden = self.config.thinker_hidden_size
         if graph_walk == "talker_prefill":
-            thinker_states = inputs["thinker_states"][0].to(device)
-            layer_0_embed, layer_n_hidden = self._split_thinker_states(thinker_states)
-            mask = inputs["thinker_mask"][0]
+            selected_hidden = inputs["thinker_states"][0].to(device)
+            multimodal_mask = inputs["thinker_mask"][0]
             input_embeds = self._get_talker_embeds(
-                layer_0_embed=layer_0_embed, layer_n_hidden=layer_n_hidden,
-                multimodal_mask=mask[0, :],
-                text_inclusion_mask=mask[1, :]
+                selected_hidden=selected_hidden,
+                multimodal_mask=multimodal_mask,
             )
             seq_len = input_embeds.shape[0]
 
         if graph_walk == "talker_last_prefill":
             rid = fwd_info.request_id
-            thinker_states = inputs["thinker_states"][0].to(device)
-            layer_0_embed, _ = self._split_thinker_states(thinker_states)
+            # Last-prefill is the assistant's first token, which is
+            # text-only — Thinker postprocess pre-selected layer-0 for it.
+            last_hidden = inputs["thinker_states"][0].to(device)
 
             input_embeds = self._get_last_prefill_codec_hidden(
                 fwd_info.step_metadata.get("voice", "Ethan")
-            ) + self._get_last_prefill_talker_hidden(layer_0_embed)
+            ) + self._get_last_prefill_talker_hidden(last_hidden)
             seq_len = input_embeds.shape[0]
 
         elif graph_walk == "talker_decode":
@@ -1394,9 +1403,9 @@ class TalkerSubmodule(ARNodeSubmodule):
             thinker_states = inputs.get("thinker_states", [])
             rid = fwd_info.request_id
             if thinker_states:
-                thinker_hidden_size = self.config.thinker_hidden_size
+                # Decode is always text → text_projection.
                 text_hidden = self.model.text_projection(
-                    thinker_states[0][..., :thinker_hidden_size].to(dtype)
+                    thinker_states[0].to(dtype)
                 )
             elif rid not in self._eos_embed_sent:
                 text_hidden = self._tts_eos_embed_cached

@@ -215,6 +215,10 @@ class Qwen3OmniTalkerModel(nn.Module):
         self.hidden_projection = Qwen3OmniResizeMLP(
             thinker_hidden_size, intermediate_size, talker_text.hidden_size
         )
+    
+    def set_qkv_proj_weights(self):
+        for layer in self.model.layers:
+            layer.self_attn.set_qkv_proj_weight()
 
     def forward(
         self,

@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.utils.flashinfer_utils import run_rms_norm
@@ -77,6 +78,17 @@ class Qwen3OmniAttention(nn.Module):
         # QK-norm: per-head RMSNorm on q and k after projection, before RoPE
         self.q_norm = Qwen3OmniRMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = Qwen3OmniRMSNorm(head_dim, eps=rms_norm_eps)
+    
+    def set_qkv_proj_weight(self) -> torch.Tensor:
+        if self.q_proj is not None:
+            qkv_proj_weight = torch.cat(
+                (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
+                dim=0,
+            ).contiguous()
+            self.register_buffer("qkv_proj_weight", qkv_proj_weight, persistent=False)
+            self.q_proj = None
+            self.k_proj = None
+            self.v_proj = None
 
     def forward(
         self,
@@ -101,10 +113,17 @@ class Qwen3OmniAttention(nn.Module):
 
         # 1. Project q, k, v
         orig_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(self.q_proj.weight.dtype)
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        hidden_states = hidden_states.to(self.qkv_proj_weight.dtype)
+
+        # query_states = self.q_proj(hidden_states)
+        # key_states = self.k_proj(hidden_states)
+        # value_states = self.v_proj(hidden_states)
+        qkv = F.linear(hidden_states, self.qkv_proj_weight)
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        query_states, key_states, value_states = qkv.split(
+            (q_size, kv_size, kv_size), dim=-1
+        )
 
         # 2. Reshape to [tokens, heads, head_dim]
         query_states = query_states.view(num_tokens, self.num_heads, self.head_dim)
