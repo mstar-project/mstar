@@ -4,6 +4,7 @@ import platform
 import struct
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -742,6 +743,14 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         # uuid → file path for sender-side cleanup
         self._shm_files: dict[str, str] = {}
 
+        # Dedicated copy streams: D2H/H2D run here so they don't serialize
+        # behind the next GPU step queued on the default stream.
+        self._d2h_stream: torch.cuda.Stream | None = None
+        self._h2d_stream: torch.cuda.Stream | None = None
+        if torch.cuda.is_available() and str(device) != "cpu":
+            self._d2h_stream = torch.cuda.Stream(device=device)
+            self._h2d_stream = torch.cuda.Stream(device=device)
+
     def _shm_path(self, entity_id: str, uuid: str) -> str:
         return os.path.join(self.shm_dir, f"mminf_{entity_id}_{uuid}")
 
@@ -751,49 +760,72 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
     ):
         if not skip_cuda_sync and torch.cuda.is_available():
             torch.cuda.default_stream().synchronize()
-        for uuid in uuids:
-            if self.tensor_store.is_registered(request_id, uuid):
-                continue
-            tensor = self.tensor_store.get_tensor(request_id, uuid)
-            data = _serialize_tensor(tensor)
-            path = self._shm_path(self.my_entity_id, uuid)
-            with open(path, "wb") as f:
-                f.write(data)
-            self._shm_files[uuid] = path
-            self.tensor_store.set_metadata(request_id, uuid, mem_registered=True)
-            logger.debug("SHM: wrote tensor %s to %s (%d bytes)", uuid, path, len(data))
+        # Producer's completion event is already waited on upstream, so the
+        # source tensors are device-visible on entry. Running the D2H on a
+        # dedicated stream keeps .cpu()'s host-wait bounded by the copy
+        # itself instead of stalling behind GPU(N+1) on the default stream.
+        ctx = (
+            torch.cuda.stream(self._d2h_stream)
+            if self._d2h_stream is not None
+            else _nullcontext()
+        )
+        with ctx:
+            for uuid in uuids:
+                if self.tensor_store.is_registered(request_id, uuid):
+                    continue
+                tensor = self.tensor_store.get_tensor(request_id, uuid)
+                data = _serialize_tensor(tensor)
+                path = self._shm_path(self.my_entity_id, uuid)
+                with open(path, "wb") as f:
+                    f.write(data)
+                self._shm_files[uuid] = path
+                self.tensor_store.set_metadata(request_id, uuid, mem_registered=True)
+                logger.debug("SHM: wrote tensor %s to %s (%d bytes)", uuid, path, len(data))
 
     def start_read_tensors(
         self, request_id: str, graph_edges: list[GraphEdge],
     ):
-        for graph_edge in graph_edges:
-            if len(graph_edge.tensor_info) == 0:
-                continue
-            logger.debug(
-                "SHM: starting read of %d tensors %s for graph node %s",
-                len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node,
-            )
-            for info in graph_edge.tensor_info:
-                if info.source_entity == self.my_entity_id or \
-                   self.tensor_store.check_uuid_presence(request_id, info.uuid):
-                    self.tensor_store.increment_ref(request_id, info.uuid, 1)
+        # Run H2D copies on a dedicated stream so they overlap with the
+        # consumer's in-flight default-stream work. We make default wait
+        # for the H2D stream at the end so downstream kernels see the data.
+        h2d_did_work = False
+        ctx = (
+            torch.cuda.stream(self._h2d_stream)
+            if self._h2d_stream is not None
+            else _nullcontext()
+        )
+        with ctx:
+            for graph_edge in graph_edges:
+                if len(graph_edge.tensor_info) == 0:
                     continue
-                path = self._shm_path(info.source_entity, info.uuid)
-                with open(path, "rb") as f:
-                    data = f.read()
-                tensor = _deserialize_tensor(data, self.device)
-                self.tensor_store.put_tensor(request_id, info.uuid, tensor)
-                self.tensor_store.set_metadata(request_id, info.uuid, mem_registered=False)
-                # +1 for transit (released by get_ready_tensors)
-                # +1 for graph-node usage (released by _cleanup_consumed_inputs)
-                self.tensor_store.increment_ref(request_id, info.uuid, 2)
-                logger.debug("SHM: read tensor %s from %s", info.uuid, path)
-            self.pending.append(
-                FutureAndPointers(
-                    future=None, graph_edges=[graph_edge],
-                    request_id=request_id,
+                logger.debug(
+                    "SHM: starting read of %d tensors %s for graph node %s",
+                    len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node,
                 )
-            )
+                for info in graph_edge.tensor_info:
+                    if info.source_entity == self.my_entity_id or \
+                       self.tensor_store.check_uuid_presence(request_id, info.uuid):
+                        self.tensor_store.increment_ref(request_id, info.uuid, 1)
+                        continue
+                    path = self._shm_path(info.source_entity, info.uuid)
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    tensor = _deserialize_tensor(data, self.device)
+                    h2d_did_work = True
+                    self.tensor_store.put_tensor(request_id, info.uuid, tensor)
+                    self.tensor_store.set_metadata(request_id, info.uuid, mem_registered=False)
+                    # +1 for transit (released by get_ready_tensors)
+                    # +1 for graph-node usage (released by _cleanup_consumed_inputs)
+                    self.tensor_store.increment_ref(request_id, info.uuid, 2)
+                    logger.debug("SHM: read tensor %s from %s", info.uuid, path)
+                self.pending.append(
+                    FutureAndPointers(
+                        future=None, graph_edges=[graph_edge],
+                        request_id=request_id,
+                    )
+                )
+        if h2d_did_work and self._h2d_stream is not None:
+            torch.cuda.default_stream(self.device).wait_stream(self._h2d_stream)
         return []
 
     def _cleanup_by_uuid(self, request_id: str, uuid: str):
