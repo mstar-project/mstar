@@ -527,6 +527,7 @@ class BagelModel(Model):
                         GraphEdge(next_node="LLM", name="latents"),
                         GraphEdge(next_node="LLM", name="time_index"),
                     ],
+                    enable_async_scheduling=False
                 ),
                 max_iters=self.config.num_timesteps - 1,
                 outputs=[
@@ -560,6 +561,7 @@ class BagelModel(Model):
                             outputs=[
                                 GraphEdge(next_node="combine_cfg", name="v_main"),
                             ],
+                            enable_async_scheduling=False
                         ),
                         GraphNode(
                             name="LLM_cfg_text",
@@ -567,6 +569,7 @@ class BagelModel(Model):
                             outputs=[
                                 GraphEdge(next_node="combine_cfg", name="v_cfg_text"),
                             ],
+                            enable_async_scheduling=False
                         ),
                         GraphNode(
                             name="LLM_cfg_img",
@@ -574,6 +577,7 @@ class BagelModel(Model):
                             outputs=[
                                 GraphEdge(next_node="combine_cfg", name="v_cfg_img"),
                             ],
+                            enable_async_scheduling=False
                         ),
                     ]),
                     GraphNode(
