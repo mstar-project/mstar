@@ -112,7 +112,12 @@ def apply_vision_rope(
 
 
 class Qwen3OmniVisionPatchEmbed(nn.Module):
-    """3D conv patch embedding. Matches HF's reference verbatim."""
+    """Patch embedding. Stored as Conv3d for HF state_dict compatibility,
+    but executed as a Linear since kernel == stride == input spatial dims
+    makes the Conv3d mathematically identical to a single GEMM. cuDNN's
+    Conv3d algo selection for these dims was 4-5 orders of magnitude
+    slower than cuBLAS GEMM (1.1s vs 20us for 256 tokens on H100 bf16).
+    """
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -120,6 +125,10 @@ class Qwen3OmniVisionPatchEmbed(nn.Module):
         self.temporal_patch_size = config.temporal_patch_size
         self.in_channels = config.in_channels
         self.embed_dim = config.hidden_size
+        self.in_features = (
+            self.in_channels * self.temporal_patch_size
+            * self.patch_size * self.patch_size
+        )
 
         kernel_size = (self.temporal_patch_size, self.patch_size, self.patch_size)
         self.proj = nn.Conv3d(
@@ -129,14 +138,8 @@ class Qwen3OmniVisionPatchEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1, self.in_channels, self.temporal_patch_size,
-            self.patch_size, self.patch_size,
-        )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
-            -1, self.embed_dim,
-        )
-        return hidden_states
+        weight = self.proj.weight.view(self.embed_dim, self.in_features)
+        return F.linear(hidden_states.to(dtype=target_dtype), weight, self.proj.bias)
 
 
 class Qwen3OmniVisionMLP(nn.Module):
