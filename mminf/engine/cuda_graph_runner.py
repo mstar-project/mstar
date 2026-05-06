@@ -777,13 +777,46 @@ class CudaGraphRunner:
             return None
         return sizes[idx]
 
+    def _get_basic_batched_key_for(
+        self,
+        graph_walk: str,
+        requires_cfg: bool,
+        batch_size: int,
+    ) -> CudaGraphKey | None:
+        """Look up a captured key by (graph_walk, requires_cfg, bs) alone.
+
+        For ``BASIC_BATCHED`` configs, the captured ``num_tokens`` is uniquely
+        determined by the per-input ``input_seq_len`` and the (padded) batch
+        size: ``get_total_tokens(bs) == [input_seq_len * bs]``. Callers on
+        the decode/spec path can therefore find their captured graph without
+        independently knowing ``num_tokens`` — used by ``pre_plan_for_batch``
+        and ``reset_pre_plan_state_for_slot``, both of which are
+        BASIC_BATCHED-only.
+        """
+        config = self._config_for(graph_walk, requires_cfg)
+        if config is None or config.get_config_type() != CudaGraphConfigType.BASIC_BATCHED:
+            return None
+        padded_bs = self._get_padded_batch_size(batch_size, config)
+        if padded_bs is None:
+            return None
+        total_tokens = config.get_total_tokens(padded_bs)
+        if not total_tokens:
+            return None
+        key = CudaGraphKey(
+            graph_walk=graph_walk,
+            requires_cfg=requires_cfg,
+            bs=padded_bs,
+            num_tokens=total_tokens[0],
+        )
+        return key if key in self.graphs else None
+
 
     def reserve_slot(
         self,
         graph_walk: str,
         requires_cfg: bool,
         batch_size: int,
-        num_tokens: int,
+        num_tokens: int | None = None,
     ) -> int | None:
         """Allocate the next double-buffer slot for an upcoming submission.
 
@@ -792,13 +825,26 @@ class CudaGraphRunner:
         see the same slot. Increments the per-key ``next_slot`` counter so
         the following submission picks the OTHER slot.
 
+        ``num_tokens`` is optional: when ``None`` the runner derives it from
+        the captured BASIC_BATCHED config (the only kind that participates
+        in pre-reserved replay today). Pass it explicitly for non-BASIC
+        configs or if a future caller needs to disambiguate among multiple
+        token-bucket captures for the same (walk, cfg, bs).
+
         Returns the slot index, or ``None`` if no captured graph matches —
         in which case the engine's eager fallback runs (no slot needed).
         """
-        key = self._get_key_for(
-            batch_size=batch_size, num_tokens=num_tokens,
-            graph_walk=graph_walk, requires_cfg=requires_cfg,
-        )
+        if num_tokens is None:
+            key = self._get_basic_batched_key_for(
+                graph_walk=graph_walk,
+                requires_cfg=requires_cfg,
+                batch_size=batch_size,
+            )
+        else:
+            key = self._get_key_for(
+                batch_size=batch_size, num_tokens=num_tokens,
+                graph_walk=graph_walk, requires_cfg=requires_cfg,
+            )
         if key is None:
             return None
         data = self.graphs[key]
@@ -862,23 +908,20 @@ class CudaGraphRunner:
         from mminf.utils.profiler import range_pop, range_push
 
         real_bs = len(request_ids)
-        # AR decode always emits 1 token per request.
-        real_num_tokens = real_bs
-
-        key = self._get_key_for(
-            batch_size=real_bs,
-            num_tokens=real_num_tokens,
+        # num_tokens is derivable from the captured BASIC_BATCHED config —
+        # don't hardcode it from real_bs (works today only because AR decode
+        # has input_seq_len=1; would silently mismatch for any future
+        # multi-token-per-request decode/spec capture).
+        key = self._get_basic_batched_key_for(
             graph_walk=graph_walk,
             requires_cfg=requires_cfg,
+            batch_size=real_bs,
         )
         if key is None:
             return False
 
         graph_data = self.graphs[key]
         config = graph_data.config
-        if config.get_config_type() != CudaGraphConfigType.BASIC_BATCHED:
-            # Only decode-style basic_batched speculates / pre-plans.
-            return False
         if not graph_data.slots:
             return False
         if slot is None:
@@ -914,9 +957,15 @@ class CudaGraphRunner:
         # respect natural FIFO ordering, so a single plan_done_event after
         # the last call covers every label's writes.
         config_labels = config.labels
+        # Per-request token count comes from the captured config — the same
+        # ``input_seq_len`` that ``_capture_one_basic_batched`` used to size
+        # ``total_tokens = bs * input_seq_len``. Don't hardcode 1; today AR
+        # decode happens to be 1, but multi-token-per-request decode/spec
+        # captures (e.g. tree-spec) would silently mis-plan with [1]*bs.
+        per_req_seq_len = config.single_request_inputs.input_seq_len
         try:
             static_cm.request_ids = list(request_ids) + saved_request_ids[len(request_ids):]
-            seq_lens = [1] * len(saved_request_ids)
+            seq_lens = [per_req_seq_len] * len(saved_request_ids)
             if plan_stream is not None:
                 with torch.cuda.stream(plan_stream):
                     for label_name in config_labels:
@@ -950,7 +999,6 @@ class CudaGraphRunner:
         graph_walk: str,
         requires_cfg: bool,
         batch_size: int,
-        num_tokens: int,
         slot: int | None = None,
     ) -> None:
         """Clear the slot-local ``_pre_planned_labels`` and
@@ -962,12 +1010,15 @@ class CudaGraphRunner:
         pre-plan whose flags have not yet been consumed by its matching
         replay (currently impossible because plan_executor.max_workers=1,
         but a latent footgun if concurrency is raised).
+
+        BASIC_BATCHED-only (paired with ``pre_plan_for_batch``); the key
+        is derived from ``(graph_walk, requires_cfg, batch_size)`` via the
+        captured config so callers don't need to know ``num_tokens``.
         """
-        key = self._get_key_for(
-            batch_size=batch_size,
-            num_tokens=num_tokens,
+        key = self._get_basic_batched_key_for(
             graph_walk=graph_walk,
             requires_cfg=requires_cfg,
+            batch_size=batch_size,
         )
         if key is None:
             return

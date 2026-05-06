@@ -59,9 +59,12 @@ def _make_slot(label_set: set[str], event_marker: object | None) -> CudaGraphSlo
 
 def _make_runner_with_two_keys() -> CudaGraphRunner:
     """Build a runner via ``__new__`` and populate ``graphs`` with two keys,
-    each with two slots. Stub ``_get_key_for`` to do an exact-match lookup
-    against (graph_walk, requires_cfg, bs, num_tokens) — skipping the
-    padding logic that would require capture configs.
+    each with two slots. Stub ``_get_basic_batched_key_for`` to do an
+    exact-match lookup against (graph_walk, requires_cfg, bs) — skipping
+    the padding/config-resolution logic that would require real capture
+    configs. The reset path uses this helper (BASIC_BATCHED-only,
+    num_tokens derived from config) since num_tokens is fully determined
+    by the captured config for those graphs.
     """
     runner = CudaGraphRunner.__new__(CudaGraphRunner)
     runner.enable_nvtx = False
@@ -88,16 +91,17 @@ def _make_runner_with_two_keys() -> CudaGraphRunner:
         ),
     }
 
-    def _get_key_for(batch_size, num_tokens, graph_walk="decode", requires_cfg=False):
-        candidate = CudaGraphKey(
-            graph_walk=graph_walk,
-            requires_cfg=requires_cfg,
-            bs=batch_size,
-            num_tokens=num_tokens,
-        )
-        return candidate if candidate in runner.graphs else None
+    def _get_basic_batched_key_for(graph_walk, requires_cfg, batch_size):
+        for key in runner.graphs:
+            if (
+                key.graph_walk == graph_walk
+                and key.requires_cfg == requires_cfg
+                and key.bs == batch_size
+            ):
+                return key
+        return None
 
-    runner._get_key_for = _get_key_for
+    runner._get_basic_batched_key_for = _get_basic_batched_key_for
     return runner
 
 
@@ -109,7 +113,7 @@ class TestResetPrePlanTargeted:
         runner = _make_runner_with_two_keys()
         runner.reset_pre_plan_state_for_slot(
             graph_walk="decode", requires_cfg=False,
-            batch_size=4, num_tokens=4, slot=0,
+            batch_size=4, slot=0,
         )
 
         a0 = runner.graphs[CudaGraphKey("decode", False, 4, 4)].slots[0].static_cache_manager
@@ -136,7 +140,7 @@ class TestResetPrePlanTargeted:
         runner = _make_runner_with_two_keys()
         runner.reset_pre_plan_state_for_slot(
             graph_walk="decode", requires_cfg=False,
-            batch_size=4, num_tokens=4, slot=1,
+            batch_size=4, slot=1,
         )
         a0 = runner.graphs[CudaGraphKey("decode", False, 4, 4)].slots[0].static_cache_manager
         a1 = runner.graphs[CudaGraphKey("decode", False, 4, 4)].slots[1].static_cache_manager
@@ -147,14 +151,14 @@ class TestResetPrePlanTargeted:
         assert a1._plan_done_event is None
 
     def test_unknown_key_is_noop(self):
-        """Reset for a (graph_walk, bs, num_tokens) that has no captured
-        graph must not raise — pre_plan also no-ops on unknown keys, so
-        the reset's contract is symmetric.
+        """Reset for a (graph_walk, bs) that has no captured graph must
+        not raise — pre_plan also no-ops on unknown keys, so the reset's
+        contract is symmetric.
         """
         runner = _make_runner_with_two_keys()
         runner.reset_pre_plan_state_for_slot(
             graph_walk="decode", requires_cfg=False,
-            batch_size=999, num_tokens=999, slot=0,
+            batch_size=999, slot=0,
         )
         # All slots unchanged.
         a0 = runner.graphs[CudaGraphKey("decode", False, 4, 4)].slots[0].static_cache_manager
@@ -167,7 +171,7 @@ class TestResetPrePlanTargeted:
         runner = _make_runner_with_two_keys()
         runner.reset_pre_plan_state_for_slot(
             graph_walk="decode", requires_cfg=False,
-            batch_size=4, num_tokens=4, slot=3,  # wraps to 1
+            batch_size=4, slot=3,  # wraps to 1
         )
         a0 = runner.graphs[CudaGraphKey("decode", False, 4, 4)].slots[0].static_cache_manager
         a1 = runner.graphs[CudaGraphKey("decode", False, 4, 4)].slots[1].static_cache_manager
@@ -179,7 +183,7 @@ class TestResetPrePlanTargeted:
         runner = _make_runner_with_two_keys()
         runner.reset_pre_plan_state_for_slot(
             graph_walk="decode", requires_cfg=False,
-            batch_size=4, num_tokens=4, slot=None,
+            batch_size=4, slot=None,
         )
         a0 = runner.graphs[CudaGraphKey("decode", False, 4, 4)].slots[0].static_cache_manager
         a1 = runner.graphs[CudaGraphKey("decode", False, 4, 4)].slots[1].static_cache_manager
@@ -194,10 +198,10 @@ class TestResetPrePlanTargeted:
         runner = CudaGraphRunner.__new__(CudaGraphRunner)
         runner.enable_nvtx = False
         runner.graphs = {}
-        runner._get_key_for = lambda *a, **k: None
+        runner._get_basic_batched_key_for = lambda *a, **k: None
         runner.reset_pre_plan_state_for_slot(
             graph_walk="decode", requires_cfg=False,
-            batch_size=4, num_tokens=4, slot=0,
+            batch_size=4, slot=0,
         )  # must not raise
 
 

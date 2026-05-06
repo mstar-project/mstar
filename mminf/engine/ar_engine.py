@@ -637,15 +637,14 @@ class AREngine(BaseEngine):
             info.requires_cfg for info in batch.per_request_info.values()
         )
         bs = len(batch.request_ids)
-        # AR loop-back speculation always emits 1 token per request, so
-        # num_tokens == bs. Non-decode (prefill) batches don't speculate
+        # Don't pass num_tokens — the runner derives it from the captured
+        # BASIC_BATCHED config. Non-decode (prefill) batches don't speculate
         # and don't pre-reserve, so they go through ``run`` which advances
         # the per-key counter itself.
         slot = runner.reserve_slot(
             graph_walk=batch.graph_walk,
             requires_cfg=has_cfg,
             batch_size=bs,
-            num_tokens=bs,
         )
         if slot is not None:
             batch.metadata["cuda_graph_slot"] = slot
@@ -669,7 +668,6 @@ class AREngine(BaseEngine):
             graph_walk=batch.graph_walk,
             requires_cfg=has_cfg,
             batch_size=bs,
-            num_tokens=bs,
             slot=slot,
         )
 
