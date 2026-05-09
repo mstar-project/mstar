@@ -2474,6 +2474,7 @@ class Worker:
                         # ['cuda_graph_slot']; the engine forwards it to
                         # the runner.
                         if speculation is not None:
+                            spec_node_batch_for_plan = speculation.node_batch
                             engine = self.engine_manager.get_engine(
                                 speculation.node_batch.node_name
                             )
