@@ -507,7 +507,7 @@ def sample_cuda_graphable_gpu(
 ) -> torch.Tensor:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
-    Uses ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` with
+    Uses ``flashinfer.sampling.top_k_top_p_sampling_from_logits`` with
     ``deterministic=True`` -- the graph-safe variant that avoids CPU-seeded
     RNG paths (those require a CPU sync to pull a random offset). Callers
     encode greedy requests as ``(temperature=1.0, top_k=1)`` so this
@@ -704,7 +704,7 @@ class SamplerBuffers:
         else:
             # Greedy: kernel takes the one-hot/argmax branch regardless of
             # top_k/top_p, so park them at the disabled defaults.
-            t, k, p = 1.0, 0, 1.0
+            t, k, p = 1.0, 1, 1.0
 
         self._row_temp_cpu[0] = t
         self._row_top_k_cpu[0] = k

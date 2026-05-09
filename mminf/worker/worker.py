@@ -78,7 +78,7 @@ class Speculation:
     node_batch: NodeBatch
     loop_back_inputs: set[str]
     continuing_rids: set[str]
-    streaming_edges: dict[str, list[GraphEdge]] = field(default_factory=list)
+    streaming_edges: dict[str, list[GraphEdge]] = field(default_factory=dict)
     dropped: set[str] = field(default_factory=set)
 
 class EvictionPolicy(Enum):
@@ -1500,8 +1500,9 @@ class Worker:
                 dropped.add(rid)
 
                 # also give back its streaming inputs, if any
-                for edge in speculation.streaming_edges:
+                for edge in speculation.streaming_edges.get(rid, []):
                     self._return_speculative_streaming_edge(rid, edge)
+                speculation.streaming_edges.pop(rid, None)
 
         if dropped:
             logger.warning(
@@ -2538,9 +2539,10 @@ class Worker:
                         # depended on N's outputs which are unusable now.
                         # Per design: discard speculation, retry batch_N.
                         self._handle_allocation_failure(p_batch, p_node_batch)
-                        for rid, streaming_edges in speculation.streaming_edges.items():
-                             for edge in streaming_edges:
-                                self._return_speculative_streaming_edge(rid, edge)
+                        if speculation is not None:
+                            for rid, streaming_edges in speculation.streaming_edges.items():
+                                for edge in streaming_edges:
+                                    self._return_speculative_streaming_edge(rid, edge)
                         speculation = None
                         # If a pre-plan was dispatched, wait for it to finish
                         # so its wrapper.plan() side effects don't leak into

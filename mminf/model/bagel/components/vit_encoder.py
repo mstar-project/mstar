@@ -10,14 +10,59 @@
 # This modified file is released under the same license.
 
 
+import logging
+
 import torch
-from flash_attn import flash_attn_varlen_func
 from torch import nn
+from torch.nn.functional import scaled_dot_product_attention
 from transformers.activations import ACT2FN
 
 from mminf.model.bagel.config import BagelViTConfig
 
+logger = logging.getLogger(__name__)
 
+try:
+    from flash_attn import flash_attn_varlen_func
+
+    _FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    flash_attn_varlen_func = None
+    _FLASH_ATTN_AVAILABLE = False
+    logger.warning(
+        "flash_attn is not available; BagelViT will fall back to torch SDPA "
+        "with a block-diagonal mask. This is slower than flash-attn varlen."
+    )
+
+
+def _sdpa_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    causal: bool,
+    scale: float | None,
+) -> torch.Tensor:
+    # q/k/v: (total_seq_len, num_heads, head_dim). Build a block-diagonal mask
+    # so packed images don't attend across boundaries, then run SDPA.
+    total_len, num_heads, head_dim = q.shape
+    seg_ids = torch.zeros(total_len, dtype=torch.int32, device=q.device)
+    seg_ids[cu_seqlens[1:-1].long()] = 1
+    seg_ids = torch.cumsum(seg_ids, dim=0)
+    attn_mask = seg_ids[:, None] == seg_ids[None, :]
+    if causal:
+        attn_mask = attn_mask & torch.ones(
+            total_len, total_len, dtype=torch.bool, device=q.device
+        ).tril()
+
+    q_b = q.transpose(0, 1).unsqueeze(0)
+    k_b = k.transpose(0, 1).unsqueeze(0)
+    v_b = v.transpose(0, 1).unsqueeze(0)
+    out = scaled_dot_product_attention(
+        q_b, k_b, v_b, attn_mask=attn_mask, scale=scale
+    )
+    return out.squeeze(0).transpose(0, 1).contiguous()
+
+@torch.compiler.disable
 def run_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -29,15 +74,17 @@ def run_attention(
 ) -> torch.Tensor:
     # cu_seqlens isolates per-image attention when multiple images are packed.
     # flashinfer's varlen kernels silently miscompute at SigLIP2's head_dim=72.
-    return flash_attn_varlen_func(
-        q, k, v,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        causal=causal,
-        softmax_scale=scale,
-    )
+    if _FLASH_ATTN_AVAILABLE:
+        return flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=causal,
+            softmax_scale=scale,
+        )
+    return _sdpa_varlen(q, k, v, cu_seqlens, causal=causal, scale=scale)
 
 
 class RotaryEmbedding2D(torch.nn.Module):

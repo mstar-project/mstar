@@ -1448,6 +1448,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         extra_args = {}
         if graph_walk != "talker_prefill":
             extra_args["suppress_mask"] = self._get_suppress_mask()
+        if graph_walk == "talker_last_prefill":
+            extra_args["last_token_indices"] = (
+                torch.tensor(seq_lens, device=device, dtype=torch.long).cumsum(0) - 1
+            )
         return {
             "input_embeds": input_embeds,
             "all_codes": torch.zeros(
@@ -1487,11 +1491,11 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         ``last_token_indices`` (when provided) is used to ``index_select`` the
         per-request last hidden out of a packed multi-token-per-request hidden
-        — the batched ``talker_last_prefill`` path passes
-        ``qo_indptr_buf[1:] - 1`` here so the codec_head only sees one hidden
-        per request. Mutually exclusive with the batched-decode (``hidden``
-        is already ``(bs, hidden)``) and non-batched (``hidden[-1:, :]``)
-        branches.
+        — the batched ``talker_last_prefill`` path computes it in ``preprocess``
+        as ``cumsum(seq_lens) - 1`` and passes it through here so the
+        codec_head only sees one hidden per request. Mutually exclusive with
+        the batched-decode (``hidden`` is already ``(bs, hidden)``) and
+        non-batched (``hidden[-1:, :]``) branches.
         """
         hidden = self.model(
             input_embeds=input_embeds, cache_handle=cache_handle
@@ -1600,13 +1604,13 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         Last-prefill path (``talker_last_prefill``; fixed 9 tokens per request,
         ``hidden`` shape ``(bs * 9, hidden)``):
-          Same _forward_decode_like as decode but uses ``qo_indptr_buf[1:] - 1``
-          to ``index_select`` the per-request last hidden before codec_head.
+          Same _forward_decode_like as decode but uses the ``last_token_indices``
+          tensor produced by ``preprocess`` (``cumsum(seq_lens) - 1``) to
+          ``index_select`` the per-request last hidden before codec_head.
           Captured under ``BasicBatchedCudaGraphConfig`` (single bucket per bs:
           total_tokens = bs * 9), which routes ``_create_persistent_wrappers``
-          through ``FlashInferPrefillWrapper`` (since total_tokens != bs), so
-          ``cache_handle.get_qo_indptr_buf("main")`` is non-None at capture and
-          replay; per-rid output construction matches the decode branch.
+          through ``FlashInferPrefillWrapper`` (since total_tokens != bs);
+          per-rid output construction matches the decode branch.
         """
         assert graph_walk in (
             "talker_decode", "talker_prefill", "talker_last_prefill",
@@ -1622,15 +1626,12 @@ class TalkerSubmodule(ARNodeSubmodule):
                 "__batched_talker_prefill_hidden__": hidden,
             }
 
+        last_token_indices = kwargs.pop("last_token_indices", None)
         if graph_walk == "talker_last_prefill":
-            qo_indptr_buf = cache_handle.get_qo_indptr_buf("main")
-            assert qo_indptr_buf is not None, (
-                "talker_last_prefill forward_batched requires a CUDA-graph "
-                "FlashInferPrefillWrapper (qo_indptr static buffer); got None."
+            assert last_token_indices is not None, (
+                "talker_last_prefill forward_batched requires "
+                "last_token_indices from preprocess; got None."
             )
-            last_token_indices = (qo_indptr_buf[1:] - 1).long()
-        else:
-            last_token_indices = None
 
         fwd_out = self._forward_decode_like(
             request_ids=engine_inputs.request_ids,
@@ -1830,6 +1831,10 @@ class Code2WavSubmodule(NodeSubmodule):
         self.full_seqlen = self.config.code2wav.codec_left_context_frames + \
             self.config.code2wav.codec_chunk_frames
     
+    def cleanup_request(self, request_id):
+        self._first_chunk_emitted.discard(request_id)
+        self._latest_seq_len.pop(request_id, None)
+    
     def get_cuda_graph_configs(self, device):
         num_quantizers = self.config.code2wav.num_quantizers
         return [
@@ -1877,7 +1882,7 @@ class Code2WavSubmodule(NodeSubmodule):
         if codec_tokens.shape[-1] > num_quantizers:
             codec_tokens = codec_tokens[..., :num_quantizers]
         
-        # pad sequence to full_seqlen with codec_pad_id for batching
+        # pad sequence to full_seqlen for batching
         orig_seq_len = codec_tokens.shape[0]
         pad_len = self.full_seqlen - codec_tokens.shape[0]
         if pad_len > 0:

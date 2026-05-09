@@ -84,7 +84,7 @@ def _decode_attn_nhd_kernel(
     # Finalize and store
     out = acc / l_i
     o_ptrs = O_ptr + pid_b * so_b + pid_hq * so_h + offs_d * so_d
-    tl.store(o_ptrs, out)
+    tl.store(o_ptrs, out.to(O_ptr.dtype.element_ty))
 
 
 @torch.compiler.disable
@@ -171,8 +171,8 @@ def _qk_norm_rope_kernel(
     out_first  = x_first * cos - x_second * sin
     out_second = x_second * cos + x_first * sin
 
-    tl.store(base + offs_half * sx_d,             out_first)
-    tl.store(base + (offs_half + HALF_D) * sx_d,  out_second)
+    tl.store(base + offs_half * sx_d,             out_first.to(X_ptr.dtype.element_ty))
+    tl.store(base + (offs_half + HALF_D) * sx_d,  out_second.to(X_ptr.dtype.element_ty))
 
 
 def fused_qk_norm_rope(x, w_norm, pos, eps, rope_theta):

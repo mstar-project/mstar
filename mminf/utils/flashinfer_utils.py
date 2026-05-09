@@ -50,47 +50,6 @@ def run_rms_norm(
     ).to(orig_dtype)
 
 
-@torch.compiler.disable
-def apply_rope(
-    self,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    position_ids: torch.Tensor,
-    rotary_dim: int | None = None,
-    interleave: bool = False,
-    rope_scale: float = 1,
-    rope_theta: float = 10000.0,
-    rope_dtype=None,
-    **kwargs
-):
-    llama31_params = {}
-    for key, value in kwargs.items():
-        if key in ['low_freq_factor', 'high_freq_factor', 'old_context_len']:
-            llama31_params[key] = value
-
-    import flashinfer
-
-    if not llama31_params:
-        flashinfer.rope.apply_rope_pos_ids_inplace(
-            q, k, position_ids,
-            rotary_dim=rotary_dim,
-            interleave=interleave,
-            rope_scale=rope_scale,
-            rope_theta=rope_theta,
-
-        )
-    else:
-        flashinfer.rope.apply_llama31_rope_pos_ids_inplace(
-            q, k, position_ids,
-            rotary_dim=rotary_dim,
-            interleave=interleave,
-            rope_scale=rope_scale,
-            rope_theta=rope_theta,
-            **llama31_params
-        )
-    return q, k
-
-
 def run_attention(
     q: torch.Tensor,
     k: torch.Tensor,

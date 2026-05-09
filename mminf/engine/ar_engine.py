@@ -254,9 +254,12 @@ class AREngine(BaseEngine):
         ]
         if not configs:
             return submod_max_bs
-        return max([
-                max(cfg.capture_batch_sizes or runner.CAPTURE_BATCH_SIZES) for cfg in configs
-        ]) # it wouldn't make sense for this value to be less than submod_max_bs
+        max_cuda_graph_bs = max([
+            max(cfg.capture_batch_sizes or runner.CAPTURE_BATCH_SIZES) for cfg in configs
+        ])
+        if submod_max_bs is not None:
+            return min(max_cuda_graph_bs, submod_max_bs)
+        return max_cuda_graph_bs
 
     def _sample_decode_outputs(
         self,

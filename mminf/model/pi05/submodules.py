@@ -283,6 +283,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
     # For the default image size and a simple text prompt, one request is about 400 tokens
     PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
     def __init__(
         self,
@@ -390,7 +391,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         noisy_actions dtype). sincos_timestep_embedding fully overwrites it
         every step, so no zeroing is needed — torch.empty suffices.
         """
-        max_bs = max(self.PREFILL_CAPTURE_BATCH_SIZES)
+        max_bs = max(self.ACTION_GEN_CAPTURE_BATCH_SIZES)
         if self._time_emb_buffer is None:
             self._time_emb_buffer = torch.empty(
                 max_bs, self.config.action_hidden_size,
@@ -440,7 +441,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                         "ts": torch.zeros(1, device=device, dtype=torch.long)
                     }
                 ),
-                capture_batch_sizes=[1, 2, 4]
+                capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
             ),
             FlashInferPackedCudaGraphConfig(
                 capture_graph_walk="prefill",
