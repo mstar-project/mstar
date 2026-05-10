@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from mminf.communication.tensors import TensorCommunicationManager
 from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
 from mminf.graph.base import GraphEdge, GraphNode
-from mminf.graph.graph_io import WorkerGraphIO, WorkerGraphIOZ
+from mminf.graph.graph_io import WorkerGraphIO
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, SPECIAL_DESTINATIONS
 from mminf.model.base import WorkerGraph
 from mminf.streaming.stream_buffer import StreamBuffer
