@@ -1,5 +1,10 @@
 from mminf.graph.base import *
 
+
+def format_graph_edge_list(lst: list[GraphEdge]) -> str:
+    return ", ".join([f"{edge.name} -> {edge.next_node}" for edge in lst])
+
+
 @dataclass
 class NestedLoopIndices:
     loop_name_order: list[str] # from outer to inner
@@ -111,6 +116,12 @@ class WorkerGraphIO:
         it has actually completed. The edge's tensor_info will be empty at this point;
         callers must not copy the edge object — actual tensor_info is updated in-place
         when the producing node completes (no-copy semantics).
+
+        Readiness gate is strict: the destination node is reported as
+        speculatively ready only when speculative_signals alone covers
+        input_names. Callers (e.g. worker `_can_speculate`) are responsible
+        for ensuring all required inputs are loop-back / streaming and will
+        be ingested speculatively before checking ready_for_speculation.
         """
         if edge.next_node not in self.nodes:
             return
@@ -125,12 +136,8 @@ class WorkerGraphIO:
         if is_loop_back:
             self._speculative_node_has_loop_back[node.name] = True
         self._nodes_with_speculative_inputs.add(node.name)
-        # Readiness: union of speculative buffer and current ready_signals covers all inputs.
-        # For the currently-executing node (loop-back case), ready_signals holds the inputs
-        # being consumed right now and will be cleared on completion — but the speculative
-        # buffer also provides all loop-back inputs, so the union is still correct.
-        combined = node.speculative_signals.ready_names | node.ready_signals.ready_names
-        if node.input_names.issubset(combined) and node.name not in self._speculative_ready:
+        if node.input_names.issubset(node.speculative_signals.ready_names) \
+                and node.name not in self._speculative_ready:
             self._speculative_ready[node.name] = SpeculativeNodeInfo(
                 node_name=node.name,
                 is_new_loop_iter=self._speculative_node_has_loop_back.get(node.name, False),
