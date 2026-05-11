@@ -296,6 +296,53 @@ def test_complete_loops_shim_drops_loop_back_on_loop_done():
     assert "post_processor" in kept_dests
 
 
+def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
+    """Regression: nodes with no declared outputs (BAGEL prefill_text,
+    vae_encoder) must still drive ``is_done`` to True via mark_node_complete.
+
+    The worker's _store_outputs_and_finish_loops used to ``continue`` over
+    empty-output nodes BEFORE calling complete_loops, so the registry never
+    flipped → WORKER_GRAPHS_DONE never fired → t2i hung on prefill_text.
+    """
+    empty_outputs_graph = GraphNode(
+        name="prefill_text",
+        input_names={"text_inputs"},
+        outputs=[],  # no declared outputs — KV-cache-only step
+    )
+    wg_id = "wg_empty"
+    worker_graph = WorkerGraph(
+        section=empty_outputs_graph,
+        graph_walks={"prefill_text"},
+        ranks=[0],
+        worker_graph_id=wg_id,
+    )
+    mgr = WorkerGraphsManager(
+        queues={wg_id: WorkerGraphQueues(
+            worker_graph_id=wg_id,
+            graph_walks={"prefill_text"},
+            worker_graph=worker_graph,
+            per_request_queues={},
+            tensor_manager=StubTensorManager(),
+        )},
+        per_request_info={},
+        all_worker_graph_ids_to_graph_walks={wg_id: {"prefill_text"}},
+        all_worker_graph_ids_to_nodes={wg_id: {"prefill_text"}},
+        all_worker_graph_ids_to_dyn_loops={wg_id: set()},
+        node_to_partition={"prefill_text": "default"},
+    )
+    mgr.add_request(
+        request_id="rid",
+        partition_worker_graph_ids=[wg_id],
+        worker_graph_to_worker={wg_id: "worker0"},
+        current_fwd_info=_fwd_info("prefill_text"),
+    )
+    mgr.process_new_inputs("rid", [GraphEdge(name="text_inputs", next_node="prefill_text")])
+    assert not mgr.queues[wg_id].is_done("rid")  # not done before complete
+    mgr.mark_node_complete("rid", wg_id, "prefill_text")
+    assert mgr.queues[wg_id].is_done("rid"), \
+        "mark_node_complete on a no-output node must flip is_done"
+
+
 def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
     """Regression: a wg whose just-completed node emits only special-destination
     edges (EMPTY_DESTINATION / EMIT_TO_CLIENT / streaming) must still flip to
