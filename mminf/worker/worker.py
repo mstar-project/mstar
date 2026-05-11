@@ -869,9 +869,6 @@ class Worker:
                 filtered_out=[]
             )
 
-            if not request_output_tensors:
-                continue  # Node produced no outputs (e.g., KV-cache-only prefill step)
-
             # store_and_populate_graph_edges populates tensor_info on
             # ``filtered_outputs`` in place — that's the SAME list of
             # GraphEdge objects we passed in, so the kept list inside
@@ -880,17 +877,23 @@ class Worker:
             # call is gone: ``LoopStateRegistry.mark_entity_complete``
             # (invoked via the ``complete_loops`` shim below) now calls
             # ``Loop.maybe_cache_output(entity.outputs)`` internally.
-            self.tensor_manager.store_and_populate_graph_edges(
-                request_id=request_id,
-                tensors=request_output_tensors,
-                graph_edges=filtered_outputs,
-                # We already synced on output.completion_event above,
-                # which waits only for GPU(N) — the unconditional
-                # default-stream sync inside store_and_return_tensor_info
-                # would also drain the speculatively-queued GPU(N+1).
-                skip_cuda_sync=True,
-            )
+            if request_output_tensors:
+                self.tensor_manager.store_and_populate_graph_edges(
+                    request_id=request_id,
+                    tensors=request_output_tensors,
+                    graph_edges=filtered_outputs,
+                    # We already synced on output.completion_event above,
+                    # which waits only for GPU(N) — the unconditional
+                    # default-stream sync inside store_and_return_tensor_info
+                    # would also drain the speculatively-queued GPU(N+1).
+                    skip_cuda_sync=True,
+                )
 
+            # ``complete_loops`` (the mark_node_complete shim) MUST run for
+            # every node, even ones with no produced tensors (BAGEL
+            # prefill_text, vae_encoder, etc.) — it's what flips the
+            # registry's is_done flag so the worker graph can fire
+            # WORKER_GRAPHS_DONE and the conductor can advance walks.
             worker_graph_id = self.worker_graphs_manager.get_worker_graph_id_for_node(
                 request_id, node_name=node.name
             )
