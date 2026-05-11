@@ -3,7 +3,7 @@ from enum import Enum
 
 from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
 from mminf.graph.base import GraphEdge, TensorPointerInfo
-from mminf.graph.loop_index import IterIndexTree
+from mminf.graph.loop_indices import NestedLoopIndices
 
 
 class Status(Enum):
@@ -75,7 +75,7 @@ class StopLoops(MessageBody):
     request_id: str
     loop_names: set[str]
     partition_name: str
-    loop_stop_times: dict[str, IterIndexTree] = field(default_factory=dict)
+    loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
 @dataclass
 class WorkerMessage:
