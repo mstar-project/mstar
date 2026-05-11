@@ -341,14 +341,6 @@ class WorkerGraphsManager:
                 )
         return inputs
 
-    def process_new_streaming_inputs(
-        self, request_id: str, inputs: list[GraphEdge]
-    ) -> list[GraphEdge]:
-        """Alias for ``process_new_inputs``: streaming edges are routed through
-        the same path, and ``ReadySignals.is_ready_for_streaming`` flips on as
-        soon as the only missing inputs are the streaming names."""
-        return self.process_new_inputs(request_id, inputs)
-
     def get_worker_graph_id_for_node(
         self, request_id: str, node_name: str
     ) -> str:
@@ -403,47 +395,16 @@ class WorkerGraphsManager:
                 kept.append(e)
         return FilteredEdges(kept=kept, filtered_out=filtered_out)
 
-    def apply_spec_consumption(
-        self, request_id: str, spec_node_name: str,
-    ) -> None:
-        """Legacy no-op. The new design does not maintain a separate
-        ``_curr_iter_section`` snapshot to short-circuit; speculation marks
-        the next iteration's inputs via ``WorkerGraphIO.ingest_for_speculation``,
-        and the natural ``Loop.complete_iter`` path advances on completion.
-        Loop termination on a stopped loop is now driven by
-        ``register_loop_finish_signal`` + ``mark_node_complete`` together.
-        """
-        return
-
-    def get_waiting_node(
-        self, request_id: str, worker_graph_id: str,
-    ):
-        """Legacy no-op. Output caching is internal to
-        ``LoopStateRegistry.mark_entity_complete`` (calls
-        ``Loop.maybe_cache_output``) — the worker no longer needs to fetch a
-        ``waiting_node`` to call ``cache_outputs`` on it directly. Returns
-        ``None`` so the existing ``if waiting_node is not None`` guard at
-        worker.py's call site skips the obsolete branch.
-        """
-        return None
-
     def process_node_outputs(
         self, request_id: str,
         outputs: list[GraphEdge],
         graph_walk: str,
-        spec_node_name: str | None = None
     ) -> NodeOutputRouting:
-        """
-        After a node has finished processing, use its outputs to update
-        worker graph queues, and return any outputs that should be sent to other
-        worker graphs or the conductor.
+        """After a node has finished, route its outputs.
 
-        ``spec_node_name`` is accepted for backward compatibility with worker.py
-        but is ignored — speculative consumption is now handled inside the
-        graph via ``WorkerGraphIO.ingest_for_speculation`` + natural advance.
+        Updates ready/waiting state in worker graphs on this worker, and
+        builds the cross-worker routing map for edges destined elsewhere.
         """
-        del spec_node_name  # legacy parameter; see apply_spec_consumption docstring
-
         # (0) separate streaming edges — they bypass the queue system
         streaming_edges = [edge for edge in outputs if edge.is_streaming]
         non_streaming_outputs = [edge for edge in outputs if not edge.is_streaming]
@@ -628,20 +589,6 @@ class WorkerGraphsManager:
                 self.queues[worker_graph_id].get_dynamic_loop_iters(request_id)
             )
         return iter_counts
-
-    def clear_dyn_loop_curr_iter_section(
-        self, request_id: str,
-        partition: str,
-        loop_names: set[str],
-    ):
-        """Legacy no-op. The old method cleared a Loop's pre-emptively-queued
-        next-iter ``_curr_iter_section`` so ``_iter_done`` could fire after
-        ``register_finished``. In the new design, ``Loop._finish_signal``
-        is checked directly in ``Loop.complete_iter`` and the inner registry
-        is cleared in the done branch — no pre-cleanup needed.
-        """
-        del request_id, partition, loop_names
-        return
 
     def add_request(
         self, request_id: str,
