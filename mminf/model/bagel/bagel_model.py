@@ -44,7 +44,6 @@ from mminf.conductor.request_info import CurrentForwardConductorMetadata
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import (
-    DynamicLoop,
     GraphEdge,
     GraphNode,
     GraphSection,
@@ -456,7 +455,7 @@ class BagelModel(Model):
         # No output needed — conductor is notified when the worker graph completes.
         prefill_text = GraphNode(
             name="LLM",
-            input_ids=["text_inputs"],
+            input_names=["text_inputs"],
             outputs=[],
         )
 
@@ -464,14 +463,14 @@ class BagelModel(Model):
         prefill_vit = Sequential([
             GraphNode(
                 name="vit_encoder",
-                input_ids=["image_inputs"],
+                input_names=["image_inputs"],
                 outputs=[
                     GraphEdge(next_node="LLM", name="img_emb"),
                 ],
             ),
             GraphNode(
                 name="LLM",
-                input_ids=["img_emb"],
+                input_names=["img_emb"],
                 outputs=[],
             ),
         ])
@@ -480,24 +479,24 @@ class BagelModel(Model):
         prefill_vae = Sequential([
             GraphNode(
                 name="vae_encoder",
-                input_ids=["image_inputs"],
+                input_names=["image_inputs"],
                 outputs=[
                     GraphEdge(next_node="LLM", name="img_emb"),
                 ],
             ),
             GraphNode(
                 name="LLM",
-                input_ids=["img_emb"],
+                input_names=["img_emb"],
                 outputs=[],
             ),
         ])
 
         # -- decode: single LLM node (embed + transformer + lm_head) --
-        decode = DynamicLoop(
+        decode = Loop(
             name="decode_loop",
             section=GraphNode(
                 name="LLM",
-                input_ids=["text_inputs"],
+                input_names=["text_inputs"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -522,7 +521,7 @@ class BagelModel(Model):
             Loop(
                 section=GraphNode(
                     name="LLM",
-                    input_ids=["latents", "time_index"],
+                    input_names=["latents", "time_index"],
                     outputs=[
                         GraphEdge(next_node="LLM", name="latents"),
                         GraphEdge(next_node="LLM", name="time_index"),
@@ -536,7 +535,7 @@ class BagelModel(Model):
             ),
             GraphNode(
                 name="vae_decoder",
-                input_ids=["latents"],
+                input_names=["latents"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -557,7 +556,7 @@ class BagelModel(Model):
                     Parallel([
                         GraphNode(
                             name="LLM",
-                            input_ids=["latents", "time_index"],
+                            input_names=["latents", "time_index"],
                             outputs=[
                                 GraphEdge(next_node="combine_cfg", name="v_main"),
                             ],
@@ -565,7 +564,7 @@ class BagelModel(Model):
                         ),
                         GraphNode(
                             name="LLM_cfg_text",
-                            input_ids=["latents", "time_index"],
+                            input_names=["latents", "time_index"],
                             outputs=[
                                 GraphEdge(next_node="combine_cfg", name="v_cfg_text"),
                             ],
@@ -573,7 +572,7 @@ class BagelModel(Model):
                         ),
                         GraphNode(
                             name="LLM_cfg_img",
-                            input_ids=["latents", "time_index"],
+                            input_names=["latents", "time_index"],
                             outputs=[
                                 GraphEdge(next_node="combine_cfg", name="v_cfg_img"),
                             ],
@@ -582,7 +581,7 @@ class BagelModel(Model):
                     ]),
                     GraphNode(
                         name="combine_cfg",
-                        input_ids=[
+                        input_names=[
                             "v_main", "v_cfg_text", "v_cfg_img",
                             "latents", "time_index",
                         ],
@@ -605,7 +604,7 @@ class BagelModel(Model):
             ),
             GraphNode(
                 name="vae_decoder",
-                input_ids=["latents"],
+                input_names=["latents"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
