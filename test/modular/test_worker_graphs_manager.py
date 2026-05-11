@@ -294,3 +294,62 @@ def test_complete_loops_shim_drops_loop_back_on_loop_done():
     # any output edges whose (name, dest) is not in the caller's set.
     kept_dests = {e.next_node for e in result.kept}
     assert "post_processor" in kept_dests
+
+
+def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
+    """Regression: a wg whose just-completed node emits only special-destination
+    edges (EMPTY_DESTINATION / EMIT_TO_CLIENT / streaming) must still flip to
+    ``completed_worker_graph_ids`` so the worker can fire WORKER_GRAPHS_DONE.
+
+    Previously the inverted-index routing only checked ``is_done`` on wgs
+    that ingested an edge in this call, so prefill walks whose outputs all
+    leave the local wg (Orpheus prefill -> EMPTY_DESTINATION + streaming to
+    SNAC) never reported done and the conductor hung.
+    """
+    # Build a 1-node wg whose single output goes to EMPTY_DESTINATION.
+    from mminf.graph.special_destinations import EMPTY_DESTINATION
+    single_node_graph = GraphNode(
+        name="prefill",
+        input_names={"prompt"},
+        outputs=[
+            GraphEdge(name="new_token", next_node=EMPTY_DESTINATION,
+                      conductor_new_token=True, persist=True),
+        ],
+    )
+    wg_id = "wg_external"
+    worker_graph = WorkerGraph(
+        section=single_node_graph,
+        graph_walks={"prefill"},
+        ranks=[0],
+        worker_graph_id=wg_id,
+    )
+    mgr = WorkerGraphsManager(
+        queues={wg_id: WorkerGraphQueues(
+            worker_graph_id=wg_id,
+            graph_walks={"prefill"},
+            worker_graph=worker_graph,
+            per_request_queues={},
+            tensor_manager=StubTensorManager(),
+        )},
+        per_request_info={},
+        all_worker_graph_ids_to_graph_walks={wg_id: {"prefill"}},
+        all_worker_graph_ids_to_nodes={wg_id: {"prefill"}},
+        all_worker_graph_ids_to_dyn_loops={wg_id: set()},
+        node_to_partition={"prefill": "default"},
+    )
+    mgr.add_request(
+        request_id="rid",
+        partition_worker_graph_ids=[wg_id],
+        worker_graph_to_worker={wg_id: "worker0"},
+        current_fwd_info=_fwd_info("prefill"),
+    )
+    mgr.process_new_inputs("rid", [GraphEdge(name="prompt", next_node="prefill")])
+    mgr.mark_node_complete("rid", wg_id, "prefill")
+
+    routing = mgr.process_node_outputs(
+        "rid",
+        outputs=list(mgr.queues[wg_id].per_request_queues["rid"].nodes["prefill"].outputs),
+        graph_walk="prefill",
+    )
+    assert wg_id in routing.completed_worker_graph_ids, \
+        "prefill wg with only EMPTY_DESTINATION outputs must still report done"
