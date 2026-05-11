@@ -157,10 +157,13 @@ def test_speculation_strict_mode_partial_spec_not_ready():
     assert ready[0].is_new_loop_iter is True
 
 
-def test_triple_deliver_raises():
-    """ingest_input called three times for the same edge name (within one
-    outer iter) must raise — only ready_signals + ready_next_iter slots
-    exist; a third copy would silently corrupt state."""
+def test_triple_deliver_returns_false():
+    """ingest_input called three times for the same edge name returns False
+    on the third call — only ready_signals + ready_next_iter slots exist.
+    Soft rejection (rather than raising) lets streaming back-pressure work:
+    the worker's StreamBuffer re-queues the rejected edge until the consumer
+    catches up. Same return semantics is used for the cross-walk persist case
+    (edge name not in destination node's input_names)."""
     graph = Sequential(sections=[
         GraphNode(
             name="x",
@@ -170,10 +173,27 @@ def test_triple_deliver_raises():
     ])
     io = WorkerGraphIO(graph)
     edge = GraphEdge(name="a", next_node="x")
-    io.ingest_input(edge)
-    io.ingest_input(edge)
-    with pytest.raises(RuntimeError, match="third copy"):
-        io.ingest_input(edge)
+    assert io.ingest_input(edge) is True
+    assert io.ingest_input(edge) is True
+    assert io.ingest_input(edge) is False
+
+
+def test_ingest_input_rejects_unknown_input_name():
+    """An edge whose name is not in the destination node's input_names
+    returns False (does NOT raise). Mirrors the Q3-Omni ``talker_input_embeds
+    → Talker`` cross-walk persist edge that lands on a Talker node in the
+    current walk that doesn't take that input."""
+    graph = Sequential(sections=[
+        GraphNode(
+            name="x",
+            input_names={"a"},
+            outputs=[],
+        ),
+    ])
+    io = WorkerGraphIO(graph)
+    assert io.ingest_input(GraphEdge(name="not_an_input", next_node="x")) is False
+    # The node's ready state must be untouched.
+    assert io.nodes["x"].ready_signals.ready_names == set()
 
 
 def test_streaming_inputs_propagate_to_ready_signals():
