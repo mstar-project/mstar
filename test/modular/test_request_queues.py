@@ -1,12 +1,20 @@
-import sys
-import time
+import pytest
 
-from mminf.graph.request_queues import PerRequestNodeQueues
+pytest.skip(
+    "Legacy test of the deleted PerRequestNodeQueues API. Will be "
+    "rewritten against WorkerGraphIO in Phase D of the graph refactor.",
+    allow_module_level=True,
+)
+
+import sys  # noqa: E402
+import time  # noqa: E402
+
+from mminf.graph.request_queues import PerRequestNodeQueues  # noqa: E402
 
 sys.path.insert(0, ".")
-import numpy as np
+import numpy as np  # noqa: E402
 
-from mminf.graph.base import GraphEdge, GraphNode, Loop, Parallel, Sequential
+from mminf.graph.base import GraphEdge, GraphNode, Loop, Parallel, Sequential  # noqa: E402
 
 if __name__ == "__main__":
     # show-o2-style graph with weird stuff added to stress-test
