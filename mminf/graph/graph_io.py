@@ -110,9 +110,13 @@ class WorkerGraphIO:
         self._nodes_with_speculative_inputs.add(node.name)
         if node.input_names.issubset(node.speculative_signals.ready_names) \
                 and node.name not in self._speculative_ready:
+            loop_name: str | None = None
+            if isinstance(node._managing_registry, LoopStateRegistry):
+                loop_name = node._managing_registry.loop.name
             self._speculative_ready[node.name] = SpeculativeNodeInfo(
                 node_name=node.name,
                 is_new_loop_iter=self._speculative_node_has_loop_back.get(node.name, False),
+                loop_name=loop_name,
             )
 
     @property

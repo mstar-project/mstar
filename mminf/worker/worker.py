@@ -1470,6 +1470,38 @@ class Worker:
                     self._return_speculative_streaming_edge(rid, edge)
             return None
 
+        # Per-rid loop-completion filter: drop any rid whose loop is about to
+        # terminate. At spec-build time the in-flight batch IS the loop's
+        # current iter (``curr_iter == N``); the spec batch represents
+        # iter N+1. If ``curr_iter + 1 >= max_iters`` OR the loop already has
+        # ``_finish_signal=True``, iter N is the last iter and the spec
+        # batch would be wasted GPU work — its outputs leak tensor_info onto
+        # already-terminated loop slots and inflate KV cache use.
+        if gate_match.loop_name is not None:
+            survivors: list[str] = []
+            for rid in continuing:
+                wgio = self._get_wgio_for_rid(batch_N, rid)
+                loop = wgio.loops.get(gate_match.loop_name)
+                if loop is not None and (
+                    loop.curr_iter + 1 >= loop.max_iters or loop._finish_signal
+                ):
+                    # Roll back this rid's speculative state and streaming edges.
+                    wgio.clear_speculative_inputs()
+                    for edge in streaming_edges.get(rid, []):
+                        self._return_speculative_streaming_edge(rid, edge)
+                    streaming_edges.pop(rid, None)
+                    new_node_objects.pop(rid, None)
+                    per_request_inputs.pop(rid, None)
+                    per_request_info.pop(rid, None)
+                    new_request_to_worker_graph.pop(rid, None)
+                    continue
+                survivors.append(rid)
+
+            if not survivors:
+                # Whole batch is at loop end — abort spec (no rid left to run).
+                return None
+            continuing = survivors
+
         # ── merge in fresh rids whose decode-loop node is ready right now ──
         # Speculation should only consume work compatible with the in-flight
         # AR loop. In partitioned models, unrelated ready work (e.g. SNAC or a

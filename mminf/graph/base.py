@@ -52,6 +52,11 @@ class SpeculativeNodeInfo:
     # True if this node received loop-back inputs speculatively, meaning it will re-run
     # in the next iteration of the same loop rather than advancing to a new section.
     is_new_loop_iter: bool
+    # Name of the enclosing Loop, when the node lives inside one. ``None`` for
+    # top-level nodes. Lets callers look up ``wgio.loops[loop_name]`` to inspect
+    # ``curr_iter`` / ``max_iters`` / ``_finish_signal`` before deciding whether
+    # to speculate.
+    loop_name: str | None = None
 
 
 class GraphSection(ABC):

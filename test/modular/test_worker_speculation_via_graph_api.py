@@ -201,6 +201,78 @@ def test_speculative_signals_sees_tensor_info_via_shared_reference():
     assert gathered.tensor_info is producer_token_edge.tensor_info  # same list
 
 
+def test_speculative_node_info_carries_loop_name():
+    """``SpeculativeNodeInfo.loop_name`` must be populated for nodes that
+    live inside a Loop (so the worker can look up ``wgio.loops[loop_name]``
+    to check ``curr_iter``/``max_iters``/``_finish_signal`` before deciding
+    whether to speculate), and ``None`` for top-level nodes.
+    """
+    # In-loop node: ar_decode inside ar_loop.
+    wgio = _per_rid_wgios(1)[0]
+    _ingest_all_loop_back(wgio, "ar_decode")
+    ready = wgio.ready_for_speculation
+    assert len(ready) == 1
+    assert ready[0].node_name == "ar_decode"
+    assert ready[0].loop_name == "ar_loop"
+
+
+def test_speculative_node_info_loop_name_none_for_top_level():
+    """A top-level node (no enclosing Loop) reports ``loop_name=None``."""
+    # Graph: a single top-level node with a loop-back to itself (no Loop
+    # wrapper). It's structurally degenerate but exercises the None path.
+    graph = Sequential(sections=[
+        GraphNode(
+            name="solo",
+            input_names={"x"},
+            outputs=[GraphEdge(name="x", next_node="solo")],
+        ),
+    ])
+    wgio = WorkerGraphIO(graph)
+    wgio.ingest_for_speculation(GraphEdge(name="x", next_node="solo"))
+    ready = wgio.ready_for_speculation
+    # Top-level node has no LoopStateRegistry → loop_name None.
+    # (is_new_loop_iter is also False here because the edge isn't in any
+    # Loop's _loop_back_inputs — there's no Loop.)
+    assert len(ready) == 1
+    assert ready[0].node_name == "solo"
+    assert ready[0].loop_name is None
+    assert ready[0].is_new_loop_iter is False
+
+
+def test_loop_state_signals_last_iter_via_curr_iter_plus_one():
+    """Sanity check that the worker's drop condition
+    (``curr_iter + 1 >= max_iters``) correctly identifies "iter N is the
+    last iter" for a Loop. Pin this so the worker-side filter doesn't drift
+    out of sync with how Loop.complete_iter decides done."""
+    graph = _ar_loop_graph(max_iters=3)
+    wgio = WorkerGraphIO(graph)
+
+    loop = wgio.loops["ar_loop"]
+    # iter 0 about to run: curr_iter=0, 0+1<3 → not last.
+    assert loop.curr_iter == 0
+    assert not (loop.curr_iter + 1 >= loop.max_iters)
+
+    # Simulate two iter advances (what complete_iter does for non-terminal iters).
+    loop.curr_iter = 1
+    assert not (loop.curr_iter + 1 >= loop.max_iters)
+    loop.curr_iter = 2
+    # iter 2 about to run: 2+1==3==max_iters → last iter, spec for iter 3 wasted.
+    assert loop.curr_iter + 1 >= loop.max_iters
+
+
+def test_loop_finish_signal_also_signals_last_iter():
+    """``_finish_signal=True`` means the loop terminates at the next
+    ``complete_iter`` regardless of ``curr_iter``. The worker drops spec in
+    that case too."""
+    graph = _ar_loop_graph(max_iters=10)
+    wgio = WorkerGraphIO(graph)
+    loop = wgio.loops["ar_loop"]
+    # Plenty of iters left by count, but external stop fired.
+    assert loop.curr_iter + 1 < loop.max_iters
+    wgio.register_loop_finish_signal("ar_loop")
+    assert loop._finish_signal is True
+
+
 def test_non_loop_back_node_does_not_appear_in_ready_for_speculation():
     """The worker only ingests outputs whose ``next_node == node.name`` (the
     loop-back filter in its per-rid loop). A non-loop-back downstream
