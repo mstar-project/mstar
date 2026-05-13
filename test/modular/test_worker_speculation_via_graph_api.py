@@ -2,7 +2,7 @@
 
 These tests do not spin up a worker — instead they exercise the
 ``ingest_for_speculation`` / ``ready_for_speculation`` API in the exact shape
-that ``Worker._try_speculate_next`` relies on after Phase G.1:
+that ``Worker._try_speculate_next`` relies on:
 
   - Per-rid wgios (deep-copied from the same graph) maintain independent
     ``speculative_signals`` state, so ingesting on one rid does not leak into
@@ -14,7 +14,7 @@ that ``Worker._try_speculate_next`` relies on after Phase G.1:
     .ready_names`` short-circuit in ``WorkerGraphIO.ingest_for_speculation``).
   - On the gate-failure rollback path: partial ingestion does NOT advance the
     strict gate even when ``ready_signals`` happens to be full from the
-    in-flight iter (the canonical Phase A-fix invariant, re-validated for the
+    in-flight iter (the canonical readiness invariant, re-validated for the
     worker's call pattern).
 """
 from copy import deepcopy
@@ -60,7 +60,7 @@ def _per_rid_wgios(num_rids: int) -> list[WorkerGraphIO]:
 
 
 def _ingest_all_loop_back(wgio: WorkerGraphIO, node_name: str) -> None:
-    """Mirror the per-rid loop in worker.py G.1: ingest every loop-back output
+    """Mirror the per-rid loop the worker uses: ingest every loop-back output
     of ``node_name`` into ``wgio``'s ``speculative_signals``."""
     rid_node = wgio.nodes[node_name]
     for edge in rid_node.outputs:
@@ -69,8 +69,9 @@ def _ingest_all_loop_back(wgio: WorkerGraphIO, node_name: str) -> None:
 
 
 def test_per_rid_speculative_state_is_isolated():
-    """G.1 assumes per-rid wgios are independent: deep-copying the graph
-    section yields wgios whose ``speculative_signals`` slots do not share state.
+    """The worker assumes per-rid wgios are independent: deep-copying the
+    graph section yields wgios whose ``speculative_signals`` slots do not
+    share state.
 
     Without this, ingesting anticipated outputs for one rid would leak into
     another rid's gate decision — a bug that would make the worker's gate
@@ -91,9 +92,9 @@ def test_per_rid_speculative_state_is_isolated():
 
 
 def test_first_rid_gate_match_shape():
-    """G.1 inspects ``first_wgio.ready_for_speculation`` for the specific
-    ``SpeculativeNodeInfo`` shape: node_name matching the in-flight batch's
-    node_name AND is_new_loop_iter=True. Pin both fields down."""
+    """The worker inspects ``first_wgio.ready_for_speculation`` for the
+    specific ``SpeculativeNodeInfo`` shape: node_name matching the in-flight
+    batch's node_name AND is_new_loop_iter=True. Pin both fields down."""
     wgio = _per_rid_wgios(1)[0]
     _ingest_all_loop_back(wgio, "ar_decode")
 
@@ -105,10 +106,11 @@ def test_first_rid_gate_match_shape():
 
 
 def test_clear_speculative_inputs_resets_for_next_outer_iter():
-    """G.1's end-of-function clear (and the abort-path clear) must reset the
-    slot, otherwise the next outer iter's ingest_for_speculation hits the
-    ``edge.name in node.speculative_signals.ready_names`` short-circuit and
-    becomes a no-op — gate would silently never fire after the first call."""
+    """The worker's end-of-function clear (and the abort-path clear) must
+    reset the slot, otherwise the next outer iter's ingest_for_speculation
+    hits the ``edge.name in node.speculative_signals.ready_names`` short-
+    circuit and becomes a no-op — gate would silently never fire after the
+    first call."""
     wgio = _per_rid_wgios(1)[0]
     _ingest_all_loop_back(wgio, "ar_decode")
     assert wgio.ready_for_speculation  # fires once
@@ -124,7 +126,7 @@ def test_clear_speculative_inputs_resets_for_next_outer_iter():
 
 def test_gate_fails_when_only_partial_outputs_ingested():
     """If the spec node has multiple loop-back outputs and the worker only
-    ingests SOME of them, the strict gate must refuse — G.1's worker-side
+    ingests SOME of them, the strict gate must refuse — the worker's
     rollback path depends on this so we don't speculate on an incompletely
     anticipated node."""
     wgio = _per_rid_wgios(1)[0]
@@ -155,16 +157,18 @@ def test_gate_fires_on_full_ingest_after_partial_was_attempted():
 
 
 def test_speculative_signals_sees_tensor_info_via_shared_reference():
-    """G.2 invariant: ``ingest_for_speculation`` stores the producer's edge
-    BY REFERENCE in ``speculative_signals.ready_inputs[name]``. When
+    """The promotion path depends on a strict invariant:
+    ``ingest_for_speculation`` stores the producer's edge BY REFERENCE in
+    ``speculative_signals.ready_inputs[name]``. When
     ``_store_outputs_and_finish_loops`` later mutates
     ``producer.outputs[i].tensor_info`` in place, the spec slot's tensor_info
-    reflects that mutation — this is what enables ``_gather_spec_inputs_from
-    _speculative_signals`` to read N's outputs without a thread step.
+    reflects that mutation — this is what enables
+    ``_gather_spec_inputs_from_speculative_signals`` to read N's outputs
+    without a separate thread step.
 
     Bug shape this guards against: if any layer ever started DEEPCOPYING the
-    edge during ingest_for_speculation (or update), G.2's gather would read
-    a stale empty tensor_info and silently drop continuing rids.
+    edge during ingest_for_speculation (or update), the spec gather would
+    read a stale empty tensor_info and silently drop continuing rids.
     """
     from mminf.graph.base import TensorPointerInfo
 
@@ -199,7 +203,7 @@ def test_speculative_signals_sees_tensor_info_via_shared_reference():
 
 def test_non_loop_back_node_does_not_appear_in_ready_for_speculation():
     """The worker only ingests outputs whose ``next_node == node.name`` (the
-    loop-back filter in G.1's per-rid loop). A non-loop-back downstream
+    loop-back filter in its per-rid loop). A non-loop-back downstream
     destination would only see one of its inputs and never satisfy the strict
     gate. This is the worker-side invariant that lets us avoid spurious spec
     fires on, e.g., the prefill → ar_decode hop."""

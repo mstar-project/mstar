@@ -1,8 +1,8 @@
 import pytest
 
 pytest.skip(
-    "Legacy test of the deleted PerRequestNodeQueues API. Will be "
-    "rewritten against WorkerGraphIO in Phase D of the graph refactor.",
+    "Legacy test of the deleted PerRequestNodeQueues API. Replaced by "
+    "WorkerGraphIO-based tests in test_graph_io.py.",
     allow_module_level=True,
 )
 

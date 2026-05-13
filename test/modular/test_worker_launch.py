@@ -4,10 +4,9 @@ Tests for conductor worker derivation and launching.
 import pytest
 
 pytest.skip(
-    "Depends on DummyModel + configs/examples/dummy.yaml — both deleted in "
-    "Phase F of the graph refactor. The conductor's worker-derivation and "
-    "launch logic should be re-tested against a real model (or a thin "
-    "GraphSection-only fixture) in a follow-up.",
+    "Depends on DummyModel + configs/examples/dummy.yaml — both deleted. "
+    "The conductor's worker-derivation and launch logic should be re-tested "
+    "against a real model (or a thin GraphSection-only fixture).",
     allow_module_level=True,
 )
 

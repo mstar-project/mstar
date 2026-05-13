@@ -1,4 +1,4 @@
-"""Tests for the Phase-D rewrite of ``WorkerGraphsManager``.
+"""Tests for ``WorkerGraphsManager``.
 
 Covers:
 - Inverted ``walk_node_to_worker_graph_id`` index built in __post_init__
@@ -6,14 +6,9 @@ Covers:
 - ``mark_node_complete`` returns the registry's ``NodeCompletionOutput``
 - ``process_new_inputs`` returns leftover edges that no wg claimed
 - ``stop_loops`` returns the loop-back ``set[(name, dest)]``
-- ``finish_loops`` returns the new ``LoopFinishOutput`` dataclass
+- ``finish_loops`` returns the ``LoopFinishOutput`` dataclass
 - Legacy ``complete_loops`` shim wraps ``mark_node_complete`` (still used by
   worker.py's ``_store_outputs_and_finish_loops``)
-
-Phase F removed the obsolete shims (``apply_spec_consumption``,
-``get_waiting_node``, ``clear_dyn_loop_curr_iter_section``,
-``process_new_streaming_inputs``) and their tests now that worker.py no
-longer calls them.
 """
 from dataclasses import dataclass, field
 

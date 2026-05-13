@@ -20,9 +20,8 @@ import pytest
 
 pytest.skip(
     "Depends on deleted mminf.graph.request_queues and on DynamicLoop "
-    "(merged into Loop in the new graph). The same per-loop loop-back "
-    "attribution behavior will be re-tested against WorkerGraphIO + "
-    "register_loop_finish_signal in Phase D.",
+    "(merged into Loop). The same per-loop loop-back attribution behavior "
+    "is now covered by WorkerGraphIO + register_loop_finish_signal tests.",
     allow_module_level=True,
 )
 
