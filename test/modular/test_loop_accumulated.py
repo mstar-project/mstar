@@ -1,8 +1,8 @@
-"""Unit tests for the Loop.accumulated_outputs primitive (Phase 2).
+"""Unit tests for the Loop.accumulated_outputs primitive.
 
 Drives Loop / DynamicLoop directly via ``cache_outputs`` + ``complete_loops``
 rather than routing through the full worker/engine stack — keeps the tests
-fast and focused on the new primitive's behavior.  A tiny ``MockTensorManager``
+fast and focused on the primitive's behavior. A tiny ``MockTensorManager``
 stands in for the real communication manager so we can assert refcount
 balance without booting shared memory.
 """
@@ -331,7 +331,7 @@ class TestRefcounts:
 
 
 # ---------------------------------------------------------------------------
-# GraphNode.optional_input_ids tests (Phase 2 primitive #2)
+# GraphNode.optional_input_ids tests
 # ---------------------------------------------------------------------------
 
 

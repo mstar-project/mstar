@@ -27,10 +27,6 @@ class FilteredEdges:
     """Output edges of a finished node split into the kept set (to be routed)
     and the filtered-out set (must be dereferenced because they fed a loop
     whose iteration is being skipped or terminated).
-
-    Legacy shape carried by worker.py's ``_store_outputs_and_finish_loops``
-    pending the Phase E rewrite, which will switch to
-    ``NodeCompletionOutput`` (output_edges + filtered_signals).
     """
     kept: list[GraphEdge] = field(default_factory=list)
     filtered_out: list[GraphEdge] = field(default_factory=list)
@@ -362,8 +358,8 @@ class WorkerGraphsManager:
         Returns the registry's ``NodeCompletionOutput`` carrying
         ``output_edges`` (entity static outputs + any loop terminal outputs)
         and ``filtered_signals`` (loop-back (name, dest) pairs to drop).
-        The Phase E worker.py rewrite consumes this directly; today's
-        worker.py still uses the legacy ``complete_loops`` shim below.
+        Today's worker.py still routes through the legacy ``complete_loops``
+        shim below; new callers should consume this directly.
         """
         return self.queues[worker_graph_id].mark_node_complete(request_id, node_name)
 
@@ -569,8 +565,7 @@ class WorkerGraphsManager:
         loop_names: set[str],
     ) -> LoopFinishOutput:
         """Structured-return variant of ``stop_loops`` (no req_info side
-        effect). Returned per-rid for the Phase E worker.py rewrite that
-        wants a single dataclass instead of a bare set.
+        effect). Returns a per-rid dataclass instead of a bare set.
         """
         part_info = self.per_request_info[request_id].per_partition_info[partition]
         loop_back_signals: set[NameAndDest] = set()

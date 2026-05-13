@@ -1092,9 +1092,7 @@ class Worker:
     #     slow_postprocess(N) ───────────► overlap with GPU(N+1)
     #
     # Speculation scope (currently): AR engine only, intra-worker, 1-deep,
-    # for rids whose loop is still continuing. Notes for extending to other
-    # engines (b) and across partitions / cross-worker (c) live in
-    # ASYNC_REDESIGN.md.
+    # for rids whose loop is still continuing.
     # ------------------------------------------------------------------
 
     def _pre_plan_for_speculative_batch(
@@ -1103,7 +1101,7 @@ class Worker:
         spec_node_batch: NodeBatch,
         prev_advance_event: "threading.Event | None",
     ) -> bool:
-        """Phase 3 double-buffer: dispatch entry point on plan_executor.
+        """Dispatch entry point on the plan_executor for the speculative batch.
 
         Waits on ``prev_advance_event`` — set by the GPU thread RIGHT AFTER
         ``advance_seq_lens(prev)`` runs (~tens of µs into prev replay) —
@@ -1198,11 +1196,11 @@ class Worker:
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
-        # Phase 3: wait for the plan_executor's pre-planned wrapper.plan()
-        # call to finish before running this batch — its results land on the
-        # captured graph's persistent wrappers, and the next plan_attention
-        # call(s) will see the matching label in _pre_planned_labels only
-        # because plan_executor populated it. Wait releases the GIL.
+        # Wait for the plan_executor's pre-planned wrapper.plan() call to
+        # finish before running this batch — its results land on the captured
+        # graph's persistent wrappers, and the next plan_attention call(s)
+        # will see the matching label in _pre_planned_labels only because
+        # plan_executor populated it. Wait releases the GIL.
         if plan_future is not None:
             if self.enable_nvtx:
                 range_push("worker.gpu_thread.await_plan", synchronize=False)
@@ -1224,11 +1222,10 @@ class Worker:
                 output.completion_event = event
             return output
         finally:
-            # Phase 3 safety net: ensure advance_event fires even if the
-            # engine raised before reaching ``advance_seq_lens`` inside
+            # Safety net: ensure advance_event fires even if the engine
+            # raised before reaching ``advance_seq_lens`` inside
             # ``_run_basic_batched``. Without this, a plan_executor waiting
-            # on prev_advance_event would block forever on the failure
-            # path.
+            # on prev_advance_event would block forever on the failure path.
             if advance_event is not None:
                 advance_event.set()
             # Same idea for launch_started_event: if the engine raised
@@ -1285,13 +1282,8 @@ class Worker:
 
         TODO(extension): generalize to (b) any same-engine walks (prefill →
         decode transitions, flow loop bodies) and (c) cross-engine /
-        cross-worker (e.g. LLM → flow). See ASYNC_REDESIGN.md.
+        cross-worker (e.g. LLM → flow).
         """
-        # Debug knob: ``MMINF_DISABLE_SPEC=1`` forces every batch through the
-        # non-spec path. Useful for bisecting whether a quality regression
-        # lives in the speculation chain vs. the base scheduling/loop path.
-        if os.environ.get("MMINF_DISABLE_SPEC", "") == "1":
-            return False
         if any(
             not getattr(node, "enable_async_scheduling", True)
             for node in batch.node_objects.values()
@@ -1309,6 +1301,17 @@ class Worker:
         the same name appears on both sides of the loop.
         """
         return {edge.name for edge in node.outputs if edge.next_node == node.name}
+
+    def _get_wgio_for_rid(self, batch: ScheduledBatch, rid: str):
+        """Per-rid WorkerGraphIO for the wg that owns this rid in this batch.
+
+        Speculation needs the WorkerGraphIO to drive ``ingest_for_speculation`` /
+        ``ready_for_speculation``. Each rid has its own deepcopied wgio (see
+        ``WorkerGraphQueues.add_request``), so graph state mutations are
+        isolated per request.
+        """
+        wg_id = batch.request_to_worker_graph[rid]
+        return self.worker_graphs_manager.queues[wg_id].per_request_queues[rid]
 
     def _try_speculate_next(
         self,
@@ -1335,26 +1338,24 @@ class Worker:
             current speculation chain to drain before they can be
             scheduled — a major regression for concurrent throughput.
 
-        Speculation requires the loop body's required inputs to be a subset
-        of its loop-back outputs (i.e. every input name has a same-name
-        ``next_node == node.name`` output edge), so the fresh-rid input
-        gathering only has to handle those names.
+        Readiness gate: per-rid ``ingest_for_speculation`` populates each
+        rid's ``speculative_signals`` with the spec node's anticipated
+        loop-back outputs plus any already-arrived streaming edges; the
+        strict gate inside ``WorkerGraphIO.ready_for_speculation`` then fires
+        only when ``speculative_signals`` covers every ``input_name``. The
+        worker checks the first rid's gate (per-rid graph shape is
+        identical; only state differs) and treats that as the batch-wide
+        decision.
         """
-        # Find loop-back inputs from a sample node. Speculation requires that
-        # ALL of the node's required inputs are loop-back or streaming
-        # (otherwise we'd need to gather other inputs from tensor_manager,
-        #  and the queue state for those isn't necessarily ready in this iter).
+        # Cheap pre-filter: a non-loop-back node can't be a same-node spec
+        # target. The real readiness gate runs after the streaming poll below,
+        # where ``ingest_for_speculation`` populates each rid's
+        # ``speculative_signals`` and we read ``ready_for_speculation`` to
+        # decide whether the next iter is speculatively schedulable.
         sample_node = next(iter(batch_N.node_objects.values()))
         loop_back_inputs = self._loop_back_input_names(sample_node)
         if not loop_back_inputs:
             return None
-        for input_name in sample_node.input_names:
-            if input_name not in loop_back_inputs \
-                    and input_name not in sample_node._streaming_inputs:
-                # Has a non-loop-back / streaming required input — speculation skipped.
-                # (E.g. a node that takes both a loop-back tensor and a fresh
-                # external input on each iter.)
-                return None
 
         continuing = []
         for rid in batch_N.node_objects:
@@ -1372,21 +1373,17 @@ class Worker:
 
         # Reuse the same GraphNode objects for the speculated step — they
         # carry no per-iter mutable state that batch_N still needs after this
-        # iter's fast_postprocess. The colleague's Phase 2 plan eliminated
-        # ``clone_for_next_iter`` deliberately: spec batches now share the
-        # registry's node, and ``ingest_for_speculation`` previews readiness
-        # without touching ``ready_signals`` or ``ready_next_iter``.
+        # iter's fast_postprocess. Spec batches share the registry's node,
+        # and ``ingest_for_speculation`` (below) previews readiness without
+        # touching ``ready_signals`` or ``ready_next_iter``.
         #
-        # Generalization note: the spec gate above requires all inputs to be
-        # loop-back or streaming, so we never gather inputs from
-        # ``ready_next_iter`` here — placeholder slots get filled from N's
-        # outputs by ``_thread_outputs_to_speculative`` and fresh-rid inputs
-        # come from the scheduler-popped node's ``ready_signals.ready_inputs``
-        # below. If a future change lifts that restriction (e.g. lets a spec
-        # node take a non-loop-back input that may have arrived early and
-        # landed in ``ready_next_iter`` because ``ready_signals`` was still
-        # full from this iter), the fresh-rid gather loop will need to union
-        # both slots before reading.
+        # Continuing-rid input slots are filled AFTER await by the main loop's
+        # ``_gather_spec_inputs_from_speculative_signals`` call — reading
+        # ``speculative_signals.ready_inputs[name].tensor_info`` (shared by
+        # reference with ``producer.outputs[i].tensor_info``, populated by
+        # ``_pre_routing``'s ``_store_outputs_and_finish_loops``). Fresh-rid
+        # inputs come from the scheduler-popped node's ``ready_signals
+        # .ready_inputs`` below.
         new_node_objects = {}
         new_request_to_worker_graph = {}
         per_request_inputs = {}
@@ -1394,9 +1391,13 @@ class Worker:
         for rid in continuing:
             new_node_objects[rid] = batch_N.node_objects[rid]
             new_request_to_worker_graph[rid] = batch_N.request_to_worker_graph[rid]
-            # Placeholder inputs for continuing rids — filled in by
-            # _thread_outputs_to_speculative once GPU(N) returns.
-            per_request_inputs[rid] = {name: [] for name in loop_back_inputs}
+            # Continuing-rid input slots are populated AFTER await GPU(N) by
+            # ``_gather_spec_inputs_from_speculative_signals``, which reads
+            # tensor_info from each rid's ``speculative_signals`` (shared by
+            # reference with producer.outputs[i].tensor_info, written by
+            # ``_pre_routing``'s call to ``_store_outputs_and_finish_loops``).
+            # Streaming names get filled below in the streaming poll loop.
+            per_request_inputs[rid] = {}
             per_request_info[rid] = self.worker_graphs_manager.get_fwd_info(
                 rid, partition_N
             )
@@ -1411,7 +1412,7 @@ class Worker:
                 if len(streaming_edges[rid]) < len(sample_node._streaming_inputs):
                     for edge in streaming_edges[rid]:
                         self._return_speculative_streaming_edge(rid, edge)
-                    
+
                     new_node_objects.pop(rid, None)
                     per_request_inputs.pop(rid, None)
                     per_request_info.pop(rid, None)
@@ -1428,6 +1429,73 @@ class Worker:
             continuing = has_streaming_ready
             if not continuing:
                 return None
+
+        # Readiness gate: per-rid ``ingest_for_speculation`` on the spec
+        # node's anticipated outputs (loop-back) plus already-arrived streaming
+        # edges. The strict gate inside ``WorkerGraphIO`` fires only when the
+        # node's ``speculative_signals`` covers every input_name, which is the
+        # graph-layer canonical "ready to speculate" signal.
+        #
+        # Per-rid: each rid has its own deepcopied wgio, so the spec slot must
+        # be populated per-rid. Gate decision uses the first rid (all rids
+        # share graph shape; only state differs).
+        for rid in continuing:
+            wgio = self._get_wgio_for_rid(batch_N, rid)
+            rid_node = batch_N.node_objects[rid]
+            for edge in rid_node.outputs:
+                if edge.next_node == rid_node.name:
+                    wgio.ingest_for_speculation(edge)
+            for edge in streaming_edges.get(rid, []):
+                wgio.ingest_for_speculation(edge)
+
+        first_wgio = self._get_wgio_for_rid(batch_N, continuing[0])
+        gate_match = next(
+            (info for info in first_wgio.ready_for_speculation
+             if info.node_name == batch_N.node_name and info.is_new_loop_iter),
+            None,
+        )
+        if gate_match is None:
+            # Gate refused — roll back speculative state for surviving rids and
+            # return the streaming edges we committed to them. (Poll-failed
+            # rids' streaming edges were already returned inline above and
+            # aren't in ``continuing``.)
+            for rid in continuing:
+                self._get_wgio_for_rid(batch_N, rid).clear_speculative_inputs()
+                for edge in streaming_edges.get(rid, []):
+                    self._return_speculative_streaming_edge(rid, edge)
+            return None
+
+        # Per-rid loop-completion filter: drop any rid whose loop is about to
+        # terminate. At spec-build time the in-flight batch IS the loop's
+        # current iter (``curr_iter == N``); the spec batch represents
+        # iter N+1. If ``curr_iter + 1 >= max_iters`` OR the loop already has
+        # ``_finish_signal=True``, iter N is the last iter and the spec
+        # batch would be wasted GPU work — its outputs leak tensor_info onto
+        # already-terminated loop slots and inflate KV cache use.
+        if gate_match.loop_name is not None:
+            survivors: list[str] = []
+            for rid in continuing:
+                wgio = self._get_wgio_for_rid(batch_N, rid)
+                loop = wgio.loops.get(gate_match.loop_name)
+                if loop is not None and (
+                    loop.curr_iter + 1 >= loop.max_iters or loop._finish_signal
+                ):
+                    # Roll back this rid's speculative state and streaming edges.
+                    wgio.clear_speculative_inputs()
+                    for edge in streaming_edges.get(rid, []):
+                        self._return_speculative_streaming_edge(rid, edge)
+                    streaming_edges.pop(rid, None)
+                    new_node_objects.pop(rid, None)
+                    per_request_inputs.pop(rid, None)
+                    per_request_info.pop(rid, None)
+                    new_request_to_worker_graph.pop(rid, None)
+                    continue
+                survivors.append(rid)
+
+            if not survivors:
+                # Whole batch is at loop end — abort spec (no rid left to run).
+                return None
+            continuing = survivors
 
         # ── merge in fresh rids whose decode-loop node is ready right now ──
         # Speculation should only consume work compatible with the in-flight
@@ -1494,6 +1562,12 @@ class Worker:
             # iter K's tensor_info that was just routed.
             spec_batch.node_objects[rid].reset_outputs()
 
+        # speculative_signals must persist until the main loop's
+        # ``_gather_spec_inputs_from_speculative_signals`` call (post-await,
+        # post-``_store_outputs``). That gather is responsible for the per-rid
+        # ``clear_speculative_inputs`` cleanup. Abort paths in the main loop
+        # call ``_clear_spec_state`` to clear if no gather happens.
+
         return Speculation(
             scheduled_batch=spec_batch,
             node_batch=spec_node_batch,
@@ -1502,42 +1576,58 @@ class Worker:
             streaming_edges=streaming_edges
         )
 
-    def _thread_outputs_to_speculative(
-        self, speculation: Speculation, output_N: NodeOutput
-    ):
-        """Replace placeholder inputs in ``spec_node_batch`` with N's actual
-        output tensors, for the subset of rids that came from batch_N
-        (``continuing_rids``). Fresh rids merged into the speculative batch
-        already had their inputs gathered from tensor_manager; we leave
-        those alone.
+    def _gather_spec_inputs_from_speculative_signals(
+        self,
+        speculation: Speculation,
+        batch_N: ScheduledBatch,
+    ) -> None:
+        """Fill the spec batch's continuing-rid inputs by reading per-rid
+        ``speculative_signals.ready_inputs[name].tensor_info``.
 
-        Sets ``(threaded_continuing, dropped)``:
-        - ``threaded_continuing``: continuing rids whose loop-back outputs
-          were successfully threaded.
-        - ``dropped``: continuing rids whose required loop-back output was
-          missing — these get removed from the spec batch (rare; would be
-          wasted GPU work).
+        At call time, ``_pre_routing`` has already invoked
+        ``_store_outputs_and_finish_loops`` on ``batch_N``, so each rid's
+        producer ``outputs[i].tensor_info`` is populated with iter N's UUIDs.
+        ``speculative_signals.ready_inputs[name]`` holds the SAME edge object
+        (captured by reference in ``_try_speculate_next``'s
+        ``ingest_for_speculation`` call), so the tensor_info is visible here
+        without any explicit thread.
+
+        Fresh rids (not in ``continuing_rids``) are untouched — their inputs
+        were gathered from ``tensor_manager`` directly in ``_try_speculate_next``.
+        Rids whose loop-back output is missing (engine produced no tensor for
+        that input) are dropped from the spec batch and reported via
+        ``speculation.dropped``.
+
+        ``clear_speculative_inputs`` is called on every continuing rid's wgio
+        after the gather so the next outer iter's ``ingest_for_speculation``
+        isn't a no-op (the gate would silently never fire otherwise).
         """
-        threaded_continuing: set[str] = set()
         dropped: set[str] = set()
-        for rid in list(speculation.node_batch.request_ids):
-            if rid not in speculation.continuing_rids:
-                continue  # fresh rid — inputs already gathered.
-            rid_outputs = output_N.per_request_output_tensors.get(rid, {})
+        for rid in list(speculation.continuing_rids):
+            if rid not in batch_N.node_objects:
+                # Defensive: rid was dropped between spec build and gather
+                # (e.g., by _store_outputs's skipped_rids handling). Nothing
+                # to gather; mark as dropped so spec batch removes it.
+                dropped.add(rid)
+                continue
+            wgio = self._get_wgio_for_rid(batch_N, rid)
+            rid_node = batch_N.node_objects[rid]
+            spec_slot = wgio.nodes[rid_node.name].speculative_signals
             ok = True
             for input_name in speculation.loop_back_inputs:
-                tensors = rid_outputs.get(input_name, [])
-                if not tensors:
+                edge = spec_slot.ready_inputs.get(input_name)
+                if edge is None or not edge.tensor_info:
                     ok = False
                     break
-                speculation.node_batch.per_request_input_tensors[rid][input_name] \
-                    = list(tensors)
-            if ok:
-                threaded_continuing.add(rid)
-            else:
+                speculation.node_batch.per_request_input_tensors[rid][input_name] = [
+                    self.tensor_manager.get_tensor(
+                        request_id=rid, uuid=info.uuid,
+                    )
+                    for info in edge.tensor_info
+                ]
+            wgio.clear_speculative_inputs()
+            if not ok:
                 dropped.add(rid)
-
-                # also give back its streaming inputs, if any
                 for edge in speculation.streaming_edges.get(rid, []):
                     self._return_speculative_streaming_edge(rid, edge)
                 speculation.streaming_edges.pop(rid, None)
@@ -1553,43 +1643,63 @@ class Worker:
             for r in dropped:
                 speculation.node_batch.per_request_input_tensors.pop(r, None)
                 speculation.node_batch.per_request_info.pop(r, None)
-        speculation.continuing_rids = threaded_continuing
+        speculation.continuing_rids -= dropped
         speculation.dropped = dropped
 
+    def _clear_spec_state(
+        self,
+        speculation: Speculation,
+        batch_N: ScheduledBatch,
+    ) -> None:
+        """Clear per-rid ``speculative_signals`` on every spec-continuing rid.
+
+        Used on the spec-abort path (allocation failure, empty spec batch
+        post-gather, no spec submit) so the next outer iter's
+        ``ingest_for_speculation`` isn't a no-op.
+        """
+        for rid in speculation.continuing_rids:
+            if rid in batch_N.node_objects:
+                self._get_wgio_for_rid(batch_N, rid).clear_speculative_inputs()
+
     # ------------------------------------------------------------------
-    # Post-processing — split into fast (intra-worker routing, no value
-    # reads) and slow (D→H of new tokens, ZMQ to conductor, check_stop).
-    # Slow runs after submit GPU(N+1), so its .cpu() sync on default stream
-    # waits for GPU(N+1) to drain. That's a streaming-token-latency cost
-    # we accept for the throughput win; see ASYNC_REDESIGN.md C-phase note
-    # for the side-stream D→H follow-up that recovers it.
+    # Post-processing is split into three stages around the spec submit:
+    #   1. ``_pre_routing`` (BEFORE submit GPU(N+1))
+    #      State advance + tensor_info write: skipped-rid handling, LRU,
+    #      stop_loops, update_request_info, apply_pending_stops, build
+    #      filtered_outputs, _store_outputs_and_finish_loops. Populates
+    #      ``producer.outputs[i].tensor_info`` so the spec batch's
+    #      ``_gather_spec_inputs_from_speculative_signals`` can read it via
+    #      the shared edge reference held in ``speculative_signals``.
+    #   2. ``_fast_postprocess_route`` (AFTER submit GPU(N+1))
+    #      Intra-worker routing: _cleanup_consumed_inputs, process_node_outputs,
+    #      loop_done ZMQ sends, _register_outputs. Overlaps with the next iter's
+    #      GPU work.
+    #   3. ``_compute_slow_postprocess`` + ``_finalize_slow_postprocess``
+    #      D→H of new tokens, conductor ZMQ, check_stop. ``.cpu()`` sync on
+    #      default stream waits for GPU(N+1) to drain — accepted latency cost
+    #      for the throughput win.
     # ------------------------------------------------------------------
 
-    def _fast_postprocess(
+    def _pre_routing(
         self,
         batch: ScheduledBatch,
         node_batch: NodeBatch,
         batch_partition: str | None,
         output: NodeOutput,
-        speculation_consumed_loop_back: dict[str, set[str]] | None = None,
-        spec_node_name: str | None = None
-    ) -> dict[str, NodeOutputRouting]:
-        """Pure-Python routing / queue updates / register_for_send. No tensor
-        value reads — safe to run while GPU(N+1) is in flight. Returns the
-        per-rid routing decisions for slow_postprocess to consume.
+    ) -> tuple[dict[str, "FilteredEdges"], dict[str, set[str]]]:
+        """State advance + tensor_info write.
 
-        ``speculation_consumed_loop_back``: ``{rid: {edge_name, ...}}`` —
-        edges that the speculation already threaded into N+1's input. We
-        keep these in ``filtered_outputs`` so ``complete_loops`` still sees
-        the loop-back signal (loop continues), but we *exclude* them from
-        ``process_node_outputs`` so the queue doesn't get stale loop-back
-        entries that would never be consumed (speculation chain handles
-        them outside the queue). We then dereference the UUIDs that
-        ``store_outputs_and_finish_loops`` allocated for those edges.
+        Runs AFTER ``await GPU(N)`` and BEFORE ``submit GPU(N+1)``. The
+        ``_store_outputs_and_finish_loops`` call here populates
+        ``producer.outputs[i].tensor_info`` on the per-rid registry node, which
+        (via shared reference) becomes the source for the spec batch's
+        ``speculative_signals.ready_inputs[name].tensor_info``. The spec
+        gather then reads from there directly.
+
+        Returns ``(node_outputs, stopped_loop_backs)`` for the routing stage
+        to consume after the spec submit.
         """
         from mminf.utils.profiler import range_pop, range_push
-
-        speculation_consumed_loop_back = speculation_consumed_loop_back or {}
 
         # Some engines can skip requests after prepare_inputs() decides the
         # current inputs are not executable yet (for example, SNAC needs enough
@@ -1625,7 +1735,10 @@ class Worker:
                     if rid in active_rids
                 }
 
-        # Update LRU + worker_graphs_manager fwd info + apply stop_loops
+        # Update LRU + worker_graphs_manager fwd info + apply stop_loops.
+        # stop_loops MUST run before _store_outputs_and_finish_loops below:
+        # ``complete_loops`` (inside the latter) consults ``_finish_signal``
+        # to decide whether the loop terminates this iter or advances another.
         if self.enable_nvtx:
             range_push("worker.update_request_info", synchronize=False)
         now = _time.monotonic()
@@ -1650,11 +1763,59 @@ class Worker:
 
         # Apply pending stops/removes deferred from prior iter.
         # Stops apply to loops on rids in this batch (1 wasted step per stop).
-        # Removes apply only to rids no longer referenced by the in-flight
-        # GPU step (handled by caller — we just consume our snapshot here).
         # Returned mapping marks loop-back input names that must NOT be
-        # re-ingested into the freshly-reset queue (see method docstring).
+        # re-ingested into the freshly-reset queue.
         stopped_loop_backs = self._apply_pending_stops_to_batch(batch, batch_partition)
+
+        if self.enable_nvtx:
+            range_push("worker.route_outputs.filter_outputs", synchronize=False)
+        filtered_outputs_per_request: dict[str, list[GraphEdge]] = {}
+        for request_id, node in batch.node_objects.items():
+            request_output_tensors = output.per_request_output_tensors.get(
+                request_id, {}
+            )
+            filtered_outputs = [
+                e for e in node.outputs if e.name in request_output_tensors
+            ]
+            filtered_outputs_per_request[request_id] = filtered_outputs
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            range_push("worker.store_outputs_and_finish_loops", synchronize=False)
+
+        node_outputs = self._store_outputs_and_finish_loops(
+            batch, output=output,
+            filtered_outputs_per_request=filtered_outputs_per_request,
+        )
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+
+        return node_outputs, stopped_loop_backs
+
+    def _fast_postprocess_route(
+        self,
+        batch: ScheduledBatch,
+        node_batch: NodeBatch,
+        batch_partition: str | None,
+        node_outputs: dict[str, "FilteredEdges"],
+        stopped_loop_backs: dict[str, set[str]],
+        speculation_consumed_loop_back: dict[str, set[str]] | None = None,
+    ) -> dict[str, NodeOutputRouting]:
+        """Intra-worker routing, overlaps with GPU(N+1).
+
+        ``speculation_consumed_loop_back``: ``{rid: {edge_name, ...}}`` —
+        edges the speculation already consumed (via the spec gather reading
+        ``speculative_signals``). We dereference the loop-back UUIDs that
+        ``_store_outputs_and_finish_loops`` allocated for those edges (the
+        spec batch holds the tensor via Python ref already) and exclude them
+        from ``process_node_outputs`` so the queue doesn't get stale loop-back
+        entries that would never be consumed.
+
+        ``stopped_loop_backs``: from ``_pre_routing``; merged into the
+        consumed map (same downstream filter applies).
+        """
+        from mminf.utils.profiler import range_pop, range_push
+
+        speculation_consumed_loop_back = speculation_consumed_loop_back or {}
         if stopped_loop_backs:
             # Merge stopped-loop loop-back exclusions into the speculation-
             # consumed map; ``process_node_outputs`` filters both alike when
@@ -1669,44 +1830,6 @@ class Worker:
             range_pop(synchronize=False)
 
         if self.enable_nvtx:
-            range_push("worker.route_outputs", synchronize=False)
-            range_push("worker.filter_outputs", synchronize=False)
-        filtered_outputs_per_request: dict[str, list[GraphEdge]] = {}
-        for request_id, node in batch.node_objects.items():
-            request_output_tensors = output.per_request_output_tensors.get(
-                request_id, {}
-            )
-            filtered_outputs = [
-                e for e in node.outputs if e.name in request_output_tensors
-            ]
-            filtered_outputs_per_request[request_id] = filtered_outputs
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            range_push("worker.route_outputs.store", synchronize=False)
-
-        # NOTE (Phase D rewrite): the apply_spec_consumption / update_for_spec
-        # dance that used to live here is gone. In the old design, a Loop kept
-        # a pre-built ``_curr_iter_section`` for the next iter that had to be
-        # explicitly cleared so ``complete_loops`` could see the loop as done.
-        # In the new design, the Loop holds no next-iter section — iteration
-        # state is just ``curr_iter`` plus per-node ``ready_signals`` /
-        # ``ready_next_iter`` slots, and ``Loop.complete_iter`` consults
-        # ``_finish_signal`` directly. Both the natural-termination case
-        # (``max_iters`` reached) and the stop case (``register_loop_finish_signal``)
-        # are handled by ``mark_node_complete`` → ``LoopStateRegistry`` chain
-        # below.
-        del spec_node_name  # parameter retained for backward-compat with callers
-
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            range_push("worker.store_outputs_and_finish_loops", synchronize=False)
-        node_outputs = self._store_outputs_and_finish_loops(
-            batch, output=output,
-            filtered_outputs_per_request=filtered_outputs_per_request
-        )
-
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
             range_push("worker.process_node_outputs", synchronize=False)
         routing_per_request: dict[str, NodeOutputRouting] = {}
         for request_id, node in batch.node_objects.items():
@@ -1747,7 +1870,6 @@ class Worker:
             )
             routing_per_request[request_id] = routing
         if self.enable_nvtx:
-            range_pop(synchronize=False)
             range_pop(synchronize=False)
 
         # Send "loop done" messages to peer workers (small ZMQ msgs, no
@@ -1960,7 +2082,7 @@ class Worker:
         # under the assumption the rid continues — that's the 1-wasted-
         # step cost per stop). Sampler seen-mask staleness for rep-penalty
         # is accepted: step N+1's sampling sees the mask state from before
-        # N's token was added. See ASYNC_REDESIGN.md.
+        # N's token was added.
         engine = self.engine_manager.get_engine(batch.node_name)
         # Pre-materialize tensors to CPU on a side stream gated on
         # event(N) so check_stop's .item() doesn't full-stream-sync (which
@@ -2023,11 +2145,10 @@ class Worker:
         for _rid, req_info in node_batch.per_request_info.items():
             req_info.dynamic_loop_stop_signals.clear()
 
-        # (Phase D rewrite) The clear_dyn_loop_curr_iter_section call that
-        # used to live here is gone — Loop._finish_signal + Loop.complete_iter
-        # handle the "loop just advanced + stop arrived" case naturally now.
-        # ``advanced_loops`` is kept on the signature for backward-compat with
-        # callers that still pass it; we no longer need it here.
+        # ``Loop._finish_signal`` + ``Loop.complete_iter`` handle the
+        # "loop just advanced + stop arrived" case naturally — no explicit
+        # curr-iter-section clear needed. ``advanced_loops`` is kept on the
+        # signature for backward-compat with callers that still pass it.
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -2058,7 +2179,7 @@ class Worker:
         until it produces another `<|im_end|>` — which fires another stop
         signal, queue resets again, infinite cycle producing duplicated
         tokens). The caller merges this into ``speculation_consumed_loop_back``
-        so ``_fast_postprocess`` filters these edges out of the routing
+        so ``_fast_postprocess_route`` filters these edges out of the routing
         kept-list, matching what speculation does for spec-consumed
         loop-backs.
         """
@@ -2267,26 +2388,24 @@ class Worker:
             "Worker %s: engine runs on dedicated GPU thread",
             self.worker_id,
         )
-        # Phase 3 (single-buffer): dedicated thread that pre-plans FlashInfer
-        # attention for the speculatively-built next batch. Runs concurrent
-        # with main thread's await_gpu (which releases the GIL), so plan()'s
-        # Python work isn't contended by main thread's fast/slow post — that
-        # contention is what made the spec-path plan_attention 2.3× slower
-        # than the fall-through path.
+        # Dedicated thread that pre-plans FlashInfer attention for the
+        # speculatively-built next batch. Runs concurrent with main thread's
+        # await_gpu (which releases the GIL), so plan()'s Python work isn't
+        # contended by main thread's fast/slow post — that contention was
+        # making spec-path plan_attention ~2.3× slower than the fall-through
+        # path.
         #
         # With double-buffered wrappers (CudaGraphRunner.NUM_SLOTS=2) and
         # advance_event signaling, plan(N+1) runs concurrent with replay(N)
-        # on the disjoint slot — the actual GPU overlap that single-buffer
-        # Phase 3 couldn't deliver. plan_executor waits on
-        # prev_advance_event (signaled right after advance_seq_lens(N) on
+        # on the disjoint slot — the actual GPU overlap. plan_executor waits
+        # on prev_advance_event (signaled right after advance_seq_lens(N) on
         # the GPU thread, ~tens of µs into replay) instead of prev_future
         # (which only resolves after replay completes), so plan() starts
-        # early. See ASYNC_REDESIGN.md for the design.
+        # early.
         #
         # Default ON. Set MMINF_PRE_PLAN_SPEC=0 to fall back to the
-        # double-buffer-without-pre-plan baseline (slightly slower than
-        # single-buffer Phase 1'' due to alternation overhead with no
-        # offsetting plan-overlap win).
+        # double-buffer-without-pre-plan baseline (slightly slower due to
+        # alternation overhead with no offsetting plan-overlap win).
         pre_plan_spec = os.environ.get("MMINF_PRE_PLAN_SPEC", "1") == "1"
         plan_executor = None
         if pre_plan_spec:
@@ -2311,14 +2430,13 @@ class Worker:
         # In-flight: (batch, node_batch, batch_partition, future) | None.
         pending: tuple[ScheduledBatch, NodeBatch, str | None, Future] | None = None
         pending_postproc: list[PendingPostproc] = []
-        # consecutive-spec cap: the original Phase 1' design caps consecutive
-        # speculative steps at 1 to give other (node, walk) pairs a turn at
-        # the scheduler — important on multi-walk workers (Qwen-Omni's
-        # Thinker+Talker on the same worker). On single-walk workers
-        # (Orpheus LLM, Orpheus SNAC) the cap forces every other iter
-        # through MicroScheduler+build for no fairness gain — see the trace
-        # analysis: spec/fall-through alternation is the source of the
-        # plan_attention variance flagged earlier.
+        # consecutive-spec cap: limit consecutive speculative steps to give
+        # other (node, walk) pairs a turn at the scheduler — important on
+        # multi-walk workers (Qwen-Omni's Thinker+Talker on the same worker).
+        # On single-walk workers (Orpheus LLM, Orpheus SNAC) the cap forces
+        # every other iter through MicroScheduler+build for no fairness gain,
+        # and spec/fall-through alternation becomes the source of
+        # plan_attention variance.
         #
         # MMINF_SPEC_PEEK_FOR_FAIRNESS=1 (default) replaces the iter-counter
         # heuristic with a peek-based check: only break the spec chain when
@@ -2455,13 +2573,12 @@ class Worker:
                             _phase_record("speculate", _time.perf_counter() - _t0)
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
-                        # Phase 3 double-buffer: reserve the slot for
-                        # batch_(N+1) NOW so both pre-plan and replay (queued
-                        # below) target the SAME slot — and the OPPOSITE
-                        # slot from batch_N's in-flight replay. The
-                        # reservation lives on spec_node_batch.metadata
-                        # ['cuda_graph_slot']; the engine forwards it to
-                        # the runner.
+                        # Reserve the double-buffer slot for batch_(N+1) NOW
+                        # so both pre-plan and replay (queued below) target
+                        # the SAME slot — and the OPPOSITE slot from
+                        # batch_N's in-flight replay. The reservation lives
+                        # on spec_node_batch.metadata['cuda_graph_slot'];
+                        # the engine forwards it to the runner.
                         if speculation is not None:
                             spec_node_batch_for_plan = speculation.node_batch
                             engine = self.engine_manager.get_engine(
@@ -2474,11 +2591,10 @@ class Worker:
                         # await_gpu (releases GIL). plan_executor waits on
                         # prev's advance_event (signaled ~tens of µs into
                         # replay(N), right after advance_seq_lens(N)) so
-                        # plan(N+1) starts WAY BEFORE replay(N) finishes —
-                        # the actual GPU overlap that single-buffer Phase 3
-                        # couldn't deliver. plan(N+1) writes the inactive
-                        # slot's wrapper buffers; replay(N) keeps running
-                        # uncontested on the active slot.
+                        # plan(N+1) starts well before replay(N) finishes.
+                        # plan(N+1) writes the inactive slot's wrapper
+                        # buffers; replay(N) keeps running uncontested on
+                        # the active slot.
                         if (
                             speculation is not None
                             and plan_executor is not None
@@ -2531,6 +2647,10 @@ class Worker:
                             for rid, streaming_edges in speculation.streaming_edges.items():
                                 for edge in streaming_edges:
                                     self._return_speculative_streaming_edge(rid, edge)
+                            # speculative_signals were populated in
+                            # _try_speculate_next; clear them so the next
+                            # outer iter's ingest_for_speculation isn't a no-op.
+                            self._clear_spec_state(speculation, p_batch)
                         speculation = None
                         # If a pre-plan was dispatched, wait for it to finish
                         # so its wrapper.plan() side effects don't leak into
@@ -2549,26 +2669,33 @@ class Worker:
                         )
                         continue
 
+                    # State advance + tensor_info write. MUST run before the
+                    # spec gather/submit below — the gather reads
+                    # ``speculative_signals.ready_inputs[name].tensor_info``,
+                    # which is the SAME list as
+                    # ``producer.outputs[i].tensor_info`` that
+                    # ``_store_outputs_and_finish_loops`` populates here.
+                    node_outputs, stopped_loop_backs = self._pre_routing(
+                        p_batch, p_node_batch, p_partition, output
+                    )
+
                     spec_consumed: dict[str, set[str]] = {}
-                    spec_node_name = None
                     if speculation is not None:
-                        self._thread_outputs_to_speculative(
-                            speculation, output
+                        # Promote per-rid speculative_signals → real inputs.
+                        # (Also clears speculative_signals per rid; reports
+                        # rids dropped on missing loop-back output.)
+                        self._gather_spec_inputs_from_speculative_signals(
+                            speculation, p_batch
                         )
-                        # Drop continuing rids whose thread-through failed
-                        # (engine produced no output for them). Fresh rids
-                        # in spec_batch are unaffected — they had their
-                        # inputs gathered from tensor_manager.
                         for rid in speculation.dropped:
                             speculation.scheduled_batch.node_objects.pop(rid, None)
                             speculation.scheduled_batch.request_to_worker_graph.pop(rid, None)
                         spec_batch = speculation.scheduled_batch
                         spec_node_batch = speculation.node_batch
                         if spec_batch.node_objects:
-                            spec_node_name = spec_batch.node_name
                             # Only continuing rids consumed loop-back from
                             # batch_N — fresh rids' loop-back doesn't exist
-                            # in batch_N's output dict, so fast_postprocess
+                            # in batch_N's output dict, so fast_postprocess_route
                             # has nothing to deref/skip for them.
                             for rid in speculation.continuing_rids:
                                 spec_consumed[rid] = set(speculation.loop_back_inputs)
@@ -2590,9 +2717,9 @@ class Worker:
                                 plan_future_for_submit = None
                             spec_plan_future = None  # ownership transferred
                             spec_plan_target = None
-                            # Phase 3: attach a fresh advance_event to this
-                            # batch so the NEXT iter's plan_executor can
-                            # gate on advance_seq_lens(THIS batch).
+                            # Attach a fresh advance_event to this batch so
+                            # the NEXT iter's plan_executor can gate on
+                            # advance_seq_lens(THIS batch).
                             spec_advance_event = threading.Event()
                             spec_node_batch.metadata["advance_event"] = spec_advance_event
 
@@ -2634,13 +2761,15 @@ class Worker:
                         spec_plan_future = None
                         spec_plan_target = None
 
-                    # Post-process N — runs concurrently with GPU(N+1)
-                    # if we submitted one above.
+                    # Post-process N (routing stage) — runs concurrently with
+                    # GPU(N+1) if we submitted one above. State advance +
+                    # _store_outputs already happened in _pre_routing.
                     _t0 = _time.perf_counter() if phase_period else 0.0
-                    routing = self._fast_postprocess(
-                        p_batch, p_node_batch, p_partition, output,
+                    routing = self._fast_postprocess_route(
+                        p_batch, p_node_batch, p_partition,
+                        node_outputs=node_outputs,
+                        stopped_loop_backs=stopped_loop_backs,
                         speculation_consumed_loop_back=spec_consumed,
-                        spec_node_name=spec_node_name
                     )
                     advanced_loops: dict[str, set[str]] = {}
                     for rid, req_info in p_node_batch.per_request_info.items():
@@ -2722,16 +2851,16 @@ class Worker:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
-                # Phase 3 double-buffer: reserve the slot on the main
-                # thread before submission so the per-key counter advances
-                # in main-thread order. Without this, the GPU thread would
-                # advance the counter at run time and races with main-
-                # thread reservations from later iters.
+                # Reserve the double-buffer slot on the main thread before
+                # submission so the per-key counter advances in main-thread
+                # order. Without this, the GPU thread would advance the
+                # counter at run time and races with main-thread reservations
+                # from later iters.
                 fallthrough_engine = self.engine_manager.get_engine(batch.node_name)
                 if hasattr(fallthrough_engine, "reserve_replay_slot"):
                     fallthrough_engine.reserve_replay_slot(node_batch)
 
-                # Phase 3: attach a fresh advance_event so the next iter's
+                # Attach a fresh advance_event so the next iter's
                 # plan_executor (if it speculates) can wait on this batch's
                 # advance_seq_lens.
                 fallthrough_advance_event = threading.Event()

@@ -1,7 +1,7 @@
-"""Validate the Phase-A bug fixes in graph/base.py + graph_io.py.
+"""Regression tests for bug fixes in graph/base.py + graph_io.py.
 
-Each test pins down a specific behavior the colleague's first-pass code
-got wrong; if any of these regress, Phase A bugs have re-surfaced.
+Each test pins down a specific behavior that the prior implementation got
+wrong; if any of these regress, the underlying bugs have re-surfaced.
 """
 import pytest
 

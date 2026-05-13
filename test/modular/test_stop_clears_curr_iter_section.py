@@ -41,8 +41,8 @@ pytest.skip(
     "Targets the deleted DynamicLoop + _curr_iter_section + complete_loops "
     "machinery. The equivalent behavior (loop terminates cleanly when "
     "register_loop_finish_signal fires on a non-speculated iter) is covered "
-    "by test_graph.py::test_eos_clears_ready_signals after the Phase A "
-    "refactor; the specific apply_spec_consumption call no longer exists.",
+    "by test_graph.py::test_eos_clears_ready_signals; the specific "
+    "apply_spec_consumption call no longer exists.",
     allow_module_level=True,
 )
 

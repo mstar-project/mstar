@@ -7,8 +7,8 @@ import pytest
 
 pytest.skip(
     "Depends on deleted mminf.graph.request_queues.PerRequestNodeQueues "
-    "and the dummy_model that is slated for deletion in Phase F. "
-    "Re-target against WorkerGraphIO + a real model in a follow-up.",
+    "and the deleted dummy_model. Re-target against WorkerGraphIO + a "
+    "real model in a follow-up.",
     allow_module_level=True,
 )
 
