@@ -154,6 +154,49 @@ def test_gate_fires_on_full_ingest_after_partial_was_attempted():
     assert ready[0].is_new_loop_iter is True
 
 
+def test_speculative_signals_sees_tensor_info_via_shared_reference():
+    """G.2 invariant: ``ingest_for_speculation`` stores the producer's edge
+    BY REFERENCE in ``speculative_signals.ready_inputs[name]``. When
+    ``_store_outputs_and_finish_loops`` later mutates
+    ``producer.outputs[i].tensor_info`` in place, the spec slot's tensor_info
+    reflects that mutation — this is what enables ``_gather_spec_inputs_from
+    _speculative_signals`` to read N's outputs without a thread step.
+
+    Bug shape this guards against: if any layer ever started DEEPCOPYING the
+    edge during ingest_for_speculation (or update), G.2's gather would read
+    a stale empty tensor_info and silently drop continuing rids.
+    """
+    from mminf.graph.base import TensorPointerInfo
+
+    wgio = _per_rid_wgios(1)[0]
+    rid_node = wgio.nodes["ar_decode"]
+    # The producer edge for the loop-back ``token`` output.
+    producer_token_edge = next(
+        e for e in rid_node.outputs if e.name == "token" and e.next_node == "ar_decode"
+    )
+    assert producer_token_edge.tensor_info == []
+
+    # Worker calls ingest_for_speculation on the producer's edge.
+    wgio.ingest_for_speculation(producer_token_edge)
+    spec_slot_edge = rid_node.speculative_signals.ready_inputs["token"]
+    # Must be the SAME object (by reference, not a copy).
+    assert spec_slot_edge is producer_token_edge
+
+    # Simulate _store_outputs_and_finish_loops appending tensor_info on the
+    # producer side (mutation in place, NOT replacement of the list).
+    fake_info = TensorPointerInfo(
+        dims=[1], dtype="float32", nbytes=4, address=0,
+        stride=[1], uuid="uuid-deadbeef", source_session_id="test",
+        source_entity="test",
+    )
+    producer_token_edge.tensor_info.append(fake_info)
+
+    # Gather sees the new tensor_info via the spec slot.
+    gathered = wgio.nodes["ar_decode"].speculative_signals.ready_inputs["token"]
+    assert gathered.tensor_info == [fake_info]
+    assert gathered.tensor_info is producer_token_edge.tensor_info  # same list
+
+
 def test_non_loop_back_node_does_not_appear_in_ready_for_speculation():
     """The worker only ingests outputs whose ``next_node == node.name`` (the
     loop-back filter in G.1's per-rid loop). A non-loop-back downstream
