@@ -71,7 +71,6 @@ def _worker_process_target(
     model: Model | None = None,
     device: str = "cuda",
     log_level: str = "INFO",
-    mooncake_port: int=8080,
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
 ):
@@ -100,7 +99,6 @@ def _worker_process_target(
         socket_path_prefix=socket_path_prefix,
         enable_nvtx=enable_nvtx,
         device=torch.device(device),
-        mooncake_port=mooncake_port,
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
     )
@@ -157,7 +155,6 @@ class Conductor:
         hostname: str = "localhost",
         enable_nvtx: bool = False,
         log_level: str = "INFO",
-        mooncake_port: int=8080,
         tensor_comm_protocol=CommProtocol.RDMA,
         tcp_transfer_device=""
     ):
@@ -167,7 +164,6 @@ class Conductor:
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
         self.enable_nvtx = enable_nvtx
-        self.mooncake_port = mooncake_port
         self.tensor_comm_protocol = tensor_comm_protocol
         self.tcp_transfer_device = tcp_transfer_device
 
@@ -276,7 +272,6 @@ class Conductor:
                     "enable_nvtx": self.enable_nvtx,
                     "device": f"cuda:{rank}",
                     "log_level": self.log_level,
-                    "mooncake_port": self.mooncake_port,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device
                 },

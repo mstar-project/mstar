@@ -97,6 +97,14 @@ class ReadySignals:
     is_ready: bool = False
     is_ready_for_streaming: bool = False
 
+    def __post_init__(self):
+        self._tensor_manager = None
+        self._request_id = None
+    
+    def register_communication_info(self, communication_manager, request_id: str):
+        self._tensor_manager = communication_manager
+        self._request_id =  request_id
+    
     def update(self, edge: GraphEdge):
         assert edge.name in self.input_names, \
             f"Node {self.node_name} does not take input named {edge.name}"
@@ -115,6 +123,10 @@ class ReadySignals:
         )
     
     def clear(self):
+        if self._tensor_manager is not None:
+            for edge in self.ready_inputs.values():
+                for info in edge.tensor_info:
+                    self._tensor_manager.dereference(self._request_id, info.uuid)
         self.ready_inputs.clear()
         self.ready_names.clear()
         self.is_ready = False
@@ -133,6 +145,11 @@ class GraphNode(GraphSection):
     # doesn't account for — e.g. BAGEL's flow-loop LLM / combine_cfg, where
     # the CFG-parallel branches need their KV caches snapshotted in lockstep.
     enable_async_scheduling: bool = True
+
+    # Whether this node is currently speculatively being executed: if so, we
+    # don't want to queue it in a "ready" queue because it's already being
+    # executed, but we do want to update everything else as normal.
+    _speculatively_scheduled: bool = False
 
     _streaming_inputs: set[str] = field(default_factory=set)
 
@@ -156,6 +173,16 @@ class GraphNode(GraphSection):
             input_names=self.input_names,
             streaming_inputs=self._streaming_inputs
         )
+        self._tensor_manager = None
+        self._request_id = None
+    
+    def register_communication_info(self, communication_manager, request_id: str):
+        self.ready_signals.register_communication_info(
+            communication_manager, request_id
+        )
+        self.ready_next_iter.register_communication_info(
+            communication_manager, request_id
+        )
 
     def _register_streaming(self, streaming_inputs: set[str]):
         # Mutate the existing set in place so that the ReadySignals instances
@@ -168,31 +195,22 @@ class GraphNode(GraphSection):
         self._streaming_inputs.clear()
         self._streaming_inputs.update(streaming_inputs)
 
-    def ingest_input(self, edge: GraphEdge) -> bool:
+    def ingest_input(self, edge: GraphEdge, can_buffer: bool=True) -> bool:
         """Try to ingest an arriving edge.
 
-        Returns True on success, False when the edge is rejected:
-          - ``edge.name`` is not in ``self.input_names`` (cross-walk routing
-            of a persisted output to a same-named node whose input set
-            doesn't match — e.g. Q3-Omni ``talker_input_embeds → Talker``
-            during ``talker_last_prefill``, where the current Talker's
-            inputs don't include it; the conductor handles the cross-walk
-            handoff via ``persist=True`` separately), or
-          - both ``ready_signals`` and ``ready_next_iter`` already hold
-            this name (streaming backpressure — producer is more than one
-            iter ahead of the consumer; the StreamBuffer at the worker
-            level will re-queue the dropped chunk).
-
-        Callers that route edges (WorkerGraphIO, process_new_inputs) use
-        the False return as "this wg didn't claim it" and fall through to
-        cross-worker / external routing.
+        Returns True on success, False when the edge is rejected; e.g., this
+        is a streaming edge that we are not redy for and needs to get re-queued 
         """
         if edge.name not in self.input_names:
             return False
         if edge.name not in self.ready_signals.ready_names:
             self.ready_signals.update(edge)
-        elif edge.name not in self.ready_next_iter.ready_names:
+        elif can_buffer and (
+            edge.name not in self.ready_next_iter.ready_names
+        ):
             # already have this input for the current iteration — buffer for the next loop iter
+            # we do not buffer streaming signals, or else we may lose streaming signals if
+            # there is actually no next iter
             self.ready_next_iter.update(edge)
         else:
             return False
@@ -200,15 +218,30 @@ class GraphNode(GraphSection):
         return True
 
     def get_inputs_outputs(self):
-        output_names = {out.name for out in self.outputs}
+        loop_back = {
+            (edge.name, self.name) for edge in self.outputs if edge.next_node == self.name
+        }
         return NodeInputsOutputs(
             ext_inputs={
-                (inp, self.name) for inp in self.input_names if inp not in output_names
+                (inp, self.name) for inp in self.input_names if (inp, self.name) not in loop_back
             },
-            ext_outputs=self.outputs,
-            loop_back={
-                (inp, self.name) for inp in self.input_names if inp in output_names
-            }
+            ext_outputs=[out for out in self.outputs if out.next_node != self.name],
+            loop_back=loop_back
+        )
+    
+    def is_ready_for_speculation(
+        self, check_next_iter: bool=False,
+        allow_streaming: bool=True
+    ):
+        needed_inputs = self.input_names
+        if allow_streaming:
+            needed_inputs = needed_inputs - self._streaming_inputs
+        if check_next_iter:
+            return needed_inputs.issubset(
+                self.ready_next_iter.ready_names | self.speculative_signals.ready_names
+            )
+        return needed_inputs.issubset(
+            self.ready_signals.ready_names | self.speculative_signals.ready_names
         )
     
     def get_nodes(self):
@@ -254,39 +287,36 @@ class Sequential(GraphSection):
         return loops
 
     def get_inputs_outputs(self):
-        section_ios = [sec.get_inputs_outputs() for sec in self.sections]
+        nodes_so_far = set()
 
-        # Output names produced by each section (by index)
-        output_names_by_section: list[set[str]] = [
-            {out.name for out in sec_io.ext_outputs}
-            for sec_io in section_ios
-        ]
-        all_output_names = set().union(*output_names_by_section) if output_names_by_section else set()
-
+        ext_outputs: list[GraphEdge] = []
         ext_inputs: set[NameAndDest] = set()
         loop_back: set[NameAndDest] = set()
 
-        for i, sec_io in enumerate(section_ios):
-            for name_dest in sec_io.ext_inputs | sec_io.loop_back:
-                name, _ = name_dest
-                if name not in all_output_names:
-                    ext_inputs.add(name_dest)
-                elif any(name in output_names_by_section[j] for j in range(i + 1, len(self.sections))):
-                    # Produced by a later section — this is a loop-back
-                    loop_back.add(name_dest)
-                # else: consumed from an earlier section — internal forward connection
+        for sec in self.sections:
+            io = sec.get_inputs_outputs()
+            loop_back.update(io.loop_back)
+            ext_inputs |= io.ext_inputs
 
-        # An output is external if its destination is not in a later section
-        node_names_by_section: list[set[str]] = [sec.get_nodes() for sec in self.sections]
-        ext_outputs: list[GraphEdge] = []
-        for i, sec_io in enumerate(section_ios):
-            later_node_names = set().union(*node_names_by_section[i + 1:]) \
-                if i + 1 < len(self.sections) else set()
-            ext_outputs.extend(
-                out for out in sec_io.ext_outputs \
-                    if out.next_node not in later_node_names
-            )
+            internal_signals = {
+                (edge.name, edge.next_node) for edge in ext_outputs \
+                    if (edge.name, edge.next_node) in ext_inputs
+            }
+            new_loop_backs = {
+                (edge.name, edge.next_node) for edge in io.ext_outputs \
+                    if edge.next_node in nodes_so_far
+            }
+            ext_outputs = [
+                edge for edge in ext_outputs \
+                    if (edge.name, edge.next_node) not in internal_signals
+            ] + [
+                edge for edge in io.ext_outputs \
+                    if (edge.name, edge.next_node) not in new_loop_backs
+            ]
+            
+            ext_inputs -= internal_signals
 
+            nodes_so_far.update(sec.get_nodes().keys())
         return NodeInputsOutputs(
             ext_inputs=ext_inputs,
             ext_outputs=ext_outputs,
@@ -591,19 +621,30 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         super().__init__(graph_section)
 
         self.ready_names = set()
-        self.ready_for_streaming = set()
         self.ready_next_iter = set()
         self.ready_streaming_next_iter = set()
 
         self.nodes = graph_section.get_nodes()
+        self.only_streaming_inputs = {
+            name for name, node in self.nodes.items() \
+                if node.input_names.issubset(node._streaming_inputs)
+        }
+
+        self.ready_for_streaming = set(self.only_streaming_inputs)
+        self.ready_streaming_next_iter = set(self.only_streaming_inputs)
 
     def register_ingested_input(self, graph_edge: GraphEdge):
         node = self.nodes[graph_edge.next_node]
         if node.ready_signals.is_ready:
-            self.ready_names.add(node.name)
+            # If node._speculatively_scheduled, not only is the node ready,
+            # but it is already executing. We don't want to double-queue it,
+            # so we omit adding it to the ready queue
+            if not node._speculatively_scheduled:
+                self.ready_names.add(node.name)
             self.ready_for_streaming.discard(node.name)
         elif node.ready_signals.is_ready_for_streaming:
-            self.ready_for_streaming.add(node.name)
+            if not node._speculatively_scheduled:
+                self.ready_for_streaming.add(node.name)
 
         if node.ready_next_iter.is_ready:
             self.ready_next_iter.add(node.name)
@@ -615,7 +656,7 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         # Top-level entities have no outer loop to drive a reset_for_iter, so
         # we clear the entity's ready_signals here so the same node can be
         # ingested for a future forward pass without ingest_input falling
-        # through to ready_next_iter.
+        # through to ready_next_iter
         output = super().mark_entity_complete(entity_name)
         entity = self.managed_entities.get(entity_name)
         if isinstance(entity, GraphNode):
@@ -625,7 +666,7 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
     def reset_for_iter(self):
         super().reset_for_iter()
         self.ready_names.clear()
-        self.ready_for_streaming.clear()
+        self.ready_for_streaming = set(self.only_streaming_inputs)
         # promote next-iter ready sets to current; nodes that already received their
         # loop-back inputs are immediately ready for the new iteration
         self.ready_names, self.ready_next_iter = (
@@ -638,6 +679,6 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
     def clear(self):
         super().clear()
         self.ready_names.clear()
-        self.ready_for_streaming.clear()
+        self.ready_for_streaming = set(self.only_streaming_inputs)
         self.ready_next_iter.clear()
-        self.ready_streaming_next_iter.clear()
+        self.ready_for_streaming = set(self.only_streaming_inputs)

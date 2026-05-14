@@ -72,17 +72,13 @@ class CurrentForwardPassInfo:
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")
 
-    # set of names of loops to stop
-    dynamic_loop_stop_signals: set[str] = field(default_factory=set)
+    # NOTE: removing the dynamic_loop_stop_signals field, as the functionality has been moved
+    # to the specific check_stop function on the submodule
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
     dynamic_loop_iter_counts: dict[str, int] = field(default_factory=dict)
 
-    def register_loop_stop(self, loop_name: str):
-        self.dynamic_loop_stop_signals.add(loop_name)
-
     def clear_loop_stop_info(self):
         self.loop_stop_times.clear()
-        self.dynamic_loop_stop_signals.clear()
         self.dynamic_loop_iter_counts.clear()
 
 # ---------------------------------------------------------------------------

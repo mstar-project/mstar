@@ -27,8 +27,6 @@ class NodeBatch:
     # {request_id: {input_name: list[tensor]}}
     per_request_input_tensors: dict[str, NameToTensorList]
     per_request_info: dict[str, CurrentForwardPassInfo] = field(default_factory=dict)
-
-    # unused for now
     metadata: dict = field(default_factory=dict)
 
 

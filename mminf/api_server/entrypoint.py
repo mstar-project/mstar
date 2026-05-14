@@ -57,7 +57,6 @@ def _conductor_process_target(
     enable_nvtx: bool = False,
     log_level: str = "INFO",
     cache_dir: str | None = None,
-    mooncake_port: int=8080,
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device=""
 ):
@@ -100,7 +99,6 @@ def _conductor_process_target(
         socket_path_prefix=socket_path_prefix,
         enable_nvtx=enable_nvtx,
         log_level=log_level,
-        mooncake_port=mooncake_port,
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device
     )
@@ -187,7 +185,6 @@ class APIServer:
         upload_dir: str = "/tmp/mminf_uploads",
         hostname: str="localhost",
         timeout_seconds: float = 600.0,
-        mooncake_port=8080,
         tensor_comm_protocol=CommProtocol.RDMA,
         tcp_transfer_device="",
         model=None,
@@ -195,8 +192,6 @@ class APIServer:
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
-
-        # self.mooncake_pid = start_mooncake_master(port=mooncake_port)
 
         self.preprocess_worker = PreprocessWorker(
             model=model,
@@ -662,7 +657,6 @@ def main():
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
         timeout_seconds=args.timeout,
-        mooncake_port=args.mooncake_port,
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         tcp_transfer_device=args.tcp_transfer_device
@@ -679,7 +673,6 @@ def main():
             args.enable_nvtx,
             args.log_level,
             args.cache_dir,
-            args.mooncake_port,
             CommProtocol(args.tensor_comm_protocol),
             args.tcp_transfer_device
         ),

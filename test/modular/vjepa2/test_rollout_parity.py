@@ -212,8 +212,7 @@ class TestRolloutParity:
 class TestEarlyExit:
     def test_register_loop_stop_at_requested_horizon(self):
         """When ``step_metadata["rollout_horizon"]`` is reached, the
-        submodule requests that the DynamicLoop terminate — the signal
-        lands in ``request_info.dynamic_loop_stop_signals``."""
+        submodule requests that the DynamicLoop terminate"""
         torch.manual_seed(2)
         config = _tiny_config()
         predictor = VJEPA2Predictor(config).eval()
@@ -237,7 +236,7 @@ class TestEarlyExit:
                 info = _make_request_info(iter_idx=k, rollout_horizon=horizon)
                 out = submodule.forward(info, encoder_hidden=encoder_hidden)
                 encoder_hidden = out["encoder_hidden"][0]
-                if "rollout_loop" in info.dynamic_loop_stop_signals:
+                if "rollout_loop" in submodule.check_stop(info.request_id, info, out):
                     stop_seen_at.append(k)
 
         # The very first iter where the stop fires should be iter == horizon - 1,

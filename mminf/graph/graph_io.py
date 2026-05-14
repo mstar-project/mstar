@@ -15,11 +15,13 @@ class WorkerGraphIO:
     register_loop_finish_signal handles externally-signalled loop termination (e.g. EOS).
     """
     def __init__(
-        self, graph: GraphSection
+        self, graph: GraphSection,
+        wg_id: str | None=None
     ):
         self.nodes = graph.get_nodes()
         self.loops = graph.get_loops()
         self.graph = graph
+        self.wg_id = wg_id
 
         # set up managing registries
         self.wg_state_registry = WorkerGraphStateRegistry(graph)
@@ -40,9 +42,6 @@ class WorkerGraphIO:
         _setup_registries(graph, self.wg_state_registry)
 
         self._nodes_with_speculative_inputs: set[str] = set()
-        # node_name → True if any speculatively ingested input was a loop-back signal
-        self._speculative_node_has_loop_back: dict[str, bool] = {}
-        self._speculative_ready: dict[str, SpeculativeNodeInfo] = {}
 
     @property
     def ready_node_names(self):
@@ -57,7 +56,7 @@ class WorkerGraphIO:
         return self.nodes[name]
     
     def ingest_input(
-        self, graph_edge: GraphEdge
+        self, graph_edge: GraphEdge, can_buffer: bool=True
     ) -> bool:
         """Route an arriving edge to its destination node.
 
@@ -69,7 +68,9 @@ class WorkerGraphIO:
         """
         if graph_edge.next_node not in self.nodes:
             return False
-        return self.nodes[graph_edge.next_node].ingest_input(graph_edge)
+        return self.nodes[graph_edge.next_node].ingest_input(
+            graph_edge, can_buffer
+        )
     
     def mark_node_complete(
         self, node_name: str
@@ -79,58 +80,63 @@ class WorkerGraphIO:
         The caller must route each edge in output_edges, skipping any in filtered_signals.
         """
         node = self.nodes[node_name]
-        return node.complete()
+        completion = node.complete()
+        # apply filtering, if needed
+        completion.output_edges = [
+            edge for edge in completion.output_edges \
+                if (edge.name, edge.next_node) not in completion.filtered_signals
+        ]
+        return completion
+    
+    def ingest_for_speculation(
+        self, edges: list[GraphEdge], source_node: str
+    ) -> list[SpeculativeNodeInfo]:
+        """Ingest an set of anticipated output edges into speculative buffers.
 
-    def ingest_for_speculation(self, edge: GraphEdge) -> None:
-        """Ingest an anticipated output edge into the speculative buffer of its destination.
+        Returns a list of nodes that are ready to be specilatively executed:
+        (A) if the same as source_node, that speculative & next_iter & streaming cover
+        all of the inputs.
 
-        Called with the edges the currently-executing node is expected to produce, before
-        it has actually completed. The edge's tensor_info will be empty at this point;
-        callers must not copy the edge object — actual tensor_info is updated in-place
-        when the producing node completes (no-copy semantics).
-
-        Readiness gate is strict: the destination node is reported as
-        speculatively ready only when speculative_signals alone covers
-        input_names. Callers (e.g. worker `_can_speculate`) are responsible
-        for ensuring all required inputs are loop-back / streaming and will
-        be ingested speculatively before checking ready_for_speculation.
+        (B) if not the same, that speculative & inputs & streaming cover the inputs.
         """
-        if edge.next_node not in self.nodes:
-            return
-        node = self.nodes[edge.next_node]
-        if edge.name in node.speculative_signals.ready_names:
-            return
-        node.speculative_signals.update(edge)
-        is_loop_back = (
-            isinstance(node._managing_registry, LoopStateRegistry)
-            and (edge.name, edge.next_node) in node._managing_registry.loop._loop_back_inputs
-        )
-        if is_loop_back:
-            self._speculative_node_has_loop_back[node.name] = True
-        self._nodes_with_speculative_inputs.add(node.name)
-        if node.input_names.issubset(node.speculative_signals.ready_names) \
-                and node.name not in self._speculative_ready:
-            loop_name: str | None = None
-            if isinstance(node._managing_registry, LoopStateRegistry):
-                loop_name = node._managing_registry.loop.name
-            self._speculative_ready[node.name] = SpeculativeNodeInfo(
-                node_name=node.name,
-                is_new_loop_iter=self._speculative_node_has_loop_back.get(node.name, False),
-                loop_name=loop_name,
-            )
+        dest_nodes = set()
+        next_iter_nodes = set()
 
-    @property
-    def ready_for_speculation(self) -> list[SpeculativeNodeInfo]:
-        """Nodes that are speculatively ready based on anticipated outputs of the current node."""
-        return list(self._speculative_ready.values())
+        reg = self.nodes[source_node]._managing_registry
+        inside_loop = isinstance(reg, LoopStateRegistry)
+        loop_back_inputs = set() if not inside_loop else reg.loop._loop_back_inputs
+        loop_name = None if not inside_loop else reg.loop.name 
+
+        for edge in edges:
+            if edge.next_node not in self.nodes:
+                continue # TODO: cross-worker-graph speculation
+            node = self.nodes[edge.next_node]
+            node.speculative_signals.update(edge)
+            self._nodes_with_speculative_inputs.add(node.name)
+            dest_nodes.add(node.name)
+
+            if (edge.name, edge.next_node) in loop_back_inputs:
+                next_iter_nodes.add(edge.next_node)
+        
+        ready_for_spec = []
+        for dest in dest_nodes:
+            node = self.nodes[dest]
+            if node.is_ready_for_speculation(
+                check_next_iter=dest == source_node,
+                allow_streaming=True
+            ):
+                ready_for_spec.append(SpeculativeNodeInfo(
+                    node_name=dest,
+                    is_new_loop_iter=dest in next_iter_nodes,
+                    loop_name=loop_name
+                ))
+        return ready_for_spec
 
     def clear_speculative_inputs(self) -> None:
         """Clear all speculative buffers — call when discarding a speculative schedule."""
         for node_name in self._nodes_with_speculative_inputs:
             self.nodes[node_name].speculative_signals.clear()
         self._nodes_with_speculative_inputs.clear()
-        self._speculative_node_has_loop_back.clear()
-        self._speculative_ready.clear()
 
     def register_loop_finish_signal(
         self, loop_name: str
@@ -147,6 +153,10 @@ class WorkerGraphIO:
     def register_communication_info(self, communication_manager, request_id: str):
         for loop in self.loops.values():
             loop.register_communication_info(
+                communication_manager, request_id
+            )
+        for node in self.nodes.values():
+            node.register_communication_info(
                 communication_manager, request_id
             )
     

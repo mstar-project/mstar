@@ -44,7 +44,7 @@ from mminf.conductor.request_info import (
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
-from mminf.graph.special_destinations import EMIT_TO_CLIENT
+from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, MAX_OUTPUT_TOKENS, Model, TensorAndMetadata
 from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mminf.model.submodule_base import NodeSubmodule
@@ -352,7 +352,7 @@ class Qwen3OmniModel(Model):
                     input_names=["thinker_states", "thinker_mask", "talker_trigger"],
                     outputs=[
                         GraphEdge(
-                            next_node="Talker",
+                            next_node=EMPTY_DESTINATION,
                             name="talker_input_embeds",
                             persist=True
                         ),
@@ -378,14 +378,13 @@ class Qwen3OmniModel(Model):
                             GraphEdge(
                                 next_node="Talker",
                                 name="talker_input_embeds",
-                                persist=True
                             ),
                             StreamingGraphEdge(
                                 next_node="Code2Wav",
                                 name="codec_tokens",
                                 target_partition="Code2Wav",
                             ),
-                        ]
+                        ],
                     )
                 ]
             ),
