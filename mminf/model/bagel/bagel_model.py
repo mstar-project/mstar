@@ -595,6 +595,7 @@ class BagelModel(Model):
                             GraphEdge(next_node="combine_cfg", name="latents"),
                             GraphEdge(next_node="combine_cfg", name="time_index"),
                         ],
+                        enable_async_scheduling=False
                     ),
                 ]),
                 max_iters=self.config.num_timesteps - 1,

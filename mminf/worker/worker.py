@@ -84,6 +84,7 @@ class Speculation:
     partition: str
     is_new_iter: bool
     is_same_node: bool
+    is_yield_away: bool = False
     loop_name: str | None = None
     dropped: set[str] = field(default_factory=set)
 
@@ -1528,6 +1529,7 @@ class Worker:
         if self.enable_nvtx:
             range_push("worker.send_outputs", synchronize=False)
 
+        # TODO: wire up the new token path (currently unused for any of the models)
         for rid, routing in routing_per_request.items():
             self._send_outputs(
                 rid, routing,
@@ -1848,7 +1850,29 @@ class Worker:
                             _phase_record("speculate", _time.perf_counter() - _t0)
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
-
+                    if speculation is None:
+                        yield_away_from_target = (
+                            pending.node_name,
+                            pending.graph_walk,
+                        ) if pending is not None else None
+                        batch = self.scheduler.get_next_batch(
+                            self.worker_graphs_manager,
+                            exclude_target=yield_away_from_target,
+                        )
+                        if batch is not None:
+                            node_batch = self._build_node_batch(batch)
+                            batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
+                            speculation = Speculation(
+                                scheduled_batch=batch,
+                                node_batch=node_batch,
+                                consumed_edges=set(),
+                                continuing_rids=set(), # n/a
+                                partition=batch_partition,
+                                is_new_iter=False,
+                                is_same_node=False,
+                                is_yield_away=True
+                            )
+                    if speculation is not None:
                         # Reserve the double-buffer slot for batch_(N+1) NOW
                         # so both pre-plan and replay (queued below) target
                         # the SAME slot — and the OPPOSITE slot from
@@ -1884,11 +1908,6 @@ class Worker:
                                     speculation.node_batch,
                                     prev_advance_event_for_plan,
                                 )
-                    else:
-                        yield_away_from_target = (
-                            pending.node_name,
-                            pending.graph_walk,
-                        )
 
                 # 3. If pending: await GPU(N), submit speculated GPU(N+1)
                 # asap, then post-process N (fast then slow) overlapping
@@ -1937,7 +1956,8 @@ class Worker:
                         spec_batch = speculation.scheduled_batch
                         spec_node_batch = speculation.node_batch
                         # Promote per-rid speculative_signals → real inputs
-                        self._thread_outputs_to_speculative(speculation, output)
+                        if not speculation.is_yield_away:
+                            self._thread_outputs_to_speculative(speculation, output)
                         # set node._speculatively_scheduled to true, so that it doesn't
                         # accidentally get put on the ready queue while already executing
                         for node in spec_batch.node_objects.values():
@@ -2013,7 +2033,10 @@ class Worker:
                     _set_pending(None)
 
                 if spec_pending is not None:
-                    consecutive_spec_steps += 1
+                    if speculation.is_yield_away:
+                        consecutive_spec_steps = 0
+                    else:
+                        consecutive_spec_steps += 1
                     if phase_period:
                         _phase_record("iter_total", _time.perf_counter() - _iter_start)
                         phase_iter[0] += 1
