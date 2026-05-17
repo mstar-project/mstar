@@ -1978,7 +1978,7 @@ class Worker:
                         # the next iter's batch (different rids/seq_lens).
                         # Then clear the skip flag explicitly so the next real
                         # plan_attention call recomputes from scratch.
-                        if speculation.plan_future is not None:
+                        if speculation is not None and speculation.plan_future is not None:
                             speculation.plan_future.result()
                             self._reset_skip_plan_flags(
                                 speculation.node_batch
