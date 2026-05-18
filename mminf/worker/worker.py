@@ -1993,29 +1993,45 @@ class Worker:
                         node._speculatively_scheduled = False
 
                     if output.allocation_failed:
-                        # Drain any speculation: if we already speculated
-                        # N+1, discard it. The speculated step would have
-                        # depended on N's outputs which are unusable now.
-                        # Per design: discard speculation, retry batch_N.
+                        # KV-cache OOM on pending. ``_handle_allocation_failure``
+                        # offloads or holds the failed rids and pushes their
+                        # GraphNodes back to the scheduler queue.
                         self._handle_allocation_failure(
                             pending.batch, pending.node_batch
                         )
-                        # If a pre-plan was dispatched, wait for it to finish
-                        # so its wrapper.plan() side effects don't leak into
-                        # the next iter's batch (different rids/seq_lens).
-                        # Then clear the skip flag explicitly so the next real
-                        # plan_attention call recomputes from scratch.
-                        if speculation is not None and speculation.plan_future is not None:
-                            speculation.plan_future.result()
-                            self._reset_skip_plan_flags(
-                                speculation.node_batch
-                            )
-                        # as speculative inputs (e.g., streaming edges) have been
-                        # ingested into the graph struture,  they will remain where
-                        # they can be used when the node is next scheduled
-                        speculation = None
-                        continue
-                    
+                        # Speculation cleanup splits by kind:
+                        #
+                        # * Non-yield-away spec depended on pending's outputs
+                        #   (its inputs would be threaded from ``output`` below
+                        #   via ``_thread_outputs_to_speculative``). Pending's
+                        #   output is invalid, so the spec batch can't run.
+                        #   Cancel it: drain the pre-plan future, reset the
+                        #   engine's skip flags, and drop the Speculation.
+                        #
+                        # * Yield-away spec is independent of pending — its
+                        #   inputs were gathered from tensor_manager in
+                        #   ``_try_speculate_next``'s fresh-rid path, not
+                        #   from pending's output. It MAY still be submitted.
+                        #   But ``_handle_allocation_failure`` may have shifted
+                        #   the engine's KV-cache state (paused/offloaded rids),
+                        #   so any pre-plan computed before that is no longer
+                        #   trusted: drain the future and reset skip flags so
+                        #   the submit below re-plans inline from scratch.
+                        if speculation is not None:
+                            if speculation.plan_future is not None:
+                                speculation.plan_future.result()
+                                self._reset_skip_plan_flags(
+                                    speculation.node_batch
+                                )
+                                speculation.plan_future = None
+                            if not speculation.is_yield_away:
+                                speculation = None
+                        # Speculative inputs (e.g., streaming edges) already
+                        # ingested into the graph state stay where they are;
+                        # they'll be consumed when the node is next scheduled.
+                        # Fall through: yield-away (if any) submits below,
+                        # and we skip pending's postprocess (output invalid).
+
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
                         spec_node_batch = speculation.node_batch
@@ -2088,20 +2104,18 @@ class Worker:
                             self._reset_skip_plan_flags(speculation.node_batch)
 
                     # Post-process N (routing stage) — runs concurrently with
-                    # GPU(N+1) if we submitted one above. State advance +
-                    # _store_outputs already happened in _pre_routing.
+                    # GPU(N+1) if we submitted one above. Skipped on
+                    # allocation_failed since the output tensors aren't valid;
+                    # ``_handle_allocation_failure`` already rehabilitated the
+                    # failed rids upstream.
                     _t0 = _time.perf_counter() if phase_period else 0.0
 
-                    # NOTE: replacing the fast_postprocess -> slow_postprocess ->
-                    # complete_slow_postprocess with a single function for now. If we
-                    # find that parts of postprocess need to be performed on another
-                    # thread, we can reconsider the structure, but otherwise this
-                    # works for now and is cleaner
-                    if self.enable_nvtx:
-                        range_push("worker.postprocess_batch", synchronize=False)
-                    self._postprocess_batch(pending, output)
-                    if self.enable_nvtx:
-                        range_pop(synchronize=False)
+                    if not output.allocation_failed:
+                        if self.enable_nvtx:
+                            range_push("worker.postprocess_batch", synchronize=False)
+                        self._postprocess_batch(pending, output)
+                        if self.enable_nvtx:
+                            range_pop(synchronize=False)
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
