@@ -13,7 +13,7 @@ class NestedLoopIndices:
     loop_indices: dict[str, int]
     wg_fwd_pass_idx: int
 
-    def label_context_gt(self, other: "NestedLoopIndices", target_loop_name: str | None=None) -> bool:
+    def label_context_gt(self, other: "NestedLoopIndices | None", target_loop_name: str | None=None) -> bool:
         """Whether ``self``'s iter indices are strictly greater than ``other``'s,
         in the path leading up to (but not including) ``target_loop_name``.
 
@@ -21,6 +21,8 @@ class NestedLoopIndices:
         to double-stop it, we can keep the last time it was stopped and only
         re-stop it again when ``new_time.label_context_gt(prev, target) == True``.
         """
+        if other is None:
+            return True
         if self.wg_fwd_pass_idx > other.wg_fwd_pass_idx:
             return True
         if self.wg_fwd_pass_idx < other.wg_fwd_pass_idx:
