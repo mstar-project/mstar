@@ -37,7 +37,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mminf.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mminf.engine.ar_engine import AREngine  # noqa: E402
+from mminf.engine.kv_cache_engine import KVCacheEngine  # noqa: E402
 from mminf.engine.cuda_graph_runner import CudaGraphKey, CudaGraphRunner  # noqa: E402
 from mminf.engine.kv_store import TransferEngineInfo  # noqa: E402
 from mminf.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
@@ -66,7 +66,7 @@ class _StubTransferEngine:
 
 
 def _bring_up_thinker(cache_dir: str | None = None):
-    """Load Qwen3-Omni Thinker, build AREngine, capture CUDA graphs.
+    """Load Qwen3-Omni Thinker, build KVCacheEngine, capture CUDA graphs.
 
     Skips ``engine.warmup()``'s ``_compile_submodules`` step so the eager
     side and the captured graph use the same uncompiled kernels (matches the
@@ -88,7 +88,7 @@ def _bring_up_thinker(cache_dir: str | None = None):
     kv_cfg = kv_cfgs[0]
     kv_cfg.max_num_pages = 256
 
-    engine = AREngine(autocast_dtype=torch.bfloat16)
+    engine = KVCacheEngine(autocast_dtype=torch.bfloat16)
     transfer_info = TransferEngineInfo(
         my_entity_id="bench",
         my_session_id="bench_session",
@@ -181,7 +181,7 @@ def _make_per_request_info(request_ids: list[str]) -> dict[str, CurrentForwardPa
 
 
 def _time_eager_one(
-    engine: AREngine,
+    engine: KVCacheEngine,
     submodule,
     bs: int,
     total_tokens: int,
@@ -227,7 +227,7 @@ def _time_eager_one(
 
 
 def _time_graph_one(
-    engine: AREngine,
+    engine: KVCacheEngine,
     runner: CudaGraphRunner,
     submodule,
     bs: int,
@@ -271,7 +271,7 @@ def _percentile(data: list[float], p: float) -> float:
 
 
 def _bench_bucket(
-    engine: AREngine,
+    engine: KVCacheEngine,
     runner: CudaGraphRunner,
     submodule,
     bs: int,
