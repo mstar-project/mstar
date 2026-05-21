@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 from mminf.graph.base import GraphEdge
+from mminf.graph.loop_indices import NestedLoopIndices
 
 
 @dataclass
@@ -17,7 +18,7 @@ class ResultTensors:
     request_id: str
     modality: str
     graph_edge: GraphEdge
-    fwd_pass_number: int
+    loop_indices: NestedLoopIndices
     metadata: dict = field(default_factory=dict)
 
 
@@ -28,7 +29,7 @@ class RequestComplete:
     # Maps output signal name to its final forward pass number.
     # The API server waits until all entries are received before
     # completing the request.
-    final_forward_outputs: dict[str, int]
+    final_outputs: dict[str, NestedLoopIndices]
 
 
 @dataclass

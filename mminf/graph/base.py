@@ -1,38 +1,6 @@
-import logging
 from abc import ABC, abstractmethod
-from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any
 from uuid import uuid4
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class FilteredEdges:
-    kept: list["GraphEdge"]
-    filtered_out: list["GraphEdge"]
-
-
-@dataclass
-class LoopCompletionOutput:
-    new_waiting: "GraphSection"
-    outputs: list["GraphEdge"] = field(default_factory=list)
-    loop_back_name_dests_to_remove: set[tuple[str, str]] = field(default_factory=set)
-
-    def filter_out_loop_back(self, edges: list["GraphEdge"]) -> FilteredEdges:
-        return FilteredEdges(
-            kept=[edge for edge in edges if (edge.name, edge.next_node) not in self.loop_back_name_dests_to_remove],
-            filtered_out=[edge for edge in edges if (edge.name, edge.next_node) in self.loop_back_name_dests_to_remove],
-        )
-
-
-def update_list_dicts(signals: dict[str, list], new_signals: dict[str, list]):
-    for key, new_signals_elem in new_signals.items():
-        if key in signals:
-            signals[key].extend(new_signals_elem)
-        else:
-            signals[key] = new_signals_elem
 
 
 @dataclass
@@ -55,745 +23,708 @@ class GraphEdge:
 
     # Flags
     persist: bool = field(default=False)  # previously back_to_conductor
-    conductor_new_token: bool = field(default=False)
+    conductor_new_token: bool = field(default=False)  # legacy; not yet wired in new system
     is_streaming: bool = field(default=False)  # streaming edge: tokens accumulate at destination buffer
     # only for EMIT_TO_CLIENT
     output_modality: str = field(default="")  # text | image | video | audio
     _persist_for_loop: bool = field(default=False)
 
-    def clone_for_next_iter(self) -> "GraphEdge":
-        """Fresh copy with empty tensor_info; same routing/flags. Preserves
-        subclass type (e.g. StreamingGraphEdge). Used by the worker's async-
-        scheduling path to build the next loop-iter's GraphNode without
-        sharing output edge state with the in-flight step."""
-        import dataclasses
-        return dataclasses.replace(self, tensor_info=[])
+    def clone(self):
+        return GraphEdge(
+            next_node=self.next_node,
+            name=self.name,
+            tensor_info=self.tensor_info[:],
+            persist=self.persist,
+            conductor_new_token=self.conductor_new_token,
+            is_streaming=self.is_streaming,
+            output_modality=self.output_modality,
+            _persist_for_loop=self._persist_for_loop
+        )
 
 
-# Two different ways of defining graph edges
-DestToGraphEdges = dict[str, list[GraphEdge]]
-
-
-def get_node_to_inputs_mapping(new_inputs: list[GraphEdge]) -> DestToGraphEdges:
-    result: DestToGraphEdges = {}
-    for edge in new_inputs:
-        if edge.next_node not in result:
-            result[edge.next_node] = []
-        result[edge.next_node].append(edge)
-    return result
+NameAndDest = tuple[str, str]
+@dataclass
+class NodeInputsOutputs:
+    ext_inputs: set[NameAndDest]
+    ext_outputs: list[GraphEdge]
+    loop_back: set[NameAndDest]
 
 
 @dataclass
+class NodeCompletionOutput:
+    output_edges: list[GraphEdge] = field(default_factory=list)
+    # loop-back (name, dest) pairs the caller must NOT route; the loop has finished so
+    # we do not want the loop-back signals to propagate
+    filtered_signals: set[NameAndDest] = field(default_factory=set)
+
+
+@dataclass
+class SpeculativeNodeInfo:
+    node_name: str
+    # True if this node received loop-back inputs speculatively, meaning it will re-run
+    # in the next iteration of the same loop rather than advancing to a new section.
+    is_new_loop_iter: bool
+    # Name of the enclosing Loop, when the node lives inside one. ``None`` for
+    # top-level nodes. Lets callers look up ``wgio.loops[loop_name]`` to inspect
+    # ``curr_iter`` / ``max_iters`` / ``_finish_signal`` before deciding whether
+    # to speculate.
+    loop_name: str | None = None
+
+
 class GraphSection(ABC):
     @abstractmethod
-    def get_node_names(self) -> set[str]:
-        pass
+    def get_inputs_outputs(self) -> NodeInputsOutputs:
+        """Return the I/O signature of this section.
+
+        Construction-time only — used to derive Loop._external_inputs /
+        _loop_back_inputs. Not for runtime introspection.
+        """
 
     @abstractmethod
-    def get_dyn_loop_names(self) -> set[str]:
-        pass
+    def get_nodes(self) -> dict[str, "GraphNode"]:
+        """Flat map of all GraphNodes in this section, keyed by name."""
 
     @abstractmethod
-    def get_inputs(self) -> list[GraphEdge]:
-        """
-        All external or "loop-back" inputs into a worker graph
-        """
-        pass
+    def get_loops(self) -> dict[str, "Loop"]:
+        """Flat map of all Loops in this section, keyed by name."""
 
-    @abstractmethod
-    def get_outputs(self) -> list[GraphEdge]:
-        """
-        All external or "loop-back" outputs from a worker graph
-        """
-        pass
 
-    @abstractmethod
-    def ingest_inputs(self, node_to_inputs: DestToGraphEdges) -> list[GraphEdge]:
-        """
-        Adds inputs to the appropriate "ready_input_ids", and **mutates
-        node_to_inputs** to remove the inputs that were able to be added
-        to the "ready_input_ids".
-        """
-        pass
+@dataclass
+class ReadySignals:
+    """Readiness state for one 'slot' of a GraphNode.
 
-    @abstractmethod
-    def split_off_ready(self) -> tuple[list["GraphNode"], "GraphSection"]:
-        """
-        Returns a list of nodes that are ready to be run, and a graph section
-        of what is still waiting.
-        """
-        pass
+    Each node holds two instances — ready_signals (current iteration) and
+    ready_next_iter — so that loop-back inputs arriving during execution can
+    be buffered without overwriting the current slot.
+    """
+    node_name: str
+    input_names: set[str]
+    streaming_inputs: set[str]
 
-    @abstractmethod
-    def split_off_ready_for_streaming(self) -> list["GraphNode"]:
-        pass
+    # Populated as previous nodes complete
+    # This will also include, e.g., tensor UUIDs associated with these inputs
+    ready_inputs: dict[str, GraphEdge] = field(default_factory=dict)  # name -> graph edge
+    ready_names: set[str] = field(default_factory=set)
+
+    is_ready: bool = False
+    is_ready_for_streaming: bool = False
+
+    def __post_init__(self):
+        self._tensor_manager = None
+        self._request_id = None
     
-    @abstractmethod
-    def split_off_for_spec(self, spec_node_name: str) -> tuple[bool, "GraphSection | None"]:
-        """
-        Returns whether a node was split off, and the new waiting
-        """
-        pass
-
-    @abstractmethod
-    def cache_outputs(
-        self,
-        tensor_info: dict[str, list[TensorPointerInfo]],
-    ):
-        pass
-
-    @abstractmethod
-    def complete_loops(self, done_node: str) -> LoopCompletionOutput:
-        """
-        Checks if any loops have completed, and returns their cached output edges,
-        if any
-        """
-        pass
-
-    @abstractmethod
     def register_communication_info(self, communication_manager, request_id: str):
-        pass
+        self._tensor_manager = communication_manager
+        self._request_id =  request_id
+    
+    def update(self, edge: GraphEdge):
+        assert edge.name in self.input_names, \
+            f"Node {self.node_name} does not take input named {edge.name}"
+        assert edge.name not in self.ready_inputs, \
+            f"Node {self.node_name} already has ready input named {edge.name}"
+        self.ready_inputs[edge.name] = edge
+        self.ready_names.add(edge.name)
 
-    @abstractmethod
-    def reset(self):
-        pass
+        if self.is_ready:
+            return
+        self.is_ready = self.input_names.issubset(self.ready_names)
+        # ready once the only missing inputs are streaming ones (which arrive incrementally)
+        self.is_ready_for_streaming = self.is_ready or \
+            self.is_ready_for_streaming or (
+            self.input_names.issuperset(self.ready_names.union(self.streaming_inputs))
+        )
+    
+    def clear(self):
+        if self._tensor_manager is not None:
+            for edge in self.ready_inputs.values():
+                if edge._persist_for_loop:
+                    continue
+                for info in edge.tensor_info:
+                    self._tensor_manager.dereference(self._request_id, info.uuid)
+        self.ready_inputs.clear()
+        self.ready_names.clear()
+        self.is_ready = False
+        self.is_ready_for_streaming = False
+
+    def remove(self, edge_name: str) -> "GraphEdge | None":
+        """Reverse ``update(edge)`` without dereferencing tensor_info.
+
+        Used by the worker's speculation rollback path when a streaming chunk
+        was ingested for a readiness check and the rid was subsequently
+        dropped. The chunk is handed back to its StreamBuffer's uningested
+        cache; the StreamBuffer remains responsible for the tensor lifecycle,
+        so we must not dereference here.
+
+        Returns the removed edge, or None if no such name was present.
+        """
+        edge = self.ready_inputs.pop(edge_name, None)
+        if edge is None:
+            return None
+        self.ready_names.discard(edge_name)
+        self.is_ready = self.input_names.issubset(self.ready_names)
+        self.is_ready_for_streaming = self.is_ready or self.input_names.issuperset(
+            self.ready_names | self.streaming_inputs
+        )
+        return edge
 
 
 @dataclass
 class GraphNode(GraphSection):
     name: str
-    input_ids: set[str]
+    input_names: set[str]
     outputs: list[GraphEdge]
-    # Names of inputs the node will accept if provided, but that do NOT
-    # block readiness when absent.  Use for optional kwargs to the
-    # underlying submodule (e.g., V-JEPA 2's ``context_mask`` /
-    # ``target_mask``, which have sensible defaults built inside the
-    # submodule).  Must be disjoint from ``input_ids``.
-    optional_input_ids: set[str] = field(default_factory=set)
-    consumes_stream: bool = field(default=False)
+    consumes_stream: bool = False
+    # When False, the worker's speculation gate (``_can_speculate``) refuses to
+    # build a speculative N+1 batch for this node. Models opt out of spec for
+    # nodes whose forward pass mutates global state in ways the spec path
+    # doesn't account for — e.g. BAGEL's flow-loop LLM / combine_cfg, where
+    # the CFG-parallel branches need their KV caches snapshotted in lockstep.
     enable_async_scheduling: bool = True
-    _streaming_inputs: set[str] = field(default_factory=set)
-    _split_off_for_streaming: bool = field(default=False)
 
-    # Populated as previous nodes complete
-    # This will also include, e.g., tensor UUIDs associated with these inputs
-    ready_inputs: dict[str, GraphEdge] = field(default_factory=dict)  # name -> graph edge
+    # Whether this node is currently speculatively being executed: if so, we
+    # don't want to queue it in a "ready" queue because it's already being
+    # executed, but we do want to update everything else as normal.
+    _speculatively_scheduled: bool = False
+
+    _streaming_inputs: set[str] = field(default_factory=set)
+
+    _managing_registry: "GraphStateRegistry | None" = None
 
     def __post_init__(self):
         # if the user inputs, e.g., a list, turn it into a set
-        self.input_ids = set(self.input_ids)
-        self.optional_input_ids = set(self.optional_input_ids)
-        _overlap = self.input_ids & self.optional_input_ids
-        if _overlap:
-            raise ValueError(
-                f"GraphNode.input_ids and GraphNode.optional_input_ids must be disjoint; overlap: {sorted(_overlap)}"
-            )
-
-    def is_ready(self):
-        # Only required inputs gate readiness — optional ones are accepted
-        # opportunistically in ingest_inputs and ignored when absent.
-        return self.input_ids.issubset(set(self.ready_inputs.keys()))
-
-    def is_ready_except_streaming(self):
-        return self.input_ids.issubset(set(self.ready_inputs.keys()).union(self._streaming_inputs))
-
-    def get_node_names(self) -> set[str]:
-        return {self.name}
-
-    def get_dyn_loop_names(self) -> set[str]:
-        return set()
-
-    def get_inputs(self) -> list[GraphEdge]:
-        # Required + optional — the graph dispatcher routes any matching
-        # edge here; ``is_ready`` still gates only on required names.
-        all_ids = self.input_ids | self.optional_input_ids
-        return [GraphEdge(next_node=self.name, name=id) for id in all_ids]
-
-    def get_outputs(self) -> list[GraphEdge]:
-        return self.outputs
-
-    def ingest_inputs(self, node_to_inputs: DestToGraphEdges):
-        if self.name not in node_to_inputs:
-            return []
-
-        accept = self.input_ids | self.optional_input_ids
-        ingested = {
-            edge.name: edge
-            for edge in node_to_inputs[self.name]
-            if edge.name in accept and edge.name not in self.ready_inputs
-        }  # ingest required + optional inputs this node accepts
-        self.ready_inputs.update(ingested)
-
-        # remove the ingested ids from the node_to_inputs
-        node_to_inputs[self.name] = [edge for edge in node_to_inputs[self.name] if edge.name not in ingested]
-        if len(node_to_inputs[self.name]) == 0:
-            del node_to_inputs[self.name]
-        logger.debug("Node %s ingesting inputs %s", self.name, list(ingested.values()))
-        return list(ingested.values())
-
-    def split_off_ready(self):
-        if self.is_ready():
-            return [self], None
-        return [], self
-
-    def split_off_for_spec(self, spec_node_name: str) -> tuple[bool, "GraphSection | None"]:
-        if self.name == spec_node_name:
-            return True, None
-        return False, self
-
-    def split_off_ready_for_streaming(self):
-        if self._split_off_for_streaming:
-            return []
-        if self.is_ready_except_streaming():
-            self._split_off_for_streaming = True
-            return [self]
-        return []
-
-    def cache_outputs(
-        self,
-        tensor_info: dict[str, list[TensorPointerInfo]],
-    ):
-        return
-
-    def complete_loops(self, done_node) -> LoopCompletionOutput:
-        return LoopCompletionOutput(self)
-
-    def register_communication_info(self, communication_manager, request_id: str):
-        return
-
-    def reset(self):
-        self.ready_inputs.clear()
-        self._split_off_for_streaming = False
-
-    def clear_outputs(self):
-        for edge in self.outputs:
-            edge.tensor_info.clear()
-
-    def clone_for_next_iter(self) -> "GraphNode":
-        """Fresh GraphNode for the next loop iter — same shape, no
-        ready_inputs, fresh output edges (with empty tensor_info). Used by
-        the worker's async-scheduling path to speculatively build batch_N+1
-        while batch_N is still in flight on the GPU thread."""
-        clone = GraphNode(
-            name=self.name,
-            input_ids=set(self.input_ids),
-            outputs=[edge.clone_for_next_iter() for edge in self.outputs],
-            optional_input_ids=set(self.optional_input_ids),
-            consumes_stream=self.consumes_stream,
-            enable_async_scheduling=self.enable_async_scheduling,
+        self.input_names = set(self.input_names)
+        self.ready_signals = ReadySignals(
+            node_name=self.name,
+            input_names=self.input_names,
+            streaming_inputs=self._streaming_inputs
         )
-        clone._streaming_inputs = set(self._streaming_inputs)
-        return clone
+        self.ready_next_iter = ReadySignals(
+            node_name=self.name,
+            input_names=self.input_names,
+            streaming_inputs=self._streaming_inputs
+        )
+        self.speculative_signals = ReadySignals(
+            node_name=self.name,
+            input_names=self.input_names,
+            streaming_inputs=self._streaming_inputs
+        )
+        self._tensor_manager = None
+        self._request_id = None
+    
+    def register_communication_info(self, communication_manager, request_id: str):
+        self.ready_signals.register_communication_info(
+            communication_manager, request_id
+        )
+        self.ready_next_iter.register_communication_info(
+            communication_manager, request_id
+        )
+
+    def _register_streaming(self, streaming_inputs: set[str]):
+        # Mutate the existing set in place so that the ReadySignals instances
+        # built in __post_init__ (which capture self._streaming_inputs by
+        # reference) stay in sync. Rebinding the attribute would leave them
+        # pointing at the original empty set.
+        if not streaming_inputs:
+            return
+        self.consumes_stream = True
+        self._streaming_inputs.clear()
+        self._streaming_inputs.update(streaming_inputs)
+
+    def ingest_input(self, edge: GraphEdge, can_buffer: bool=True) -> bool:
+        """Try to ingest an arriving edge.
+
+        Returns True on success, False when the edge is rejected; e.g., this
+        is a streaming edge that we are not redy for and needs to get re-queued 
+        """
+        if edge.next_node != self.name:
+            return False
+        if edge.name not in self.input_names:
+            return False
+        if edge.name not in self.ready_signals.ready_names:
+            self.ready_signals.update(edge)
+        elif can_buffer and (
+            edge.name not in self.ready_next_iter.ready_names
+        ):
+            # already have this input for the current iteration — buffer for the next loop iter
+            # we do not buffer streaming signals, or else we may lose streaming signals if
+            # there is actually no next iter
+            self.ready_next_iter.update(edge)
+        else:
+            return False
+        self._managing_registry.register_ingested_input(edge)
+        return True
+
+    def get_inputs_outputs(self):
+        loop_back = {
+            (edge.name, self.name) for edge in self.outputs if edge.next_node == self.name
+        }
+        return NodeInputsOutputs(
+            ext_inputs={
+                (inp, self.name) for inp in self.input_names if (inp, self.name) not in loop_back
+            },
+            ext_outputs=[out for out in self.outputs if out.next_node != self.name],
+            loop_back=loop_back
+        )
+    
+    def is_ready_for_speculation(
+        self, check_next_iter: bool=False,
+        allow_streaming: bool=True
+    ):
+        needed_inputs = self.input_names
+        if allow_streaming:
+            needed_inputs = needed_inputs - self._streaming_inputs
+        if check_next_iter:
+            return needed_inputs.issubset(
+                self.ready_next_iter.ready_names | self.speculative_signals.ready_names
+            )
+        return needed_inputs.issubset(
+            self.ready_signals.ready_names | self.speculative_signals.ready_names
+        )
+    
+    def get_nodes(self):
+        return {self.name: self}
+    
+    def get_loops(self):
+        return {}
+    
+    def reset_for_outer_iter(self):
+        self.ready_signals.clear()
+        # promote next-iter inputs to current; reuse the now-empty object as the new next-iter buffer
+        self.ready_signals, self.ready_next_iter = (
+            self.ready_next_iter, self.ready_signals
+        )
+    
+    def clear(self):
+        self.ready_signals.clear()
+        self.ready_next_iter.clear()
+        self.speculative_signals.clear()
+
+    def reset_outputs(self):
+        for out in self.outputs:
+            out.tensor_info.clear()
+
+    def complete(self) -> NodeCompletionOutput:
+        return self._managing_registry.mark_entity_complete(self.name)
 
 
 @dataclass
 class Sequential(GraphSection):
     sections: list[GraphSection]
 
-    def get_node_names(self) -> set[str]:
-        res = set()
-        for s in self.sections:
-            res.update(s.get_node_names())
-        return res
-
-    def get_dyn_loop_names(self) -> set[str]:
-        res = set()
-        for s in self.sections:
-            res.update(s.get_dyn_loop_names())
-        return res
-
-    def _get_inputs_outputs(self):
-        # In the case that this section is part of a loop, "loop-back"
-        # variables are included in the list of inputs and outputs
-        inputs: list[GraphEdge] = []
-        outputs: list[GraphEdge] = []
-        output_names = set()
-        for s in self.sections:
-            node_names = s.get_node_names()
-            inputs_of_s = s.get_inputs()
-
-            # filter out internal signals from the new inputs
-            inputs += [inp for inp in inputs_of_s if inp.name not in output_names]
-            # filter internal output signals from the output list
-            outputs = [edge for edge in outputs if not (edge.name not in inputs_of_s and edge.next_node in node_names)]
-
-            # add new outputs to the output list
-            outputs_of_s = s.get_outputs()
-            outputs += outputs_of_s
-            output_names.update([edge.name for edge in outputs_of_s])
-        return inputs, outputs
-
-    def get_inputs(self) -> list[GraphEdge]:
-        return self._get_inputs_outputs()[0]
-
-    def get_outputs(self) -> list[GraphEdge]:
-        return self._get_inputs_outputs()[1]
-
-    def ingest_inputs(self, node_to_inputs: DestToGraphEdges):
-        ingested = []
-        for s in self.sections:
-            ingested += s.ingest_inputs(node_to_inputs)
-        return ingested
-
-    def split_off_ready(self):
-        first_ready, first_waiting = self.sections[0].split_off_ready()
-
-        if first_waiting:
-            waiting = [first_waiting] + self.sections[1:]
-        else:
-            waiting = self.sections[1:]
-
-        if len(waiting) == 0:
-            return first_ready, None
-        return first_ready, Sequential(sections=waiting)
-
-    def split_off_ready_for_streaming(self):
-        return self.sections[0].split_off_ready_for_streaming()
+    def get_nodes(self):
+        nodes = {}
+        for sec in self.sections:
+            nodes.update(sec.get_nodes())
+        return nodes
     
-    def split_off_for_spec(self, spec_node_name: str):
-        split, first_waiting = self.sections[0].split_off_for_spec(spec_node_name)
-        if first_waiting:
-            waiting = [first_waiting] + self.sections[1:]
-        else:
-            waiting = self.sections[1:]
-
-        if len(waiting) == 0:
-            return split, None
-        return split, Sequential(sections=waiting)
-
-    def cache_outputs(
-        self,
-        tensor_info: dict[str, list[TensorPointerInfo]],
-    ):
+    def get_loops(self):
+        loops = {}
         for sec in self.sections:
-            sec.cache_outputs(tensor_info)
+            loops.update(sec.get_loops())
+        return loops
 
-    def complete_loops(self, done_node) -> LoopCompletionOutput:
-        output = self.sections[0].complete_loops(done_node)
-        if output.new_waiting is None:
-            waiting = self.sections[1:]
-        else:
-            waiting = [output.new_waiting] + self.sections[1:]
+    def get_inputs_outputs(self):
+        nodes_so_far = set()
 
-        if len(waiting) > 0:
-            output.new_waiting = Sequential(sections=waiting)
-        return output
+        ext_outputs: list[GraphEdge] = []
+        ext_inputs: set[NameAndDest] = set()
+        loop_back: set[NameAndDest] = set()
+        internal_signals: set[NameAndDest] = set()
 
-    def register_communication_info(self, communication_manager, request_id: str):
         for sec in self.sections:
-            sec.register_communication_info(communication_manager, request_id)
+            io = sec.get_inputs_outputs()
 
-    def reset(self):
-        for sec in self.sections:
-            sec.reset()
+            loop_back |= io.loop_back
+            ext_inputs |= io.ext_inputs
+            ext_outputs.extend(io.ext_outputs)
+
+            internal_signals |= {
+                (edge.name, edge.next_node) for edge in ext_outputs \
+                    if (edge.name, edge.next_node) in ext_inputs
+            }
+            loop_back |= {
+                (edge.name, edge.next_node) for edge in io.ext_outputs \
+                    if edge.next_node in nodes_so_far
+            }
+
+            ext_outputs = [
+                edge for edge in ext_outputs \
+                    if (edge.name, edge.next_node) not in (internal_signals | loop_back)
+            ]
+            ext_inputs -= (internal_signals | loop_back)
+
+            nodes_so_far.update(sec.get_nodes().keys())
+        return NodeInputsOutputs(
+            ext_inputs=ext_inputs,
+            ext_outputs=ext_outputs,
+            loop_back=loop_back
+        )
 
 
 @dataclass
 class Parallel(GraphSection):
     sections: list[GraphSection]
 
-    def get_node_names(self) -> set[str]:
-        res = set()
-        for s in self.sections:
-            res.update(s.get_node_names())
-        return res
-
-    def get_dyn_loop_names(self) -> set[str]:
-        res = set()
-        for s in self.sections:
-            res.update(s.get_dyn_loop_names())
-        return res
-
-    def get_inputs(self):
-        return sum([s.get_inputs() for s in self.sections], start=[])
-
-    def get_outputs(self):
-        return sum([s.get_outputs() for s in self.sections], start=[])
-
-    def ingest_inputs(self, node_to_inputs: DestToGraphEdges):
-        ingested = []
-        for s in self.sections:
-            ingested += s.ingest_inputs(node_to_inputs)
-        return ingested
-
-    def split_off_ready(self):
-        ready = []
-        waiting = []
-        for node in self.sections:
-            node_ready, node_waiting = node.split_off_ready()
-            ready += node_ready
-            if node_waiting is not None:
-                waiting.append(node_waiting)
-
-        if len(waiting) == 0:
-            return ready, None
-        return ready, Parallel(sections=waiting)
-
-    def split_off_ready_for_streaming(self):
-        return sum([sec.split_off_ready_for_streaming() for sec in self.sections], start=[])
+    def get_nodes(self):
+        nodes = {}
+        for sec in self.sections:
+            nodes.update(sec.get_nodes())
+        return nodes
     
-    def split_off_for_spec(self, spec_node_name: str):
-        sections = []
-        any_split = split
-        for section in self.sections:
-            split, new_waiting = section.split_off_for_spec(spec_node_name)
-            any_split &= split
-            sections.append(new_waiting)
-        if not sections:
-            return any_split, None
-        return any_split, Parallel(sections)
-
-    def cache_outputs(
-        self,
-        tensor_info: dict[str, list[TensorPointerInfo]],
-    ):
+    def get_loops(self):
+        loops = {}
         for sec in self.sections:
-            sec.cache_outputs(tensor_info)
+            loops.update(sec.get_loops())
+        return loops
 
-    def complete_loops(self, done_node) -> LoopCompletionOutput:
-        outputs = []
-        loop_back_name_dests = set()
-        waiting = []
+    def get_inputs_outputs(self):
+        ext_inputs: set[NameAndDest] = set()
+        loop_back: set[NameAndDest] = set()
+        ext_outputs: list[GraphEdge] = []
+
+        nodes = set(self.get_nodes().keys())
         for sec in self.sections:
-            out = sec.complete_loops(done_node)
-            outputs += out.outputs
-            loop_back_name_dests.update(out.loop_back_name_dests_to_remove)
-            if out.new_waiting is not None:
-                waiting.append(out.new_waiting)
+            sec_io = sec.get_inputs_outputs()
 
-        if len(waiting) > 0:
-            return LoopCompletionOutput(
-                new_waiting=Parallel(sections=waiting),
-                outputs=outputs,
-                loop_back_name_dests_to_remove=loop_back_name_dests,
-            )
-        return LoopCompletionOutput(
-            new_waiting=None, outputs=outputs, loop_back_name_dests_to_remove=loop_back_name_dests
-        )
+            sec_io.ext_inputs = set({(name, dest) for name, dest in sec_io.ext_inputs if dest not in nodes})
+            sec_io.loop_back |= set({(name, dest) for name, dest in sec_io.ext_inputs if dest in nodes})
+            sec_io.ext_outputs = [edge for edge in sec_io.ext_outputs  if edge.next_node not in nodes]
 
-    def register_communication_info(self, communication_manager, request_id: str):
-        for sec in self.sections:
-            sec.register_communication_info(communication_manager, request_id)
-
-    def reset(self):
-        for sec in self.sections:
-            sec.reset()
+            ext_inputs.update(sec_io.ext_inputs)
+            loop_back.update(sec_io.loop_back)
+            ext_outputs.extend(sec_io.ext_outputs)
+        return NodeInputsOutputs(ext_inputs=ext_inputs, ext_outputs=ext_outputs, loop_back=loop_back)
 
 
 @dataclass
 class Loop(GraphSection):
-    # "section" is used by users to specify the loop iterior.It is also
-    # used in the current copy-free "advance iter" logic; see "_advance_one_iter"
-    # for more information
     section: GraphSection
     max_iters: int
     outputs: list[GraphEdge]
-    # Per-iteration outputs: every iter's tensor_info is appended to an
-    # internal accumulator (``_accumulated_cache``) and the full list is
-    # emitted on loop completion.  Unlike ``outputs`` — whose cache is
-    # wiped by ``_advance_one_iter`` so only the last iter's tensor_info
-    # survives — this cache is preserved across iterations.  Used for
-    # walks that want to stream or gather every iteration's output
-    # (e.g., autoregressive rollout that emits H predictions).
-    # Must be disjoint from ``outputs`` by name.
+
+    # MUST manually set the loop name if you want to be able to dynamically register
+    # loop stop signals, since stop signals are registered by loop name
+    name: str = field(default_factory=lambda: str(uuid4()))
+
+    # Per-iteration outputs whose tensor_info is appended across iterations and emitted
+    # all at once on loop completion. Disjoint from outputs by name.
     accumulated_outputs: list[GraphEdge] = field(default_factory=list)
-    curr_iter: int = field(default=0, repr=False)
-    _external_inputs: list[GraphEdge] = field(default=None, repr=False)
-    _loop_back_signals: list[GraphEdge] = field(default=None, repr=False)
-    _curr_iter_section: GraphSection = field(default=None, repr=False)
-    _nxt_iter_section: GraphSection = field(default=None, repr=False)
-    _cached_outputs: dict[str, list[TensorPointerInfo]] = field(default_factory=dict, repr=False)
-    _accumulated_cache: dict[str, list[TensorPointerInfo]] = field(default_factory=dict, repr=False)
-    _output_names: set[str] = field(default_factory=set, repr=False)
-    _accumulated_output_names: set[str] = field(default_factory=set, repr=False)
-    _uuid_label: str = field(default_factory=lambda: str(uuid4()), repr=False)
 
-    # For handling tensor reference counting of loop outputs
-    _tensor_manager: Any | None = field(default=None, repr=False)  # no type annotation because
-    # of circular imports
-    _request_id: str | None = field(default=None, repr=False)
-    _waiting_for_execution: set[str] = field(default_factory=set, repr=False)
+    curr_iter: int = field(default=0)
+    is_done: bool = False
+    _finish_signal: bool = False
 
-    def get_outputs(self):
-        return self.outputs
+    _managing_registry: "GraphStateRegistry | None" = None
+    # external inputs are saved so they can be re-injected at the start of each new iteration
+    _ingested_external_inputs: list[GraphEdge] = field(default_factory=list)
+    _ingested_external_input_names: set[str] = field(default_factory=set)
 
-    def get_inputs(self):
-        return self.section.get_inputs()
+    _cached_outputs: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
+    _accumulated_cache: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
+    _accumulated_output_names: set[str] = field(default_factory=set)
 
-    def get_node_names(self):
-        return self.section.get_node_names()
+    # These fields are usually set in __post_init__, except in the case of disaggregated
+    # loops, where they are set manually
+    _external_inputs: set[NameAndDest] | None = None
+    _loop_back_inputs: set[NameAndDest] | None = None
 
-    def get_dyn_loop_names(self) -> set[str]:
-        return self.section.get_dyn_loop_names()
 
+    def get_nodes(self):
+        return self.section.get_nodes()
+    
+    def register_finished(self):
+        self._finish_signal = True
+    
+    def get_loops(self):
+        loops = self.section.get_loops()
+        loops[self.name] = self
+        return loops
+    
+    def get_inputs_outputs(self):
+        inp_out = self.section.get_inputs_outputs()
+        inp_out.ext_outputs = self.outputs + self.accumulated_outputs
+        return inp_out
+    
+    def _advance_one_iter(self):
+        self.curr_iter += 1
+        self.inner_registry.reset_for_iter()
+        self._uncache_outputs()
+    
+    def ingest_external_input(self, graph_edge: GraphEdge):
+        # track one copy of each external input for re-injection on the next iteration
+        if (graph_edge.name, graph_edge.next_node) in self._external_inputs \
+                and graph_edge.name not in self._ingested_external_input_names:
+            self._ingested_external_inputs.append(graph_edge)
+            self._ingested_external_input_names.add(graph_edge.name)
+            graph_edge._persist_for_loop = True
+        self._managing_registry.register_ingested_input(graph_edge)
+    
+    def complete_iter(self):
+        """Called when every entity in the loop's section has finished for this iteration.
+
+        If the loop is done (last iter or finish signal received): populates output
+        tensor_info from the cache, marks itself complete in the outer registry, and
+        returns the loop's declared outputs with loop-back signals in filtered_signals.
+        Otherwise: advances curr_iter, resets the inner registry, and returns the
+        saved external inputs so they can be re-routed into the next iteration.
+        """
+        if self.max_iters == self.curr_iter + 1 or self._finish_signal:
+            self.is_done = True
+            # Clear buffered loop-back inputs so no stale ready state lingers after termination.
+            # Note: wg_state_registry.ready_next_iter may still hold node names added via
+            # register_ingested_input before termination — cleaning those up is deferred
+            # (they're harmless since reset_for_iter won't be called after the loop is done).
+            self.inner_registry.clear()
+            self._managing_registry.mark_entity_complete(self.name)
+            for edge in self.outputs:
+                edge.tensor_info = self._cached_outputs.get(edge.name, [])
+            for edge in self.accumulated_outputs:
+                edge.tensor_info = self._accumulated_cache.get(edge.name, [])
+            
+            # Don't dereference, becaue the tensors will be used downstream
+            self._cached_outputs.clear()
+            self._accumulated_cache.clear()
+            return NodeCompletionOutput(
+                output_edges=self.outputs + self.accumulated_outputs,
+                filtered_signals=self._loop_back_inputs
+            )
+        else:
+            self._advance_one_iter()
+            return NodeCompletionOutput(
+                output_edges=self._ingested_external_inputs
+            )
+    
     def register_communication_info(self, communication_manager, request_id: str):
         self._tensor_manager = communication_manager
         self._request_id = request_id
-        self.section.register_communication_info(communication_manager, request_id)
+    
+    def maybe_cache_output(self, edges: list[GraphEdge]):
+        """Snapshot tensor_info for any edge that matches a declared loop output.
 
-    def cache_outputs(
-        self,
-        tensor_info: dict[str, list[TensorPointerInfo]],
-    ):
-        # Terminal outputs: cache gets wiped at each ``_advance_one_iter`` so
-        # only the last iter's tensor_info survives to completion.
-        names = [key for key in tensor_info if key in self._output_names]
-        for out_name in names:
-            tensor_infos = tensor_info[out_name]
-            for info in tensor_infos:
-                self._tensor_manager.increment_ref(self._request_id, info.uuid)
-            self._cached_outputs.setdefault(out_name, []).extend(tensor_infos)
-
-        # Per-iteration accumulated outputs: cache survives across iterations
-        # (cleared only on loop completion via ``reset``), so every iter's
-        # tensor_info is preserved and emitted as a single list at the end.
-        acc_names = [key for key in tensor_info if key in self._accumulated_output_names]
-        for out_name in acc_names:
-            tensor_infos = tensor_info[out_name]
-            for info in tensor_infos:
-                self._tensor_manager.increment_ref(self._request_id, info.uuid)
-            self._accumulated_cache.setdefault(out_name, []).extend(tensor_infos)
-
-        if self._curr_iter_section is not None:
-            self._curr_iter_section.cache_outputs(tensor_info)
-
-    def _uncache_outputs(self):
-        for tensor_infos in self._cached_outputs.values():
-            for info in tensor_infos:
-                self._tensor_manager.dereference(self._request_id, info.uuid)
-        self._cached_outputs.clear()
-
-    def _uncache_accumulated_outputs(self):
-        """Dereference and clear the per-iteration accumulated cache.
-
-        Called from ``reset`` only — NOT from ``_advance_one_iter`` — because
-        the whole point of ``accumulated_outputs`` is to survive the inter-
-        iteration cleanup that ``_uncache_outputs`` performs.  Guarded against
-        a missing ``_tensor_manager`` so ``reset`` works on freshly built
-        Loop copies before ``register_communication_info`` has run.
+        Called after every entity completion so the most recent iteration's
+        tensor_info is available when complete_iter populates self.outputs.
+        Accumulated output tensor_info is appended across iterations.
+        Deduplicates by name so multi-destination edges don't double-count.
         """
+        seen_names: set[str] = set()
+        for edge in edges:
+            if edge.name in seen_names:
+                continue
+            seen_names.add(edge.name)
+            if edge.name in self._output_names:
+                self._cached_outputs.setdefault(
+                    edge.name,[]
+                ).extend(edge.tensor_info)
+                if self._tensor_manager is not None:
+                    for info in edge.tensor_info:
+                        self._tensor_manager.increment_ref(self._request_id, info.uuid)
+
+            elif edge.name in self._accumulated_output_names:
+                self._accumulated_cache.setdefault(edge.name, []).extend(edge.tensor_info)
+                if self._tensor_manager is not None:
+                    for info in edge.tensor_info:
+                        self._tensor_manager.increment_ref(self._request_id, info.uuid)
+
+    
+    def __post_init__(self):
+        # Will be set later
+        self._tensor_manager = None
+        self._request_id = None
+
+        io = self.section.get_inputs_outputs()
+        if self._external_inputs is None:
+            self._external_inputs = io.ext_inputs
+        if self._loop_back_inputs is None:
+            self._loop_back_inputs = io.loop_back
+
+        # In the disaggregated case, we need filter self.outputs for outputs
+        # that this subgraph actually produces
+        outputs_we_produce = set([edge.name for edge in io.ext_outputs]) | set([name for name, _ in io.loop_back])
+        self.outputs = [edge for edge in self.outputs if edge.name in outputs_we_produce]
+        self.accumulated_outputs = [edge for edge in self.accumulated_outputs if edge.name in outputs_we_produce]
+
+        self._output_names = {out.name for out in self.outputs}
+        self._accumulated_output_names = {out.name for out in self.accumulated_outputs}
+        _overlap = self._output_names & self._accumulated_output_names
+        if _overlap:
+            raise ValueError(
+                f"Loop.outputs and Loop.accumulated_outputs must be disjoint by name; "
+                f"overlap: {sorted(_overlap)}"
+            )
+        self.inner_registry = LoopStateRegistry(self)
+    
+    def _reset_metadata(self):
+        self._ingested_external_inputs.clear()
+        self._ingested_external_input_names.clear()
+        self.curr_iter = 0
+        self._finish_signal = False
+        self.is_done = False
+    
+    def _uncache_outputs(self):
+        if self._tensor_manager is not None and self._request_id is not None:
+            for tensor_infos in self._cached_outputs.values():
+                for info in tensor_infos:
+                    self._tensor_manager.dereference(self._request_id, info.uuid)
+        self._cached_outputs.clear()
+    
+    def _uncache_accumulated_outputs(self):
         if self._tensor_manager is not None and self._request_id is not None:
             for tensor_infos in self._accumulated_cache.values():
                 for info in tensor_infos:
                     self._tensor_manager.dereference(self._request_id, info.uuid)
         self._accumulated_cache.clear()
 
-    def ingest_inputs(self, node_to_inputs: DestToGraphEdges):
-        # Populate the current iteration first, then populate the next iteration
-        # if there are any leftover inputs (which would signal either inputs that
-        # are not for this section, or loop-back inputs)
-        ingested: list[GraphEdge] = []
-        if self._curr_iter_section is not None:
-            ingested += self._curr_iter_section.ingest_inputs(node_to_inputs)
-
-        # we should only be populating the nxt_iter_section with loop-back inputs,
-        # so exclude external inputs from populating nxt_iter_section. This logic
-        # is required to make nested loops work.
-        my_external_inputs = {(edge.name, edge.next_node): edge for edge in self._external_inputs}
-        external_inputs = {
-            dest: [edge for edge in inputs if (edge.name, dest) in my_external_inputs]
-            for dest, inputs in node_to_inputs.items()
-        }
-        for dest in node_to_inputs:
-            node_to_inputs[dest] = [i for i in node_to_inputs[dest] if i not in external_inputs[dest]]
-
-        ingested += self._nxt_iter_section.ingest_inputs(node_to_inputs)
-        update_list_dicts(node_to_inputs, external_inputs)
-
-        if self.curr_iter != self.max_iters - 1:
-            for graph_edge in ingested:
-                if (graph_edge.name, graph_edge.next_node) in my_external_inputs:
-                    my_external_inputs[(graph_edge.name, graph_edge.next_node)].tensor_info = graph_edge.tensor_info
-                    graph_edge._persist_for_loop = True
-        return ingested
-
-    def _get_external_inputs(self):
-        inputs = self.section.get_inputs()
-        internal_outputs = self.section.get_outputs()
-        output_names_dests = set([(edge.name, edge.next_node) for edge in internal_outputs])
-
-        # compute "external inputs", i.e., ones that don't come from looping
-        # back, and make sure those are populated for the next loop iter
-        return [inp for inp in inputs if (inp.name, inp.next_node) not in output_names_dests]
-
-    def _get_loop_back_signals(self) -> list[GraphEdge]:
-        # these inputs and outputs only include external and loop-back signals;
-        # they do not include signals that are purely internal to the section
-        inputs = self.section.get_inputs()
-        input_names_dests = [(edge.name, edge.next_node) for edge in inputs]
-        outputs = self.section.get_outputs()
-
-        return [edge for edge in outputs if (edge.name, edge.next_node) in input_names_dests]
-
-    def __post_init__(self):
-        # In the disaggregated case, we need filter self.outputs for outputs
-        # that this subgraph actually produces
-        outputs_we_produce = set([edge.name for edge in self.section.get_outputs()])
-        self.outputs = [edge for edge in self.outputs if edge.name in outputs_we_produce]
-        self.accumulated_outputs = [edge for edge in self.accumulated_outputs if edge.name in outputs_we_produce]
-
-        self._output_names = set([edge.name for edge in self.outputs])
-        self._accumulated_output_names = set([edge.name for edge in self.accumulated_outputs])
-        _overlap = self._output_names & self._accumulated_output_names
-        if _overlap:
-            raise ValueError(
-                f"Loop.outputs and Loop.accumulated_outputs must be disjoint by name; overlap: {sorted(_overlap)}"
-            )
-
-        if self._curr_iter_section is None:
-            self._curr_iter_section = self.section
-        if self._nxt_iter_section is None:
-            self._nxt_iter_section = deepcopy(self.section)
-        if self._external_inputs is None:
-            self._external_inputs = self._get_external_inputs()
-        if self._loop_back_signals is None:
-            self._loop_back_signals = self._get_loop_back_signals()
-
-    def _advance_one_iter(self) -> "Loop":
-        """
-        Advance the iteration by essentially resetting the curr_iter_section
-        and swapping it with the next_iter_section. This allows loop iteration while
-        remaining copy-free. The overall logic is as follows:
-
-        1. Loop instantiation: _curr_iter_section is set to section ("obj A"), and
-        _nxt_iter_section is set to a copy ("obj B")
-
-        2. Advance iter 0 -> 1: reset self.section (obj A). Set _curr_iter_section
-        to obj B (which has possibly accumulated inputs in its tenure as
-        _nxt_iter_section), and _curr_iter_section is set to the newly-reset obj B.
-        We have to use self.section here because _curr_iter_section will be None before
-        calling _advance_one_iter.
-
-        3. Advance iter 1 -> 2: Same as (2), but sets _curr_iter_section to obj A,
-        and sets _nxt_iter_section to a freshly-reset obj B.
-        """
-        self._uncache_outputs()
-
-        # TODO: maybe if we call node.reset right after running each node in the worker,
-        # so we know that all nodes in self.section have already been reset if
-        # self._iter_done() returns True, we don't have to call this here. But we
-        # will have to make sure to carefully reset the loop curr_iter in complete_loops(),
-        # so leaving this as a comment to think about later.
-        self.section.reset()
-
-        new_curr, new_next = self._nxt_iter_section, self.section
-        self._curr_iter_section = new_curr
-        self._nxt_iter_section = new_next
-        self.section = new_curr
-        self.curr_iter += 1
-
-        logger.debug(
-            "Advancing loop with nodes %s from iter %d -> %d (out of %d)",
-            str(self.section.get_node_names()),
-            self.curr_iter,
-            self.curr_iter + 1,
-            self.max_iters,
-        )
-
-        self.ingest_inputs(get_node_to_inputs_mapping(self._external_inputs))
-
-    def _is_done(self):
-        return (self.max_iters == self.curr_iter + 1) and self._iter_done()
-
-    def _iter_done(self):
-        return (self._curr_iter_section is None) and len(self._waiting_for_execution) == 0
-
-    def split_off_ready(self):
-        if self._iter_done():
-            if self._is_done():
-                return [], None
-            self._advance_one_iter()
-        elif self._curr_iter_section is None:
-            return [], self
-        first_ready, first_waiting = self._curr_iter_section.split_off_ready()
-        self._waiting_for_execution.update([node.name for node in first_ready])
-        self._curr_iter_section = first_waiting
-        return first_ready, self
+    def reset_for_outer_iter(self):
+        self.inner_registry.reset_for_iter()
+        self._reset_metadata()
     
-    def split_off_for_spec(self, spec_node_name):
-        if self._iter_done():
-            if self._is_done():
-                return [], None
-            self._advance_one_iter()
-        elif self._curr_iter_section is None:
-            return [], self
-        split, new_waiting = self._curr_iter_section.split_off_for_spec(spec_node_name)
-        self._curr_iter_section = new_waiting
-        return split, self
-
-    def split_off_ready_for_streaming(self):
-        return (
-            self._curr_iter_section.split_off_ready_for_streaming() if self._curr_iter_section is not None else []
-        ) + self._nxt_iter_section.split_off_ready_for_streaming()
-
-    def complete_loops(self, done_node: str) -> LoopCompletionOutput:
-        if done_node in self._waiting_for_execution:
-            self._waiting_for_execution.remove(done_node)
-        output_signals = []
-        loop_back_name_dests = set()
-
-        # recursive call
-        if self._curr_iter_section is not None:
-            recursive_output = self._curr_iter_section.complete_loops(done_node)
-            output_signals = recursive_output.outputs
-            loop_back_name_dests = recursive_output.loop_back_name_dests_to_remove
-            self._curr_iter_section = recursive_output.new_waiting
-
-        # check if the loop is done after the recursive call updates _curr_iter_section
-        done = self._is_done()
-        if not done:
-            return LoopCompletionOutput(
-                new_waiting=self, outputs=output_signals, loop_back_name_dests_to_remove=loop_back_name_dests
-            )
-
-        # if done, new_waiting is None and also need to collect our outputs
-        for output in self.outputs:
-            if output.name in self._cached_outputs:
-                output.tensor_info = self._cached_outputs[output.name]
-                output_signals.append(output)
-
-        # Emit per-iteration accumulated outputs (disjoint from self.outputs
-        # by __post_init__ validation).  tensor_info here is the concatenated
-        # list of every iter's contribution that was appended by cache_outputs.
-        for output in self.accumulated_outputs:
-            if output.name in self._accumulated_cache:
-                output.tensor_info = self._accumulated_cache[output.name]
-                output_signals.append(output)
-
-        loop_back_name_dests.update([(edge.name, edge.next_node) for edge in self._loop_back_signals])
-
-        return LoopCompletionOutput(
-            new_waiting=None, outputs=output_signals, loop_back_name_dests_to_remove=loop_back_name_dests
-        )        
-
-    def reset(self):
-        self.section.reset()
-        self._curr_iter_section = self.section
-        self._nxt_iter_section.reset()
-        self.curr_iter = 0
-        # ``_cached_outputs`` is wiped by ``_advance_one_iter`` between iters
-        # and is expected to be empty at reset; the accumulated cache is NOT
-        # wiped between iters, so we must clean it up here or a fresh run of
-        # the same Loop would emit stale tensor_infos from the previous run.
+    def clear(self):
+        self.inner_registry.clear()
+        self._reset_metadata()
         self._uncache_accumulated_outputs()
 
 
-@dataclass
-class DynamicLoop(Loop):
-    name: str = field(default="loop")
-    _finished: bool = field(default=False)
+class GraphStateRegistry(ABC):
+    def __init__(
+        self, graph_section: GraphSection,
+    ):
+        # "Outer-level" nodes and loops
+        self.managed_entities: dict[str, GraphNode|Loop] = {}
 
-    def register_finished(self):
-        self._finished = True
+        def _set_managed_entities(section: GraphSection):
+            if isinstance(section, GraphNode) or isinstance(section, Loop):
+                # stop here — Loop's inner entities are owned by its own LoopStateRegistry
+                self.managed_entities[section.name] = section
+                return
+            assert isinstance(section, Sequential) or isinstance(section, Parallel)
+            for sec in section.sections:
+                _set_managed_entities(sec)
+        _set_managed_entities(graph_section)
 
-    def get_dyn_loop_names(self) -> set[str]:
-        res = super().get_dyn_loop_names()
-        res.add(self.name)
-        return res
+        self.is_done = False
+        self._num_completed_entities = 0
+        self._num_managed_entities = len(self.managed_entities)
+    
+    def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
+        """Record that an entity has finished; no-ops if already done (safeguard only)."""
+        if not self.is_done and entity_name in self.managed_entities:
+            self._num_completed_entities += 1
+            self.is_done = self._num_completed_entities == self._num_managed_entities
+        return NodeCompletionOutput(
+            output_edges=self.managed_entities[entity_name].outputs
+        )
+    
+    @abstractmethod
+    def register_ingested_input(self, graph_edge: GraphEdge):
+        pass
+    
+    def reset_for_iter(self):
+        self.is_done = False
+        self._num_completed_entities = 0
+        for entity in self.managed_entities.values():
+            entity.reset_for_outer_iter()
 
-    def _is_done(self):
-        return ((self.max_iters == self.curr_iter + 1) or self._finished) and self._iter_done()
+    def clear(self):
+        self.is_done = False
+        self._num_completed_entities = 0
+        for entity in self.managed_entities.values():
+            entity.clear()
 
-    def reset(self):
-        super().reset()
-        self._finished = False
+
+class LoopStateRegistry(GraphStateRegistry):
+    def __init__(
+        self, loop: Loop
+    ):
+        super().__init__(loop.section)
+        self.loop = loop
+    
+    def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
+        output = super().mark_entity_complete(entity_name)
+        self.loop.maybe_cache_output(self.managed_entities[entity_name].outputs)
+        if self.is_done:
+            loop_out = self.loop.complete_iter()
+            output.filtered_signals.update(loop_out.filtered_signals)
+            # strip loop-back edges from this entity's raw outputs, then append the
+            # loop's declared outputs (either the external outputs if done, or the
+            # re-injected external inputs if advancing to the next iteration)
+            output.output_edges = [
+                edge for edge in output.output_edges \
+                    if (edge.name, edge.next_node) not in loop_out.filtered_signals
+            ]
+            output.output_edges.extend(loop_out.output_edges)
+        return output
+    
+    def register_ingested_input(self, graph_edge: GraphEdge):
+        self.loop.ingest_external_input(graph_edge)
+
+
+class WorkerGraphStateRegistry(GraphStateRegistry):
+    def __init__(self, graph_section: GraphSection):
+        super().__init__(graph_section)
+
+        self.ready_names = set()
+        self.ready_next_iter = set()
+        self.ready_streaming_next_iter = set()
+
+        self.nodes = graph_section.get_nodes()
+        self.only_streaming_inputs = {
+            name for name, node in self.nodes.items() \
+                if node.input_names.issubset(node._streaming_inputs)
+        }
+
+        self.ready_for_streaming = set(self.only_streaming_inputs)
+        self.ready_streaming_next_iter = set(self.only_streaming_inputs)
+
+    def register_ingested_input(self, graph_edge: GraphEdge):
+        node = self.nodes[graph_edge.next_node]
+        # If node._speculatively_scheduled, the node is already executing as
+        # a spec batch. We don't want to double-queue it (either for the
+        # current iter via ``ready_names`` or for the next iter via
+        # ``ready_next_iter`` — both eventually feed the scheduler) so we
+        # gate every queue add on the flag.
+        if node.ready_signals.is_ready:
+            if not node._speculatively_scheduled:
+                self.ready_names.add(node.name)
+            self.ready_for_streaming.discard(node.name)
+        elif node.ready_signals.is_ready_for_streaming:
+            if not node._speculatively_scheduled:
+                self.ready_for_streaming.add(node.name)
+
+        if node.ready_next_iter.is_ready:
+            if not node._speculatively_scheduled:
+                self.ready_next_iter.add(node.name)
+            self.ready_streaming_next_iter.discard(node.name)
+        elif node.ready_next_iter.is_ready_for_streaming:
+            if not node._speculatively_scheduled:
+                self.ready_streaming_next_iter.add(node.name)
+
+    def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
+        # Top-level entities have no outer loop to drive a reset_for_iter, so
+        # we clear the entity's ready_signals here so the same node can be
+        # ingested for a future forward pass without ingest_input falling
+        # through to ready_next_iter
+        output = super().mark_entity_complete(entity_name)
+        entity = self.managed_entities.get(entity_name)
+        if isinstance(entity, GraphNode):
+            entity.ready_signals.clear()
+        return output
+
+    def reset_for_iter(self):
+        super().reset_for_iter()
+        self.ready_names.clear()
+        self.ready_for_streaming = set(self.only_streaming_inputs)
+        # promote next-iter ready sets to current; nodes that already received their
+        # loop-back inputs are immediately ready for the new iteration
+        self.ready_names, self.ready_next_iter = (
+            self.ready_next_iter, self.ready_names
+        )
+        self.ready_for_streaming, self.ready_streaming_next_iter = (
+            self.ready_streaming_next_iter, self.ready_for_streaming
+        )
+
+    def clear(self):
+        super().clear()
+        self.ready_names.clear()
+        self.ready_for_streaming = set(self.only_streaming_inputs)
+        self.ready_next_iter.clear()
+        self.ready_for_streaming = set(self.only_streaming_inputs)

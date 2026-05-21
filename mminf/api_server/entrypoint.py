@@ -57,7 +57,6 @@ def _conductor_process_target(
     enable_nvtx: bool = False,
     log_level: str = "INFO",
     cache_dir: str | None = None,
-    mooncake_port: int=8080,
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device=""
 ):
@@ -100,7 +99,6 @@ def _conductor_process_target(
         socket_path_prefix=socket_path_prefix,
         enable_nvtx=enable_nvtx,
         log_level=log_level,
-        mooncake_port=mooncake_port,
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device
     )
@@ -134,47 +132,6 @@ def _shutdown_conductor_process(
 
 
 # ------------------------------------------------------------------
-# Mooncake KV store setup
-# ------------------------------------------------------------------
-def start_mooncake_master(port=8080, log_file: str | None = None):
-    cmd = [
-        "mooncake_master",
-        "--enable_http_metadata_server=true",
-        "--http_metadata_server_host=0.0.0.0",
-        f"--http_metadata_server_port={port}",
-    ]
-
-    stdout = open(log_file, "a") if log_file else subprocess.DEVNULL
-    stderr = subprocess.STDOUT
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=stdout,
-        stderr=stderr,
-        process_group=os.setsid,  # start new process group
-    )
-
-    wait_for_port("localhost", 50051)
-    logger.info("Successfully started Mooncake metadata server")
-
-    return process
-
-
-def wait_for_port(host, port, timeout=10):
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            with socket.create_connection((host, port), timeout=1):
-                return True
-        except OSError:
-            time.sleep(0.1)
-    raise RuntimeError(f"Timeout waiting for {host}:{port}")
-
-
-def stop_mooncake_master(process: subprocess.Popen):
-    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-
-# ------------------------------------------------------------------
 # APIServer
 # ------------------------------------------------------------------
 
@@ -187,7 +144,6 @@ class APIServer:
         upload_dir: str = "/tmp/mminf_uploads",
         hostname: str="localhost",
         timeout_seconds: float = 600.0,
-        mooncake_port=8080,
         tensor_comm_protocol=CommProtocol.RDMA,
         tcp_transfer_device="",
         model=None,
@@ -195,8 +151,6 @@ class APIServer:
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
-
-        # self.mooncake_pid = start_mooncake_master(port=mooncake_port)
 
         self.preprocess_worker = PreprocessWorker(
             model=model,
@@ -266,7 +220,7 @@ class APIServer:
                 "consumed_chunks": 0,
                 "input_modalities": input_modalities,
                 "output_modalities": output_modalities,
-                "final_forward_outputs": {},
+                "final_outputs": {},
             }
 
         self.preprocess_worker.new_request(PreprocessInput(
@@ -293,8 +247,12 @@ class APIServer:
         stale = [
             rid
             for rid, ts in self.recently_completed.items()
-            if not self.preprocess_worker.has_pending_tensors(rid)
-            or (now - ts) >= self._recently_completed_ttl
+            if (
+                (not self.preprocess_worker.has_pending_tensors(rid)) \
+                    and self.preprocess_worker.received_final_chunks(
+                        rid, self.pending_requests[rid]["final_outputs"]
+                    )
+            ) or (now - ts) >= self._recently_completed_ttl
         ]
         for rid in stale:
             # only set the event when there are no more pending chunks
@@ -330,8 +288,8 @@ class APIServer:
                             elif message.message_type == "request_complete":
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
-                                self.pending_requests[rid]["final_forward_outputs"] = \
-                                    message.body.final_forward_outputs
+                                self.pending_requests[rid]["final_outputs"] = \
+                                    message.body.final_outputs
                         elif rid in self.recently_completed:
                             logger.debug("Late message for completed %s", rid)
                         else:
@@ -435,7 +393,6 @@ class APIServer:
     # ----------------------------------------------------------
 
     def cleanup(self) -> None:
-        # stop_mooncake_master(self.mooncake_pid)
         self.preprocess_worker.shutdown()
         self.running = False
         if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
@@ -662,7 +619,6 @@ def main():
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
         timeout_seconds=args.timeout,
-        mooncake_port=args.mooncake_port,
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         tcp_transfer_device=args.tcp_transfer_device
@@ -679,7 +635,6 @@ def main():
             args.enable_nvtx,
             args.log_level,
             args.cache_dir,
-            args.mooncake_port,
             CommProtocol(args.tensor_comm_protocol),
             args.tcp_transfer_device
         ),

@@ -298,12 +298,12 @@ class Pi05Model(Model):
             [
                 GraphNode(
                     name="vit_encoder",
-                    input_ids=["image_inputs"],
+                    input_names=["image_inputs"],
                     outputs=[GraphEdge(next_node="LLM", name="img_emb")],
                 ),
                 GraphNode(
                     name="LLM",
-                    input_ids=["img_emb", "text_inputs"],
+                    input_names=["img_emb", "text_inputs"],
                     outputs=[],
                 ),
             ]
@@ -322,7 +322,7 @@ class Pi05Model(Model):
         action_gen = Loop(
             section=GraphNode(
                 name="LLM",
-                input_ids=["noisy_actions", "timestep_index"],
+                input_names=["noisy_actions", "timestep_index"],
                 outputs=[
                     GraphEdge(next_node="LLM", name="noisy_actions"),
                     GraphEdge(next_node="LLM", name="timestep_index"),

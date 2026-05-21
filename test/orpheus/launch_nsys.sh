@@ -20,7 +20,8 @@ else
     exit 1
 fi
 
-CUDA_VISIBLE_DEVICES=$DEVICES python mminf/api_server/entrypoint.py \
+CUDA_VISIBLE_DEVICES=$DEVICES nsys profile --trace=cuda,nvtx --output=orpheus_profile --force-overwrite=true \
+    python mminf/api_server/entrypoint.py --enable-nvtx \
     --config configs/orpheus_colocated.yaml --port $PORT \
     --cache-dir $ORPHEUS_CACHE_DIR \
     --socket-path-prefix /tmp/mminf_${WHO}/ \

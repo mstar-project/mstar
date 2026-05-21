@@ -37,7 +37,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.config = config
 
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
     def _build_prefill_packed(
         self, num_tokens: int, device: torch.device,
@@ -306,6 +306,8 @@ class SNACDecoderSubmodule(NodeSubmodule):
         self.idx_2356 = torch.tensor([2, 3, 5, 6], dtype=torch.long, device=device)
         self.config = config
 
+        self._orig_seq_len = {}
+
     # _tokens_to_codes pads to multiples of 28 tokens then reshapes to
     # (N_frames, 4, 7); for a single streaming window this is 1 frame.
     @property
@@ -341,24 +343,26 @@ class SNACDecoderSubmodule(NodeSubmodule):
         **kwargs
     ) -> ARNodeInputs:
         tokens = inputs["new_token"][0].flatten()
-        # Need at least one full codebook row (7 tokens) to form a
-        # meaningful frame; below that, _tokens_to_codes' pad branch
-        # either crashes on the empty tensor or emits all-pad codes.
-        if tokens.numel() < self.config.tokens_per_frame:
-            logger.debug(
-                "SNAC preprocess: only %d tokens — signaling skip",
-                tokens.numel(),
-            )
-            return None
+        # # Need at least one full codebook row (7 tokens) to form a
+        # # meaningful frame; below that, _tokens_to_codes' pad branch
+        # # either crashes on the empty tensor or emits all-pad codes.
+        # if tokens.numel() < self.config.tokens_per_frame:
+        #     logger.debug(
+        #         "SNAC preprocess: only %d tokens — signaling skip",
+        #         tokens.numel(),
+        #     )
+        #     return None
+        self._orig_seq_len[fwd_info.request_id] = tokens.shape[0]
         return ARNodeInputs(
             input_ids=self._tokens_to_codes(tokens),
             input_seq_len=tokens.shape[0]
         )
 
     def can_batch(self, batch: NodeBatch, inputs: list[ARNodeInputs]) -> bool:
-        return len({
-            input.input_seq_len for input in inputs
-        }) == 1
+        # return len({
+        #     input.input_seq_len for input in inputs
+        # }) == 1
+        return True
 
     def preprocess(
         self,

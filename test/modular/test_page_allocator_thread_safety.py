@@ -1,6 +1,6 @@
 """Thread-safety tests for ``PageAllocator`` and ``PagedAllocationManager``.
 
-PR #78 issue #4: under Phase 3 spec, the plan thread runs ``alloc`` while
+PR #78 issue #4: under speculative scheduling, the plan thread runs ``alloc`` while
 the GPU thread runs ``reset_label``. The previous implementation had two
 unprotected races:
 

@@ -30,7 +30,7 @@ from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
 from mminf.engine.ar_engine import KVCacheConfig
 from mminf.engine.base import EngineType
-from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, GraphSection, TensorPointerInfo
+from mminf.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model
 from mminf.model.orpheus.config import OrpheusModelConfig
@@ -111,7 +111,7 @@ class OrpheusModel(Model):
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(
             name="LLM",
-            input_ids=["text_inputs"],
+            input_names=["text_inputs"],
             outputs=[
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
@@ -127,11 +127,11 @@ class OrpheusModel(Model):
             ],
         )
 
-        decode = DynamicLoop(
+        decode = Loop(
             name="decode_loop",
             section=GraphNode(
                 name="LLM",
-                input_ids=["text_inputs"],
+                input_names=["text_inputs"],
                 outputs=[
                     GraphEdge(
                         next_node="LLM",
@@ -155,7 +155,7 @@ class OrpheusModel(Model):
 
         snac_chunk = GraphNode(
             name="snac_decoder",
-            input_ids=["new_token"],
+            input_names=["new_token"],
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
@@ -433,6 +433,12 @@ class OrpheusModel(Model):
         )
 
         language_model.eval()
+        # Fuse q/k/v_proj into qkv_proj and gate_proj/up_proj into gate_up_proj
+        # per layer. Must run after weight loading so per-Linear weights are
+        # populated; the originals are nulled out and the forward path uses
+        # F.linear against the fused buffers.
+        language_model.consolidate_fused_weights()
+
         return OrpheusLLMSubmodule(
             language_model=language_model,
             config=self.config,

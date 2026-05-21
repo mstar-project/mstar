@@ -43,8 +43,8 @@ from mminf.conductor.request_info import (
 )
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
-from mminf.graph.base import DynamicLoop, GraphEdge, GraphNode, Sequential, TensorPointerInfo
-from mminf.graph.special_destinations import EMIT_TO_CLIENT
+from mminf.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
+from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, MAX_OUTPUT_TOKENS, Model, TensorAndMetadata
 from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mminf.model.submodule_base import NodeSubmodule
@@ -208,7 +208,7 @@ class Qwen3OmniModel(Model):
         #    to the Talker partition via StreamingGraphEdge --
         prefill_text = GraphNode(
             name="Thinker",
-            input_ids=["text_inputs"],
+            input_names=["text_inputs"],
             outputs=[
                 GraphEdge( # last prefill samples a token
                     next_node=EMIT_TO_CLIENT,
@@ -238,12 +238,12 @@ class Qwen3OmniModel(Model):
                 # audio_seqlens carries the original (pre-padding) length of
                 # each audio clip, used by the encoder to compute attention
                 # masks and output position IDs.
-                input_ids=["audio_features", "audio_seqlens"],
+                input_names=["audio_features", "audio_seqlens"],
                 outputs=[GraphEdge(next_node="Thinker", name="audio_embeds")],
             ),
             GraphNode(
                 name="Thinker",
-                input_ids=["audio_embeds"],
+                input_names=["audio_embeds"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -271,7 +271,7 @@ class Qwen3OmniModel(Model):
                 # image_grid_thw / video_grid_thw carries the (T, H, W) grid
                 # dimensions per image/video, used by the encoder to compute
                 # spatial position IDs and patch counts.
-                input_ids=["pixel_values", "image_grid_thw"],
+                input_names=["pixel_values", "image_grid_thw"],
                 outputs=[
                     GraphEdge(next_node="Thinker", name="vision_embeds"),
                     GraphEdge(next_node="Thinker", name="deepstack")
@@ -279,7 +279,7 @@ class Qwen3OmniModel(Model):
             ),
             GraphNode(
                 name="Thinker",
-                input_ids=["vision_embeds", "deepstack", "video_second_per_grid", "image_grid_thw"],
+                input_names=["vision_embeds", "deepstack", "video_second_per_grid", "image_grid_thw"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -303,11 +303,11 @@ class Qwen3OmniModel(Model):
 
         # -- Thinker decode: produces new_token (persist) + thinker_states
         #    (streaming to Talker) --
-        thinker_decode = DynamicLoop(
+        thinker_decode = Loop(
             name="thinker_decode_loop",
             section=GraphNode(
                 name="Thinker",
-                input_ids=["text_inputs"],
+                input_names=["text_inputs"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -341,7 +341,7 @@ class Qwen3OmniModel(Model):
         # present for a prefill step.
         talker_prefill = GraphNode(
             name="Talker",
-            input_ids=["thinker_states", "thinker_mask", "talker_trigger"],
+            input_names=["thinker_states", "thinker_mask", "talker_trigger"],
             outputs=[],
         )
 
@@ -349,10 +349,10 @@ class Qwen3OmniModel(Model):
             sections=[
                 GraphNode(
                     name="Talker",
-                    input_ids=["thinker_states", "thinker_mask", "talker_trigger"],
+                    input_names=["thinker_states", "thinker_mask", "talker_trigger"],
                     outputs=[
                         GraphEdge(
-                            next_node="Talker",
+                            next_node=EMPTY_DESTINATION,
                             name="talker_input_embeds",
                             persist=True
                         ),
@@ -367,25 +367,24 @@ class Qwen3OmniModel(Model):
         )
 
         # -- Talker decode: autoregressive codec token generation --
-        talker_decode = DynamicLoop(
+        talker_decode = Loop(
             name="talker_decode_loop",
             section=Sequential(
                 sections=[
                     GraphNode(
                         name="Talker",
-                        input_ids=["thinker_states", "thinker_mask", "talker_input_embeds"],
+                        input_names=["thinker_states", "thinker_mask", "talker_input_embeds"],
                         outputs=[
                             GraphEdge(
                                 next_node="Talker",
                                 name="talker_input_embeds",
-                                persist=True
                             ),
                             StreamingGraphEdge(
                                 next_node="Code2Wav",
                                 name="codec_tokens",
                                 target_partition="Code2Wav",
                             ),
-                        ]
+                        ],
                     )
                 ]
             ),
@@ -396,7 +395,7 @@ class Qwen3OmniModel(Model):
         # -- Code2Wav chunk: vocoder streaming decode --
         code2wav_chunk = GraphNode(
             name="Code2Wav",
-            input_ids=["codec_tokens"],
+            input_names=["codec_tokens"],
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,

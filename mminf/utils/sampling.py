@@ -323,7 +323,7 @@ class Sampler(BaseSampler):
         # autotunes), which causes mid-sequence token doubling once the
         # budget runs out. Keep the sync unconditional — its cost is
         # ~10 µs per sample, well below the iter budget (3-5 ms), so it
-        # does not regress the spec/Phase 3 perf wins.
+        # does not regress the speculative/CUDA-graph perf wins.
         torch.cuda.current_stream().synchronize()
 
 
@@ -426,7 +426,7 @@ def sample_tokens(
         # already serializes them — at that point the sync is pure overhead
         # AND it blocks the same-thread async path from overlapping
         # post-processing with the just-submitted GPU(N+1) work (see
-        # worker.run + ASYNC_REDESIGN.md). The budget is owned by each
+        # worker.run). The budget is owned by each
         # Sampler instance so co-located Thinker/Talker/code-predictor
         # samplers cannot consume one another's warmup protection.
         if consume_autotune_sync_budget is not None:

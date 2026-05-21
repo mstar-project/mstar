@@ -40,10 +40,10 @@ from mminf.conductor.request_info import (
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import (
-    DynamicLoop,
     GraphEdge,
     GraphNode,
     GraphSection,
+    Loop,
     Sequential,
     TensorPointerInfo,
 )
@@ -335,12 +335,12 @@ class VJepa2Model(Model):
             [
                 GraphNode(
                     name="video_encoder",
-                    input_ids=["video_frames"],
+                    input_names=["video_frames"],
                     outputs=[GraphEdge(next_node="predictor", name="encoder_hidden")],
                 ),
                 GraphNode(
                     name="predictor",
-                    input_ids=predictor_inputs,
+                    input_names=predictor_inputs,
                     outputs=[
                         GraphEdge(
                             next_node=EMIT_TO_CLIENT,
@@ -355,7 +355,7 @@ class VJepa2Model(Model):
 
         prefill_encoder_only = GraphNode(
             name="video_encoder",
-            input_ids=["video_frames"],
+            input_names=["video_frames"],
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
@@ -382,7 +382,7 @@ class VJepa2Model(Model):
         # ``Loop.__post_init__`` recognizes it when filtering the
         # ``accumulated_outputs`` edge list — its ``next_node`` target is
         # the same node, meaning the loop-back value is ignored by the
-        # node's ``input_ids`` and only survives in the accumulated cache.
+        # node's ``input_names`` and only survives in the accumulated cache.
         #
         #
         # Two variants of the walk coexist:
@@ -403,7 +403,7 @@ class VJepa2Model(Model):
         #     Orpheus LLM -> SNAC), which isn't what per-iter client
         #     emit requires.
         # Both walks route to the SAME ``rollout_predictor`` node name
-        # (same submodule, same engine type, same ``register_loop_stop``
+        # (same submodule, same engine type, same ``check_stop``
         # semantics) — only the emit topology differs.  Gated per-request
         # via ``model_kwargs["stream_rollout"]`` in ``_initial_walk``.
         rollout_inputs: list[str] = ["encoder_hidden"]
@@ -426,7 +426,7 @@ class VJepa2Model(Model):
             # reusing one instance across two walks would entangle them.
             return GraphNode(
                 name="video_encoder",
-                input_ids=["video_frames"],
+                input_names=["video_frames"],
                 outputs=[
                     GraphEdge(next_node="rollout_predictor", name="encoder_hidden"),
                 ],
@@ -435,14 +435,16 @@ class VJepa2Model(Model):
         # -- Batched (Phase 2 + 3.D): accumulated_outputs, one message at
         # -- loop completion.  ``max_iters`` is a config-level upper bound
         # -- baked in at graph-build time; the per-request horizon is
-        # -- enforced inside the submodule via ``register_loop_stop`` when
+        # -- enforced inside the submodule via ``check_stop`` when
         # -- iter_idx + 1 reaches it.
         rollout_section_batched = GraphNode(
             name="rollout_predictor",
-            input_ids=rollout_inputs,
+            input_names=rollout_inputs,
             outputs=list(rollout_loopback_outputs),
+            # dynamic rollout loop; don't want async scheduling to overshoot by one
+            enable_async_scheduling=False
         )
-        rollout_loop_batched = DynamicLoop(
+        rollout_loop_batched = Loop(
             name=self.ROLLOUT_LOOP_NAME,
             section=rollout_section_batched,
             max_iters=self.config.max_rollout_horizon,
@@ -465,7 +467,7 @@ class VJepa2Model(Model):
         # -- is one-shot per iter; nothing needs to survive across iters.
         rollout_section_streaming = GraphNode(
             name="rollout_predictor",
-            input_ids=rollout_inputs,
+            input_names=rollout_inputs,
             outputs=list(rollout_loopback_outputs) + [
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
@@ -473,8 +475,10 @@ class VJepa2Model(Model):
                     output_modality="video",
                 ),
             ],
+            # dynamic rollout loop; don't want async scheduling to overshoot by one
+            enable_async_scheduling=False
         )
-        rollout_loop_streaming = DynamicLoop(
+        rollout_loop_streaming = Loop(
             name=self.ROLLOUT_LOOP_NAME,
             section=rollout_section_streaming,
             max_iters=self.config.max_rollout_horizon,
@@ -508,21 +512,21 @@ class VJepa2Model(Model):
                 [
                     GraphNode(
                         name="video_encoder",
-                        input_ids=["video_frames"],
+                        input_names=["video_frames"],
                         outputs=[
                             GraphEdge(next_node="ac_predictor_mpc", name="encoder_hidden"),
                         ],
                     ),
                     GraphNode(
                         name="ac_predictor_mpc",
-                        input_ids=mpc_predictor_inputs,
+                        input_names=mpc_predictor_inputs,
                         outputs=[
                             GraphEdge(next_node="mpc_scorer", name="predicted_hidden"),
                         ],
                     ),
                     GraphNode(
                         name="mpc_scorer",
-                        input_ids=["predicted_hidden", "goal_hidden"],
+                        input_names=["predicted_hidden", "goal_hidden"],
                         outputs=[
                             GraphEdge(
                                 next_node=EMIT_TO_CLIENT,
@@ -890,8 +894,8 @@ class VJepa2Model(Model):
         step_metadata: dict = {"is_prefill": True}
         if walk in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING):
             # Per-request horizon enforced by ``VJepa2RolloutPredictorSubmodule``
-            # via ``register_loop_stop`` once iter_idx + 1 reaches it.  The
-            # graph's DynamicLoop is always built with ``max_iters=config.max_rollout_horizon``.
+            # via ``check_stop`` once iter_idx + 1 reaches it.  The
+            # graph's Loop is always built with ``max_iters=config.max_rollout_horizon``.
             # Streaming variant uses the same horizon logic — the submodule
             # doesn't distinguish walks.
             requested = int((model_kwargs or {}).get("rollout_horizon", 2) or 2)

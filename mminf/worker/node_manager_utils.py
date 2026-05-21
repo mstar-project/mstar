@@ -4,23 +4,9 @@ from dataclasses import dataclass, field
 
 from mminf.communication.tensors import TensorCommunicationManager
 from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
-from mminf.graph.base import (
-    DynamicLoop,
-    FilteredEdges,
-    GraphEdge,
-    GraphNode,
-    GraphSection,
-    Loop,
-    Parallel,
-    Sequential,
-    TensorPointerInfo,
-)
-from mminf.graph.loop_index import build_loop_index_tree, update_loop_index_tree
-from mminf.graph.request_queues import (
-    PerRequestNodeQueues,
-    ProcessedInputs,
-    format_graph_edge_list,
-)
+from mminf.graph.base import GraphEdge, GraphNode, NameAndDest, NodeCompletionOutput, TensorPointerInfo
+from mminf.graph.graph_io import WorkerGraphIO, format_graph_edge_list
+from mminf.graph.loop_indices import NestedLoopIndices
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, SPECIAL_DESTINATIONS
 from mminf.model.base import WorkerGraph
 from mminf.streaming.stream_buffer import StreamBuffer
@@ -59,56 +45,83 @@ class WorkerGraphQueues:
     graph_walks: set[str] # e.g., this worker graph is active during decode and image_gen
                           # but not the prefill graph walk
     worker_graph: WorkerGraph
-    per_request_queues: dict[str, PerRequestNodeQueues] # request_id -> queue
+    per_request_queues: dict[str, WorkerGraphIO]
     tensor_manager: TensorCommunicationManager
 
-    def process_new_inputs(self, request_id: str, inputs: list[GraphEdge]) -> ProcessedInputs:
-        """
-        Add new inputs for a request, and update waiting/ready nodes accordingly.
-        Returns any signals that should be sent to other worker graphs.
-        """
-        return self.per_request_queues[request_id].process_new_inputs(inputs)
+    def __post_init__(self):
+        self.nodes = set(self.worker_graph.section.get_nodes().keys())
+        self.loops = set(self.worker_graph.section.get_loops().keys())
 
-    def process_new_streaming_inputs(self, request_id: str, inputs: list[GraphEdge]) -> ProcessedInputs:
+    def process_new_inputs(
+        self, request_id: str, inputs: list[GraphEdge],
+        can_buffer: bool=True
+    ) -> list[GraphEdge]:
+        """Ingest inputs into this worker graph's per-request io.
+
+        Returns the edges that were NOT routed here (because their next_node
+        is not a node in this worker graph) so the caller can try the next
+        worker graph. Works for both normal and streaming inputs — the per-
+        node io routes by name and lets ``ReadySignals.is_ready_for_streaming``
+        light up the streaming readiness set on its own.
         """
-        Add new inputs for a request, and update waiting/ready nodes accordingly.
-        Returns any signals that should be sent to other worker graphs.
-        """
-        return self.per_request_queues[request_id].process_streaming_input(inputs)
+        assert request_id in self.per_request_queues, \
+            f"Tried to process new inputs for unknown request ID {request_id}"
+        queue = self.per_request_queues[request_id]
+        not_ingested: list[GraphEdge] = []
+        for inp in inputs:
+            if not queue.ingest_input(inp, can_buffer):
+                not_ingested.append(inp)
+        return not_ingested
+    
+    def process_new_streaming_inputs(
+        self, request_id: str, inputs: list[GraphEdge],
+        can_buffer: bool=True
+    ) -> list[GraphEdge]:
+        assert request_id in self.per_request_queues, \
+            f"Tried to process new inputs for unknown request ID {request_id}"
+        queue = self.per_request_queues[request_id]
+        not_ingested: list[GraphEdge] = []
+        for inp in inputs:
+            if (inp.next_node not in queue.ready_for_streaming) or (not queue.ingest_input(inp, can_buffer)):
+                not_ingested.append(inp)
+        return not_ingested
 
     def is_done(self, request_id) -> bool:
-        q = self.per_request_queues[request_id]
-        return q.waiting is None and len(q.ready) == 0 and len(q.waiting_for_stream) == 0
+        assert request_id in self.per_request_queues, \
+            f"Tried to check queue done state for unknown request ID {request_id}"
+        queue = self.per_request_queues[request_id]
+        return queue.wg_state_registry.is_done
 
     def add_request(self, request_id: str):
         """
         Initialize queues for a new request
         """
         section_copy = deepcopy(self.worker_graph.section)
-        section_copy.register_communication_info(
+        queue = WorkerGraphIO(section_copy, wg_id=self.worker_graph_id)
+        queue.register_communication_info(
             self.tensor_manager, request_id
         )
-        self.per_request_queues[request_id] = PerRequestNodeQueues(
-            waiting=section_copy,
-            full_section=section_copy,
-            worker_graph_id=self.worker_graph_id
-        )
+        self.per_request_queues[request_id] = queue
 
     def remove_request(self, request_id: str):
         """
         Delete queues for a completed/removed request (saw EOS)
         """
-        if request_id in self.per_request_queues:
-            del self.per_request_queues[request_id]
+        self.per_request_queues.pop(request_id, None)
 
-    def get_ready_node_names(self) -> dict[str, str]:
+    def get_ready_node_names(self) -> dict[str, set[str]]:
         """
         Returns mapping of request id to ready node names for that request
         """
         return {
-            request_id: [s.name for s in q.ready] \
+            request_id: q.ready_node_names \
                 for (request_id, q) in self.per_request_queues.items()
         }
+    
+    def get_ready_for_streaming(self, request_id: str):
+        assert request_id in self.per_request_queues, \
+            f"Tried to check ready for streaming for unknown request ID {request_id}"
+        return self.per_request_queues[request_id].ready_for_streaming
 
     def pop_ready_nodes(
         self, request_id: str, node_names: list[str]
@@ -120,11 +133,9 @@ class WorkerGraphQueues:
         nodes = []
         if request_id in self.per_request_queues:
             q = self.per_request_queues[request_id]
-            pop_idxs = set(
-                [i for i, node in enumerate(q.ready) if node.name in set(node_names)]
-            )
-            nodes = [q.ready[i] for i in pop_idxs]
-            q.ready = [node for i, node in enumerate(q.ready) if i not in pop_idxs]
+            for name in node_names:
+                q.ready_node_names.discard(name)
+                nodes.append(q.nodes[name])
         return nodes
 
     def push_back_node(
@@ -132,99 +143,47 @@ class WorkerGraphQueues:
     ) -> None:
         """Push a previously popped node back onto the ready queue (e.g., after OOM hold)."""
         if request_id in self.per_request_queues:
-            self.per_request_queues[request_id].ready.append(node)
+            self.per_request_queues[request_id].ready_node_names.add(node.name)
 
     def reset(self, request_id):
         """
         At the end of a worker graph, reset the queues for a request so it can
         be used for the next full model forward pass.
         """
-        self.per_request_queues[request_id].reset()
+        self.per_request_queues[request_id].clear()
 
     def stop_loops(
         self, request_id: str, loop_names: set[str]
-    ) -> set[tuple[str, str]]:
-        """Stop matching DynamicLoops and return the
-        ``(edge.name, edge.next_node)`` pairs of those loops' loop-back
-        signals — the caller uses this to drop *only* the stopped loops'
-        loop-back edges from the routing kept-list, instead of every
-        self-loop edge on the running node. Without per-loop attribution,
-        a node that participates in two distinct dynamic loops with
-        disjoint loop-back edges would lose the surviving loop's
-        loop-back tensor when the other loop stops.
+    ) -> set[NameAndDest]:
+        """Register a finish signal for each named loop and return the union
+        of their ``_loop_back_inputs`` so the caller can drop those (name, dest)
+        edges from the current iter's output routing.
         """
-        stopped_loop_back_signals: set[tuple[str, str]] = set()
+        assert request_id in self.per_request_queues, \
+            f"Tried to stop loops for unknown request ID {request_id}"
+        queue = self.per_request_queues[request_id]
+        loop_back_signals: set[NameAndDest] = set()
+        for name in loop_names:
+            if name not in queue.loops:
+                continue
+            queue.register_loop_finish_signal(name)
+            loop_back_signals.update(queue.loops[name]._loop_back_inputs)
+        return loop_back_signals
 
-        def _stop_loops(section: GraphSection):
-            if isinstance(section, Sequential) or isinstance(section, Parallel):
-                for sec in section.sections:
-                    _stop_loops(sec)
-                return
-            if isinstance(section, DynamicLoop):
-                if section.name in loop_names:
-                    section.register_finished()
-                    for edge in section._loop_back_signals:
-                        stopped_loop_back_signals.add(
-                            (edge.name, edge.next_node)
-                        )
-            if isinstance(section, Loop):
-                # including dynamic loops
-                _stop_loops(section._curr_iter_section)
-        _stop_loops(self.per_request_queues[request_id].waiting)
-        return stopped_loop_back_signals
-
-    def clear_dyn_loop_curr_iter_section(
-        self, request_id: str, loop_names: set[str]
-    ):
-        """Set ``_curr_iter_section = None`` AND ``register_finished`` on
-        matching dynamic loops.
-
-        Called from ``_finalize_slow_postprocess`` when a stop has been
-        detected for a loop whose iter ALSO advanced during the same batch's
-        fast postprocess. Two effects matter:
-
-        1. Clearing ``_curr_iter_section`` so the eventual ``stop_loops``
-           call (via ``_pending_stops``) doesn't leave ``_iter_done`` False
-           and prevent the worker graph from reporting done.
-        2. Marking ``_finished=True`` immediately. Without this, anything
-           that triggers ``_update_ready_waiting`` between now and the
-           next ``fast_postprocess`` (e.g. ``_poll_stream_buffers``
-           ingesting a streaming chunk for a downstream partition) sees
-           ``_iter_done=True`` + ``_is_done=False`` and calls
-           ``_advance_one_iter`` — quietly bumping the iter past where
-           the loop is meant to terminate, leaving the queue's view of
-           the loop one step ahead of reality.
-        """
-        def _clear(section: GraphSection):
-            if section is None:
-                return
-            if isinstance(section, Sequential) or isinstance(section, Parallel):
-                for sec in section.sections:
-                    _clear(sec)
-                return
-            if isinstance(section, Loop):
-                # Recurse first to handle nested dynamic loops; mutating an
-                # outer loop's _curr_iter_section here would lose the path.
-                _clear(section._curr_iter_section)
-                if isinstance(section, DynamicLoop) and section.name in loop_names:
-                    section._curr_iter_section = None
-                    section.register_finished()
-        _clear(self.per_request_queues[request_id].waiting)
+    def mark_node_complete(
+        self, request_id: str, node_name: str
+    ) -> NodeCompletionOutput:
+        """Complete a node in this worker graph's per-request io and return
+        the registry's NodeCompletionOutput (output_edges + filtered_signals)."""
+        assert request_id in self.per_request_queues, \
+            f"Tried to complete node {node_name!r} for unknown request ID {request_id}"
+        return self.per_request_queues[request_id].mark_node_complete(node_name)
 
     def get_dynamic_loop_iters(self, request_id: str) -> dict[str, int]:
-        iter_dict = {}
-        def _get_iters(section: GraphSection):
-            if isinstance(section, Sequential) or isinstance(section, Parallel):
-                for sec in section.sections:
-                    _get_iters(sec)
-                return
-            if isinstance(section, DynamicLoop):
-                iter_dict[section.name] = section.curr_iter
-            if isinstance(section, Loop):
-                # including dynamic loops
-                _get_iters(section._curr_iter_section)
-        _get_iters(self.per_request_queues[request_id].waiting)
-        return iter_dict
+        assert request_id in self.per_request_queues, \
+            f"Tried to get dynamic loop iters for unknown request ID {request_id}"
+        queue = self.per_request_queues[request_id]
+        return queue.get_loop_indices()
 
 
 @dataclass
@@ -263,6 +222,7 @@ class PerRequestInfo:
     pending_new_tokens: dict[str, list[int]] = field(default_factory=dict)
     stream_buffers: dict[str, StreamBuffer] = field(default_factory=dict)  # edge_name -> StreamBuffer
     current_output_chunks: list[str] = field(default_factory=list)
+    output_loop_indices: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
     per_partition_info: dict[str, PerPartitionInfo] = field(default_factory=dict)
 
@@ -288,6 +248,23 @@ class WorkerGraphsManager:
     # to in the colocated case.
     node_to_partition: dict[str, str] = field(default_factory=dict)
 
+    # Inverted index: (graph_walk, node_name) -> worker_graph_id.
+    # Built in __post_init__ from all_worker_graph_ids_to_graph_walks +
+    # all_worker_graph_ids_to_nodes. Lets get_worker_graph_id_for_node skip
+    # the linear scan over the request's worker_graph_ids.
+    walk_node_to_worker_graph_id: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    def __post_init__(self):
+        for wg_id, walks in self.all_worker_graph_ids_to_graph_walks.items():
+            for walk in walks:
+                for node in self.all_worker_graph_ids_to_nodes.get(wg_id, set()):
+                    # Multiple worker graphs may share a (walk, node) only when
+                    # walks are co-partitioned; the last write wins. This index
+                    # is only consulted with (walk, node) pairs that the
+                    # request's per_request_info already includes, so the
+                    # ambiguity is moot for routing.
+                    self.walk_node_to_worker_graph_id[(walk, node)] = wg_id
+
     def update_request_info(
         self, request_id: str,
         partition_name,
@@ -298,7 +275,6 @@ class WorkerGraphsManager:
         part_info = req_info.per_partition_info[partition_name]
 
         if current_fwd_info is not None:
-            partition_name = partition_name or getattr(current_fwd_info, 'partition_name', 'default')
             graph_walk = current_fwd_info.graph_walk
             if self.get_graph_walk(request_id, partition_name) != graph_walk:
                 part_info.graph_walk_worker_graph_ids = [
@@ -335,112 +311,81 @@ class WorkerGraphsManager:
         self,
         request_id: str,
         inputs: list[GraphEdge],
-    ):
-        """
-        Updates queues with new inputs for a request.
+        can_buffer: bool=True
+    ) -> list[GraphEdge]:
+        """Route arriving inputs to the per-request io of every active worker
+        graph for this request.
 
-        Routes inputs to the worker graphs of the currently-active walks
-        for each partition this request participates in.
+        Returns the leftover edges that no worker graph claimed (their
+        ``next_node`` lives on a different worker). Caller uses these for
+        cross-worker routing.
         """
         for part_info in self.per_request_info[request_id].per_partition_info.values():
             worker_graph_ids = part_info.graph_walk_worker_graph_ids
             for worker_graph_id in worker_graph_ids:
-                inputs = self.queues[worker_graph_id].process_new_inputs(request_id, inputs).for_other_worker_graphs
+                inputs = self.queues[worker_graph_id].process_new_inputs(
+                    request_id, inputs, can_buffer=can_buffer
+                )
         return inputs
-
+    
     def process_new_streaming_inputs(
         self,
         request_id: str,
         inputs: list[GraphEdge],
-    ):
-        """
-        Updates queues with new inputs for a request.
-
-        Routes inputs to the worker graphs of the currently-active walks
-        for each partition this request participates in.
-        """
+        can_buffer: bool=True
+    ) -> list[GraphEdge]:
         for part_info in self.per_request_info[request_id].per_partition_info.values():
             worker_graph_ids = part_info.graph_walk_worker_graph_ids
             for worker_graph_id in worker_graph_ids:
                 inputs = self.queues[worker_graph_id].process_new_streaming_inputs(
-                    request_id, inputs
-                ).for_other_worker_graphs
+                    request_id, inputs, can_buffer=can_buffer
+                )
         return inputs
-
 
     def get_worker_graph_id_for_node(
         self, request_id: str, node_name: str
     ) -> str:
         partition = self.get_partition_for_node(node_name)
         graph_walk = self.get_graph_walk(request_id, partition)
-        for gid in self.per_request_info[request_id].worker_graph_ids:
-            if (graph_walk in self.all_worker_graph_ids_to_graph_walks[gid]) and \
-                        (node_name in self.all_worker_graph_ids_to_nodes[gid]):
-                return gid
-        raise RuntimeError(f"Could not find worker graph for node {node_name}, request {request_id}")
-
-
-    def get_waiting_node(
-        self, request_id: str, worker_graph_id: str
-    ):
-        return self.queues[worker_graph_id].per_request_queues[request_id].waiting
-
-
-    def complete_loops(
-        self, request_id: str, worker_graph_id: str,
-        output_edges: list[GraphEdge], done_node: str
-    ) -> FilteredEdges:
-        queue = self.queues[worker_graph_id].per_request_queues[request_id]
-        if queue.waiting is None:
-            return FilteredEdges(
-                kept=output_edges,
-                filtered_out=[]
+        wg_id = self.walk_node_to_worker_graph_id.get((graph_walk, node_name))
+        if wg_id is None:
+            raise RuntimeError(
+                f"Could not find worker graph for node {node_name!r}, "
+                f"request {request_id!r}, graph_walk {graph_walk!r}"
             )
-        out = queue.waiting.complete_loops(done_node)
-        queue.waiting = out.new_waiting
+        return wg_id
 
-        filter_result = out.filter_out_loop_back(output_edges)
-        filter_result.kept += out.outputs
-        return filter_result
+    def mark_node_complete(
+        self, request_id: str, worker_graph_id: str, node_name: str,
+    ) -> NodeCompletionOutput:
+        """Complete a node in the given worker graph's per-request io.
 
-    def apply_spec_consumption(
-        self, request_id: str, spec_node_name: str
-    ) -> None:
-        """Mark the spec node as consumed in the queue's waiting tree, BEFORE
-        ``complete_loops`` runs for the same iter. This sets the Loop's
-        ``_curr_iter_section`` to ``None`` so that when ``complete_loops``
-        subsequently fires for the just-completed body, ``_iter_done()`` can
-        return True at the terminal iter, ``_is_done()`` matches
-        ``max_iters == curr_iter + 1``, and the Loop's ``outputs`` field
-        (e.g. BAGEL image_gen Loop's ``latents → vae_decoder``) is emitted
-        through ``LoopCompletionOutput``.
+        Returns the registry's ``NodeCompletionOutput`` carrying
+        ``output_edges`` (entity static outputs + any loop terminal outputs)
+        and ``filtered_signals`` (loop-back (name, dest) pairs to drop).
         """
-        wg_id = self.get_worker_graph_id_for_node(request_id, spec_node_name)
-        queue = self.queues[wg_id].per_request_queues[request_id]
-        queue.update_for_spec(spec_node_name)
-
+        return self.queues[worker_graph_id].mark_node_complete(request_id, node_name)
+    
+    def register_output_loop_indices(
+        self, request_id: str,
+        loop_indices: NestedLoopIndices,
+        output_name: str
+    ):
+        self.per_request_info[request_id].output_loop_indices[output_name] = loop_indices
+    
+    def get_output_loop_indices(self, request_id: str):
+        return self.per_request_info[request_id].output_loop_indices
 
     def process_node_outputs(
         self, request_id: str,
         outputs: list[GraphEdge],
         graph_walk: str,
-        spec_node_name: str | None = None
     ) -> NodeOutputRouting:
-        """
-        After a node has finished processing, use its outputs to update
-        worker graph queues, and return any outputs that should be sent to other
-        worker graphs or the conductor.
+        """After a node has finished, route its outputs.
 
-        I.e., it updates ready/waiting queues for worker graphs on this current
-        worker, and directs external outputs to worker graphs on the appropriate
-        (different) worker.
+        Updates ready/waiting state in worker graphs on this worker, and
+        builds the cross-worker routing map for edges destined elsewhere.
         """
-        # (-1) if spec node name, update graph accordingly
-        if spec_node_name is not None:
-            wg_id = self.get_worker_graph_id_for_node(request_id, spec_node_name)
-            queue = self.queues[wg_id].per_request_queues[request_id]
-            queue.update_for_spec(spec_node_name)
-
         # (0) separate streaming edges — they bypass the queue system
         streaming_edges = [edge for edge in outputs if edge.is_streaming]
         non_streaming_outputs = [edge for edge in outputs if not edge.is_streaming]
@@ -449,30 +394,39 @@ class WorkerGraphsManager:
         to_conductor = [edge for edge in non_streaming_outputs if edge.persist]
         new_token_outputs = [edge for edge in non_streaming_outputs if edge.conductor_new_token]
 
-        # (2) process all internal-facing outputs
-        worker_graph_ids = [
-            gid
-            for gid in self.per_request_info[request_id].worker_graph_ids
-            if graph_walk in self.all_worker_graph_ids_to_graph_walks[gid]
-        ]
+        # (2) route each output edge to its destination worker graph via the
+        # inverted index. Local wg -> ingest; absent/non-local -> defer to
+        # the cross-worker routing pass below.
+        routed_to_this_worker: list[GraphEdge] = []
+        external_outputs: list[GraphEdge] = []
+        for edge in non_streaming_outputs:
+            wg_id = self.walk_node_to_worker_graph_id.get((graph_walk, edge.next_node))
+            if wg_id is not None and wg_id in self.queues:
+                leftover = self.queues[wg_id].process_new_inputs(
+                    request_id, [edge], can_buffer=True
+                )
+                if leftover:
+                    # The edge's next_node maps here but the queue declined
+                    # (e.g. wg has no per-request io for this rid yet).
+                    external_outputs.extend(leftover)
+                else:
+                    routed_to_this_worker.append(edge)
+            else:
+                external_outputs.append(edge)
 
-        completed_worker_graph_ids = []
-        routed_to_this_worker: list[GraphEdge] = [] # list of graph edges
-        external_outputs: list[GraphEdge] = non_streaming_outputs
-        for worker_graph_id in worker_graph_ids:
-            queue = self.queues[worker_graph_id] # ready / waiting graph node queue
-            # process_new_inputs consumes outputs that are used as
-            # node inputs within `queue`
-            processed_inputs = queue.process_new_inputs(request_id, external_outputs)
-
-            # keep updating outputs to be the edges that have not yet been utilized
-            external_outputs = processed_inputs.for_other_worker_graphs
-            routed_to_this_worker += processed_inputs.routed_to_this_worker_graph
+        # Sweep all worker graphs the request is registered with for THIS walk
+        # to see which became done. A wg can become done without having
+        # ingested any edge in this call — e.g. when the just-completed node's
+        # outputs all target EMPTY_DESTINATION / EMIT_TO_CLIENT / a streaming
+        # partition (Orpheus prefill, BAGEL vae_decoder, Code2Wav).
+        completed_worker_graph_ids: list[str] = []
+        for wg_id in self.per_request_info[request_id].worker_graph_ids:
+            if graph_walk not in self.all_worker_graph_ids_to_graph_walks[wg_id]:
+                continue
+            queue = self.queues[wg_id]
             if queue.is_done(request_id):
-                completed_worker_graph_ids.append(worker_graph_id)
+                completed_worker_graph_ids.append(wg_id)
                 queue.reset(request_id)
-            # all outputs left over at this point are external outputs (to nodes
-            # in different workers)
 
         # (3) get mapping of worker to external outputs
         # Skip edges whose next_node is a special destination (e.g.,
@@ -552,41 +506,52 @@ class WorkerGraphsManager:
         loop_names: set[str],
         req_info: CurrentForwardPassInfo | None = None,
         last_node_run: str | None = None
-    ) -> set[tuple[str, str]]:
-        """
-        Stops dynamic loops based on stop signals. If req_info is also passed in,
-        then this also updates req_info.loop_stop_times with the urrent loop indices.
+    ) -> set[NameAndDest]:
+        """Register a finish signal for each named loop across this partition's
+        worker graphs and return the union of their loop-back ``(name, dest)``
+        pairs so the caller can drop them from output routing on the iter
+        that triggered the stop.
 
-        Returns the union of ``(edge.name, edge.next_node)`` pairs across all
-        worker graphs for the loop-back signals of loops that were actually
-        stopped — see ``WorkerGraphQueues.stop_loops`` for why per-loop
-        attribution matters.
+        If ``req_info`` and ``last_node_run`` are provided AND the last-run
+        node lives on a given worker graph, this also snapshots the current
+        nested-loop iteration indices into ``req_info.loop_stop_times[name]``
+        as a ``NestedLoopIndices`` (used by the conductor's stop-ordering to
+        suppress duplicate stop messages).
         """
         part_info = self.per_request_info[request_id].per_partition_info[partition]
         worker_graph_ids = part_info.graph_walk_worker_graph_ids
-        stopped_loop_back_signals: set[tuple[str, str]] = set()
+        stopped_loop_back_signals: set[NameAndDest] = set()
+        # In disaggregated mode the same Loop name can exist on multiple worker
+        # graphs (each with its own _finish_signal), so this still has to fan out.
         for worker_graph_id in worker_graph_ids:
             stopped_loop_back_signals |= self.queues[worker_graph_id].stop_loops(
-                request_id, loop_names
+                request_id, loop_names,
             )
-            waiting = self.queues[worker_graph_id].per_request_queues[request_id].waiting
 
-            if req_info is not None and (
-                last_node_run in self.all_worker_graph_ids_to_nodes[worker_graph_id]
-            ):
-                for name in loop_names:
-                    if name in req_info.loop_stop_times:
-                        update_loop_index_tree(
-                            index_tree=req_info.loop_stop_times[name],
-                            graph=waiting,
-                            fwd_idx=req_info.fwd_index
-                        )
-                    else:
-                        req_info.loop_stop_times[name] = build_loop_index_tree(
-                            graph=waiting,
-                            fwd_idx=req_info.fwd_index
+        # loop_stop_times is a single observation per loop, so we only need
+        # the worker graph that owns the last-run node. Direct index lookup
+        # instead of iterating.
+        if req_info is not None and last_node_run is not None:
+            graph_walk = self.get_graph_walk(request_id, partition)
+            owner_wg_id = self.walk_node_to_worker_graph_id.get(
+                (graph_walk, last_node_run)
+            )
+            if owner_wg_id is not None and owner_wg_id in self.queues:
+                wgio = self.queues[owner_wg_id].per_request_queues.get(request_id)
+                if wgio is not None:
+                    for name in loop_names & wgio.loops.keys():
+                        req_info.loop_stop_times[name] = wgio.get_nested_loop_idxs(
+                            target_loop_name=name,
                         )
         return stopped_loop_back_signals
+    
+    def get_nested_loop_idxs_for_node(
+        self, request_id: str, partition: str, node_name: str
+    ) -> NestedLoopIndices:
+        graph_walk = self.get_graph_walk(request_id, partition)
+        wgid = self.walk_node_to_worker_graph_id[ (graph_walk, node_name)]
+        wgio = self.queues[wgid].per_request_queues.get(request_id)
+        return wgio.get_nested_loop_idxs_for_node(node_name)
 
     def get_dynamic_loop_iters(
         self, request_id: str,
@@ -601,18 +566,6 @@ class WorkerGraphsManager:
                 self.queues[worker_graph_id].get_dynamic_loop_iters(request_id)
             )
         return iter_counts
-
-    def clear_dyn_loop_curr_iter_section(
-        self, request_id: str,
-        partition: str,
-        loop_names: set[str],
-    ):
-        part_info = self.per_request_info[request_id].per_partition_info[partition]
-        worker_graph_ids = part_info.graph_walk_worker_graph_ids
-        for worker_graph_id in worker_graph_ids:
-            self.queues[worker_graph_id].clear_dyn_loop_curr_iter_section(
-                request_id, loop_names
-            )
 
     def add_request(
         self, request_id: str,

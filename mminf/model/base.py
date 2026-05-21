@@ -15,7 +15,6 @@ from mminf.conductor.request_info import (
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import (
-    DynamicLoop,
     GraphEdge,
     GraphNode,
     GraphSection,
@@ -72,9 +71,9 @@ def _divide_into_worker_graphs(
     Given a graph, break it into worker graphs
     """
     if isinstance(graph, GraphNode):
-        graph._streaming_inputs = input_streams.intersection(graph.input_ids)
-        if len(graph._streaming_inputs) > 0:
-            graph.consumes_stream = True
+        # Mutate via the GraphNode helper so the ReadySignals instances built in
+        # __post_init__ keep referencing the live set (they captured by reference).
+        graph._register_streaming(input_streams.intersection(graph.input_names))
 
         return [
             WorkerGraph(
@@ -150,7 +149,10 @@ def _divide_into_worker_graphs(
             node_groups=node_groups,
             input_streams=input_streams,
         )
-        ext_inps = [inp for inp in graph._external_inputs if inp.name not in input_streams]
+        ext_inps = set([
+            (name, dest) for name, dest in graph._external_inputs \
+                if name not in input_streams
+        ])
         for s in loop_section_worker_graphs:
             # ``accumulated_outputs`` must be propagated to the per-worker
             # reconstruction — otherwise ``Loop.cache_outputs`` sees an
@@ -158,29 +160,16 @@ def _divide_into_worker_graphs(
             # per-iter tensor silently falls on the floor, and nothing ever
             # reaches ``EMIT_TO_CLIENT`` (symptom: 4 "Deferring cleanup"
             # warnings + empty client response in the V-JEPA 2 rollout run).
-            if isinstance(graph, DynamicLoop):
-                s.section = DynamicLoop(
-                    section=s.section,
-                    name=graph.name,
-                    max_iters=graph.max_iters,
-                    curr_iter=graph.curr_iter,
-                    _external_inputs=ext_inps,
-                    _loop_back_signals=graph._loop_back_signals,
-                    outputs=graph.outputs,
-                    accumulated_outputs=graph.accumulated_outputs,
-                    _uuid_label=graph._uuid_label,
-                )
-            else:
-                s.section = Loop(
-                    section=s.section,
-                    max_iters=graph.max_iters,
-                    curr_iter=graph.curr_iter,
-                    _external_inputs=ext_inps,
-                    _loop_back_signals=graph._loop_back_signals,
-                    outputs=graph.outputs,
-                    accumulated_outputs=graph.accumulated_outputs,
-                    _uuid_label=graph._uuid_label,
-                )
+            s.section = Loop(
+                section=s.section,
+                max_iters=graph.max_iters,
+                curr_iter=graph.curr_iter,
+                outputs=graph.outputs,
+                name=graph.name,
+                accumulated_outputs=graph.accumulated_outputs,
+                _external_inputs=ext_inps,
+                _loop_back_inputs=graph._loop_back_inputs,
+            )
         return loop_section_worker_graphs
 
 

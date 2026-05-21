@@ -1645,9 +1645,9 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         outputs = {
             rid: {
-                "talker_input_embeds": fwd_out["talker_input_embeds"][0][i:i+1],
-                "codec_tokens": fwd_out["codec_tokens"][0][i],
-                "new_token": fwd_out["new_token"][0][i],
+                "talker_input_embeds": [fwd_out["talker_input_embeds"][0][i:i+1]],
+                "codec_tokens": [fwd_out["codec_tokens"][0][i]],
+                "new_token": [fwd_out["new_token"][0][i]],
             } for i, rid in enumerate(engine_inputs.request_ids)
         }
         return outputs

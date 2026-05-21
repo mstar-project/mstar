@@ -244,6 +244,28 @@ class EncoderDecoderEngine(BaseEngine):
                         node_name, exc_info=True,
                     )
 
+    def check_stop_for_batch(
+        self, batch: NodeBatch, output: NodeOutput
+    ) -> dict[str, set[str]]:
+        """Delegate to each rid's submodule.check_stop. Worker calls this on
+        the slow-postprocess path so the .item() / .cpu() reads no longer
+        block ``execute_batch`` on the GPU thread."""
+        if batch.node_name not in self.submodules:
+            return {}
+        submodule = self.submodules[batch.node_name]
+        result: dict[str, set[str]] = {}
+        for rid in batch.request_ids:
+            req_outputs = output.per_request_output_tensors.get(rid, {})
+            if not req_outputs:
+                continue
+            req_info = batch.per_request_info.get(rid)
+            if req_info is None:
+                continue
+            stops = submodule.check_stop(rid, req_info, req_outputs)
+            if stops:
+                result[rid] = stops
+        return result
+
     def add_request(self, request_id: str) -> None:
         pass  # stateless
 

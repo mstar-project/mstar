@@ -7,6 +7,8 @@ import time
 
 import torch
 
+from mminf.graph.loop_indices import NestedLoopIndices
+
 try:
     import torchaudio  # noqa: F401 — probes availability; real usage in callers
     from torchcodec.decoders import VideoDecoder
@@ -34,7 +36,7 @@ def _preprocess_loop(**kwargs):
     worker.run()
 
 
-NameToFwdPassNumber = dict[str, int]
+NameToLoopIndices = dict[str, NestedLoopIndices]
 
 
 class PreprocessWorker:
@@ -53,7 +55,7 @@ class PreprocessWorker:
         self.stop_event = threading.Event()
 
         self.per_request_reading_tensors = {}
-        self.output_fwd_pass_numbers: dict[str, NameToFwdPassNumber] = {}
+        self.output_loop_idxs: dict[str, NameToLoopIndices] = {}
 
         self.thread = threading.Thread(
             target=_preprocess_loop,
@@ -73,18 +75,18 @@ class PreprocessWorker:
         self.thread.start()
 
     def new_request(self, input: PreprocessInput):
-        self.output_fwd_pass_numbers[input.request_id] = {}
+        self.output_loop_idxs[input.request_id] = {}
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
 
     def new_result_tensors(self, input: ResultTensors):
         name = input.graph_edge.name
-        if input.request_id not in self.output_fwd_pass_numbers:
+        if input.request_id not in self.output_loop_idxs:
             logger.debug("Late result_tensors for cleaned-up request %s, ignoring", input.request_id)
             return
-        self.output_fwd_pass_numbers[input.request_id][name] = max(
-            self.output_fwd_pass_numbers[input.request_id].get(name, -1),
-            input.fwd_pass_number
+
+        self.output_loop_idxs[input.request_id][name] = input.loop_indices.max(
+            self.output_loop_idxs[input.request_id].get(name, None)
         )
 
         self.per_request_reading_tensors[input.request_id] += len(input.graph_edge.tensor_info)
@@ -99,11 +101,12 @@ class PreprocessWorker:
 
     def received_final_chunks(
         self, request_id: str,
-        final_forward_outputs: dict[str, int],
+        final_outputs: dict[str, NestedLoopIndices],
     ):
         return all(
-            self.output_fwd_pass_numbers[request_id].get(name, -1) >= fwd_pass
-            for name, fwd_pass in final_forward_outputs.items()
+            not loop_iters.label_context_gt( # recv'd loop iters is not less than the final_fwd
+                self.output_loop_idxs[request_id].get(name, None)
+            ) for name, loop_iters in final_outputs.items()
         )
 
     def get_result_chunks(self)-> list[ResultChunk]:
@@ -120,7 +123,7 @@ class PreprocessWorker:
 
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
-        del self.output_fwd_pass_numbers[request_id]
+        del self.output_loop_idxs[request_id]
         del self.per_request_reading_tensors[request_id]
 
     def shutdown(self):

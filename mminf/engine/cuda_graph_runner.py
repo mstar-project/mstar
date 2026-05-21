@@ -1080,9 +1080,19 @@ class CudaGraphRunner:
         if slot is None:
             slot = 0
         slot %= len(graph_data.slots)
-        cm = graph_data.slots[slot].static_cache_manager
+        slot_data = graph_data.slots[slot]
+        cm = slot_data.static_cache_manager
         cm._pre_planned_labels.clear()
         cm._plan_done_event = None
+
+        # pre_plan_for_batch allocates pages on the slot's tail dummy rids
+        # (positions [real_bs..padded_bs) in static_cm.request_ids). If
+        # replay never runs to free them via _restore_dummy_states, the
+        # pages leak. Free every dummy rid's pages — no-op for positions
+        # pre-plan didn't touch.
+        for rid in slot_data.static_inputs.get("dummy_rids", []):
+            for label in graph_data.config.labels:
+                self.alloc_manager.reset_label(rid, label, free=True)
 
     def run(
         self,
@@ -1194,159 +1204,171 @@ class CudaGraphRunner:
         capture_template = static["capture_template"]
         config_labels = graph_data.config.labels
 
-        # --- Step 1: Swap real request states onto dummy slots ---
-        if self.enable_nvtx:
-            mark("gpu_thread.preprocess_start")
-            range_push("gpu_thread.preprocess", synchronize=False)
-        if self.enable_nvtx:
-            range_push("cg.swap_states", synchronize=False)
-        for i, rid in enumerate(request_ids):
-            dummy_rid = dummy_rids[i]
-            for label in config_labels:
-                real_state = self.alloc_manager.get_state(rid, label)
-                # makes state if it doesn't exist
-                self.alloc_manager.get_state(dummy_rid, label)
-                self.alloc_manager.request_states[dummy_rid][label] = real_state
+        # Swap-and-restore must be paired: if any step between swap and restore
+        # raises (e.g., submodule.preprocess hitting an insufficient-KV alloc
+        # failure), the dummy slots are still aliased to real RequestState
+        # objects. The finally below un-aliases them; flush_writes stays False
+        # on failure since the captured forward never replayed.
+        swapped = False
+        success = False
+        try:
+            # --- Step 1: Swap real request states onto dummy slots ---
+            if self.enable_nvtx:
+                mark("gpu_thread.preprocess_start")
+                range_push("gpu_thread.preprocess", synchronize=False)
+            if self.enable_nvtx:
+                range_push("cg.swap_states", synchronize=False)
+            for i, rid in enumerate(request_ids):
+                dummy_rid = dummy_rids[i]
+                for label in config_labels:
+                    real_state = self.alloc_manager.get_state(rid, label)
+                    # makes state if it doesn't exist
+                    self.alloc_manager.get_state(dummy_rid, label)
+                    self.alloc_manager.request_states[dummy_rid][label] = real_state
 
-        # For padding slots (i >= real_bs), ensure dummy states exist
-        for i in range(real_bs, padded_bs):
-            dummy_rid = dummy_rids[i]
-            for label in config_labels:
-                self.alloc_manager.get_state(dummy_rid, label)
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
+            # For padding slots (i >= real_bs), ensure dummy states exist
+            for i in range(real_bs, padded_bs):
+                dummy_rid = dummy_rids[i]
+                for label in config_labels:
+                    self.alloc_manager.get_state(dummy_rid, label)
+            swapped = True
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
-        # --- Step 2: Pad inputs to padded_bs and re-plan via preprocess ---
-        if self.enable_nvtx:
-            range_push("cg.preprocess_replan", synchronize=False)
-        if self.enable_nvtx:
-            range_push("cg.preprocess_replan.pad_inputs", synchronize=False)
-        real_inputs = list(inputs)
-        # Padding slots reuse the capture_template so submodule.preprocess sees the
-        # same input shape it saw at capture time and doesn't crash on missing keys.
-        for _i in range(real_bs, padded_bs):
-            real_inputs.append(capture_template.clone())
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
+            # --- Step 2: Pad inputs to padded_bs and re-plan via preprocess ---
+            if self.enable_nvtx:
+                range_push("cg.preprocess_replan", synchronize=False)
+            if self.enable_nvtx:
+                range_push("cg.preprocess_replan.pad_inputs", synchronize=False)
+            real_inputs = list(inputs)
+            # Padding slots reuse the capture_template so submodule.preprocess sees the
+            # same input shape it saw at capture time and doesn't crash on missing keys.
+            for _i in range(real_bs, padded_bs):
+                real_inputs.append(capture_template.clone())
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
-        if self.enable_nvtx:
-            range_push("cg.preprocess_replan.metadata", synchronize=False)
-        real_metadata = self._build_replay_metadata(
-            dummy_rids, request_ids, real_bs,
-            per_request_info, static["dummy_metadata"],
-        )
-        engine_inputs = ModelInputsFromEngine(
-            request_ids=dummy_rids,
-            per_request_info=real_metadata,
-            cache_manager=static_cm,
-            sampler=self._get_sampler(
-                per_request_info=per_request_info,
-                request_ids=request_ids,
-                padded_bs=padded_bs
+            if self.enable_nvtx:
+                range_push("cg.preprocess_replan.metadata", synchronize=False)
+            real_metadata = self._build_replay_metadata(
+                dummy_rids, request_ids, real_bs,
+                per_request_info, static["dummy_metadata"],
             )
-        )
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            range_push("cg.preprocess_replan.submodule_preprocess", synchronize=False)
-        real_inputs = submodule.preprocess(
-            graph_walk=key.graph_walk,
-            engine_inputs=engine_inputs,
-            inputs=real_inputs,
-        )
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
+            engine_inputs = ModelInputsFromEngine(
+                request_ids=dummy_rids,
+                per_request_info=real_metadata,
+                cache_manager=static_cm,
+                sampler=self._get_sampler(
+                    per_request_info=per_request_info,
+                    request_ids=request_ids,
+                    padded_bs=padded_bs
+                )
+            )
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_push("cg.preprocess_replan.submodule_preprocess", synchronize=False)
+            real_inputs = submodule.preprocess(
+                graph_walk=key.graph_walk,
+                engine_inputs=engine_inputs,
+                inputs=real_inputs,
+            )
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
-        # --- Step 3: Copy real packed tensors into static buffers ---
-        if self.enable_nvtx:
-            range_push("cg.copy_inputs", synchronize=False)
-        for k in static_input_keys:
-            real_val = real_inputs.get(k)
-            if real_val is None or not isinstance(real_val, torch.Tensor):
-                continue
-            static_buf = preprocessed[k]
-            static_buf[:real_val.shape[0]].copy_(real_val)
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            range_pop(synchronize=False)
-            mark("gpu_thread.preprocess_end")
+            # --- Step 3: Copy real packed tensors into static buffers ---
+            if self.enable_nvtx:
+                range_push("cg.copy_inputs", synchronize=False)
+            for k in static_input_keys:
+                real_val = real_inputs.get(k)
+                if real_val is None or not isinstance(real_val, torch.Tensor):
+                    continue
+                static_buf = preprocessed[k]
+                static_buf[:real_val.shape[0]].copy_(real_val)
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_pop(synchronize=False)
+                mark("gpu_thread.preprocess_end")
 
-        # --- Step 4: Replay ---
-        # Phase 3: if pre-plan was applied for this iter, the wrapper's
-        # static buffers were written on a side stream. Make the default
-        # stream wait on plan_done_event before replay reads them.
-        plan_done_event = getattr(static_cm, "_plan_done_event", None)
-        if plan_done_event is not None:
-            torch.cuda.default_stream(self.device).wait_event(plan_done_event)
-            static_cm._plan_done_event = None
-        if self.enable_nvtx:
-            mark("gpu_thread.cuda_graph_start")
-            range_push("gpu_thread.cuda_graph", synchronize=False)
-            range_push("cg.replay", synchronize=False)
-        # Release the main thread now that all CPU-side prep is done and
-        # we're about to enter the CUDA driver. graph.replay() drops the
-        # GIL inside C++, so main-thread postprocess can overlap.
-        if launch_started_event is not None:
-            launch_started_event.set()
-        graph.replay()
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            range_pop(synchronize=False)
-            mark("gpu_thread.cuda_graph_end")
+            # --- Step 4: Replay ---
+            # Phase 3: if pre-plan was applied for this iter, the wrapper's
+            # static buffers were written on a side stream. Make the default
+            # stream wait on plan_done_event before replay reads them.
+            plan_done_event = getattr(static_cm, "_plan_done_event", None)
+            if plan_done_event is not None:
+                torch.cuda.default_stream(self.device).wait_event(plan_done_event)
+                static_cm._plan_done_event = None
+            if self.enable_nvtx:
+                mark("gpu_thread.cuda_graph_start")
+                range_push("gpu_thread.cuda_graph", synchronize=False)
+                range_push("cg.replay", synchronize=False)
+            # Release the main thread now that all CPU-side prep is done and
+            # we're about to enter the CUDA driver. graph.replay() drops the
+            # GIL inside C++, so main-thread postprocess can overlap.
+            if launch_started_event is not None:
+                launch_started_event.set()
+            graph.replay()
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_pop(synchronize=False)
+                mark("gpu_thread.cuda_graph_end")
 
-        # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
-        # advance_seq_lens is not captured in the graph; we call it manually so
-        # the real states (aliased onto dummy slots) move forward.
-        if self.enable_nvtx:
-            mark("gpu_thread.postprocess_start")
-            range_push("gpu_thread.postprocess", synchronize=False)
-        if self.enable_nvtx:
-            range_push("cg.advance_seq_lens", synchronize=False)
-        for label in config_labels:
-            static_cm.set_active_label(label)
-            static_cm.advance_seq_lens()
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
+            # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
+            # advance_seq_lens is not captured in the graph; we call it manually so
+            # the real states (aliased onto dummy slots) move forward.
+            if self.enable_nvtx:
+                mark("gpu_thread.postprocess_start")
+                range_push("gpu_thread.postprocess", synchronize=False)
+            if self.enable_nvtx:
+                range_push("cg.advance_seq_lens", synchronize=False)
+            for label in config_labels:
+                static_cm.set_active_label(label)
+                static_cm.advance_seq_lens()
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
-        # Phase 3: signal that alloc_manager state for batch_N is now
-        # post-advance. plan_executor's pre_plan(batch_(N+1)) waits on this
-        # event instead of prev_future, so plan() starts ~tens of µs into
-        # replay(N) (overlapping with replay(N)'s remaining GPU work) rather
-        # than after replay(N) fully completes. The event is also signaled
-        # in the GPU thread's outer try/finally so a failure path still
-        # wakes plan_executor.
-        if advance_event is not None:
-            advance_event.set()
+            # Phase 3: signal that alloc_manager state for batch_N is now
+            # post-advance. plan_executor's pre_plan(batch_(N+1)) waits on this
+            # event instead of prev_future, so plan() starts ~tens of µs into
+            # replay(N) (overlapping with replay(N)'s remaining GPU work) rather
+            # than after replay(N) fully completes. The event is also signaled
+            # in the GPU thread's outer try/finally so a failure path still
+            # wakes plan_executor.
+            if advance_event is not None:
+                advance_event.set()
 
-        # --- Step 6: Sample logits and remap dummy → real outputs ---
-        if self.enable_nvtx:
-            range_push("cg.sample_and_remap", synchronize=False)
-        outputs = self._sample_and_remap(
-            request_ids=request_ids,
-            dummy_rids=dummy_rids,
-            static_output=static_output,
-            per_request_info=per_request_info,
-            slot_data=slot_data,
-            submodule=submodule,
-            inputs=inputs,
-        )
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
+            # --- Step 6: Sample logits and remap dummy → real outputs ---
+            if self.enable_nvtx:
+                range_push("cg.sample_and_remap", synchronize=False)
+            outputs = self._sample_and_remap(
+                request_ids=request_ids,
+                dummy_rids=dummy_rids,
+                static_output=static_output,
+                per_request_info=per_request_info,
+                slot_data=slot_data,
+                submodule=submodule,
+                inputs=inputs,
+            )
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
-        # --- Step 7: Restore dummy states ---
-        self._restore_dummy_states(
-            dummy_rids=dummy_rids,
-            request_ids=request_ids,
-            real_bs=real_bs,
-            config_labels=config_labels,
-            static_cm=static_cm,
-        )
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            mark("gpu_thread.postprocess_end")
-
-        return outputs
+            success = True
+            return outputs
+        finally:
+            # --- Step 7: Restore dummy states (always — un-aliases dummy slots) ---
+            if swapped:
+                self._restore_dummy_states(
+                    dummy_rids=dummy_rids,
+                    request_ids=request_ids,
+                    real_bs=real_bs,
+                    config_labels=config_labels,
+                    static_cm=static_cm,
+                    flush_writes=success,
+                )
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                mark("gpu_thread.postprocess_end")
 
     def _run_flashinfer_packed(
         self,
@@ -1387,148 +1409,159 @@ class CudaGraphRunner:
         static_input_keys = static["static_input_keys"]
         config_labels = graph_data.config.labels
 
-        # --- Step 1: Swap real request states onto dummy slots ---
-        if self.enable_nvtx:
-            mark("gpu_thread.preprocess_start")
-            range_push("gpu_thread.preprocess", synchronize=False)
-        if self.enable_nvtx:
-            range_push("cg.swap_states", synchronize=False)
-        for i, rid in enumerate(request_ids):
-            dummy_rid = dummy_rids[i]
-            for label in config_labels:
-                real_state = self.alloc_manager.get_state(rid, label)
-                self.alloc_manager.get_state(dummy_rid, label)
-                self.alloc_manager.request_states[dummy_rid][label] = real_state
+        # Swap-and-restore must be paired (see _run_basic_batched). On a
+        # submodule.preprocess failure mid-flight, the dummy slots are still
+        # aliased to real RequestState objects; the finally below un-aliases
+        # them and skips the store flush (no captured forward ran).
+        swapped = False
+        success = False
+        try:
+            # --- Step 1: Swap real request states onto dummy slots ---
+            if self.enable_nvtx:
+                mark("gpu_thread.preprocess_start")
+                range_push("gpu_thread.preprocess", synchronize=False)
+            if self.enable_nvtx:
+                range_push("cg.swap_states", synchronize=False)
+            for i, rid in enumerate(request_ids):
+                dummy_rid = dummy_rids[i]
+                for label in config_labels:
+                    real_state = self.alloc_manager.get_state(rid, label)
+                    self.alloc_manager.get_state(dummy_rid, label)
+                    self.alloc_manager.request_states[dummy_rid][label] = real_state
 
-        for i in range(real_bs, padded_bs):
-            dummy_rid = dummy_rids[i]
-            for label in config_labels:
-                self.alloc_manager.get_state(dummy_rid, label)
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
+            for i in range(real_bs, padded_bs):
+                dummy_rid = dummy_rids[i]
+                for label in config_labels:
+                    self.alloc_manager.get_state(dummy_rid, label)
+            swapped = True
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
-        # --- Step 2: Build padded per-request inputs and re-plan via preprocess ---
-        if self.enable_nvtx:
-            range_push("cg.preprocess_replan", synchronize=False)
-        if self.enable_nvtx:
-            range_push("cg.preprocess_replan.pad_inputs", synchronize=False)
-        # Unlike basic_matched, prefill captures don't expose a capture_template
-        # ARNodeInputs (the config provides post-preprocess packed dicts instead).
-        # Synthesize zero-length ARNodeInputs from the first real input's shape so
-        # all required tensor fields exist as empty slices for the padding slots.
-        padded_inputs = list(inputs)
-        for _i in range(real_bs, padded_bs):
-            zero_padding_inp = graph_data.config.zero_padding_input
-            if zero_padding_inp is None:
-                zero_padding_inp = self._zero_padding_input(inputs[0])
-            else:
-                zero_padding_inp = zero_padding_inp.clone()
-            padded_inputs.append(zero_padding_inp)
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
+            # --- Step 2: Build padded per-request inputs and re-plan via preprocess ---
+            if self.enable_nvtx:
+                range_push("cg.preprocess_replan", synchronize=False)
+            if self.enable_nvtx:
+                range_push("cg.preprocess_replan.pad_inputs", synchronize=False)
+            # Unlike basic_matched, prefill captures don't expose a capture_template
+            # ARNodeInputs (the config provides post-preprocess packed dicts instead).
+            # Synthesize zero-length ARNodeInputs from the first real input's shape so
+            # all required tensor fields exist as empty slices for the padding slots.
+            padded_inputs = list(inputs)
+            for _i in range(real_bs, padded_bs):
+                zero_padding_inp = graph_data.config.zero_padding_input
+                if zero_padding_inp is None:
+                    zero_padding_inp = self._zero_padding_input(inputs[0])
+                else:
+                    zero_padding_inp = zero_padding_inp.clone()
+                padded_inputs.append(zero_padding_inp)
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
-        if self.enable_nvtx:
-            range_push("cg.preprocess_replan.metadata", synchronize=False)
-        real_metadata = self._build_replay_metadata(
-            dummy_rids, request_ids, real_bs,
-            per_request_info, static["dummy_metadata"],
-        )
-        engine_inputs = ModelInputsFromEngine(
-            request_ids=dummy_rids,
-            per_request_info=real_metadata,
-            cache_manager=static_cm,
-            sampler=self._get_sampler(
-                per_request_info=per_request_info,
-                request_ids=request_ids,
-                padded_bs=padded_bs
+            if self.enable_nvtx:
+                range_push("cg.preprocess_replan.metadata", synchronize=False)
+            real_metadata = self._build_replay_metadata(
+                dummy_rids, request_ids, real_bs,
+                per_request_info, static["dummy_metadata"],
             )
-        )
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            range_push("cg.preprocess_replan.submodule_preprocess", synchronize=False)
-        real_packed = submodule.preprocess(
-            graph_walk=key.graph_walk,
-            engine_inputs=engine_inputs,
-            inputs=padded_inputs,
-        )
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
+            engine_inputs = ModelInputsFromEngine(
+                request_ids=dummy_rids,
+                per_request_info=real_metadata,
+                cache_manager=static_cm,
+                sampler=self._get_sampler(
+                    per_request_info=per_request_info,
+                    request_ids=request_ids,
+                    padded_bs=padded_bs
+                )
+            )
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_push("cg.preprocess_replan.submodule_preprocess", synchronize=False)
+            real_packed = submodule.preprocess(
+                graph_walk=key.graph_walk,
+                engine_inputs=engine_inputs,
+                inputs=padded_inputs,
+            )
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
-        # --- Step 3: Copy real packed tensors into static buffers ---
-        if self.enable_nvtx:
-            range_push("cg.copy_inputs", synchronize=False)
-        for k in static_input_keys:
-            real_val = real_packed.get(k)
-            if real_val is None or not isinstance(real_val, torch.Tensor):
-                continue
-            static_buf = templates[k]
-            static_buf[:real_val.shape[0]].copy_(real_val)
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            range_pop(synchronize=False)
-            mark("gpu_thread.preprocess_end")
+            # --- Step 3: Copy real packed tensors into static buffers ---
+            if self.enable_nvtx:
+                range_push("cg.copy_inputs", synchronize=False)
+            for k in static_input_keys:
+                real_val = real_packed.get(k)
+                if real_val is None or not isinstance(real_val, torch.Tensor):
+                    continue
+                static_buf = templates[k]
+                static_buf[:real_val.shape[0]].copy_(real_val)
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_pop(synchronize=False)
+                mark("gpu_thread.preprocess_end")
 
-        # --- Step 4: Replay ---
-        if self.enable_nvtx:
-            mark("gpu_thread.cuda_graph_start")
-            range_push("gpu_thread.cuda_graph", synchronize=False)
-            range_push("cg.replay", synchronize=False)
-        # Release the main thread now that all CPU-side prep is done and
-        # we're about to enter the CUDA driver. graph.replay() drops the
-        # GIL inside C++, so main-thread postprocess can overlap.
-        if launch_started_event is not None:
-            launch_started_event.set()
-        graph.replay()
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            range_pop(synchronize=False)
-            mark("gpu_thread.cuda_graph_end")
+            # --- Step 4: Replay ---
+            if self.enable_nvtx:
+                mark("gpu_thread.cuda_graph_start")
+                range_push("gpu_thread.cuda_graph", synchronize=False)
+                range_push("cg.replay", synchronize=False)
+            # Release the main thread now that all CPU-side prep is done and
+            # we're about to enter the CUDA driver. graph.replay() drops the
+            # GIL inside C++, so main-thread postprocess can overlap.
+            if launch_started_event is not None:
+                launch_started_event.set()
+            graph.replay()
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_pop(synchronize=False)
+                mark("gpu_thread.cuda_graph_end")
 
-        # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
-        if self.enable_nvtx:
-            mark("gpu_thread.postprocess_start")
-            range_push("gpu_thread.postprocess", synchronize=False)
-        if self.enable_nvtx:
-            range_push("cg.advance_seq_lens", synchronize=False)
-        for label in config_labels:
-            static_cm.set_active_label(label)
-            static_cm.advance_seq_lens()
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
+            # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
+            if self.enable_nvtx:
+                mark("gpu_thread.postprocess_start")
+                range_push("gpu_thread.postprocess", synchronize=False)
+            if self.enable_nvtx:
+                range_push("cg.advance_seq_lens", synchronize=False)
+            for label in config_labels:
+                static_cm.set_active_label(label)
+                static_cm.advance_seq_lens()
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
-        if advance_event is not None:
-            advance_event.set()
+            if advance_event is not None:
+                advance_event.set()
 
-        # --- Step 6: Sample logits and remap dummy → real outputs ---
-        if self.enable_nvtx:
-            range_push("cg.sample_and_remap", synchronize=False)
-        outputs = self._sample_and_remap(
-            request_ids=request_ids,
-            dummy_rids=dummy_rids,
-            static_output=static_output,
-            per_request_info=per_request_info,
-            slot_data=slot_data,
-            submodule=submodule,
-            inputs=inputs,
-        )
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
+            # --- Step 6: Sample logits and remap dummy → real outputs ---
+            if self.enable_nvtx:
+                range_push("cg.sample_and_remap", synchronize=False)
+            outputs = self._sample_and_remap(
+                request_ids=request_ids,
+                dummy_rids=dummy_rids,
+                static_output=static_output,
+                per_request_info=per_request_info,
+                slot_data=slot_data,
+                submodule=submodule,
+                inputs=inputs,
+            )
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
 
-        # --- Step 7: Restore dummy states ---
-        self._restore_dummy_states(
-            dummy_rids=dummy_rids,
-            request_ids=request_ids,
-            real_bs=real_bs,
-            config_labels=config_labels,
-            static_cm=static_cm,
-        )
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-            mark("gpu_thread.postprocess_end")
-
-        return outputs
+            success = True
+            return outputs
+        finally:
+            # --- Step 7: Restore dummy states (always — un-aliases dummy slots) ---
+            if swapped:
+                self._restore_dummy_states(
+                    dummy_rids=dummy_rids,
+                    request_ids=request_ids,
+                    real_bs=real_bs,
+                    config_labels=config_labels,
+                    static_cm=static_cm,
+                    flush_writes=success,
+                )
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                mark("gpu_thread.postprocess_end")
 
     def _build_replay_metadata(
         self,
@@ -1607,9 +1640,14 @@ class CudaGraphRunner:
         real_bs: int,
         config_labels: list[str],
         static_cm: BatchedCacheManager,
+        flush_writes: bool = True,
     ) -> None:
-        """Reset every dummy slot's per-label state and flush real-request KV
-        writes to the store for any label whose plan_state had write_store enabled."""
+        """Reset every dummy slot's per-label state and (on the success path)
+        flush real-request KV writes to the store for any label whose plan_state
+        had write_store enabled. ``flush_writes=False`` on a failure path skips
+        the flush — the captured forward never executed, so there's nothing to
+        commit, and flushing partial state would publish stale pages.
+        """
         if self.enable_nvtx:
             range_push("cg.restore_states", synchronize=False)
         for i, rid in enumerate(dummy_rids):
@@ -1617,11 +1655,12 @@ class CudaGraphRunner:
                 self.alloc_manager.reset_label(
                     rid, label, free=i >= real_bs,
                 )
-        for rid in request_ids:
-            for label in config_labels:
-                ps = static_cm._plan_states.get(label)
-                if ps is not None and ps.write_store:
-                    self.alloc_manager.flush_to_store(rid, label)
+        if flush_writes:
+            for rid in request_ids:
+                for label in config_labels:
+                    ps = static_cm._plan_states.get(label)
+                    if ps is not None and ps.write_store:
+                        self.alloc_manager.flush_to_store(rid, label)
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
@@ -2011,6 +2050,7 @@ class CodecCudaGraphRunner:
         inputs: list[ARNodeInputs],
         per_request_info: dict[str, CurrentForwardPassInfo],
         submodule: NodeSubmodule,
+        launch_started_event: "object | None" = None,
     ) -> dict[str, dict[str, list[torch.Tensor]]]:
         """End-to-end replay: preprocess + replay + per-rid output split.
 
@@ -2069,6 +2109,11 @@ class CodecCudaGraphRunner:
             mark("gpu_thread.cuda_graph_start")
             range_push("gpu_thread.cuda_graph", synchronize=False)
             range_push("codec_cg.replay", synchronize=False)
+        # Release the main thread now that all CPU-side prep is done and
+        # we're about to enter the CUDA driver. graph.replay() drops the
+        # GIL inside C++, so main-thread postprocess can overlap.
+        if launch_started_event is not None:
+            launch_started_event.set()
         self.graphs[key].replay()
         if self.enable_nvtx:
             range_pop(synchronize=False)

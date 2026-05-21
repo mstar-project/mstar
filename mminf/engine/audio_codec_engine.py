@@ -191,6 +191,7 @@ class AudioCodecEngine(BaseEngine):
             inputs=inputs,
             per_request_info=batch.per_request_info,
             submodule=submodule,
+            launch_started_event=batch.metadata.get("launch_started_event")
         )
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -219,6 +220,12 @@ class AudioCodecEngine(BaseEngine):
 
         if self.enable_nvtx:
             range_push("codec.batched.forward")
+         # Signal the main thread that we're about to enter CUDA launch
+        # code. PyTorch drops the GIL inside the C++ kernel-launch path,
+        # so main can resume Python-heavy postprocess in parallel.
+        launch_started_event = batch.metadata.get("launch_started_event")
+        if launch_started_event is not None:
+            launch_started_event.set()
         outputs = submodule.forward_batched(
             graph_walk=batch.graph_walk,
             engine_inputs=engine_inputs,
@@ -256,6 +263,12 @@ class AudioCodecEngine(BaseEngine):
 
             if self.enable_nvtx:
                 range_push(f"codec.forward.{i}")
+            # Signal the main thread that we're about to enter CUDA launch
+            # code. PyTorch drops the GIL inside the C++ kernel-launch path,
+            # so main can resume Python-heavy postprocess in parallel.
+            launch_started_event = batch.metadata.get("launch_started_event")
+            if launch_started_event is not None:
+                launch_started_event.set()
             outputs[rid] = submodule.forward(
                 batch.graph_walk,
                 engine_inputs=engine_inputs,
@@ -314,6 +327,49 @@ class AudioCodecEngine(BaseEngine):
         #     except Exception:
         #         logger.warning("AudioCodecEngine: torch.compile failed for %s, using eager mode",
         #                        node_name, exc_info=True)
+    
+    def get_max_batch_size(self, node_name, graph_walk):
+        if node_name not in self.submodules:
+            return
+        submod_max_bs = self.submodules[node_name].max_batch_size(graph_walk)
+        if node_name not in self.cuda_graph_runners:
+            return submod_max_bs
+        
+        runner = self.cuda_graph_runners[node_name]
+        configs = [
+            cfg for cfg in runner.capture_configs \
+                if graph_walk in cfg.replay_graph_walks
+        ]
+        if not configs:
+            return submod_max_bs
+        max_cuda_graph_bs = max([
+            max(cfg.capture_batch_sizes or runner.DEFAULT_CAPTURE_BATCH_SIZES) for cfg in configs
+        ])
+        if submod_max_bs is not None:
+            return min(max_cuda_graph_bs, submod_max_bs)
+        return max_cuda_graph_bs
+
+    def check_stop_for_batch(
+        self, batch: NodeBatch, output: NodeOutput
+    ) -> dict[str, set[str]]:
+        """Delegate to each rid's submodule.check_stop. Worker calls this on
+        the slow-postprocess path so the .item() / .cpu() reads no longer
+        block ``execute_batch`` on the GPU thread."""
+        if batch.node_name not in self.submodules:
+            return {}
+        submodule = self.submodules[batch.node_name]
+        result: dict[str, set[str]] = {}
+        for rid in batch.request_ids:
+            req_outputs = output.per_request_output_tensors.get(rid, {})
+            if not req_outputs:
+                continue
+            req_info = batch.per_request_info.get(rid)
+            if req_info is None:
+                continue
+            stops = submodule.check_stop(rid, req_info, req_outputs)
+            if stops:
+                result[rid] = stops
+        return result
 
     def add_request(self, request_id: str) -> None:
         pass  # stateless

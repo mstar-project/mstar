@@ -1,13 +1,11 @@
 from mminf.model.bagel.bagel_model import BagelModel
 from mminf.model.base import Model
-from mminf.model.dummy_model import DummyModel
 from mminf.model.orpheus.orpheus_model import OrpheusModel
 from mminf.model.pi05.pi05_model import Pi05Model
 from mminf.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mminf.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
 
 MODEL_REGISTRY: dict[str, type[Model]] = {
-    "dummy": DummyModel,
     "bagel": BagelModel,
     "orpheus": OrpheusModel,
     "pi05": Pi05Model,

@@ -74,9 +74,9 @@ class VJepa2Config:
     predictor_kind: str = "masked"
     ac_predictor: VJepa2ACPredictorConfig | None = None
 
-    # Rollout (Phase 2).  ``max_rollout_horizon`` caps the DynamicLoop's
+    # Rollout (Phase 2).  ``max_rollout_horizon`` caps the Loop's
     # ``max_iters`` at graph-build time; per-request ``rollout_horizon`` is
-    # enforced by early-exit (``register_loop_stop``) from inside the
+    # enforced by early-exit (``check_stop``) from inside the
     # rollout submodule.
     max_rollout_horizon: int = 16
     # AnticipativeWrapper-parity rollout geometry.  Per-request tuning is a

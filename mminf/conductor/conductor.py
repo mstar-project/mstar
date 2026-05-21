@@ -23,6 +23,7 @@ from mminf.conductor.request_info import (
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphEdge, TensorPointerInfo
+from mminf.graph.loop_indices import NestedLoopIndices
 from mminf.model.base import ForwardPassArgs, Model, WorkerGraph
 from mminf.utils.ipc_format import (
     ConductorMessageType,
@@ -71,7 +72,6 @@ def _worker_process_target(
     model: Model | None = None,
     device: str = "cuda",
     log_level: str = "INFO",
-    mooncake_port: int=8080,
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
 ):
@@ -84,7 +84,7 @@ def _worker_process_target(
 
     from mminf.worker.worker import Worker
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
-        [wg.section.get_node_names() for wg in my_worker_graphs]
+        [set(wg.section.get_nodes()) for wg in my_worker_graphs]
     ))
     worker = Worker(
         worker_id=worker_id,
@@ -100,7 +100,6 @@ def _worker_process_target(
         socket_path_prefix=socket_path_prefix,
         enable_nvtx=enable_nvtx,
         device=torch.device(device),
-        mooncake_port=mooncake_port,
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
     )
@@ -124,6 +123,9 @@ class RequestData:
 
     # Per-streaming-connection state (keyed by "from_partition->to_partition")
     streaming_connections: dict[str, StreamingConnectionState] = field(default_factory=dict)
+
+    # for api server recv bookeeping
+    final_outputs: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
     def remove_persist_signal_uuids(self, uuids: list[str]):
         uuids = set(uuids)
@@ -157,7 +159,6 @@ class Conductor:
         hostname: str = "localhost",
         enable_nvtx: bool = False,
         log_level: str = "INFO",
-        mooncake_port: int=8080,
         tensor_comm_protocol=CommProtocol.RDMA,
         tcp_transfer_device=""
     ):
@@ -167,7 +168,6 @@ class Conductor:
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
         self.enable_nvtx = enable_nvtx
-        self.mooncake_port = mooncake_port
         self.tensor_comm_protocol = tensor_comm_protocol
         self.tcp_transfer_device = tcp_transfer_device
 
@@ -247,11 +247,11 @@ class Conductor:
             worker_graph_id: worker_graph.graph_walks for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
         self._all_worker_graph_ids_to_nodes: dict[str, set[str]] = {
-            worker_graph_id: worker_graph.section.get_node_names()
+            worker_graph_id: set(worker_graph.section.get_nodes())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        self._all_worker_graph_ids_to_dyn_loops = {
-            worker_graph_id: worker_graph.section.get_dyn_loop_names()
+        self._all_worker_graph_ids_to_dyn_loops: dict[str, set[str]] = {
+            worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
 
@@ -276,7 +276,6 @@ class Conductor:
                     "enable_nvtx": self.enable_nvtx,
                     "device": f"cuda:{rank}",
                     "log_level": self.log_level,
-                    "mooncake_port": self.mooncake_port,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device
                 },
@@ -324,7 +323,7 @@ class Conductor:
             worker_graph = self.worker_graphs[worker_graph_id]
             if graph_walk not in worker_graph.graph_walks:
                 continue
-            nodes = set(worker_graph.section.get_node_names())
+            nodes = set(worker_graph.section.get_nodes())
 
             if worker_id not in inputs_per_worker:
                 inputs_per_worker[worker_id] = []
@@ -565,20 +564,13 @@ class Conductor:
             )
             self.communicator.send(worker_id, msg)
 
-        # Build output dict: output_name -> final forward pass number
-        final_forward_outputs: dict[str, int] = {}
-        for pstate in request_data.partition_states.values():
-            for output_name in pstate.curr_forward_outputs:
-                # fwd_pass_number was already incremented past the last pass
-                final_forward_outputs[output_name] = max(0, pstate.fwd_pass_number - 1)
-
         self.communicator.send(
             "api_server",
             APIServerMessage(
                 message_type="request_complete",
                 body=RequestComplete(
                     request_id=request_id,
-                    final_forward_outputs=final_forward_outputs,
+                    final_outputs=request_data.final_outputs,
                 )
             )
         )
@@ -604,6 +596,7 @@ class Conductor:
         partition_name = body.partition_name
 
         pstate = request_data.partition_states.get(partition_name)
+        request_data.final_outputs.update(body.output_loop_indices)
         if pstate is None:
             logger.warning(
                 "WorkerGraphsDone for unknown partition %s (request %s)",

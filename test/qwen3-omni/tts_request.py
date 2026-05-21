@@ -105,7 +105,7 @@ def main():
 
                 pcm_buffer.write(decoded)
                 chunk_count += 1
-                sys.stdout.write(f"\rReceived {chunk_count} audio chunks ({pcm_buffer.tell()} bytes)")
+                # sys.stdout.write(f"\rReceived {chunk_count} audio chunks ({pcm_buffer.tell()} bytes)")
                 sys.stdout.flush()
     except BaseException as e:
         print("Exception: ", e)

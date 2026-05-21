@@ -843,6 +843,16 @@ class DROIDDataset(BaseDataset):
             },
         )
 
+    @property
+    def num_requests(self) -> int:
+        return self._num_requests
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestInput:
+        return self.items[idx]
+
     # ------------------------------------------------------------------
 class VideoMMEDataset(BaseDataset):
     """

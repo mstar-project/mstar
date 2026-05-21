@@ -16,20 +16,27 @@ directly with a hand-built section to exercise the walker logic in isolation.
 
 from __future__ import annotations
 
-import sys
+import pytest
+
+pytest.skip(
+    "Depends on deleted mminf.graph.request_queues and on DynamicLoop "
+    "(merged into Loop). The same per-loop loop-back attribution behavior "
+    "is now covered by WorkerGraphIO + register_loop_finish_signal tests.",
+    allow_module_level=True,
+)
+
+import sys  # noqa: E402
 
 sys.path.insert(0, ".")
 
-import pytest
-
-from mminf.graph.base import (
+from mminf.graph.base import (  # noqa: E402
     DynamicLoop,
     GraphEdge,
     GraphNode,
     Parallel,
 )
-from mminf.graph.request_queues import PerRequestNodeQueues
-from mminf.worker.node_manager_utils import WorkerGraphQueues
+from mminf.graph.request_queues import PerRequestNodeQueues  # noqa: E402
+from mminf.worker.node_manager_utils import WorkerGraphQueues  # noqa: E402
 
 
 def _make_queues(section, rid: str = "rid") -> WorkerGraphQueues:

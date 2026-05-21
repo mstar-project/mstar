@@ -63,17 +63,26 @@ class SinusoidalEmbeddings(nn.Module):
         self.scale_base = scale_base
         scale = (torch.arange(0, dim, 2) + 0.4 * dim) / (1.4 * dim)
         self.register_buffer("scale", scale, persistent=False)
+        # Cache (freqs, scale) per seq_len. SNAC's LocalMHA always calls with
+        # seq_len == window_size (fixed at construction), so this hits 100%.
+        self._cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def forward(self, x):
         seq_len, device = x.shape[-2], x.device
+        cached = self._cache.get(seq_len)
+        if cached is not None:
+            return cached
+
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
         freqs = torch.einsum("i , j -> i j", t, self.inv_freq)
         freqs = torch.cat((freqs, freqs), dim=-1)
         if not self.use_xpos:
-            return freqs, torch.ones(1, device=device)
-        power = (t - (seq_len // 2)) / self.scale_base
-        scale = self.scale ** rearrange(power, "n -> n 1")
-        scale = torch.cat((scale, scale), dim=-1)
+            scale = torch.ones(1, device=device)
+        else:
+            power = (t - (seq_len // 2)) / self.scale_base
+            scale = self.scale ** rearrange(power, "n -> n 1")
+            scale = torch.cat((scale, scale), dim=-1)
+        self._cache[seq_len] = (freqs, scale)
         return freqs, scale
 
 

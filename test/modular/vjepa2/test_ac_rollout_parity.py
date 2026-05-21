@@ -322,7 +322,7 @@ class TestACRolloutEarlyExit:
                     states=states,
                 )
                 eh = out["encoder_hidden"][0]
-                if "rollout_loop" in info.dynamic_loop_stop_signals:
+                if "rollout_loop" in submodule.check_stop(info.request_id, info, out):
                     stop_seen_at.append(k)
 
         assert stop_seen_at, "submodule never registered a loop stop"
