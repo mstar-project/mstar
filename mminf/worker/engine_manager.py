@@ -1,21 +1,46 @@
 import logging
 from dataclasses import dataclass, field
+from typing import Callable
 
 import torch
 
-from mminf.engine.ar_engine import AREngine
-from mminf.engine.audio_codec_engine import AudioCodecEngine
 from mminf.engine.base import BaseEngine
-from mminf.engine.enc_dec_engine import EncoderDecoderEngine
-from mminf.engine.flow_engine import FlowEngine
+from mminf.engine.kv_cache_engine import KVCacheEngine
 from mminf.engine.kv_store import KVCacheConfig, TransferEngineInfo
+from mminf.engine.stateless_engine import (
+    StatelessEngine,
+    StatelessEngineConfig,
+    make_audio_codec_config,
+    make_enc_dec_config,
+    make_flow_config,
+)
 from mminf.model.base import Model
 
-ENGINE_TYPE_TO_CLASS: dict[str, type[BaseEngine]] = {
-    "ar": AREngine,
-    "flow": FlowEngine,
-    "enc_dec": EncoderDecoderEngine,
-    "audio_codec": AudioCodecEngine,
+
+def _make_kv_cache(autocast_dtype: torch.dtype, enable_nvtx: bool) -> BaseEngine:
+    return KVCacheEngine(autocast_dtype=autocast_dtype, enable_nvtx=enable_nvtx)
+
+
+def _make_stateless_factory(
+    config_factory: Callable[[torch.dtype | None], StatelessEngineConfig],
+) -> Callable[[torch.dtype | None, bool], BaseEngine]:
+    def factory(autocast_dtype: torch.dtype | None, enable_nvtx: bool) -> BaseEngine:
+        return StatelessEngine(
+            config=config_factory(autocast_dtype),
+            enable_nvtx=enable_nvtx,
+        )
+
+    return factory
+
+
+# Each engine type string maps to a factory that takes (autocast_dtype,
+# enable_nvtx) and returns a freshly constructed engine. The split between
+# AR (stateful, paged KV cache) and the stateless flavors lives here.
+ENGINE_TYPE_FACTORIES: dict[str, Callable[[torch.dtype | None, bool], BaseEngine]] = {
+    "kv_cache": _make_kv_cache,
+    "flow": _make_stateless_factory(make_flow_config),
+    "enc_dec": _make_stateless_factory(make_enc_dec_config),
+    "audio_codec": _make_stateless_factory(make_audio_codec_config),
 }
 
 logger = logging.getLogger(__name__)
@@ -61,12 +86,8 @@ class EngineManager:
             autocast_dtype = model_config["autocast_dtype"]
 
         for engine_type_str, engine_node_names in type_to_nodes.items():
-            engine_cls = ENGINE_TYPE_TO_CLASS[engine_type_str]
-
-            engine = engine_cls(
-                autocast_dtype=autocast_dtype,
-                enable_nvtx=enable_nvtx,
-            )
+            factory = ENGINE_TYPE_FACTORIES[engine_type_str]
+            engine = factory(autocast_dtype, enable_nvtx)
 
             # Extract submodules from the Model for this engine's nodes
             submodules: dict[str, torch.nn.Module] = {}
@@ -132,14 +153,14 @@ class EngineManager:
 
     def set_alloc_write_policies(self, policy):
         for engine in self.node_to_engine.values():
-            if isinstance(engine, AREngine):
+            if isinstance(engine, KVCacheEngine):
                 for submod_mgmt in engine.submodule_management.values():
                     submod_mgmt.kv_management.alloc_manager.write_policy = policy
 
-    def get_ar_engine(self) -> "AREngine | None":
-        """Return the first AR engine instance, if any."""
+    def get_kv_cache_engine(self) -> "KVCacheEngine | None":
+        """Return the first KV-cache engine instance, if any."""
         for engine in self.node_to_engine.values():
-            if isinstance(engine, AREngine):
+            if isinstance(engine, KVCacheEngine):
                 return engine
         return None
 
