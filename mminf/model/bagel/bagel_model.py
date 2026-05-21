@@ -432,9 +432,9 @@ class BagelModel(Model):
             "vit_encoder": EngineType.ENC_DEC,
             "vae_encoder": EngineType.ENC_DEC,
             "init_latents": EngineType.ENC_DEC,
-            "LLM": EngineType.AR,
-            "LLM_cfg_text": EngineType.AR,
-            "LLM_cfg_img": EngineType.AR,
+            "LLM": EngineType.KV_CACHE,
+            "LLM_cfg_text": EngineType.KV_CACHE,
+            "LLM_cfg_img": EngineType.KV_CACHE,
             "combine_cfg": EngineType.ENC_DEC,
             "vae_decoder": EngineType.ENC_DEC,
         }
