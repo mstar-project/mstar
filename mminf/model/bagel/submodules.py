@@ -375,7 +375,7 @@ class LLMSubmodule(ARNodeSubmodule):
       - prefill_vit/vae: forward [main], snapshot main->cfg_text
       - decode: forward [main, cfg_img]
       - image_gen: 3-pass CFG with conditional skip and renormalization
-    The CacheHandle (provided by AREngine) manages label switching, page
+    The CacheHandle (provided by KVCacheEngine) manages label switching, page
     allocation, and KV data copying.
     """
 
