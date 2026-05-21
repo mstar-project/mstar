@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mminf.engine.ar_engine import BatchedCacheManager
+from mminf.engine.kv_cache_engine import BatchedCacheManager
 from mminf.model.qwen3_omni.components.attention import (
     Qwen3OmniAttention,
     Qwen3OmniRMSNorm,
@@ -506,7 +506,7 @@ class Qwen3OmniCodePredictor(nn.Module):
 
         # FlashInfer's rope kernels require bf16; the rest of the code
         # predictor runs at the weights' native dtype (fp32 for quality per
-        # the AREngine.has_autocast=False invariant).
+        # the KVCacheEngine.has_autocast=False invariant).
         flat_pos = position_ids.reshape(-1)
 
         for layer_idx, layer in enumerate(self.model.layers):
