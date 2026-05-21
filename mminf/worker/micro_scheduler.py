@@ -30,9 +30,9 @@ class ScheduledBatch:
 
 
 # Priority: lower value = higher priority
-# AR decode is most latency-sensitive
+# KV-cache decode is most latency-sensitive
 PRIORITY = {
-    EngineType.AR: 0,
+    EngineType.KV_CACHE: 0,
     EngineType.CODE_PREDICTOR: 0.5,
     EngineType.FLOW: 1,
     EngineType.ENC_DEC: 2,
