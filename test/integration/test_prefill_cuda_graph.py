@@ -38,7 +38,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mminf.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mminf.engine.ar_engine import AREngine  # noqa: E402
+from mminf.engine.kv_cache_engine import KVCacheEngine  # noqa: E402
 from mminf.engine.cuda_graph_runner import CudaGraphKey, CudaGraphRunner  # noqa: E402
 from mminf.engine.kv_store import TransferEngineInfo  # noqa: E402
 from mminf.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
@@ -134,7 +134,7 @@ def thinker_engine_with_runner():
     # × 128 page_size = 32768 tokens leaves comfortable headroom.
     kv_cfg.max_num_pages = 256
 
-    engine = AREngine(autocast_dtype=torch.bfloat16)
+    engine = KVCacheEngine(autocast_dtype=torch.bfloat16)
     transfer_info = TransferEngineInfo(
         my_entity_id="parity_test",
         my_session_id="parity_session",
@@ -249,7 +249,7 @@ def _make_per_request_info(request_ids: list[str]) -> dict[str, CurrentForwardPa
 
 
 def _run_eager_per_rid(
-    engine: AREngine,
+    engine: KVCacheEngine,
     submodule,
     request_ids: list[str],
     inputs: list[ARNodeInputs],
@@ -257,7 +257,7 @@ def _run_eager_per_rid(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-rid sequential eager prefill — the production eager path.
 
-    AREngine._execute_sequential calls submodule.forward in a per-rid loop
+    KVCacheEngine._execute_sequential calls submodule.forward in a per-rid loop
     for prefill_text (can_batch returns False for that walk). We can't use
     forward_batched here: it asserts cache_manager.get_qo_indptr_buf("main")
     is non-None, which only holds for the runner's static cache manager.
