@@ -316,7 +316,7 @@ class VJepa2Model(Model):
         if self.config.predictor_kind == "ac":
             types["ac_predictor_mpc"] = EngineType.ENC_DEC
             types["mpc_scorer"] = EngineType.ENC_DEC
-            types["rollout_predictor"] = EngineType.AR
+            types["rollout_predictor"] = EngineType.KV_CACHE
         return types
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
