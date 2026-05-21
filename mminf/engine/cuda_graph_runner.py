@@ -153,7 +153,7 @@ class CudaGraphRunner:
         self.device = device
         self.autocast_dtype = autocast_dtype
         self.buffer_manager = buffer_manager
-        self.enable_nvtx = False  # set by AREngine after construction
+        self.enable_nvtx = False  # set by KVCacheEngine after construction
 
         self.graphs: dict[CudaGraphKey, CudaGraphData] = {}
 
@@ -838,7 +838,7 @@ class CudaGraphRunner:
         request_ids: list[str], padded_bs: int
     ):
         # Per-request sampling configs are pre-staged on master GPU buffers
-        # (see ``register_request`` / ``update_request_config`` from AREngine);
+        # (see ``register_request`` / ``update_request_config`` from KVCacheEngine);
         # the per-step path is just a slot-index gather + index_select. The
         # ``per_request_info`` argument is unused here but kept on the
         # signature for symmetry with the older callers.
