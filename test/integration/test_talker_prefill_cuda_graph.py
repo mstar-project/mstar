@@ -37,7 +37,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mminf.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mminf.engine.ar_engine import AREngine  # noqa: E402
+from mminf.engine.kv_cache_engine import KVCacheEngine  # noqa: E402
 from mminf.engine.cuda_graph_runner import CudaGraphKey, CudaGraphRunner  # noqa: E402
 from mminf.engine.kv_store import TransferEngineInfo  # noqa: E402
 from mminf.model.submodule_base import ARNodeInputs  # noqa: E402
@@ -113,7 +113,7 @@ def talker_engine_with_runner():
     kv_cfg = kv_cfgs[0]
     kv_cfg.max_num_pages = 256
 
-    engine = AREngine(autocast_dtype=torch.bfloat16)
+    engine = KVCacheEngine(autocast_dtype=torch.bfloat16)
     transfer_info = TransferEngineInfo(
         my_entity_id="determinism_test",
         my_session_id="determinism_session",
