@@ -16,7 +16,14 @@ from dataclasses import dataclass
 
 import torch
 
-from mminf.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput
+from mminf.engine.base import (
+    BaseEngine,
+    EngineType,
+    NodeBatch,
+    NodeOutput,
+    PlannedBatch,
+    PreparedBatch,
+)
 from mminf.engine.cuda_graph_runner import CodecCudaGraphRunner
 from mminf.model.submodule_base import (
     ARNodeInputs,
@@ -211,65 +218,72 @@ class StatelessEngine(BaseEngine):
     # ─── Core execution ────────────────────────────────────────────────
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
+        """Wrap the template with the NVTX range and inference context that
+        all stateless forwards run under.
+        """
         if self.enable_nvtx:
             range_push(
                 f"engine.{self.config.name}.{batch.node_name}."
                 f"{batch.graph_walk}.bs{len(batch.request_ids)}"
             )
-
-        submodule = self.submodules.get(batch.node_name)
-        if submodule is None:
-            output = NodeOutput(
-                per_request_output_tensors={rid: {} for rid in batch.request_ids}
-            )
-            if self.enable_nvtx:
-                range_pop(synchronize=False)
-            return output
-
         try:
             with self._inference_context():
-                node_inputs, skipped_rids = self._prepare_inputs(batch, submodule)
-
-                active_rids = [rid for rid in batch.request_ids if rid not in skipped_rids]
-                if not active_rids:
-                    output = NodeOutput(
-                        per_request_output_tensors={rid: {} for rid in batch.request_ids}
-                    )
-                    return output
-
-                # The audio codec path historically mutates the batch to drop
-                # skipped rids before dispatch so downstream batched forwards
-                # see only active ones. Preserve that — but record the mutation
-                # in a single place so it's obvious.
-                if skipped_rids:
-                    batch.request_ids = active_rids
-                    batch.per_request_info = {
-                        rid: info
-                        for rid, info in batch.per_request_info.items()
-                        if rid not in skipped_rids
-                    }
-
-                output = self._dispatch(batch, node_inputs, submodule)
-
-                # Skipped rids get an empty output slot so the worker's per-rid
-                # bookkeeping stays consistent.
-                output.per_request_output_tensors.update(
-                    {rid: {} for rid in skipped_rids}
-                )
-
-                for rid in batch.request_ids:
-                    info = batch.per_request_info.get(rid)
-                    if info is None:
-                        continue
-                    submodule.postprocess(
-                        request_id=rid,
-                        request_info=info,
-                        outputs=output.per_request_output_tensors.get(rid, {}),
-                    )
-                return output
+                return super().execute_batch(batch)
         finally:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
+
+    def prepare_batch(self, batch: NodeBatch) -> PreparedBatch:
+        """Look up the submodule, run per-rid ``prepare_inputs``, and filter
+        out rids the submodule vetoed (returned None).
+
+        Mutates ``batch.request_ids`` / ``batch.per_request_info`` to drop
+        skipped rids when any exist — downstream batched forwards rely on the
+        batch only containing active rids. The template emits empty output
+        slots for skipped rids so the worker still sees one entry per request.
+        """
+        submodule = self.submodules.get(batch.node_name)
+        if submodule is None:
+            # Marking every rid as skipped → template emits empty output.
+            return PreparedBatch(
+                batch=batch,
+                submodule=None,
+                skipped_rids=set(batch.request_ids),
+            )
+
+        node_inputs, skipped_rids = self._prepare_inputs(batch, submodule)
+        if skipped_rids:
+            batch.request_ids = [rid for rid in batch.request_ids if rid not in skipped_rids]
+            batch.per_request_info = {
+                rid: info
+                for rid, info in batch.per_request_info.items()
+                if rid not in skipped_rids
+            }
+        return PreparedBatch(
+            batch=batch,
+            submodule=submodule,
+            node_inputs=node_inputs,
+            skipped_rids=skipped_rids,
+        )
+
+    def execute_forward(self, planned: PlannedBatch) -> NodeOutput:
+        if planned.submodule is None:
+            return NodeOutput(per_request_output_tensors={})
+        return self._dispatch(planned.batch, planned.node_inputs, planned.submodule)
+
+    def postprocess_batch(self, planned: PlannedBatch, output: NodeOutput) -> None:
+        submodule = planned.submodule
+        if submodule is None:
+            return
+        for rid in planned.batch.request_ids:
+            info = planned.batch.per_request_info.get(rid)
+            if info is None:
+                continue
+            submodule.postprocess(
+                request_id=rid,
+                request_info=info,
+                outputs=output.per_request_output_tensors.get(rid, {}),
+            )
 
     # ─── Internals ─────────────────────────────────────────────────────
 
