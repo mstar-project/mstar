@@ -152,15 +152,28 @@ class EngineManager:
                 engine.remove_request(request_id)
 
     def set_alloc_write_policies(self, policy):
-        for engine in self.node_to_engine.values():
-            if isinstance(engine, KVCacheEngine):
-                for submod_mgmt in engine.submodule_management.values():
-                    submod_mgmt.kv_management.alloc_manager.write_policy = policy
+        for engine in self._unique_engines():
+            engine.set_alloc_write_policy(policy)
+
+    def lru_tracked_nodes(self) -> list[str]:
+        """Aggregate ``engine.lru_tracked_nodes()`` across unique engines.
+        The worker uses this to seed / clean up the per-request LRU
+        timestamps it needs for offload-victim selection.
+        """
+        out: list[str] = []
+        for engine in self._unique_engines():
+            out.extend(engine.lru_tracked_nodes())
+        return out
 
     def get_kv_cache_engine(self) -> "KVCacheEngine | None":
-        """Return the first KV-cache engine instance, if any."""
+        """Return the first engine declaring ``requires_kv_cache=True``, if any.
+
+        Kept for callers that need the concrete engine reference (e.g.
+        tests). Production code should prefer ``get_engine(node_name)``
+        and dispatch through the capability surface.
+        """
         for engine in self.node_to_engine.values():
-            if isinstance(engine, KVCacheEngine):
+            if engine.capabilities.requires_kv_cache:
                 return engine
         return None
 
