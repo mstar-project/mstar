@@ -7,6 +7,7 @@ import torch
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import (
     BaseEngine,
+    EngineCapabilities,
     EngineType,
     NodeBatch,
     NodeOutput,
@@ -20,6 +21,7 @@ from mminf.engine.kv_store import (
     AllocationFailedError,
     KVCacheConfig,
     PagedAllocationManager,
+    StoreWritePolicy,
     TransferEngineInfo,
 )
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
@@ -74,6 +76,11 @@ class KVCacheEngine(BaseEngine):
         # Dedup set for "cuda graphs captured but not usable for this shape"
         # warnings — each unique miss shape is logged at most once.
         self._logged_graph_misses: set[tuple] = set()
+
+    capabilities = EngineCapabilities(
+        requires_kv_cache=True,
+        supports_cpu_offload=True,
+    )
 
     def engine_type(self) -> EngineType:
         return EngineType.KV_CACHE
@@ -950,6 +957,65 @@ class KVCacheEngine(BaseEngine):
         for submodule_mgmt in self.submodule_management.values():
             cache_mgmt = submodule_mgmt.kv_management
             cache_mgmt.alloc_manager.get_state(request_id, cache_label).is_paused = False
+
+    # ── Optional surfaces declared via ``capabilities`` ─────────────────
+
+    def lru_tracked_nodes(self) -> list[str]:
+        return list(self.submodule_management.keys())
+
+    def set_alloc_write_policy(self, policy: StoreWritePolicy) -> None:
+        for submod_mgmt in self.submodule_management.values():
+            submod_mgmt.kv_management.alloc_manager.write_policy = policy
+
+    def offload_candidates(self, node_name: str) -> list[tuple[str, int]]:
+        submod_mgmt = self.submodule_management.get(node_name)
+        if submod_mgmt is None or submod_mgmt.kv_management.cpu_page_pool is None:
+            return []
+        alloc = submod_mgmt.kv_management.alloc_manager
+        out: list[tuple[str, int]] = []
+        for rid, labels in alloc.request_states.items():
+            total_pages = sum(len(s.page_indices) for s in labels.values())
+            if total_pages > 0:
+                out.append((rid, total_pages))
+        return out
+
+    def offload_request(self, node_name: str, request_id: str) -> int:
+        submod_mgmt = self.submodule_management.get(node_name)
+        if submod_mgmt is None:
+            return 0
+        cache_mgmt = submod_mgmt.kv_management
+        if cache_mgmt.cpu_page_pool is None:
+            return 0
+        return cache_mgmt.alloc_manager.offload_request(
+            request_id, cache_mgmt.cpu_page_pool,
+        )
+
+    def reload_request(self, node_name: str, request_id: str) -> bool:
+        submod_mgmt = self.submodule_management.get(node_name)
+        if submod_mgmt is None:
+            return False
+        cache_mgmt = submod_mgmt.kv_management
+        if cache_mgmt.cpu_page_pool is None:
+            return False
+        if not cache_mgmt.cpu_page_pool.is_offloaded(request_id):
+            return False
+        try:
+            cache_mgmt.alloc_manager.reload_request(
+                request_id, cache_mgmt.cpu_page_pool,
+            )
+            return True
+        except RuntimeError:
+            # Not enough GPU pages to reload — caller will retry later.
+            return False
+
+    def is_offloaded(self, node_name: str, request_id: str) -> bool:
+        submod_mgmt = self.submodule_management.get(node_name)
+        if submod_mgmt is None:
+            return False
+        cache_mgmt = submod_mgmt.kv_management
+        if cache_mgmt.cpu_page_pool is None:
+            return False
+        return cache_mgmt.cpu_page_pool.is_offloaded(request_id)
 
     def shutdown(self) -> None:
         for submodule_mgmt in self.submodule_management.values():
