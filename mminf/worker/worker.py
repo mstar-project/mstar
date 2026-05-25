@@ -1121,6 +1121,12 @@ class Worker:
             launch_started_event = node_batch.metadata.get("launch_started_event")
             if launch_started_event is not None:
                 launch_started_event.set()
+            # Mirror engine-internal state (e.g. KV-cache seq_info) back
+            # onto node_batch.per_request_info so the next iter's prep /
+            # routing sees the updated values. Runs regardless of success,
+            # allocation_failed, or an uncaught raise — finalize_batch
+            # reads whatever state the engine actually reached.
+            engine.finalize_batch(node_batch)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
