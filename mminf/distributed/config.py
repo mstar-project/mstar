@@ -62,7 +62,7 @@ class ShardingConfig:
                 nodes=[node], tp_size=1, graph_walks=[gw],
             )
             singleton.register_workers(
-                list(node_to_worker[(node, gw)]), my_tp_rank=0
+                list(node_to_worker[(node, gw)][0:1]), my_tp_rank=0
             )
             self.group_mapping[(node, gw)] = singleton
 

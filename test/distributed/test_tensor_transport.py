@@ -78,6 +78,18 @@ def _setup_cfg(*, groups, shard_dim, node_to_worker) -> ShardingConfig:
     return cfg
 
 
+def _drain_reads(manager, request_id, graph_edges, graph_walk):
+    """Issue reads and block until any async futures complete. SHM returns
+    an empty list (sync read); Mooncake returns futures we have to wait on
+    before calling get_ready_tensors.
+    """
+    futures = manager.start_read_tensors(
+        request_id, graph_edges, graph_walk=graph_walk,
+    )
+    for f in futures or []:
+        f.result()
+
+
 def _send(
     manager, request_id: str, signal: str, dest_node: str,
     tensor: torch.Tensor, source_tp_rank: int, source_tp_size: int,
@@ -120,7 +132,7 @@ def test_basic_replicated_roundtrip(make_manager, protocol):
     edge = _send(sender, "req1", "x", "B", original,
                  source_tp_rank=0, source_tp_size=1)
 
-    receiver.start_read_tensors("req1", graph_walk="decode", graph_edges=[deepcopy(edge)])
+    _drain_reads(receiver, "req1", [deepcopy(edge)], graph_walk="decode")
     ready = receiver.get_ready_tensors(graph_walk="decode")
 
     assert "req1" in ready and len(ready["req1"]) == 1
@@ -153,7 +165,9 @@ def test_sharded_tp2_to_tp1_fanin_consolidates(make_manager, protocol):
     edge0 = _send(sender0, "req1", "x", "B", shard0, 0, 2)
     edge1 = _send(sender1, "req1", "x", "B", shard1, 1, 2)
 
-    receiver.start_read_tensors("req1", graph_walk="decode", graph_edges=[deepcopy(edge0), deepcopy(edge1)])
+    _drain_reads(
+        receiver, "req1", [deepcopy(edge0), deepcopy(edge1)], graph_walk="decode",
+    )
     ready = receiver.get_ready_tensors(graph_walk="decode")
 
     assert "req1" in ready and len(ready["req1"]) == 1
@@ -186,12 +200,12 @@ def test_fanin_buffers_partial_then_completes(make_manager, protocol):
     edge1 = _send(sender1, "req1", "x", "B", shard1, 1, 2)
 
     # First poll: only shard 0 has arrived — buffered, nothing emitted.
-    receiver.start_read_tensors("req1", graph_walk="decode", graph_edges=[deepcopy(edge0)])
+    _drain_reads(receiver, "req1", [deepcopy(edge0)], graph_walk="decode")
     first = receiver.get_ready_tensors(graph_walk="decode")
     assert first.get("req1", []) == []
 
     # Second poll: shard 1 arrives — consolidation runs and edge is emitted.
-    receiver.start_read_tensors("req1", graph_walk="decode", graph_edges=[deepcopy(edge1)])
+    _drain_reads(receiver, "req1", [deepcopy(edge1)], graph_walk="decode")
     second = receiver.get_ready_tensors(graph_walk="decode")
     assert "req1" in second and len(second["req1"]) == 1
     out_uuid = second["req1"][0].tensor_info[0].uuid
@@ -240,13 +254,13 @@ def test_sharded_tp4_to_tp2_fanin(make_manager, protocol):
         for i in range(4)
     ]
 
-    receivers[0].start_read_tensors(
-        "req1", [deepcopy(edges[0]), deepcopy(edges[1])],
-        graph_walk="decode",
+    _drain_reads(
+        receivers[0], "req1",
+        [deepcopy(edges[0]), deepcopy(edges[1])], graph_walk="decode",
     )
-    receivers[1].start_read_tensors(
-        "req1", [deepcopy(edges[2]), deepcopy(edges[3])],
-        graph_walk="decode",
+    _drain_reads(
+        receivers[1], "req1",
+        [deepcopy(edges[2]), deepcopy(edges[3])], graph_walk="decode",
     )
 
     r0_ready = receivers[0].get_ready_tensors(graph_walk="decode")
@@ -285,7 +299,7 @@ def test_sharded_with_nonzero_shard_dim_roundtrips(make_manager, protocol):
     original = torch.randn(3, 5, 7)
     edge = _send(sender, "req1", "x", "B", original,
                  source_tp_rank=0, source_tp_size=1)
-    receiver.start_read_tensors("req1", graph_walk="decode", graph_edges=[deepcopy(edge)])
+    _drain_reads(receiver, "req1", [deepcopy(edge)], graph_walk="decode")
     ready = receiver.get_ready_tensors(graph_walk="decode")
     assert "req1" in ready and len(ready["req1"]) == 1
     out_uuid = ready["req1"][0].tensor_info[0].uuid
@@ -319,6 +333,12 @@ def test_colocated_replicated_to_sharded_slices_locally(make_manager, protocol):
                  source_tp_rank=0, source_tp_size=1)
     producer_uuid = edge.tensor_info[0].uuid
 
+    # Simulate the cross-worker LLM rank 1's pending read by pre-bumping the
+    # producer's refcount. _send only registered one outgoing edge (rank 0),
+    # so without this the colocated slice's dereference would drop the
+    # producer's ref to 0 and GC the canonical tensor.
+    mgr.tensor_store.increment_ref("req1", producer_uuid, 1)
+
     # Worker-pre-computed per-receiver slice metadata.
     half_nbytes = edge.tensor_info[0].nbytes // 2
     edge.tensor_info[0].offset = 0
@@ -326,7 +346,7 @@ def test_colocated_replicated_to_sharded_slices_locally(make_manager, protocol):
     edge.tensor_info[0].dims = torch.Size([4, 4])
     edge.tensor_info[0].stride = (4, 1)
 
-    mgr.start_read_tensors("req1", graph_walk="decode", graph_edges=[edge])
+    _drain_reads(mgr, "req1", [edge], graph_walk="decode")
     ready = mgr.get_ready_tensors(graph_walk="decode")
 
     assert "req1" in ready and len(ready["req1"]) == 1
