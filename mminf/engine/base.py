@@ -7,7 +7,7 @@ import torch
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
-from mminf.engine.kv_store import KVCacheConfig
+from mminf.engine.kv_store import KVCacheConfig, StoreWritePolicy
 
 
 class EngineType(Enum):
@@ -16,6 +16,21 @@ class EngineType(Enum):
     ENC_DEC = "enc_dec"
     AUDIO_CODEC = "audio_codec"
     CODE_PREDICTOR = "code_predictor"
+
+
+@dataclass(frozen=True)
+class EngineCapabilities:
+    """Static declaration of optional surfaces an engine implements.
+
+    The worker and ``EngineManager`` consult these flags instead of
+    ``isinstance`` / ``hasattr`` probes to decide whether to iterate or
+    dispatch into engine-specific code paths (e.g. CPU-offload victim
+    selection, KV-cache LRU tracking, store write-policy push). The
+    default ``EngineCapabilities()`` declares an engine that needs none
+    of the optional surfaces — stateless engines leave it untouched.
+    """
+    requires_kv_cache: bool = False
+    supports_cpu_offload: bool = False
 
 
 @dataclass
@@ -260,6 +275,59 @@ class BaseEngine(ABC):
         slot recomputes from scratch instead of trusting stale state.
         """
         return
+
+    # ── Capabilities + optional surfaces ────────────────────────────────
+    #
+    # ``capabilities`` is a class-level declaration of which optional
+    # surfaces this engine class implements. Worker / EngineManager check
+    # it instead of ``isinstance`` / ``hasattr`` probes. The methods below
+    # are the corresponding surfaces — all safe no-op defaults so engines
+    # that don't opt in can still be called uniformly. KVCacheEngine
+    # overrides both the capability flags and the methods; stateless
+    # engines leave them at default.
+
+    capabilities = EngineCapabilities()
+
+    def lru_tracked_nodes(self) -> list[str]:
+        """Nodes for which the worker should LRU-track per-request activity
+        (used to pick CPU-offload victims). Default: no nodes — stateless
+        engines have no KV state to age out.
+        """
+        return []
+
+    def set_alloc_write_policy(self, policy: StoreWritePolicy) -> None:
+        """Apply a store write policy. Default: no-op — engines without an
+        alloc manager have nothing to set.
+        """
+        return
+
+    def offload_candidates(self, node_name: str) -> list[tuple[str, int]]:
+        """Return ``(request_id, gpu_pages_held)`` for every request with
+        GPU pages on ``node_name``. The worker partitions the result into
+        in-batch vs external candidates and picks an eviction victim.
+        Default: empty list — no offloadable state.
+        """
+        return []
+
+    def offload_request(self, node_name: str, request_id: str) -> int:
+        """Offload ``request_id``'s KV pages on ``node_name`` to CPU.
+        Returns the number of GPU pages freed (0 if nothing was freed or
+        the engine doesn't support offload).
+        """
+        return 0
+
+    def reload_request(self, node_name: str, request_id: str) -> bool:
+        """Reload an offloaded request back to GPU on ``node_name``.
+        Returns True on success; False if the request isn't offloaded, GPU
+        pages are insufficient, or the engine doesn't support offload.
+        """
+        return False
+
+    def is_offloaded(self, node_name: str, request_id: str) -> bool:
+        """Whether ``request_id`` is currently CPU-offloaded on ``node_name``.
+        Default: False.
+        """
+        return False
 
     def execute_with_max_batch_size(self, batch: NodeBatch) -> NodeOutput:
         bs = self.get_max_batch_size(batch.node_name, batch.graph_walk)
