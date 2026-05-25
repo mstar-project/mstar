@@ -165,18 +165,6 @@ class EngineManager:
             out.extend(engine.lru_tracked_nodes())
         return out
 
-    def get_kv_cache_engine(self) -> "KVCacheEngine | None":
-        """Return the first engine declaring ``requires_kv_cache=True``, if any.
-
-        Kept for callers that need the concrete engine reference (e.g.
-        tests). Production code should prefer ``get_engine(node_name)``
-        and dispatch through the capability surface.
-        """
-        for engine in self.node_to_engine.values():
-            if engine.capabilities.requires_kv_cache:
-                return engine
-        return None
-
     def _unique_engines(self) -> list[BaseEngine]:
         seen = set()
         result = []
