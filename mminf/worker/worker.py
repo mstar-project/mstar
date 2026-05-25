@@ -1049,13 +1049,11 @@ class Worker:
         valid in-flight pre-plan whose flags have not yet been consumed
         by the matching replay isn't stomped. The engine's
         ``reset_pre_plan_for_batch`` looks up the same (key, slot) the
-        pre-plan path used; absent that method (non-AR engine), this is
-        a no-op (those engines don't pre-plan).
+        pre-plan path used; engines without a pre-plan surface inherit
+        ``BaseEngine``'s no-op default.
         """
         engine = self.engine_manager.get_engine(spec_node_batch.node_name)
-        reset = getattr(engine, "reset_pre_plan_for_batch", None)
-        if reset is not None:
-            reset(spec_node_batch)
+        engine.reset_pre_plan_for_batch(spec_node_batch)
 
     def _execute_on_gpu_thread(
         self,
@@ -1951,9 +1949,8 @@ class Worker:
                             engine = self.engine_manager.get_engine(
                                 speculation.node_batch.node_name
                             )
-                            if hasattr(engine, "reserve_replay_slot"):
-                                engine.reserve_replay_slot(speculation.node_batch)
-        
+                            engine.reserve_replay_slot(speculation.node_batch)
+
                         # Kick off pre-planning on the plan_executor NOW —
                         # its Python work runs while the main thread is in
                         # await_gpu (releases GIL). plan_executor waits on
@@ -1964,18 +1961,17 @@ class Worker:
                             engine = self.engine_manager.get_engine(
                                 speculation.node_batch.node_name
                             )
-                            if hasattr(engine, "pre_plan_for_batch"):
-                                prev_advance_event_for_plan: threading.Event | None = None
-                                if pending is not None:
-                                    prev_advance_event_for_plan = (
-                                        pending.node_batch.metadata.get("advance_event")
-                                    )
-                                speculation.plan_future = plan_executor.submit(
-                                    self._pre_plan_for_speculative_batch,
-                                    engine,
-                                    speculation.node_batch,
-                                    prev_advance_event_for_plan,
+                            prev_advance_event_for_plan: threading.Event | None = None
+                            if pending is not None:
+                                prev_advance_event_for_plan = (
+                                    pending.node_batch.metadata.get("advance_event")
                                 )
+                            speculation.plan_future = plan_executor.submit(
+                                self._pre_plan_for_speculative_batch,
+                                engine,
+                                speculation.node_batch,
+                                prev_advance_event_for_plan,
+                            )
 
                 # 3. If pending: await GPU(N), submit speculated GPU(N+1)
                 # asap, then post-process N (fast then slow) overlapping
@@ -2171,8 +2167,7 @@ class Worker:
                 # counter at run time and races with main-thread reservations
                 # from later iters.
                 fallthrough_engine = self.engine_manager.get_engine(batch.node_name)
-                if hasattr(fallthrough_engine, "reserve_replay_slot"):
-                    fallthrough_engine.reserve_replay_slot(node_batch)
+                fallthrough_engine.reserve_replay_slot(node_batch)
 
                 # Attach a fresh advance_event so the next iter's
                 # plan_executor (if it speculates) can wait on this batch's
