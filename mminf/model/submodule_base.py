@@ -235,6 +235,19 @@ class NodeSubmodule(torch.nn.Module):
         """
         return "enc_dec"
 
+    def get_autocast_dtype(self) -> torch.dtype | None:
+        """Per-submodule autocast dtype override for the engine's forward
+        wrap. The engine consults this on each ``execute_batch`` and uses
+        the returned dtype instead of its own when non-``None``.
+
+        Default: ``None`` (inherit the engine's autocast dtype). To turn
+        autocast off for one specific submodule whose engine otherwise has
+        it enabled, wrap the submodule's forward with
+        ``torch.amp.autocast(enabled=False)`` — that path is engine-agnostic
+        and doesn't need this surface.
+        """
+        return None
+
     # Note: do not import CudaGraphConfig; it causes a circular import situation
     def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
         """TODO: add cuda graph support for pi05.
