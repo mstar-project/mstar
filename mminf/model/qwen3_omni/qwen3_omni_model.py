@@ -174,11 +174,11 @@ class Qwen3OmniModel(Model):
 
     def get_node_engine_types(self) -> dict[str, EngineType]:
         return {
-            "audio_encoder": EngineType.ENC_DEC,
-            "vision_encoder": EngineType.ENC_DEC,
+            "audio_encoder": EngineType.STATELESS,
+            "vision_encoder": EngineType.STATELESS,
             "Thinker": EngineType.KV_CACHE,
             "Talker": EngineType.KV_CACHE,
-            "Code2Wav": EngineType.AUDIO_CODEC,
+            "Code2Wav": EngineType.STATELESS,
         }
     
     def get_max_talker_output_tokens(self, **model_kwargs):
