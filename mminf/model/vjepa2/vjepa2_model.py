@@ -298,8 +298,8 @@ class VJepa2Model(Model):
 
     def get_node_engine_types(self) -> dict[str, EngineType]:
         types: dict[str, EngineType] = {
-            "video_encoder": EngineType.ENC_DEC,
-            "predictor": EngineType.ENC_DEC,
+            "video_encoder": EngineType.STATELESS,
+            "predictor": EngineType.STATELESS,
         }
         # Rollout uses a distinct node so the single-pass and rollout walks
         # can coexist without branching inside a submodule.  Both node names
@@ -308,14 +308,14 @@ class VJepa2Model(Model):
         # for AC) — no weight duplication.  AC-variant rollout landed in
         # Phase 3.D (sliding-window autoregressive AC rollout), so
         # ``rollout_predictor`` is now registered for both predictor kinds.
-        types["rollout_predictor"] = EngineType.ENC_DEC
+        types["rollout_predictor"] = EngineType.STATELESS
         # Phase 3.B: MPC nodes advertised only for AC (the masked predictor
         # has no action input, so K-way candidate evaluation makes no sense
         # for it).  ``ac_predictor_mpc`` shares the underlying
         # VisionTransformerPredictorAC nn.Module with ``predictor``.
         if self.config.predictor_kind == "ac":
-            types["ac_predictor_mpc"] = EngineType.ENC_DEC
-            types["mpc_scorer"] = EngineType.ENC_DEC
+            types["ac_predictor_mpc"] = EngineType.STATELESS
+            types["mpc_scorer"] = EngineType.STATELESS
             types["rollout_predictor"] = EngineType.KV_CACHE
         return types
 
