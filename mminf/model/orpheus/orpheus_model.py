@@ -101,7 +101,7 @@ class OrpheusModel(Model):
     def get_node_engine_types(self) -> dict[str, EngineType]:
         return {
             "LLM": EngineType.KV_CACHE,
-            "snac_decoder": EngineType.AUDIO_CODEC,
+            "snac_decoder": EngineType.STATELESS,
         }
 
     # -------------------------------------------------------------------
