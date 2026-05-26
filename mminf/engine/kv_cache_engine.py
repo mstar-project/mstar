@@ -587,11 +587,15 @@ class KVCacheEngine(BaseEngine):
             range_push(
                 f"engine.kv_cache.{batch.node_name}.{batch.graph_walk}.bs{len(batch.request_ids)}"
             )
+        submodule = self.submodule_management[batch.node_name].submodule
+        per_submodule_dtype = submodule.get_autocast_dtype() if submodule is not None else None
+        autocast_dtype = per_submodule_dtype if per_submodule_dtype is not None \
+            else self.autocast_dtype
         try:
             try:
                 with torch.no_grad():
                     with torch.amp.autocast(
-                        "cuda", enabled=True, dtype=self.autocast_dtype
+                        "cuda", enabled=True, dtype=autocast_dtype
                     ):
                         return super().execute_batch(batch)
             except AllocationFailedError as err:
