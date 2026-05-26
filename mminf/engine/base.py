@@ -13,11 +13,6 @@ from mminf.engine.kv_store import KVCacheConfig, StoreWritePolicy
 class EngineType(Enum):
     KV_CACHE = "kv_cache"
     STATELESS = "stateless"
-    # Legacy stateless flavors — being migrated to ``STATELESS`` with the
-    # per-submodule ``get_stateless_flavor()`` surface picking enc_dec vs
-    # audio_codec config. Remove once every model declares ``STATELESS``.
-    ENC_DEC = "enc_dec"
-    AUDIO_CODEC = "audio_codec"
 
 
 @dataclass(frozen=True)
