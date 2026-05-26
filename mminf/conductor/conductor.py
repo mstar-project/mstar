@@ -213,7 +213,7 @@ class Conductor:
     def _get_sampling_configs(self, model_kwargs: dict):
         ar_nodes = [
             node for (node, engine) in self.model.get_node_engine_types().items() \
-                if engine in {EngineType.KV_CACHE, EngineType.CODE_PREDICTOR}
+                if engine == EngineType.KV_CACHE
         ]
         return {
             node: self.model.get_sampling_config(

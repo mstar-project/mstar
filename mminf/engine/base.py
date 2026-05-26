@@ -15,7 +15,6 @@ class EngineType(Enum):
     FLOW = "flow"
     ENC_DEC = "enc_dec"
     AUDIO_CODEC = "audio_codec"
-    CODE_PREDICTOR = "code_predictor"
 
 
 @dataclass(frozen=True)
