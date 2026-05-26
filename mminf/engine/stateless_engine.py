@@ -60,7 +60,7 @@ class StatelessEngineConfig:
     - ``name`` is the NVTX range prefix.
     """
 
-    engine_type: EngineType = EngineType.ENC_DEC
+    engine_type: EngineType = EngineType.STATELESS
     autocast_dtype: torch.dtype | None = torch.bfloat16
     force_float32_submodules: bool = False
     cuda_graph_capable: bool = True
@@ -71,7 +71,7 @@ class StatelessEngineConfig:
 
 def make_enc_dec_config(autocast_dtype: torch.dtype | None) -> StatelessEngineConfig:
     return StatelessEngineConfig(
-        engine_type=EngineType.ENC_DEC,
+        engine_type=EngineType.STATELESS,
         autocast_dtype=autocast_dtype,
         cuda_graph_capable=True,
         apply_torch_compile=True,
@@ -82,7 +82,7 @@ def make_enc_dec_config(autocast_dtype: torch.dtype | None) -> StatelessEngineCo
 
 def make_audio_codec_config(_autocast_dtype: torch.dtype | None = None) -> StatelessEngineConfig:
     return StatelessEngineConfig(
-        engine_type=EngineType.AUDIO_CODEC,
+        engine_type=EngineType.STATELESS,
         autocast_dtype=None,
         force_float32_submodules=True,
         cuda_graph_capable=True,
