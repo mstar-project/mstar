@@ -135,7 +135,7 @@ class TestEngines:
 
     def test_enc_dec_engine_type(self):
         engine = StatelessEngine(make_enc_dec_config(torch.bfloat16))
-        assert engine.engine_type() == EngineType.ENC_DEC
+        assert engine.engine_type() == EngineType.STATELESS
 
     def test_enc_dec_engine_dummy_execute(self):
         engine = StatelessEngine(make_enc_dec_config(torch.bfloat16))
@@ -162,8 +162,8 @@ class TestEngineManager:
         ]
         mgr = EngineManager.build(configs, device="cpu")
         assert mgr.get_engine("LLM").engine_type() == EngineType.KV_CACHE
-        assert mgr.get_engine("text_emb").engine_type() == EngineType.ENC_DEC
-        assert mgr.get_engine("VAE_dec").engine_type() == EngineType.ENC_DEC
+        assert mgr.get_engine("text_emb").engine_type() == EngineType.STATELESS
+        assert mgr.get_engine("VAE_dec").engine_type() == EngineType.STATELESS
         # text_emb and image_emb share the same engine instance
         assert mgr.get_engine("text_emb") is mgr.get_engine("image_emb")
 

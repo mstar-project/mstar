@@ -107,7 +107,7 @@ def test_pi05_node_engine_types():
     model = _make_model()
     types = model.get_node_engine_types()
     assert types == {
-        "vit_encoder": EngineType.ENC_DEC,
+        "vit_encoder": EngineType.STATELESS,
         "LLM": EngineType.KV_CACHE,
     }
 
