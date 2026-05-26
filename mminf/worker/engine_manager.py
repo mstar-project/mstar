@@ -37,11 +37,6 @@ def _make_stateless_factory(
 # depends on the submodule (enc_dec vs audio_codec).
 ENGINE_TYPE_FACTORIES: dict[str, Callable[[torch.dtype | None, bool], BaseEngine]] = {
     "kv_cache": _make_kv_cache,
-    # Legacy stateless engine-type entries — kept while models migrate to
-    # ``EngineType.STATELESS`` + per-submodule flavor. Remove once no model
-    # declares ``ENC_DEC`` / ``AUDIO_CODEC`` directly.
-    "enc_dec": _make_stateless_factory(make_enc_dec_config),
-    "audio_codec": _make_stateless_factory(make_audio_codec_config),
 }
 
 
