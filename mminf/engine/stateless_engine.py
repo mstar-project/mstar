@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import torch
 
+from mminf.distributed.communication import WorkerTPGroups
 from mminf.engine.base import (
     BaseEngine,
     EngineType,
@@ -163,6 +164,7 @@ class StatelessEngine(BaseEngine):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
+        tp_groups: WorkerTPGroups,
         device: torch.device,
         **kwargs,
     ) -> None:

@@ -33,17 +33,31 @@ class ColumnParallelLinear(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(self.output_size_per_partition, self.input_size_per_partition, dtype=dtype)
         )
-        self.weight.weight_loader = self.weight_loader
         if bias:
             self.bias = nn.Parameter(
                 torch.empty(self.output_size_per_partition, dtype=dtype)
             )
-            self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
         self.gather_output = gather_output
         self.skip_bias_add = skip_bias_add
         self.comm_group = comm_group
+        self._attach_weight_loaders()
+
+    def _attach_weight_loaders(self) -> None:
+        """Attach the bound ``weight_loader`` to ``self.weight`` (and
+        ``self.bias`` if present). Re-run after any ``_apply`` because
+        ``to_empty`` / ``.to(...)`` re-allocates Parameters and drops
+        attribute attachments on the old objects.
+        """
+        self.weight.weight_loader = self.weight_loader
+        if self.bias is not None:
+            self.bias.weight_loader = self.weight_loader
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        self._attach_weight_loaders()
+        return result
 
     def weight_loader(
         self,
@@ -321,18 +335,30 @@ class RowParallelLinear(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(self.output_size_per_partition, self.input_size_per_partition, dtype=dtype)
         )
-        self.weight.weight_loader = self.weight_loader
         if bias:
             # Bias is on the output side (not sharded). Each rank holds the
             # full bias; only rank 0 adds it via the forward to avoid
             # double-add under all-reduce.
             self.bias = nn.Parameter(torch.empty(output_size, dtype=dtype))
-            self.bias.weight_loader = self._bias_loader
         else:
             self.register_parameter("bias", None)
 
         self.comm_group = comm_group
         self.skip_bias_add = skip_bias_add
+        self._attach_weight_loaders()
+
+    def _attach_weight_loaders(self) -> None:
+        """Re-attach loaders to ``self.weight`` (sharded) and ``self.bias``
+        (replicated). Called from ``__init__`` and re-applied after any
+        ``_apply`` transform (``to_empty`` / ``.to(...)``)."""
+        self.weight.weight_loader = self.weight_loader
+        if self.bias is not None:
+            self.bias.weight_loader = self._bias_loader
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        self._attach_weight_loaders()
+        return result
 
     def weight_loader(
         self,

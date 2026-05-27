@@ -1,9 +1,8 @@
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 import torch.distributed as dist
-
-from mminf.model.base import WorkerGraph
 
 
 class TPCommGroup:
@@ -144,12 +143,15 @@ class WorkerTPGroups:
             comm_group.init_process_group()
     
     def get_tp_config_for_node(self, node: str) -> TPCommGroup:
+        if node not in self.node_to_group:
+            self.node_to_group[node] = TPCommGroup.trivial()
         return self.node_to_group[node]
 
 
 class GlobalTPConfig:
     def __init__(
-        self, worker_graphs: dict[str, WorkerGraph],
+        # leaving type annotation as Any due to circular import
+        self, worker_graphs: dict[str, Any],
         worker_ids: list[str]
     ):
         self.num_workers = len(worker_ids)
@@ -161,7 +163,6 @@ class GlobalTPConfig:
 
         # (global rank, (group ranks...)) -> comm group
         self.comm_groups: dict[tuple[int, tuple], TPCommGroup] = {}
-
         for wg in worker_graphs.values():
             for rank_group in wg._tp_ranks:
                 rank_group_tuple = tuple(rank_group)

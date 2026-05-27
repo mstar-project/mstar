@@ -36,7 +36,7 @@ class ParallelAttention(nn.Module):
     def __init__(
         self,
         *,
-        comm_group: TPCommGroup,
+        comm_group: TPCommGroup | None = None,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -53,6 +53,8 @@ class ParallelAttention(nn.Module):
         input_hidden_size: int | None = None,
     ):
         super().__init__()
+        if comm_group is None:
+            comm_group = TPCommGroup.trivial()
         self.comm_group = comm_group
         self.hidden_size = hidden_size
         self.input_hidden_size = input_hidden_size or hidden_size

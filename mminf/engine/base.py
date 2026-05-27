@@ -7,6 +7,7 @@ import torch
 
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import CurrentForwardPassInfo
+from mminf.distributed.communication import WorkerTPGroups
 from mminf.engine.kv_store import KVCacheConfig, StoreWritePolicy
 
 
@@ -139,6 +140,7 @@ class BaseEngine(ABC):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
+        tp_groups: WorkerTPGroups,
         kv_cache_config: list[KVCacheConfig],
         device: torch.device,
         **kwargs

@@ -42,13 +42,15 @@ class ParallelGatedMLP(nn.Module):
 
     def __init__(
         self,
-        comm_group: TPCommGroup,
         hidden_size: int,
         intermediate_size: int,
+        comm_group: TPCommGroup | None = None,
         activation: str | Callable = "silu",
         bias: bool = False,
     ):
         super().__init__()
+        if comm_group is None:
+            comm_group = TPCommGroup.trivial()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.act = _resolve_activation(activation)

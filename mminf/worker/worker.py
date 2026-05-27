@@ -178,6 +178,7 @@ class Worker:
             device=device,
             kv_config=kv_config,
             model_config=model_config,
+            tp_groups=self.tp_groups,
             transfer_engine_info=TransferEngineInfo(
                 my_entity_id=worker_id,
                 my_session_id=self.tensor_manager.my_session_id,

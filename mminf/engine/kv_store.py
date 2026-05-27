@@ -17,6 +17,7 @@ from mminf.communication.tensors import (
     TransferReadInfo,
 )
 from mminf.conductor.request_info import SequenceInfo
+from mminf.distributed.utils import divide
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +82,21 @@ class KVCacheConfig:
     def __post_init__(self):
         if self.num_qo_heads is None:
             self.num_qo_heads = self.num_kv_heads
+        
+        self._sharded = False
+        self.original_num_kv_heads = self.num_kv_heads
 
     def get_node_str(self):
         if self.nodes is None:
             return "ALL_NODES"
         return "///".join(self.nodes)
+    
+    def shard(self, tp_size: int):
+        if tp_size >= self.original_num_kv_heads:
+            self.num_kv_heads = 1
+        else:
+            self.num_kv_heads = divide(self.original_num_kv_heads, tp_size)
+        self._sharded = True 
 
 
 

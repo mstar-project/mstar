@@ -8,9 +8,10 @@ the prefill walk.
 
 Composed from ``mminf.model.components`` — ``AdaRMSNorm`` for the
 conditional norms, ``GatedDecoderLayer`` for the gated-residual block,
-shared ``Attention`` / ``GatedMLP`` for the inner blocks. The
-model-specific pieces left here are ``Pi05TimeMLP`` (the sincos →
-adaRMS conditioning MLP) and the stack assembly.
+and the parallel-aware ``ParallelAttention`` / ``ParallelGatedMLP`` for
+the inner blocks (with a trivial single-rank comm group for the non-TP
+case). The model-specific pieces left here are ``Pi05TimeMLP`` (the
+sincos → adaRMS conditioning MLP) and the stack assembly.
 """
 from __future__ import annotations
 
@@ -18,12 +19,8 @@ import torch
 from torch import nn
 
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.model.components import (
-    AdaRMSNorm,
-    Attention,
-    GatedDecoderLayer,
-    GatedMLP,
-)
+from mminf.model.components import AdaRMSNorm, GatedDecoderLayer
+from mminf.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mminf.model.pi05.config import Pi05Config
 
 
@@ -59,7 +56,7 @@ def Pi05ActionExpertLayer(config: Pi05Config) -> GatedDecoderLayer:
     """
     h = config.action_hidden_size
     return GatedDecoderLayer(
-        self_attn=Attention(
+        self_attn=ParallelAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_qo_heads,
             num_kv_heads=config.num_kv_heads,
@@ -67,7 +64,11 @@ def Pi05ActionExpertLayer(config: Pi05Config) -> GatedDecoderLayer:
             input_hidden_size=h,
             rope_theta=config.rope_theta,
         ),
-        mlp=GatedMLP(h, config.action_intermediate_size, activation="gelu_tanh"),
+        mlp=ParallelGatedMLP(
+            hidden_size=h,
+            intermediate_size=config.action_intermediate_size,
+            activation="gelu_tanh",
+        ),
         input_layernorm=AdaRMSNorm(h, cond_dim=h, eps=config.rms_norm_eps),
         post_attention_layernorm=AdaRMSNorm(h, cond_dim=h, eps=config.rms_norm_eps),
     )
@@ -103,8 +104,3 @@ class Pi05ActionExpert(nn.Module):
             )
         out, _ = self.norm(query_sequence, adarms_cond)
         return out
-
-    def consolidate_fused_weights(self) -> None:
-        for layer in self.layers:
-            layer.self_attn.consolidate_qkv_weight()
-            layer.mlp.consolidate_gate_up_weight()

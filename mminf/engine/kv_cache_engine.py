@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, field
 import torch
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
+from mminf.distributed.communication import TPCommGroup, WorkerTPGroups
+from mminf.distributed.utils import divide
 from mminf.engine.base import (
     BaseEngine,
     EngineCapabilities,
@@ -45,6 +47,7 @@ class KVManagement:
 class SubmoduleManagement:
     submodule: ARNodeSubmodule
     kv_management: KVManagement
+    tp_group: TPCommGroup
     sampler: Sampler = field(default_factory=Sampler)
     cuda_graph_runner: CudaGraphRunner | None = None
 
@@ -88,6 +91,7 @@ class KVCacheEngine(BaseEngine):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
+        tp_groups: WorkerTPGroups,
         kv_cache_config: list[KVCacheConfig],
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
@@ -102,8 +106,23 @@ class KVCacheEngine(BaseEngine):
             num_layers = cfg.num_layers
             max_num_pages = cfg.max_num_pages
             page_size = cfg.page_size
-            num_kv_heads = cfg.num_kv_heads
             head_dim = cfg.head_dim
+
+            nodes = set(cfg.nodes or submodules.keys()) & set(submodules.keys())
+            world_sizes = set([
+                tp_groups.get_tp_config_for_node(node).world_size for node in nodes
+            ])
+            tp_ranks = set([
+                tp_groups.get_tp_config_for_node(node).rank for node in nodes
+            ])
+            if len(world_sizes) > 1 or len(tp_ranks) > 1:
+                raise RuntimeError(
+                    "It is disallowed to share a KV cache among colocated nodes "
+                    f"from different TP groups: {nodes}."
+                )
+            tp_size = world_sizes.pop()
+            cfg.shard(tp_size)
+            num_kv_heads = cfg.num_kv_heads
 
             kv_cache = torch.zeros(
                 num_layers, max_num_pages, 2,
@@ -139,13 +158,14 @@ class KVCacheEngine(BaseEngine):
             )
             self.kv_management[cfg.get_node_str()] = kv_mgmt
 
-            for node_name in (cfg.nodes or submodules.keys()):
+            for node_name in nodes:
                 node_to_kv_mgmt[node_name] = kv_mgmt
 
         for node_name, submodule in submodules.items():
             self.submodule_management[node_name] = SubmoduleManagement(
                 submodule=submodule,
                 kv_management=node_to_kv_mgmt[node_name],
+                tp_group=tp_groups.get_tp_config_for_node(node_name)
             )
 
 

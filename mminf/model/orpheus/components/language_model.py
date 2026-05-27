@@ -4,6 +4,11 @@ Built from the shared transformer components in ``mminf.model.components``.
 Orpheus uses standard Llama-style RMSNorm (Llama mode, not Gemma),
 SwiGLU MLP, GQA self-attention with Llama-3 RoPE scaling, and no
 QK-norm.
+
+QKV and gate/up projections are fused from construction via the
+parallel-linear classes (with a trivial single-rank comm group for the
+non-TP case). Weight loading goes through ``load_weights`` with stacked
+shard routing (no post-load consolidate step).
 """
 from __future__ import annotations
 
@@ -11,18 +16,14 @@ import torch
 from torch import nn
 
 from mminf.engine.kv_cache_engine import BatchedCacheManager
-from mminf.model.components import (
-    Attention,
-    DecoderLayer,
-    GatedMLP,
-    RMSNorm,
-)
+from mminf.model.components import DecoderLayer, RMSNorm
+from mminf.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mminf.model.orpheus.config import OrpheusModelConfig
 
 
 def _build_decoder_layer(config: OrpheusModelConfig) -> DecoderLayer:
     return DecoderLayer(
-        self_attn=Attention(
+        self_attn=ParallelAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -33,7 +34,7 @@ def _build_decoder_layer(config: OrpheusModelConfig) -> DecoderLayer:
             rope_high_freq_factor=config.rope_scaling["high_freq_factor"],
             rope_old_context_len=config.rope_scaling["original_max_position_embeddings"],
         ),
-        mlp=GatedMLP(
+        mlp=ParallelGatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             activation="silu",
@@ -67,11 +68,6 @@ class OrpheusLanguageModel(nn.Module):
         cache_handle.advance_seq_lens()
         return self.norm(query_sequence)
 
-    def consolidate_fused_weights(self) -> None:
-        for layer in self.layers:
-            layer.self_attn.consolidate_qkv_weight()
-            layer.mlp.consolidate_gate_up_weight()
-
 
 class OrpheusForCausalLM(nn.Module):
     def __init__(self, config: OrpheusModelConfig):
@@ -87,24 +83,8 @@ class OrpheusForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(query_sequence=query_sequence, cache_handle=cache_handle)
 
-    def consolidate_fused_weights(self) -> None:
-        self.model.consolidate_fused_weights()
-
     def load_weights(self, weights):
-        """Load weights from a ``(name, tensor)`` iterable into this model.
+        """Load HF Llama-style weights into the fused parameters."""
+        from mminf.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 
-        Orpheus's HF Llama checkpoint key naming already matches this
-        module's parameter paths, so no name remap or stacked-shard
-        routing is needed; each tensor is dispatched to the matching
-        parameter via the default copy. After load, the separate
-        ``q/k/v_proj`` and ``gate/up_proj`` Linears are fused into
-        single buffers for the fast forward path.
-        """
-        from mminf.model.loader import load_weights_into
-
-        loaded = load_weights_into(
-            self, weights,
-            skip_predicate=lambda n: "rotary_emb" in n,
-        )
-        self.consolidate_fused_weights()
-        return loaded
+        return load_hf_weights(self, weights, stacked_params=LLAMA_STACKED_PARAMS)

@@ -20,7 +20,7 @@ from mminf.communication.tensors import (
     create_tensor_communication_manager,
 )
 from mminf.distributed.base import ShardingConfig, ShardingGroup
-from mminf.graph.base import GraphEdge
+from mminf.graph.base import GraphEdge, NodeAndGraphWalk
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +93,17 @@ def _drain_reads(manager, request_id, graph_edges, graph_walk):
 def _send(
     manager, request_id: str, signal: str, dest_node: str,
     tensor: torch.Tensor, source_tp_rank: int, source_tp_size: int,
+    fanin: int, shard_dim: int
 ) -> GraphEdge:
     """Producer side: store the tensor, stamp source TP info into the edge's
     tensor_info, and register for send. Returns the edge for the receiver
     to consume.
     """
-    edge = GraphEdge(next_node=dest_node, name=signal)
+    edge = GraphEdge(
+        next_node=dest_node, name=signal,
+        _total_fanin=fanin, 
+        _shard_dim=shard_dim
+    )
     manager.store_and_populate_graph_edges(
         request_id, {signal: [tensor]}, [edge],
     )
@@ -123,14 +128,15 @@ def test_basic_replicated_roundtrip(make_manager, protocol):
     receiver = make_manager("w1", protocol)
     cfg = _setup_cfg(
         groups=[], shard_dim={"x": None},
-        node_to_worker={("A", "decode"): ["w0"], ("B", "decode"): ["w1"]},
+        node_to_worker={NodeAndGraphWalk("A", "decode"): ["w0"], NodeAndGraphWalk("B", "decode"): ["w1"]},
     )
     sender.register_request("req1", cfg)
     receiver.register_request("req1", cfg)
 
     original = torch.randn(4, 8)
     edge = _send(sender, "req1", "x", "B", original,
-                 source_tp_rank=0, source_tp_size=1)
+                 source_tp_rank=0, source_tp_size=1,
+                 fanin=1, shard_dim=None)
 
     _drain_reads(receiver, "req1", [deepcopy(edge)], graph_walk="decode")
     ready = receiver.get_ready_tensors(graph_walk="decode")
@@ -154,16 +160,16 @@ def test_sharded_tp2_to_tp1_fanin_consolidates(make_manager, protocol):
     a_grp.register_workers(["w0", "w1"], my_tp_rank=0)
     cfg = ShardingConfig(groups=[a_grp], shard_dim={"x": 1})
     cfg.setup({
-        ("A", "decode"): ["w0", "w1"],
-        ("B", "decode"): ["w2"],
+        NodeAndGraphWalk("A", "decode"): ["w0", "w1"],
+        NodeAndGraphWalk("B", "decode"): ["w2"],
     })
     for m in (sender0, sender1, receiver):
         m.register_request("req1", cfg)
 
     shard0 = torch.randn(4, 8)
     shard1 = torch.randn(4, 8)
-    edge0 = _send(sender0, "req1", "x", "B", shard0, 0, 2)
-    edge1 = _send(sender1, "req1", "x", "B", shard1, 1, 2)
+    edge0 = _send(sender0, "req1", "x", "B", shard0, 0, 2, fanin=2, shard_dim=1)
+    edge1 = _send(sender1, "req1", "x", "B", shard1, 1, 2, fanin=2, shard_dim=1)
 
     _drain_reads(
         receiver, "req1", [deepcopy(edge0), deepcopy(edge1)], graph_walk="decode",
@@ -188,16 +194,16 @@ def test_fanin_buffers_partial_then_completes(make_manager, protocol):
     a_grp.register_workers(["w0", "w1"], my_tp_rank=0)
     cfg = ShardingConfig(groups=[a_grp], shard_dim={"x": 0})
     cfg.setup({
-        ("A", "decode"): ["w0", "w1"],
-        ("B", "decode"): ["w2"],
+        NodeAndGraphWalk("A", "decode"): ["w0", "w1"],
+        NodeAndGraphWalk("B", "decode"): ["w2"],
     })
     for m in (sender0, sender1, receiver):
         m.register_request("req1", cfg)
 
     shard0 = torch.randn(3, 4)
     shard1 = torch.randn(3, 4)
-    edge0 = _send(sender0, "req1", "x", "B", shard0, 0, 2)
-    edge1 = _send(sender1, "req1", "x", "B", shard1, 1, 2)
+    edge0 = _send(sender0, "req1", "x", "B", shard0, 0, 2, fanin=2, shard_dim=0)
+    edge1 = _send(sender1, "req1", "x", "B", shard1, 1, 2, fanin=2, shard_dim=0)
 
     # First poll: only shard 0 has arrived — buffered, nothing emitted.
     _drain_reads(receiver, "req1", [deepcopy(edge0)], graph_walk="decode")
@@ -226,8 +232,8 @@ def test_sharded_tp4_to_tp2_fanin(make_manager, protocol):
     receivers = [make_manager(f"w{i}", protocol) for i in (4, 5)]
 
     node_to_worker = {
-        ("A", "decode"): ["w0", "w1", "w2", "w3"],
-        ("B", "decode"): ["w4", "w5"],
+        NodeAndGraphWalk("A", "decode"): ["w0", "w1", "w2", "w3"],
+        NodeAndGraphWalk("B", "decode"): ["w4", "w5"],
     }
 
     # Receiver configs differ only in dst group's _tp_rank.
@@ -254,7 +260,8 @@ def test_sharded_tp4_to_tp2_fanin(make_manager, protocol):
     shards = [torch.randn(2, 6) for _ in range(4)]
     edges = [
         _send(senders[i], "req1", "x", "B", shards[i],
-              source_tp_rank=i, source_tp_size=4)
+              source_tp_rank=i, source_tp_size=4,
+              fanin=2, shard_dim=0)
         for i in range(4)
     ]
 
@@ -294,7 +301,7 @@ def test_sharded_with_nonzero_shard_dim_roundtrips(make_manager, protocol):
     cfg = _setup_cfg(
         groups=[], shard_dim={"x": 1},
         node_to_worker={
-            ("A", "decode"): ["w0"], ("B", "decode"): ["w1"],
+            NodeAndGraphWalk("A", "decode"): ["w0"], NodeAndGraphWalk("B", "decode"): ["w1"],
         },
     )
     sender.register_request("req1", cfg)
@@ -302,7 +309,8 @@ def test_sharded_with_nonzero_shard_dim_roundtrips(make_manager, protocol):
 
     original = torch.randn(3, 5, 7)
     edge = _send(sender, "req1", "x", "B", original,
-                 source_tp_rank=0, source_tp_size=1)
+                 source_tp_rank=0, source_tp_size=1,
+                 fanin=1, shard_dim=1)
     _drain_reads(receiver, "req1", [deepcopy(edge)], graph_walk="decode")
     ready = receiver.get_ready_tensors(graph_walk="decode")
     assert "req1" in ready and len(ready["req1"]) == 1
@@ -323,8 +331,8 @@ def test_colocated_replicated_to_sharded_slices_locally(make_manager, protocol):
     cfg = _setup_cfg(
         groups=[llm_group], shard_dim={"hidden": 1},
         node_to_worker={
-            ("encoder", "decode"): ["w0"],
-            ("LLM", "decode"): ["w0", "w1"],
+            NodeAndGraphWalk("encoder", "decode"): ["w0"],
+            NodeAndGraphWalk("LLM", "decode"): ["w0", "w1"],
         },
     )
     mgr.register_request("req1", cfg)
@@ -334,7 +342,8 @@ def test_colocated_replicated_to_sharded_slices_locally(make_manager, protocol):
     # original, which in canonical layout is the first 4 rows.
     original = torch.randn(4, 8)
     edge = _send(mgr, "req1", "hidden", "LLM", original,
-                 source_tp_rank=0, source_tp_size=1)
+                 source_tp_rank=0, source_tp_size=1,
+                 fanin=1, shard_dim=1)
     producer_uuid = edge.tensor_info[0].uuid
 
     # Simulate the cross-worker LLM rank 1's pending read by pre-bumping the

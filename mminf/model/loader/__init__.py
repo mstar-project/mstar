@@ -14,8 +14,11 @@ Top-level driver: ``load_weights(model, source)`` picks the right
 iterator and calls ``model.load_weights(...)``.
 """
 from mminf.model.loader.base import (
+    HF_DEFAULT_SKIP_FRAGMENTS,
+    LLAMA_STACKED_PARAMS,
     StackedParamRule,
     default_weight_loader,
+    load_hf_weights,
     load_weights,
     load_weights_into,
 )
@@ -25,8 +28,11 @@ from mminf.model.loader.iterators import (
 )
 
 __all__ = [
+    "HF_DEFAULT_SKIP_FRAGMENTS",
+    "LLAMA_STACKED_PARAMS",
     "StackedParamRule",
     "default_weight_loader",
+    "load_hf_weights",
     "load_weights",
     "load_weights_into",
     "iter_safetensors_file",

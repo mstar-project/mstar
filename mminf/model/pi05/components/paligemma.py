@@ -6,9 +6,9 @@ the prefix tokens (image + language + state) and writes the KV cache
 that the action expert later reads during action generation.
 
 Composed entirely from ``mminf.model.components`` — Gemma RMSNorm
-(``gemma_mode=True``), GELU-tanh GatedMLP, and the standard Attention
-block. The model-specific piece is just the stack assembly + final norm
-+ ``consolidate_fused_weights`` post-load hook.
+(``gemma_mode=True``), GELU-tanh ``ParallelGatedMLP``, and a standard
+``ParallelAttention`` block (with a trivial single-rank comm group for
+the non-TP case, so the same code runs for TP=1 and TP>1).
 """
 from __future__ import annotations
 
@@ -16,12 +16,8 @@ import torch
 from torch import nn
 
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.model.components import (
-    Attention,
-    DecoderLayer,
-    GatedMLP,
-    RMSNorm,
-)
+from mminf.model.components import DecoderLayer, RMSNorm
+from mminf.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mminf.model.pi05.config import Pi05Config
 
 
@@ -39,7 +35,7 @@ def _build_paligemma_layer(
     h = input_hidden_size if input_hidden_size is not None else config.hidden_size
     inter = intermediate_size if intermediate_size is not None else config.pali_intermediate_size
     return DecoderLayer(
-        self_attn=Attention(
+        self_attn=ParallelAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_qo_heads,
             num_kv_heads=config.num_kv_heads,
@@ -47,7 +43,11 @@ def _build_paligemma_layer(
             input_hidden_size=h,
             rope_theta=config.rope_theta,
         ),
-        mlp=GatedMLP(h, inter, activation="gelu_tanh"),
+        mlp=ParallelGatedMLP(
+            hidden_size=h,
+            intermediate_size=inter,
+            activation="gelu_tanh",
+        ),
         input_layernorm=RMSNorm(h, eps=config.rms_norm_eps, gemma_mode=True),
         post_attention_layernorm=RMSNorm(h, eps=config.rms_norm_eps, gemma_mode=True),
     )
@@ -86,11 +86,3 @@ class Pi05PaliGemmaExpert(nn.Module):
             cache_handle.advance_seq_lens()
 
         return self.norm(query_sequence)
-
-    def consolidate_fused_weights(self) -> None:
-        """Fuse separate q/k/v and gate/up Linears into single buffers.
-        Call after weight loading.
-        """
-        for layer in self.layers:
-            layer.self_attn.consolidate_qkv_weight()
-            layer.mlp.consolidate_gate_up_weight()

@@ -4,6 +4,7 @@ from typing import Callable
 
 import torch
 
+from mminf.distributed.communication import WorkerTPGroups
 from mminf.engine.base import BaseEngine, EngineType
 from mminf.engine.kv_cache_engine import KVCacheEngine
 from mminf.engine.kv_store import KVCacheConfig, TransferEngineInfo
@@ -64,6 +65,7 @@ class EngineManager:
         device: torch.device,
         kv_config: list[KVCacheConfig],
         model_config: dict,
+        tp_groups: WorkerTPGroups,
         transfer_engine_info: TransferEngineInfo,
         model: Model,
         enable_nvtx: bool = False,
@@ -129,6 +131,7 @@ class EngineManager:
 
             engine.load_model(
                 submodules,
+                tp_groups=tp_groups,
                 kv_cache_config=kv_config,
                 device=device,
                 transfer_engine_info=transfer_engine_info,

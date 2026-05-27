@@ -145,6 +145,53 @@ def load_weights_into(
     return loaded
 
 
+# Standard HF checkpoint keys that aren't loadable model parameters:
+# precomputed rotary_emb buffers (every Llama-flavored checkpoint
+# carries these) and similar non-parameter artifacts.
+HF_DEFAULT_SKIP_FRAGMENTS: tuple[str, ...] = (
+    "rotary_emb",
+)
+
+# Standard fused-projection routing used by Llama/Qwen/Mistral/Gemma/etc.:
+# checkpoint stores ``q/k/v_proj`` and ``gate/up_proj`` separately; the
+# model holds fused ``qkv_proj`` and ``gate_up_proj`` parameters with
+# per-shard ``weight_loader`` methods.
+LLAMA_STACKED_PARAMS: list[StackedParamRule] = [
+    StackedParamRule(".qkv_proj",     ".q_proj",    "q"),
+    StackedParamRule(".qkv_proj",     ".k_proj",    "k"),
+    StackedParamRule(".qkv_proj",     ".v_proj",    "v"),
+    StackedParamRule(".gate_up_proj", ".gate_proj", 0),
+    StackedParamRule(".gate_up_proj", ".up_proj",   1),
+]
+
+
+def load_hf_weights(
+    module: nn.Module,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    stacked_params: list[StackedParamRule] | None = None,
+    name_remapper: Callable[[str], str | None] | None = None,
+    extra_skip_fragments: tuple[str, ...] = (),
+) -> set[str]:
+    """Convenience wrapper for HF-style checkpoint loading.
+
+    Combines ``load_weights_into`` with the standard HF skip predicate
+    (``HF_DEFAULT_SKIP_FRAGMENTS``). Use when the model's parameter
+    paths line up with HF naming after the supplied stacked rules /
+    ``name_remapper`` are applied.
+    """
+    skip_fragments = HF_DEFAULT_SKIP_FRAGMENTS + tuple(extra_skip_fragments)
+
+    def skip(name: str) -> bool:
+        return any(frag in name for frag in skip_fragments)
+
+    return load_weights_into(
+        module, weights,
+        stacked_params=stacked_params,
+        name_remapper=name_remapper,
+        skip_predicate=skip,
+    )
+
+
 def load_weights(
     model: nn.Module,
     source: str | Path,
