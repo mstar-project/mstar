@@ -52,11 +52,13 @@ class MicroScheduler:
 
     def __init__(
         self, engine_manager: EngineManager,
-        sched_type=SchedulingType.ROUND_ROBIN
+        sched_type=SchedulingType.ROUND_ROBIN,
+        tp_rank_zero_nodes: set[str] | None = None,
     ):
         self.engine_manager = engine_manager
         self.batch_number = 0
         self.sched_type = sched_type
+        self.tp_rank_zero_nodes = tp_rank_zero_nodes
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[str, float] = {}
@@ -152,6 +154,8 @@ class MicroScheduler:
                 if request_id in self.held_until:
                     continue
                 for sname in node_names:
+                    if sname not in self.tp_rank_zero_nodes:
+                        continue # only rank 0 can initiate scheduling!
                     if target_node_name is not None and sname != target_node_name:
                         continue
                     node_partition = worker_graphs_manager.get_partition_for_node(sname)

@@ -208,7 +208,13 @@ class Worker:
             worker_id=self.worker_id
         )
 
-        self.scheduler = MicroScheduler(self.engine_manager)
+        self.tp_rank_zero_nodes = set([
+            node for node in node_names if self.tp_groups.get_tp_config_for_node(node).rank == 0
+        ])
+        self.scheduler = MicroScheduler(
+            self.engine_manager,
+            tp_rank_zero_nodes=self.tp_rank_zero_nodes
+        )
 
         # Determine store write policy based on worker graph topology
         node_engine_types = model.get_node_engine_types() if model is not None else {}
