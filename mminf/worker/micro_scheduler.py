@@ -128,7 +128,6 @@ class MicroScheduler:
     def register_tp_follow(
         self, message: ScheduleTPNode
     ):
-        print("REGISTER TP FOLLOW", message)
         self.tp_batches_pending_schedule.append(message)
     
     def _try_schedule_tp_follow(
@@ -151,7 +150,7 @@ class MicroScheduler:
         queue = worker_graphs_manager.queues[wgid]
         for rid in first_tp_node.request_ids:
             wg = queue.per_request_queues[rid]
-            if rid not in wg.ready_node_names:
+            if first_tp_node.node_name not in wg.ready_node_names:
                 return
             fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
             # check if the node is ready on the engine level

@@ -754,6 +754,7 @@ class KVCacheEngine(BaseEngine):
         node_inputs = planned.node_inputs
         submod_mgmt = planned.prepared.metadata["submod_mgmt"]
         sampler = submod_mgmt.sampler
+        submod_mgmt.tp_group.barrier()
 
         if self._can_use_cuda_graph(batch, node_inputs):
             if self.enable_nvtx:

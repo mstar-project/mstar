@@ -6,5 +6,5 @@ node_groups:
     tp_size: 2
     graph_walks: [prefill, decode]
   - node_names: [snac_decoder]
-    ranks: [2]
+    ranks: [0]
     graph_walks: [snac_chunk]

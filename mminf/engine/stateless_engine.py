@@ -174,6 +174,7 @@ class StatelessEngine(BaseEngine):
         else:
             self.submodules = dict(submodules)
         self.device = device
+        self.tp_groups = tp_groups
 
     def add_request(self, request_id: str, **kwargs) -> None:
         pass  # stateless
@@ -217,6 +218,7 @@ class StatelessEngine(BaseEngine):
                 f"engine.{self.config.name}.{batch.node_name}."
                 f"{batch.graph_walk}.bs{len(batch.request_ids)}"
             )
+        self.tp_groups.get_tp_config_for_node(batch.node_name).barrier()
         submodule = self.submodules.get(batch.node_name)
         per_submodule_dtype = submodule.get_autocast_dtype() if submodule is not None else None
         try:
@@ -546,6 +548,7 @@ class StatelessEngine(BaseEngine):
                 submodule_name=node_name,
                 submodule=submodule,
                 device=self.device,
+                tp_group=self.tp_groups.get_tp_config_for_node(node_name)
             )
             runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()
