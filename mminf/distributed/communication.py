@@ -59,6 +59,11 @@ class TPCommGroup:
             + input_size[dim + 1 :]
         )
         return output_tensor
+    
+    def barrier(self):
+        if self.world_size == 1:
+            return
+        dist.barrier(group=self.device_group)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
@@ -115,9 +120,12 @@ class WorkerTPGroups:
 
     def add(self, node: str, comm_group: TPCommGroup):
         # disallow colocation of multiple comm groups on the same node
-        assert node not in self.node_to_group, \
-            f"Node {node} already has a comm group assigned for worker {self.global_rank}"
-        self.node_to_group[node] = comm_group
+        if node in self.node_to_group and self.node_to_group[node].group_members != comm_group.group_members:
+            raise RuntimeError(
+                f"Node {node} already has a comm group assigned for worker {self.global_rank}"
+            )
+        if node not in self.node_to_group:
+            self.node_to_group[node] = comm_group
     
     def init_dist(
         self, init_method="tcp://127.0.0.1:29500"

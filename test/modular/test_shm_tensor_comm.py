@@ -35,7 +35,7 @@ class MockCommunicator(BaseCommunicator):
 
 
 def _empty_sharding_config() -> ShardingConfig:
-    cfg = ShardingConfig(groups=[], shard_dim={})
+    cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[], shard_dim={})
     cfg.setup({})
     return cfg
 

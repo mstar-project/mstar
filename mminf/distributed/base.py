@@ -1,6 +1,6 @@
 from collections import defaultdict
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mminf.graph.base import GraphEdge, NodeAndGraphWalk
 
@@ -61,6 +61,7 @@ class ShardingConfig:
     def clone_empty(self):
         return ShardingConfig(
             groups=[group.clone_empty() for group in self.groups],
+            tp_enabled_nodes=self.tp_enabled_nodes,
             shard_dim=self.shard_dim
         )
     

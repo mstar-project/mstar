@@ -822,6 +822,7 @@ class Worker:
     def maybe_send_zmq_to_tp_followers(
         self, node_batch: NodeBatch
     ):
+        print(self.tp_nodes, self.tp_rank_zero_nodes)
         if node_batch.node_name not in self.tp_nodes or \
                 node_batch.node_name not in self.tp_rank_zero_nodes:
             return
@@ -834,6 +835,7 @@ class Worker:
             node_batch.node_name, node_batch.graph_walk
         )._workers[1:]
         for worker in workers:
+            print("SEND MSG", worker)
             self.communicator.send(
                 worker, msg=WorkerMessage(
                     message_type=WorkerMessageType.SCHEDULE_TP,

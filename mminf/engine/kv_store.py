@@ -85,6 +85,7 @@ class KVCacheConfig:
         
         self._sharded = False
         self.original_num_kv_heads = self.num_kv_heads
+        self.original_num_qo_heads =  self.num_qo_heads
 
     def get_node_str(self):
         if self.nodes is None:
@@ -96,7 +97,8 @@ class KVCacheConfig:
             self.num_kv_heads = 1
         else:
             self.num_kv_heads = divide(self.original_num_kv_heads, tp_size)
-        self._sharded = True 
+        self.num_qo_heads = divide(self.original_num_qo_heads, tp_size)
+        self._sharded = True
 
 
 

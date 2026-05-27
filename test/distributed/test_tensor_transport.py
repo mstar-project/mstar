@@ -73,7 +73,7 @@ def make_manager(tmp_path):
 
 
 def _setup_cfg(*, groups, shard_dim, node_to_worker) -> ShardingConfig:
-    cfg = ShardingConfig(groups=list(groups), shard_dim=shard_dim)
+    cfg = ShardingConfig(tp_enabled_nodes=set(), groups=list(groups), shard_dim=shard_dim)
     cfg.setup(node_to_worker)
     return cfg
 
@@ -158,7 +158,7 @@ def test_sharded_tp2_to_tp1_fanin_consolidates(make_manager, protocol):
     # auto-singleton via setup() with _tp_rank=0.
     a_grp = ShardingGroup(nodes={"A"}, tp_size=2, graph_walks={"decode"})
     a_grp.register_workers(["w0", "w1"], my_tp_rank=0)
-    cfg = ShardingConfig(groups=[a_grp], shard_dim={"x": 1})
+    cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[a_grp], shard_dim={"x": 1})
     cfg.setup({
         NodeAndGraphWalk("A", "decode"): ["w0", "w1"],
         NodeAndGraphWalk("B", "decode"): ["w2"],
@@ -192,7 +192,7 @@ def test_fanin_buffers_partial_then_completes(make_manager, protocol):
     receiver = make_manager("w2", protocol)
     a_grp = ShardingGroup(nodes={"A"}, tp_size=2, graph_walks={"decode"})
     a_grp.register_workers(["w0", "w1"], my_tp_rank=0)
-    cfg = ShardingConfig(groups=[a_grp], shard_dim={"x": 0})
+    cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[a_grp], shard_dim={"x": 0})
     cfg.setup({
         NodeAndGraphWalk("A", "decode"): ["w0", "w1"],
         NodeAndGraphWalk("B", "decode"): ["w2"],
@@ -242,7 +242,7 @@ def test_sharded_tp4_to_tp2_fanin(make_manager, protocol):
         src.register_workers(["w0", "w1", "w2", "w3"], my_tp_rank=0)
         dst = ShardingGroup(nodes={"B"}, tp_size=2, graph_walks={"decode"})
         dst.register_workers(["w4", "w5"], my_tp_rank=my_rank)
-        cfg = ShardingConfig(groups=[src, dst], shard_dim={"x": 0})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[src, dst], shard_dim={"x": 0})
         cfg.setup(node_to_worker)
         return cfg
 
@@ -250,7 +250,7 @@ def test_sharded_tp4_to_tp2_fanin(make_manager, protocol):
     a_grp.register_workers(["w0", "w1", "w2", "w3"], my_tp_rank=0)
     b_grp = ShardingGroup(nodes={"B"}, tp_size=2, graph_walks={"decode"})
     b_grp.register_workers(["w4", "w5"], my_tp_rank=0)
-    sender_cfg = ShardingConfig(groups=[a_grp, b_grp], shard_dim={"x": 0})
+    sender_cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[a_grp, b_grp], shard_dim={"x": 0})
     sender_cfg.setup(node_to_worker)
     for s in senders:
         s.register_request("req1", sender_cfg)

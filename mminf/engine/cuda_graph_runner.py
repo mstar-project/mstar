@@ -160,11 +160,16 @@ class CudaGraphRunner:
         buffer_manager: WorkspaceBufferManager,
         device: torch.device,
         autocast_dtype: torch.dtype,
-        tp_world_size: int = 1,
+        tp_group=None,
     ):
+        from mminf.distributed.communication import TPCommGroup
+
         self.submodule_name = submodule_name
         self.submodule = submodule
-        self.capture_configs: list[CudaGraphConfig] = submodule.get_cuda_graph_configs(device, tp_world_size)
+        self.tp_group: TPCommGroup = tp_group or TPCommGroup.trivial()
+        self.capture_configs: list[CudaGraphConfig] = submodule.get_cuda_graph_configs(
+            device, self.tp_group.world_size
+        )
         self.kv_cache_config = kv_cache_config
         self.alloc_manager = alloc_manager
         self.sampler = sampler
@@ -230,6 +235,7 @@ class CudaGraphRunner:
                         requires_cfg=config.requires_cfg,
                         bs=bs, num_tokens=num_tokens
                     )
+                    self.tp_group.barrier()
                     try:
                         cfg_type = config.get_config_type()
                         if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
@@ -1878,11 +1884,14 @@ class StatelessCudaGraphRunner:
         submodule_name: str,
         submodule: nn.Module,
         device: torch.device,
-        tp_world_size: int = 1,
+        tp_group=None,
     ):
+        from mminf.distributed.communication import TPCommGroup
+
         self.submodule_name = submodule_name
         self.submodule = submodule
         self.device = device
+        tp_world_size = tp_group.world_size if tp_group is not None else 1
         self.capture_configs: list[CudaGraphConfig] = (
             submodule.get_cuda_graph_configs(device, tp_world_size) if submodule is not None else []
         )

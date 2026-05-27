@@ -470,6 +470,7 @@ class Conductor:
                     dest_graph_walk=graph_walk,
                     source_tp_rank=src_rank,
                 )
+                print("FANOUT", fanout)
                 for dest_worker, sliced_edge in fanout.items():
                     inputs_per_worker[dest_worker].append(sliced_edge)
         return inputs_per_worker

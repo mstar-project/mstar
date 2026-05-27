@@ -128,6 +128,7 @@ class MicroScheduler:
     def register_tp_follow(
         self, message: ScheduleTPNode
     ):
+        print("REGISTER TP FOLLOW", message)
         self.tp_batches_pending_schedule.append(message)
     
     def _try_schedule_tp_follow(

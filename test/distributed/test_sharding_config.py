@@ -55,7 +55,7 @@ class TestSetup:
     def test_setup_maps_explicit_groups(self):
         llm = ShardingGroup(nodes={"LLM"}, tp_size=2, graph_walks={"decode"})
         llm.register_workers(["w0", "w1"], my_tp_rank=0)
-        cfg = ShardingConfig(groups=[llm], shard_dim={})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[llm], shard_dim={})
         cfg.setup({
             NodeAndGraphWalk("LLM", "decode"): ["w0", "w1"],
             NodeAndGraphWalk("encoder", "prefill"): ["w0"],
@@ -72,7 +72,7 @@ class TestSetup:
         """A group with graph_walks=None should map every observed walk."""
         all_walks = ShardingGroup(nodes={"LLM"}, tp_size=2, graph_walks=None)
         all_walks.register_workers(["w0", "w1"], my_tp_rank=0)
-        cfg = ShardingConfig(groups=[all_walks], shard_dim={})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[all_walks], shard_dim={})
         cfg.setup({
             NodeAndGraphWalk("LLM", "prefill"): ["w0", "w1"],
             NodeAndGraphWalk("LLM", "decode"): ["w0", "w1"],
@@ -89,7 +89,7 @@ class TestSetup:
         """
         g = ShardingGroup(nodes={"LLM"}, tp_size=1, graph_walks=None)
         g.register_workers(["w0"], my_tp_rank=0)
-        cfg = ShardingConfig(groups=[g], shard_dim={})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[g], shard_dim={})
         cfg.setup({
             NodeAndGraphWalk("LLM", "decode"): ["w0"],
             NodeAndGraphWalk("encoder", "prefill"): ["w0"],
@@ -99,14 +99,14 @@ class TestSetup:
 
     def test_setup_singleton_workers_are_unwrapped(self):
         """Regression: setup used to do set([list_of_workers]) which TypeErrors."""
-        cfg = ShardingConfig(groups=[], shard_dim={})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[], shard_dim={})
         cfg.setup({NodeAndGraphWalk("encoder", "prefill"): ["w3"]})
         enc = cfg.group_mapping[NodeAndGraphWalk("encoder", "prefill")]
         assert enc._workers_set == {"w3"}
         assert enc._workers == ["w3"]
 
     def test_compute_fanout_requires_setup(self):
-        cfg = ShardingConfig(groups=[], shard_dim={})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[], shard_dim={})
         with pytest.raises(RuntimeError, match="setup"):
             cfg.compute_fanout(
                 signal="x", source_graph_walk="decode",
@@ -136,7 +136,7 @@ def _make_config(
         g = ShardingGroup(nodes=set(nodes), tp_size=tp_size, graph_walks=gw)
         g.register_workers(workers, my_tp_rank=0)
         sg_list.append(g)
-    cfg = ShardingConfig(groups=sg_list, shard_dim=shard_dim)
+    cfg = ShardingConfig(tp_enabled_nodes=set(), groups=sg_list, shard_dim=shard_dim)
     cfg.setup(node_to_worker)
     return cfg
 
@@ -411,7 +411,7 @@ class TestFanin:
         a.register_workers(["w0", "w1"], my_tp_rank=0)
         b = ShardingGroup(nodes={"B"}, tp_size=2, graph_walks={"decode"})
         b.register_workers(["w2", "w3"], my_tp_rank=dest_rank)
-        cfg = ShardingConfig(groups=[a, b], shard_dim={"x": 1})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[a, b], shard_dim={"x": 1})
         cfg.setup({
             NodeAndGraphWalk("A", "decode"): ["w0", "w1"],
             NodeAndGraphWalk("B", "decode"): ["w2", "w3"],
@@ -427,7 +427,7 @@ class TestFanin:
         """Source covers entire range, every dest reads from it: fanin=1."""
         b = ShardingGroup(nodes={"B"}, tp_size=4, graph_walks={"decode"})
         b.register_workers(["w1", "w2", "w3", "w4"], my_tp_rank=dest_rank)
-        cfg = ShardingConfig(groups=[b], shard_dim={"x": 1})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[b], shard_dim={"x": 1})
         cfg.setup({
             NodeAndGraphWalk("A", "decode"): ["w0"],
             NodeAndGraphWalk("B", "decode"): ["w1", "w2", "w3", "w4"],
@@ -445,7 +445,7 @@ class TestFanin:
         a.register_workers(["w0", "w1", "w2", "w3"], my_tp_rank=0)
         b = ShardingGroup(nodes={"B"}, tp_size=2, graph_walks={"decode"})
         b.register_workers(["w4", "w5"], my_tp_rank=dest_rank)
-        cfg = ShardingConfig(groups=[a, b], shard_dim={"x": 1})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[a, b], shard_dim={"x": 1})
         cfg.setup({
             NodeAndGraphWalk("A", "decode"): ["w0", "w1", "w2", "w3"],
             NodeAndGraphWalk("B", "decode"): ["w4", "w5"],
@@ -467,7 +467,7 @@ class TestFanin:
         a.register_workers(["w0", "w1"], my_tp_rank=0)
         b = ShardingGroup(nodes={"B"}, tp_size=3, graph_walks={"decode"})
         b.register_workers(["w2", "w3", "w4"], my_tp_rank=dest_rank)
-        cfg = ShardingConfig(groups=[a, b], shard_dim={"x": 1})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[a, b], shard_dim={"x": 1})
         cfg.setup({
             NodeAndGraphWalk("A", "decode"): ["w0", "w1"],
             NodeAndGraphWalk("B", "decode"): ["w2", "w3", "w4"],
@@ -486,7 +486,7 @@ class TestCrossGraphWalkAndAllFanouts:
         prefill_grp.register_workers(["w0", "w1", "w2", "w3"], my_tp_rank=0)
         decode_grp = ShardingGroup(nodes={"LLM"}, tp_size=2, graph_walks={"decode"})
         decode_grp.register_workers(["w4", "w5"], my_tp_rank=0)
-        cfg = ShardingConfig(groups=[prefill_grp, decode_grp], shard_dim={"kv": 0})
+        cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[prefill_grp, decode_grp], shard_dim={"kv": 0})
         cfg.setup({
             NodeAndGraphWalk("LLM", "prefill"): ["w0", "w1", "w2", "w3"],
             NodeAndGraphWalk("LLM", "decode"): ["w4", "w5"],
