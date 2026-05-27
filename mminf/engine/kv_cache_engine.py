@@ -650,7 +650,8 @@ class KVCacheEngine(BaseEngine):
         """
         if batch.node_name not in self.submodule_management:
             return
-        cache_mgmt = self.submodule_management[batch.node_name].kv_management
+        submod_mgmt = self.submodule_management[batch.node_name]
+        cache_mgmt = submod_mgmt.kv_management
         kv_cache_string = cache_mgmt.kv_cache_config.get_node_str()
         for req_id in batch.request_ids:
             info = batch.per_request_info.get(req_id)
@@ -658,6 +659,8 @@ class KVCacheEngine(BaseEngine):
                 continue
             info.per_label_seq_info.add(
                 kv_cache_string,
+                submod_mgmt.tp_group.rank,
+                submod_mgmt.tp_group.world_size,
                 cache_mgmt.alloc_manager.get_per_label_seq_info(req_id),
             )
 
@@ -679,8 +682,15 @@ class KVCacheEngine(BaseEngine):
 
         if self.enable_nvtx:
             range_push("kv_cache.kv_sync_retrieve", synchronize=False)
+        world_size = submod_mgmt.tp_group.world_size
         for req_id, info in batch.per_request_info.items():
-            for label, seq_info in info.per_label_seq_info.get(kv_cache_string).items():
+            if info.per_label_seq_info.world_size.get(kv_cache_string, world_size) != world_size:
+                raise RuntimeError(
+                    "KV cache transfer across TP world size is currently disallowed"
+                ) # TODO: figure out fanin/fanout for KV cache transfer
+            for label, seq_info in info.per_label_seq_info.get(
+                kv_cache_string, submod_mgmt.tp_group.rank
+            ).items():
                 if needed_labels is not None and label not in needed_labels:
                     continue
                 cache_mgmt.alloc_manager.sync_retrieve(req_id, label, seq_info)
@@ -817,8 +827,14 @@ class KVCacheEngine(BaseEngine):
 
         labels_to_check = []
         try:
+            kv_cache_string = cache_mgmt.kv_cache_config.get_node_str()
+            world_size = submod_mgmt.tp_group.world_size
+            if request_info.per_label_seq_info.world_size.get(kv_cache_string, world_size) != world_size:
+                raise RuntimeError(
+                    "KV cache transfer across TP world size is currently disallowed"
+                ) # TODO: figure out fanin/fanout for KV cache transfer
             for label, seq_info in request_info.per_label_seq_info.get(
-                cache_mgmt.kv_cache_config.get_node_str()
+                kv_cache_string,  submod_mgmt.tp_group.rank
             ).items():
                 if needed_labels is not None and label not in needed_labels:
                     continue
