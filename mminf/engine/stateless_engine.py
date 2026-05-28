@@ -594,6 +594,7 @@ class StatelessEngine(BaseEngine):
                 kv_cache_config=None,
                 alloc_manager=None,
                 buffer_manager=None,
+                tp_group=self.tp_groups.get_tp_config_for_node(node_name),
             )
             pcgr.warmup_and_capture()
             if pcgr.graphs:
