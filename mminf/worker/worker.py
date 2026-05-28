@@ -1622,6 +1622,7 @@ class Worker:
             range_push("worker.postprocess.route_outputs", synchronize=False)
         # Mark nodes complete and route
         routing_per_request: dict[str, NodeOutputRouting] = {}
+        per_request_uuids: dict[str, set[str]] = {}
         for rid, wg_id in batch_N.batch.request_to_worker_graph.items():
             # Store output tensors before marking the node as complete so that
             # loop outputs can be buffered properly.
@@ -1629,26 +1630,42 @@ class Worker:
             node = batch_N.batch.node_objects[rid]
             node.reset_outputs() # reset stale outputs
             if req_output_tensors:
-                self.tensor_manager.store_and_populate_graph_edges(
+                graph_node_info = self.tensor_manager.store_and_populate_graph_edges(
                     request_id=rid,
                     tensors=req_output_tensors,
                     graph_edges=node.outputs,
                     node_name=node.name,
                     graph_walk=batch_N.graph_walk,
-                    # We already synced on output.completion_event above
                     skip_cuda_sync=True,
+                    skip_ref_count=True,
                 )
+                per_request_uuids[rid] = {
+                    info.uuid for infos in graph_node_info.values() for info in infos
+                }
 
             completion_output = self.worker_graphs_manager.mark_node_complete(
                 rid, wg_id, batch_N.node_name
             )
             real_outputs = [edge.clone() for edge in completion_output.output_edges]
 
-            # Get output routing
             routing_per_request[rid] = self.worker_graphs_manager.process_node_outputs(
                 rid, node_name=batch_N.node_name,
                 outputs=real_outputs, graph_walk=batch_N.graph_walk
             )
+
+            if rid in per_request_uuids:
+                routing = routing_per_request[rid]
+                routed_edges = (
+                    routing.routed_to_this_worker_graph
+                    + routing.persist
+                    + routing.emit_to_client
+                    + routing.streaming_local
+                    + sum(routing.to_workers.values(), start=[])
+                    + sum(routing.streaming_to_workers.values(), start=[])
+                )
+                self.tensor_manager.set_output_ref_counts(
+                    rid, per_request_uuids[rid], routed_edges
+                )
         
         if self.enable_nvtx:
             range_pop(synchronize=False)

@@ -443,6 +443,7 @@ class TensorCommunicationManager(ABC):
         node_name: str | None=None,
         graph_walk: str | None=None,
         skip_cuda_sync: bool = False,
+        skip_ref_count: bool = False,
     ):
         name_to_graph_edges: dict[str, list[GraphEdge]] = {}
         for edge in graph_edges:
@@ -460,15 +461,49 @@ class TensorCommunicationManager(ABC):
                 str([edge.name for edge in name_to_graph_edges.get(name, [])])
             )
             edges = name_to_graph_edges.get(name, [])
-            for info in graph_node_info[name]:
-                self.tensor_store.increment_ref(
-                    request_id, info.uuid, n=len([
-                        e for e in edges if e.next_node != EMPTY_DESTINATION
-                    ])
-                )
+            if skip_ref_count:
+                # Safety hold: ref=1 prevents premature GC. The caller
+                # must call set_output_ref_counts() to adjust to the real
+                # fanout after routing is computed.
+                for info in graph_node_info[name]:
+                    self.tensor_store.increment_ref(request_id, info.uuid, n=1)
+            else:
+                for info in graph_node_info[name]:
+                    self.tensor_store.increment_ref(
+                        request_id, info.uuid, n=len([
+                            e for e in edges if e.next_node != EMPTY_DESTINATION
+                        ])
+                    )
             for edge in edges:
                 edge.tensor_info = graph_node_info[name]
         return graph_node_info
+
+    def set_output_ref_counts(
+        self,
+        request_id: str,
+        safety_hold_uuids: set[str],
+        routed_edges: list[GraphEdge],
+    ):
+        """Adjust ref counts from the safety hold (1) to the actual fanout.
+
+        Called after ``process_node_outputs`` determines the real routing.
+        ``safety_hold_uuids`` is the set of UUIDs that were given ref=1 by
+        ``store_and_populate_graph_edges(skip_ref_count=True)``.
+        ``routed_edges`` is the flat list of all edges that will actually be
+        consumed (local ingestion, remote send, persist, emit, streaming).
+        """
+        actual_counts: dict[str, int] = {uuid: 0 for uuid in safety_hold_uuids}
+        for edge in routed_edges:
+            for info in edge.tensor_info:
+                if info.uuid in actual_counts:
+                    actual_counts[info.uuid] += 1
+
+        for uuid, count in actual_counts.items():
+            delta = count - 1  # subtract the safety hold of 1
+            if delta > 0:
+                self.tensor_store.increment_ref(request_id, uuid, n=delta)
+            elif delta < 0:
+                self.dereference(request_id, uuid, n=-delta)
 
     # ---- abstract: transport-specific ----
 
