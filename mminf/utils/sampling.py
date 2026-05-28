@@ -576,7 +576,16 @@ class CudaGraphableSampler(BaseSampler):
             seed=self.seed_buf, offset=self.offset_buf
         )
         self.offset_buf += 1
-        return samples.to(torch.int64)
+        tokens = samples.to(torch.int64)
+        # Defensive broadcast for callers that run this sampler on every TP
+        # rank with replicated logits (Qwen3-Omni CodePredictor's unrolled
+        # depth loop). ``deterministic=True`` should already produce
+        # bit-equal output, but tied-probability sorts can still resolve
+        # differently across GPUs in edge cases — one diverging code
+        # cascades into garbled audio with no recovery, so we pay the
+        # ~5µs in-place broadcast (no-op for trivial groups) to guarantee
+        # agreement. Mirrors ``CudaGraphableSampler.sample``.
+        return self._broadcast_tokens(tokens)
 
 
 @dataclass
