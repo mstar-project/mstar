@@ -20,8 +20,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mminf.distributed.communication import TPCommGroup
 from mminf.engine.kv_cache_engine import BatchedCacheManager
-from mminf.model.components import GatedMLP, RMSNorm, SparseMoeBlockWithSharedExpert
+from mminf.model.components import ParallelSparseMoeBlockWithSharedExpert, RMSNorm
+from mminf.model.components.distributed import ParallelGatedMLP
 from mminf.model.qwen3_omni.components.attention import Qwen3OmniAttention
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig, TalkerTextConfig
 from mminf.utils.attention import decode_attn_nhd, fused_qk_norm_rope
@@ -61,7 +63,10 @@ class Qwen3OmniResizeMLP(nn.Module):
 class Qwen3OmniTalkerLayer(nn.Module):
     """Single Talker transformer layer (pre-norm attention + MoE FFN)."""
 
-    def __init__(self, config: TalkerTextConfig, layer_idx: int):
+    def __init__(
+        self, config: TalkerTextConfig, layer_idx: int,
+        comm_group: TPCommGroup | None = None,
+    ):
         super().__init__()
         hidden_size = config.hidden_size
         rms_norm_eps = config.rms_norm_eps
@@ -72,25 +77,26 @@ class Qwen3OmniTalkerLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
-            # Talker reuses the same rope_theta as the Thinker (1e6)
             rope_theta=1_000_000.0,
             rms_norm_eps=rms_norm_eps,
-            use_mrope=False,  # Standard 1-D RoPE, NOT 3-D MRoPE
+            use_mrope=False,
+            comm_group=comm_group,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
 
-        # Every Talker layer is MoE (with shared expert + sigmoid gate)
-        self.mlp = SparseMoeBlockWithSharedExpert(
+        self.mlp = ParallelSparseMoeBlockWithSharedExpert(
             hidden_size=hidden_size,
             moe_intermediate_size=config.moe_intermediate_size,
             num_experts=config.num_experts,
             num_experts_per_tok=config.num_experts_per_tok,
             norm_topk_prob=config.norm_topk_prob,
-            shared_expert=GatedMLP(
+            shared_expert=ParallelGatedMLP(
                 hidden_size=hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
                 activation="silu",
+                comm_group=comm_group,
             ),
+            comm_group=comm_group,
         )
 
     def forward(
@@ -205,10 +211,6 @@ class Qwen3OmniTalkerModel(nn.Module):
         self.hidden_projection = Qwen3OmniResizeMLP(
             thinker_hidden_size, intermediate_size, talker_text.hidden_size
         )
-    
-    def set_qkv_proj_weights(self):
-        for layer in self.model.layers:
-            layer.self_attn.set_qkv_proj_weight()
 
     def forward(
         self,
@@ -257,7 +259,7 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
             use_mrope=False,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = GatedMLP(
+        self.mlp = ParallelGatedMLP(
             hidden_size=hidden_size, intermediate_size=intermediate_size,
             activation="silu",
         )
@@ -275,18 +277,6 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
-    
-    def set_qkv_proj_weight(self) -> torch.Tensor:
-        if self.self_attn.q_proj is not None:
-            attn = self.self_attn
-            qkv_proj_weight = torch.cat(
-                (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight),
-                dim=0,
-            ).contiguous()
-            self.register_buffer("qkv_proj_weight", qkv_proj_weight, persistent=False)
-            attn.q_proj = None
-            attn.k_proj = None
-            attn.v_proj = None
 
 
 class Qwen3OmniCodePredictorInnerModel(nn.Module):
@@ -409,10 +399,6 @@ class Qwen3OmniCodePredictor(nn.Module):
         # place (see nn.Module.__setattr__); this replaces the meta
         # placeholder created in __init__ with the real device tensor.
         self.lm_head_weight = stacked
-    
-    def set_qkv_proj_weights(self):
-        for layer in self.model.layers:
-            layer.set_qkv_proj_weight()
 
     def forward(self, *args):
         return self.model(*args)
@@ -498,7 +484,7 @@ class Qwen3OmniCodePredictor(nn.Module):
             hidden_states = layer.input_layernorm(hidden_states)
 
             total_tokens = bs * seq_len
-            qkv = F.linear(hidden_states, layer.qkv_proj_weight)
+            qkv = F.linear(hidden_states, layer.self_attn.qkv_proj.weight)
             q_size = n_q_heads * head_dim
             kv_size = n_kv_heads * head_dim
             q, k, v = qkv.split((q_size, kv_size, kv_size), dim=-1)

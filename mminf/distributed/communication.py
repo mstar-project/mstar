@@ -116,6 +116,9 @@ class TPCommGroup:
 class WorkerTPGroups:
     num_workers: int
     global_rank: int
+    # True iff any worker in the run uses TP. Set by GlobalTPConfig from
+    # the global worker-graph view so all ranks agree.
+    any_tp: bool = False
     node_to_group: dict[str, TPCommGroup] = field(default_factory=dict)
 
     def add(self, node: str, comm_group: TPCommGroup):
@@ -128,26 +131,29 @@ class WorkerTPGroups:
             self.node_to_group[node] = comm_group
     
     def init_dist(
-        self, init_method="tcp://127.0.0.1:29500"
+        self, init_method="tcp://127.0.0.1:29500",
     ):
+        """Initialize the NCCL world group and per-node TP subgroups.
+
+        Every worker calls ``dist.init_process_group`` when *any* worker
+        in the run participates in TP (``self.any_tp``) — otherwise ranks
+        with no local TP would skip the call and the TP-participating
+        ranks would hang waiting for them.
+        """
         torch.cuda.set_device(self.global_rank)
-        if all([
-            group.world_size == 1 for group in self.node_to_group.values()
-        ]):
-            # No TP here; skip all NCCL process group initialization
+        if not self.any_tp:
             return
-        
+
         dist.init_process_group(
             backend="nccl",
-            init_method=init_method,  # rendezvous point
+            init_method=init_method,
             world_size=self.num_workers,
             rank=self.global_rank,
         )
 
         for comm_group in self.node_to_group.values():
-            # this is in a stable order across workers (post-python 3.7, dictionaries
-            # maintain insertion order), and also no-ops if a group has already been
-            # initialized to avoid double-initialization
+            # stable order across workers (post-python 3.7 insertion order),
+            # and no-ops if already initialized to avoid double-init.
             comm_group.init_process_group()
     
     def get_tp_config_for_node(self, node: str) -> TPCommGroup:
@@ -163,9 +169,11 @@ class GlobalTPConfig:
         worker_ids: list[str]
     ):
         self.num_workers = len(worker_ids)
+        any_tp = any(wg.tp_size > 1 for wg in worker_graphs.values())
         self.per_worker_config: dict[str, WorkerTPGroups] = {
             wid: WorkerTPGroups(
-                global_rank=i, num_workers=self.num_workers
+                global_rank=i, num_workers=self.num_workers,
+                any_tp=any_tp,
             ) for i, wid in enumerate(worker_ids)
         }
 
@@ -186,3 +194,4 @@ class GlobalTPConfig:
                         self.per_worker_config[worker_ids[rank]].add(
                             node,  self.comm_groups[key]
                         )
+        

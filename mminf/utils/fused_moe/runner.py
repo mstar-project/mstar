@@ -35,6 +35,7 @@ def fused_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
+    reduce_results: bool = True,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -58,11 +59,17 @@ def fused_experts(
         ``(tokens, top_k)`` int; will be cast to int32 if not already.
     activation : str
         ``"silu"`` (default) or ``"gelu"``.  Qwen3-Omni always uses silu.
+    reduce_results : bool
+        If True (default), sum-reduce over the top-k dimension and return
+        ``(tokens, hidden)``. If False, skip the sum-reduce and return
+        ``(tokens, top_k, hidden)`` — the caller is responsible for the
+        reduce (e.g. after an all-reduce for TP).
 
     Returns
     -------
     torch.Tensor
-        Shape ``(tokens, hidden)``, same dtype as ``hidden_states``.
+        Shape ``(tokens, hidden)`` if ``reduce_results`` else
+        ``(tokens, top_k, hidden)``.
     """
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert w1.is_contiguous(), "w1 must be contiguous"
@@ -145,6 +152,8 @@ def fused_experts(
     )
 
     # 6. Sum over the top-k slots -> (tokens, hidden).
+    if not reduce_results:
+        return cache3
     output = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
     return output

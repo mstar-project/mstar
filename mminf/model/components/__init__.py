@@ -13,6 +13,8 @@ from mminf.model.components.attention import Attention
 from mminf.model.components.decoder_layer import DecoderLayer, GatedDecoderLayer
 from mminf.model.components.mlp import MLP, GatedMLP
 from mminf.model.components.moe import (
+    ParallelSparseMoeBlock,
+    ParallelSparseMoeBlockWithSharedExpert,
     SparseMoeBlock,
     SparseMoeBlockWithSharedExpert,
     TopKRouter,
@@ -26,6 +28,8 @@ __all__ = [
     "GatedDecoderLayer",
     "MLP",
     "GatedMLP",
+    "ParallelSparseMoeBlock",
+    "ParallelSparseMoeBlockWithSharedExpert",
     "SparseMoeBlock",
     "SparseMoeBlockWithSharedExpert",
     "TopKRouter",

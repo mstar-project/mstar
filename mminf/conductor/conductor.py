@@ -90,25 +90,29 @@ def _worker_process_target(
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
         [set(wg.section.get_nodes()) for wg in my_worker_graphs]
     ))
-    worker = Worker(
-        worker_id=worker_id,
-        worker_ids=worker_ids,
-        model=model,
-        my_worker_graphs=my_worker_graphs,
-        kv_config=kv_config,
-        model_config=model_config,
-        all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
-        all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
-        all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
-        sharding_config=sharding_config,
-        tp_groups=tp_groups,
-        hostname=hostname,
-        socket_path_prefix=socket_path_prefix,
-        enable_nvtx=enable_nvtx,
-        device=torch.device(device),
-        tensor_comm_protocol=tensor_comm_protocol,
-        tcp_transfer_device=tcp_transfer_device,
-    )
+    try:
+        worker = Worker(
+            worker_id=worker_id,
+            worker_ids=worker_ids,
+            model=model,
+            my_worker_graphs=my_worker_graphs,
+            kv_config=kv_config,
+            model_config=model_config,
+            all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
+            all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
+            all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
+            sharding_config=sharding_config,
+            tp_groups=tp_groups,
+            hostname=hostname,
+            socket_path_prefix=socket_path_prefix,
+            enable_nvtx=enable_nvtx,
+            device=torch.device(device),
+            tensor_comm_protocol=tensor_comm_protocol,
+            tcp_transfer_device=tcp_transfer_device,
+        )
+    except BaseException as e:
+        logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
+        raise e
     worker.run()
 
 

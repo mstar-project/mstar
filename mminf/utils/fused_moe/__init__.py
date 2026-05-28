@@ -10,6 +10,7 @@ the import fails and callers fall back to the naive dispatch.
 """
 from __future__ import annotations
 
+from mminf.utils.fused_moe.kernels import moe_sum_reduce_triton
 from mminf.utils.fused_moe.runner import fused_experts
 
-__all__ = ["fused_experts"]
+__all__ = ["fused_experts", "moe_sum_reduce_triton"]

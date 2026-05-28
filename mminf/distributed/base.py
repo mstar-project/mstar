@@ -185,8 +185,8 @@ class ShardingConfig:
             source_tp_size = source_group.tp_size
         
         if dest_group is None:
-            dest_worker_set = set()
-            dest_worker_to_tp_rank = {}
+            dest_worker_set = {""}
+            dest_worker_to_tp_rank = {"": 0}
             dest_tp_size = 1
             dest_tp_rank = 0
         else:
@@ -231,7 +231,7 @@ class ShardingConfig:
                 if source_shard_starts[0] >= dest_shard_ends[0]:
                     continue  # not reached the point of overlap yet, keep looking
 
-                worker = dest_group._workers[dest_tp_rank] if dest_group else "api_server"
+                worker = dest_worker_to_tp_rank[dest_tp_rank]
                 fanout.append(ShardDestination(
                     worker=worker,
                     full_tensor=False,

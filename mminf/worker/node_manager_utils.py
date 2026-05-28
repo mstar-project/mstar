@@ -462,19 +462,19 @@ class WorkerGraphsManager:
                 node=edge.next_node, graph_walk=graph_walk
             )
             if node_graph_walk not in self.per_request_info[request_id].node_to_workers:
+                fanout = sharding_config.fanout_graph_edges(
+                    edge, source_node=node_name,
+                    source_graph_walk=graph_walk,
+                    dest_graph_walk=graph_walk
+                )
                 if edge.next_node in SPECIAL_DESTINATIONS or edge.persist:
                     if edge.next_node == EMIT_TO_CLIENT:
-                        emit_to_client.append(edge)
+                        emit_to_client.extend(fanout.values())
                     continue  # e.g., emit_to_client — already captured in to_conductor
                 raise ValueError(
                     f"Output edge targets unknown node/graph walk: {node_graph_walk}. "
                     f"Check graph construction."
                 )
-            fanout = sharding_config.fanout_graph_edges(
-                edge, source_node=node_name,
-                source_graph_walk=graph_walk,
-                dest_graph_walk=graph_walk
-            )
             for (wkr, wkr_edge) in fanout.items():
                 to_workers.setdefault(wkr, []).append(wkr_edge)
 
