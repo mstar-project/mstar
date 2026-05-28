@@ -161,6 +161,21 @@ class WorkerTPGroups:
             self.node_to_group[node] = TPCommGroup.trivial()
         return self.node_to_group[node]
 
+    def barrier_all(self) -> None:
+        """Global barrier across every worker process in the run.
+
+        No-op when ``any_tp`` is False (no NCCL world was initialized in
+        ``init_dist``). Otherwise calls ``dist.barrier()`` on the default
+        global process group, syncing both TP-participating and non-TP
+        workers. Used at phase boundaries that require all ranks to be
+        ready — e.g. between CUDA-graph warmup and the worker's main
+        loop, so a TP leader can't send a ``ScheduleTPNode`` to a
+        follower that's still inside ``engine.warmup``.
+        """
+        if not self.any_tp:
+            return
+        dist.barrier()
+
 
 class GlobalTPConfig:
     def __init__(
