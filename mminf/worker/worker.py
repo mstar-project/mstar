@@ -135,6 +135,11 @@ class Worker:
         self.device = device
         self.enable_nvtx = enable_nvtx
 
+        # ``dist_init_method`` is normally provided by the conductor — it
+        # picks a free TCP port at startup so multiple ``mminf`` runs on
+        # the same host don't collide. The ``tcp://{hostname}:29500``
+        # fallback is for standalone Worker construction (e.g. tests);
+        # production paths always pass a value.
         if dist_init_method is None:
             dist_init_method = f"tcp://{hostname}:29500"
 
@@ -1179,6 +1184,27 @@ class Worker:
     def _handle_allocation_failure(
         self, batch: ScheduledBatch, node_batch: NodeBatch
     ) -> None:
+        """Push back nodes and hold the rids for backoff after KV OOM.
+
+        Under TP, this runs on every rank of the TP group independently:
+        admission decisions (``add_request`` / ``alloc`` / ``free``) are
+        all driven by rank 0's scheduler and replicated via the
+        ``ScheduleTPNode`` ZMQ broadcast, so the page allocator state is
+        symmetric across ranks. Both rank 0 and followers raise
+        ``AllocationFailedError`` on the same batch and both reach this
+        function with the same ``batch_ids``; their local actions
+        (push-back, hold) produce identical follower state.
+
+        ``KVCacheEngine._verify_tp_kv_symmetry`` fails fast at startup if
+        that invariant ever breaks.
+
+        v2 caveat: this function does not yet coordinate ``_last_active``
+        / eviction-victim selection across TP ranks. Wall-clock LRU can
+        pick different victims per rank under contention, leading to
+        request-id ↔ page-index drift and (eventually) asymmetric OOM on
+        future reloads. Today's TP configs don't enable CPU offload, so
+        the path isn't exercised; revisit when we light up offload + TP.
+        """
         batch_ids = set(batch.node_objects.keys())
         victim_id = self._try_offload_cold_request(node_batch.node_name, batch_ids)
 
@@ -1274,9 +1300,21 @@ class Worker:
         )
         wgio.clear_speculative_inputs()
 
+        # Filter out destinations that aren't speculation candidates.
+        #
+        # * ``info.node_name in self.tp_nodes`` — TP nodes don't support
+        #   speculation in v1 (rank-0 schedules; followers can't initiate).
+        # * ``not wgio.nodes[info.node_name].enable_async_scheduling`` — the
+        #   destination node opts out of async scheduling. Mirrors the
+        #   source-side check in ``_can_speculate``; without this, a
+        #   destination that's structurally ineligible (e.g. a node whose
+        #   downstream graph isn't speculation-safe) could still be picked,
+        #   then dropped per-rid further down.
         ready_for_spec = [
-            info for info in ready_for_spec if info.node_name not in self.tp_nodes
-        ] # disallow spec scheduling of TP nodes for now
+            info for info in ready_for_spec
+            if info.node_name not in self.tp_nodes
+            and wgio.nodes[info.node_name].enable_async_scheduling
+        ]
 
         if not ready_for_spec:
             return # no nodes can be speculated
@@ -1843,6 +1881,17 @@ class Worker:
 
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
+
+        # Sync every worker before the main loop opens. Per-batch-size
+        # captures inside CudaGraphRunner are already barriered on the
+        # node-local TP group, but that doesn't bound the time between
+        # ``warmup_and_capture`` returning and ``run()`` starting to
+        # schedule. Without this fence, a TP leader can finish warmup
+        # quickly, schedule its first batch, and ZMQ-send
+        # ``ScheduleTPNode`` to a follower that's still inside another
+        # engine's ``warmup``. The follower can't service the message
+        # yet, but the leader will sit on the first NCCL collective.
+        self.tp_groups.barrier_all()
 
         # The async worker path needs decode submission to return quickly so
         # the main loop can overlap queue/tensor polling and post-processing
