@@ -133,20 +133,23 @@ class Qwen3OmniTalkerLanguageModel(nn.Module):
     This corresponds to the ``talker.model.*`` weight namespace.
     """
 
-    def __init__(self, config: TalkerTextConfig):
+    def __init__(self, config: TalkerTextConfig, comm_group: TPCommGroup | None = None):
         super().__init__()
         # NOTE: No embed_tokens here -- the HF Talker text model does not
         # have a text embedding table.  The Talker receives pre-computed
         # embeddings (projected Thinker states + codec embeddings).
         self.layers = nn.ModuleList(
             [
-                Qwen3OmniTalkerLayer(config, layer_idx)
+                Qwen3OmniTalkerLayer(config, layer_idx, comm_group=comm_group)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-        # Codec embedding for layer-0 codec tokens
+        # Codec embedding for layer-0 codec tokens. Kept replicated across TP
+        # ranks: the codec vocab is small (~codec_vocab_size codes) and the
+        # embed is read after the LLM all-reduce so the input token id is the
+        # same on every rank, making the lookup output naturally replicated.
         self.codec_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
 
     def forward(
@@ -188,22 +191,33 @@ class Qwen3OmniTalkerModel(nn.Module):
         talker.hidden_projection.linear_fc2.{weight,bias}
     """
 
-    def __init__(self, config: Qwen3OmniModelConfig):
+    def __init__(
+        self, config: Qwen3OmniModelConfig,
+        comm_group: TPCommGroup | None = None,
+    ):
         super().__init__()
         talker_text = config.talker_text
         thinker_hidden_size = config.thinker_hidden_size
 
-        # Transformer backbone
-        self.model = Qwen3OmniTalkerLanguageModel(talker_text)
+        # Transformer backbone (TP-sharded inside each attention + MoE).
+        self.model = Qwen3OmniTalkerLanguageModel(talker_text, comm_group=comm_group)
 
-        # Codec head (replaces lm_head -- predicts codec tokens)
+        # Codec head (replaces lm_head -- predicts codec tokens). Kept
+        # unsharded: vocab is small (talker_text.vocab_size ~ 16k) so the
+        # weight replicates cheaply, and the all-reduce inside the last
+        # MoE layer already produces a replicated ``last_hidden`` — running
+        # ``codec_head`` unsharded gives the same ``[B, V]`` logits on
+        # every rank without an extra all-gather.
         self.codec_head = nn.Linear(
             talker_text.hidden_size, talker_text.vocab_size, bias=False
         )
 
-        # Projection MLPs: Thinker hidden space -> Talker hidden space
-        # linear_fc1: (thinker_hidden, intermediate) -> linear_fc2: (intermediate, talker_hidden)
-        # HF uses text_config.intermediate_size as the intermediate dimension
+        # Thinker->Talker projection MLPs. Replicated: the Thinker emits a
+        # replicated ``thinker_states`` chunk (its all-reduces close the
+        # loop before streaming), so each Talker rank runs an identical
+        # projection on identical input and produces identical output.
+        # TP'ing these would buy nothing — the cross-rank reduction would
+        # just re-sum what every rank already has.
         intermediate_size = talker_text.intermediate_size
         self.text_projection = Qwen3OmniResizeMLP(
             thinker_hidden_size, intermediate_size, talker_text.hidden_size
