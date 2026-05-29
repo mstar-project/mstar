@@ -1879,6 +1879,19 @@ class Worker:
                     switch_interval,
                 )
 
+        # Bound the load-time asymmetry between workers before any
+        # subgroup NCCL collective fires inside the per-bs CUDA-graph
+        # capture loop. Without this fence, a worker with a small model
+        # (e.g. an 8B Talker) can finish loading, enter warmup, and hit
+        # its first subgroup barrier while a worker with a 30B Thinker
+        # is still streaming safetensors shards. The subgroup NCCL comm
+        # is created lazily on that first collective; its connect-retry
+        # budget is ~33 s, which is shorter than the load-time delta on
+        # large multi-tower models. Syncing here means every worker
+        # reaches warmup at the same wall-clock instant, so subgroup
+        # bootstrap completes within the retry budget.
+        self.tp_groups.barrier_all()
+
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
 
