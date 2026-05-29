@@ -26,16 +26,6 @@ class TPCommGroup:
         non-TP runs so the same code path works everywhere."""
         return cls(my_global_rank=0, my_group_rank=0, group_members=[0])
 
-    def init_process_group(self):
-        if self.initialized:
-            return
-        if self.world_size == 1:
-            # Trivial group — no NCCL init needed.
-            self.initialized = True
-            return
-        self.device_group = dist.new_group(ranks=self.group_members)
-        self.initialized = True
-
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if self.world_size == 1:
             return input_
@@ -119,6 +109,13 @@ class WorkerTPGroups:
     # True iff any worker in the run uses TP. Set by GlobalTPConfig from
     # the global worker-graph view so all ranks agree.
     any_tp: bool = False
+    # Every distinct TP rank tuple in the run, sorted for stable iteration
+    # order across workers. Set by GlobalTPConfig. ``init_dist`` calls
+    # ``dist.new_group`` once per entry on every rank — including ranks
+    # that aren't members of the group — because PyTorch assigns an
+    # auto-incrementing tag inside ``new_group`` that all ranks must agree
+    # on; asymmetric call counts deadlock the participating ranks.
+    world_tp_groups: list[tuple[int, ...]] = field(default_factory=list)
     node_to_group: dict[str, TPCommGroup] = field(default_factory=dict)
 
     def add(self, node: str, comm_group: TPCommGroup):
@@ -139,6 +136,14 @@ class WorkerTPGroups:
         in the run participates in TP (``self.any_tp``) — otherwise ranks
         with no local TP would skip the call and the TP-participating
         ranks would hang waiting for them.
+
+        Subgroup creation: PyTorch's ``dist.new_group`` is collective on
+        the global world. It assigns an auto-incrementing tag inside the
+        call that every rank must agree on; if non-member ranks skip the
+        call, the tag counter drifts and member ranks deadlock. We
+        therefore call ``new_group`` once per distinct TP rank tuple on
+        every rank — members keep the returned handle, non-members
+        discard it.
         """
         torch.cuda.set_device(self.global_rank)
         if not self.any_tp:
@@ -151,10 +156,20 @@ class WorkerTPGroups:
             rank=self.global_rank,
         )
 
+        rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        for rank_tuple in self.world_tp_groups:
+            rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
+
+        seen: set[int] = set()
         for comm_group in self.node_to_group.values():
-            # stable order across workers (post-python 3.7 insertion order),
-            # and no-ops if already initialized to avoid double-init.
-            comm_group.init_process_group()
+            if id(comm_group) in seen:
+                continue
+            seen.add(id(comm_group))
+            if comm_group.world_size == 1:
+                comm_group.initialized = True
+                continue
+            comm_group.device_group = rank_tuple_to_pg[tuple(comm_group.group_members)]
+            comm_group.initialized = True
     
     def get_tp_config_for_node(self, node: str) -> TPCommGroup:
         if node not in self.node_to_group:
@@ -185,10 +200,17 @@ class GlobalTPConfig:
     ):
         self.num_workers = len(worker_ids)
         any_tp = any(wg.tp_size > 1 for wg in worker_graphs.values())
+        world_tp_groups: list[tuple[int, ...]] = sorted({
+            tuple(rank_group)
+            for wg in worker_graphs.values()
+            for rank_group in wg._tp_ranks
+            if len(rank_group) > 1
+        })
         self.per_worker_config: dict[str, WorkerTPGroups] = {
             wid: WorkerTPGroups(
                 global_rank=i, num_workers=self.num_workers,
                 any_tp=any_tp,
+                world_tp_groups=world_tp_groups,
             ) for i, wid in enumerate(worker_ids)
         }
 
