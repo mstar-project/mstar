@@ -17,7 +17,7 @@ Usage:
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import triton
@@ -618,6 +618,15 @@ class SamplerBuffers:
     top_p_buf: torch.Tensor         # [max_bs], float32
     seed_buf: torch.Tensor          # [max_bs], int64
     offset_buf: torch.Tensor        # [max_bs], int64
+    # TP communicator for the submodule that owns these buffers. Passed
+    # through ``slice_for_bs`` into every per-step ``CudaGraphableSampler``
+    # so its ``_broadcast_tokens`` aligns the sampled token across ranks.
+    # Without this, ``sample`` / ``sample_with_config`` would build a
+    # sampler with ``tp_group=None``, the broadcast would silently no-op,
+    # and TP ranks would drift apart on the first tied-logit sample —
+    # garbled audio for Talker, premature EOS for Thinker. Defaults to
+    # ``None`` for non-TP submodules (trivial broadcast is a cheap no-op).
+    tp_group: "TPCommGroup | None" = None  # noqa: F821
     # Master cache: one row per active request, indexed by slot. Grown
     # dynamically (doubling) when more than ``max_batch_size`` requests are
     # in-flight simultaneously — the master is decoupled from the per-step
@@ -653,6 +662,7 @@ class SamplerBuffers:
         cls,
         max_batch_size: int,
         device: torch.device,
+        tp_group: "TPCommGroup | None" = None,  # noqa: F821
     ) -> "SamplerBuffers":
         """Allocate zero-initialised sampling buffers for ``max_batch_size``.
         """
@@ -686,6 +696,7 @@ class SamplerBuffers:
             top_p_buf=top_p_buf,
             seed_buf=seed_buf,
             offset_buf=offset_buf,
+            tp_group=tp_group,
             _master_temperature=master_temperature,
             _master_top_k=master_top_k,
             _master_top_p=master_top_p,
@@ -700,14 +711,17 @@ class SamplerBuffers:
             _free_slots=list(range(max_batch_size)),
         )
 
-    def slice_for_bs(self, bs: int) -> dict[str, torch.Tensor]:
-        """Return bs-sized views into each buffer (zero-copy slices)."""
+    def slice_for_bs(self, bs: int) -> dict[str, Any]:
+        """Return bs-sized views into each buffer (zero-copy slices) plus
+        the owning submodule's ``tp_group`` so the constructed sampler
+        broadcasts across TP ranks."""
         return {
             "temperature_buf": self.temperature_buf[:bs],
             "top_k_buf": self.top_k_buf[:bs],
             "top_p_buf": self.top_p_buf[:bs],
             "seed_buf": self.seed_buf[:bs],
             "offset_buf": self.offset_buf[:bs],
+            "tp_group": self.tp_group,
         }
 
     # ------------------------------------------------------------------
