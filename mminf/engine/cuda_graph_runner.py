@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
@@ -223,17 +222,6 @@ class CudaGraphRunner:
             logger.info("Submodule %s does not support batched forward, "
                         "skipping CUDA graph capture", self.submodule_name)
             return
-
-        if self.tp_group.world_size > 1:
-            # Sync every rank in the run on the global default communicator
-            # before any per-subgroup collective fires. The global comm was
-            # established eagerly inside init_process_group, so this barrier
-            # does not pay the lazy-bootstrap connect-retry budget that the
-            # first call on a freshly-created subgroup pays. After it
-            # returns, every rank is past model load and ready to enter
-            # the per-bs subgroup barrier below without socket retries
-            # racing against asymmetric load times.
-            dist.barrier()
 
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
         mem_before = torch.cuda.memory_allocated(self.device)
@@ -2247,17 +2235,6 @@ class PiecewiseCudaGraphRunner:
         if not torch.cuda.is_available() or self.device is None:
             logger.warning("CUDA not available — skipping PiecewiseCudaGraphRunner capture")
             return
-
-        if self.tp_group.world_size > 1:
-            # Sync every rank in the run on the global default communicator
-            # before any per-subgroup collective fires. The global comm was
-            # established eagerly inside init_process_group, so this barrier
-            # does not pay the lazy-bootstrap connect-retry budget that the
-            # first call on a freshly-created subgroup pays. After it
-            # returns, every rank is past model load and ready to enter
-            # the per-bs subgroup barrier below without socket retries
-            # racing against asymmetric load times.
-            dist.barrier()
 
         torch.cuda.set_device(self.device)
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
