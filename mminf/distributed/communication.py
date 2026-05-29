@@ -149,6 +149,11 @@ class WorkerTPGroups:
             init_method=init_method,
             world_size=self.num_workers,
             rank=self.global_rank,
+            # Pin this rank's CUDA device explicitly. Without it, NCCL
+            # guesses from the global rank and prints a runtime warning;
+            # heterogeneous rank-to-device mappings would also fail loudly
+            # here rather than later inside the first collective.
+            device_id=torch.device(f"cuda:{self.global_rank}"),
         )
 
         for comm_group in self.node_to_group.values():
