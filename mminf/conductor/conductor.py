@@ -3,6 +3,7 @@ import hashlib
 import logging
 import multiprocessing as mp
 import os
+import socket
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -59,6 +60,20 @@ def _req_id_to_seed(req_id: str):
     return int.from_bytes(digest[:4], "little")
 
 
+def _pick_free_tcp_port() -> int:
+    """Ask the OS for an unused ephemeral TCP port.
+
+    Binds to port 0, reads back the assignment, releases. There is a tiny
+    race window between this release and the NCCL TCPStore bind in the
+    worker process — small enough in practice for single-host use. The
+    point of picking dynamically is to avoid colliding with another
+    ``mminf`` instance hard-coded to 29500 on the same host.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
 def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
@@ -72,6 +87,7 @@ def _worker_process_target(
     tp_groups: WorkerTPGroups,
     hostname: str,
     socket_path_prefix: str,
+    dist_init_method: str,
     enable_nvtx: bool = False,
     model: Model | None = None,
     device: str = "cuda",
@@ -105,6 +121,7 @@ def _worker_process_target(
             tp_groups=tp_groups,
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
+            dist_init_method=dist_init_method,
             enable_nvtx=enable_nvtx,
             device=torch.device(device),
             tensor_comm_protocol=tensor_comm_protocol,
@@ -253,6 +270,13 @@ class Conductor:
                         for i, r in enumerate(ranks):
                             self.worker_tp_group_to_tp_rank.setdefault(r, {})[group_key] = i
 
+        # Pick a free TCP port for the NCCL init store. Done once on the
+        # conductor and shared with every spawned worker via
+        # ``dist_init_method`` so two ``mminf`` instances on the same host
+        # don't collide on a hard-coded port.
+        self._dist_init_port = _pick_free_tcp_port()
+        self._dist_init_method = f"tcp://{hostname}:{self._dist_init_port}"
+
         os.makedirs(socket_path_prefix, exist_ok=True)
         self._derive_worker_info()
         self._launch_workers()
@@ -355,6 +379,7 @@ class Conductor:
                     "tp_groups": self.tp_config.per_worker_config[worker_id],
                     "hostname": self.hostname,
                     "socket_path_prefix": self.socket_path_prefix,
+                    "dist_init_method": self._dist_init_method,
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,
                     "device": f"cuda:{rank}",

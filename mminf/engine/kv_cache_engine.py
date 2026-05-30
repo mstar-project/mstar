@@ -270,6 +270,7 @@ class KVCacheEngine(BaseEngine):
                     alloc_manager=kv_mgmt.alloc_manager,
                     buffer_manager=kv_mgmt.buffer_manager,
                     cache_labels=pcgr_config.get("cache_labels", ["main"]),
+                    tp_group=submodule_mgmt.tp_group,
                 )
                 pcgr.warmup_and_capture()
                 if pcgr.graphs:
@@ -282,6 +283,56 @@ class KVCacheEngine(BaseEngine):
         # torch.compile applied after CUDA graph capture so compiled kernels
         # are baked into the graphs.
         self._compile_submodules()
+
+        # Fail fast on asymmetric KV state across TP ranks. v1 OOM
+        # recovery relies on the invariant that every rank of a TP group
+        # sees the same alloc-manager state at every scheduling step
+        # (because rank 0 is the sole source of admission decisions, KV
+        # caches aren't shared across TP groups, and ``add_request`` /
+        # ``alloc`` / ``free`` are driven by rank-0-broadcast
+        # ``ScheduleTPNode`` messages). If the page count diverges at
+        # startup, one rank will OOM while another won't and the next
+        # NCCL collective will hang. The check is one ``all_gather`` of
+        # a scalar per shared cache, fired once.
+        self._verify_tp_kv_symmetry()
+
+    def _verify_tp_kv_symmetry(self) -> None:
+        """Assert ``num_free_pages`` is identical across every TP rank
+        for each KV cache this engine owns.
+
+        Catches YAML drift (e.g. ``cpu_offload_pages`` set on one rank
+        but not another), allocator-init bugs, and any future code path
+        that adds requests asymmetrically before ``warmup`` returns. The
+        ``all_gather`` itself is synchronizing, so no extra barrier is
+        needed on the success path.
+        """
+        seen_keys: set[tuple[int, int]] = set()
+        for submod_mgmt in self.submodule_management.values():
+            tp_group = submod_mgmt.tp_group
+            if tp_group.world_size == 1:
+                continue
+            cache_mgmt = submod_mgmt.kv_management
+            key = (id(cache_mgmt), id(tp_group))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            local_free = cache_mgmt.alloc_manager.page_allocator.num_free
+            cache_name = cache_mgmt.kv_cache_config.get_node_str()
+
+            local_t = torch.tensor(
+                [local_free], dtype=torch.int64, device=self.device,
+            )
+            gathered = tp_group.all_gather(local_t, dim=0)
+            values = gathered.cpu().tolist()
+            if any(v != values[0] for v in values):
+                raise RuntimeError(
+                    f"KV cache {cache_name!r} has asymmetric num_free_pages "
+                    f"across TP ranks: {values}. v1 requires symmetric "
+                    "allocator state; check the YAML for per-rank-divergent "
+                    "max_num_pages / cpu_offload_pages, and any model code "
+                    "that calls add_request before warmup completes."
+                )
 
     def get_max_batch_size(self, node_name, graph_walk):
         if node_name not in self.submodule_management:

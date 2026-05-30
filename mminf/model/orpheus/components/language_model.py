@@ -18,7 +18,12 @@ from torch import nn
 from mminf.distributed.communication import TPCommGroup
 from mminf.engine.kv_cache_engine import BatchedCacheManager
 from mminf.model.components import DecoderLayer, RMSNorm
-from mminf.model.components.distributed import ParallelAttention, ParallelGatedMLP
+from mminf.model.components.distributed import (
+    ColumnParallelLinear,
+    ParallelAttention,
+    ParallelGatedMLP,
+    VocabParallelEmbedding,
+)
 from mminf.model.orpheus.config import OrpheusModelConfig
 
 
@@ -50,8 +55,14 @@ def _build_decoder_layer(config: OrpheusModelConfig, comm_group: TPCommGroup | N
 class OrpheusLanguageModel(nn.Module):
     def __init__(self, config: OrpheusModelConfig, comm_group: TPCommGroup | None = None):
         super().__init__()
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id,
+        # Vocab-parallel embedding: ``[V, H]`` is row-sharded so each rank
+        # holds ``V/tp`` rows. Forward masks + ``all_reduce`` produces a
+        # replicated ``[..., H]`` output, identical to a non-TP embedding.
+        self.embed_tokens = VocabParallelEmbedding(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            comm_group=comm_group,
+            padding_idx=config.pad_token_id,
         )
         self.layers = nn.ModuleList(
             [_build_decoder_layer(config, comm_group=comm_group) for _ in range(config.num_hidden_layers)]
@@ -76,7 +87,18 @@ class OrpheusForCausalLM(nn.Module):
     def __init__(self, config: OrpheusModelConfig, comm_group: TPCommGroup | None = None):
         super().__init__()
         self.model = OrpheusLanguageModel(config, comm_group=comm_group)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # LM head is column-parallel over vocab: each rank computes
+        # ``[B, V/tp]``; ``gather_output=True`` runs an all-gather on the
+        # last dim so the caller (and the sampler) see the full ``[B, V]``
+        # logits — no sampler-side coordination needed. For ``tp_size == 1``
+        # the all-gather is a no-op and behaviour matches ``nn.Linear``.
+        self.lm_head = ColumnParallelLinear(
+            comm_group=comm_group,
+            input_size=config.hidden_size,
+            output_size=config.vocab_size,
+            bias=False,
+            gather_output=True,
+        )
 
     def forward(
         self,

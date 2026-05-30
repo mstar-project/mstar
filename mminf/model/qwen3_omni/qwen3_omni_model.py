@@ -1178,7 +1178,18 @@ class Qwen3OmniModel(Model):
     def get_default_sharding_config(self):
         from mminf.distributed.base import ShardingConfig
 
-        return ShardingConfig(groups=[], tp_enabled_nodes={"Thinker"}, shard_dim={})
+        # Talker LLM (attention + MoE-with-shared-expert) is TP-capable
+        # via the same ``ParallelAttention`` / ``ParallelSparseMoeBlock*``
+        # parts as the Thinker. The internal CodePredictor is intentionally
+        # left at TP=1 (replicated weights, deterministic sampler) — see
+        # ``_create_talker_submodule``. ``shard_dim`` stays empty because
+        # every cross-edge signal (``thinker_states``, ``thinker_mask``,
+        # ``codec_tokens``, ``talker_input_embeds``, ``new_token``) is
+        # already replicated by the upstream all-reduce or sampler
+        # broadcast before it leaves its producing node.
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes={"Thinker", "Talker"}, shard_dim={},
+        )
 
     # -----------------------------------------------------------------------
     # Model ABC: submodule loading
@@ -1215,7 +1226,7 @@ class Qwen3OmniModel(Model):
         if node_name == "Thinker":
             return self._create_thinker_submodule(device, tp_group=tp_group)
         elif node_name == "Talker":
-            return self._create_talker_submodule(device)
+            return self._create_talker_submodule(device, tp_group=tp_group)
         elif node_name == "Code2Wav":
             return self._create_code2wav_submodule(device)
         elif node_name == "audio_encoder":
@@ -1325,7 +1336,7 @@ class Qwen3OmniModel(Model):
             config=self.config,
         )
 
-    def _create_talker_submodule(self, device: str) -> NodeSubmodule:
+    def _create_talker_submodule(self, device: str, tp_group=None) -> NodeSubmodule:
         from mminf.model.loader import load_hf_weights
         from mminf.model.loader.iterators import iter_safetensors_shards
         from mminf.model.qwen3_omni.components.talker import (
@@ -1334,7 +1345,13 @@ class Qwen3OmniModel(Model):
         )
 
         with torch.device("meta"):
-            talker_model = Qwen3OmniTalkerModel(self.config)
+            # ``tp_group`` shards the Talker LLM's attention + MoE. The
+            # CodePredictor stays TP=1 (separate construction below) —
+            # its compute is small and the deterministic FlashInfer sampler
+            # produces bit-equal codes on every rank, so per-rank
+            # replication is cheaper than 150+ NCCL all-reduces per
+            # decode step (5 layers x 15 unrolled iterations).
+            talker_model = Qwen3OmniTalkerModel(self.config, comm_group=tp_group)
         talker_model.to_empty(device=device)
 
         # Talker and CodePredictor share the "talker." prefix. We stream

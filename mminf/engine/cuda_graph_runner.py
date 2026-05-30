@@ -208,7 +208,8 @@ class CudaGraphRunner:
             for config in self.capture_configs] or [1]
         )
         self.sampler_buffer: SamplerBuffers = SamplerBuffers.allocate(
-            max_batch_size=self.max_bs, device=device
+            max_batch_size=self.max_bs, device=device,
+            tp_group=self.tp_group,
         )
 
     def warmup_and_capture(self) -> None:
@@ -2200,7 +2201,10 @@ class PiecewiseCudaGraphRunner:
         alloc_manager: PagedAllocationManager | None = None,
         buffer_manager: WorkspaceBufferManager | None = None,
         cache_labels: list[str] | None = None,
+        tp_group=None,
     ):
+        from mminf.distributed.communication import TPCommGroup
+
         self.fn_factory = fn_factory
         self.embed_dim = embed_dim
         self.capture_batch_sizes = sorted(capture_batch_sizes)
@@ -2212,6 +2216,14 @@ class PiecewiseCudaGraphRunner:
         self.alloc_manager = alloc_manager
         self.buffer_manager = buffer_manager
         self.cache_labels: list[str] = cache_labels or ["main"]
+        # ``tp_group`` is the per-node TP comm group. Defaults to the
+        # trivial single-rank group so the runner behaves identically for
+        # non-TP submodules (V-JEPA2 today). When ``world_size > 1`` the
+        # captured block-loop closure may include NCCL collectives via
+        # parallel layers — ``warmup_and_capture`` barriers before each
+        # per-bs capture to keep ranks in lockstep (the same race the
+        # standard ``CudaGraphRunner`` guards against).
+        self.tp_group: TPCommGroup = tp_group or TPCommGroup.trivial()
 
         self.graphs: dict[int, PiecewiseGraphData] = {}
         self.memory_pool = None
@@ -2229,6 +2241,10 @@ class PiecewiseCudaGraphRunner:
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
 
         for bs in reversed(self.capture_batch_sizes):
+            # Sync TP ranks before each capture so a faster rank doesn't
+            # enter the warmup forward and issue NCCL while a slower one
+            # is still in pre-capture setup. No-op for trivial groups.
+            self.tp_group.barrier()
             try:
                 self._capture_one(bs)
                 logger.info("PiecewiseCudaGraphRunner: captured bs=%d seq_len=%d", bs, self.capture_seq_len)
