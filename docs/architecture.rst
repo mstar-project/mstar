@@ -1,0 +1,50 @@
+Architecture
+============
+
+High-level components
+---------------------
+
+``mminf`` is organized as a set of cooperating processes:
+
+- **API server** (``mminf/api_server/``): FastAPI layer that accepts ``POST /generate``,
+  tokenizes/loads media, dispatches the request, and streams results back to the client.
+  Entry point: ``mminf.api_server.entrypoint:main`` (the ``mminf-serve`` console script).
+- **Conductor** (``mminf/conductor/``): central coordinator. It manages the request
+  lifecycle, walks the model's computation graph, selects workers, routes inputs, and
+  detects completion.
+- **Workers** (``mminf/worker/``): one process per GPU. Each runs an engine manager, a
+  micro-scheduler (continuous batching), and a KV cache manager, and routes tensors
+  directly to downstream workers.
+- **Engines** (``mminf/engine/``): execution backends that actually run submodules on the
+  GPU — ``AREngine`` (autoregressive), ``FlowEngine`` (diffusion/ODE),
+  ``EncoderDecoderEngine`` (vision/audio encoding), ``AudioCodecEngine``,
+  ``CodePredictorEngine``.
+- **Models** (``mminf/model/``): each model declares its computation graph, tokenization,
+  engine types, and submodules. Registered via ``mminf/model/registry.py``.
+- **Graph** (``mminf/graph/``): computation-graph primitives — ``GraphNode``,
+  ``Sequential``, ``Parallel``, ``Loop``, ``DynamicLoop``, ``GraphEdge``.
+- **Communication** (``mminf/communication/``): ZMQ-based IPC/TCP messaging; tensor
+  transport over RDMA or TCP.
+- **Streaming** (``mminf/streaming/``): streaming output with configurable chunking
+  policies and async partition topology.
+
+Core design principles
+----------------------
+
+- **Models define execution plans.** Each model provides its own graph walks (e.g.
+  ``prefill``, ``decode``, ``image_gen``) via ``get_graph_walk_graphs()``.
+- **Disaggregated.** Logical computation nodes map to physical workers via the YAML
+  config's ``node_groups`` (node names → GPU ranks).
+- **Graph-driven scheduling.** The conductor walks the computation graph to coordinate
+  multi-engine pipelines, including async producer/consumer partitions.
+
+Execution flow (simplified)
+---------------------------
+
+1. The API server receives a request, loads media, and calls the model's
+   ``process_prompt`` to produce the initial tensors.
+2. The conductor seeds the initial graph walk (e.g. ``prefill``) and asks the model for
+   the next forward-pass arguments after each step.
+3. Workers execute the ready graph nodes on GPU through the appropriate engine and route
+   outputs (tensors) to downstream nodes/workers.
+4. Outputs marked for the client are post-processed (``postprocess``) and streamed back.
