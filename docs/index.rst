@@ -15,6 +15,7 @@ that graph to coordinate multi-engine pipelines across one or more GPUs.
 
    architecture
    models
+   api
 
 .. toctree::
    :maxdepth: 2
