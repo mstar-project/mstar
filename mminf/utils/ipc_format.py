@@ -32,6 +32,7 @@ class WorkerMessageType(Enum):
     INPUT_SIGNALS = "input_signals"
     UNPERSIST_TENSORS = "unpersist"
     TENSOR_RECEIVED = "tensor_received"
+    SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
 
 
@@ -39,7 +40,7 @@ class WorkerMessageType(Enum):
 class NewRequest(MessageBody):
     request_id: str
     partition_worker_graph_ids: list[str]
-    worker_graph_to_worker: dict[str, str]
+    worker_graph_to_workers: dict[str, list[str]]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
 
@@ -77,6 +78,13 @@ class StopLoops(MessageBody):
     partition_name: str
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
+
+@dataclass
+class ScheduleTPNode(MessageBody):
+    node_name: str
+    graph_walk: str
+    request_ids: list[str]
+
 @dataclass
 class WorkerMessage:
     message_type: WorkerMessageType
@@ -106,6 +114,7 @@ class NewRequestConductor(MessageBody):
 class WorkerGraphsDone(MessageBody):
     request_id: str
     worker_graph_ids: list[str]
+    is_first_tp_rank: bool
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
     output_signal_names: int = field(default=0)

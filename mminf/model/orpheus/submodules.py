@@ -55,7 +55,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         }
 
     def get_cuda_graph_configs(
-        self, device: torch.device,
+        self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
         prefill_packed = {
             num_tokens: self._build_prefill_packed(num_tokens, device)
@@ -318,7 +318,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
     def _num_frames(self) -> int:
         return self.config.snac_window_tokens // (4 * self.config.tokens_per_frame)
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list[BasicBatchedCudaGraphConfig]:
+    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[BasicBatchedCudaGraphConfig]:
         """Declare the SNAC decode capture.
         """
         # One streaming window is ``snac_window_tokens`` raw tokens

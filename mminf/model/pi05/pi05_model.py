@@ -57,6 +57,39 @@ from mminf.model.submodule_base import NodeSubmodule
 logger = logging.getLogger(__name__)
 
 
+# Lerobot key prefixes from the lerobot/pi05_base safetensors layout.
+_PALIGEMMA_PREFIX = "paligemma_with_expert.paligemma.model."
+_GEMMA_EXPERT_PREFIX = "paligemma_with_expert.gemma_expert.model."
+_PALIGEMMA_LM_HEAD = "paligemma_with_expert.paligemma.lm_head.weight"
+_GEMMA_EXPERT_LM_HEAD = "paligemma_with_expert.gemma_expert.lm_head.weight"
+
+
+class _Pi05LLMWeightContainer(nn.Module):
+    """Flat wrapper holding the LLM-side components for the new loader.
+
+    The loader walks ``named_parameters()`` to build its dispatch table,
+    so this wrapper exposes the LLM components as direct attributes whose
+    paths line up 1:1 with the names produced by :meth:`Pi05Model._lerobot_remap`.
+    """
+
+    def __init__(
+        self,
+        embed_tokens: nn.Embedding,
+        paligemma,
+        action_expert,
+        action_in_proj: nn.Linear,
+        action_out_proj: nn.Linear,
+        time_mlp,
+    ):
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        self.paligemma = paligemma
+        self.action_expert = action_expert
+        self.action_in_proj = action_in_proj
+        self.action_out_proj = action_out_proj
+        self.time_mlp = time_mlp
+
+
 def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
     """Re-initialize non-persistent buffers like ``position_ids`` after a
     ``meta + to_empty`` materialization.
@@ -114,7 +147,7 @@ class Pi05Model(Model):
         self.tokenizer: Pi05Tokenizer | None = self._load_tokenizer()
 
         self._repo_dir: Path | None = None
-        self._lerobot_buckets: dict[str, dict[str, torch.Tensor]] | None = None
+        self._lerobot_flat: dict[str, torch.Tensor] | None = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
         # Components, materialized lazily by get_submodule().
@@ -240,21 +273,17 @@ class Pi05Model(Model):
         self._repo_dir = Path(local)
         return self._repo_dir
 
-    def _ensure_lerobot_buckets(self) -> dict[str, dict[str, torch.Tensor]]:
-        """Lazily load ``model.safetensors`` from the lerobot snapshot and
-        bucket its keys by mminf submodule via :func:`remap_lerobot_state_dict`.
+    def _ensure_lerobot_flat(self) -> dict[str, torch.Tensor]:
+        """Lazily load ``model.safetensors`` from the lerobot snapshot.
 
-        Pi0.5 (lerobot/pi05_base) ships as a single ~14 GB safetensors blob,
-        not a sharded HF index, so we can't use ``load_weights_from_hf_shards``
-        here. Instead, we load the file once into CPU memory, run the
-        lerobot→mminf key remap, and cache the buckets so subsequent
-        ``get_submodule`` calls (vit_encoder + LLM) reuse them.
+        Pi0.5 (lerobot/pi05_base) ships as a single ~14 GB safetensors
+        blob (not a sharded HF index), so we load it once into CPU memory
+        and cache it. Both ``get_submodule`` calls (vit_encoder + LLM)
+        consume the same dict.
         """
-        if self._lerobot_buckets is not None:
-            return self._lerobot_buckets
+        if self._lerobot_flat is not None:
+            return self._lerobot_flat
         from safetensors.torch import load_file
-
-        from mminf.model.pi05.weight_loader import remap_lerobot_state_dict
 
         repo_dir = self._ensure_repo()
         safetensors_path = repo_dir / "model.safetensors"
@@ -264,9 +293,86 @@ class Pi05Model(Model):
                 "safetensors blob in the lerobot/pi05_base snapshot."
             )
         logger.info("Loading Pi0.5 weights from %s", safetensors_path)
-        flat = load_file(str(safetensors_path), device="cpu")
-        self._lerobot_buckets = remap_lerobot_state_dict(flat)
-        return self._lerobot_buckets
+        self._lerobot_flat = load_file(str(safetensors_path), device="cpu")
+        return self._lerobot_flat
+
+    def _lerobot_remap(self, name: str) -> str | None:
+        """Translate one lerobot Pi0.5 key into the matching mminf
+        parameter path under the LLM weight container, or ``None`` to drop.
+
+        The LLM container layout (see :class:`_Pi05LLMWeightContainer`)
+        is::
+
+            embed_tokens.weight
+            paligemma.<gemma transformer keys>
+            action_expert.<gemma transformer keys>
+            action_in_proj.{weight,bias}
+            action_out_proj.{weight,bias}
+            time_mlp.linear_{in,out}.{weight,bias}
+
+        Siglip / connector keys live on a different module
+        (``vit_encoder``), so they are dropped here and picked up by
+        :meth:`_extract_siglip_state_dict`.
+        """
+        # Top-level wrappers (already match in name).
+        if name.startswith("action_in_proj.") or name.startswith("action_out_proj."):
+            return name
+        if name.startswith("time_mlp_in."):
+            return "time_mlp.linear_in." + name.removeprefix("time_mlp_in.")
+        if name.startswith("time_mlp_out."):
+            return "time_mlp.linear_out." + name.removeprefix("time_mlp_out.")
+
+        # PaliGemma uses tied embeddings; lm_head.weight IS the input
+        # embedding matrix, which we hold separately as embed_tokens.
+        if name == _PALIGEMMA_LM_HEAD:
+            return "embed_tokens.weight"
+        if name.startswith(_PALIGEMMA_PREFIX):
+            inner = name.removeprefix(_PALIGEMMA_PREFIX)
+            if inner.startswith("language_model."):
+                return "paligemma." + inner.removeprefix("language_model.")
+            # vision_tower / multi_modal_projector belong to the SigLIP
+            # submodule; drop here and let _extract_siglip_state_dict
+            # route them.
+            return None
+
+        # The gemma_expert lm_head exists in the checkpoint because
+        # GemmaForCausalLM owns it, but Pi0.5 inference never decodes
+        # tokens through it.
+        if name == _GEMMA_EXPERT_LM_HEAD:
+            return None
+        if name.startswith(_GEMMA_EXPERT_PREFIX):
+            return "action_expert." + name.removeprefix(_GEMMA_EXPERT_PREFIX)
+
+        return None
+
+    @staticmethod
+    def _extract_siglip_state_dict(
+        flat: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Bucket the SigLIP-relevant subset of the lerobot flat dict
+        into a ``Pi05SiglipEncoder.state_dict()``-compatible mapping.
+
+        Used by the SigLIP loading path which still uses
+        ``load_state_dict`` (no fused projections to route).
+        """
+        out: dict[str, torch.Tensor] = {}
+        for key, tensor in flat.items():
+            if not key.startswith(_PALIGEMMA_PREFIX):
+                continue
+            inner = key.removeprefix(_PALIGEMMA_PREFIX)
+            if inner.startswith("vision_tower.vision_model."):
+                # The lerobot key is
+                #   paligemma.model.vision_tower.vision_model.<rest>
+                # Pi05SiglipEncoder owns ``self.vision_model = SiglipVisionModel(...)``,
+                # and HF's SiglipVisionModel has its own inner ``.vision_model``
+                # attribute, so the corresponding key is
+                # ``vision_model.vision_model.<rest>``. We replace
+                # ``vision_tower`` with ``vision_model`` to make that explicit.
+                out["vision_model." + inner.removeprefix("vision_tower.")] = tensor
+            elif inner.startswith("multi_modal_projector.linear."):
+                sub = inner.removeprefix("multi_modal_projector.linear.")
+                out[f"connector.{sub}"] = tensor
+        return out
 
     # ------------------------------------------------------------------
     # Model ABC: structure
@@ -480,7 +586,7 @@ class Pi05Model(Model):
     # ------------------------------------------------------------------
 
     def get_submodule(
-        self, node_name: str, device: str = "cpu"
+        self, node_name: str, device: str = "cpu", tp_group=None,
     ) -> torch.nn.Module | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
@@ -530,7 +636,7 @@ class Pi05Model(Model):
             _reset_non_persistent_buffers(self.siglip, device)
             return
 
-        buckets = self._ensure_lerobot_buckets()
+        flat = self._ensure_lerobot_flat()
         self.siglip.to_empty(device=device)
         # CRITICAL: HF's SiglipVisionEmbeddings registers ``position_ids`` as
         # a NON-persistent buffer (persistent=False), so it's not in any
@@ -543,9 +649,10 @@ class Pi05Model(Model):
         # non-persistent ``position_ids`` buffer with the canonical
         # ``arange`` values before running the forward.
         _reset_non_persistent_buffers(self.siglip, device)
-        # strict=False: the lerobot bucket may contain stray pooling-head keys
-        # that Pi05SiglipEncoder doesn't model (vision_use_head=False).
-        self.siglip.load_state_dict(buckets["siglip"], strict=False)
+        # strict=False: the extracted bucket may contain stray pooling-head
+        # keys that Pi05SiglipEncoder doesn't model (vision_use_head=False).
+        siglip_sd = self._extract_siglip_state_dict(flat)
+        self.siglip.load_state_dict(siglip_sd, strict=False)
 
     def _init_llm_components(self, device: str):
         if self.embed_tokens is not None:
@@ -583,19 +690,25 @@ class Pi05Model(Model):
                 mod.to_empty(device=device)
             return
 
-        buckets = self._ensure_lerobot_buckets()
-        # Materialize each module on `device`, then copy in its bucket. We
-        # use strict=False because the lerobot paligemma bucket carries an
-        # extra ``embed_tokens.weight`` key (loaded separately into
-        # self.embed_tokens) and possibly other tied/aux tensors that
-        # Pi05PaliGemmaExpert doesn't model.
-        for mod, name in (
-            (self.embed_tokens, "embed_tokens"),
-            (self.paligemma, "paligemma"),
-            (self.action_expert, "action_expert"),
-            (self.action_in_proj, "action_in_proj"),
-            (self.action_out_proj, "action_out_proj"),
-            (self.time_mlp, "time_mlp"),
-        ):
-            mod.to_empty(device=device)
-            mod.load_state_dict(buckets[name], strict=False)
+        from mminf.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
+
+        flat = self._ensure_lerobot_flat()
+        # Wrap the LLM components in a flat container so the loader's
+        # named_parameters() table has entries like ``paligemma.layers.0.
+        # self_attn.qkv_proj.weight`` for the stacked-param rules to route
+        # ``q/k/v_proj.weight`` checkpoint keys into.
+        wrapper = _Pi05LLMWeightContainer(
+            embed_tokens=self.embed_tokens,
+            paligemma=self.paligemma,
+            action_expert=self.action_expert,
+            action_in_proj=self.action_in_proj,
+            action_out_proj=self.action_out_proj,
+            time_mlp=self.time_mlp,
+        )
+        wrapper.to_empty(device=device)
+        load_hf_weights(
+            wrapper,
+            flat.items(),
+            stacked_params=LLAMA_STACKED_PARAMS,
+            name_remapper=self._lerobot_remap,
+        )

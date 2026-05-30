@@ -1,0 +1,31 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+node_groups:
+  # Thinker LLM (text + audio + vision) on 2 GPUs, TP=2.
+  # ParallelAttention + ParallelSparseMoeBlock (no shared expert) shard
+  # across these two ranks; QKVParallelLinear handles GQA replication.
+  - node_names: [Thinker]
+    ranks: [0, 1]
+    tp_size: 2
+
+  # Stateless encoders run only on rank 0; their outputs (audio_embeds,
+  # vision_embeds, deepstack) are replicated tensors, so the conductor
+  # fan-out sends one copy to Thinker rank 1.
+  - node_names: [audio_encoder, vision_encoder]
+    ranks: [0]
+
+  # Talker LLM on 2 GPUs, TP=2.
+  # ParallelAttention + ParallelSparseMoeBlockWithSharedExpert. The
+  # internal CodePredictor stays TP=1 (replicated weights, deterministic
+  # sampler with broadcast) — sharding its 5-layer x 15-iter unrolled
+  # loop would cost more in NCCL than the compute it saves.
+  - node_names: [Talker]
+    ranks: [2, 3]
+    tp_size: 2
+
+  # Code2Wav (vocoder) is stateless and small — colocated with Talker
+  # rank 0 to avoid spending a 5th GPU. The codec_tokens streaming edge
+  # is replicated across Talker ranks, so only rank 0 (worker 2) fans
+  # out, and the destination is local on the same worker.
+  - node_names: [Code2Wav]
+    ranks: [2]

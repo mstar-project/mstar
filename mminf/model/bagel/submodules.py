@@ -477,7 +477,7 @@ class LLMSubmodule(ARNodeSubmodule):
         }
 
     def get_cuda_graph_configs(
-        self, device: torch.device,
+        self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
         """Declare CUDA graph captures for ``decode`` (cfg-off + cfg-on) and ``prefill_text`` (cfg-off only).
 

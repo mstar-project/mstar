@@ -1,20 +1,18 @@
 """Fused MoE entry point: plan permute, two GEMMs, activation, reduce.
 
-Designed to be a drop-in replacement for
-:func:`mminf.model.qwen3_omni.components.moe._dispatch_experts_fused`
-for bf16 / fp16 Qwen3-Omni Thinker and Talker routed-expert dispatch.
-The shared expert (Talker only) stays outside and the router stays
-outside -- this function handles only the gate_up GEMM, SwiGLU, down
-GEMM, and weighted sum over top-k.
+Drop-in replacement for
+:func:`mminf.model.components.moe.dispatch_experts_fused` for bf16 /
+fp16 routed-expert dispatch. The shared expert (when present) stays
+outside and the router stays outside — this function handles only the
+gate_up GEMM, SwiGLU, down GEMM, and weighted sum over top-k.
 """
-
 from __future__ import annotations
 
 import torch
 import triton.language as tl
 
-from mminf.model.qwen3_omni.components.fused_moe.align import moe_align_block_size
-from mminf.model.qwen3_omni.components.fused_moe.kernels import (
+from mminf.utils.fused_moe.align import moe_align_block_size
+from mminf.utils.fused_moe.kernels import (
     act_and_mul_triton,
     get_default_config,
     invoke_fused_moe_kernel,
@@ -37,6 +35,7 @@ def fused_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
+    reduce_results: bool = True,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -60,11 +59,17 @@ def fused_experts(
         ``(tokens, top_k)`` int; will be cast to int32 if not already.
     activation : str
         ``"silu"`` (default) or ``"gelu"``.  Qwen3-Omni always uses silu.
+    reduce_results : bool
+        If True (default), sum-reduce over the top-k dimension and return
+        ``(tokens, hidden)``. If False, skip the sum-reduce and return
+        ``(tokens, top_k, hidden)`` — the caller is responsible for the
+        reduce (e.g. after an all-reduce for TP).
 
     Returns
     -------
     torch.Tensor
-        Shape ``(tokens, hidden)``, same dtype as ``hidden_states``.
+        Shape ``(tokens, hidden)`` if ``reduce_results`` else
+        ``(tokens, top_k, hidden)``.
     """
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert w1.is_contiguous(), "w1 must be contiguous"
@@ -147,6 +152,8 @@ def fused_experts(
     )
 
     # 6. Sum over the top-k slots -> (tokens, hidden).
+    if not reduce_results:
+        return cache3
     output = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
     return output

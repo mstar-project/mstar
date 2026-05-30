@@ -804,7 +804,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             )
         return packed
 
-    def get_cuda_graph_configs(self, device: torch.device):
+    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1):
         """Declare CUDA graph captures for ``thinker_decode`` and the prefill walks.
 
         Decode uses ``BasicBatchedCudaGraphConfig`` (one capture per bs;
@@ -1721,7 +1721,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             ),
         }
 
-    def get_cuda_graph_configs(self, device: torch.device):
+    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1):
         """Declare CUDA graph captures for ``talker_decode``, ``talker_prefill``, and ``talker_last_prefill``.
 
         ``talker_decode``: ``BasicBatchedCudaGraphConfig`` (one capture per bs;
@@ -1839,7 +1839,7 @@ class Code2WavSubmodule(NodeSubmodule):
         self._first_chunk_emitted.discard(request_id)
         self._latest_seq_len.pop(request_id, None)
     
-    def get_cuda_graph_configs(self, device):
+    def get_cuda_graph_configs(self, device, tp_world_size: int = 1):
         num_quantizers = self.config.code2wav.num_quantizers
         return [
             BasicBatchedCudaGraphConfig(

@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, field
 import torch
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
+from mminf.distributed.communication import TPCommGroup, WorkerTPGroups
+from mminf.distributed.utils import divide
 from mminf.engine.base import (
     BaseEngine,
     EngineCapabilities,
@@ -45,6 +47,7 @@ class KVManagement:
 class SubmoduleManagement:
     submodule: ARNodeSubmodule
     kv_management: KVManagement
+    tp_group: TPCommGroup
     sampler: Sampler = field(default_factory=Sampler)
     cuda_graph_runner: CudaGraphRunner | None = None
 
@@ -88,6 +91,7 @@ class KVCacheEngine(BaseEngine):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
+        tp_groups: WorkerTPGroups,
         kv_cache_config: list[KVCacheConfig],
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
@@ -102,8 +106,25 @@ class KVCacheEngine(BaseEngine):
             num_layers = cfg.num_layers
             max_num_pages = cfg.max_num_pages
             page_size = cfg.page_size
-            num_kv_heads = cfg.num_kv_heads
             head_dim = cfg.head_dim
+
+            nodes = set(cfg.nodes or submodules.keys()) & set(submodules.keys())
+            if not nodes:
+                continue  # skip KV cache configs that don't apply to any loaded submodule
+            world_sizes = set([
+                tp_groups.get_tp_config_for_node(node).world_size for node in nodes
+            ])
+            tp_ranks = set([
+                tp_groups.get_tp_config_for_node(node).rank for node in nodes
+            ])
+            if len(world_sizes) > 1 or len(tp_ranks) > 1:
+                raise RuntimeError(
+                    "It is disallowed to share a KV cache among colocated nodes "
+                    f"from different TP groups: {nodes}."
+                )
+            tp_size = world_sizes.pop()
+            cfg.shard(tp_size)
+            num_kv_heads = cfg.num_kv_heads
 
             kv_cache = torch.zeros(
                 num_layers, max_num_pages, 2,
@@ -139,13 +160,16 @@ class KVCacheEngine(BaseEngine):
             )
             self.kv_management[cfg.get_node_str()] = kv_mgmt
 
-            for node_name in (cfg.nodes or submodules.keys()):
+            for node_name in nodes:
                 node_to_kv_mgmt[node_name] = kv_mgmt
 
         for node_name, submodule in submodules.items():
+            tp_group = tp_groups.get_tp_config_for_node(node_name)
             self.submodule_management[node_name] = SubmoduleManagement(
                 submodule=submodule,
                 kv_management=node_to_kv_mgmt[node_name],
+                tp_group=tp_group,
+                sampler=Sampler(tp_group=tp_group),
             )
 
 
@@ -220,7 +244,8 @@ class KVCacheEngine(BaseEngine):
                 sampler=submodule_mgmt.sampler,
                 buffer_manager=kv_mgmt.buffer_manager,
                 device=self.device,
-                autocast_dtype=self.autocast_dtype
+                autocast_dtype=self.autocast_dtype,
+                tp_group=submodule_mgmt.tp_group,
             )
             runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()
@@ -245,6 +270,7 @@ class KVCacheEngine(BaseEngine):
                     alloc_manager=kv_mgmt.alloc_manager,
                     buffer_manager=kv_mgmt.buffer_manager,
                     cache_labels=pcgr_config.get("cache_labels", ["main"]),
+                    tp_group=submodule_mgmt.tp_group,
                 )
                 pcgr.warmup_and_capture()
                 if pcgr.graphs:
@@ -257,6 +283,56 @@ class KVCacheEngine(BaseEngine):
         # torch.compile applied after CUDA graph capture so compiled kernels
         # are baked into the graphs.
         self._compile_submodules()
+
+        # Fail fast on asymmetric KV state across TP ranks. v1 OOM
+        # recovery relies on the invariant that every rank of a TP group
+        # sees the same alloc-manager state at every scheduling step
+        # (because rank 0 is the sole source of admission decisions, KV
+        # caches aren't shared across TP groups, and ``add_request`` /
+        # ``alloc`` / ``free`` are driven by rank-0-broadcast
+        # ``ScheduleTPNode`` messages). If the page count diverges at
+        # startup, one rank will OOM while another won't and the next
+        # NCCL collective will hang. The check is one ``all_gather`` of
+        # a scalar per shared cache, fired once.
+        self._verify_tp_kv_symmetry()
+
+    def _verify_tp_kv_symmetry(self) -> None:
+        """Assert ``num_free_pages`` is identical across every TP rank
+        for each KV cache this engine owns.
+
+        Catches YAML drift (e.g. ``cpu_offload_pages`` set on one rank
+        but not another), allocator-init bugs, and any future code path
+        that adds requests asymmetrically before ``warmup`` returns. The
+        ``all_gather`` itself is synchronizing, so no extra barrier is
+        needed on the success path.
+        """
+        seen_keys: set[tuple[int, int]] = set()
+        for submod_mgmt in self.submodule_management.values():
+            tp_group = submod_mgmt.tp_group
+            if tp_group.world_size == 1:
+                continue
+            cache_mgmt = submod_mgmt.kv_management
+            key = (id(cache_mgmt), id(tp_group))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            local_free = cache_mgmt.alloc_manager.page_allocator.num_free
+            cache_name = cache_mgmt.kv_cache_config.get_node_str()
+
+            local_t = torch.tensor(
+                [local_free], dtype=torch.int64, device=self.device,
+            )
+            gathered = tp_group.all_gather(local_t, dim=0)
+            values = gathered.cpu().tolist()
+            if any(v != values[0] for v in values):
+                raise RuntimeError(
+                    f"KV cache {cache_name!r} has asymmetric num_free_pages "
+                    f"across TP ranks: {values}. v1 requires symmetric "
+                    "allocator state; check the YAML for per-rank-divergent "
+                    "max_num_pages / cpu_offload_pages, and any model code "
+                    "that calls add_request before warmup completes."
+                )
 
     def get_max_batch_size(self, node_name, graph_walk):
         if node_name not in self.submodule_management:
@@ -630,7 +706,8 @@ class KVCacheEngine(BaseEngine):
         """
         if batch.node_name not in self.submodule_management:
             return
-        cache_mgmt = self.submodule_management[batch.node_name].kv_management
+        submod_mgmt = self.submodule_management[batch.node_name]
+        cache_mgmt = submod_mgmt.kv_management
         kv_cache_string = cache_mgmt.kv_cache_config.get_node_str()
         for req_id in batch.request_ids:
             info = batch.per_request_info.get(req_id)
@@ -638,6 +715,8 @@ class KVCacheEngine(BaseEngine):
                 continue
             info.per_label_seq_info.add(
                 kv_cache_string,
+                submod_mgmt.tp_group.rank,
+                submod_mgmt.tp_group.world_size,
                 cache_mgmt.alloc_manager.get_per_label_seq_info(req_id),
             )
 
@@ -659,8 +738,15 @@ class KVCacheEngine(BaseEngine):
 
         if self.enable_nvtx:
             range_push("kv_cache.kv_sync_retrieve", synchronize=False)
+        world_size = submod_mgmt.tp_group.world_size
         for req_id, info in batch.per_request_info.items():
-            for label, seq_info in info.per_label_seq_info.get(kv_cache_string).items():
+            if info.per_label_seq_info.world_size.get(kv_cache_string, world_size) != world_size:
+                raise RuntimeError(
+                    "KV cache transfer across TP world size is currently disallowed"
+                ) # TODO: figure out fanin/fanout for KV cache transfer
+            for label, seq_info in info.per_label_seq_info.get(
+                kv_cache_string, submod_mgmt.tp_group.rank
+            ).items():
                 if needed_labels is not None and label not in needed_labels:
                     continue
                 cache_mgmt.alloc_manager.sync_retrieve(req_id, label, seq_info)
@@ -721,6 +807,7 @@ class KVCacheEngine(BaseEngine):
         node_inputs = planned.node_inputs
         submod_mgmt = planned.prepared.metadata["submod_mgmt"]
         sampler = submod_mgmt.sampler
+        submod_mgmt.tp_group.barrier()
 
         if self._can_use_cuda_graph(batch, node_inputs):
             if self.enable_nvtx:
@@ -797,8 +884,14 @@ class KVCacheEngine(BaseEngine):
 
         labels_to_check = []
         try:
+            kv_cache_string = cache_mgmt.kv_cache_config.get_node_str()
+            world_size = submod_mgmt.tp_group.world_size
+            if request_info.per_label_seq_info.world_size.get(kv_cache_string, world_size) != world_size:
+                raise RuntimeError(
+                    "KV cache transfer across TP world size is currently disallowed"
+                ) # TODO: figure out fanin/fanout for KV cache transfer
             for label, seq_info in request_info.per_label_seq_info.get(
-                cache_mgmt.kv_cache_config.get_node_str()
+                kv_cache_string,  submod_mgmt.tp_group.rank
             ).items():
                 if needed_labels is not None and label not in needed_labels:
                     continue

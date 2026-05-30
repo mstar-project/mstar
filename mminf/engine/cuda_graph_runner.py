@@ -159,11 +159,17 @@ class CudaGraphRunner:
         sampler: Sampler,
         buffer_manager: WorkspaceBufferManager,
         device: torch.device,
-        autocast_dtype: torch.dtype
+        autocast_dtype: torch.dtype,
+        tp_group=None,
     ):
+        from mminf.distributed.communication import TPCommGroup
+
         self.submodule_name = submodule_name
         self.submodule = submodule
-        self.capture_configs: list[CudaGraphConfig] = submodule.get_cuda_graph_configs(device)
+        self.tp_group: TPCommGroup = tp_group or TPCommGroup.trivial()
+        self.capture_configs: list[CudaGraphConfig] = submodule.get_cuda_graph_configs(
+            device, self.tp_group.world_size
+        )
         self.kv_cache_config = kv_cache_config
         self.alloc_manager = alloc_manager
         self.sampler = sampler
@@ -202,7 +208,8 @@ class CudaGraphRunner:
             for config in self.capture_configs] or [1]
         )
         self.sampler_buffer: SamplerBuffers = SamplerBuffers.allocate(
-            max_batch_size=self.max_bs, device=device
+            max_batch_size=self.max_bs, device=device,
+            tp_group=self.tp_group,
         )
 
     def warmup_and_capture(self) -> None:
@@ -229,6 +236,7 @@ class CudaGraphRunner:
                         requires_cfg=config.requires_cfg,
                         bs=bs, num_tokens=num_tokens
                     )
+                    self.tp_group.barrier()
                     try:
                         cfg_type = config.get_config_type()
                         if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
@@ -1848,7 +1856,7 @@ class StatelessCudaGraphRunner:
             have batch-dim first, same size as the input batch dim, so the
             runner can slice ``[:actual_bs]`` and index per request.
 
-        get_cuda_graph_configs(device) -> list[CudaGraphConfig]
+        get_cuda_graph_configs(device, tp_world_size=1) -> list[CudaGraphConfig]
             Each config's ``single_request_inputs`` is a single per-request
             ARNodeInputs (same shape as real runtime inputs). The runner
             clones it per capture batch slot, then feeds the resulting list
@@ -1877,12 +1885,16 @@ class StatelessCudaGraphRunner:
         submodule_name: str,
         submodule: nn.Module,
         device: torch.device,
+        tp_group=None,
     ):
+        from mminf.distributed.communication import TPCommGroup
+
         self.submodule_name = submodule_name
         self.submodule = submodule
         self.device = device
+        tp_world_size = tp_group.world_size if tp_group is not None else 1
         self.capture_configs: list[CudaGraphConfig] = (
-            submodule.get_cuda_graph_configs(device) if submodule is not None else []
+            submodule.get_cuda_graph_configs(device, tp_world_size) if submodule is not None else []
         )
 
         # Keyed by (graph_walk, padded_bs)
@@ -2189,7 +2201,10 @@ class PiecewiseCudaGraphRunner:
         alloc_manager: PagedAllocationManager | None = None,
         buffer_manager: WorkspaceBufferManager | None = None,
         cache_labels: list[str] | None = None,
+        tp_group=None,
     ):
+        from mminf.distributed.communication import TPCommGroup
+
         self.fn_factory = fn_factory
         self.embed_dim = embed_dim
         self.capture_batch_sizes = sorted(capture_batch_sizes)
@@ -2201,6 +2216,14 @@ class PiecewiseCudaGraphRunner:
         self.alloc_manager = alloc_manager
         self.buffer_manager = buffer_manager
         self.cache_labels: list[str] = cache_labels or ["main"]
+        # ``tp_group`` is the per-node TP comm group. Defaults to the
+        # trivial single-rank group so the runner behaves identically for
+        # non-TP submodules (V-JEPA2 today). When ``world_size > 1`` the
+        # captured block-loop closure may include NCCL collectives via
+        # parallel layers — ``warmup_and_capture`` barriers before each
+        # per-bs capture to keep ranks in lockstep (the same race the
+        # standard ``CudaGraphRunner`` guards against).
+        self.tp_group: TPCommGroup = tp_group or TPCommGroup.trivial()
 
         self.graphs: dict[int, PiecewiseGraphData] = {}
         self.memory_pool = None
@@ -2218,6 +2241,10 @@ class PiecewiseCudaGraphRunner:
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
 
         for bs in reversed(self.capture_batch_sizes):
+            # Sync TP ranks before each capture so a faster rank doesn't
+            # enter the warmup forward and issue NCCL while a slower one
+            # is still in pre-capture setup. No-op for trivial groups.
+            self.tp_group.barrier()
             try:
                 self._capture_one(bs)
                 logger.info("PiecewiseCudaGraphRunner: captured bs=%d seq_len=%d", bs, self.capture_seq_len)

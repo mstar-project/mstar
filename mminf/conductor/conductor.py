@@ -3,6 +3,7 @@ import hashlib
 import logging
 import multiprocessing as mp
 import os
+import socket
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -20,9 +21,11 @@ from mminf.conductor.request_info import (
     PartitionState,
     StreamingConnectionState,
 )
+from mminf.distributed.base import ShardingConfig
+from mminf.distributed.communication import GlobalTPConfig, WorkerTPGroups
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
-from mminf.graph.base import GraphEdge, TensorPointerInfo
+from mminf.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mminf.graph.loop_indices import NestedLoopIndices
 from mminf.model.base import ForwardPassArgs, Model, WorkerGraph
 from mminf.utils.ipc_format import (
@@ -57,6 +60,20 @@ def _req_id_to_seed(req_id: str):
     return int.from_bytes(digest[:4], "little")
 
 
+def _pick_free_tcp_port() -> int:
+    """Ask the OS for an unused ephemeral TCP port.
+
+    Binds to port 0, reads back the assignment, releases. There is a tiny
+    race window between this release and the NCCL TCPStore bind in the
+    worker process — small enough in practice for single-host use. The
+    point of picking dynamically is to avoid colliding with another
+    ``mminf`` instance hard-coded to 29500 on the same host.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
 def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
@@ -66,8 +83,11 @@ def _worker_process_target(
     all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
     all_worker_graph_ids_to_nodes: dict[str, set[str]],
     all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
+    sharding_config: ShardingConfig,
+    tp_groups: WorkerTPGroups,
     hostname: str,
     socket_path_prefix: str,
+    dist_init_method: str,
     enable_nvtx: bool = False,
     model: Model | None = None,
     device: str = "cuda",
@@ -86,23 +106,30 @@ def _worker_process_target(
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
         [set(wg.section.get_nodes()) for wg in my_worker_graphs]
     ))
-    worker = Worker(
-        worker_id=worker_id,
-        worker_ids=worker_ids,
-        model=model,
-        my_worker_graphs=my_worker_graphs,
-        kv_config=kv_config,
-        model_config=model_config,
-        all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
-        all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
-        all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
-        hostname=hostname,
-        socket_path_prefix=socket_path_prefix,
-        enable_nvtx=enable_nvtx,
-        device=torch.device(device),
-        tensor_comm_protocol=tensor_comm_protocol,
-        tcp_transfer_device=tcp_transfer_device,
-    )
+    try:
+        worker = Worker(
+            worker_id=worker_id,
+            worker_ids=worker_ids,
+            model=model,
+            my_worker_graphs=my_worker_graphs,
+            kv_config=kv_config,
+            model_config=model_config,
+            all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
+            all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
+            all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
+            sharding_config=sharding_config,
+            tp_groups=tp_groups,
+            hostname=hostname,
+            socket_path_prefix=socket_path_prefix,
+            dist_init_method=dist_init_method,
+            enable_nvtx=enable_nvtx,
+            device=torch.device(device),
+            tensor_comm_protocol=tensor_comm_protocol,
+            tcp_transfer_device=tcp_transfer_device,
+        )
+    except BaseException as e:
+        logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
+        raise e
     worker.run()
 
 
@@ -111,11 +138,12 @@ class RequestData:
     # Request-level shared state
     persist_signals: dict[str, list[TensorPointerInfo]]  # signals passed back to conductor
     persist_signal_ref_cnt: dict[str, int]  # uuid -> number of times it was passed to workers
-    worker_graph_to_worker: dict[str, str]
+    worker_graph_to_workers: dict[str, list[str]]
     all_worker_graph_ids: set[str]
     max_output_tokens: int
     random_seed: int
     sampling_config: dict[str, SamplingConfig | None]
+    sharding_config: ShardingConfig | None = None
 
     # Partition state (always populated — single-partition models use a "default" partition)
     partition_states: dict[str, PartitionState] = field(default_factory=dict)
@@ -146,11 +174,6 @@ class RequestData:
 
 
 class Conductor:
-    """
-    Initial in-progress conductor implementation. TODO: this is extremely
-    un-optimized, but it provides a sense of the data movement between the
-    conductor and the workers
-    """
     def __init__(
         self,
         model: Model,
@@ -182,10 +205,77 @@ class Conductor:
         assert "max_seq_len" in self.model_config
         assert "node_groups" in self.model_config
 
+        self.default_sharding_config = model.get_sharding_config(model_config_file)
         self.worker_graphs = {
             worker_graph.worker_graph_id: worker_graph
             for worker_graph in model.get_worker_graphs(model_config_file)
-        }
+        }        
+
+        # (1) Set up worker graph TP ranks
+        # (2) Assert that streaming consumers don't have graph-walk-specific sharding config
+        self.streaming_consumers = set()
+        self.node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
+
+        # (worker idx) -> {tp_group_str: tp_rank}
+        self.worker_tp_group_to_tp_rank: dict[int, dict[str, int]] = {}
+
+        graph_walks = set()
+        for wg in self.worker_graphs.values():
+            for walk in wg.graph_walks:
+                graph_walks.add(walk)
+            for name, node in wg.section.get_nodes().items():
+                for walk in wg.graph_walks:
+                    self.node_walk_to_wg[(name, walk)] = wg
+                if node.consumes_stream:
+                    self.streaming_consumers.add(name)
+
+        # v1: one sharding group per worker graph. Track which group "owns"
+        # each wg so we can assert single-group-per-wg.
+        wg_to_owning_group: dict[str, str] = {}
+
+        for group in self.default_sharding_config.groups:
+            if group.graph_walks is not None and any([
+                node in self.streaming_consumers for node in group.nodes
+            ]):
+                raise RuntimeError((
+                    f"Sharding group with nodes {group.nodes} includes a streaming consumer but "
+                    f"has custom graph walk configuration {group.graph_walks}. It is currently "
+                    "disallowed to set custom graph walks for TP groups that include streaming "
+                    "consumer nodes."
+                ))
+            group_graph_walks = group.graph_walks or graph_walks
+            group_key = group.key_str()
+            for walk in group_graph_walks:
+                for node in group.nodes:
+                    if (node, walk) not in self.node_walk_to_wg:
+                        continue
+                    wg = self.node_walk_to_wg[(node, walk)]
+                    # v1: a worker graph belongs to at most one sharding group.
+                    # Construct worker graphs so this holds; revisit if we
+                    # need multiple TP groups colocated in one wg.
+                    prior = wg_to_owning_group.setdefault(wg.worker_graph_id, group_key)
+                    assert prior == group_key, (
+                        f"Worker graph {wg.worker_graph_id} is claimed by two sharding "
+                        f"groups ({prior!r} and {group_key!r}). v1 requires one TP group "
+                        f"per worker graph; split the wg or merge the groups."
+                    )
+                    # wg._tp_ranks is computed in WorkerGraph.__post_init__
+                    # from wg.tp_size (which came from the node_group entry).
+                    assert wg.tp_size == group.tp_size, (
+                        f"Worker graph {wg.worker_graph_id} has tp_size {wg.tp_size}, "
+                        f"but its sharding group has tp_size {group.tp_size}. "
+                        f"node_groups and sharding_config disagree."
+                    )
+                    for ranks in wg._tp_ranks:
+                        for i, r in enumerate(ranks):
+                            self.worker_tp_group_to_tp_rank.setdefault(r, {})[group_key] = i
+
+        # Pick a free TCP port for the NCCL init store. Done once on the
+        # conductor and shared with every spawned worker via
+        # ``dist_init_method`` so two ``mminf`` instances on the same host
+        # don't collide on a hard-coded port.
+        self._dist_init_port = _pick_free_tcp_port()
+        self._dist_init_method = f"tcp://{hostname}:{self._dist_init_port}"
 
         os.makedirs(socket_path_prefix, exist_ok=True)
         self._derive_worker_info()
@@ -255,6 +345,21 @@ class Conductor:
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
 
+        # set the _tp_rank properly for each worker
+        self.per_worker_sharding_config: dict[str, ShardingConfig] = {}
+        for i, worker_id in enumerate(self.worker_ids):
+            sharding_cfg = self.default_sharding_config.clone_empty()
+            for group in sharding_cfg.groups:
+                group_key = group.key_str()
+                if group_key in self.worker_tp_group_to_tp_rank.get(i, {}):
+                    group._tp_rank = self.worker_tp_group_to_tp_rank[i][group_key]
+            self.per_worker_sharding_config[worker_id] = sharding_cfg
+        
+        self.tp_config = GlobalTPConfig(
+            worker_graphs=self.worker_graphs,
+            worker_ids=self.worker_ids,
+        )
+
     def _launch_workers(self):
         """Spawn one process per worker rank using spawn context."""
         ctx = mp.get_context("spawn")
@@ -270,8 +375,11 @@ class Conductor:
                     "all_worker_graph_ids_to_graph_walks": self._all_worker_graph_ids_to_graph_walks,
                     "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
                     "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
+                    "sharding_config": self.per_worker_sharding_config[worker_id],
+                    "tp_groups": self.tp_config.per_worker_config[worker_id],
                     "hostname": self.hostname,
                     "socket_path_prefix": self.socket_path_prefix,
+                    "dist_init_method": self._dist_init_method,
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,
                     "device": f"cuda:{rank}",
@@ -296,40 +404,103 @@ class Conductor:
             p.join(timeout=5)
         self._worker_processes.clear()
 
-    def _assign_worker_graphs_to_workers(self) -> dict[str, str]:
+    def _assign_worker_graphs_to_workers(self) -> dict[str, list[str]]:
         """
-        For a request, assign worker graphs to workers. This is relevant in the
-        data parallel case, where there may be a worker graph that is replicated
-        across many workers.
+        For a request, assign worker graphs to workers. DP picks are
+        coordinated by ``_group_id`` so all wgs derived from the same
+        node_group land on the same (replica's) workers — without this,
+        two wgs sharing a TP group could end up on different DP replicas
+        and break model topology.
+
+        TODO: smarter assignment that minimizes cross-graph-walk tensor
+        transfer (e.g., bias toward keeping prefill→decode handoff local
+        for the same request).
         """
-        # Do a random policy for now. TODO: refine this
-        return {
-            worker_graph_id: f"worker_{np.random.choice(worker_graph.ranks)}"
-            for worker_graph_id, worker_graph in self.worker_graphs.items()
-        }
+        # _group_id -> chosen DP-replica index within that group's ranks
+        group_id_to_replica_idx: dict[int, int] = {}
+        result = {}
+        for wg_id, wg in self.worker_graphs.items():
+            if wg._tp_ranks:
+                replica_idx = group_id_to_replica_idx.setdefault(
+                    wg._group_id, np.random.randint(len(wg._tp_ranks)),
+                )
+                ranks = wg._tp_ranks[replica_idx]
+                result[wg_id] = [f"worker_{r}" for r in ranks]
+            else:
+                replica_idx = group_id_to_replica_idx.setdefault(
+                    wg._group_id, np.random.randint(len(wg.ranks)),
+                )
+                result[wg_id] = [f"worker_{wg.ranks[replica_idx]}"]
+        return result
+
+    def _build_request_sharding_config(
+        self, worker_graph_to_workers: dict[str, list[str]],
+    ) -> ShardingConfig:
+        """Per-request ShardingConfig: clone default + setup with this
+        request's worker assignments.
+
+        TODO: each worker also builds its own ShardingConfig from
+        ``worker_graph_to_workers`` (with the worker's own ``_tp_rank``
+        set). The duplication keeps conductor↔worker chatter down, but if
+        request setup ever becomes a hotspot, consider sending the built
+        config over instead.
+        """
+        cfg = self.default_sharding_config.clone_empty()
+        node_to_workers: dict[NodeAndGraphWalk, list[str]] = {}
+        for wg_id, worker_ids in worker_graph_to_workers.items():
+            wg = self.worker_graphs[wg_id]
+            for walk in wg.graph_walks:
+                for node_name in wg.section.get_nodes():
+                    node_to_workers[NodeAndGraphWalk(node_name, walk)] = worker_ids
+        cfg.setup(node_to_workers)
+        cfg.assert_stream_consumer_compatibility(self.streaming_consumers)
+        return cfg
 
     def _split_inputs_to_workers(
-        self, worker_graph_to_worker: dict[str, str],
+        self,
+        sharding_config: ShardingConfig,
         inputs: list[GraphEdge],
-        graph_walk: str
+        graph_walk: str,
     ) -> dict[str, list[GraphEdge]]:
-        """
-        Given the full ForwardPassInputs for kicking off a new forward pass,
-        return a mapping of worker_id to the ForwardPassInputs that are routed
-        to that worker. ForwardPassInputs consists of graph edges and tensors.
-        """
-        inputs_per_worker: dict[str, list[GraphEdge]] = {}
-        for worker_graph_id, worker_id in worker_graph_to_worker.items():
-            worker_graph = self.worker_graphs[worker_graph_id]
-            if graph_walk not in worker_graph.graph_walks:
-                continue
-            nodes = set(worker_graph.section.get_nodes())
+        """Route inputs to consumer workers using per-source-rank fanout.
 
-            if worker_id not in inputs_per_worker:
-                inputs_per_worker[worker_id] = []
-            inputs_per_worker[worker_id] += [
-                edge for edge in inputs if edge.next_node in nodes
-            ]
+        tensor_info is grouped by (source_tp_rank, _source_node_name,
+        _source_graph_walk); each group fans out via the request's
+        ShardingConfig. Multi-rank sources produce one edge per source rank
+        per dest, which the consumer's fan-in path consolidates.
+        """
+        inputs_per_worker: dict[str, list[GraphEdge]] = defaultdict(list)
+        for edge in inputs:
+            if not edge.tensor_info:
+                # Signal-only — broadcast to every dest worker.
+                dest_workers = sharding_config.node_to_worker.get(
+                    NodeAndGraphWalk(edge.next_node, graph_walk), [],
+                )
+                for dest_worker in dest_workers:
+                    inputs_per_worker[dest_worker].append(edge.clone())
+                continue
+
+            groups: dict[tuple, list[TensorPointerInfo]] = defaultdict(list)
+            for info in edge.tensor_info:
+                key = (
+                    info.source_tp_rank,
+                    info._source_node_name,
+                    info._source_graph_walk,
+                )
+                groups[key].append(info)
+
+            for (src_rank, src_node, src_walk), infos in groups.items():
+                sub_edge = edge.clone()
+                sub_edge.tensor_info = infos
+                fanout = sharding_config.fanout_graph_edges(
+                    sub_edge,
+                    source_node=src_node,
+                    source_graph_walk=src_walk,
+                    dest_graph_walk=graph_walk,
+                    source_tp_rank=src_rank,
+                )
+                for dest_worker, sliced_edge in fanout.items():
+                    inputs_per_worker[dest_worker].append(sliced_edge)
         return inputs_per_worker
 
     def _update_persist_ref_counts(
@@ -414,7 +585,7 @@ class Conductor:
     ):
         """Actually dispatch a request to workers (no admission check)."""
         logger.debug("Conductor ingesting request %s", body.request_id)
-        worker_graph_to_worker = self._assign_worker_graphs_to_workers()
+        worker_graph_to_workers = self._assign_worker_graphs_to_workers()
 
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self.model.get_max_output_tokens(**model_kwargs)
@@ -452,21 +623,25 @@ class Conductor:
         request_data = RequestData(
             persist_signals=body.initial_signals,
             persist_signal_ref_cnt={},
-            worker_graph_to_worker=worker_graph_to_worker,
-            all_worker_graph_ids=set(worker_graph_to_worker.keys()),
+            worker_graph_to_workers=worker_graph_to_workers,
+            all_worker_graph_ids=set(worker_graph_to_workers.keys()),
             max_output_tokens=max_output_tokens,
             random_seed=seed,
             partition_states=partition_states,
             partition_definitions=partition_definitions,
             streaming_connections=streaming_connections,
-            sampling_config=self._get_sampling_configs(model_kwargs)
+            sampling_config=self._get_sampling_configs(model_kwargs),
+            sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
         )
+        for cfg in request_data.sampling_config.values():
+            cfg.set_seed(seed)
         self.requests[body.request_id] = request_data
 
         # Collect all worker_graph_ids per worker for the NewRequest
         worker_to_worker_graph_ids: dict[str, list[str]] = defaultdict(list)
-        for wg_id, worker_id in worker_graph_to_worker.items():
-            worker_to_worker_graph_ids[worker_id].append(wg_id)
+        for wg_id, worker_ids in worker_graph_to_workers.items():
+            for worker_id in worker_ids:
+                worker_to_worker_graph_ids[worker_id].append(wg_id)
 
         # Kick off all partitions by calling get_initial_forward_pass_args per partition
         partition_fwd_args: dict[str, ForwardPassArgs] = {}
@@ -499,7 +674,7 @@ class Conductor:
                 fwd_args = partition_fwd_args[partition_name]
                 pstate = partition_states[partition_name]
                 inputs_per_worker = self._split_inputs_to_workers(
-                    worker_graph_to_worker=worker_graph_to_worker,
+                    sharding_config=request_data.sharding_config,
                     inputs=fwd_args.inputs,
                     graph_walk=fwd_args.full_metadata.graph_walk,
                 )
@@ -507,7 +682,7 @@ class Conductor:
                 message = NewRequest(
                     request_id=body.request_id,
                     partition_worker_graph_ids=partition_wg_ids,
-                    worker_graph_to_worker=worker_graph_to_worker,
+                    worker_graph_to_workers=worker_graph_to_workers,
                     initial_inputs=inputs_per_worker.get(worker_id, []),
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
@@ -557,12 +732,13 @@ class Conductor:
         """Called when all partitions are done."""
         logger.info("Request %s done", request_id)
         request_data = self.requests[request_id]
-        for worker_id in set(request_data.worker_graph_to_worker.values()):
-            msg = WorkerMessage(
-                message_type=WorkerMessageType.REMOVE_REQUEST,
-                body=RemoveRequest(request_id)
-            )
-            self.communicator.send(worker_id, msg)
+        for worker_ids in request_data.worker_graph_to_workers.values():
+            for worker_id in worker_ids:
+                msg = WorkerMessage(
+                    message_type=WorkerMessageType.REMOVE_REQUEST,
+                    body=RemoveRequest(request_id)
+                )
+                self.communicator.send(worker_id, msg)
 
         self.communicator.send(
             "api_server",
@@ -604,35 +780,45 @@ class Conductor:
             )
             return []
 
-        # Update sequence info
-        pstate.per_label_seq_info.update(body.per_label_seq_info)
-
-        # Absorb persist signals (request-level)
+        # Persist signals: every rank contributes its shard (different uuid +
+        # source_tp_rank); accumulate across ranks, do not dedup.
         if body.persist_signals:
-            request_data.persist_signals.update(body.persist_signals)
+            for name, infos in body.persist_signals.items():
+                request_data.persist_signals.setdefault(name, []).extend(infos)
 
-        # Absorb new tokens and update streaming connection state
-        if body.new_tokens:
-            for name, tokens in body.new_tokens.items():
-                pstate.new_tokens.setdefault(name, []).extend(tokens)
-                pstate.num_output_tokens += len(tokens)
-                # Update streaming connections where this partition is producer
+        # Absorb-only fields are replicated across TP ranks; only the rank-0
+        # message contributes.
+        if body.is_first_tp_rank:
+            pstate.per_label_seq_info.update(body.per_label_seq_info)
+
+            if body.new_tokens:
+                for name, tokens in body.new_tokens.items():
+                    pstate.new_tokens.setdefault(name, []).extend(tokens)
+                    pstate.num_output_tokens += len(tokens)
+                    for conn in request_data.streaming_connections.values():
+                        if conn.from_partition == partition_name and conn.edge_name == name:
+                            conn.token_count += len(tokens)
+
+            if body.stream_tokens_consumed:
                 for conn in request_data.streaming_connections.values():
-                    if conn.from_partition == partition_name and conn.edge_name == name:
-                        conn.token_count += len(tokens)
+                    if conn.from_partition == partition_name:
+                        continue  # skip producer connections
+                    consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
+                    conn.consumed_count = max(conn.consumed_count, consumed)
 
-        # Update consumed counts from worker-reported stream consumption
-        if body.stream_tokens_consumed:
-            for conn in request_data.streaming_connections.values():
-                if conn.from_partition == partition_name:
-                    continue  # skip producer connections
-                consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
-                conn.consumed_count = max(conn.consumed_count, consumed)
+            request_data.final_outputs.update(body.output_loop_indices)
 
-        pstate.completed_worker_graph_ids.update(body.worker_graph_ids)
-        pstate.curr_forward_outputs += body.output_signal_names if isinstance(
-            body.output_signal_names, list
-        ) else []
+            pstate.curr_forward_outputs += body.output_signal_names if isinstance(
+                body.output_signal_names, list
+            ) else []
+
+        # Each wg is only marked complete when all its TP ranks have reported.
+        for wg_id in body.worker_graph_ids:
+            count = pstate.wg_rank_completions.get(wg_id, 0) + 1
+            pstate.wg_rank_completions[wg_id] = count
+            expected = len(request_data.worker_graph_to_workers[wg_id])
+            if count >= expected:
+                pstate.completed_worker_graph_ids.add(wg_id)
 
         # Check if this partition's forward pass is fully done
         done_partitions = []
@@ -707,8 +893,11 @@ class Conductor:
         pstate.new_tokens = {}
         pstate.completed_worker_graph_ids = set()
         pstate.current_worker_graph_ids = set()
+        pstate.wg_rank_completions = {}
         pstate.fwd_pass_number += 1
         pstate.random_seed += 1
+        for cfg in request_data.sampling_config.values():
+            cfg.set_seed(pstate.random_seed)
 
         self._set_partition_worker_graph_ids(
             request_id, partition_name, fwd_args.full_metadata.graph_walk,
@@ -727,7 +916,7 @@ class Conductor:
         self._update_persist_ref_counts(request_id, fwd_args.inputs)
 
         inputs_per_worker = self._split_inputs_to_workers(
-            worker_graph_to_worker=request_data.worker_graph_to_worker,
+            sharding_config=request_data.sharding_config,
             inputs=fwd_args.inputs,
             graph_walk=fwd_args.full_metadata.graph_walk,
         )
@@ -766,10 +955,10 @@ class Conductor:
         # Find which workers handle this consumer partition
         consumer_workers = set()
         pdef = request_data.partition_definitions[consumer_partition_name]
-        for wg_id, worker_id in request_data.worker_graph_to_worker.items():
+        for wg_id, worker_ids in request_data.worker_graph_to_workers.items():
             walks = self._all_worker_graph_ids_to_graph_walks.get(wg_id, set())
             if walks & pdef.graph_walks:
-                consumer_workers.add(worker_id)
+                consumer_workers.update(worker_ids)
 
         for worker_id in consumer_workers:
             message = WorkerMessage(

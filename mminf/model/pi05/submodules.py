@@ -144,7 +144,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
             for inp in model_inputs
         )
 
-    def get_cuda_graph_configs(self, device: torch.device) -> list:
+    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list:
         """CUDA graph capture config for the SigLIP encoder.
 
         Captures the batched encoder forward for bs ∈ [1, 2, 4] during the
@@ -405,7 +405,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         return emb * self._text_embed_scale
 
     def get_cuda_graph_configs(
-        self, device: torch.device,
+        self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
         # Visibility check: log the shape that's about to be captured so it's
         # easy to confirm yaml-level Pi05Config overrides (e.g. action_horizon

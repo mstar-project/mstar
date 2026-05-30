@@ -12,6 +12,7 @@ from mminf.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
+from mminf.distributed.base import ShardingConfig, ShardingGroup
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import (
@@ -40,9 +41,26 @@ class WorkerGraph:
     section: GraphSection
     graph_walks: set[str]  # e.g., prefill, decode, image_gen
     consumes_stream: bool = field(default=False)
+
     ranks: list[int] = field(default_factory=list)
-    _group_id: int = field(default=-1)  # used in going from config yaml to worker graphs
+    tp_size: int = 1
+
+    # each element of the outer list is a tensor-parallel group; populated
+    # in __post_init__ from ``ranks`` chunked by ``tp_size``.
+    _tp_ranks: list[list[int]] = field(default_factory=list)
+    _group_id: int = field(default=-1)  # original index into config's node_groups
     worker_graph_id: str = field(default_factory=lambda: str(uuid4()))
+
+    def __post_init__(self):
+        if self.tp_size > 1 and not self._tp_ranks:
+            assert len(self.ranks) % self.tp_size == 0, (
+                f"WorkerGraph {self.worker_graph_id} has {len(self.ranks)} ranks; "
+                f"not divisible by tp_size {self.tp_size}."
+            )
+            self._tp_ranks = [
+                self.ranks[i:i + self.tp_size]
+                for i in range(0, len(self.ranks), self.tp_size)
+            ]
 
 
 def _combine_sections_sequential_or_parallel(
@@ -75,13 +93,16 @@ def _divide_into_worker_graphs(
         # __post_init__ keep referencing the live set (they captured by reference).
         graph._register_streaming(input_streams.intersection(graph.input_names))
 
+        group_idx = node_to_group_idx[graph.name]
+        ng = node_groups[group_idx]
         return [
             WorkerGraph(
                 section=graph,
                 graph_walks=set([graph_walk]),
                 consumes_stream=graph.consumes_stream,
-                _group_id=node_to_group_idx[graph.name],
-                ranks=node_groups[node_to_group_idx[graph.name]]["ranks"],
+                _group_id=group_idx,
+                ranks=ng["ranks"],
+                tp_size=ng.get("tp_size", 1),
             )
         ]
 
@@ -198,9 +219,13 @@ class Model(ABC):
         graph: GraphSection,
         node_groups: list[dict],
     ):
-        node_groups = [g for g in node_groups if ("graph_walks" not in g or graph_walk in g["graph_walks"])]
+        # Use the *original* (pre-filter) index as the group id so it's stable
+        # across graph walks. A node_group that only fires for some walks
+        # still keeps the same id everywhere it appears.
         node_to_group_idx: dict[str, int] = {}
         for i, group in enumerate(node_groups):
+            if "graph_walks" in group and graph_walk not in group["graph_walks"]:
+                continue
             node_to_group_idx.update({name: i for name in group["node_names"]})
 
         partition = "default"
@@ -236,6 +261,45 @@ class Model(ABC):
             ],
             start=[],
         )
+    
+    def get_sharding_config(self, config_path: str) -> ShardingConfig:
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        
+        sharding_config = self.get_default_sharding_config()
+
+        # Derive sharding groups from node_groups with tp_size > 1. The
+        # node_groups section drives both worker assignment and TP grouping;
+        # the separate "sharding_config" section just holds shard_dim.
+        groups: list[ShardingGroup] = []
+        for ng in config.get("node_groups", []):
+            if ng.get("tp_size", 1) <= 1:
+                continue
+            if any(
+                node not in sharding_config.tp_enabled_nodes
+                for node in ng["node_names"]
+            ):
+                raise ValueError(
+                    f"Node group with tp_size {ng['tp_size']} contains "
+                    f"nodes not in tp_enabled_nodes {sharding_config.tp_enabled_nodes}: "
+                    f"{ng['node_names']}"
+                )
+            groups.append(ShardingGroup(
+                nodes=set(ng["node_names"]),
+                tp_size=ng["tp_size"],
+                graph_walks=set(ng["graph_walks"]) if "graph_walks" in ng else None,
+            ))
+
+        sharding_config.groups = groups
+        sharding_config_yaml = config.get("sharding_config")
+        if sharding_config_yaml is not None and "shard_dim" in sharding_config_yaml:
+            sharding_config.shard_dim.update(sharding_config_yaml["shard_dim"])
+        return sharding_config
+
+    def get_default_sharding_config(self) -> ShardingConfig:
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes=[], shard_dim={}
+        ) # default: no sharding
 
     @abstractmethod
     def get_kv_cache_config(self) -> list[KVCacheConfig]:
@@ -349,12 +413,14 @@ class Model(ABC):
         return output.cpu().numpy().tobytes()
 
     @abstractmethod
-    def get_submodule(self, node_name: str, device="cpu") -> torch.nn.Module | None:
-        """
-        Return the nn.Module for this node, or None for dummy mode.
-        The engine calls this (via EngineManager) to get the submodule it
-        will execute directly with engine-specific wrapping (KV cache,
-        FlashInfer, etc.).
+    def get_submodule(self, node_name: str, device="cpu", tp_group=None) -> torch.nn.Module | None:
+        """Return the nn.Module for this node, or None for dummy mode.
+
+        ``tp_group`` is the :class:`TPCommGroup` for this node on the
+        calling worker (``None`` when TP is not active for this node).
+        Models that support tensor parallelism should forward it to
+        parallel-linear constructors so weight shapes are partitioned at
+        init time and the weight loaders shard correctly.
         """
         pass
 

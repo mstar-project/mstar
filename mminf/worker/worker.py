@@ -17,6 +17,8 @@ from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.communication.event import EventWakeup
 from mminf.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mminf.conductor.request_info import CurrentForwardPassInfo
+from mminf.distributed.base import ShardingConfig
+from mminf.distributed.communication import WorkerTPGroups
 from mminf.engine.base import EngineType, NodeBatch, NodeOutput
 from mminf.engine.kv_store import KVCacheConfig, StoreWritePolicy, TransferEngineInfo
 from mminf.graph.base import GraphEdge, GraphNode
@@ -30,6 +32,7 @@ from mminf.utils.ipc_format import (
     InputSignals,
     NewRequest,
     RemoveRequest,
+    ScheduleTPNode,
     StopLoops,
     TensorReceived,
     UnpersistTensors,
@@ -118,16 +121,30 @@ class Worker:
         all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
         all_worker_graph_ids_to_nodes: dict[str, set[str]],
         all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
+        sharding_config: ShardingConfig,
+        tp_groups: WorkerTPGroups,
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         device: torch.device = torch.device("cuda"),
         enable_nvtx: bool = False,
-        tcp_transfer_device=""
+        tcp_transfer_device="",
+        dist_init_method=None
     ):
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = enable_nvtx
+
+        # ``dist_init_method`` is normally provided by the conductor — it
+        # picks a free TCP port at startup so multiple ``mminf`` runs on
+        # the same host don't collide. The ``tcp://{hostname}:29500``
+        # fallback is for standalone Worker construction (e.g. tests);
+        # production paths always pass a value.
+        if dist_init_method is None:
+            dist_init_method = f"tcp://{hostname}:29500"
+
+        self.tp_groups = tp_groups
+        self.tp_groups.init_dist(init_method=dist_init_method)
 
         # Build node_to_partition mapping from model's partitions and graph walks
         node_to_partition: dict[str, str] = {}
@@ -167,6 +184,7 @@ class Worker:
             device=device,
             kv_config=kv_config,
             model_config=model_config,
+            tp_groups=self.tp_groups,
             transfer_engine_info=TransferEngineInfo(
                 my_entity_id=worker_id,
                 my_session_id=self.tensor_manager.my_session_id,
@@ -192,9 +210,27 @@ class Worker:
             all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
             node_to_partition=node_to_partition,
+            base_sharding_config=sharding_config,
+            worker_id=self.worker_id
         )
 
-        self.scheduler = MicroScheduler(self.engine_manager)
+        self.tp_rank_zero_nodes = set([
+            node for node in node_names if self.tp_groups.get_tp_config_for_node(node).rank == 0
+        ])
+
+        # v1: disallow multiple TP nodes in the same worker
+        self.tp_nodes = set([
+            node for node in node_names if self.tp_groups.get_tp_config_for_node(node).world_size > 1
+        ])
+        if len(self.tp_nodes) > 1:
+            raise NotImplementedError(
+                f"Multiple TP nodes {self.tp_nodes} found in worker {worker_id}; "
+                "current implementation requires at most one TP node per worker."
+            )
+        self.scheduler = MicroScheduler(
+            self.engine_manager,
+            tp_rank_zero_nodes=self.tp_rank_zero_nodes
+        )
 
         # Determine store write policy based on worker graph topology
         node_engine_types = model.get_node_engine_types() if model is not None else {}
@@ -353,10 +389,14 @@ class Worker:
         self.worker_graphs_manager.add_request(
             request_id=body.request_id,
             partition_worker_graph_ids=body.partition_worker_graph_ids,
-            worker_graph_to_worker=body.worker_graph_to_worker,
+            worker_graph_to_workers=body.worker_graph_to_workers,
             current_fwd_info=body.request_info
         )
         self.engine_manager.add_request(body.request_id)
+        self.tensor_manager.register_request(
+            body.request_id,
+            self.worker_graphs_manager.per_request_info[body.request_id].sharding_config
+        )
 
         # Create StreamBuffers for consumer connections on this worker
         for conn in self._my_consumer_connections:
@@ -371,6 +411,7 @@ class Worker:
         # Start RDMA reads for tensors that have tensor_info
         futures = self.tensor_manager.start_read_tensors(
             body.request_id, body.initial_inputs,
+            graph_walk=body.request_info.graph_walk
         )
         self.wakeup_event.register_futures(futures)
 
@@ -453,6 +494,7 @@ class Worker:
         # Start RDMA reads for non-streaming edges with tensor_info
         futures = self.tensor_manager.start_read_tensors(
             body.request_id, non_streaming,
+            graph_walk=body.request_info.graph_walk
         )
         self.wakeup_event.register_futures(futures)
         # Start RDMA reads for streaming edges with tensor_info (will be routed to buffer in _check_ready_tensors)
@@ -539,6 +581,8 @@ class Worker:
                 self._unpersist_tensors(message.body)
             elif message.message_type == WorkerMessageType.STOP_LOOPS:
                 self._stop_loops(message.body)
+            elif message.message_type == WorkerMessageType.SCHEDULE_TP:
+                self.scheduler.register_tp_follow(message.body)
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
@@ -779,6 +823,32 @@ class Worker:
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info
         )
+    
+    def maybe_send_zmq_to_tp_followers(
+        self, node_batch: NodeBatch
+    ):
+        if node_batch.node_name not in self.tp_nodes or \
+                node_batch.node_name not in self.tp_rank_zero_nodes:
+            return
+        # this worker is only a part of one TP group for this node,
+        # so, we can just look at the sharding_config for the first
+        # request to get the relevant workers
+        sample_rid = node_batch.request_ids[0]
+        cfg = self.worker_graphs_manager.per_request_info[sample_rid]
+        workers = cfg.sharding_config.get_sharding_group(
+            node_batch.node_name, node_batch.graph_walk
+        )._workers[1:]
+        for worker in workers:
+            self.communicator.send(
+                worker, msg=WorkerMessage(
+                    message_type=WorkerMessageType.SCHEDULE_TP,
+                    body=ScheduleTPNode(
+                        node_name=node_batch.node_name,
+                        graph_walk=node_batch.graph_walk,
+                        request_ids=node_batch.request_ids
+                    )
+                )
+            )
 
     # ------------------------------------------------------------------
     # Output handling
@@ -943,6 +1013,7 @@ class Worker:
                 body=WorkerGraphsDone(
                     request_id=request_id,
                     worker_graph_ids=outputs.completed_worker_graph_ids,
+                    is_first_tp_rank=outputs.is_first_tp_rank,
                     persist_signals=self.worker_graphs_manager.flush_persist_signals(request_id),
                     new_tokens=self.worker_graphs_manager.flush_new_tokens(request_id),
                     output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id),
@@ -1113,6 +1184,27 @@ class Worker:
     def _handle_allocation_failure(
         self, batch: ScheduledBatch, node_batch: NodeBatch
     ) -> None:
+        """Push back nodes and hold the rids for backoff after KV OOM.
+
+        Under TP, this runs on every rank of the TP group independently:
+        admission decisions (``add_request`` / ``alloc`` / ``free``) are
+        all driven by rank 0's scheduler and replicated via the
+        ``ScheduleTPNode`` ZMQ broadcast, so the page allocator state is
+        symmetric across ranks. Both rank 0 and followers raise
+        ``AllocationFailedError`` on the same batch and both reach this
+        function with the same ``batch_ids``; their local actions
+        (push-back, hold) produce identical follower state.
+
+        ``KVCacheEngine._verify_tp_kv_symmetry`` fails fast at startup if
+        that invariant ever breaks.
+
+        v2 caveat: this function does not yet coordinate ``_last_active``
+        / eviction-victim selection across TP ranks. Wall-clock LRU can
+        pick different victims per rank under contention, leading to
+        request-id ↔ page-index drift and (eventually) asymmetric OOM on
+        future reloads. Today's TP configs don't enable CPU offload, so
+        the path isn't exercised; revisit when we light up offload + TP.
+        """
         batch_ids = set(batch.node_objects.keys())
         victim_id = self._try_offload_cold_request(node_batch.node_name, batch_ids)
 
@@ -1146,7 +1238,8 @@ class Worker:
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if any(
             not node.enable_async_scheduling for node in batch.node_objects.values()
-        ):
+        ) or batch.node_name in self.tp_nodes:
+            # disable speculation for TP nodes for now
             return False
         return True
 
@@ -1206,6 +1299,22 @@ class Worker:
             sample_node.outputs, sample_node.name
         )
         wgio.clear_speculative_inputs()
+
+        # Filter out destinations that aren't speculation candidates.
+        #
+        # * ``info.node_name in self.tp_nodes`` — TP nodes don't support
+        #   speculation in v1 (rank-0 schedules; followers can't initiate).
+        # * ``not wgio.nodes[info.node_name].enable_async_scheduling`` — the
+        #   destination node opts out of async scheduling. Mirrors the
+        #   source-side check in ``_can_speculate``; without this, a
+        #   destination that's structurally ineligible (e.g. a node whose
+        #   downstream graph isn't speculation-safe) could still be picked,
+        #   then dropped per-rid further down.
+        ready_for_spec = [
+            info for info in ready_for_spec
+            if info.node_name not in self.tp_nodes
+            and wgio.nodes[info.node_name].enable_async_scheduling
+        ]
 
         if not ready_for_spec:
             return # no nodes can be speculated
@@ -1551,6 +1660,7 @@ class Worker:
             range_push("worker.postprocess.route_outputs", synchronize=False)
         # Mark nodes complete and route
         routing_per_request: dict[str, NodeOutputRouting] = {}
+        per_request_uuids: dict[str, set[str]] = {}
         for rid, wg_id in batch_N.batch.request_to_worker_graph.items():
             # Store output tensors before marking the node as complete so that
             # loop outputs can be buffered properly.
@@ -1558,23 +1668,42 @@ class Worker:
             node = batch_N.batch.node_objects[rid]
             node.reset_outputs() # reset stale outputs
             if req_output_tensors:
-                self.tensor_manager.store_and_populate_graph_edges(
+                graph_node_info = self.tensor_manager.store_and_populate_graph_edges(
                     request_id=rid,
                     tensors=req_output_tensors,
                     graph_edges=node.outputs,
-                    # We already synced on output.completion_event above
+                    node_name=node.name,
+                    graph_walk=batch_N.graph_walk,
                     skip_cuda_sync=True,
+                    skip_ref_count=True,
                 )
+                per_request_uuids[rid] = {
+                    info.uuid for infos in graph_node_info.values() for info in infos
+                }
 
             completion_output = self.worker_graphs_manager.mark_node_complete(
                 rid, wg_id, batch_N.node_name
             )
             real_outputs = [edge.clone() for edge in completion_output.output_edges]
 
-            # Get output routing
             routing_per_request[rid] = self.worker_graphs_manager.process_node_outputs(
-                rid, outputs=real_outputs, graph_walk=batch_N.graph_walk
+                rid, node_name=batch_N.node_name,
+                outputs=real_outputs, graph_walk=batch_N.graph_walk
             )
+
+            if rid in per_request_uuids:
+                routing = routing_per_request[rid]
+                routed_edges = (
+                    routing.routed_to_this_worker_graph
+                    + routing.persist
+                    + routing.emit_to_client
+                    + routing.streaming_local
+                    + sum(routing.to_workers.values(), start=[])
+                    + sum(routing.streaming_to_workers.values(), start=[])
+                )
+                self.tensor_manager.set_output_ref_counts(
+                    rid, per_request_uuids[rid], routed_edges
+                )
         
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -1750,8 +1879,32 @@ class Worker:
                     switch_interval,
                 )
 
+        # Bound the load-time asymmetry between workers before any
+        # subgroup NCCL collective fires inside the per-bs CUDA-graph
+        # capture loop. Without this fence, a worker with a small model
+        # (e.g. an 8B Talker) can finish loading, enter warmup, and hit
+        # its first subgroup barrier while a worker with a 30B Thinker
+        # is still streaming safetensors shards. The subgroup NCCL comm
+        # is created lazily on that first collective; its connect-retry
+        # budget is ~33 s, which is shorter than the load-time delta on
+        # large multi-tower models. Syncing here means every worker
+        # reaches warmup at the same wall-clock instant, so subgroup
+        # bootstrap completes within the retry budget.
+        self.tp_groups.barrier_all()
+
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
+
+        # Sync every worker before the main loop opens. Per-batch-size
+        # captures inside CudaGraphRunner are already barriered on the
+        # node-local TP group, but that doesn't bound the time between
+        # ``warmup_and_capture`` returning and ``run()`` starting to
+        # schedule. Without this fence, a TP leader can finish warmup
+        # quickly, schedule its first batch, and ZMQ-send
+        # ``ScheduleTPNode`` to a follower that's still inside another
+        # engine's ``warmup``. The follower can't service the message
+        # yet, but the leader will sit on the first NCCL collective.
+        self.tp_groups.barrier_all()
 
         # The async worker path needs decode submission to return quickly so
         # the main loop can overlap queue/tensor polling and post-processing
@@ -1924,6 +2077,9 @@ class Worker:
                                 is_same_node=False,
                                 is_yield_away=True
                             )
+                            
+                            # send messages to follower ranks if relevant
+                            self.maybe_send_zmq_to_tp_followers(node_batch)
                     if speculation is not None:
                         # Reserve the double-buffer slot for batch_(N+1) NOW
                         # so both pre-plan and replay (queued below) target
@@ -2154,6 +2310,9 @@ class Worker:
                 # from later iters.
                 fallthrough_engine = self.engine_manager.get_engine(batch.node_name)
                 fallthrough_engine.reserve_replay_slot(node_batch)
+
+                # send messages to follower ranks if relevant
+                self.maybe_send_zmq_to_tp_followers(node_batch)
 
                 # Attach a fresh advance_event so the next iter's
                 # plan_executor (if it speculates) can wait on this batch's

@@ -249,9 +249,7 @@ class NodeSubmodule(torch.nn.Module):
         return None
 
     # Note: do not import CudaGraphConfig; it causes a circular import situation
-    def get_cuda_graph_configs(self, device: torch.device) -> list[CudaGraphConfig]:
-        """TODO: add cuda graph support for pi05.
-        """
+    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
         return []
 
     def can_use_cuda_graphs(
@@ -280,7 +278,7 @@ class NodeSubmodule(torch.nn.Module):
         """
         if not hasattr(self, "_cached_cuda_graph_walks"):
             walks: set[str] = set()
-            for cfg in self.get_cuda_graph_configs(device=torch.device("cpu")):
+            for cfg in self.get_cuda_graph_configs(device=torch.device("cpu"), tp_world_size=1):
                 walks.update(cfg.replay_graph_walks)
             self._cached_cuda_graph_walks = walks
         return batch.graph_walk in self._cached_cuda_graph_walks

@@ -395,28 +395,37 @@ class OrpheusModel(Model):
         raise ValueError(f"Unsupported modality for Orpheus: {modality!r}")
 
     # -------------------------------------------------------------------
+    # Model ABC: sharding
+    # -------------------------------------------------------------------
+
+    def get_default_sharding_config(self):
+        from mminf.distributed.base import ShardingConfig
+
+        return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={})
+
+    # -------------------------------------------------------------------
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
 
-    def get_submodule(self, node_name: str, device: str = "cpu") -> NodeSubmodule | None:
+    def get_submodule(self, node_name: str, device: str = "cpu", tp_group=None) -> NodeSubmodule | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, tp_group=tp_group)
         logger.info("Successfully loaded Orpheus submodule for %s", node_name)
         self._submodule_cache[node_name] = submodule
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device: str, tp_group=None) -> NodeSubmodule | None:
         if node_name == "LLM":
-            return self._create_llm_submodule(device)
+            return self._create_llm_submodule(device, tp_group=tp_group)
         elif node_name == "snac_decoder":
             return self._create_snac_submodule(device)
         return None
 
-    def _create_llm_submodule(self, device: str) -> NodeSubmodule:
+    def _create_llm_submodule(self, device: str, tp_group=None) -> NodeSubmodule:
+        from mminf.model.loader import load_weights
         from mminf.model.orpheus.components.language_model import OrpheusForCausalLM
         from mminf.model.orpheus.submodules import OrpheusLLMSubmodule
-        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         local_dir = _resolve_local_hf_snapshot(
             self.model_path_hf,
@@ -424,20 +433,11 @@ class OrpheusModel(Model):
         )
 
         with torch.device("meta"):
-            language_model = OrpheusForCausalLM(self.config)
+            language_model = OrpheusForCausalLM(self.config, comm_group=tp_group)
+        language_model.to_empty(device=device)
 
-        load_weights_from_hf_shards(
-            repo_dir=local_dir,
-            modules=[ModuleAndPrefix(language_model)],
-            device=device,
-        )
-
+        load_weights(language_model, local_dir, device=device)
         language_model.eval()
-        # Fuse q/k/v_proj into qkv_proj and gate_proj/up_proj into gate_up_proj
-        # per layer. Must run after weight loading so per-Linear weights are
-        # populated; the originals are nulled out and the forward path uses
-        # F.linear against the fused buffers.
-        language_model.consolidate_fused_weights()
 
         return OrpheusLLMSubmodule(
             language_model=language_model,

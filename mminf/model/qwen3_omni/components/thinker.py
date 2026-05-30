@@ -26,38 +26,37 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
+from mminf.distributed.communication import TPCommGroup
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.model.qwen3_omni.components.attention import (
-    Qwen3OmniAttention,
-    Qwen3OmniRMSNorm,
-)
-from mminf.model.qwen3_omni.components.moe import (
-    Qwen3OmniMLP,
-    Qwen3OmniSparseMoeBlock,
-)
+from mminf.model.components import ParallelSparseMoeBlock, RMSNorm
+from mminf.model.components.distributed import ParallelGatedMLP
+from mminf.model.qwen3_omni.components.attention import Qwen3OmniAttention
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig
-from mminf.utils.flashinfer_utils import run_rms_norm
 
 
 class Qwen3OmniThinkerLayer(nn.Module):
     """Single Thinker decoder layer: attention + MoE/dense MLP.
 
-    Uses MoE (``Qwen3OmniSparseMoeBlock``) for most layers, and a dense
-    ``Qwen3OmniMLP`` for layers listed in ``mlp_only_layers``.
+    Uses ``ParallelSparseMoeBlock`` for most layers, and a dense
+    ``ParallelGatedMLP`` (SiLU SwiGLU) for layers in ``mlp_only_layers``.
 
     Args:
         config: top-level Qwen3-Omni model configuration.
         layer_idx: index of this layer in the stack.
+        comm_group: TP communication group for MoE/MLP sharding.
     """
 
-    def __init__(self, config: Qwen3OmniModelConfig, layer_idx: int):
+    def __init__(
+        self, config: Qwen3OmniModelConfig, layer_idx: int,
+        comm_group: TPCommGroup | None = None,
+    ):
         super().__init__()
         tc = config.thinker_text
 
         self.hidden_size = tc.hidden_size
 
         # Pre-attention layernorm
-        self.input_layernorm = Qwen3OmniRMSNorm(tc.hidden_size, eps=tc.rms_norm_eps)
+        self.input_layernorm = RMSNorm(tc.hidden_size, eps=tc.rms_norm_eps)
 
         # Self-attention with QK-norm and 3D MRoPE
         self.self_attn = Qwen3OmniAttention(
@@ -68,33 +67,35 @@ class Qwen3OmniThinkerLayer(nn.Module):
             rope_theta=tc.rope_theta,
             rms_norm_eps=tc.rms_norm_eps,
             use_mrope=True,
+            comm_group=comm_group,
         )
 
         # Post-attention layernorm
-        self.post_attention_layernorm = Qwen3OmniRMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             tc.hidden_size, eps=tc.rms_norm_eps
         )
 
         # MoE or dense MLP depending on layer index.
-        # HF condition: use MoE when not in mlp_only_layers AND
-        # num_experts > 0 AND (layer_idx + 1) % decoder_sparse_step == 0.
         use_moe = (
             layer_idx not in tc.mlp_only_layers
             and tc.num_experts > 0
             and (layer_idx + 1) % tc.decoder_sparse_step == 0
         )
         if use_moe:
-            self.mlp = Qwen3OmniSparseMoeBlock(
+            self.mlp = ParallelSparseMoeBlock(
                 hidden_size=tc.hidden_size,
                 moe_intermediate_size=tc.moe_intermediate_size,
                 num_experts=tc.num_experts,
                 num_experts_per_tok=tc.num_experts_per_tok,
                 norm_topk_prob=tc.norm_topk_prob,
+                comm_group=comm_group,
             )
         else:
-            self.mlp = Qwen3OmniMLP(
+            self.mlp = ParallelGatedMLP(
                 hidden_size=tc.hidden_size,
                 intermediate_size=tc.intermediate_size,
+                activation="silu",
+                comm_group=comm_group,
             )
 
     def forward(
@@ -116,11 +117,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
         """
         # Pre-attention norm + self-attention + residual
         residual = hidden_states
-        hidden_states = run_rms_norm(
-            hidden_states,
-            self.input_layernorm.weight,
-            eps=self.input_layernorm.variance_epsilon,
-        )
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states,
             cache_handle=cache_handle,
@@ -131,11 +128,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
 
         # Post-attention norm + MLP/MoE + residual
         residual = hidden_states
-        hidden_states = run_rms_norm(
-            hidden_states,
-            self.post_attention_layernorm.weight,
-            eps=self.post_attention_layernorm.variance_epsilon,
-        )
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -145,14 +138,15 @@ class Qwen3OmniThinkerLayer(nn.Module):
 class Qwen3OmniThinkerTextModel(nn.Module):
     """Inner text model (maps to ``thinker.model.*`` in HF weights)."""
 
-    def __init__(self, config: Qwen3OmniModelConfig):
+    def __init__(self, config: Qwen3OmniModelConfig, comm_group: TPCommGroup | None = None):
         super().__init__()
         tc = config.thinker_text
         self.embed_tokens = nn.Embedding(tc.vocab_size, tc.hidden_size)
-        self.layers = nn.ModuleList(
-            [Qwen3OmniThinkerLayer(config, layer_idx=i) for i in range(tc.num_hidden_layers)]
-        )
-        self.norm = Qwen3OmniRMSNorm(tc.hidden_size, eps=tc.rms_norm_eps)
+        self.layers = nn.ModuleList([
+            Qwen3OmniThinkerLayer(config, layer_idx=i, comm_group=comm_group)
+            for i in range(tc.num_hidden_layers)
+        ])
+        self.norm = RMSNorm(tc.hidden_size, eps=tc.rms_norm_eps)
 
 
 class Qwen3OmniThinkerModel(nn.Module):
@@ -171,7 +165,7 @@ class Qwen3OmniThinkerModel(nn.Module):
     - Layer-N hidden states (``accept_hidden_layer``) for Talker conditioning
     """
 
-    def __init__(self, config: Qwen3OmniModelConfig):
+    def __init__(self, config: Qwen3OmniModelConfig, comm_group: TPCommGroup | None = None):
         super().__init__()
         tc = config.thinker_text
 
@@ -179,27 +173,17 @@ class Qwen3OmniThinkerModel(nn.Module):
         self.num_layers = tc.num_hidden_layers
         self.accept_hidden_layer = config.accept_hidden_layer
 
-        # Inner text model: embed_tokens + layers + norm
-        # Maps to thinker.model.* in HF weights
-        self.model = Qwen3OmniThinkerTextModel(config)
+        self.model = Qwen3OmniThinkerTextModel(config, comm_group=comm_group)
 
-        # Language model head (at top level: thinker.lm_head)
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
 
     def _deepstack_process(
         self, hidden_states: torch.Tensor, visual_embeds: torch.Tensor
     ):
-        # visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-        # hidden_states = hidden_states.clone()
-
         # NOTE: must ensure that visual_embeds is the same shape as hidden_states,
         # and zero where we do not have visual tokens!!
         hidden_states += visual_embeds
         return hidden_states
-    
-    def set_qkv_proj_weights(self):
-        for layer in self.model.layers:
-            layer.self_attn.set_qkv_proj_weight()
 
     def forward(
         self,
@@ -270,8 +254,6 @@ class Qwen3OmniThinkerModel(nn.Module):
         cache_handle.advance_seq_lens(pos_id_ns=mrope_pos_advance)
 
         # Final layer norm
-        hidden_states = run_rms_norm(
-            hidden_states, self.model.norm.weight, eps=self.model.norm.variance_epsilon
-        )
+        hidden_states = self.model.norm(hidden_states)
 
         return hidden_states, layer_0_embed, layer_n_hidden

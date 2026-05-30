@@ -3,6 +3,17 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 
+@dataclass(frozen=True)
+class NodeAndGraphWalk:
+    """
+    Pair of node name and graph walk, e.g., (LLM, decode) or (flow, image_gen).
+    graph_walk may be None for streaming-consumer lookups where the graph walk
+    is not known a priori.
+    """
+    node: str
+    graph_walk: str | None
+
+
 @dataclass
 class TensorPointerInfo:
     dims: list[int]
@@ -13,6 +24,30 @@ class TensorPointerInfo:
     uuid: str  # for indexing storage
     source_session_id: str  # "{HOSTNAME}:{client_engine.get_rpc_port()}"
     source_entity: str  # which {worker, api_server} the tensor is on
+    offset: int = 0 # offset, in bytes, of the read (e.g., for in-transport sharding
+                    # in tensor parallel configurations)
+    source_tp_size: int = 1
+    source_tp_rank: int = 0
+
+    _source_node_name: str | None = None
+    _source_graph_walk: str | None = None
+
+    def clone(self):
+        return TensorPointerInfo(
+            dims=self.dims[:],
+            dtype=self.dtype,
+            nbytes=self.nbytes,
+            address=self.address,
+            stride=self.stride[:],
+            uuid=self.uuid,
+            source_session_id=self.source_session_id,
+            source_entity=self.source_entity,
+            offset=self.offset,
+            source_tp_size=self.source_tp_size,
+            source_tp_rank=self.source_tp_rank,
+            _source_node_name=self._source_node_name,
+            _source_graph_walk=self._source_graph_walk
+        )
 
 
 @dataclass
@@ -28,6 +63,10 @@ class GraphEdge:
     # only for EMIT_TO_CLIENT
     output_modality: str = field(default="")  # text | image | video | audio
     _persist_for_loop: bool = field(default=False)
+
+    # Set for sharded configurations
+    _total_fanin: int = 1
+    _shard_dim: int | None = None
 
     def clone(self):
         return GraphEdge(

@@ -31,8 +31,11 @@ class SequenceInfo:
 
 @dataclass
 class PerLabelSeqInfo:
-    # {kv_cache_string -> {label: SequenceInfo}}
-    info: dict[str, dict[str, SequenceInfo]] = field(default_factory=dict)
+    # {(kv_cache_string,  rank) -> {label: SequenceInfo}}
+    info: dict[tuple[str, int], dict[str, SequenceInfo]] = field(default_factory=dict)
+
+    # kv cache str -> TP world size
+    world_size: dict[str, int] = field(default_factory=dict)
 
     def update(self, other: "PerLabelSeqInfo"):
         for key, val in other.info.items():
@@ -44,13 +47,14 @@ class PerLabelSeqInfo:
                 **val
             }
 
-    def get(self, kv_cache_str: str) -> dict:
-        return self.info.get(kv_cache_str, {})
+    def get(self, kv_cache_str: str, rank: int) -> dict:
+        return self.info.get((kv_cache_str, rank), {})
 
-    def add(self, kv_cache_str: str, cache_info: dict[str, SequenceInfo]):
+    def add(self, kv_cache_str: str, rank: int, world_size: int, cache_info: dict[str, SequenceInfo]):
         self.update(PerLabelSeqInfo(
-            info={kv_cache_str: cache_info}
+            info={(kv_cache_str, rank): cache_info}
         ))
+        self.world_size[kv_cache_str] = world_size
 
 
 @dataclass
@@ -120,6 +124,8 @@ class PartitionState:
     new_tokens: dict[str, list[int]] = field(default_factory=dict)
     completed_worker_graph_ids: set[str] = field(default_factory=set)
     current_worker_graph_ids: set[str] = field(default_factory=set)
+    # wg_id -> count of distinct TP ranks that have reported completion
+    wg_rank_completions: dict[str, int] = field(default_factory=dict)
     num_output_tokens: int = 0
     curr_forward_outputs: list[str] = field(default_factory=list)
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)

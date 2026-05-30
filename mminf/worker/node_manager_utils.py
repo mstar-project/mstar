@@ -4,7 +4,15 @@ from dataclasses import dataclass, field
 
 from mminf.communication.tensors import TensorCommunicationManager
 from mminf.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
-from mminf.graph.base import GraphEdge, GraphNode, NameAndDest, NodeCompletionOutput, TensorPointerInfo
+from mminf.distributed.base import ShardingConfig
+from mminf.graph.base import (
+    GraphEdge,
+    GraphNode,
+    NameAndDest,
+    NodeAndGraphWalk,
+    NodeCompletionOutput,
+    TensorPointerInfo,
+)
 from mminf.graph.graph_io import WorkerGraphIO, format_graph_edge_list
 from mminf.graph.loop_indices import NestedLoopIndices
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, SPECIAL_DESTINATIONS
@@ -14,18 +22,10 @@ from mminf.streaming.stream_buffer import StreamBuffer
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class NodeAndGraphWalk:
-    """
-    Tuple of node name and graph walk, e.g., (LLM, decode) or (flow, image_gen)
-    """
-    node: str
-    graph_walk: str
-
-
 @dataclass
 class NodeOutputRouting:
     routed_to_this_worker_graph: list[GraphEdge]
+    is_first_tp_rank: bool
     persist: list[GraphEdge] # outputs that are going back to the conductor
     to_workers: dict[str, list[GraphEdge]] # worker id to signals
     emit_to_client: list[GraphEdge] = field(default_factory=list)
@@ -214,9 +214,10 @@ class PerRequestInfo:
         where multiple partitions run on the same worker
     - tensors: TBD
     """
-    node_to_worker: dict[NodeAndGraphWalk, str]  # for all nodes
+    node_to_workers: dict[NodeAndGraphWalk, list[str]]  # for all nodes
     dyn_loop_to_workers: dict[NodeAndGraphWalk, list[str]]
     worker_graph_ids: list[str] # for this worker
+    sharding_config: ShardingConfig
 
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
     pending_new_tokens: dict[str, list[int]] = field(default_factory=dict)
@@ -237,6 +238,8 @@ class WorkerGraphsManager:
     """
     queues: dict[str, WorkerGraphQueues] # worker graph id to queues
     per_request_info: dict[str, PerRequestInfo] # request id to info
+    base_sharding_config: ShardingConfig
+    worker_id: str
 
     # The following two are for routing purposes:
     all_worker_graph_ids_to_graph_walks: dict[str, set[str]] # for worker graphs on different workers too
@@ -378,6 +381,7 @@ class WorkerGraphsManager:
 
     def process_node_outputs(
         self, request_id: str,
+        node_name: str,
         outputs: list[GraphEdge],
         graph_walk: str,
     ) -> NodeOutputRouting:
@@ -394,23 +398,41 @@ class WorkerGraphsManager:
         to_conductor = [edge for edge in non_streaming_outputs if edge.persist]
         new_token_outputs = [edge for edge in non_streaming_outputs if edge.conductor_new_token]
 
+        sharding_config = self.per_request_info[request_id].sharding_config
+        group = sharding_config.get_sharding_group(node_name, graph_walk)
+        # No group → singleton/non-TP; treat as rank 0.
+        is_first_tp_rank = group is None or group._tp_rank == 0
+
         # (2) route each output edge to its destination worker graph via the
-        # inverted index. Local wg -> ingest; absent/non-local -> defer to
-        # the cross-worker routing pass below.
+        # inverted index. Compute the per-rank fanout first; ingest *this
+        # worker's* sliced edge into the local wg (so the local consumer
+        # sees the right tensor_info); fan the rest out to cross-worker
+        # routing. Edges that don't map to any local wg fall through to
+        # external for the same cross-worker pass.
         routed_to_this_worker: list[GraphEdge] = []
         external_outputs: list[GraphEdge] = []
+        to_workers: dict[str, list[GraphEdge]] = {}
         for edge in non_streaming_outputs:
             wg_id = self.walk_node_to_worker_graph_id.get((graph_walk, edge.next_node))
             if wg_id is not None and wg_id in self.queues:
-                leftover = self.queues[wg_id].process_new_inputs(
-                    request_id, [edge], can_buffer=True
+                fanout = sharding_config.fanout_graph_edges(
+                    edge, source_node=node_name,
+                    source_graph_walk=graph_walk,
+                    dest_graph_walk=graph_walk,
                 )
-                if leftover:
-                    # The edge's next_node maps here but the queue declined
-                    # (e.g. wg has no per-request io for this rid yet).
-                    external_outputs.extend(leftover)
-                else:
-                    routed_to_this_worker.append(edge)
+                this_worker_edge = fanout.pop(self.worker_id, None)
+                if this_worker_edge is not None:
+                    leftover = self.queues[wg_id].process_new_inputs(
+                        request_id, [this_worker_edge], can_buffer=True,
+                    )
+                    if leftover:
+                        # local wg declined (e.g., no per-request io yet);
+                        # route to self via the cross-worker path
+                        to_workers.setdefault(self.worker_id, []).extend(leftover)
+                    else:
+                        routed_to_this_worker.append(this_worker_edge)
+                for (wkr, wkr_edge) in fanout.items():
+                    to_workers.setdefault(wkr, []).append(wkr_edge)
             else:
                 external_outputs.append(edge)
 
@@ -434,25 +456,27 @@ class WorkerGraphsManager:
         # Note: back_to_conductor edges may ALSO route to a worker
         # (e.g., concat_text outputs text_emb -> LLM with back_to_conductor=True),
         # so we do NOT filter on back_to_conductor here.
-        to_workers: dict[str, list[GraphEdge]] = {}
         emit_to_client: list[GraphEdge] = []
         for edge in external_outputs:
             node_graph_walk = NodeAndGraphWalk(
                 node=edge.next_node, graph_walk=graph_walk
             )
-            if node_graph_walk not in self.per_request_info[request_id].node_to_worker:
+            if node_graph_walk not in self.per_request_info[request_id].node_to_workers:
+                fanout = sharding_config.fanout_graph_edges(
+                    edge, source_node=node_name,
+                    source_graph_walk=graph_walk,
+                    dest_graph_walk=graph_walk
+                )
                 if edge.next_node in SPECIAL_DESTINATIONS or edge.persist:
                     if edge.next_node == EMIT_TO_CLIENT:
-                        emit_to_client.append(edge)
+                        emit_to_client.extend(fanout.values())
                     continue  # e.g., emit_to_client — already captured in to_conductor
                 raise ValueError(
                     f"Output edge targets unknown node/graph walk: {node_graph_walk}. "
                     f"Check graph construction."
                 )
-            worker_id = self.per_request_info[request_id].node_to_worker[node_graph_walk]
-            if worker_id not in to_workers:
-                to_workers[worker_id] = []
-            to_workers[worker_id].append(edge)
+            for (wkr, wkr_edge) in fanout.items():
+                to_workers.setdefault(wkr, []).append(wkr_edge)
 
         # (4) route streaming edges — find destination workers for streaming outputs
         streaming_to_workers: dict[str, list[GraphEdge]] = {}
@@ -462,22 +486,16 @@ class WorkerGraphsManager:
             my_node_names.update(self.all_worker_graph_ids_to_nodes.get(gid, []))
 
         for edge in streaming_edges:
-            if edge.next_node in my_node_names:
-                # Destination node is on this worker — store locally
-                streaming_local.append(edge)
-            else:
-                # Find the worker that has this node (check all graph walks)
-                dest_worker = None
-                for wg_id, worker_id in self.per_request_info[request_id].node_to_worker.items():
-                    if wg_id.node == edge.next_node:
-                        dest_worker = worker_id
-                        break
-                if dest_worker is not None:
-                    streaming_to_workers.setdefault(dest_worker, []).append(edge)
-                else:
-                    logger.warning(
-                        "Streaming edge to %s has no known destination worker", edge.next_node,
-                    )
+            fanout = sharding_config.fanout_graph_edges(
+                edge, source_node=node_name,
+                source_graph_walk=graph_walk,
+                dest_graph_walk=None
+            )
+            this_worker_edge = fanout.pop(self.worker_id, None)
+            if this_worker_edge:
+                streaming_local.append(this_worker_edge)
+            for (wkr, wkr_edge) in fanout.items():
+                streaming_to_workers.setdefault(wkr, []).append(wkr_edge)
 
         logger.debug(
             ("Finished processing outputs from rid %s. \n"
@@ -498,6 +516,7 @@ class WorkerGraphsManager:
             completed_worker_graph_ids=completed_worker_graph_ids,
             streaming_to_workers=streaming_to_workers,
             streaming_local=streaming_local,
+            is_first_tp_rank=is_first_tp_rank
         )
 
     def stop_loops(
@@ -570,7 +589,7 @@ class WorkerGraphsManager:
     def add_request(
         self, request_id: str,
         partition_worker_graph_ids: list[str], # for this worker's worker graphs
-        worker_graph_to_worker: dict[str, str], # for other / all worker graphs
+        worker_graph_to_workers: dict[str, list[str]], # for other / all worker graphs
         current_fwd_info: CurrentForwardPassInfo,
     ):
         """
@@ -592,29 +611,33 @@ class WorkerGraphsManager:
             # Note: conductor.py passes the same worker_graph_to_worker dict
             # on every NewRequest for a given request(i.e., for every partition).
             # So the below logic only needs to be done once.
-            node_to_worker = {}
+            node_to_workers = {}
             dyn_loop_to_workers = {}
-            for worker_graph_id, worker_id in worker_graph_to_worker.items():
+            for worker_graph_id, worker_ids in worker_graph_to_workers.items():
                 if worker_graph_id not in self.all_worker_graph_ids_to_graph_walks:
                     continue
                 for graph_walk in self.all_worker_graph_ids_to_graph_walks[worker_graph_id]:
-                    node_to_worker.update({
+                    node_to_workers.update({
                         NodeAndGraphWalk(
                             node=name,
                             graph_walk=graph_walk
-                        ): worker_id for name in self.all_worker_graph_ids_to_nodes[worker_graph_id]
+                        ): worker_ids for name in self.all_worker_graph_ids_to_nodes[worker_graph_id]
                     })
 
                     for loop_name in self.all_worker_graph_ids_to_dyn_loops[worker_graph_id]:
                         dyn_loop_to_workers.setdefault(NodeAndGraphWalk(
                             node=loop_name,
                             graph_walk=graph_walk
-                        ), []).append(worker_id)
+                        ), []).extend(worker_ids)
 
+
+            sharding_config = self.base_sharding_config.clone_empty()
+            sharding_config.setup(node_to_workers)
             self.per_request_info[request_id] = PerRequestInfo(
-                node_to_worker=node_to_worker,
+                node_to_workers=node_to_workers,
                 dyn_loop_to_workers=dyn_loop_to_workers,
                 worker_graph_ids=my_worker_graph_ids,
+                sharding_config=sharding_config,
                 per_partition_info={
                     partition_name: PerPartitionInfo(
                         graph_walk_worker_graph_ids=[

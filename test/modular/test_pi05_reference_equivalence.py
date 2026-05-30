@@ -46,12 +46,12 @@ from torch import nn
 
 sys.path.insert(0, ".")
 
+from mminf.model.components import AdaRMSNorm as Pi05AdaRMSNorm
+from mminf.model.components.decoder_layer import _gated_residual
 from mminf.model.pi05.components.action_expert import (
     Pi05ActionExpert,
     Pi05ActionExpertLayer,
-    Pi05AdaRMSNorm,
     Pi05TimeMLP,
-    _gated_residual,
 )
 from mminf.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mminf.model.pi05.config import Pi05Config
@@ -446,7 +446,7 @@ def test_action_expert_layer_matches_reference_single_request():
 
     handle = MockCacheHandle(scale=config.head_dim ** -0.5)
     ours_out = ours(
-        query_sequence=x.to(MMINF_DTYPE),
+        hidden_states=x.to(MMINF_DTYPE),
         cache_handle=handle,
         adarms_cond=cond.to(MMINF_DTYPE),
     ).to(torch.float32)

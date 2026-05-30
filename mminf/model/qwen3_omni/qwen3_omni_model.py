@@ -1172,13 +1172,33 @@ class Qwen3OmniModel(Model):
         raise ValueError(f"Unsupported modality for Qwen3-Omni: {modality!r}")
 
     # -----------------------------------------------------------------------
+    # Model ABC: sharding
+    # -----------------------------------------------------------------------
+
+    def get_default_sharding_config(self):
+        from mminf.distributed.base import ShardingConfig
+
+        # Talker LLM (attention + MoE-with-shared-expert) is TP-capable
+        # via the same ``ParallelAttention`` / ``ParallelSparseMoeBlock*``
+        # parts as the Thinker. The internal CodePredictor is intentionally
+        # left at TP=1 (replicated weights, deterministic sampler) — see
+        # ``_create_talker_submodule``. ``shard_dim`` stays empty because
+        # every cross-edge signal (``thinker_states``, ``thinker_mask``,
+        # ``codec_tokens``, ``talker_input_embeds``, ``new_token``) is
+        # already replicated by the upstream all-reduce or sampler
+        # broadcast before it leaves its producing node.
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes={"Thinker", "Talker"}, shard_dim={},
+        )
+
+    # -----------------------------------------------------------------------
     # Model ABC: submodule loading
     # -----------------------------------------------------------------------
 
-    def get_submodule(self, node_name: str, device: str = "cpu") -> NodeSubmodule | None:
+    def get_submodule(self, node_name: str, device: str = "cpu", tp_group=None) -> NodeSubmodule | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, tp_group=tp_group)
         logger.info("Successfully loaded Qwen3-Omni submodule for %s", node_name)
         self._submodule_cache[node_name] = submodule
 
@@ -1202,11 +1222,11 @@ class Qwen3OmniModel(Model):
 
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device: str, tp_group=None) -> NodeSubmodule | None:
         if node_name == "Thinker":
-            return self._create_thinker_submodule(device)
+            return self._create_thinker_submodule(device, tp_group=tp_group)
         elif node_name == "Talker":
-            return self._create_talker_submodule(device)
+            return self._create_talker_submodule(device, tp_group=tp_group)
         elif node_name == "Code2Wav":
             return self._create_code2wav_submodule(device)
         elif node_name == "audio_encoder":
@@ -1215,66 +1235,172 @@ class Qwen3OmniModel(Model):
             return self._create_vision_encoder_submodule(device)
         return None
 
-    def _create_thinker_submodule(self, device: str) -> NodeSubmodule:
+    @staticmethod
+    def _thinker_remap(name: str) -> str | None:
+        """Map HF checkpoint keys (after ``thinker.`` prefix strip) to model param paths.
+
+        Handles the ``block_sparse_moe`` → ``mlp`` rename and the per-expert
+        weight fusion: ``experts.{N}.{gate,up,down}_proj.weight`` becomes a
+        shard_id-carrying key that the MoE weight_loaders consume via
+        ``StackedParamRule``.
+        """
+        import re
+
+        if "rotary_emb" in name:
+            return None
+        name = name.replace("block_sparse_moe.", "mlp.")
+        # Per-expert weights: experts.N.{gate,up,down}_proj.weight
+        # → experts.{gate_up_proj,down_proj} with shard_id handled by stacked rules.
+        # We rewrite the name so StackedParamRule suffix matching works:
+        # "experts.N.gate_proj.weight" → "experts.gate_proj.__N__.weight"
+        # The weight_loader on the fused param extracts the expert index from shard_id.
+        m = re.match(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$", name)
+        if m:
+            prefix, expert_idx, proj = m.groups()
+            return f"{prefix}.experts.{proj}.__expert{expert_idx}__.weight"
+        return name
+
+    # MoE stacked param rules: route per-expert projections into fused params.
+    # The shard_id encodes both the projection type AND the expert index.
+    # The __expertN__ marker is injected by _thinker_remap; weight_loaders
+    # parse it to determine the expert slot.
+    _THINKER_STACKED_PARAMS: list = []  # populated lazily below
+
+    def _get_thinker_stacked_params(self):
+        from mminf.model.loader.base import StackedParamRule
+
+        if self._THINKER_STACKED_PARAMS:
+            return self._THINKER_STACKED_PARAMS
+        E = self.config.thinker_text.num_experts
+        # MoE expert rules MUST come before dense MLP rules because
+        # the dense ".gate_proj" suffix would also match the remapped
+        # MoE key "experts.gate_proj.__expertN__.weight". _apply_stacked
+        # returns on first match, so longer/more-specific rules go first.
+        rules = []
+        for i in range(E):
+            # source_suffix includes ".weight" so the replacement strips it —
+            # the target params (experts.gate_up_proj, experts.down_proj) are
+            # bare nn.Parameters, not Linear submodules, so they have no
+            # ".weight" suffix in named_parameters().
+            rules.append(StackedParamRule(
+                target_suffix=".experts.gate_up_proj",
+                source_suffix=f".experts.gate_proj.__expert{i}__.weight",
+                shard_id=f"gate:{i}",
+            ))
+            rules.append(StackedParamRule(
+                target_suffix=".experts.gate_up_proj",
+                source_suffix=f".experts.up_proj.__expert{i}__.weight",
+                shard_id=f"up:{i}",
+            ))
+            rules.append(StackedParamRule(
+                target_suffix=".experts.down_proj",
+                source_suffix=f".experts.down_proj.__expert{i}__.weight",
+                shard_id=f"down:{i}",
+            ))
+        # Dense MLP gate/up fusion and attention qkv fusion.
+        rules.append(StackedParamRule(".gate_up_proj", ".gate_proj", 0))
+        rules.append(StackedParamRule(".gate_up_proj", ".up_proj", 1))
+        rules.append(StackedParamRule(".qkv_proj", ".q_proj", "q"))
+        rules.append(StackedParamRule(".qkv_proj", ".k_proj", "k"))
+        rules.append(StackedParamRule(".qkv_proj", ".v_proj", "v"))
+        self._THINKER_STACKED_PARAMS = rules
+        return rules
+
+    def _create_thinker_submodule(self, device: str, tp_group=None) -> NodeSubmodule:
+        from mminf.model.loader import load_hf_weights
+        from mminf.model.loader.iterators import iter_safetensors_shards
         from mminf.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
-        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         with torch.device("meta"):
-            thinker_model = Qwen3OmniThinkerModel(self.config)
+            thinker_model = Qwen3OmniThinkerModel(self.config, comm_group=tp_group)
+        thinker_model.to_empty(device=device)
 
-        load_weights_from_hf_shards(
-            repo_dir=self.local_dir,
-            modules=[
-                ModuleAndPrefix(thinker_model, prefix="thinker"),
-            ],
-            device=device,
-            conv=self.CONVERTER
+        weights = iter_safetensors_shards(
+            self.local_dir, device=device,
+            prefix="thinker."
         )
+        # Strip the "thinker." prefix from checkpoint keys.
+        weights = ((k.removeprefix("thinker."), v) for k, v in weights)
 
+        load_hf_weights(
+            thinker_model, weights,
+            stacked_params=self._get_thinker_stacked_params(),
+            name_remapper=self._thinker_remap,
+        )
         thinker_model.eval()
-        thinker_model.set_qkv_proj_weights()
+        
 
-        # Return a placeholder -- the actual ThinkerSubmodule class will be
-        # implemented in a separate submodules.py file.
         from mminf.model.qwen3_omni.submodules import ThinkerSubmodule
         return ThinkerSubmodule(
             thinker_model=thinker_model,
             config=self.config,
         )
 
-    def _create_talker_submodule(self, device: str) -> NodeSubmodule:
-        from mminf.model.qwen3_omni.components.talker import Qwen3OmniTalkerModel
-        from mminf.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
+    def _create_talker_submodule(self, device: str, tp_group=None) -> NodeSubmodule:
+        from mminf.model.loader import load_hf_weights
+        from mminf.model.loader.iterators import iter_safetensors_shards
+        from mminf.model.qwen3_omni.components.talker import (
+            Qwen3OmniCodePredictor,
+            Qwen3OmniTalkerModel,
+        )
 
         with torch.device("meta"):
-            talker_model = Qwen3OmniTalkerModel(self.config)
+            # ``tp_group`` shards the Talker LLM's attention + MoE. The
+            # CodePredictor stays TP=1 (separate construction below) —
+            # its compute is small and the deterministic FlashInfer sampler
+            # produces bit-equal codes on every rank, so per-rank
+            # replication is cheaper than 150+ NCCL all-reduces per
+            # decode step (5 layers x 15 unrolled iterations).
+            talker_model = Qwen3OmniTalkerModel(self.config, comm_group=tp_group)
+        talker_model.to_empty(device=device)
 
-        # Talker weights: text_projection, hidden_projection, codec_head,
-        # codec_embedding, and the transformer layers are all under "talker."
-        load_weights_from_hf_shards(
-            repo_dir=self.local_dir,
-            modules=[
-                ModuleAndPrefix(talker_model, prefix="talker"),
-            ],
-            device=device,
-            conv=self.CONVERTER
+        # Talker and CodePredictor share the "talker." prefix. We stream
+        # once and split: code_predictor keys go to the CodePredictor,
+        # everything else goes to the TalkerModel.
+        talker_weights = []
+        code_pred_weights = []
+        _CP_PREFIX = "talker.code_predictor."
+        _TALKER_PREFIX = "talker."
+
+        initialized_thinker_embed_tokens = False
+        text_config = self.config.thinker_text
+        embed_tokens = torch.nn.Embedding(
+            text_config.vocab_size, text_config.hidden_size,
+            device=device
+        ).eval()
+        for k, v in iter_safetensors_shards(self.local_dir, device=device, prefix=_TALKER_PREFIX):
+            if k.startswith(_CP_PREFIX):
+                code_pred_weights.append((k.removeprefix(_CP_PREFIX), v))
+            else:
+                talker_weights.append((k.removeprefix(_TALKER_PREFIX), v))
+        for k, v in iter_safetensors_shards(
+            self.local_dir, device=device, prefix="thinker.model.embed_tokens"
+        ):
+            initialized_thinker_embed_tokens = True
+            with torch.no_grad():
+                embed_tokens.weight.copy_(v)
+
+        assert initialized_thinker_embed_tokens, \
+            "thinker.model.embed_tokens not found to initialize talker TTS embeds"
+
+        stacked = self._get_thinker_stacked_params()
+        load_hf_weights(
+            talker_model, iter(talker_weights),
+            stacked_params=stacked,
+            name_remapper=self._thinker_remap,
         )
         talker_model.eval()
 
         with torch.device("meta"):
             code_predictor = Qwen3OmniCodePredictor(self.config)
-        load_weights_from_hf_shards(
-            repo_dir=self.local_dir,
-            modules=[
-                ModuleAndPrefix(code_predictor, prefix="talker.code_predictor"),
-            ],
-            device=device,
+        code_predictor.to_empty(device=device)
+        load_hf_weights(
+            code_predictor, iter(code_pred_weights),
+            stacked_params=stacked,
+            name_remapper=self._thinker_remap,
         )
         code_predictor.consolidate_stacked_weights()
-        code_predictor.set_qkv_proj_weights()
         code_predictor.eval()
-
-        talker_model.set_qkv_proj_weights()
 
         from mminf.model.qwen3_omni.submodules import TalkerSubmodule
         talker_sub = TalkerSubmodule(
@@ -1282,64 +1408,8 @@ class Qwen3OmniModel(Model):
             code_predictor=code_predictor,
             config=self.config,
         )
-
-        # W3: Pre-compute TTS special embeddings using the Thinker's
-        # embedding table.  The HF reference computes:
-        #   tts_pad_embed = talker.text_projection(thinker.embed_tokens(pad_id))
-        #   tts_bos_embed = talker.text_projection(thinker.embed_tokens(bos_id))
-        #   tts_eos_embed = talker.text_projection(thinker.embed_tokens(eos_id))
-        #
-        # Two cases:
-        #
-        # 1. Colocated (Thinker + Talker on same worker): grab the
-        #    Thinker submodule's already-loaded embed_tokens directly.
-        #    Zero extra memory.
-        #
-        # 2. Disaggregated (Talker on a different worker than Thinker):
-        #    load JUST the embed_tokens layer from the checkpoint, use
-        #    it to compute the 3 projected TTS embeds (~12 KB cached on
-        #    the Talker submodule), and immediately discard the
-        #    embedding layer to free its memory.
-        thinker_sub = self._submodule_cache.get("Thinker")
-        if thinker_sub is not None and hasattr(thinker_sub, "model"):
-            # Colocated: reuse the already-loaded embed_tokens
-            try:
-                embed_tokens = thinker_sub.model.model.embed_tokens
-                talker_sub.init_tts_embeds(embed_tokens)
-            except Exception as e:
-                logger.warning(
-                    "Could not init TTS embeds from colocated Thinker "
-                    "embed_tokens: %s", e,
-                )
-        else:
-            # Disaggregated: load embed_tokens temporarily from the checkpoint
-            logger.info(
-                "Thinker submodule not loaded on this worker; loading "
-                "embed_tokens temporarily to compute Talker TTS special embeds."
-            )
-            text_config = self.config.thinker_text
-            embed_tokens = torch.nn.Embedding(
-                text_config.vocab_size, text_config.hidden_size,
-            )
-            try:
-                load_weights_from_hf_shards(
-                    repo_dir=self.local_dir,
-                    modules=[ModuleAndPrefix(
-                        embed_tokens, prefix="thinker.model.embed_tokens"
-                    )],
-                    device=device,
-                )
-                talker_sub.init_tts_embeds(embed_tokens)
-            except Exception as e:
-                logger.warning(
-                    "Failed to load Thinker embed_tokens for TTS embeds; "
-                    "Talker will use zero fallback (degraded audio quality): %s",
-                    e,
-                )
-            finally:
-                # Free the temporary embedding layer (~620 MB).  The 12 KB
-                # of cached projected embeds remain on the Talker submodule.
-                del embed_tokens
+        talker_sub.init_tts_embeds(embed_tokens)
+        del embed_tokens
 
         return talker_sub
 

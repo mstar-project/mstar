@@ -930,7 +930,7 @@ class VJepa2Model(Model):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
-    def get_submodule(self, node_name: str, device: str = "cpu") -> torch.nn.Module | None:
+    def get_submodule(self, node_name: str, device: str = "cpu", tp_group=None) -> torch.nn.Module | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(node_name, device)

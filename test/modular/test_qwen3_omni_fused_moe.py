@@ -24,12 +24,9 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mminf.model.qwen3_omni.components.fused_moe.align import has_sgl_kernel
-from mminf.model.qwen3_omni.components.moe import (
-    Qwen3OmniSparseMoeBlock,
-    Qwen3OmniTalkerSparseMoeBlock,
-    _dispatch_experts_fused,
-)
+from mminf.model.components import GatedMLP, SparseMoeBlock, SparseMoeBlockWithSharedExpert
+from mminf.model.components.moe import dispatch_experts_fused as _dispatch_experts_fused
+from mminf.utils.fused_moe.align import has_sgl_kernel
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="fused MoE requires CUDA")
 
@@ -80,7 +77,7 @@ def _seed():
 )
 def test_fused_experts_numerical_parity(num_tokens, hidden, inter, num_experts, top_k):
     _skip_if_no_sgl_kernel()
-    from mminf.model.qwen3_omni.components.fused_moe import fused_experts
+    from mminf.utils.fused_moe import fused_experts
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -129,7 +126,7 @@ def test_thinker_block_parity(num_tokens):
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    block = Qwen3OmniSparseMoeBlock(
+    block = SparseMoeBlock(
         hidden_size=hidden,
         num_experts=num_experts,
         num_experts_per_tok=top_k,
@@ -145,7 +142,7 @@ def test_thinker_block_parity(num_tokens):
     x = torch.randn(num_tokens, hidden, device=device, dtype=dtype)
 
     # Force naive path by disabling the fused flag on the module.
-    import mminf.model.qwen3_omni.components.moe as moe_mod
+    import mminf.model.components.moe as moe_mod
 
     saved = moe_mod._HAS_FUSED
     try:
@@ -173,13 +170,15 @@ def test_talker_block_parity(num_tokens):
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    block = Qwen3OmniTalkerSparseMoeBlock(
+    block = SparseMoeBlockWithSharedExpert(
         hidden_size=hidden,
         num_experts=num_experts,
         num_experts_per_tok=top_k,
         moe_intermediate_size=inter,
         norm_topk_prob=False,
-        shared_expert_intermediate_size=shared_inter,
+        shared_expert=GatedMLP(
+            hidden_size=hidden, intermediate_size=shared_inter, activation="silu",
+        ),
     ).to(device=device, dtype=dtype)
     with torch.no_grad():
         block.experts.gate_up_proj.normal_(std=0.02)
@@ -192,7 +191,7 @@ def test_talker_block_parity(num_tokens):
 
     x = torch.randn(num_tokens, hidden, device=device, dtype=dtype)
 
-    import mminf.model.qwen3_omni.components.moe as moe_mod
+    import mminf.model.components.moe as moe_mod
 
     saved = moe_mod._HAS_FUSED
     try:

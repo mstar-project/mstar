@@ -14,7 +14,8 @@ from mminf.communication.tensors import (
     _serialize_tensor,
     create_tensor_communication_manager,
 )
-from mminf.graph.base import GraphEdge
+from mminf.distributed.base import ShardingConfig
+from mminf.graph.base import GraphEdge, TensorPointerInfo
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -33,14 +34,37 @@ class MockCommunicator(BaseCommunicator):
         return []
 
 
-def _make_manager(shm_dir: str, entity_id: str = "worker_0") -> SharedMemoryCommunicationManager:
-    return SharedMemoryCommunicationManager(
+def _empty_sharding_config() -> ShardingConfig:
+    cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[], shard_dim={})
+    cfg.setup({})
+    return cfg
+
+
+def _stub_info(t: torch.Tensor) -> TensorPointerInfo:
+    """Build a minimal TensorPointerInfo carrying dims/dtype for the
+    serialize/deserialize round-trip tests.
+    """
+    return TensorPointerInfo(
+        dims=tuple(t.shape), dtype=t.dtype, stride=t.stride(),
+        nbytes=t.nbytes, address=0, uuid="stub",
+        source_session_id="local", source_entity="local",
+    )
+
+
+def _make_manager(
+    shm_dir: str, entity_id: str = "worker_0",
+    request_id: str | None = None,
+) -> SharedMemoryCommunicationManager:
+    mgr = SharedMemoryCommunicationManager(
         my_entity_id=entity_id,
         hostname="localhost",
         device="cpu",
         communicator=MockCommunicator(),
         shm_dir=shm_dir,
     )
+    if request_id is not None:
+        mgr.register_request(request_id, _empty_sharding_config())
+    return mgr
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +84,7 @@ def test_serialize_roundtrip_dtypes(dtype):
         t = torch.randint(0, 100, (4, 8), dtype=dtype)
 
     data = _serialize_tensor(t)
-    t2 = _deserialize_tensor(data, "cpu")
+    t2 = _deserialize_tensor(data, "cpu", tensor_info=_stub_info(t))
     assert t2.shape == t.shape
     assert t2.dtype == t.dtype
     assert torch.equal(t2, t)
@@ -69,7 +93,7 @@ def test_serialize_roundtrip_dtypes(dtype):
 def test_serialize_scalar():
     t = torch.tensor(3.14, dtype=torch.float32)
     data = _serialize_tensor(t)
-    t2 = _deserialize_tensor(data, "cpu")
+    t2 = _deserialize_tensor(data, "cpu", tensor_info=_stub_info(t))
     assert t2.shape == t.shape
     assert torch.equal(t2, t)
 
@@ -77,14 +101,14 @@ def test_serialize_scalar():
 def test_serialize_empty():
     t = torch.empty(0, 3, dtype=torch.float32)
     data = _serialize_tensor(t)
-    t2 = _deserialize_tensor(data, "cpu")
+    t2 = _deserialize_tensor(data, "cpu", tensor_info=_stub_info(t))
     assert t2.shape == t.shape
 
 
 def test_serialize_high_dim():
     t = torch.randn(2, 3, 4, 5)
     data = _serialize_tensor(t)
-    t2 = _deserialize_tensor(data, "cpu")
+    t2 = _deserialize_tensor(data, "cpu", tensor_info=_stub_info(t))
     assert torch.equal(t2, t)
 
 
@@ -94,7 +118,7 @@ def test_serialize_high_dim():
 
 def test_store_and_register_creates_file():
     with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = _make_manager(tmpdir)
+        mgr = _make_manager(tmpdir, request_id="req1")
         tensor = torch.randn(4, 8)
         info = mgr.store_and_return_tensor_info("req1", {"out": [tensor]})
         uuid = info["out"][0].uuid
@@ -107,8 +131,8 @@ def test_store_and_register_creates_file():
 def test_full_sender_receiver_cycle():
     """Simulate a full sender → receiver cycle via SHM."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        sender = _make_manager(tmpdir, entity_id="worker_0")
-        receiver = _make_manager(tmpdir, entity_id="worker_1")
+        sender = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        receiver = _make_manager(tmpdir, entity_id="worker_1", request_id="req1")
 
         original = torch.randn(10, 32)
 
@@ -119,10 +143,10 @@ def test_full_sender_receiver_cycle():
         sender.register_for_send("req1", uuids)
 
         # Receiver: start read
-        receiver.start_read_tensors("req1", edges)
+        receiver.start_read_tensors("req1", edges, graph_walk="decode")
 
         # Receiver: poll ready
-        ready = receiver.get_ready_tensors()
+        ready = receiver.get_ready_tensors(graph_walk="decode")
         assert "req1" in ready
         assert len(ready["req1"]) == 1
 
@@ -134,8 +158,8 @@ def test_full_sender_receiver_cycle():
 def test_full_cycle_bfloat16():
     """Ensure bfloat16 tensors survive the SHM round-trip."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        sender = _make_manager(tmpdir, entity_id="worker_0")
-        receiver = _make_manager(tmpdir, entity_id="worker_1")
+        sender = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        receiver = _make_manager(tmpdir, entity_id="worker_1", request_id="req1")
 
         original = torch.randn(5, 16, dtype=torch.bfloat16)
 
@@ -144,15 +168,15 @@ def test_full_cycle_bfloat16():
         uuids = [info.uuid for info in edges[0].tensor_info]
         sender.register_for_send("req1", uuids)
 
-        receiver.start_read_tensors("req1", edges)
-        ready = receiver.get_ready_tensors()
+        receiver.start_read_tensors("req1", edges, graph_walk="decode")
+        receiver.get_ready_tensors(graph_walk="decode")
         received = receiver.get_tensor("req1", uuids[0])
         assert torch.equal(received, original)
 
 
 def test_cleanup_unlinks_file():
     with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = _make_manager(tmpdir)
+        mgr = _make_manager(tmpdir, request_id="req1")
         tensor = torch.randn(4, 8)
         info = mgr.store_and_return_tensor_info("req1", {"out": [tensor]})
         uuid = info["out"][0].uuid
@@ -170,7 +194,7 @@ def test_cleanup_unlinks_file():
 def test_local_tensor_skips_shm():
     """When source_entity == my_entity_id, no SHM file I/O should occur."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = _make_manager(tmpdir, entity_id="worker_0")
+        mgr = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
         tensor = torch.randn(3, 3)
 
         edges = [GraphEdge(next_node="LLM", name="data")]
@@ -179,8 +203,8 @@ def test_local_tensor_skips_shm():
         mgr.register_for_send("req1", uuids)
 
         # Reading from self — should NOT open an SHM file, just increment ref
-        mgr.start_read_tensors("req1", edges)
-        ready = mgr.get_ready_tensors()
+        mgr.start_read_tensors("req1", edges, graph_walk="decode")
+        ready = mgr.get_ready_tensors(graph_walk="decode")
         assert "req1" in ready
 
         retrieved = mgr.get_tensor("req1", uuids[0])
@@ -190,8 +214,8 @@ def test_local_tensor_skips_shm():
 def test_ack_sent_on_remote_read():
     """Verify that get_ready_tensors sends a TENSOR_RECEIVED ACK for remote tensors."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        sender = _make_manager(tmpdir, entity_id="worker_0")
-        receiver = _make_manager(tmpdir, entity_id="worker_1")
+        sender = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        receiver = _make_manager(tmpdir, entity_id="worker_1", request_id="req1")
 
         original = torch.randn(2, 4)
         edges = [GraphEdge(next_node="node", name="t")]
@@ -199,8 +223,8 @@ def test_ack_sent_on_remote_read():
         uuids = [info.uuid for info in edges[0].tensor_info]
         sender.register_for_send("req1", uuids)
 
-        receiver.start_read_tensors("req1", edges)
-        receiver.get_ready_tensors()
+        receiver.start_read_tensors("req1", edges, graph_walk="decode")
+        receiver.get_ready_tensors(graph_walk="decode")
 
         # Check that ACK was sent to "worker_0"
         comm = receiver.communicator

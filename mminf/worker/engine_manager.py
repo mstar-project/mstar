@@ -4,6 +4,7 @@ from typing import Callable
 
 import torch
 
+from mminf.distributed.communication import WorkerTPGroups
 from mminf.engine.base import BaseEngine, EngineType
 from mminf.engine.kv_cache_engine import KVCacheEngine
 from mminf.engine.kv_store import KVCacheConfig, TransferEngineInfo
@@ -64,6 +65,7 @@ class EngineManager:
         device: torch.device,
         kv_config: list[KVCacheConfig],
         model_config: dict,
+        tp_groups: WorkerTPGroups,
         transfer_engine_info: TransferEngineInfo,
         model: Model,
         enable_nvtx: bool = False,
@@ -91,7 +93,8 @@ class EngineManager:
         node_submodules: dict[str, torch.nn.Module | None] = {}
         if model is not None:
             for name in node_names:
-                node_submodules[name] = model.get_submodule(name, device)
+                node_tp_group = tp_groups.get_tp_config_for_node(name)
+                node_submodules[name] = model.get_submodule(name, device, tp_group=node_tp_group)
 
         # Group nodes by the factory key. STATELESS nodes split further by
         # the flavor declared on the submodule; other engine types group
@@ -129,6 +132,7 @@ class EngineManager:
 
             engine.load_model(
                 submodules,
+                tp_groups=tp_groups,
                 kv_cache_config=kv_config,
                 device=device,
                 transfer_engine_info=transfer_engine_info,

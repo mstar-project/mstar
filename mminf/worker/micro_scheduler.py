@@ -1,3 +1,4 @@
+from collections import deque
 import logging
 import time
 from dataclasses import dataclass
@@ -5,6 +6,7 @@ from enum import Enum
 
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphNode
+from mminf.utils.ipc_format import ScheduleTPNode
 from mminf.worker.engine_manager import EngineManager
 from mminf.worker.node_manager_utils import WorkerGraphsManager
 
@@ -52,11 +54,20 @@ class MicroScheduler:
 
     def __init__(
         self, engine_manager: EngineManager,
-        sched_type=SchedulingType.ROUND_ROBIN
+        sched_type=SchedulingType.ROUND_ROBIN,
+        tp_rank_zero_nodes: set[str] | None = None,
+        max_consec_tp_follower_batches: int = 1,
     ):
         self.engine_manager = engine_manager
         self.batch_number = 0
         self.sched_type = sched_type
+
+        # tensor parallel
+        self.tp_rank_zero_nodes = tp_rank_zero_nodes
+        self.tp_batches_pending_schedule = deque()
+        self.num_consec_tp_follower_batches = 0
+        self.max_consec_tp_follower_batches = max_consec_tp_follower_batches
+
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[str, float] = {}
@@ -113,6 +124,66 @@ class MicroScheduler:
         deadline = time.monotonic() + self.HOLD_BACKOFF_SECONDS
         for rid in request_ids:
             self.held_until[rid] = deadline
+    
+    def register_tp_follow(
+        self, message: ScheduleTPNode
+    ):
+        self.tp_batches_pending_schedule.append(message)
+    
+    def _try_schedule_tp_follow(
+        self, worker_graphs_manager: WorkerGraphsManager,
+    ) -> ScheduledBatch | None:
+        if len(self.tp_batches_pending_schedule) == 0:
+            return
+        first_tp_node: ScheduleTPNode = self.tp_batches_pending_schedule[0]
+        if self.num_consec_tp_follower_batches >= self.max_consec_tp_follower_batches and \
+                self.has_ready_excluding(
+                    worker_graphs_manager,
+                    (first_tp_node.node_name, first_tp_node.graph_walk)
+                ):
+            return
+        # check if batch is ready
+        node_partition = worker_graphs_manager.get_partition_for_node(first_tp_node.node_name)
+        wgid = worker_graphs_manager.get_worker_graph_id_for_node(
+            first_tp_node.request_ids[0], first_tp_node.node_name
+        )
+        queue = worker_graphs_manager.queues[wgid]
+        for rid in first_tp_node.request_ids:
+            wg = queue.per_request_queues[rid]
+            if first_tp_node.node_name not in wg.ready_node_names:
+                return
+            fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
+            # check if the node is ready on the engine level
+            # (e.g., for AR, whether the kv cache is read in)
+            engine = self.engine_manager.get_engine(first_tp_node.node_name)
+            if not engine.check_ready(first_tp_node.node_name, rid, fwd_info):
+                return
+        
+        node_objects = {}
+        request_to_worker_graph = {}
+
+        # TODO: this code is also repeated below, should pull into a helper fn
+        for rid in first_tp_node.request_ids:
+            popped = queue.pop_ready_nodes(rid, [first_tp_node.node_name])
+            if popped:
+                assert len(popped) == 1
+                node_objects[rid] = popped[0]
+                request_to_worker_graph[rid] = wgid
+
+        self.batch_number += 1
+        self.node_and_walk_to_last_batch_num[(
+            first_tp_node.node_name, first_tp_node.graph_walk
+        )] = self.batch_number
+
+        self.tp_batches_pending_schedule.popleft()
+
+        return ScheduledBatch(
+            node_name=first_tp_node.node_name,
+            graph_walk=first_tp_node.graph_walk,
+            node_objects=node_objects,
+            request_to_worker_graph=request_to_worker_graph,
+        )
+
 
     def get_next_batch(
         self,
@@ -143,6 +214,13 @@ class MicroScheduler:
             rid: t for rid, t in self.held_until.items() if t > now
         }
 
+        tp_follow_batch = self._try_schedule_tp_follow(worker_graphs_manager)
+        if tp_follow_batch is None:
+            self.num_consec_tp_follower_batches = 0
+        else:
+            self.num_consec_tp_follower_batches += 1
+            return tp_follow_batch
+
         for worker_graph_id, queue in worker_graphs_manager.queues.items():
             ready_map = queue.get_ready_node_names()
             for request_id, node_names in ready_map.items():
@@ -152,6 +230,8 @@ class MicroScheduler:
                 if request_id in self.held_until:
                     continue
                 for sname in node_names:
+                    if sname not in self.tp_rank_zero_nodes:
+                        continue # only rank 0 can initiate scheduling!
                     if target_node_name is not None and sname != target_node_name:
                         continue
                     node_partition = worker_graphs_manager.get_partition_for_node(sname)

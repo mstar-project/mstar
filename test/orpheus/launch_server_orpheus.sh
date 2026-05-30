@@ -21,7 +21,7 @@ else
 fi
 
 CUDA_VISIBLE_DEVICES=$DEVICES python mminf/api_server/entrypoint.py \
-    --config configs/orpheus_colocated.yaml --port $PORT \
+    --config configs/orpheus_tp2.yaml --port $PORT \
     --cache-dir $ORPHEUS_CACHE_DIR \
     --socket-path-prefix /tmp/mminf_${WHO}/ \
     --upload-dir /tmp/mminf_uploads_${WHO}/ \
