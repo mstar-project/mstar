@@ -500,6 +500,18 @@ class TensorCommunicationManager(ABC):
 
         for uuid, count in actual_counts.items():
             delta = count - 1  # subtract the safety hold of 1
+            if delta < 0:
+                # Diagnostic: a safety-hold UUID was not referenced by any
+                # routed edge. The tensor is about to be freed before any
+                # downstream consumer has a chance to read it.
+                logger.warning(
+                    "[DIAG-RC] req %s uuid %s: count=%d (delta=%d) — tensor "
+                    "will be freed; no routed edges reference it. "
+                    "routed_edges with tensor_info: %s",
+                    request_id, uuid, count, delta,
+                    [(e.name, e.next_node, len(e.tensor_info), e.is_streaming)
+                     for e in routed_edges],
+                )
             if delta > 0:
                 self.tensor_store.increment_ref(request_id, uuid, n=delta)
             elif delta < 0:
