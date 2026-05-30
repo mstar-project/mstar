@@ -16,9 +16,9 @@ High-level components
   micro-scheduler (continuous batching), and a KV cache manager, and routes tensors
   directly to downstream workers.
 - **Engines** (``mminf/engine/``): execution backends that actually run submodules on the
-  GPU — ``AREngine`` (autoregressive), ``FlowEngine`` (diffusion/ODE),
-  ``EncoderDecoderEngine`` (vision/audio encoding), ``AudioCodecEngine``,
-  ``CodePredictorEngine``.
+  GPU — ``KVCacheEngine`` (nodes with a persistent paged KV cache, e.g. autoregressive
+  LLMs and LLM-as-denoiser flow loops) and ``StatelessEngine`` (everything else: ViT/VAE
+  encoders and decoders, codec decoders, projection/combine stages).
 - **Models** (``mminf/model/``): each model declares its computation graph, tokenization,
   engine types, and submodules. Registered via ``mminf/model/registry.py``.
 - **Graph** (``mminf/graph/``): computation-graph primitives — ``GraphNode``,
