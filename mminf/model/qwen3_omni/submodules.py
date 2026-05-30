@@ -1511,6 +1511,28 @@ class TalkerSubmodule(ARNodeSubmodule):
         layer0_codes = injected_sampler.sample(
             request_ids, logits
         )
+        # Diagnostic: every 100 iterations, log the sampled token and the
+        # codec_eos token's softmax probability. If codec_eos never accrues
+        # mass, the model is stuck in a silence-emitting attractor; if it
+        # accrues mass but isn't sampled, sampling params are too restrictive.
+        import logging as _logging
+        _diag_logger = _logging.getLogger(__name__)
+        if _diag_logger.isEnabledFor(_logging.INFO):
+            for _i, _rid in enumerate(request_ids):
+                _row_logits = logits[_i].float()
+                _probs = torch.softmax(_row_logits, dim=-1)
+                _eos_id = self.config.talker.codec_eos_token_id
+                _eos_prob = _probs[_eos_id].item() if 0 <= _eos_id < _probs.numel() else -1.0
+                _sampled = int(layer0_codes[_i].item())
+                _top3 = torch.topk(_probs, k=3)
+                _top3_str = ",".join(
+                    f"({int(_top3.indices[_k].item())}:{_top3.values[_k].item():.3f})"
+                    for _k in range(3)
+                )
+                _diag_logger.info(
+                    "[DIAG-TALKER] rid=%s sampled=%d codec_eos=%d p(eos)=%.4g top3=%s",
+                    _rid, _sampled, _eos_id, _eos_prob, _top3_str,
+                )
 
         # code predictor section
         embed = self.talker_code_emb(layer0_codes)  # [bs, hidden]
