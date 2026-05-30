@@ -1677,6 +1677,19 @@ class TalkerSubmodule(ARNodeSubmodule):
         max_tokens = request_info.step_metadata.get(
             "talker_max_tokens", request_info.max_tokens
         )
+        # Diagnostic: log the sampled token every 100 iters per request, and
+        # ALWAYS when codec_eos is sampled. Builds up a coarse sequence of
+        # what Talker is emitting in the silence region.
+        iter_count = request_info.dynamic_loop_iter_counts.get(
+            "talker_decode_loop", 0,
+        )
+        if iter_count % 100 == 0 or token == eos_token_id:
+            logger.info(
+                "[DIAG-TALKER-CS] rid=%s iter=%d sampled=%d codec_eos=%d "
+                "eos_sent=%s",
+                request_id, iter_count, token, eos_token_id,
+                request_id in self._eos_embed_sent,
+            )
         if (eos_token_id is not None and eos_token_id == token) or \
                 (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= max_tokens):
             return {"talker_decode_loop"}
