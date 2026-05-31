@@ -119,6 +119,9 @@ class WorkerGraphsDone(MessageBody):
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
     output_signal_names: int = field(default=0)
+    new_produced_edge_idx: dict[str, int] = field(default_factory=dict)
+    new_consumed_edge_idx: dict[str, int] = field(default_factory=dict)
+    consumer_graph_walk_transitions: dict[str, str] = field(default_factory=dict)
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)

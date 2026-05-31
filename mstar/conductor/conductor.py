@@ -20,6 +20,7 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     PartitionState,
     StreamingConnectionState,
+    TransitionSource,
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalTPConfig, WorkerTPGroups
@@ -189,6 +190,7 @@ class Conductor:
     ):
         self.requests: dict[str, RequestData] = {}
         self.model = model
+        self._validate_transition_sources()
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
@@ -564,6 +566,52 @@ class Conductor:
             )
             self._do_ingest_request(body)
 
+    def _validate_transition_sources(self):
+        """Validate that graph-walk transition authority is unambiguous.
+
+        Each partition's walk is moved by exactly one source. A
+        ``PRODUCER_TRIGGERED`` partition must be driven by at least one streaming
+        connection carrying a ``consumer_walk_transition``; a ``STATE_MACHINE``
+        partition must not be driven by any. Fails fast at conductor startup.
+
+        (A producer-triggered partition may have several driving connections —
+        e.g. qwen3omni's thinker_states + thinker_mask both carry the marker so
+        each lands in the right walk.)
+        """
+        pdefs = {p.name: p for p in self.model.get_partitions()}
+        topology = self.model.get_partition_topology()
+
+        # Collect transition-carrying connections per consumer partition.
+        driving_conns: dict[str, list[str]] = {}
+        for conn in topology.connections:
+            if conn.consumer_walk_transition is None:
+                continue
+            consumer = pdefs.get(conn.to_partition)
+            if consumer is None:
+                raise ValueError(
+                    f"Connection edge {conn.edge_name!r} targets unknown "
+                    f"partition {conn.to_partition!r}."
+                )
+            if consumer.transition_source != TransitionSource.PRODUCER_TRIGGERED:
+                raise ValueError(
+                    f"Connection edge {conn.edge_name!r} defines a "
+                    f"consumer_walk_transition for partition "
+                    f"{conn.to_partition!r}, but that partition's "
+                    f"transition_source is {consumer.transition_source.value!r}, "
+                    f"not 'producer_triggered'. The two transition mechanisms "
+                    f"must not be mixed."
+                )
+            driving_conns.setdefault(conn.to_partition, []).append(conn.edge_name)
+
+        for name, pdef in pdefs.items():
+            if (pdef.transition_source == TransitionSource.PRODUCER_TRIGGERED
+                    and not driving_conns.get(name)):
+                raise ValueError(
+                    f"Producer-triggered partition {name!r} has no incoming "
+                    f"connection with a consumer_walk_transition to drive its "
+                    f"graph-walk transitions."
+                )
+
     def _ingest_request(
         self, body: NewRequestConductor
     ):
@@ -672,6 +720,14 @@ class Conductor:
                 body.request_id, p.name, fwd_args.full_metadata.graph_walk,
             )
             partition_fwd_args[p.name] = fwd_args
+        
+        # set up tracked_consumer_graph_walks
+        for conn in topology.connections:
+            producer = partition_states[conn.from_partition]
+            consumer = partition_states[conn.to_partition]
+            if conn.consumer_walk_transition is not None:
+                producer.tracked_consumer_graph_walks[conn.to_partition] \
+                    = consumer.metadata.graph_walk
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         for worker_id, worker_graph_ids in worker_to_worker_graph_ids.items():
@@ -706,7 +762,10 @@ class Conductor:
                         requires_cfg=fwd_args.full_metadata.requires_cfg,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        sampling_config=request_data.sampling_config
+                        sampling_config=request_data.sampling_config,
+                        produced_edge_idx=pstate.produced_edge_idx,
+                        consumed_edge_idx=pstate.consumed_edge_idx,
+                        tracked_consumer_graph_walks=pstate.tracked_consumer_graph_walks,
                     ),
                 )
                 self.communicator.send(
@@ -792,6 +851,10 @@ class Conductor:
                 partition_name, body.request_id,
             )
             return []
+        
+        pstate.produced_edge_idx.update(body.new_produced_edge_idx)
+        pstate.consumed_edge_idx.update(body.new_consumed_edge_idx)
+        pstate.tracked_consumer_graph_walks.update(body.consumer_graph_walk_transitions)
 
         # Persist signals: every rank contributes its shard (different uuid +
         # source_tp_rank); accumulate across ranks, do not dedup.
@@ -947,6 +1010,9 @@ class Conductor:
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
                         sampling_config=request_data.sampling_config,
+                        produced_edge_idx=pstate.produced_edge_idx,
+                        consumed_edge_idx=pstate.consumed_edge_idx,
+                        tracked_consumer_graph_walks=pstate.tracked_consumer_graph_walks,
                     ),
                     partition_name=partition_name
                 ),
@@ -983,7 +1049,10 @@ class Conductor:
                         requires_cfg=False,
                         partition_name=consumer_partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        sampling_config=request_data.sampling_config
+                        sampling_config=request_data.sampling_config,
+                        produced_edge_idx=pstate.produced_edge_idx,
+                        consumed_edge_idx=pstate.consumed_edge_idx,
+                        tracked_consumer_graph_walks=pstate.tracked_consumer_graph_walks,
                     ),
                     partition_name=consumer_partition_name,
                     producer_done=set([producer_partition]),

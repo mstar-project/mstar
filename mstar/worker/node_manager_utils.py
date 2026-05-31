@@ -289,6 +289,15 @@ class WorkerGraphsManager:
         if per_label_seq_info is not None:
             fwd_info = self.get_fwd_info(request_id, partition_name)
             fwd_info.per_label_seq_info.update(per_label_seq_info)
+    
+    def update_graph_walk(self, request_id: str, partition_name: str, graph_walk: str):
+        part_info = self.per_request_info[request_id].per_partition_info[partition_name]
+        if self.get_graph_walk(request_id, partition_name) != graph_walk:
+            part_info.graph_walk_worker_graph_ids = [
+                graph_id for graph_id in self.per_request_info[request_id].worker_graph_ids \
+                    if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
+            ]
+        part_info.current_fwd_info.graph_walk = graph_walk
 
     def get_graph_walk(self, request_id: str, partition_name: str):
         return self.get_fwd_info(request_id, partition_name).graph_walk

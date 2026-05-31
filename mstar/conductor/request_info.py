@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -75,6 +76,9 @@ class CurrentForwardPassInfo:
     step_metadata: dict = field(default_factory=dict)
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")
+    produced_edge_idx: dict[str, int] = field(default_factory=dict)
+    consumed_edge_idx: dict[str, int] = field(default_factory=dict)
+    tracked_consumer_graph_walks: dict[str, str] = field(default_factory=dict)
 
     # Per-loop stop indices; stop decisions come from each submodule's check_stop.
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
@@ -88,6 +92,20 @@ class CurrentForwardPassInfo:
 # Partition types for async graph partitions
 # ---------------------------------------------------------------------------
 
+class TransitionSource(str, Enum):
+    """Who owns a partition's graph-walk transitions.
+
+    A partition's walk is moved by exactly one authority:
+      - STATE_MACHINE: the conductor advances the walk via the model's
+        ``get_partition_forward_pass_args``.
+      - PRODUCER_TRIGGERED: a producer partition drives the walk via streaming
+        transition markers (``Connection.consumer_walk_transition``); the
+        conductor does not advance it.
+    """
+    STATE_MACHINE = "state_machine"
+    PRODUCER_TRIGGERED = "producer_triggered"
+
+
 @dataclass
 class PartitionDefinition:
     """Defines a partition within a model's computation graph.
@@ -99,6 +117,7 @@ class PartitionDefinition:
     graph_walks: set[str]                                       # walks this partition uses
     initial_walk: str | None = None                             # first walk, or None = triggered later
     producer_partitions: list[str] = field(default_factory=list)  # partitions feeding tokens to this one
+    transition_source: TransitionSource = TransitionSource.STATE_MACHINE
 
 
 @dataclass
@@ -120,6 +139,12 @@ class PartitionState:
     fwd_pass_number: int = 0
     random_seed: int = 0
     is_done: bool = False
+    # streaming edge name -> number of times this edge has been emitted
+    produced_edge_idx: dict[str, int] = field(default_factory=dict)
+    consumed_edge_idx: dict[str, int] = field(default_factory=dict)
+    # only for producer-driven graph walk transitions
+    tracked_consumer_graph_walks: dict[str, str] = field(default_factory=dict)
+    new_tokens: dict[str, list[int]] = field(default_factory=dict)
     completed_worker_graph_ids: set[str] = field(default_factory=set)
     current_worker_graph_ids: set[str] = field(default_factory=set)
     # wg_id -> count of distinct TP ranks that have reported completion

@@ -39,17 +39,18 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     PartitionDefinition,
     StreamingConnectionState,
+    TransitionSource,
 )
 from mstar.engine.base import EngineType
 from mstar.engine.kv_store import KVCacheConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, MAX_OUTPUT_TOKENS, Model, TensorAndMetadata
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import Operation, WeightConverter
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
-from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.streaming.topology import Connection, ConsumerTransitionCtx, PartitionTopology, StreamingGraphEdge, WalkTransition
 from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
@@ -334,13 +335,10 @@ class Qwen3OmniModel(Model):
             outputs=[],
         )
 
-        # -- Talker prefill: receives thinker_states + talker_trigger --
-        # Dual-input gating: both thinker_states from streaming and
-        # talker_trigger from conductor cross-partition trigger must be
-        # present for a prefill step.
+        # -- Talker prefill: receives thinker_states
         talker_prefill = GraphNode(
             name="Talker",
-            input_names=["thinker_states", "thinker_mask", "talker_trigger"],
+            input_names=["thinker_states", "thinker_mask"],
             outputs=[],
         )
 
@@ -348,7 +346,7 @@ class Qwen3OmniModel(Model):
             sections=[
                 GraphNode(
                     name="Talker",
-                    input_names=["thinker_states", "thinker_mask", "talker_trigger"],
+                    input_names=["thinker_states", "thinker_mask"],
                     outputs=[
                         GraphEdge(
                             next_node=EMPTY_DESTINATION,
@@ -435,6 +433,7 @@ class Qwen3OmniModel(Model):
                 graph_walks={"talker_prefill", "talker_last_prefill", "talker_decode"},
                 initial_walk="talker_prefill",
                 producer_partitions=["Thinker"],
+                transition_source=TransitionSource.PRODUCER_TRIGGERED,
             ),
             PartitionDefinition(
                 name="Code2Wav",
@@ -445,6 +444,13 @@ class Qwen3OmniModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
+        def talker_state_transition(ctx: ConsumerTransitionCtx) -> WalkTransition:
+            if ctx.producer_walk != "thinker_decode":
+                return WalkTransition("talker_prefill")
+            if ctx.consumer_walk == "talker_prefill":
+                return WalkTransition("talker_last_prefill")
+            return WalkTransition("talker_decode")
+            
         return PartitionTopology(
             partitions=["Thinker", "Talker", "Code2Wav"],
             connections=[
@@ -452,13 +458,19 @@ class Qwen3OmniModel(Model):
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_states",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    chunk_policy_factory=lambda: FixedChunkPolicy(
+                        chunk_size=1, continue_after_done={"talker_decode"}
+                    ),
+                    consumer_walk_transition=talker_state_transition
                 ),
                 Connection(
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_mask",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    chunk_policy_factory=lambda: FixedChunkPolicy(
+                        chunk_size=1, continue_after_done={"talker_decode"}
+                    ),
+                    consumer_walk_transition=talker_state_transition
                 ),
                 Connection(
                     from_partition="Talker",
@@ -549,7 +561,7 @@ class Qwen3OmniModel(Model):
             )
             return ForwardPassArgs(
                 full_metadata=full_metadata,
-                inputs=[GraphEdge(next_node="Talker", name="talker_trigger")] if audio_output else [],
+                inputs=[],
                 unpersist_tensors=[],
                 request_done="audio" not in output_modalities,
                 step_metadata={
@@ -812,11 +824,9 @@ class Qwen3OmniModel(Model):
             # alongside the primary feature tensor).
             schedule = metadata.kwargs["prefill_schedule"]
             step = metadata.kwargs["prefill_step"]
-            is_last_prefill = (step == len(schedule) - 1)
             inputs = self._get_thinker_prefill_inputs(metadata, persist_signals)
         else:
             # Decode: previous token feeds back as text_inputs
-            is_last_prefill = False
             edge = GraphEdge(next_node="Thinker", name="text_inputs")
             edge.tensor_info = persist_signals.get("new_token", [])
             inputs = [edge]
@@ -827,7 +837,6 @@ class Qwen3OmniModel(Model):
 
         step_metadata = {
             "is_prefill": metadata.is_prefill,
-            "is_last_prefill": is_last_prefill,
             # Persist the audio_output flag across every Thinker step so
             # the submodule can gate thinker_states emission.  Default True
             # for backwards compatibility with callers that never set it.
@@ -849,60 +858,7 @@ class Qwen3OmniModel(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        """Talker partition state machine.
-
-        1. While prefill: return empty inputs (wait for cross-partition trigger)
-           - When trigger arrives with is_last_prefill=False:
-             extend KV cache only, no outputs
-           - When trigger arrives with is_last_prefill=True:
-             sample first codec token, produce all_codes
-        2. After last prefill produces all_codes: transition to talker_decode
-           - Set graph_walk="talker_decode", is_prefill=False
-           - Return all_codes as input edge (conductor-driven)
-        3. Each decode step: check all_codes for codec_eos
-           - If codec_eos: request_done=True for Talker
-           - Else: return all_codes as input again (loop)
-        """
-        if metadata.graph_walk == "talker_prefill":
-            metadata.kwargs["prefill_chunks_processed"] += 1
-            is_last_prefill = metadata.kwargs["num_thinker_prefill_steps"] == \
-                 metadata.kwargs["prefill_chunks_processed"]
-            metadata.graph_walk = "talker_last_prefill" if is_last_prefill else "talker_prefill"
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[GraphEdge(next_node="Talker", name="talker_trigger")],
-                unpersist_tensors=[],
-                step_metadata={
-                    "is_prefill": True,
-                    # voice is used for the last prefill
-                    "voice": metadata.kwargs.get("voice", "Ethan"),
-                    "talker_max_tokens": metadata.kwargs.get("talker_max_tokens")
-                },
-            )
-        elif metadata.graph_walk == "talker_last_prefill":
-            metadata.is_prefill = False
-            metadata.graph_walk = "talker_decode"
-            metadata.kwargs["talker_prefill_done"] = True
-
-            # Feed talker_input_embeds back as input for first decode step
-            edge = GraphEdge(next_node="Talker", name="talker_input_embeds")
-            edge.tensor_info = persist_signals["talker_input_embeds"]
-            inputs = [edge]
-            unpersist_tensors = sum(
-                [inp.tensor_info for inp in inputs], start=[]
-            )
-
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=inputs,
-                unpersist_tensors=unpersist_tensors,
-                step_metadata={
-                    "is_prefill": False,
-                    "talker_max_tokens": metadata.kwargs.get("talker_max_tokens")
-                },
-            )
-
-        elif metadata.graph_walk == "talker_decode":
+        if metadata.graph_walk == "talker_decode":
             # If the decode dynamic loop reaches the conductor, we can end the request.
             return ForwardPassArgs(
                 full_metadata=metadata,
@@ -911,9 +867,29 @@ class Qwen3OmniModel(Model):
                 request_done=True,
             )
 
-        raise ValueError(
-            f"Talker in unexpected state: walk={metadata.graph_walk!r}, "
-            f"is_prefill={metadata.is_prefill}"
+        step_metadata = {
+            # voice is used for the last prefill
+            "voice": metadata.kwargs.get("voice", "Ethan"),
+            "talker_max_tokens": metadata.kwargs.get("talker_max_tokens")
+        }
+        inputs = []
+        unpersist_tensors = []
+
+        if metadata.graph_walk == "talker_last_prefill":
+            # Feed talker_input_embeds back as input for first decode step
+            edge = GraphEdge(next_node="Talker", name="talker_input_embeds")
+            edge.tensor_info = persist_signals["talker_input_embeds"]
+            inputs = [edge]
+            unpersist_tensors = sum(
+                [inp.tensor_info for inp in inputs], start=[]
+            )
+            metadata.graph_walk = "talker_decode"
+
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata=step_metadata,
         )
 
     # -- Code2Wav state machine --------------------------------------------

@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Callable
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge
 from mstar.streaming.chunk_policy import ChunkPolicy
 
@@ -15,10 +16,24 @@ class StreamingGraphEdge(GraphEdge):
     consuming node's input.
     """
     target_partition: str = ""
+    _index: int = 0
+    _graph_walk_transition: str | None = None
 
     def __post_init__(self):
         self.is_streaming = True
 
+
+@dataclass(frozen=True)
+class ConsumerTransitionCtx:
+    producer_walk: str
+    consumer_walk: str | None        # None on the very first trigger
+    producer_fwd: CurrentForwardPassInfo
+
+
+@dataclass
+class WalkTransition:
+    graph_walk: str | None = None
+    # TODO: hook up metadata if needed
 
 @dataclass
 class Connection:
@@ -27,6 +42,7 @@ class Connection:
     to_partition: str
     edge_name: str
     chunk_policy_factory: Callable[[], ChunkPolicy]
+    consumer_walk_transition: Callable[[ConsumerTransitionCtx], WalkTransition] | None = None
 
 
 @dataclass
