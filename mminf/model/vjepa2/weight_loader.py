@@ -4,10 +4,9 @@ Two checkpoint families are supported:
 
 * **HF safetensors** (``facebook/vjepa2-{vitl,vith,vitg,vitg-384}-fpc64-*``) —
   top-level ``encoder.*`` / ``predictor.*`` key layout; our component classes
-  match, so ``load_vjepa2_hf_weights`` just threads them through
-  :func:`mminf.model.utils.load_weights_from_file` /
-  :func:`load_weights_from_hf_shards` with a ``ModuleAndPrefix`` per component
-  — no key renames.
+  match, so :func:`load_vjepa2_hf_weights` just streams each prefix slice
+  through :func:`mminf.model.loader.load_hf_weights` with a thin remapper
+  that strips the outer ``encoder.``/``predictor.`` prefix.
 
 * **Upstream ``.pt``** (``facebook/vjepa2-ac-vitg/original/model.pth`` or the
   raw S3 mirror at ``https://dl.fbaipublicfiles.com/vjepa2/vjepa2-ac-vitg.pt``)
@@ -20,21 +19,23 @@ Two checkpoint families are supported:
   layout deliberately, so its side of the rename is a trivial
   ``module.``/``backbone.`` strip.  The encoder is HF-keyed in our tree, so
   we apply the same renames the HF conversion script does
-  (``transformers/.../convert_vjepa2_to_hf.py::convert_encoder_keys``).
+  (``transformers/.../convert_vjepa2_to_hf.py::convert_encoder_keys``).  The
+  encoder rename also splits the fused ``qkv`` weight/bias into separate
+  ``query`` / ``key`` / ``value`` projections (our :class:`VJEPA2Encoder`
+  uses the HF-style separated layout).
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 import torch
 
-from mminf.model.utils import (
-    ModuleAndPrefix,
-    load_weights_from_file,
-    load_weights_from_hf_shards,
+from mminf.model.loader import (
+    iter_safetensors_shards,
+    load_hf_weights,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,22 +47,33 @@ logger = logging.getLogger(__name__)
 VJEPA2_AC_VITG_S3_URL = "https://dl.fbaipublicfiles.com/vjepa2/vjepa2-ac-vitg.pt"
 
 
-def _find_checkpoint(repo_dir: Path) -> tuple[Path, bool]:
-    """Return ``(path, is_sharded)`` for the main checkpoint in a HF repo dir.
-
-    Prefers the sharded index if present, else falls back to the single
-    ``model.safetensors``.  Raises ``FileNotFoundError`` if neither exists.
+def _strip_prefix_remapper(prefix: str) -> Callable[[str], str | None]:
+    """Return a ``load_hf_weights`` ``name_remapper`` that strips ``prefix.``
+    from each key (returning ``None`` for non-matching keys so they're
+    dropped).  Used to peel the outer ``encoder.``/``predictor.`` envelope
+    off HF V-JEPA 2 safetensors keys.
     """
-    index = repo_dir / "model.safetensors.index.json"
-    if index.exists():
-        return index, True
-    single = repo_dir / "model.safetensors"
-    if single.exists():
-        return single, False
-    raise FileNotFoundError(
-        f"No V-JEPA 2 checkpoint found in {repo_dir}: expected either "
-        "model.safetensors.index.json (sharded) or model.safetensors (single)."
-    )
+    pref = prefix if prefix.endswith(".") else prefix + "."
+
+    def remap(name: str) -> str | None:
+        if name.startswith(pref):
+            return name[len(pref):]
+        return None
+
+    return remap
+
+
+def _assert_no_missing(
+    expected: set[str], loaded: set[str], context: str,
+) -> None:
+    missing = expected - loaded
+    if missing:
+        sample = sorted(missing)[:10]
+        more = "…" if len(missing) > 10 else ""
+        raise KeyError(
+            f"Missing {len(missing)} keys when loading {context}: "
+            f"{sample}{more}"
+        )
 
 
 def load_vjepa2_hf_weights(
@@ -69,43 +81,39 @@ def load_vjepa2_hf_weights(
     encoder_module: torch.nn.Module | None,
     predictor_module: torch.nn.Module | None,
     device: str = "cpu",
-    enforce_missing_keys: bool = True,
 ) -> None:
     """Load HF V-JEPA 2 weights into the supplied encoder / predictor modules.
 
     Pass ``None`` for a module you don't want to load (e.g. when only the
-    encoder lives on this worker's GPU).  ``encoder_module.state_dict()`` is
-    expected to have the same keys as HF under the ``encoder.`` prefix;
-    ``predictor_module.state_dict()`` similarly under ``predictor.``.
+    encoder lives on this worker's GPU).  ``encoder_module.named_parameters()``
+    is expected to have keys matching the HF layout *after* the ``encoder.``
+    prefix is stripped; same for ``predictor_module`` and ``predictor.``.
+
+    Raises :class:`KeyError` if any parameter of the supplied module(s) is
+    missing from the checkpoint — the equivalent of the old
+    ``enforce_missing_keys=True`` safety net.
     """
     repo_dir = Path(repo_dir)
-    path, is_sharded = _find_checkpoint(repo_dir)
-
-    modules: list[ModuleAndPrefix] = []
-    if encoder_module is not None:
-        modules.append(
-            ModuleAndPrefix(
-                module=encoder_module,
-                prefix="encoder",
-                enforce_missing_keys=enforce_missing_keys,
-            )
-        )
-    if predictor_module is not None:
-        modules.append(
-            ModuleAndPrefix(
-                module=predictor_module,
-                prefix="predictor",
-                enforce_missing_keys=enforce_missing_keys,
-            )
-        )
-    if not modules:
+    if encoder_module is None and predictor_module is None:
         logger.warning("load_vjepa2_hf_weights called with no modules to load")
         return
 
-    if is_sharded:
-        load_weights_from_hf_shards(repo_dir=repo_dir, modules=modules, device=device)
-    else:
-        load_weights_from_file(safetensors_file=str(path), modules=modules, device=device)
+    for module, prefix, label in (
+        (encoder_module, "encoder.", "HF V-JEPA 2 encoder"),
+        (predictor_module, "predictor.", "HF V-JEPA 2 predictor"),
+    ):
+        if module is None:
+            continue
+        expected = set(dict(module.named_parameters()).keys())
+        # iter_safetensors_shards transparently handles both the sharded
+        # (``model.safetensors.index.json``) and single-file
+        # (``model.safetensors``) layouts.
+        loaded = load_hf_weights(
+            module,
+            iter_safetensors_shards(repo_dir, device=device, prefix=prefix),
+            name_remapper=_strip_prefix_remapper(prefix),
+        )
+        _assert_no_missing(expected, loaded, label)
 
 
 def download_vjepa2_snapshot(model_path_hf: str, cache_dir: str | None = None) -> Path:
@@ -258,6 +266,20 @@ def download_vjepa2_ac_upstream_pt(
     return pt_path
 
 
+def _to_device_items(
+    renamed: Mapping[str, torch.Tensor], device: torch.device,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Yield ``(name, tensor)`` with each tensor moved to ``device``.
+
+    The upstream ``.pt`` is loaded into CPU RAM via ``torch.load``; we move
+    tensors to the worker's GPU lazily as the loader pulls them, matching
+    what the previous ``state_dict = {k: v.to(device) ...}`` bulk-copy did.
+    """
+    is_cpu = device.type == "cpu"
+    for key, tensor in renamed.items():
+        yield key, tensor if is_cpu else tensor.to(device, non_blocking=True)
+
+
 def load_vjepa2_ac_upstream_weights(
     pt_path: str | Path,
     encoder_module: torch.nn.Module | None,
@@ -274,10 +296,10 @@ def load_vjepa2_ac_upstream_weights(
             ``None`` if the encoder lives on a different worker.
         predictor_module: instance of :class:`VisionTransformerPredictorAC`
             to populate, or ``None``.
-        device: target device for tensors after load_state_dict.  Weights
-            are first loaded into CPU RAM (via ``torch.load``) and then
-            moved; pinning each rank's load to its own ``cuda:X`` here lets
-            the OS disk cache amortize multi-rank reads.
+        device: target device for tensors after the load.  Weights are first
+            loaded into CPU RAM (via ``torch.load``) and then moved; pinning
+            each rank's load to its own ``cuda:X`` here lets the OS disk
+            cache amortize multi-rank reads.
         hidden_size: encoder embedding dim.  Required when
             ``encoder_module`` is not None (used to split fused qkv); ignored
             otherwise.  If None, falls back to
@@ -319,34 +341,28 @@ def load_vjepa2_ac_upstream_weights(
         logger.info("AC encoder: %d source keys; sample: %s", len(blob["encoder"]), src_sample)
         renamed = _rename_upstream_encoder_keys(blob["encoder"], hidden_size=hidden_size)
         logger.info("AC encoder: %d renamed keys; sample: %s", len(renamed), list(renamed.keys())[:4])
-        if target_device.type != "cpu":
-            renamed = {k: v.to(target_device) for k, v in renamed.items()}
-        missing, unexpected = encoder_module.load_state_dict(renamed, strict=False, assign=True)
-        if missing:
-            raise KeyError(
-                f"Missing keys when loading AC encoder weights: {missing[:8]} "
-                f"(total {len(missing)}; unexpected = {unexpected[:4]})"
-            )
-        if unexpected:
-            logger.debug("Ignored %d unexpected AC-encoder keys: %s", len(unexpected), unexpected[:8])
+        expected = set(dict(encoder_module.named_parameters()).keys())
+        loaded = load_hf_weights(
+            encoder_module,
+            _to_device_items(renamed, target_device),
+        )
+        _assert_no_missing(expected, loaded, "AC V-JEPA 2 encoder")
         # Free upstream-layout encoder state once it's been remapped +
-        # assigned — otherwise the ~5.8 GB original CPU blob stays pinned
-        # in memory until the caller drops the reference to ``blob``.
+        # assigned — otherwise the ~5.8 GB original CPU blob (and the
+        # ``renamed`` views into it) stay pinned in memory while we go on
+        # to load the predictor.
         blob["encoder"] = None
+        del renamed
 
     if predictor_module is not None:
         src_sample = list(blob["predictor"].keys())[:4]
         logger.info("AC predictor: %d source keys; sample: %s", len(blob["predictor"]), src_sample)
         renamed = _rename_upstream_ac_predictor_keys(blob["predictor"])
         logger.info("AC predictor: %d renamed keys; sample: %s", len(renamed), list(renamed.keys())[:4])
-        if target_device.type != "cpu":
-            renamed = {k: v.to(target_device) for k, v in renamed.items()}
-        missing, unexpected = predictor_module.load_state_dict(renamed, strict=False, assign=True)
-        if missing:
-            raise KeyError(
-                f"Missing keys when loading AC predictor weights: {missing[:8]} "
-                f"(total {len(missing)}; unexpected = {unexpected[:4]})"
-            )
-        if unexpected:
-            logger.debug("Ignored %d unexpected AC-predictor keys: %s", len(unexpected), unexpected[:8])
+        expected = set(dict(predictor_module.named_parameters()).keys())
+        loaded = load_hf_weights(
+            predictor_module,
+            _to_device_items(renamed, target_device),
+        )
+        _assert_no_missing(expected, loaded, "AC V-JEPA 2 predictor")
         blob["predictor"] = None
