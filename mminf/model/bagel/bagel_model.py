@@ -68,7 +68,7 @@ from mminf.model.bagel.submodules import (
 )
 from mminf.model.base import DECODE, ForwardPassArgs, Model
 from mminf.model.submodule_base import NodeSubmodule
-from mminf.model.utils import ModuleAndPrefix, load_weights_from_file
+from mminf.model.loader import iter_safetensors_file, load_hf_weights
 from mminf.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,85 @@ GEN_THINK_SYSTEM_PROMPT = (
     "You should first think about the planning process in the mind "
     "and then generate the image."
 )
+
+
+# ---------------------------------------------------------------------------
+# Weight-loading containers
+# ---------------------------------------------------------------------------
+#
+# The HF safetensors files for BAGEL group multiple top-level modules under
+# distinct key prefixes (``language_model.*``, ``llm2vae.*``, ``vit_model.*``,
+# etc.). ``load_hf_weights`` takes a single ``nn.Module`` whose
+# ``named_parameters()`` define the lookup table, so we wrap the relevant
+# top-level modules in small file-local containers whose own attribute names
+# reproduce the checkpoint prefixes. The container is discarded after the
+# load — only the wrapped modules retain the materialised parameters.
+
+
+class _BagelLLMEMA(nn.Module):
+    """``language_model`` + ``llm2vae`` slice of ``ema.safetensors``."""
+
+    def __init__(self, language_model: nn.Module, llm2vae: nn.Module):
+        super().__init__()
+        self.language_model = language_model
+        self.llm2vae = llm2vae
+
+
+class _BagelGenAuxEMA(nn.Module):
+    """``vae2llm`` + ``time_embedder`` + ``latent_pos_embed`` slice of
+    ``ema.safetensors`` (the auxiliary projections / embeddings the
+    image-gen path needs in addition to the LLM)."""
+
+    def __init__(
+        self,
+        vae2llm: nn.Module,
+        time_embedder: nn.Module,
+        latent_pos_embed: nn.Module,
+    ):
+        super().__init__()
+        self.vae2llm = vae2llm
+        self.time_embedder = time_embedder
+        self.latent_pos_embed = latent_pos_embed
+
+
+class _BagelViTEMA(nn.Module):
+    """``vit_model`` + ``connector`` + ``vit_pos_embed`` slice of
+    ``ema.safetensors`` (the SigLIP2 ViT and its projection)."""
+
+    def __init__(
+        self,
+        vit_model: nn.Module,
+        connector: nn.Module,
+        vit_pos_embed: nn.Module,
+    ):
+        super().__init__()
+        self.vit_model = vit_model
+        self.connector = connector
+        self.vit_pos_embed = vit_pos_embed
+
+
+def _load_into(
+    module: nn.Module, source_path: Path, device: str,
+) -> None:
+    """Materialise ``module`` on ``device`` and load every parameter from
+    ``source_path``. Raises ``KeyError`` if any parameter is missing from
+    the checkpoint — the equivalent of the old ``enforce_missing_keys=True``
+    safety net.
+    """
+    module.to_empty(device=device)
+    expected = set(dict(module.named_parameters()).keys())
+    loaded = load_hf_weights(
+        module,
+        iter_safetensors_file(source_path, device=device, keys=expected),
+    )
+    missing = expected - loaded
+    if missing:
+        sample = sorted(missing)[:10]
+        more = "…" if len(missing) > 10 else ""
+        raise KeyError(
+            f"Missing {len(missing)} keys when loading from {source_path}: "
+            f"{sample}{more}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -188,13 +267,9 @@ class BagelModel(Model):
 
         ema_path = self.repo / "ema.safetensors"
 
-        load_weights_from_file(
-            ema_path,
-            modules=[
-                ModuleAndPrefix(self.language_model, prefix="language_model"),
-                ModuleAndPrefix(self.llm2vae, prefix="llm2vae"),
-            ],
-            device=device
+        _load_into(
+            _BagelLLMEMA(self.language_model, self.llm2vae),
+            ema_path, device,
         )
 
         if not self.vae_initialized:
@@ -205,14 +280,11 @@ class BagelModel(Model):
                 )
                 self.time_embedder = TimestepEmbedder(self.config.hidden_size)
                 self.vae2llm = nn.Linear(self.config.patch_latent_dim, self.config.hidden_size)
-            load_weights_from_file(
-                ema_path,
-                modules=[
-                    ModuleAndPrefix(self.vae2llm, prefix="vae2llm"),
-                    ModuleAndPrefix(self.time_embedder, prefix="time_embedder"),
-                    ModuleAndPrefix(self.latent_pos_embed, prefix="latent_pos_embed")
-                ],
-                device=device
+            _load_into(
+                _BagelGenAuxEMA(
+                    self.vae2llm, self.time_embedder, self.latent_pos_embed,
+                ),
+                ema_path, device,
             )
 
     def _init_vae_components(self, device):
@@ -226,13 +298,7 @@ class BagelModel(Model):
 
         # Load in weights: VAE
         vae_path = self.repo / "ae.safetensors"
-        load_weights_from_file(
-            vae_path,
-            modules=[ModuleAndPrefix(
-                self.vae_model
-            )],
-            device=device
-        )
+        _load_into(self.vae_model, vae_path, device)
 
         if not self.llm_initialized:
             # LLM components also need these for image gen, so these
@@ -244,14 +310,11 @@ class BagelModel(Model):
                 self.time_embedder = TimestepEmbedder(self.config.hidden_size)
                 self.vae2llm = nn.Linear(self.config.patch_latent_dim, self.config.hidden_size)
             ema_path = self.repo / "ema.safetensors"
-            load_weights_from_file(
-                ema_path,
-                modules=[
-                    ModuleAndPrefix(self.vae2llm, prefix="vae2llm"),
-                    ModuleAndPrefix(self.time_embedder, prefix="time_embedder"),
-                    ModuleAndPrefix(self.latent_pos_embed, prefix="latent_pos_embed")
-                ],
-                device=device
+            _load_into(
+                _BagelGenAuxEMA(
+                    self.vae2llm, self.time_embedder, self.latent_pos_embed,
+                ),
+                ema_path, device,
             )
 
 
@@ -273,14 +336,9 @@ class BagelModel(Model):
         )
 
         ema_path = self.repo / "ema.safetensors"
-        load_weights_from_file(
-            ema_path,
-            modules=[
-                ModuleAndPrefix(self.vit_model, prefix="vit_model"),
-                ModuleAndPrefix(self.connector, prefix="connector"),
-                ModuleAndPrefix(self.vit_pos_embed, prefix="vit_pos_embed")
-            ],
-            device=device
+        _load_into(
+            _BagelViTEMA(self.vit_model, self.connector, self.vit_pos_embed),
+            ema_path, device,
         )
 
 

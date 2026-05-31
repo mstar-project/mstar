@@ -46,6 +46,7 @@ from mminf.graph.base import (
 )
 from mminf.graph.special_destinations import EMIT_TO_CLIENT
 from mminf.model.base import ForwardPassArgs, Model
+from mminf.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mminf.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mminf.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mminf.model.pi05.components.siglip import Pi05SiglipEncoder
@@ -352,8 +353,9 @@ class Pi05Model(Model):
         """Bucket the SigLIP-relevant subset of the lerobot flat dict
         into a ``Pi05SiglipEncoder.state_dict()``-compatible mapping.
 
-        Used by the SigLIP loading path which still uses
-        ``load_state_dict`` (no fused projections to route).
+        The renamed entries are fed straight into ``load_hf_weights`` —
+        no stacked-param routing is needed for SigLIP, just the flat
+        key rename and the surrounding prefix filter.
         """
         out: dict[str, torch.Tensor] = {}
         for key, tensor in flat.items():
@@ -626,9 +628,9 @@ class Pi05Model(Model):
         # without paying for ~ViT-bytes of CUDA memory + a throwaway random
         # init that we'd immediately overwrite with the lerobot weights.
         # ``mod.to_empty(device=device)`` then materializes uninitialized
-        # tensors on the target device, and ``load_state_dict`` overwrites
-        # them with the real weights. Same pattern HuggingFace
-        # ``from_pretrained`` uses under the hood.
+        # tensors on the target device, and the loader overwrites them
+        # with the real weights via ``param.data.copy_(...)``. Same
+        # pattern HuggingFace ``from_pretrained`` uses under the hood.
         with torch.device("meta" if not self.skip_weight_loading else "cpu"):
             self.siglip = Pi05SiglipEncoder(self.config)
         if self.skip_weight_loading:
@@ -649,10 +651,13 @@ class Pi05Model(Model):
         # non-persistent ``position_ids`` buffer with the canonical
         # ``arange`` values before running the forward.
         _reset_non_persistent_buffers(self.siglip, device)
-        # strict=False: the extracted bucket may contain stray pooling-head
-        # keys that Pi05SiglipEncoder doesn't model (vision_use_head=False).
+        # The extracted bucket may contain stray pooling-head keys that
+        # Pi05SiglipEncoder doesn't model (``vision_use_head=False``);
+        # ``load_hf_weights`` silently ignores any key that has no matching
+        # parameter in the target module, so the leftover keys are dropped
+        # without needing an explicit ``strict=False`` switch.
         siglip_sd = self._extract_siglip_state_dict(flat)
-        self.siglip.load_state_dict(siglip_sd, strict=False)
+        load_hf_weights(self.siglip, siglip_sd.items())
 
     def _init_llm_components(self, device: str):
         if self.embed_tokens is not None:
@@ -689,8 +694,6 @@ class Pi05Model(Model):
             ):
                 mod.to_empty(device=device)
             return
-
-        from mminf.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 
         flat = self._ensure_lerobot_flat()
         # Wrap the LLM components in a flat container so the loader's

@@ -461,12 +461,19 @@ class WorkerGraphsManager:
             node_graph_walk = NodeAndGraphWalk(
                 node=edge.next_node, graph_walk=graph_walk
             )
+            # Compute the per-worker fanout once so it is available in both
+            # the SPECIAL_DESTINATIONS branch (emit_to_client.extend) and
+            # the cross-worker dispatch loop below. Computing it inside only
+            # one branch leaves ``fanout`` unbound when control reaches the
+            # other — a latent crash in any multi-worker config whose
+            # external edges target a known node on a remote worker
+            # (e.g. BAGEL CFG-parallel's cross-LLM edges).
+            fanout = sharding_config.fanout_graph_edges(
+                edge, source_node=node_name,
+                source_graph_walk=graph_walk,
+                dest_graph_walk=graph_walk,
+            )
             if node_graph_walk not in self.per_request_info[request_id].node_to_workers:
-                fanout = sharding_config.fanout_graph_edges(
-                    edge, source_node=node_name,
-                    source_graph_walk=graph_walk,
-                    dest_graph_walk=graph_walk
-                )
                 if edge.next_node in SPECIAL_DESTINATIONS or edge.persist:
                     if edge.next_node == EMIT_TO_CLIENT:
                         emit_to_client.extend(fanout.values())
