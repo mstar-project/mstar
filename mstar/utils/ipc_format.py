@@ -125,6 +125,9 @@ class WorkerGraphsDone(MessageBody):
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)
+    # the graph walk this partition's just-completed forward pass ran under;
+    # used by the conductor to track a producer-triggered partition's walk
+    partition_graph_walk: str | None = field(default=None)
     stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
     output_loop_indices: dict[str, NestedLoopIndices] = field(default_factory=dict)
 

@@ -17,7 +17,7 @@ from mstar.api_server.request_types import APIServerMessage, ResultTensors
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo, TransitionSource
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerTPGroups
 from mstar.engine.base import EngineType, NodeBatch, NodeOutput
@@ -284,6 +284,7 @@ class Worker:
 
         # New streaming path: PartitionTopology + StreamBuffer on consumer worker
         self.partition_topology = model.get_partition_topology() if model else None
+        self.partitions = model.get_partitions() if model else []
 
         # Determine which partition this worker serves (by checking which node names
         # appear in my_worker_graphs vs the topology connections)
@@ -306,6 +307,10 @@ class Worker:
         self._streaming_edge_names: set[str] = {
             conn.edge_name for conn in self._my_consumer_connections
         }
+
+        self._producer_triggered_partitions: set[str] = set([
+            part.name for part in self.partitions if part.transition_source == TransitionSource.PRODUCER_TRIGGERED
+        ])
 
         # Build consumer node cache: edge_name -> next_node name
         self._consumer_node_cache: dict[str, str] = {}
@@ -486,15 +491,22 @@ class Worker:
         # partition). Streaming-only InputSignals must not overwrite the current
         # partition's fwd_info.
         if non_streaming:
+            # Tag each input with the walk the conductor intends it for. Must be
+            # done BEFORE update_request_info: for producer-triggered partitions
+            # that call rewrites body.request_info.graph_walk to the stream walk.
+            # If the tag differs from the partition's current (stream-applied)
+            # walk, the ingest-time gate buffers it until the transition.
+            for edge in non_streaming:
+                edge._target_graph_walk = body.request_info.graph_walk
             self.worker_graphs_manager.update_request_info(
                 body.request_id, current_fwd_info=body.request_info,
-                partition_name=body.partition_name
+                partition_name=body.partition_name,
+                allow_graph_walk_transition=body.partition_name not in self._producer_triggered_partitions
             )
             for edge, idx in body.request_info.consumed_edge_idx.items():
                 req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
                 if edge in req_info.stream_buffers:
                     req_info.stream_buffers[edge].set_index(idx)
-                
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -1095,6 +1107,10 @@ class Worker:
                     },
                     partition_name=partition_name,
                     partition_done=p_done,
+                    # the walk this just-completed forward pass ran under, so
+                    # the conductor can track a producer-triggered partition's
+                    # stream-applied walk
+                    partition_graph_walk=fwd_info.graph_walk,
                     stream_tokens_consumed=stream_consumed,
                     output_loop_indices=self.worker_graphs_manager.get_output_loop_indices(request_id),
                 ),

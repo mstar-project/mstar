@@ -887,6 +887,22 @@ class Conductor:
                 body.output_signal_names, list
             ) else []
 
+        # Producer-triggered partitions self-apply their walk from the stream.
+        # Adopt the walk the consumer actually ran (reported back) before the
+        # completion check, and realign the completion-tracking worker-graph set
+        # to it — otherwise current_worker_graph_ids (a state-machine-derived
+        # walk) diverges and the subset check below breaks. The conductor does
+        # not drive this partition's transitions; this only mirrors them.
+        pdef = request_data.partition_definitions.get(partition_name)
+        if (pdef is not None
+                and pdef.transition_source == TransitionSource.PRODUCER_TRIGGERED
+                and body.partition_graph_walk
+                and body.partition_graph_walk != pstate.metadata.graph_walk):
+            pstate.metadata.graph_walk = body.partition_graph_walk
+            self._set_partition_worker_graph_ids(
+                body.request_id, partition_name, body.partition_graph_walk,
+            )
+
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
             count = pstate.wg_rank_completions.get(wg_id, 0) + 1

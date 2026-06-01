@@ -71,6 +71,9 @@ class GraphEdge:
     _total_fanin: int = 1
     _shard_dim: int | None = None
 
+    # set for non-streaming inputs
+    _target_graph_walk: str | None = None
+
     def clone(self):
         return GraphEdge(
             next_node=self.next_node,
@@ -82,6 +85,7 @@ class GraphEdge:
             output_modality=self.output_modality,
             _persist_for_loop=self._persist_for_loop,
             _final_stream_chunk=self._final_stream_chunk,
+            _target_graph_walk=self._target_graph_walk,
         )
 
 

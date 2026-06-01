@@ -192,6 +192,10 @@ class PerPartitionInfo:
     # graph_walk_worker_graph_ids = worker graphs for current graph walk
     graph_walk_worker_graph_ids: list[str] = field(default_factory=list) # for this worker
     stream_partition_done: bool = False  # set True when last chunk pops with is_final
+    
+    # edges that are pending a producer-triggered graph walk transition
+    # {graph walk -> edges}
+    pending_edges: dict[str, list[GraphEdge]] = field(default_factory=dict)
 
 
 @dataclass
@@ -268,22 +272,34 @@ class WorkerGraphsManager:
                     # ambiguity is moot for routing.
                     self.walk_node_to_worker_graph_id[(walk, node)] = wg_id
 
+    def buffer_pending_edge(
+        self, request_id: str, graph_walk: str, edge: GraphEdge
+    ):
+        partition_name = self.get_partition_for_node(edge.next_node)
+        req_info = self.per_request_info[request_id]
+        part_info = req_info.per_partition_info[partition_name]
+        part_info.pending_edges.setdefault(graph_walk, []).append(edge)
+
     def update_request_info(
         self, request_id: str,
         partition_name,
         current_fwd_info: CurrentForwardPassInfo | None=None,
         per_label_seq_info: PerLabelSeqInfo | None=None,
+        allow_graph_walk_transition: bool=True
     ):
         req_info = self.per_request_info[request_id]
         part_info = req_info.per_partition_info[partition_name]
 
         if current_fwd_info is not None:
-            graph_walk = current_fwd_info.graph_walk
-            if self.get_graph_walk(request_id, partition_name) != graph_walk:
-                part_info.graph_walk_worker_graph_ids = [
-                    graph_id for graph_id in self.per_request_info[request_id].worker_graph_ids \
-                        if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
-                ]
+            if allow_graph_walk_transition:
+                self.update_graph_walk(request_id, partition_name, current_fwd_info.graph_walk)
+            else:
+                # Producer-triggered partition: the stream owns the walk. Absorb
+                # everything else from the conductor but keep the locally
+                # (stream-)applied walk so the wholesale replace below doesn't
+                # clobber it. (Inputs were already tagged with the conductor's
+                # intended walk before this call.)
+                current_fwd_info.graph_walk = self.get_graph_walk(request_id, partition_name)
             part_info.current_fwd_info = current_fwd_info
 
         if per_label_seq_info is not None:
@@ -298,6 +314,11 @@ class WorkerGraphsManager:
                     if graph_walk in self.all_worker_graph_ids_to_graph_walks[graph_id]
             ]
         part_info.current_fwd_info.graph_walk = graph_walk
+        if graph_walk in part_info.pending_edges:
+            edges = part_info.pending_edges.pop(graph_walk)
+            self.process_new_inputs(
+                request_id, inputs=edges
+            )
 
     def get_graph_walk(self, request_id: str, partition_name: str):
         return self.get_fwd_info(request_id, partition_name).graph_walk
@@ -332,6 +353,20 @@ class WorkerGraphsManager:
         ``next_node`` lives on a different worker). Caller uses these for
         cross-worker routing.
         """
+        wrong_graph_walk = [
+            edge for edge in inputs if edge._target_graph_walk is not None \
+                and edge._target_graph_walk != self.get_graph_walk(
+                    request_id, partition_name=self.get_partition_for_node(edge.next_node)
+                )
+        ]
+        for edge in wrong_graph_walk:
+            self.buffer_pending_edge(request_id, edge._target_graph_walk, edge)
+        inputs = [
+            edge for edge in inputs if edge._target_graph_walk is None \
+                or edge._target_graph_walk == self.get_graph_walk(
+                    request_id, partition_name=self.get_partition_for_node(edge.next_node)
+                )
+        ]
         for part_info in self.per_request_info[request_id].per_partition_info.values():
             worker_graph_ids = part_info.graph_walk_worker_graph_ids
             for worker_graph_id in worker_graph_ids:
