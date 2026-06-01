@@ -634,11 +634,23 @@ class Worker:
         allow_graph_walk_transition: bool=True
     ) -> GraphEdge | None:
         consumer_node = self._consumer_node_cache.get(edge_name, "")
-        synthetic_edge = sbuf.pop_waiting_edge()
         consumer_partition = self.worker_graphs_manager.get_partition_for_node(consumer_node)
         graph_walk = self.worker_graphs_manager.get_graph_walk(
             request_id, consumer_partition
         )
+        
+        waiting_edge = sbuf.pop_waiting_edge()
+        if waiting_edge is not None and waiting_edge.walk_transition is not None \
+                                    and waiting_edge.walk_transition != graph_walk:
+            if not allow_graph_walk_transition:
+                sbuf.store_uningested_edge(waiting_edge.edge, waiting_edge.walk_transition)
+                return
+            self.worker_graphs_manager.update_graph_walk(
+                request_id, consumer_partition,
+                waiting_edge.walk_transition
+            )
+        synthetic_edge = waiting_edge.edge if waiting_edge is not None else None
+
         if synthetic_edge is None and sbuf.has_chunk_ready(graph_walk):
             chunk = sbuf.pop_chunk(graph_walk)
             chunk_tensor = chunk.data.get("data")
@@ -671,7 +683,7 @@ class Worker:
                 )
             if chunk.graph_walk_transition is not None and chunk.graph_walk_transition != graph_walk:
                 if not allow_graph_walk_transition:
-                    sbuf.store_uningested_edge(synthetic_edge)
+                    sbuf.store_uningested_edge(synthetic_edge, chunk.graph_walk_transition)
                     return
                 self.worker_graphs_manager.update_graph_walk(
                     request_id, consumer_partition,
@@ -715,7 +727,18 @@ class Worker:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
         for request_id, req_info in list(self.worker_graphs_manager.per_request_info.items()):
             for edge_name, sbuf in req_info.stream_buffers.items():
-                synthetic_edge = self._pop_streaming_edge(sbuf, edge_name, request_id)
+                consumer_node = self._consumer_node_cache.get(edge_name, "")
+                partition_name = self.worker_graphs_manager.get_partition_for_node(consumer_node)
+                wgid = self.worker_graphs_manager.get_worker_graph_id_for_node(request_id, consumer_node)
+
+                allow_graph_walk_transition = len(
+                    self.worker_graphs_manager.queues[wgid].per_request_queues[request_id].ready_node_names
+                ) == 0
+
+                synthetic_edge = self._pop_streaming_edge(
+                    sbuf, edge_name, request_id,
+                    allow_graph_walk_transition=allow_graph_walk_transition
+                )
 
                 if synthetic_edge is not None:
                     # Streaming edges go through the same path as regular ones —
@@ -1053,6 +1076,14 @@ class Worker:
             walk_transition = consumer_graph_walk_transitions.get(edge.name)
             edge._graph_walk_transition = walk_transition.graph_walk if walk_transition else None
 
+        # Advance our local view of each consumer's walk by the transition just
+        # emitted: inside a dynamic loop there is no conductor round-trip to
+        # refresh tracked_consumer_graph_walks. After the edge loop so all edges
+        # of a pass see the same (pre-update) consumer walk.
+        for edge_name, wt in consumer_graph_walk_transitions.items():
+            to_partition = self.edge_to_connection[edge_name].to_partition
+            fwd_info.tracked_consumer_graph_walks[to_partition] = wt.graph_walk
+
         for edge in outputs.streaming_local:
             stream_buf = req_info.stream_buffers[edge.name]
             for _ in edge.tensor_info:
@@ -1107,10 +1138,11 @@ class Worker:
                     },
                     partition_name=partition_name,
                     partition_done=p_done,
-                    # the walk this just-completed forward pass ran under, so
-                    # the conductor can track a producer-triggered partition's
-                    # stream-applied walk
-                    partition_graph_walk=fwd_info.graph_walk,
+                    # the walk this just-completed forward pass ran under (the
+                    # batch's walk, NOT fwd_info.graph_walk which may have
+                    # already advanced via a stream-buffer transition before
+                    # this report is built — that race drops talker_input_embeds)
+                    partition_graph_walk=graph_walk,
                     stream_tokens_consumed=stream_consumed,
                     output_loop_indices=self.worker_graphs_manager.get_output_loop_indices(request_id),
                 ),
@@ -1614,9 +1646,9 @@ class Worker:
                 speculation.node_batch.per_request_info.pop(r, None)
                 speculation.scheduled_batch.request_to_worker_graph.pop(r, None)
                 speculation.scheduled_batch.node_objects.pop(r, None)
-                for edge in speculation.consumed_streaming_edges.get(rid, []):
-                    self._return_speculative_streaming_edge(rid, edge)
-                speculation.consumed_streaming_edges.pop(rid, None)
+                for edge in speculation.consumed_streaming_edges.get(r, []):
+                    self._return_speculative_streaming_edge(r, edge)
+                speculation.consumed_streaming_edges.pop(r, None)
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
 

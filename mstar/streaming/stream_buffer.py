@@ -23,6 +23,11 @@ class StreamingTensor:
     tensor: torch.Tensor
     graph_walk: str | None = None
 
+@dataclass
+class WaitingEdge:
+    edge: GraphEdge
+    walk_transition: str | None = None
+
 
 @dataclass
 class StreamBuffer:
@@ -102,7 +107,7 @@ class StreamBuffer:
         return self.producer_done and \
             self._num_buffer_writes >= self._num_tensors_registered
 
-    def pop_waiting_edge(self) -> GraphEdge | None:
+    def pop_waiting_edge(self) -> WaitingEdge | None:
         if len(self._waiting_graph_edges) > 0:
             return self._waiting_graph_edges.popleft()
 
@@ -211,8 +216,11 @@ class StreamBuffer:
         self._chunks_popped += 1
         return chunk
 
-    def store_uningested_edge(self, edge: GraphEdge):
-        self._waiting_graph_edges.append(edge)
+    def store_uningested_edge(self, edge: GraphEdge, walk_transition: str | None=None):
+        self._waiting_graph_edges.append(WaitingEdge(
+            edge=edge,
+            walk_transition=walk_transition
+        ))
 
     def _collate(self, items: list) -> dict[str, torch.Tensor | None]:
         if not items:

@@ -21,6 +21,22 @@ class StreamingGraphEdge(GraphEdge):
 
     def __post_init__(self):
         self.is_streaming = True
+    
+    def clone(self):
+        return StreamingGraphEdge(
+            next_node=self.next_node,
+            name=self.name,
+            tensor_info=self.tensor_info[:],
+            persist=self.persist,
+            conductor_new_token=self.conductor_new_token,
+            is_streaming=self.is_streaming,
+            output_modality=self.output_modality,
+            _persist_for_loop=self._persist_for_loop,
+            _target_graph_walk=self._target_graph_walk,
+            target_partition=self.target_partition,
+            _index=self._index,
+            _graph_walk_transition=self._graph_walk_transition,
+        )
 
 
 @dataclass(frozen=True)
