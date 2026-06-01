@@ -384,12 +384,11 @@ class Benchmark:
         else:  # ONLINE
             wave_size = 1
 
-        # Replicate the first `wave_size` requests `num_warmup` times so we
-        # always have enough payloads even when the dataset is smaller than
-        # the wave size.
-        seed = requests[: max(1, wave_size)]
+        # Take requests in the same order as the measurement run. Cycle through
+        # the dataset only if it's smaller than the number of warmup payloads
+        # needed.
         warmup_total = wave_size * self.config.num_warmup
-        warmup_reqs = [seed[i % len(seed)] for i in range(warmup_total)]
+        warmup_reqs = [requests[i % len(requests)] for i in range(warmup_total)]
 
         if self.config.verbose:
             print(f"--- Warmup ({self.config.profiling_type.value}, {warmup_total} request(s), wave={wave_size}) ---")

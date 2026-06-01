@@ -878,6 +878,32 @@ def _build_openai_user_message(prompt: str, input_modality: str, req_input: Requ
     return {"role": "user", "content": content}
 
 
+def _build_bagel_i2t_user_message(prompt: str, req_input: RequestInput) -> dict:
+    """Build a vllm-omni user message for BAGEL image-to-text (understanding).
+
+    BAGEL does NOT auto-apply a chat template on vllm-omni's chat-completions
+    path. With a bare prompt + `modalities: ["text"]` the server still routes
+    the request to BAGEL's image generator and returns an image. The prompt
+    must be hand-wrapped in BAGEL's template with the `<|image_pad|>` token so
+    the model runs understanding (text out) instead of generation. Content
+    order is text-first, then the image — matching vllm-omni's documented
+    img2text payload.
+    """
+    text = f"<|im_start|>user\n<|image_pad|>\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    content: list[dict] = [{"type": "text", "text": text}]
+    b64 = req_input.get_b64("image")
+    media_path = req_input.image_path
+    if b64 is not None:
+        mime = (mimetypes.guess_type(media_path)[0] if media_path else None) or "image/jpeg"
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            }
+        )
+    return {"role": "user", "content": content}
+
+
 def _parse_sse_chunk(raw_line: bytes) -> Optional[dict]:
     """Parse one SSE line and return its JSON payload, or None for non-data lines.
 
@@ -906,6 +932,7 @@ def _record_vllm_omni_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
     reading usage.
     """
     arrival_time = time.monotonic()
+    print(chunk)
 
     usage = chunk.get("usage")
     if usage:
@@ -941,6 +968,23 @@ def _record_vllm_omni_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
             arrival_time=arrival_time,
             n_tokens=1,
         )
+
+
+def _extract_chat_text(content) -> str:
+    """Pull plain text out of a chat-completion `message.content`.
+
+    vllm-omni returns BAGEL understanding output as a single non-streaming
+    completion whose `content` is a plain string (often wrapped in
+    `<think>…</think>`). Other paths may return a list of OpenAI content parts.
+    Handle both.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text") or "" for part in content if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
 
 
 def _bytes_to_data_url(image_bytes: bytes, image_path: str | None) -> str:
@@ -1016,7 +1060,13 @@ class VLLMOmni(InferenceSystem):
             )
 
         try:
-            user_message = _build_openai_user_message(req_input.prompt, input_mod, req_input)
+            # BAGEL image-to-text needs its template-wrapped prompt (with
+            # `<|image_pad|>`) to route to understanding; the generic builder's
+            # bare prompt makes BAGEL generate an image instead.
+            if isinstance(model, Bagel) and req_type == RequestType.I2T:
+                user_message = _build_bagel_i2t_user_message(req_input.prompt, req_input)
+            else:
+                user_message = _build_openai_user_message(req_input.prompt, input_mod, req_input)
             # Always send `modalities` explicitly. Omitting the field makes
             # vllm-omni's server fall back to text+audio output even for
             # text-only requests (the talker runs unconditionally), inflating
@@ -1093,6 +1143,28 @@ class VLLMOmni(InferenceSystem):
                                     arrival_time=arrival_time,
                                     n_tokens=1,
                                 )
+                    usage = response_json.get("usage") or {}
+                    if (ct := usage.get("completion_tokens")) is not None:
+                        metrics.output_text_tokens = ct
+                    if (pt := usage.get("prompt_tokens")) is not None:
+                        metrics.input_tokens = pt
+                elif resp.content_type == "application/json":
+                    # vllm-omni honors stream=True for some paths (SSE) but
+                    # returns a single non-streaming completion for others —
+                    # BAGEL understanding always comes back as one JSON body
+                    # with the full text in choices[0].message.content. TTFT
+                    # collapses to E2E here since there's nothing to stream.
+                    response_json = await resp.json()
+                    arrival_time = time.monotonic()
+                    for choice in response_json.get("choices", []):
+                        text = _extract_chat_text(choice.get("message", {}).get("content"))
+                        if text:
+                            metrics.record_output_chunk(
+                                modality="text",
+                                data_b64=base64.b64encode(text.encode()).decode(),
+                                arrival_time=arrival_time,
+                                n_tokens=1,
+                            )
                     usage = response_json.get("usage") or {}
                     if (ct := usage.get("completion_tokens")) is not None:
                         metrics.output_text_tokens = ct
