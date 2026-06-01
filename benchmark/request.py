@@ -943,6 +943,18 @@ def _record_vllm_omni_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
         )
 
 
+def _bytes_to_data_url(image_bytes: bytes, image_path: str | None) -> str:
+        mime = (
+            mimetypes.guess_type(image_path)[0]
+            if image_path
+            else None
+        ) or "image/jpeg"
+
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+        return f"data:{mime};base64,{encoded}"
+
+
+
 class VLLMOmni(InferenceSystem):
     """
     Benchmark adapter for the vllm-omni OpenAI-compatible server.
@@ -1136,110 +1148,139 @@ class VLLMOmni(InferenceSystem):
         metrics: "RequestMetrics",
         additional_model_kwargs: dict,
     ) -> "RequestMetrics":
-        """BAGEL T2I/I2I via vllm-omni's diffusion endpoints. Mirrors what
-        `vllm-omni/benchmarks/diffusion/backends.py:async_request_openai_images`
-        does. Sidesteps two known bugs in `/v1/chat/completions`:
 
-          - T2I: with `modalities: ["image"]` the server returns the same
-            deterministic image regardless of the user prompt (server doesn't
-            thread the prompt into BAGEL's thinker on this commit).
-          - I2I: the bench's chat-completions message format produces a
-            `<|fim_middle|>{prompt}` server-side that fails BAGEL's
-            `OmniBagelProcessor.apply` validation (missing `<|im_start|>...
-            <|im_end|>` wrap).
-
-        Both `/v1/images/generations` (T2I) and `/v1/images/edits` (I2I)
-        return the OpenAI Images API shape: `{"data": [{"b64_json": "..."}]}`.
-        """
         req_type = req_input.req_type
-        # Server side, both endpoints accept `cfg_*_scale` and other BAGEL
-        # gen-params via the model_extra fallback (same mechanism that the
-        # chat-completions handler uses) — pass them at the JSON top level
-        # for `/v1/images/generations`, and as Form fields for
-        # `/v1/images/edits`. The default 1024×1024 size matches Noah's
-        # methodology (and vllm-omni's bench example). num_inference_steps
-        # is left to BAGEL's default (50) unless overridden.
-        kwargs = {**model.get_model_kwargs(req_type), **additional_model_kwargs}
-        kwargs.pop("temperature", None)  # not meaningful for the diffusion endpoints
+
+        kwargs = {
+            **model.get_model_kwargs(req_type),
+            **additional_model_kwargs,
+        }
+        kwargs.pop("temperature", None)
+
         try:
             metrics.start_time = time.monotonic()
-            if req_type == RequestType.I2I:
-                if not req_input.image_path or not req_input._image_bytes:
-                    raise RuntimeError("I2I request missing input image bytes")
-                form = aiohttp.FormData()
-                form.add_field("model", model.get_hf_url())
-                form.add_field("prompt", req_input.prompt)
-                form.add_field("n", "1")
-                form.add_field("size", "1024x1024")
-                form.add_field("response_format", "b64_json")
-                form.add_field(
-                    "image",
-                    req_input._image_bytes,
-                    filename=req_input.get_filename("image") or "input.png",
-                    content_type=mimetypes.guess_type(req_input.image_path)[0] or "image/jpeg",
+
+            content = []
+
+            if req_input.prompt:
+                content.append(
+                    {
+                        "type": "text",
+                        "text": req_input.prompt,
+                    }
                 )
-                # Pass BAGEL gen-params as Form fields. Only the keys the
-                # server's edit_images endpoint accepts (or routes via
-                # model_extra) are useful; the rest are harmless extras.
-                for k, v in kwargs.items():
-                    form.add_field(k, json.dumps(v) if not isinstance(v, str) else v)
-                async with session.post(
-                    f"{base_url}/v1/images/edits",
-                    data=form,
-                    headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"},
-                    read_bufsize=2**24,
-                    timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
-                ) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"HTTP {resp.status}: {await resp.text()}")
-                    response_json = await resp.json()
-            else:
-                # T2I → /v1/images/generations (JSON body)
-                payload: dict = {
-                    "model": model.get_hf_url(),
-                    "prompt": req_input.prompt,
-                    "n": 1,
-                    "size": "1024x1024",
-                    "response_format": "b64_json",
-                    **kwargs,
+
+            if req_type == RequestType.I2I:
+                if not req_input._image_bytes:
+                    raise RuntimeError(
+                        "I2I request missing input image bytes"
+                    )
+
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _bytes_to_data_url(
+                                req_input._image_bytes,
+                                req_input.image_path,
+                            )
+                        },
+                    }
+                )
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": content if content else req_input.prompt,
                 }
-                async with session.post(
-                    f"{base_url}/v1/images/generations",
-                    json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}",
-                    },
-                    read_bufsize=2**24,
-                    timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
-                ) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"HTTP {resp.status}: {await resp.text()}")
-                    response_json = await resp.json()
+            ]
+
+            payload = {
+                "model": model.get_hf_url(),
+                "messages": messages,
+            }
+
+            #
+            # Match vllm-omni benchmark:
+            # generation parameters go into extra_body.
+            #
+            extra_body = dict(kwargs)
+
+            extra_body.setdefault("width", 1024)
+            extra_body.setdefault("height", 1024)
+
+            if extra_body:
+                payload["extra_body"] = extra_body
+
+            async with session.post(
+                f"{base_url}/v1/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": (
+                        f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"
+                    )
+                },
+                read_bufsize=2**24,
+                timeout=aiohttp.ClientTimeout(
+                    total=None,
+                    sock_read=300,
+                ),
+            ) as resp:
+
+                if resp.status != 200:
+                    raise Exception(
+                        f"HTTP {resp.status}: {await resp.text()}"
+                    )
+
+                response_json = await resp.json()
 
             arrival_time = time.monotonic()
-            data = response_json.get("data") or []
-            if not data:
-                raise Exception(f"No image data in response: {response_json}")
-            for item in data:
-                b64 = item.get("b64_json")
-                if not b64:
+
+            found_image = False
+
+            for choice in response_json.get("choices", []):
+                message = choice.get("message", {})
+                content = message.get("content")
+
+                if not isinstance(content, list):
                     continue
-                metrics.record_output_chunk(
-                    modality="image",
-                    data_b64=b64,
-                    arrival_time=arrival_time,
-                    n_tokens=1,
-                )
+
+                for item in content:
+                    if item.get("type") != "image_url":
+                        continue
+
+                    url = item["image_url"]["url"]
+
+                    if url.startswith("data:image"):
+                        _, b64 = url.split(",", 1)
+
+                        metrics.record_output_chunk(
+                            modality="image",
+                            data_b64=b64,
+                            arrival_time=arrival_time,
+                            n_tokens=1,
+                        )
+
+                        found_image = True
+
+            if not found_image:
+                raise RuntimeError(
+                    f"No image outputs found: {response_json}"
+            )
+
             usage = response_json.get("usage") or {}
+
             if (ct := usage.get("completion_tokens")) is not None:
                 metrics.output_text_tokens = ct
+
             if (pt := usage.get("prompt_tokens")) is not None:
                 metrics.input_tokens = pt
+
         except Exception as e:
             metrics.record_error(str(e))
         else:
             metrics.record_completion()
+
         return metrics
 
 
