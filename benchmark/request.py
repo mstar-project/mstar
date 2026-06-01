@@ -932,7 +932,6 @@ def _record_vllm_omni_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
     reading usage.
     """
     arrival_time = time.monotonic()
-    print(chunk)
 
     usage = chunk.get("usage")
     if usage:
