@@ -322,8 +322,8 @@ def _init_latents_and_time_index(
     config: BagelModelConfig,
     device,
     seed: int,
-    H: int=1024,
-    W: int=1024,
+    H: int,
+    W: int,
 ):
 
     h, w = (H // config.latent_downsample,
@@ -548,7 +548,7 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         pos_info: dict[str, PositionInfo] = {},
     ) -> ARNodeInputs:
-
+    
         device = self.get_device()
         node_inputs = ARNodeInputs(input_seq_len=0)
 
@@ -577,7 +577,8 @@ class LLMSubmodule(ARNodeSubmodule):
 
         if graph_walk in ("image_gen", "image_gen_cfg"):
             tensor_inputs = {}
-            H, W = 1024, 1024 # TODO: make this configurable?
+            H = fwd_info.step_metadata.get("height", 1024)
+            W = fwd_info.step_metadata.get("width", 1024)
 
             tensor_inputs["vae_position_ids"] = get_flattened_position_ids_extrapolate(
                 H, W,
@@ -1296,8 +1297,11 @@ class VAEDecoderSubmodule(NodeSubmodule):
         return NodeInputs(
             tensor_inputs={
                 "latents": inputs["latents"][0]
+            },
+            kwargs={
+                "image_h": fwd_info.step_metadata.get("height", 1024),
+                "image_w": fwd_info.step_metadata.get("width", 1024)
             }
-            ## NOTE: we could also add image_h, image_w as kwargs here
         )
 
 
@@ -1306,11 +1310,11 @@ class VAEDecoderSubmodule(NodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         latents: torch.Tensor,
-        image_h: int | torch.Tensor = 1024, # BAGEL's default image dim
-        image_w: int | torch.Tensor = 1024,
+        image_h: int,
+        image_w: int,
         **kwargs,
     ) -> NameToTensorList:
-        logger.debug(
+        logger.info(
             "Running BAGEL VAE dec with latents shape %s, h %d, w %d",
             str(latents.shape), image_h, image_w
         )
@@ -1375,7 +1379,8 @@ class CombineCFGSubmodule(NodeSubmodule):
         }
         kwargs = fwd_info.step_metadata
         if "latents" not in inputs or len(inputs["latents"]) == 0:
-            H, W = 1024, 1024
+            H = kwargs.get("height", 1024)
+            W = kwargs.get("width", 1024)
             result["latents"], result["time_index"] = _init_latents_and_time_index(
                 self.config, device=device, seed=fwd_info.random_seed, H=H, W=W
             )
