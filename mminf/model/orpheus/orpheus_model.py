@@ -370,13 +370,23 @@ class OrpheusModel(Model):
         self, node_name: str,
         model_kwargs: dict | None = None,
     )  -> SamplingConfig | None:
+        # Per-request overrides take precedence over the model-level config
+        # defaults, so OpenAI-style ``temperature`` / ``top_p`` (and
+        # ``repetition_penalty``) passed through ``model_kwargs`` are honored.
+        model_kwargs = model_kwargs or {}
         keys = [
             "temperature", "top_p", "repetition_penalty"
         ]
-        params = {k: getattr(self.config, k) for k in keys}
+        params = {
+            k: model_kwargs.get(k, getattr(self.config, k))
+            for k in keys
+        }
         return SamplingConfig(
             **params
         )
+
+    def get_output_sample_rate(self, modality: str = "audio") -> int:
+        return self.config.sample_rate
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
