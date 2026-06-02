@@ -818,21 +818,33 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
+        sample_token = kwargs.pop("sample_prefill_token", True)
 
         if requires_cfg and cache_handle is not None:
             for label in ["main", "cfg_img"]:
                 cache_handle.set_active_label(label)
-                self.language_model(
+                out = self.language_model(
                     emb, mode="und",
                     cache_handle=cache_handle, **kwargs
                 )
+                if label == "main":
+                    hidden = out
         else:
             if cache_handle is not None:
                 cache_handle.set_active_label("main")
-            self.language_model(
+            hidden = self.language_model(
                 emb, mode="und",
                 cache_handle=cache_handle, **kwargs
             )
+        if sample_token:
+            qo_indptr_buf = cache_handle.get_qo_indptr_buf("main")
+            assert qo_indptr_buf is not None
+            last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
+            last_hidden = hidden.index_select(0, last_token_indices)
+            logits = self.lm_head(last_hidden)
+            return {
+                "logits": [logits]
+            }
         return {}
 
     def _forward_prefill_vit(
@@ -851,9 +863,10 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
+        sample_token = kwargs.pop("sample_prefill_token", True)
 
         cache_handle.set_active_label("main")
-        self.language_model(
+        hidden = self.language_model(
             input_embeds, mode="und",
             custom_advance_pos_id=1,
             cache_handle=cache_handle, **kwargs
@@ -861,6 +874,16 @@ class LLMSubmodule(ARNodeSubmodule):
 
         if requires_cfg:
             cache_handle.snapshot_all("main", "cfg_text")
+
+        if sample_token:
+            qo_indptr_buf = cache_handle.get_qo_indptr_buf("main")
+            assert qo_indptr_buf is not None
+            last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
+            last_hidden = hidden.index_select(0, last_token_indices)
+            logits = self.lm_head(last_hidden)
+            return {
+                "logits": [logits]
+            }
         return {}
 
     def _forward_prefill_vae(
@@ -1202,28 +1225,25 @@ class LLMSubmodule(ARNodeSubmodule):
                 requires_cfg=requires_cfg,
             )
         elif graph_walk == "prefill_text":
-            self._forward_prefill_text(
+            out = self._forward_prefill_text(
                 cache_handle=cache_manager,
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
                 **kwargs
-            ) # prefill is the same batched and unbatched
-            # Empty top-level dict (NOT ``{rid: []}``): prefill_text only
-            # populates the KV cache, no per-rid outputs. The runner's
-            # ``_sample_and_remap`` slow path falls through to
-            # ``outputs[rid] = {}`` for each rid when no ``__batched_logits__``
-            # sentinel is present and no dummy_rid keys exist in static_output;
-            # ``{rid: []}`` would AttributeError on ``[].items()`` in the
-            # per-rid collection loop.
-            return {}
+            )
+            if "logits" in out:
+                out["__batched_logits__"] = out.pop("logits")[0]
+            return out
         elif graph_walk == "prefill_vit":
-            self._forward_prefill_vit(
+            out = self._forward_prefill_vit(
                 cache_handle=cache_manager,
                 input_embeds=input_embeds,
                 requires_cfg=requires_cfg,
                 **kwargs
             )
-            return {}
+            if "logits" in out:
+                out["__batched_logits__"] = out.pop("logits")[0]
+            return out
         else:
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
 
@@ -1332,6 +1352,11 @@ class LLMSubmodule(ARNodeSubmodule):
         **kwargs
     ):
         if "new_token" not in outputs:
+            return
+        if request_info.graph_walk != "decode" and (
+            not request_info.step_metadata.get("sample_prefill_token")
+        ):
+            outputs.pop("new_token")
             return
         outputs["text_inputs"] = outputs["new_token"]
 

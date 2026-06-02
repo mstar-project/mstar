@@ -595,7 +595,14 @@ class BagelModel(Model):
         prefill_text = GraphNode(
             name="LLM",
             input_names=["text_inputs"],
-            outputs=[],
+            outputs=[
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="new_token",
+                    output_modality="text",
+                    persist=True
+                ),
+            ],
         )
 
         # -- prefill_vit: ViT encoder -> LLM --
@@ -610,7 +617,14 @@ class BagelModel(Model):
             GraphNode(
                 name="LLM",
                 input_names=["img_emb"],
-                outputs=[],
+                outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="new_token",
+                        output_modality="text",
+                        persist=True
+                    ),
+                ],
             ),
         ])
 
@@ -788,11 +802,8 @@ class BagelModel(Model):
         # between them so the image sits at the <|image_pad|> position, then the
         # user question + assistant generation prompt follow. Without this
         # wrapping BAGEL has no turn structure and stops early.
-        if is_understanding and len(images) == 1 and len(texts) == 2:
-            schedule.append(("prefill_text", texts[0]))
-            schedule.append(("prefill_vit", images[0]))
-            schedule.append(("prefill_text", texts[1]))
-            return schedule
+        if is_understanding and len(texts) == 2:
+            input_modalities.insert(0, "text")
 
         text_idx, image_idx = 0, 0
         for mod in input_modalities:
@@ -875,8 +886,10 @@ class BagelModel(Model):
             return [graph_edge]
 
         elif graph_walk == DECODE:
-            # The submodule automatically adds a BOS to start
-            graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
+            graph_edge = GraphEdge(
+                next_node="LLM", name="text_inputs",
+                tensor_info=persist_signals.get("new_token", [])
+            )
             return [graph_edge]
 
         elif graph_walk == "image_gen":
@@ -1021,9 +1034,17 @@ class BagelModel(Model):
         """
         metadata = partition_metadata
         request_done = False
+
+        sample_prefill_token = metadata.is_prefill and (
+            metadata.kwargs.get("think_mode", False) or metadata.kwargs["target_output"] != "image"
+        )
         if metadata.is_prefill:
             step = metadata.kwargs["prefill_step"] + 1
             schedule = metadata.kwargs["prefill_schedule"]
+
+            sample_prefill_token = sample_prefill_token and (
+                step == len(schedule) - 1
+            )
 
             if step < len(schedule):
                 # More prefill steps remaining
@@ -1056,6 +1077,7 @@ class BagelModel(Model):
             request_done = True
 
         step_metadata =  self._get_step_metadata(metadata)
+        step_metadata["sample_prefill_token"] = sample_prefill_token
         inputs = self._get_fwd_pass_inputs(
             metadata, persist_signals
         )

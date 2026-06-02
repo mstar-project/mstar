@@ -201,6 +201,10 @@ class FlashInferPrefillWrapper:
             paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
             paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
             paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
+        
+        if not self.use_cuda_graph:
+            # so we can access the qo indptr outside of cuda graph mode
+            self._qo_indptr_buf = qo_indptr
 
         # Compute per-token page and offset for vectorized KV writes
         n_req = qo_indptr.shape[0] - 1
