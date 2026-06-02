@@ -913,8 +913,6 @@ class Conductor:
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
 
-        self._update_persist_ref_counts(request_id, fwd_args.inputs)
-
         inputs_per_worker = self._split_inputs_to_workers(
             sharding_config=request_data.sharding_config,
             inputs=fwd_args.inputs,
@@ -922,6 +920,7 @@ class Conductor:
         )
 
         for worker, inputs in inputs_per_worker.items():
+            self._update_persist_ref_counts(request_id, inputs)
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
