@@ -744,9 +744,8 @@ class Worker:
                 # reset (clean) state — no partial progress that the scheduler
                 # would otherwise dispatch under the new walk. A request with no
                 # queue entry yet has no progress, so allow the transition.
-                per_req_queue = self.worker_graphs_manager.queues[wgid].per_request_queues.get(request_id)
-                allow_graph_walk_transition = (
-                    per_req_queue is None or per_req_queue.wg_state_registry.clean
+                allow_graph_walk_transition = self.worker_graphs_manager.partition_clean(
+                    request_id, partition_name
                 )
 
                 synthetic_edge = self._pop_streaming_edge(

@@ -352,6 +352,18 @@ class WorkerGraphsManager:
     def get_partition_for_node(self, node_name: str) -> str | None:
         """Look up which partition a node belongs to."""
         return self.node_to_partition.get(node_name)
+    
+    def partition_clean(self, request_id: str, partition_name: str) -> bool:
+        if request_id not in self.per_request_info:
+            return True
+        wgids = self.per_request_info[request_id].per_partition_info[partition_name].graph_walk_worker_graph_ids
+        for wgid in wgids:
+            queue = self.queues[wgid].per_request_queues.get(request_id)
+            if queue is None:
+                continue
+            if not queue.wg_state_registry.clean:
+                return False
+        return True
 
     def process_new_inputs(
         self,
