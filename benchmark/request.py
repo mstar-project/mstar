@@ -878,32 +878,6 @@ def _build_openai_user_message(prompt: str, input_modality: str, req_input: Requ
     return {"role": "user", "content": content}
 
 
-def _build_bagel_i2t_user_message(prompt: str, req_input: RequestInput) -> dict:
-    """Build a vllm-omni user message for BAGEL image-to-text (understanding).
-
-    BAGEL does NOT auto-apply a chat template on vllm-omni's chat-completions
-    path. With a bare prompt + `modalities: ["text"]` the server still routes
-    the request to BAGEL's image generator and returns an image. The prompt
-    must be hand-wrapped in BAGEL's template with the `<|image_pad|>` token so
-    the model runs understanding (text out) instead of generation. Content
-    order is text-first, then the image — matching vllm-omni's documented
-    img2text payload.
-    """
-    text = f"<|im_start|>user\n<|image_pad|>\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-    content: list[dict] = [{"type": "text", "text": text}]
-    b64 = req_input.get_b64("image")
-    media_path = req_input.image_path
-    if b64 is not None:
-        mime = (mimetypes.guess_type(media_path)[0] if media_path else None) or "image/jpeg"
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-            }
-        )
-    return {"role": "user", "content": content}
-
-
 def _parse_sse_chunk(raw_line: bytes) -> Optional[dict]:
     """Parse one SSE line and return its JSON payload, or None for non-data lines.
 
@@ -1059,13 +1033,7 @@ class VLLMOmni(InferenceSystem):
             )
 
         try:
-            # BAGEL image-to-text needs its template-wrapped prompt (with
-            # `<|image_pad|>`) to route to understanding; the generic builder's
-            # bare prompt makes BAGEL generate an image instead.
-            if isinstance(model, Bagel) and req_type == RequestType.I2T:
-                user_message = _build_bagel_i2t_user_message(req_input.prompt, req_input)
-            else:
-                user_message = _build_openai_user_message(req_input.prompt, input_mod, req_input)
+            user_message = _build_openai_user_message(req_input.prompt, input_mod, req_input)
             # Always send `modalities` explicitly. Omitting the field makes
             # vllm-omni's server fall back to text+audio output even for
             # text-only requests (the talker runs unconditionally), inflating

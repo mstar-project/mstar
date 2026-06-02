@@ -87,16 +87,14 @@ GEN_THINK_SYSTEM_PROMPT = (
     "and then generate the image."
 )
 
-# Chat-template envelope for image understanding (image-to-text). BAGEL does
-# not apply this itself; a bare prompt has no user/assistant turn structure, so
-# the model terminates early and returns terse or empty text. The image
-# embeddings occupy the ``<|image_pad|>`` position, so the template is split
-# into the text *before* the image and the text *after* it (the user's question
-# plus the assistant generation prompt). The two halves wrap the prefill_vit
-# walk in _build_prefill_schedule. Mirrors vllm-omni's img2text prompt
-# (vllm-omni examples/offline_inference/bagel/end2end.py): full template is
-# ``<|im_start|>user\n<|image_pad|>\n{prompt}<|im_end|>\n<|im_start|>assistant\n``.
-VLM_UNDERSTANDING_PREFIX = "<|im_start|>user\n"
+# System prompt for image understanding.
+BAGEL_DEFAULT_SYSTEM_PROMPT = "You are BAGEL, a helpful multimodal assistant created by ByteDance."
+
+# Chat-template envelope for image understanding (image-to-text).
+# ``<|im_start|>system\n{SYS}<|im_end|>\n<|im_start|>user\n<|image_pad|>\n{prompt}<|im_end|>\n<|im_start|>assistant\n``.
+VLM_UNDERSTANDING_PREFIX = (
+    f"<|im_start|>system\n{BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n"
+)
 VLM_UNDERSTANDING_SUFFIX = "\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
 

@@ -72,10 +72,12 @@ class Model(ABC):
             (gradio_demo, openai_chat_completion_client_for_multimodal_generation,
             seed_tts_dataset.SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT) all hardcode the
             "You are Qwen…" preamble and the talker's behavior degrades without it.
-          - BAGEL: the model has its own `<|fim_middle|><|im_start|>…<|im_end|>`
-            template; an extra system role corrupts prompt handling and produces
-            off-prompt images. vllm-omni's own diffusion bench
-            (`benchmarks/diffusion/backends.py`) sends user-only messages for BAGEL.
+          - BAGEL: image-generation requests must NOT receive a system role (it
+            corrupts prompt handling and produces off-prompt images), but those
+            bypass this path entirely (VLLMOmni._send_request_bagel_images). For
+            the text/understanding path BAGEL DOES send a system message — see
+            Bagel.get_openai_system_message — so vllm-omni uses a BAGEL persona
+            instead of its chat template's generic "You are Qwen…" default.
 
         Default: None (no system message). Override in subclasses that need one.
         """
@@ -125,6 +127,24 @@ class Bagel(Model):
                 "cfg_renorm_type": "text_channel",
             })
         return kwargs
+
+    def get_openai_system_message(self) -> Optional[dict]:
+        # BAGEL's stock chat template injects a generic "You are Qwen…" persona
+        # when no system message is sent. We send a BAGEL-specific persona
+        # instead so vllm-omni uses ours rather than the Qwen default, matching
+        # what our system feeds (mminf/model/bagel/bagel_model.py:
+        # BAGEL_DEFAULT_SYSTEM_PROMPT — keep the text in sync). Only the text /
+        # understanding path uses this; BAGEL image-gen requests bypass it via
+        # VLLMOmni._send_request_bagel_images, so it can't derail generation.
+        return {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "You are BAGEL, a helpful multimodal assistant created by ByteDance.",
+                }
+            ],
+        }
 
     def get_hf_url(self):
         return "ByteDance-Seed/BAGEL-7B-MoT"
