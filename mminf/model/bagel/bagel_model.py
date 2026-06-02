@@ -1075,7 +1075,7 @@ class BagelModel(Model):
         model_kwargs: dict | None = None,
     )  -> SamplingConfig | None:
         keys = [
-            "temperature", "top_k", "top_p",
+            "temperature", "top_k", "top_p", "repetition_penalty",
         ]
         params = {k: getattr(self.config, k) for k in keys}
         if model_kwargs:

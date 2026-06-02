@@ -66,9 +66,10 @@ class BagelModelConfig:
     think_mode: bool = False
 
     # Sampling defaults (per-request overridable via model_kwargs)
-    temperature: float = 0.6  # 0 = greedy (argmax), >0 = sampling
-    top_k: int = 0            # 0 = disabled
-    top_p: float = 1.0        # 1.0 = disabled
+    temperature: float = 0.6        # 0 = greedy (argmax), >0 = sampling
+    top_k: int = 0                  # 0 = disabled
+    top_p: float = 1.0              # 1.0 = disabled
+    repetition_penalty: float = 1.05  # matches vllm-omni's bagel.yaml default; applied even when greedy
 
     vocab_size: int = 151936
     hidden_size: int = 4096
