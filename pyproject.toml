@@ -15,6 +15,7 @@ dependencies = [
     "PyYAML",
     "pyzmq",
     "python-multipart",
+    "requests",
     "torch",
     "uvicorn",
     "gdown",
@@ -23,12 +24,19 @@ dependencies = [
 ]
 
 [project.scripts]
+mminf = "mminf.cli.main:main"
 mminf-serve = "mminf.api_server.entrypoint:main"
 
 [project.optional-dependencies]
 dev = [
     "ruff",
     "pytest",
+]
+
+# Optional: non-WAV audio containers (mp3/flac/...) for the OpenAI audio API
+# and SDK. WAV/PCM work without this.
+audio = [
+    "soundfile",
 ]
 
 bagel = [
