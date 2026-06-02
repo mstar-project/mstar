@@ -268,3 +268,37 @@ class ImageTransform:
         img = self.resize_transform(img, img_num=img_num)
         img = self.normalize_transform(img)
         return img
+
+
+def vllm_vit_resize(image: torch.Tensor, size: int) -> torch.Tensor:
+    """vllm-omni's SigLIP ViT preprocessing: resize to a fixed ``size``x``size``
+    square, discarding aspect ratio. Mirrors HF ``SiglipImageProcessor`` with
+    ``size={"height": size, "width": size}`` (BICUBIC, antialias), which is what
+    vllm-omni feeds BAGEL for image understanding. ``image`` is a CHW float
+    tensor in [0, 1]; normalization is applied separately by the caller.
+    """
+    return F.resize(image, (size, size), InterpolationMode.BICUBIC, antialias=True)
+
+
+def vllm_vae_resize(
+    image: torch.Tensor,
+    stride: int,
+    max_img_size: int,
+    min_img_size: int = 256,
+) -> torch.Tensor:
+    """vllm-omni's img2img VAE input resize (``_resize_to_stride`` in
+    vllm_omni/diffusion/models/bagel/pipeline_bagel.py): aspect-preserving,
+    longest edge <= ``max_img_size``, shortest edge >= ``min_img_size``, both
+    rounded to a multiple of ``stride`` and clamped to ``max_img_size``
+    (BICUBIC, antialias). ``image`` is a CHW float tensor in [0, 1];
+    normalization is applied separately by the caller.
+    """
+    _, h, w = image.shape
+    scale = min(max_img_size / max(w, h), 1.0)
+    min_size = min(min_img_size, max_img_size)
+    scale = max(scale, min_size / min(w, h))
+    new_w = max(stride, int(round(w * scale / stride) * stride))
+    new_h = max(stride, int(round(h * scale / stride) * stride))
+    new_w = min(new_w, max_img_size)
+    new_h = min(new_h, max_img_size)
+    return F.resize(image, (new_h, new_w), InterpolationMode.BICUBIC, antialias=True)

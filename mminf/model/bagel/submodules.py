@@ -24,6 +24,8 @@ from mminf.model.bagel.components.modeling_utils import (
     TimestepEmbedder,
     get_flattened_position_ids_extrapolate,
     patchify,
+    vllm_vae_resize,
+    vllm_vit_resize,
 )
 from mminf.model.bagel.config import BagelModelConfig
 from mminf.model.submodule_base import (
@@ -74,8 +76,17 @@ class ViTEncoderSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         image_inputs = inputs["image_inputs"]
 
-        image_tensor = self.vae_transform.resize_transform(image_inputs[0])
-        image_tensor = self.transform(image_tensor)
+        image_preprocess = fwd_info.step_metadata.get("image_preprocess", "default")
+        if image_preprocess == "vllm":
+            # vllm-omni parity: SiglipImageProcessor resizes to a fixed square
+            # (size = max_num_patch_per_side * patch_size, e.g. 70*14=980),
+            # discarding aspect ratio, then [0.5]/[0.5] normalize.
+            square = self.vit_max_num_patch_per_side * self.vit_patch_size
+            image_tensor = vllm_vit_resize(image_inputs[0], square)
+            image_tensor = self.transform.normalize_transform(image_tensor)
+        else:
+            image_tensor = self.vae_transform.resize_transform(image_inputs[0])
+            image_tensor = self.transform(image_tensor)
 
         device = image_tensor.device
 
@@ -251,7 +262,20 @@ class VAEEncoderSubmodule(NodeSubmodule):
         image_inputs = inputs["image_inputs"]
 
         # [C, H, W]
-        image_tensor: torch.Tensor = self.transform(self.transform.resize_transform(image_inputs[0].contiguous()))
+        image_preprocess = fwd_info.step_metadata.get("image_preprocess", "default")
+        img = image_inputs[0].contiguous()
+        if image_preprocess == "vllm":
+            # vllm-omni parity: _resize_to_stride (aspect-preserving, divisible
+            # by latent_downsample, long <= max_latent_size*latent_downsample,
+            # short >= 256), then [0.5]/[0.5] normalize.
+            image_tensor = vllm_vae_resize(
+                img,
+                stride=self.latent_downsample,
+                max_img_size=self.max_latent_size * self.latent_downsample,
+            )
+            image_tensor = self.transform.normalize_transform(image_tensor)
+        else:
+            image_tensor = self.transform(self.transform.resize_transform(img))
         device = image_tensor.device
 
         # Compute patchified dimensions as ints (CUDA graph compatible)

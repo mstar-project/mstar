@@ -103,9 +103,14 @@ class Model(ABC):
 
 
 class Bagel(Model):
-    def __init__(self, disable_cfg: bool = False, **kwargs):
+    # Default to "vllm" preprocessing so our system matches vllm-omni's image
+    # transforms out of the box (benchmark parity); "default" uses the
+    # BAGEL-codebase transforms. mminf reads this from model_kwargs; vllm-omni
+    # ignores the unknown field (it preprocesses natively).
+    def __init__(self, disable_cfg: bool = False, image_preprocess: str = "vllm", **kwargs):
         super().__init__(**kwargs)
         self.disable_cfg = disable_cfg
+        self.image_preprocess = image_preprocess
 
     def get_model_kwargs(self, request_type: RequestType):
         # Force greedy on the thinker for cross-system parity. Without this,
@@ -114,7 +119,7 @@ class Bagel(Model):
         # two systems would generate different token sequences, mostly
         # affecting I2T latency (variable EOS timing) but also leaking into
         # T2I/I2I via the tokens emitted before the image-gen handoff.
-        kwargs = {"temperature": 0.0}
+        kwargs = {"temperature": 0.0, "image_preprocess": self.image_preprocess}
         if self.disable_cfg:
             kwargs.update({
                 "cfg_img_scale": 1.0,

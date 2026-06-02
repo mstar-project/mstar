@@ -834,6 +834,7 @@ class BagelModel(Model):
             "cfg_renorm_min": full_metadata.kwargs["cfg_renorm_min"],
             "width": full_metadata.kwargs["width"],
             "height": full_metadata.kwargs["height"],
+            "image_preprocess": full_metadata.kwargs["image_preprocess"],
         }
 
     def _get_fwd_pass_inputs(
@@ -941,8 +942,14 @@ class BagelModel(Model):
         # request (or, on the image-edit path below, from the input image).
         params["width"] = 1024
         params["height"] = 1024
+        # Image preprocessing mode for the ViT/VAE encoders: "default" uses the
+        # BAGEL-codebase aspect-preserving transforms; "vllm" matches vllm-omni
+        # (fixed-square ViT resize, _resize_to_stride VAE resize) for
+        # cross-system benchmarking parity. See ViTEncoderSubmodule /
+        # VAEEncoderSubmodule.prepare_inputs.
+        params["image_preprocess"] = "default"
         if model_kwargs:
-            for key in overridable_keys + ["width", "height"]:
+            for key in overridable_keys + ["width", "height", "image_preprocess"]:
                 if key in model_kwargs:
                     params[key] = model_kwargs[key]
 

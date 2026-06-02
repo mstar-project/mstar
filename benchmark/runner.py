@@ -481,6 +481,10 @@ def parse_args() -> BenchmarkConfig:
 
     # specific to image gen
     parser.add_argument("--disable-cfg", action="store_true")
+    # BAGEL-only: image preprocessing mode for our system's ViT/VAE encoders.
+    # "vllm" (default) matches vllm-omni's transforms for benchmark parity;
+    # "default" uses the BAGEL-codebase transforms.
+    parser.add_argument("--image-preprocess", choices=["default", "vllm"], default="vllm")
 
     # VBench args
     vbench = parser.add_argument_group("vbench")
@@ -583,7 +587,7 @@ def parse_args() -> BenchmarkConfig:
     # it so robotics models (Pi05, VJepa2AC) don't see a stray kwarg.
     model_type = ModelType(args.model)
     if model_type == ModelType.BAGEL:
-        model = model_type.inst(disable_cfg=args.disable_cfg)
+        model = model_type.inst(disable_cfg=args.disable_cfg, image_preprocess=args.image_preprocess)
     else:
         model = model_type.inst()
 
