@@ -689,6 +689,12 @@ class Worker:
                     request_id, consumer_partition,
                     chunk.graph_walk_transition
                 )
+            # "Consumed" here means drained into the buffer (high-water index),
+            # not popped out of it. These coincide for non-overlapping policies.
+            # For left-context/sliding-window policies the buffer retains items
+            # past this index as overlap, so a PD re-seed via set_index() would
+            # skip them — fine today since no sliding-window consumer spans
+            # multiple graph walks; revisit if that changes.
             self.worker_graphs_manager.get_fwd_info(
                 request_id, consumer_partition
             ).consumed_edge_idx[edge_name] = sbuf._current_index
@@ -731,9 +737,14 @@ class Worker:
                 partition_name = self.worker_graphs_manager.get_partition_for_node(consumer_node)
                 wgid = self.worker_graphs_manager.get_worker_graph_id_for_node(request_id, consumer_node)
 
-                allow_graph_walk_transition = len(
-                    self.worker_graphs_manager.queues[wgid].per_request_queues[request_id].ready_node_names
-                ) == 0
+                # Defer a walk transition while a node is still ready (and so
+                # about to be scheduled) under the current walk — otherwise the
+                # scheduler would dispatch it under the new walk. A request with
+                # no queue entry yet has no ready nodes, so allow the transition.
+                per_req_queue = self.worker_graphs_manager.queues[wgid].per_request_queues.get(request_id)
+                allow_graph_walk_transition = (
+                    per_req_queue is None or len(per_req_queue.ready_node_names) == 0
+                )
 
                 synthetic_edge = self._pop_streaming_edge(
                     sbuf, edge_name, request_id,
@@ -1055,12 +1066,16 @@ class Worker:
         req_info = self.worker_graphs_manager.per_request_info[request_id]
         fwd_info = self.worker_graphs_manager.get_fwd_info(request_id, partition_name)
 
+        # One stream index per logical edge per pass. A single edge may fan out
+        # to several physical copies (local + one per consumer-shard worker);
+        # they all carry the same _index so the consumer's dedup/PD-reseed sees
+        # one item, not N. Assign the index once, reuse it for every copy.
+        edge_indices: dict[str, int] = {}
         for edge in chain(outputs.streaming_local, *outputs.streaming_to_workers.values()):
-            edge._index = fwd_info.produced_edge_idx.get(edge.name, 0)
             if edge.name not in produced_streaming_edges:
                 produced_streaming_edges.add(edge.name)
-                fwd_info.produced_edge_idx[edge.name] = \
-                    fwd_info.produced_edge_idx.get(edge.name, 0) + 1
+                edge_indices[edge.name] = fwd_info.produced_edge_idx.get(edge.name, 0)
+                fwd_info.produced_edge_idx[edge.name] = edge_indices[edge.name] + 1
                 conn = self.edge_to_connection.get(edge.name)
                 if conn and conn.consumer_walk_transition:
                     consumer_graph_walk_transitions[edge.name] = conn.consumer_walk_transition(
@@ -1073,6 +1088,7 @@ class Worker:
                         )
                     )
 
+            edge._index = edge_indices[edge.name]
             walk_transition = consumer_graph_walk_transitions.get(edge.name)
             edge._graph_walk_transition = walk_transition.graph_walk if walk_transition else None
 
