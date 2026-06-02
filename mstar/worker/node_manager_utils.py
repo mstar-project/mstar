@@ -291,6 +291,19 @@ class WorkerGraphsManager:
         part_info = req_info.per_partition_info[partition_name]
 
         if current_fwd_info is not None:
+            # produced_edge_idx is a monotonic local counter for streaming
+            # output. The conductor round-trips it but its copy lags (refreshed
+            # only at WorkerGraphsDone), so a stale value here would rewind the
+            # counter and re-emit an already-used stream index — which the
+            # consumer drops as a duplicate, taking its walk-transition tag with
+            # it. Never let the conductor rewind it (mirrors the set_index()
+            # max-guard on the consumer side).
+            old_fwd_info = part_info.current_fwd_info
+            if old_fwd_info is not None:
+                for name, idx in old_fwd_info.produced_edge_idx.items():
+                    current_fwd_info.produced_edge_idx[name] = max(
+                        current_fwd_info.produced_edge_idx.get(name, 0), idx
+                    )
             if allow_graph_walk_transition:
                 self.update_graph_walk(request_id, partition_name, current_fwd_info.graph_walk)
             else:
@@ -307,6 +320,7 @@ class WorkerGraphsManager:
             fwd_info.per_label_seq_info.update(per_label_seq_info)
     
     def update_graph_walk(self, request_id: str, partition_name: str, graph_walk: str):
+        print(f"update graph walk {self.get_graph_walk(request_id, partition_name)} -> {graph_walk}")
         part_info = self.per_request_info[request_id].per_partition_info[partition_name]
         if self.get_graph_walk(request_id, partition_name) != graph_walk:
             part_info.graph_walk_worker_graph_ids = [

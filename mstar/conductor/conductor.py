@@ -852,8 +852,14 @@ class Conductor:
             )
             return []
         
-        pstate.produced_edge_idx.update(body.new_produced_edge_idx)
-        pstate.consumed_edge_idx.update(body.new_consumed_edge_idx)
+        # Stream indices are monotonic, but only the emitting TP rank advances
+        # them; sibling ranks report the (stale) seed they were given. With
+        # last-writer-wins .update(), a sibling landing after the emitter would
+        # rewind the index, re-emitting an already-used one. Merge with max.
+        for name, idx in body.new_produced_edge_idx.items():
+            pstate.produced_edge_idx[name] = max(pstate.produced_edge_idx.get(name, 0), idx)
+        for name, idx in body.new_consumed_edge_idx.items():
+            pstate.consumed_edge_idx[name] = max(pstate.consumed_edge_idx.get(name, 0), idx)
         pstate.tracked_consumer_graph_walks.update(body.consumer_graph_walk_transitions)
 
         # Persist signals: every rank contributes its shard (different uuid +

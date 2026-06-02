@@ -735,6 +735,9 @@ class Worker:
             for edge_name, sbuf in req_info.stream_buffers.items():
                 consumer_node = self._consumer_node_cache.get(edge_name, "")
                 partition_name = self.worker_graphs_manager.get_partition_for_node(consumer_node)
+
+                if not self.worker_graphs_manager.has_partition(request_id, partition_name):
+                    continue
                 wgid = self.worker_graphs_manager.get_worker_graph_id_for_node(request_id, consumer_node)
 
                 # Defer a walk transition while a node is still ready (and so
@@ -744,7 +747,7 @@ class Worker:
                 per_req_queue = self.worker_graphs_manager.queues[wgid].per_request_queues.get(request_id)
                 allow_graph_walk_transition = (
                     per_req_queue is None or len(per_req_queue.ready_node_names) == 0
-                )
+                ) and request_id not in self._in_flight_rids
 
                 synthetic_edge = self._pop_streaming_edge(
                     sbuf, edge_name, request_id,
@@ -1000,7 +1003,7 @@ class Worker:
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
                     request_id=request_id,
-                    inputs=edges,
+                    inputs=[edge.clone() for edge in edges],
                     request_info=self.worker_graphs_manager.get_fwd_info(request_id, partition_name),
                     partition_name=partition_name
                 ),
