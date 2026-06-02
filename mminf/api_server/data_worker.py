@@ -290,12 +290,21 @@ class PreprocessWorkerThread:
                         tensor, modality
                     )
 
+                    chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
+                        tensor_info.uuid] or {}
+                    # Audio is emitted as raw float32 PCM (no container); surface
+                    # the model's output sample rate so clients can wrap it.
+                    if modality == "audio" and self.model is not None:
+                        chunk_metadata = {
+                            **chunk_metadata,
+                            "sample_rate": self.model.get_output_sample_rate("audio"),
+                        }
+
                     self.out_queue.put(ResultChunk(
                         request_id=request_id,
                         modality=modality,
                         data=postprocessed,
-                        metadata=self.tensor_uuid_to_metadata_per_request[request_id][
-                            tensor_info.uuid]
+                        metadata=chunk_metadata,
                     ))
                     del self.tensor_uuid_to_metadata_per_request[request_id][
                         tensor_info.uuid]
