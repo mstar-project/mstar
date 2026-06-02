@@ -139,10 +139,10 @@ class ViTEncoderSubmodule(NodeSubmodule):
         return {"img_emb": [features]}
 
     def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
-        # Opt-in via MMINF_VIT_BATCHING=1. Off by default because flashattn
+        # Opt-in via MMINF_VIT_BATCHING=1. WARNING: flashattn
         # varlen reductions across packed images produce small bf16 drift,
         # which at greedy temperature=0 can flip downstream LLM argmax.
-        if os.environ.get("MMINF_VIT_BATCHING", "0") != "1":
+        if os.environ.get("MMINF_VIT_BATCHING", "1") != "1":
             return False
         return batch.graph_walk == "prefill_vit" and len(model_inputs) > 1
 
@@ -483,6 +483,9 @@ class LLMSubmodule(ARNodeSubmodule):
     PREFILL_TEXT_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
     PREFILL_TEXT_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
+    PREFILL_VIT_TOKEN_BUCKETS = [2048, 4096, 8192, 16384, 20000]
+    PREFILL_VIT_CAPTURE_BATCH_SIZES = [1, 2, 4]
+
     def _build_prefill_text_packed(
         self, num_tokens: int, device: torch.device,
     ) -> dict[str, torch.Tensor]:
@@ -497,6 +500,16 @@ class LLMSubmodule(ARNodeSubmodule):
         return {
             "input_ids": torch.zeros(
                 (num_tokens,), dtype=torch.long, device=device,
+            ),
+        }
+    
+    def _build_prefill_vit_packed(
+        self, num_tokens: int, device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        
+        return {
+            "input_embeds": torch.zeros(
+                (num_tokens, self.config.hidden_size), device=device,
             ),
         }
 
@@ -524,6 +537,10 @@ class LLMSubmodule(ARNodeSubmodule):
             num_tokens: self._build_prefill_text_packed(num_tokens, device)
             for num_tokens in self.PREFILL_TEXT_TOKEN_BUCKETS
         }
+        prefill_vit_packed = {
+            num_tokens: self._build_prefill_vit_packed(num_tokens, device)
+            for num_tokens in self.PREFILL_VIT_TOKEN_BUCKETS
+        }
         return [
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=False, labels=["main"],
@@ -542,6 +559,16 @@ class LLMSubmodule(ARNodeSubmodule):
                 compile=True,
                 causal_attention=True,
                 capture_batch_sizes=self.PREFILL_TEXT_CAPTURE_BATCH_SIZES,
+            ),
+            FlashInferPackedCudaGraphConfig(
+                capture_graph_walk="prefill_vit",
+                replay_graph_walks=["prefill_vit"],
+                packed_seq_len_to_inputs=prefill_vit_packed,
+                requires_cfg=False,
+                labels=["main"],
+                compile=False,
+                causal_attention=False,
+                capture_batch_sizes=self.PREFILL_VIT_CAPTURE_BATCH_SIZES,
             ),
         ]
 
@@ -1143,7 +1170,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
         requires_cfg: bool=False,
         **kwargs
     ) -> dict[str, NameToTensorList]:
@@ -1176,6 +1204,14 @@ class LLMSubmodule(ARNodeSubmodule):
             # sentinel is present and no dummy_rid keys exist in static_output;
             # ``{rid: []}`` would AttributeError on ``[].items()`` in the
             # per-rid collection loop.
+            return {}
+        elif graph_walk == "prefill_vit":
+            self._forward_prefill_vit(
+                cache_handle=cache_manager,
+                input_embeds=input_embeds,
+                requires_cfg=requires_cfg,
+                **kwargs
+            )
             return {}
         else:
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
@@ -1263,7 +1299,7 @@ class LLMSubmodule(ARNodeSubmodule):
     def can_batch(
         self, batch: NodeBatch, model_inputs: list[NodeInputs]
     ):
-        return batch.graph_walk in ["decode", "prefill_text"]
+        return batch.graph_walk in ["decode", "prefill_text", "prefill_vit"]
 
     def postprocess(
         self, request_id: str,
