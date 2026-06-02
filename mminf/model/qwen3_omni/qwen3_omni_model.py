@@ -501,6 +501,10 @@ class Qwen3OmniModel(Model):
         # fallback to default config
         return SamplingConfig()
 
+    def get_output_sample_rate(self, modality: str = "audio") -> int:
+        # Qwen3-Omni's Code2Wav vocoder emits speech at 24 kHz.
+        return 24000
+
     # -----------------------------------------------------------------------
     # Model ABC: initial forward pass args
     # -----------------------------------------------------------------------
