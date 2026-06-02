@@ -384,7 +384,8 @@ class Food101Dataset(BaseDataset):
     image is passed via image_path.
     """
 
-    DEFAULT_PROMPT = FOOD101_IMAGE_PROMPTS[0]
+    # DEFAULT_PROMPT = FOOD101_IMAGE_PROMPTS[0]
+    DEFAULT_PROMPT = "Describe in great detail the food item pictured here."
 
     def __init__(
         self,

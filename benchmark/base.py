@@ -119,7 +119,12 @@ class Bagel(Model):
         # two systems would generate different token sequences, mostly
         # affecting I2T latency (variable EOS timing) but also leaking into
         # T2I/I2I via the tokens emitted before the image-gen handoff.
-        kwargs = {"temperature": 0.0, "image_preprocess": self.image_preprocess}
+        kwargs = {
+            "temperature": 0.0,
+            "image_preprocess": self.image_preprocess,
+            "max_tokens": 64,
+            "max_output_tokens": 64,
+        }
         if self.disable_cfg:
             kwargs.update({
                 "cfg_img_scale": 1.0,
