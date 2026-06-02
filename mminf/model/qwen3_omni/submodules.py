@@ -36,7 +36,7 @@ from mminf.model.qwen3_omni.components.rope import (
 from mminf.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor, Qwen3OmniTalkerModel
 from mminf.model.qwen3_omni.config import Qwen3OmniModelConfig
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mminf.utils.sampling import CudaGraphableSampler
+from mminf.utils.sampling import CudaGraphableSampler, SeenTokenMask
 
 
 logger = logging.getLogger(__name__)
@@ -348,7 +348,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        pos_info: dict[str, PositionInfo] = {}
+        seen_token_mask: SeenTokenMask,
+        pos_info: dict[str, PositionInfo] = {},
+        **kwargs
     ) -> ARNodeInputs:
         device = self.get_device()
         start_pos = pos_info.get("main", PositionInfo()).position_id_start
@@ -379,6 +381,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         if graph_walk == "prefill_text":
             text_ids = inputs["text_inputs"][0].to(device)  # (seq_len,)
+
+            # NOTE: newly-sampled tokens automatically added sto the seen token mask in decode
+            seen_token_mask.add_tokens(text_ids)
             embeds = self.model.model.embed_tokens(text_ids)
             seq_len = text_ids.shape[0]
 

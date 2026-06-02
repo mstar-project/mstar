@@ -13,6 +13,7 @@ from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
 from mminf.model.orpheus.config import OrpheusModelConfig
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mminf.utils.sampling import SeenTokenMask
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +88,14 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        seen_token_mask: SeenTokenMask,
         pos_info: dict[str, PositionInfo] = {},
+        **kwargs
     ) -> ARNodeInputs:
+        if graph_walk == "prefill":
+            seen_token_mask.add_tokens(
+                inputs["text_inputs"][0]
+            ) # NOTE: newly-sampled tokens automatically added sto the seen token mask
         return ARNodeInputs(
             input_ids=inputs["text_inputs"][0],
             input_seq_len=inputs["text_inputs"][0].shape[0]

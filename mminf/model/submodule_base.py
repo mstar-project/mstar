@@ -13,7 +13,7 @@ from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.kv_store import PositionInfo
-from mminf.utils.sampling import BaseSampler, CudaGraphableSampler
+from mminf.utils.sampling import BaseSampler, CudaGraphableSampler, SeenTokenMask
 
 if TYPE_CHECKING:
     from mminf.engine.cuda_graph_config import CudaGraphConfig
@@ -346,7 +346,9 @@ class ARNodeSubmodule(NodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        seen_token_mask: SeenTokenMask,
         pos_info: dict[str, PositionInfo] = {},
+        **kwargs,
     ) -> ARNodeInputs:
         pass
 

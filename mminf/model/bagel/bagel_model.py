@@ -1083,5 +1083,6 @@ class BagelModel(Model):
                 if key in model_kwargs:
                     params[key] = model_kwargs[key]
         return SamplingConfig(
+            vocab_size=self.config.vocab_size,
             **params
         )

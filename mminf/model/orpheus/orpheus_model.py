@@ -375,6 +375,7 @@ class OrpheusModel(Model):
         ]
         params = {k: getattr(self.config, k) for k in keys}
         return SamplingConfig(
+            vocab_size=self.config.vocab_size,
             **params
         )
 

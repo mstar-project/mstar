@@ -36,6 +36,7 @@ from mminf.model.submodule_base import (
     NodeSubmodule,
     StackingMethod,
 )
+from mminf.utils.sampling import SeenTokenMask
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +94,9 @@ class ViTEncoderSubmodule(NodeSubmodule):
         position_ids = get_flattened_position_ids_extrapolate(
             image_tensor.size(1), image_tensor.size(2),
             self.vit_patch_size,
-            max_num_patches_per_side=self.vit_max_num_patch_per_side
-        ).to(device)
+            max_num_patches_per_side=self.vit_max_num_patch_per_side,
+            device=device,
+        )
         pixel_values = patchify(image_tensor, self.vit_patch_size)
         # patchify yields (num_patches, p²·C); pre-patchify image_tensor is
         # (C, H, W), so its .shape[0] is the channel count, not the patch
@@ -566,7 +568,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 packed_seq_len_to_inputs=prefill_vit_packed,
                 requires_cfg=False,
                 labels=["main"],
-                compile=False,
+                compile=True,
                 causal_attention=False,
                 capture_batch_sizes=self.PREFILL_VIT_CAPTURE_BATCH_SIZES,
             ),
@@ -597,7 +599,9 @@ class LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        seen_token_mask: SeenTokenMask,
         pos_info: dict[str, PositionInfo] = {},
+        **kwargs
     ) -> ARNodeInputs:
     
         device = self.get_device()
@@ -605,10 +609,12 @@ class LLMSubmodule(ARNodeSubmodule):
 
         if graph_walk == "prefill_text":
             node_inputs.input_ids = self._preprocess_prefill_text(inputs["text_inputs"][0])
+            seen_token_mask.add_tokens(node_inputs.input_ids)
             node_inputs.input_seq_len = node_inputs.input_ids.shape[0]
 
         elif graph_walk == "decode":
             bos = torch.tensor([self.bos_token_id], device=device)
+            # NOTE: newly-sampled tokens automatically added sto the seen token mask
             node_inputs.input_ids = inputs["text_inputs"][0] if len(inputs["text_inputs"]) > 0 else bos.clone()
             node_inputs.input_seq_len = 1
 
@@ -617,7 +623,12 @@ class LLMSubmodule(ARNodeSubmodule):
             seq_len = node_inputs.input_embeds.shape[0]
             node_inputs.input_seq_len = seq_len
 
-            labels = ["main", "cfg_text", "cfg_img"] # just return all labels since it is cheap
+            # Only build pos-ids for labels that preprocess actually plans.
+            # For prefill_vit/prefill_vae that is always just ["main"]; the
+            # cfg_text/cfg_img caches inherit these positions later via
+            # snapshot_all, so emitting their (identical) pos-ids here just
+            # allocates tensors that preprocess never reads.
+            labels = self._get_active_labels(graph_walk, fwd_info.requires_cfg)
 
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
                 labels, pos_info, device, seq_len
@@ -1284,17 +1295,30 @@ class LLMSubmodule(ARNodeSubmodule):
         return torch.tensor(values, device=device, dtype=dtype)
 
 
+    def _get_boi_eoi_emb(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Lazily compute & cache the (constant) BOI/EOI token embeddings.
+
+        These delimiters are fixed, so embedding them once and reusing the
+        result avoids two single-token ``embed_tokens`` gathers (plus the
+        id-tensor allocations) on every image prefill / image_gen step.
+        """
+        cache = getattr(self, "_boi_eoi_emb_cache", None)
+        if cache is None or cache[0].device != device:
+            ids = torch.tensor(
+                [self.boi_token_id, self.eoi_token_id], device=device
+            )
+            with torch.no_grad():
+                embs = self.embed_tokens(ids)
+            cache = (embs[0:1], embs[1:2])
+            self._boi_eoi_emb_cache = cache
+        return cache
+
     def _wrap_with_boi_eoi(self, emb: torch.Tensor) -> torch.Tensor:
         """Wrap embeddings with <|vision_start|> and <|vision_end|> tokens."""
         assert self.boi_token_id is not None and self.eoi_token_id is not None
 
-        device = emb.device
-        boi_ids = torch.tensor([self.boi_token_id], device=device)
-        eoi_ids = torch.tensor([self.eoi_token_id], device=device)
-        with torch.no_grad():
-            boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
-            eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
-        return torch.cat([boi_emb, emb, eoi_emb], dim=0)
+        boi_emb, eoi_emb = self._get_boi_eoi_emb(emb.device)
+        return torch.cat([boi_emb.to(emb.dtype), emb, eoi_emb.to(emb.dtype)], dim=0)
 
     def can_batch(
         self, batch: NodeBatch, model_inputs: list[NodeInputs]
