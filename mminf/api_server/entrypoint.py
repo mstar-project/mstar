@@ -147,10 +147,18 @@ class APIServer:
         tensor_comm_protocol=CommProtocol.RDMA,
         tcp_transfer_device="",
         model=None,
+        model_name: str = "dummy",
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
+
+        # Kept so the OpenAI-compatible layer can look up the per-model adapter
+        # (``model_name``) and query model-level metadata such as the audio
+        # output sample rate (``model``). The instance is the lightweight,
+        # tokenizer-only model the API server already builds for preprocessing.
+        self.model = model
+        self.model_name = model_name
 
         self.preprocess_worker = PreprocessWorker(
             model=model,
@@ -316,8 +324,16 @@ class APIServer:
     # Streaming helper
     # ----------------------------------------------------------
 
-    async def async_stream_results(self, request_id: str):
-        """Yield NDJSON lines as result chunks arrive."""
+    async def iter_result_chunks(self, request_id: str):
+        """Yield raw :class:`ResultChunk` objects as they arrive.
+
+        Shared source for both output surfaces: ``/generate`` formats each
+        chunk as NDJSON (via :meth:`async_stream_results`), while the
+        OpenAI-compatible endpoints translate the same chunks into SSE. The
+        per-request timeout, incremental drain, and final flush behave exactly
+        as before — only the yielded type changed (``ResultChunk`` instead of a
+        pre-serialized line).
+        """
         start = time.time()
         while True:
             if time.time() - start > self.timeout_seconds:
@@ -339,7 +355,7 @@ class APIServer:
                     done = True
 
             for chunk in new_chunks:
-                yield self._chunk_to_ndjson(chunk)
+                yield chunk
 
             if done:
                 logger.info("Async stream results received finish for %s", request_id)
@@ -351,10 +367,15 @@ class APIServer:
                         remaining = req["chunks"][req["consumed_chunks"]:]
                         self.pending_requests.pop(request_id, None)
                 for chunk in remaining:
-                    yield self._chunk_to_ndjson(chunk)
+                    yield chunk
                 break
 
             await asyncio.sleep(0.001)
+
+    async def async_stream_results(self, request_id: str):
+        """Yield NDJSON lines as result chunks arrive (``/generate`` format)."""
+        async for chunk in self.iter_result_chunks(request_id):
+            yield self._chunk_to_ndjson(chunk)
 
     @staticmethod
     def _chunk_to_ndjson(chunk: ResultChunk) -> str:
@@ -415,6 +436,13 @@ app.add_middleware(
 )
 
 api_server: APIServer | None = None
+
+# Mount the OpenAI-compatible routes (/v1/*) alongside the native /generate.
+# The router resolves the loaded model's adapter lazily per request, so models
+# without an adapter simply return a 404 there and keep working via /generate.
+from mminf.api_server.openai.router import router as openai_router  # noqa: E402
+
+app.include_router(openai_router)
 
 
 @app.post("/generate")
@@ -543,7 +571,7 @@ async def shutdown_event():
 # CLI entry point
 # ------------------------------------------------------------------
 
-def main():
+def main(argv: list[str] | None = None):
     import argparse
 
     import yaml
@@ -589,7 +617,7 @@ def main():
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -621,6 +649,7 @@ def main():
         timeout_seconds=args.timeout,
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
+        model_name=model_name,
         tcp_transfer_device=args.tcp_transfer_device
     )
 
