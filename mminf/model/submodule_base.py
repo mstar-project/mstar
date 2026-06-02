@@ -138,6 +138,7 @@ class ModelInputsFromEngine:
     sampler: BaseSampler | None = None
 
     @property
+    @torch.compiler.disable
     def single_request_info(self):
         """
         IMPORTANT: asserts that there is only one request
@@ -146,6 +147,7 @@ class ModelInputsFromEngine:
         return self.per_request_info[self.request_ids[0]]
     
     @property
+    @torch.compiler.disable
     def first_request_info(self):
         """
         unlike single_request_info, does not assert that there is only one request

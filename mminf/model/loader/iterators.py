@@ -14,11 +14,16 @@ from safetensors import safe_open
 
 
 def _resolve_safetensors_device(device: torch.device | str) -> str:
-    """safetensors accepts ``"cuda"`` (no index) and ``"cpu"`` only —
-    not ``"cuda:0"``. Map our device strings to its conventions.
+    """safetensors (>=0.4) accepts indexed CUDA devices (``"cuda:1"``)
+    as well as ``"cuda"`` and ``"cpu"``. Pass the device through as-is so
+    each tensor is materialized directly on the target GPU.
+
+    Stripping the index (the old behavior) forced every tensor onto the
+    *current* device (``cuda:0``) first, then a redundant ``.to(device)``
+    copy to the real rank — doubling transient GPU memory during load and
+    piling that pressure onto ``cuda:0`` for non-zero-rank workers.
     """
-    s = str(device)
-    return "cuda" if s.startswith("cuda") else s
+    return str(device)
 
 
 def iter_safetensors_file(
@@ -36,10 +41,9 @@ def iter_safetensors_file(
                     (keys is not None and key not in keys):
                 continue
 
-            tensor = f.get_tensor(key)
-            if str(device) != st_device:
-                tensor = tensor.to(device, non_blocking=True)
-            yield key, tensor
+            # safe_open materializes directly on st_device (the target
+            # GPU, index included), so no extra .to() copy is needed.
+            yield key, f.get_tensor(key)
 
 
 def iter_safetensors_shards(

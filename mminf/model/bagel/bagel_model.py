@@ -87,6 +87,18 @@ GEN_THINK_SYSTEM_PROMPT = (
     "and then generate the image."
 )
 
+# Chat-template envelope for image understanding (image-to-text). BAGEL does
+# not apply this itself; a bare prompt has no user/assistant turn structure, so
+# the model terminates early and returns terse or empty text. The image
+# embeddings occupy the ``<|image_pad|>`` position, so the template is split
+# into the text *before* the image and the text *after* it (the user's question
+# plus the assistant generation prompt). The two halves wrap the prefill_vit
+# walk in _build_prefill_schedule. Mirrors vllm-omni's img2text prompt
+# (vllm-omni examples/offline_inference/bagel/end2end.py): full template is
+# ``<|im_start|>user\n<|image_pad|>\n{prompt}<|im_end|>\n<|im_start|>assistant\n``.
+VLM_UNDERSTANDING_PREFIX = "<|im_start|>user\n"
+VLM_UNDERSTANDING_SUFFIX = "\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
 
 # ---------------------------------------------------------------------------
 # Weight-loading containers
@@ -260,6 +272,13 @@ class BagelModel(Model):
 
     def _init_language_model_components(self, device):
         self._download_hf()
+        if self.llm_initialized:
+            # Colocated nodes (e.g. LLM + combine_cfg on the same rank in
+            # cfg-parallel) both reach here; without this guard the second
+            # call would build and load a second full LLM copy onto the GPU
+            # while the first stays alive in the cached submodule — ~2x the
+            # 7B LLM resident, which OOMs even an 80GB card.
+            return
         self.llm_initialized = True
         with torch.device("meta"):
             self.language_model = BagelForCausalLM(self.config)
@@ -405,6 +424,13 @@ class BagelModel(Model):
     # Model ABC implementation
     # -----------------------------------------------------------------------
 
+    def _encode_text(self, text: str) -> torch.Tensor:
+        """Tokenize a text segment, falling back to raw bytes when no tokenizer
+        is available (dummy-model test path)."""
+        if self.tokenizer is not None:
+            return torch.tensor(self.tokenizer.encode(text), dtype=torch.long)
+        return torch.tensor(list(text.encode("utf-8")), dtype=torch.uint8)
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -425,17 +451,22 @@ class BagelModel(Model):
         result: NameToTensorList = {}
 
         if prompt is not None:
-            if self.tokenizer is not None:
-                tokens = self.tokenizer.encode(prompt)
-                result["text_inputs"] = [
-                    torch.tensor(tokens, dtype=torch.long)
+            target_output = output_modalities[0] if output_modalities else "text"
+            is_understanding = target_output == "text"
+            has_image = "image" in input_modalities
+            if is_understanding and has_image:
+                # Wrap the prompt in BAGEL's understanding chat template, split
+                # around the image so the image embeddings land at the
+                # <|image_pad|> position (inserted by the prefill_vit walk).
+                # _build_prefill_schedule places the image between these two
+                # segments.
+                segments = [
+                    VLM_UNDERSTANDING_PREFIX,
+                    VLM_UNDERSTANDING_SUFFIX.format(prompt=prompt),
                 ]
             else:
-                # Fallback for testing without a tokenizer
-                byte_data = prompt.encode("utf-8")
-                result["text_inputs"] = [
-                    torch.tensor(list(byte_data), dtype=torch.uint8)
-                ]
+                segments = [prompt]
+            result["text_inputs"] = [self._encode_text(seg) for seg in segments]
 
         # Image edit path: both input and output include "image". If the
         # request specifies a target width and/or height, resize the input
@@ -754,6 +785,17 @@ class BagelModel(Model):
         images = input_signals.get("image_inputs", [])
         texts = input_signals.get("text_inputs", [])
 
+        # Image understanding (image-to-text): process_prompt emits the chat
+        # template as two text segments [prefix, suffix]; place the image walk
+        # between them so the image sits at the <|image_pad|> position, then the
+        # user question + assistant generation prompt follow. Without this
+        # wrapping BAGEL has no turn structure and stops early.
+        if is_understanding and len(images) == 1 and len(texts) == 2:
+            schedule.append(("prefill_text", texts[0]))
+            schedule.append(("prefill_vit", images[0]))
+            schedule.append(("prefill_text", texts[1]))
+            return schedule
+
         text_idx, image_idx = 0, 0
         for mod in input_modalities:
             if mod == "text":
@@ -1031,6 +1073,10 @@ class BagelModel(Model):
             "temperature", "top_k", "top_p",
         ]
         params = {k: getattr(self.config, k) for k in keys}
+        if model_kwargs:
+            for key in keys:
+                if key in model_kwargs:
+                    params[key] = model_kwargs[key]
         return SamplingConfig(
             **params
         )
