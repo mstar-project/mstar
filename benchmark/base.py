@@ -122,8 +122,6 @@ class Bagel(Model):
         kwargs = {
             "temperature": 0.0,
             "image_preprocess": self.image_preprocess,
-            "max_tokens": 64,
-            "max_output_tokens": 64,
         }
         if self.disable_cfg:
             kwargs.update({
