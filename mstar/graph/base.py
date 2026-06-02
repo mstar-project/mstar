@@ -721,8 +721,10 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
 
         self.ready_for_streaming = set(self.only_streaming_inputs)
         self.ready_streaming_next_iter = set(self.only_streaming_inputs)
+        self.clean = True
 
     def register_ingested_input(self, graph_edge: GraphEdge):
+        self.clean = False
         node = self.nodes[graph_edge.next_node]
         # If node._speculatively_scheduled, the node is already executing as
         # a spec batch. We don't want to double-queue it (either for the
@@ -770,6 +772,7 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         )
 
     def clear(self):
+        self.clean = True
         super().clear()
         self.ready_names.clear()
         self.ready_for_streaming = set(self.only_streaming_inputs)

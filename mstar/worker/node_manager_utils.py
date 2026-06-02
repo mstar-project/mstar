@@ -320,7 +320,6 @@ class WorkerGraphsManager:
             fwd_info.per_label_seq_info.update(per_label_seq_info)
     
     def update_graph_walk(self, request_id: str, partition_name: str, graph_walk: str):
-        print(f"update graph walk {self.get_graph_walk(request_id, partition_name)} -> {graph_walk}")
         part_info = self.per_request_info[request_id].per_partition_info[partition_name]
         if self.get_graph_walk(request_id, partition_name) != graph_walk:
             part_info.graph_walk_worker_graph_ids = [

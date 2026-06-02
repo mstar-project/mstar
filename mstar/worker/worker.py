@@ -740,14 +740,14 @@ class Worker:
                     continue
                 wgid = self.worker_graphs_manager.get_worker_graph_id_for_node(request_id, consumer_node)
 
-                # Defer a walk transition while a node is still ready (and so
-                # about to be scheduled) under the current walk — otherwise the
-                # scheduler would dispatch it under the new walk. A request with
-                # no queue entry yet has no ready nodes, so allow the transition.
+                # Only transition the walk when the worker graph is in a fully
+                # reset (clean) state — no partial progress that the scheduler
+                # would otherwise dispatch under the new walk. A request with no
+                # queue entry yet has no progress, so allow the transition.
                 per_req_queue = self.worker_graphs_manager.queues[wgid].per_request_queues.get(request_id)
                 allow_graph_walk_transition = (
-                    per_req_queue is None or len(per_req_queue.ready_node_names) == 0
-                ) and request_id not in self._in_flight_rids
+                    per_req_queue is None or per_req_queue.wg_state_registry.clean
+                )
 
                 synthetic_edge = self._pop_streaming_edge(
                     sbuf, edge_name, request_id,
