@@ -27,10 +27,19 @@ router = APIRouter()
 
 
 def _api():
-    # Imported lazily to avoid an import cycle (entrypoint mounts this router).
-    from mminf.api_server import entrypoint
+    # The server runs either as the package module (console scripts ``mminf`` /
+    # ``mminf-serve``) or as ``__main__`` (``python mminf/api_server/entrypoint.py``,
+    # used by the test/*/launch_server_*.sh scripts). main() sets ``api_server``
+    # on whichever module it runs in, so resolve the live instance from both —
+    # via sys.modules (importing would re-execute the entrypoint module).
+    import sys
 
-    return entrypoint.api_server
+    for name in ("mminf.api_server.entrypoint", "__main__"):
+        mod = sys.modules.get(name)
+        api = getattr(mod, "api_server", None) if mod is not None else None
+        if api is not None:
+            return api
+    return None
 
 
 def _error(status: int, message: str, type_: str = "invalid_request_error") -> JSONResponse:
