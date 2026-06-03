@@ -134,6 +134,27 @@ def test_images(client_and_stub):
     assert base64.b64decode(body["data"][0]["b64_json"]) == png
 
 
+def test_images_edits(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    edited = b"\x89PNGedited"
+    stub.next_chunks = [_Chunk("image", edited)]
+    resp = client.post(
+        "/v1/images/edits",
+        files={"image": ("in.png", b"\x89PNGinput", "image/png")},
+        data={"prompt": "make it neon", "cfg_img_scale": "2.0", "cfg_interval": "[0.0, 1.0]"},
+    )
+    body = resp.json()
+    assert base64.b64decode(body["data"][0]["b64_json"]) == edited
+    # input image + prompt submitted as I2I; passthrough kwargs JSON-parsed
+    assert stub.last_submit["output_modalities"] == ["image"]
+    assert "image" in stub.last_submit["input_modalities"] and "text" in stub.last_submit["input_modalities"]
+    assert stub.last_submit["text"] == "make it neon"
+    mk = stub.last_submit["model_kwargs"]
+    assert mk.get("cfg_img_scale") == 2.0 and mk.get("cfg_interval") == [0.0, 1.0]
+    assert "image" in (stub.last_submit["file_paths"] or {})
+
+
 def test_chat_stream(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
