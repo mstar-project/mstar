@@ -12,18 +12,14 @@ import json
 import wave
 
 
-def pcm_f32_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int = 1) -> bytes:
-    """Wrap raw float32 PCM into a 16-bit WAV blob."""
-    import numpy as np
-
-    audio = np.clip(np.frombuffer(pcm, dtype=np.float32), -1.0, 1.0)
-    pcm16 = (audio * 32767.0).astype("<i2")
+def pcm16_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int = 1) -> bytes:
+    """Wrap raw little-endian 16-bit PCM into a WAV blob (stdlib only)."""
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(num_channels)
         wf.setsampwidth(2)
         wf.setframerate(int(sample_rate))
-        wf.writeframes(pcm16.tobytes())
+        wf.writeframes(pcm)
     return buf.getvalue()
 
 
