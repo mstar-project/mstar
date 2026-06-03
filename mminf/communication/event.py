@@ -6,9 +6,18 @@ class EventWakeup:
     def __init__(self):
         self.event = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
     
+    def signal(self): # thread-safe, async-signal-safe
+        """Wake any thread blocked in ``wait_for_work`` on this event's fd.
+
+        Producers on other threads call this after enqueuing work onto a
+        plain ``queue.Queue`` (which a poll on the socket fd can't observe)
+        so the polling consumer wakes immediately instead of waiting out its
+        timeout."""
+        os.eventfd_write(self.event, 1) # one syscall
+
     def _wake(self, _fut): # runs on whatever thread finished the future
-        os.eventfd_write(self.event, 1) # one syscall, thread-safe, async-signal-safe
-    
+        self.signal()
+
     def register_future(self, future: Future):
         if future.done():
             return

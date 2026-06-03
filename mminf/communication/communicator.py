@@ -102,6 +102,8 @@ class ZMQCommunicator(BaseCommunicator):
             return base_port + 1
         if entity_id == "api_server_preprocess_worker":
             return base_port + 2
+        if entity_id == "api_server_postprocess_worker":
+            return base_port + 3
         if entity_id.startswith("worker_"):
             rank = entity_id.removeprefix("worker_")
             if rank.isdigit():

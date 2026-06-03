@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from mminf.api_server.data_worker import PreprocessWorker
+from mminf.api_server.data_worker import DataProcessWorker
 from mminf.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.model.registry import HF_MODELS
@@ -152,7 +152,7 @@ class APIServer:
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
 
-        self.preprocess_worker = PreprocessWorker(
+        self.preprocess_worker = DataProcessWorker(
             model=model,
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
@@ -174,6 +174,12 @@ class APIServer:
             my_id="api_server",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
+        )
+        # Register the preprocess worker's output eventfd with our poller so
+        # _process_messages blocks on both incoming ZMQ messages and ready
+        # result chunks, instead of a fixed poll sleep.
+        self.communicator.register_event_for_poll(
+            self.preprocess_worker.output_wakeup_event
         )
 
         # Background thread that drains results from conductor
@@ -310,7 +316,11 @@ class APIServer:
                 if self.running:
                     logger.exception("Error in message processing loop")
                     time.sleep(0.01)
-            time.sleep(0.001)
+            # Block until an incoming ZMQ message (result_tensors /
+            # request_complete) or a ready result chunk (output eventfd) wakes
+            # us, instead of a fixed 1ms poll. The timeout bounds the
+            # recently-completed pruning cadence and guards missed wakeups.
+            self.communicator.wait_for_work(timeout_ms=10)
 
     # ----------------------------------------------------------
     # Streaming helper

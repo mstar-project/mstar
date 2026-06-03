@@ -17,6 +17,7 @@ except (ImportError, RuntimeError, OSError):
 
 from mminf.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
+from mminf.communication.event import EventWakeup
 from mminf.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mminf.model.base import Model
 from mminf.utils.ipc_format import (
@@ -36,10 +37,15 @@ def _preprocess_loop(**kwargs):
     worker.run()
 
 
+def _postprocess_loop(**kwargs):
+    worker = PostprocessWorkerThread(**kwargs)
+    worker.run()
+
+
 NameToLoopIndices = dict[str, NestedLoopIndices]
 
 
-class PreprocessWorker:
+class DataProcessWorker:
     def __init__(
         self,
         model: Model | None = None,
@@ -50,21 +56,34 @@ class PreprocessWorker:
     ):
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
-        self.cleanup_request_queue = queue.Queue()
+        self.preproc_cleanup_request_queue = queue.Queue()
+        self.postproc_cleanup_request_queue = queue.Queue()
         self.output_queue = queue.Queue()
-        self.stop_event = threading.Event()
+        self.preproc_stop_event = threading.Event()
+        self.postproc_stop_event = threading.Event()
 
         self.per_request_reading_tensors = {}
         self.output_loop_idxs: dict[str, NameToLoopIndices] = {}
 
-        self.thread = threading.Thread(
+        # Producers (this api-server thread) put work on the plain queues
+        # above; the worker thread blocks in ``wait_for_work`` polling its
+        # ZMQ socket. A poll on the socket can't see a queue.put, so signal
+        # this eventfd (registered with the worker's poller) on every put to
+        # wake the consumer immediately.
+        self.preproc_wakeup_event = EventWakeup()
+        self.postproc_wakeup_event = EventWakeup()
+        # Signalled by the worker thread when it places a result chunk on
+        # ``output_queue``; the api server registers this with its own socket
+        # poller so its message loop wakes to drain results promptly.
+        self.output_wakeup_event = EventWakeup()
+        
+        self.preprocess_thread = threading.Thread(
             target=_preprocess_loop,
             kwargs=dict(
                 in_queue=self.request_input_queue,
-                result_tensor_queue=self.result_tensor_input_queue,
-                out_queue=self.output_queue,
-                cleanup_request_queue=self.cleanup_request_queue,
-                stop_event=self.stop_event,
+                cleanup_request_queue=self.preproc_cleanup_request_queue,
+                stop_event=self.preproc_stop_event,
+                wakeup_event=self.preproc_wakeup_event,
                 hostname=hostname,
                 socket_path_prefix=socket_path_prefix,
                 tensor_comm_protocol=tensor_comm_protocol,
@@ -72,12 +91,31 @@ class PreprocessWorker:
                 tcp_transfer_device=tcp_transfer_device
             )
         )
-        self.thread.start()
+        self.preprocess_thread.start()
+
+        self.postprocess_thread = threading.Thread(
+            target=_postprocess_loop,
+            kwargs=dict(
+                result_tensor_queue=self.result_tensor_input_queue,
+                out_queue=self.output_queue,
+                cleanup_request_queue=self.postproc_cleanup_request_queue,
+                stop_event=self.postproc_stop_event,
+                wakeup_event=self.postproc_wakeup_event,
+                output_wakeup_event=self.output_wakeup_event,
+                hostname=hostname,
+                socket_path_prefix=socket_path_prefix,
+                tensor_comm_protocol=tensor_comm_protocol,
+                model=model,
+                tcp_transfer_device=tcp_transfer_device
+            )
+        )
+        self.postprocess_thread.start()
 
     def new_request(self, input: PreprocessInput):
         self.output_loop_idxs[input.request_id] = {}
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
+        self.preproc_wakeup_event.signal()
 
     def new_result_tensors(self, input: ResultTensors):
         name = input.graph_edge.name
@@ -95,6 +133,7 @@ class PreprocessWorker:
             input.request_id,  self.per_request_reading_tensors[input.request_id]
         )
         self.result_tensor_input_queue.put(input)
+        self.postproc_wakeup_event.signal()
 
     def has_pending_tensors(self, request_id: str):
         return self.per_request_reading_tensors.get(request_id, 0) > 0
@@ -122,24 +161,33 @@ class PreprocessWorker:
         return results
 
     def cleanup_request(self, request_id: str):
-        self.cleanup_request_queue.put(request_id)
+        self.preproc_cleanup_request_queue.put(request_id)
+        self.preproc_wakeup_event.signal()
+        self.postproc_cleanup_request_queue.put(request_id)
+        self.postproc_wakeup_event.signal()
         del self.output_loop_idxs[request_id]
         del self.per_request_reading_tensors[request_id]
 
     def shutdown(self):
-        self.stop_event.set()
-        if self.thread.is_alive():
-            self.thread.join()
+        self.preproc_stop_event.set()
+        self.postproc_stop_event.set()
+        # Wake both threads out of wait_for_work so they observe the stop
+        # events immediately instead of waiting out the poll timeout.
+        self.preproc_wakeup_event.signal()
+        self.postproc_wakeup_event.signal()
+        if self.preprocess_thread.is_alive():
+            self.preprocess_thread.join()
+        if self.postprocess_thread.is_alive():
+            self.postprocess_thread.join()
 
 
 class PreprocessWorkerThread:
     def __init__(
         self,
         in_queue: queue.Queue, # for preprocessing
-        result_tensor_queue: queue.Queue, # for output streaming
-        out_queue: queue.Queue,
         cleanup_request_queue: queue.Queue,
         stop_event: threading.Event,
+        wakeup_event: EventWakeup | None = None,
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mminf",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
@@ -148,21 +196,26 @@ class PreprocessWorkerThread:
         tcp_transfer_device="",
     ):
         self.in_queue = in_queue
-        self.result_tensor_queue = result_tensor_queue
         self.cleanup_request_queue = cleanup_request_queue
-        self.out_queue = out_queue
 
         self.stop_event = stop_event
+        self.wakeup_event = wakeup_event
+        # Signalled when a result chunk is placed on out_queue so the api
+        # server's message loop (which polls its own socket) wakes to drain it
+        # instead of waiting out a fixed poll interval.
         self.device = device
         self.model = model
-
-        self.tensor_uuid_to_metadata_per_request = {}
 
         self.communicator = ZMQCommunicator(
             my_id="api_server_preprocess_worker",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
-        ) # only used to send
+        )
+        # Register the producer-side wakeup fd with the socket poller so a
+        # single ``wait_for_work`` blocks on both incoming ZMQ messages and
+        # new queue work, replacing the old fixed 1ms poll sleep.
+        if self.wakeup_event is not None:
+            self.communicator.register_event_for_poll(self.wakeup_event)
 
         self.tensor_manager = create_tensor_communication_manager(
             protocol=tensor_comm_protocol,
@@ -261,11 +314,136 @@ class PreprocessWorkerThread:
         )
         self.communicator.send("conductor", msg)
 
+    def _process_messages(self) -> bool:
+        """Drain incoming tensor-lifecycle messages. Returns whether any were
+        processed (so the interleaved run-loop counts it as progress)."""
+        messages = self.communicator.get_all_new_messages()
+        for message in messages:
+            if message.message_type == WorkerMessageType.TENSOR_RECEIVED:
+                body: TensorReceived = message.body
+                for (uuid, ref_cnt) in body.successful_tensors.items():
+                    self.tensor_manager.dereference(
+                        body.request_id, uuid, n=ref_cnt
+                    )
+            elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
+                body: UnpersistTensors = message.body
+                for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
+                    self.tensor_manager.increment_ref(
+                        body.request_id, uuid, n=ref_cnt
+                    )
+                    self.tensor_manager.set_persist(
+                        body.request_id, uuid, persist=False
+                    )
+        return bool(messages)
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                progressed = True
+                while progressed:
+                    progressed = self._process_messages()
+                    if not self.in_queue.empty():
+                        self._process_input(self.in_queue.get())
+                        progressed = True
+                    if not self.cleanup_request_queue.empty():
+                        req_id = self.cleanup_request_queue.get()
+                        self.tensor_manager.cleanup_request(req_id)
+                        progressed = True
+            except Exception:
+                logger.exception("PreprocessWorkerThread error")
+
+            # Block until an incoming ZMQ message, a producer signalling new
+            # queue work (eventfd), or a completed async read wakes us —
+            # replacing the fixed 1ms sleep that throttled result-tensor
+            # ingestion. The timeout is just a safety net for missed wakeups.
+            if self.wakeup_event is not None:
+                self.communicator.wait_for_work(timeout_ms=10)
+            else:
+                time.sleep(0.001)
+
+
+class PostprocessWorkerThread:
+    def __init__(
+        self,
+        result_tensor_queue: queue.Queue, # for output streaming
+        out_queue: queue.Queue,
+        cleanup_request_queue: queue.Queue,
+        stop_event: threading.Event,
+        wakeup_event: EventWakeup | None = None,
+        output_wakeup_event: EventWakeup | None = None,
+        hostname: str = "localhost",
+        socket_path_prefix: str = "/tmp/mminf",
+        tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
+        device: str = "cpu",
+        model: Model | None = None,
+        tcp_transfer_device="",
+    ):
+        self.result_tensor_queue = result_tensor_queue
+        self.cleanup_request_queue = cleanup_request_queue
+        self.out_queue = out_queue
+
+        self.stop_event = stop_event
+        self.wakeup_event = wakeup_event
+        # Signalled when a result chunk is placed on out_queue so the api
+        # server's message loop (which polls its own socket) wakes to drain it
+        # instead of waiting out a fixed poll interval.
+        self.output_wakeup_event = output_wakeup_event
+        self.device = device
+        self.model = model
+
+        self.tensor_uuid_to_metadata_per_request = {}
+
+        self.communicator = ZMQCommunicator(
+            my_id="api_server_postprocess_worker",
+            push_ids=["conductor"],
+            ipc_socket_path_prefix=socket_path_prefix,
+        )
+        # Register the producer-side wakeup fd with the socket poller so a
+        # single ``wait_for_work`` blocks on both incoming ZMQ messages and
+        # new queue work, replacing the old fixed 1ms poll sleep.
+        if self.wakeup_event is not None:
+            self.communicator.register_event_for_poll(self.wakeup_event)
+
+        self.tensor_manager = create_tensor_communication_manager(
+            protocol=tensor_comm_protocol,
+            my_entity_id="api_server_postprocess_worker",
+            hostname=hostname,
+            device=self.device,
+            communicator=self.communicator,
+            tcp_transfer_device=tcp_transfer_device,
+        )
+
+    def _process_messages(self) -> bool:
+        """Drain incoming tensor-lifecycle messages. Returns whether any were
+        processed. The postproc thread is read-only on output tensors and only
+        *sends* acks, so it normally receives nothing — but ``wait_for_work``
+        polls this socket, and an undrained PULL message stays POLLIN-readable
+        and would hot-spin the loop, so drain it defensively (and handle any
+        lifecycle message that does route here)."""
+        messages = self.communicator.get_all_new_messages()
+        for message in messages:
+            if message.message_type == WorkerMessageType.TENSOR_RECEIVED:
+                body: TensorReceived = message.body
+                for (uuid, ref_cnt) in body.successful_tensors.items():
+                    self.tensor_manager.dereference(
+                        body.request_id, uuid, n=ref_cnt
+                    )
+            elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
+                body: UnpersistTensors = message.body
+                for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
+                    self.tensor_manager.increment_ref(
+                        body.request_id, uuid, n=ref_cnt
+                    )
+                    self.tensor_manager.set_persist(
+                        body.request_id, uuid, persist=False
+                    )
+        return bool(messages)
+
     def _read_result_tensor(
         self, result: ResultTensors
     ):
         result.graph_edge.name = f"{result.modality}_output"
-        self.tensor_manager.start_read_tensors(
+        futures = self.tensor_manager.start_read_tensors(
             request_id=result.request_id,
             graph_edges=[result.graph_edge],
         )
@@ -274,6 +452,7 @@ class PreprocessWorkerThread:
         for tensor_info in result.graph_edge.tensor_info:
             self.tensor_uuid_to_metadata_per_request[result.request_id][
                 tensor_info.uuid] = result.metadata
+        return futures
 
     def _process_read_tensors(self):
         for request_id, graph_edges in self.tensor_manager.get_ready_tensors().items():
@@ -297,6 +476,8 @@ class PreprocessWorkerThread:
                         metadata=self.tensor_uuid_to_metadata_per_request[request_id][
                             tensor_info.uuid]
                     ))
+                    if self.output_wakeup_event is not None:
+                        self.output_wakeup_event.signal()
                     del self.tensor_uuid_to_metadata_per_request[request_id][
                         tensor_info.uuid]
                     self.tensor_manager.dereference(
@@ -304,40 +485,36 @@ class PreprocessWorkerThread:
                         uuid=tensor_info.uuid
                     )
 
-    def _process_messages(self):
-        for message in self.communicator.get_all_new_messages():
-            if message.message_type == WorkerMessageType.TENSOR_RECEIVED:
-                body: TensorReceived = message.body
-                for (uuid, ref_cnt) in body.successful_tensors.items():
-                    self.tensor_manager.dereference(
-                        body.request_id, uuid, n=ref_cnt
-                    )
-            elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
-                body: UnpersistTensors = message.body
-                for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
-                    self.tensor_manager.increment_ref(
-                        body.request_id, uuid, n=ref_cnt
-                    )
-                    self.tensor_manager.set_persist(
-                        body.request_id, uuid, persist=False
-                    )
-
     def run(self):
         while not self.stop_event.is_set():
             try:
-                self._process_messages()
-                if not self.in_queue.empty():
-                    self._process_input(self.in_queue.get())
-                if not self.result_tensor_queue.empty():
-                    self._read_result_tensor(self.result_tensor_queue.get())
-                if not self.cleanup_request_queue.empty():
-                    req_id = self.cleanup_request_queue.get()
-                    self.tensor_manager.cleanup_request(req_id)
-                    if req_id in self.tensor_uuid_to_metadata_per_request:
-                        del self.tensor_uuid_to_metadata_per_request[req_id]
-                self._process_read_tensors()
+                progressed = True
+                while progressed:
+                    progressed = self._process_messages()
+                    if not self.result_tensor_queue.empty():
+                        futures = self._read_result_tensor(self.result_tensor_queue.get())
+                        # Async transports (RDMA/TCP) complete reads off-thread;
+                        # wake this loop when they land so _process_read_tensors
+                        # runs promptly instead of waiting out the poll timeout.
+                        if futures and self.wakeup_event is not None:
+                            self.wakeup_event.register_futures(futures)
+                        progressed = True
+                    if not self.cleanup_request_queue.empty():
+                        req_id = self.cleanup_request_queue.get()
+                        self.tensor_manager.cleanup_request(req_id)
+                        if req_id in self.tensor_uuid_to_metadata_per_request:
+                            del self.tensor_uuid_to_metadata_per_request[req_id]
+                        progressed = True
+                    self._process_read_tensors()
             except Exception:
-                logger.exception("PreprocessWorkerThread error")
+                logger.exception("PostprocessWorkerThread error")
 
-            time.sleep(0.001)
+            # Block until an incoming ZMQ message, a producer signalling new
+            # queue work (eventfd), or a completed async read wakes us —
+            # replacing the fixed 1ms sleep that throttled result-tensor
+            # ingestion. The timeout is just a safety net for missed wakeups.
+            if self.wakeup_event is not None:
+                self.communicator.wait_for_work(timeout_ms=10)
+            else:
+                time.sleep(0.001)
 

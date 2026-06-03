@@ -1669,7 +1669,12 @@ class Worker:
             # loop outputs can be buffered properly.
             req_output_tensors = output.per_request_output_tensors.get(rid)
             node = batch_N.batch.node_objects[rid]
+            if self.enable_nvtx:
+                range_push("worker.postprocess.reset_outputs", synchronize=False)
             node.reset_outputs() # reset stale outputs
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_push("worker.postprocess.store_edges", synchronize=False)
             if req_output_tensors:
                 graph_node_info = self.tensor_manager.store_and_populate_graph_edges(
                     request_id=rid,
@@ -1683,16 +1688,27 @@ class Worker:
                 per_request_uuids[rid] = {
                     info.uuid for infos in graph_node_info.values() for info in infos
                 }
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_push("worker.postprocess.mark_complete", synchronize=False)
 
             completion_output = self.worker_graphs_manager.mark_node_complete(
                 rid, wg_id, batch_N.node_name
             )
             real_outputs = [edge.clone() for edge in completion_output.output_edges]
 
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_push("worker.postprocess.process_outputs", synchronize=False)
+
             routing_per_request[rid] = self.worker_graphs_manager.process_node_outputs(
                 rid, node_name=batch_N.node_name,
                 outputs=real_outputs, graph_walk=batch_N.graph_walk
             )
+
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+                range_push("worker.postprocess.ref_count", synchronize=False)
 
             if rid in per_request_uuids:
                 routing = routing_per_request[rid]
@@ -1707,6 +1723,8 @@ class Worker:
                 self.tensor_manager.set_output_ref_counts(
                     rid, per_request_uuids[rid], routed_edges
                 )
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
         
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -2216,7 +2234,7 @@ class Worker:
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
-                            spec_launch_started_event.wait(timeout=0.005)
+                            spec_launch_started_event.wait(timeout=0.02)
                             if phase_period:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
