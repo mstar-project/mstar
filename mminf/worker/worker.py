@@ -135,6 +135,9 @@ class Worker:
         self.device = device
         self.enable_nvtx = enable_nvtx
 
+        if self.device.type == "cuda" and self.device.index is not None:
+            torch.cuda.set_device(self.device)
+
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mminf`` runs on
         # the same host don't collide. The ``tcp://{hostname}:29500``
