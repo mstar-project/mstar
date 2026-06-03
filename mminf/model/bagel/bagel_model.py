@@ -68,7 +68,12 @@ from mminf.model.bagel.submodules import (
 )
 from mminf.model.base import DECODE, ForwardPassArgs, Model
 from mminf.model.submodule_base import NodeSubmodule
-from mminf.model.loader import iter_safetensors_file, load_hf_weights
+from mminf.model.loader import (
+    LLAMA_STACKED_PARAMS,
+    StackedParamRule,
+    iter_safetensors_file,
+    load_hf_weights,
+)
 from mminf.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
@@ -93,15 +98,16 @@ BAGEL_DEFAULT_SYSTEM_PROMPT = "You are BAGEL, a helpful multimodal assistant cre
 # Chat-template envelope for image understanding (image-to-text).
 # ``<|im_start|>system\n{SYS}<|im_end|>\n<|im_start|>user\n<|image_pad|>\n{prompt}<|im_end|>\n<|im_start|>assistant\n``.
 VLM_UNDERSTANDING_PREFIX = (
-    f"<|im_start|>system\n{BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n"
+    "<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n"
 )
 VLM_UNDERSTANDING_SUFFIX = "\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-VLM_UNDERSTANDING_TEMPLATE = f"<|im_start|>system\n{BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|>" + \
+VLM_UNDERSTANDING_TEMPLATE = "<|im_start|>system\n{system_prompt}<|im_end|>" + \
     "\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
 # Image generation (T2I/I2I): bare wrapping, no system prompt or roles. Input
 # image (I2I) is positioned before this by the prefill_vae/vit walks.
-GEN_TEMPLATE = "<|im_start|>{prompt}<|im_end|>"
+GEN_TEMPLATE = "<|im_start|>{prompt}<|im_end|><|im_start|>"
+BOS_EOS_TEMPL = "<|im_start|>{prompt}<|im_end|>"
 
 
 # ---------------------------------------------------------------------------
@@ -159,19 +165,49 @@ class _BagelViTEMA(nn.Module):
         self.vit_pos_embed = vit_pos_embed
 
 
+def _stacked_source_keys(
+    expected: set[str], stacked_params: list[StackedParamRule] | None,
+) -> set[str]:
+    """Expand fused parameter names into the per-shard checkpoint keys they
+    are loaded from.
+
+    ``_load_into`` filters the safetensors read to ``expected`` (the
+    module's own parameter names). When ``stacked_params`` fuse several
+    checkpoint tensors into one parameter (``q_proj`` / ``k_proj`` /
+    ``v_proj`` → ``qkv_proj``), the source keys differ from the fused name,
+    so they must be added to the read filter or the iterator would skip
+    them.
+    """
+    if not stacked_params:
+        return expected
+    keys = set(expected)
+    for name in expected:
+        for rule in stacked_params:
+            if rule.target_suffix in name:
+                keys.add(name.replace(rule.target_suffix, rule.source_suffix))
+    return keys
+
+
 def _load_into(
     module: nn.Module, source_path: Path, device: str,
+    stacked_params: list[StackedParamRule] | None = None,
 ) -> None:
     """Materialise ``module`` on ``device`` and load every parameter from
     ``source_path``. Raises ``KeyError`` if any parameter is missing from
     the checkpoint — the equivalent of the old ``enforce_missing_keys=True``
     safety net.
+
+    ``stacked_params`` routes per-shard checkpoint tensors into fused
+    parameters (e.g. ``q/k/v_proj`` → ``qkv_proj``); pass it for modules
+    that use ``FusedColumnLinear`` projections.
     """
     module.to_empty(device=device)
     expected = set(dict(module.named_parameters()).keys())
+    read_keys = _stacked_source_keys(expected, stacked_params)
     loaded = load_hf_weights(
         module,
-        iter_safetensors_file(source_path, device=device, keys=expected),
+        iter_safetensors_file(source_path, device=device, keys=read_keys),
+        stacked_params=stacked_params,
     )
     missing = expected - loaded
     if missing:
@@ -290,9 +326,14 @@ class BagelModel(Model):
 
         ema_path = self.repo / "ema.safetensors"
 
+        # The LLM fuses q/k/v → qkv_proj and gate/up → gate_up_proj (in both
+        # the understanding and gen experts); route the per-shard checkpoint
+        # tensors into those fused params. llm2vae is a plain Linear and is
+        # untouched by these rules.
         _load_into(
             _BagelLLMEMA(self.language_model, self.llm2vae),
             ema_path, device,
+            stacked_params=LLAMA_STACKED_PARAMS,
         )
 
         if not self.vae_initialized:
@@ -458,21 +499,34 @@ class BagelModel(Model):
             target_output = output_modalities[0] if output_modalities else "text"
             is_understanding = target_output == "text"
             has_image = "image" in input_modalities
+            think_mode = kwargs.get("think_mode", self.config.think_mode)
+            system_prompt = BAGEL_DEFAULT_SYSTEM_PROMPT
+
             if is_understanding and has_image:
                 # Wrap the prompt in BAGEL's understanding chat template, split
                 # around the image so the image embeddings land at the
                 # <|image_pad|> position (inserted by the prefill_vit walk).
                 # _build_prefill_schedule places the image between these two
                 # segments.
+                if think_mode:
+                    system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
                 segments = [
-                    VLM_UNDERSTANDING_PREFIX,
+                    VLM_UNDERSTANDING_PREFIX.format(system_prompt=system_prompt),
                     VLM_UNDERSTANDING_SUFFIX.format(prompt=prompt),
                 ]
             elif is_understanding:
-                segments = [VLM_UNDERSTANDING_TEMPLATE.format(prompt=prompt)]
+                if think_mode:
+                    system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
+                segments = [VLM_UNDERSTANDING_TEMPLATE.format(
+                    system_prompt=system_prompt, prompt=prompt
+                )]
             else:
                 # Image generation (T2I/I2I): the input image (I2I) is placed
                 # before this text by the prefill_vae/vit walks.
+                if think_mode:
+                    result["system_prompt"] = [self._encode_text(
+                        BOS_EOS_TEMPL.format(prompt=GEN_THINK_SYSTEM_PROMPT)
+                    )]
                 segments = [GEN_TEMPLATE.format(prompt=prompt)]
             result["text_inputs"] = [self._encode_text(seg) for seg in segments]
 
@@ -493,18 +547,17 @@ class BagelModel(Model):
                 for img in tensors["image_inputs"]
             ]
 
-        think_mode = kwargs.get("think_mode", self.config.think_mode)
-        if think_mode and self.tokenizer is not None:
-            target_output = output_modalities[0] if output_modalities else "text"
-            is_understanding = (target_output == "text")
-            sys_prompt = (
-                VLM_THINK_SYSTEM_PROMPT if is_understanding
-                else GEN_THINK_SYSTEM_PROMPT
-            )
-            sys_tokens = self.tokenizer.encode(sys_prompt)
-            result["system_prompt"] = [
-                torch.tensor(sys_tokens, dtype=torch.long)
-            ]
+        # if think_mode and self.tokenizer is not None:
+        #     target_output = output_modalities[0] if output_modalities else "text"
+        #     is_understanding = (target_output == "text")
+        #     sys_prompt = (
+        #         VLM_THINK_SYSTEM_PROMPT if is_understanding
+        #         else GEN_THINK_SYSTEM_PROMPT
+        #     )
+        #     sys_tokens = self.tokenizer.encode(BOS_EOS_TEMPL.format(prompt=sys_prompt))
+        #     result["system_prompt"] = [
+        #         torch.tensor(sys_tokens, dtype=torch.long)
+        #     ]
 
         return result
 
@@ -814,7 +867,7 @@ class BagelModel(Model):
         # wrapping BAGEL has no turn structure and stops early.
         if is_understanding and len(texts) == 2:
             input_modalities.insert(0, "text")
-
+        
         text_idx, image_idx = 0, 0
         for mod in input_modalities:
             if mod == "text":

@@ -590,9 +590,14 @@ class LLMSubmodule(ARNodeSubmodule):
             node_inputs.input_seq_len = node_inputs.input_ids.shape[0]
 
         elif graph_walk == "decode":
-            bos = torch.tensor([self.bos_token_id], device=device)
-            # NOTE: newly-sampled tokens automatically added sto the seen token mask
-            node_inputs.input_ids = inputs["text_inputs"][0] if len(inputs["text_inputs"]) > 0 else bos.clone()
+            # NOTE: newly-sampled tokens automatically added to the seen token mask.
+            # Steady-state decode always feeds the previous token back via
+            # text_inputs; only fall back to a fresh BOS tensor on the (rare)
+            # cold-start step so we don't do a per-request H2D alloc every token.
+            if len(inputs["text_inputs"]) > 0:
+                node_inputs.input_ids = inputs["text_inputs"][0]
+            else:
+                node_inputs.input_ids = torch.tensor([self.bos_token_id], device=device)
             node_inputs.input_seq_len = 1
 
         if graph_walk in ["prefill_vit", "prefill_vae"]:
@@ -1277,25 +1282,6 @@ class LLMSubmodule(ARNodeSubmodule):
         }
         out["__batched_logits__"] = logits
         return out
-
-    @torch.compiler.disable
-    def _batch_get_sampling_param(
-        self,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        request_ids: list[str],
-        key: str,
-        default: float | int,
-        device,
-        dtype: torch.dtype = torch.float32,
-    ) -> float | int | torch.Tensor:
-        """Extract a sampling param. Returns scalar if uniform, tensor if per-request."""
-        values = [
-            per_request_info[rid].step_metadata.get(key, default)
-            for rid in request_ids
-        ]
-        if len(set(values)) == 1:
-            return values[0]
-        return torch.tensor(values, device=device, dtype=dtype)
 
 
     def _get_boi_eoi_emb(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:

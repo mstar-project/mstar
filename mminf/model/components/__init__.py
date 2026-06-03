@@ -11,7 +11,8 @@ room for that.
 """
 from mminf.model.components.attention import Attention
 from mminf.model.components.decoder_layer import DecoderLayer, GatedDecoderLayer
-from mminf.model.components.mlp import MLP, GatedMLP
+from mminf.model.components.linear import FusedColumnLinear
+from mminf.model.components.mlp import MLP, FusedGatedMLP, GatedMLP
 from mminf.model.components.moe import (
     ParallelSparseMoeBlock,
     ParallelSparseMoeBlockWithSharedExpert,
@@ -26,6 +27,8 @@ __all__ = [
     "Attention",
     "DecoderLayer",
     "GatedDecoderLayer",
+    "FusedColumnLinear",
+    "FusedGatedMLP",
     "MLP",
     "GatedMLP",
     "ParallelSparseMoeBlock",
