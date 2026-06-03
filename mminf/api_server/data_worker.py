@@ -292,8 +292,8 @@ class PreprocessWorkerThread:
 
                     chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
                         tensor_info.uuid] or {}
-                    # Audio is emitted as raw float32 PCM (no container); surface
-                    # the model's output sample rate so clients can wrap it.
+                    # Audio is emitted as headerless 16-bit PCM; surface the
+                    # model's output sample rate so clients can wrap it.
                     if modality == "audio" and self.model is not None:
                         chunk_metadata = {
                             **chunk_metadata,
