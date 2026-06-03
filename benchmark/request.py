@@ -13,7 +13,7 @@ from typing import Optional
 
 import aiohttp
 
-from benchmark.base import Bagel, Model, RequestType, Status
+from benchmark.base import Bagel, Model, Orpheus, RequestType, Status
 from benchmark.utils import _write_wav
 
 
@@ -1388,4 +1388,112 @@ class SGLangOmni(InferenceSystem):
         else:
             metrics.record_completion()
 
+        return metrics
+
+
+class OursOpenAI(VLLMOmni):
+    """Benchmark adapter for M*'s own OpenAI-compatible ``/v1`` surface.
+
+    M*'s ``/v1`` mirrors the OpenAI shapes :class:`VLLMOmni` already speaks, so
+    chat (text / image-understanding / Qwen3-Omni speech-via-chat) and BAGEL
+    image generation + editing (``/v1/images/generations`` and
+    ``/v1/images/edits``) are inherited unchanged. The one divergence: Orpheus
+    is speech-only on M* (no chat path), so its TTS is served at
+    ``/v1/audio/speech`` rather than ``/v1/chat/completions``.
+    """
+
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        req_type = req_input.req_type
+        if req_type.get_output_modalities() == "audio" and isinstance(model, Orpheus):
+            metrics = RequestMetrics(
+                request_id=request_id,
+                type=req_type,
+                expected_output_modalities=["audio"],
+            )
+            return await self._send_request_audio_speech(
+                session=session,
+                req_input=req_input,
+                base_url=base_url,
+                model=model,
+                metrics=metrics,
+                additional_model_kwargs=additional_model_kwargs,
+            )
+        # Everything else (text/image-understanding chat, Qwen3-Omni speech via
+        # chat, BAGEL image gen/edit) matches VLLMOmni's request/response shapes.
+        return await super().send_request(
+            session=session,
+            req_input=req_input,
+            base_url=base_url,
+            request_id=request_id,
+            model=model,
+            additional_model_kwargs=additional_model_kwargs,
+        )
+
+    async def _send_request_audio_speech(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: "RequestInput",
+        base_url: str,
+        model: Model,
+        metrics: "RequestMetrics",
+        additional_model_kwargs: dict,
+    ) -> "RequestMetrics":
+        """Orpheus TTS via OpenAI ``/v1/audio/speech`` (streaming WAV).
+
+        M*'s streaming speech response is a WAV: a 44-byte header followed by
+        16-bit PCM frames. Strip the header once, then record each subsequent
+        read as a PCM16 audio chunk so timing/throughput match the native path.
+        """
+        kwargs = {**model.get_model_kwargs(req_input.req_type), **additional_model_kwargs}
+        payload: dict = {
+            "model": model.get_hf_url(),
+            "input": req_input.prompt,
+            "response_format": "wav",
+            "stream": True,
+            **kwargs,
+        }
+        try:
+            metrics.start_time = time.monotonic()
+            async with session.post(
+                f"{base_url}/v1/audio/speech",
+                json=payload,
+                headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"},
+                read_bufsize=2**24,
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
+            ) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+
+                header_skipped = False
+                pending = b""
+                async for raw in resp.content.iter_any():
+                    if not raw:
+                        continue
+                    if not header_skipped:
+                        pending += raw
+                        if len(pending) < 44:
+                            continue
+                        raw = pending[44:]  # drop the 44-byte streaming WAV header
+                        pending = b""
+                        header_skipped = True
+                        if not raw:
+                            continue
+                    metrics.record_output_chunk(
+                        modality="audio",
+                        data_b64=base64.b64encode(raw),
+                        arrival_time=time.monotonic(),
+                        n_tokens=1,
+                    )
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
         return metrics
