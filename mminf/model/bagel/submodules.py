@@ -441,15 +441,6 @@ class LLMSubmodule(ARNodeSubmodule):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
-    def _preprocess_prefill_text(
-        self, text_inputs: torch.Tensor
-    ):
-        out = text_inputs.new_zeros(text_inputs.shape[0] + 2)
-        out[0] = self.bos_token_id
-        out[-1] = self.eos_token_id
-        out[1:-1] = text_inputs
-        return out
-
     def _get_image_pos_ids(
         self, labels: list[str],
         pos_info: dict[str, PositionInfo],
@@ -539,10 +530,6 @@ class LLMSubmodule(ARNodeSubmodule):
             num_tokens: self._build_prefill_text_packed(num_tokens, device)
             for num_tokens in self.PREFILL_TEXT_TOKEN_BUCKETS
         }
-        prefill_vit_packed = {
-            num_tokens: self._build_prefill_vit_packed(num_tokens, device)
-            for num_tokens in self.PREFILL_VIT_TOKEN_BUCKETS
-        }
         return [
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode", requires_cfg=False, labels=["main"],
@@ -561,16 +548,6 @@ class LLMSubmodule(ARNodeSubmodule):
                 compile=True,
                 causal_attention=True,
                 capture_batch_sizes=self.PREFILL_TEXT_CAPTURE_BATCH_SIZES,
-            ),
-            FlashInferPackedCudaGraphConfig(
-                capture_graph_walk="prefill_vit",
-                replay_graph_walks=["prefill_vit"],
-                packed_seq_len_to_inputs=prefill_vit_packed,
-                requires_cfg=False,
-                labels=["main"],
-                compile=True,
-                causal_attention=False,
-                capture_batch_sizes=self.PREFILL_VIT_CAPTURE_BATCH_SIZES,
             ),
         ]
 
@@ -608,7 +585,7 @@ class LLMSubmodule(ARNodeSubmodule):
         node_inputs = ARNodeInputs(input_seq_len=0)
 
         if graph_walk == "prefill_text":
-            node_inputs.input_ids = self._preprocess_prefill_text(inputs["text_inputs"][0])
+            node_inputs.input_ids = inputs["text_inputs"][0]
             seen_token_mask.add_tokens(node_inputs.input_ids)
             node_inputs.input_seq_len = node_inputs.input_ids.shape[0]
 
@@ -1229,20 +1206,26 @@ class LLMSubmodule(ARNodeSubmodule):
                 cache_handle=cache_manager,
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
+                sample_prefill_token=True,
                 **kwargs
             )
             if "logits" in out:
                 out["__batched_logits__"] = out.pop("logits")[0]
+                for i, rid in enumerate(request_ids):
+                    out[rid] = {"logits": [out["__batched_logits__"][i]]}
             return out
         elif graph_walk == "prefill_vit":
             out = self._forward_prefill_vit(
                 cache_handle=cache_manager,
                 input_embeds=input_embeds,
                 requires_cfg=requires_cfg,
+                sample_prefill_token=True,
                 **kwargs
             )
             if "logits" in out:
                 out["__batched_logits__"] = out.pop("logits")[0]
+                for i, rid in enumerate(request_ids):
+                    out[rid] = {"logits": [out["__batched_logits__"][i]]}
             return out
         else:
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
@@ -1354,7 +1337,7 @@ class LLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         if request_info.graph_walk != "decode" and (
-            not request_info.step_metadata.get("sample_prefill_token")
+            not request_info.step_metadata.get("sample_prefill_token", False)
         ):
             outputs.pop("new_token")
             return
@@ -1365,7 +1348,7 @@ class LLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if "new_token" not in outputs:
+        if "new_token" not in outputs or request_info.graph_walk != "decode":
             return set()
         token = outputs["new_token"][0].item()
         if (self.eos_token_id is not None and self.eos_token_id == token) or \

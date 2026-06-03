@@ -96,6 +96,12 @@ VLM_UNDERSTANDING_PREFIX = (
     f"<|im_start|>system\n{BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n"
 )
 VLM_UNDERSTANDING_SUFFIX = "\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+VLM_UNDERSTANDING_TEMPLATE = f"<|im_start|>system\n{BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|>" + \
+    "\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+# Image generation (T2I/I2I): bare wrapping, no system prompt or roles. Input
+# image (I2I) is positioned before this by the prefill_vae/vit walks.
+GEN_TEMPLATE = "<|im_start|>{prompt}<|im_end|>"
 
 
 # ---------------------------------------------------------------------------
@@ -462,8 +468,12 @@ class BagelModel(Model):
                     VLM_UNDERSTANDING_PREFIX,
                     VLM_UNDERSTANDING_SUFFIX.format(prompt=prompt),
                 ]
+            elif is_understanding:
+                segments = [VLM_UNDERSTANDING_TEMPLATE.format(prompt=prompt)]
             else:
-                segments = [prompt]
+                # Image generation (T2I/I2I): the input image (I2I) is placed
+                # before this text by the prefill_vae/vit walks.
+                segments = [GEN_TEMPLATE.format(prompt=prompt)]
             result["text_inputs"] = [self._encode_text(seg) for seg in segments]
 
         # Image edit path: both input and output include "image". If the
@@ -998,6 +1008,10 @@ class BagelModel(Model):
             kwargs=kwargs,
         )
         step_metadata =  self._get_step_metadata(full_metadata)
+
+        sample_prefill_token = (think_mode or target_output != "image") and len(schedule) == 1
+        step_metadata["sample_prefill_token"] = sample_prefill_token
+
         inputs = self._get_fwd_pass_inputs(
             full_metadata, input_signals
         )
