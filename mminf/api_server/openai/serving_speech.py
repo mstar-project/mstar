@@ -39,7 +39,7 @@ async def create_speech(api, model_name, adapter, req):  # noqa: ARG001
 
     chunks = await run_in_threadpool(api.collect_results, request_id)
     pcm = b"".join(c.data for c in chunks if c.modality == "audio")
-    audio_bytes, mime = media_io.pcm_f32_to_container(pcm, sample_rate, fmt)
+    audio_bytes, mime = media_io.pcm16_to_container(pcm, sample_rate, fmt)
     return Response(content=audio_bytes, media_type=mime)
 
 
@@ -47,5 +47,4 @@ async def _stream_wav(api, request_id, sample_rate):
     yield media_io.wav_stream_header(sample_rate)
     async for c in api.iter_result_chunks(request_id):
         if c.modality == "audio" and c.data:
-            pcm16, _ = media_io.pcm_f32_to_container(c.data, sample_rate, "pcm")
-            yield pcm16
+            yield c.data
