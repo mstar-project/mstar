@@ -10,25 +10,24 @@ np = pytest.importorskip("numpy")
 from mminf.api_server import media_io  # noqa: E402
 
 
-def test_pcm_to_wav_header_and_rate():
-    pcm = np.array([0.0, 0.5, -0.5, 1.0], dtype=np.float32).tobytes()
-    wav = media_io.pcm_f32_to_wav_bytes(pcm, 24000)
+def test_pcm16_to_wav_header_rate_and_data():
+    pcm = np.array([0, 16000, -16000, 32767], dtype="<i2").tobytes()
+    wav = media_io.pcm16_to_wav_bytes(pcm, 24000)
     assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
     assert struct.unpack("<I", wav[24:28])[0] == 24000  # sample rate field
+    assert wav[44:] == pcm  # 44-byte header, then the int16 samples pass through unchanged
 
 
-def test_pcm_container_pcm16_clips_and_scales():
-    pcm = np.array([1.0, -1.0, 2.0], dtype=np.float32).tobytes()
-    out, mime = media_io.pcm_f32_to_container(pcm, 24000, "pcm")
-    assert mime == "audio/pcm"
-    vals = np.frombuffer(out, dtype="<i2")
-    assert vals[0] == 32767 and vals[1] == -32767 and vals[2] == 32767  # clipped
+def test_container_pcm_passthrough():
+    pcm = np.array([1, -1, 100], dtype="<i2").tobytes()
+    out, mime = media_io.pcm16_to_container(pcm, 24000, "pcm")
+    assert mime == "audio/pcm" and out == pcm  # already PCM_16, returned as-is
 
 
 def test_container_wav_default():
-    pcm = np.array([0.0], dtype=np.float32).tobytes()
-    out, mime = media_io.pcm_f32_to_container(pcm, 16000, "wav")
-    assert mime == "audio/wav" and out[:4] == b"RIFF"
+    pcm = np.array([0, 123, -123], dtype="<i2").tobytes()
+    out, mime = media_io.pcm16_to_container(pcm, 16000, "wav")
+    assert mime == "audio/wav" and out[:4] == b"RIFF" and out[44:] == pcm
 
 
 def test_data_url_roundtrip(tmp_path):
