@@ -7,25 +7,26 @@ from dataclasses import dataclass, field
 
 @dataclass
 class AudioBuffer:
-    """Decoded audio output: raw float32 PCM samples plus the sample rate.
+    """Decoded audio output: little-endian 16-bit PCM samples plus the sample rate.
 
-    The server emits audio as headerless float32 PCM; this wraps it with the
-    rate so callers can save a real WAV or get a numpy array without caring
-    about the on-the-wire encoding.
+    The server emits audio as headerless int16 PCM; this wraps it with the rate
+    so callers can save a real WAV or get a numpy array without caring about the
+    on-the-wire encoding.
     """
 
     pcm: bytes
     sample_rate: int = 24000
 
     def to_numpy(self):
+        """int16 samples as a numpy array (divide by 32768 for float in [-1, 1])."""
         import numpy as np
 
-        return np.frombuffer(self.pcm, dtype=np.float32)
+        return np.frombuffer(self.pcm, dtype="<i2")
 
     def wav_bytes(self) -> bytes:
-        from mminf.client.media import pcm_f32_to_wav_bytes
+        from mminf.client.media import pcm16_to_wav_bytes
 
-        return pcm_f32_to_wav_bytes(self.pcm, self.sample_rate)
+        return pcm16_to_wav_bytes(self.pcm, self.sample_rate)
 
     def to_wav(self, path) -> str:
         with open(path, "wb") as f:
@@ -33,7 +34,7 @@ class AudioBuffer:
         return str(path)
 
     def __len__(self) -> int:
-        return len(self.pcm) // 4  # float32 -> 4 bytes per sample
+        return len(self.pcm) // 2  # int16 -> 2 bytes per sample
 
 
 # --- streaming events (yielded by MMInfClient.stream / generate(stream=True)) ---
@@ -57,14 +58,14 @@ class ImageChunk:
 
 @dataclass
 class AudioChunk:
-    pcm: bytes  # raw float32 PCM
+    pcm: bytes  # raw little-endian 16-bit PCM
     sample_rate: int = 24000
     metadata: dict = field(default_factory=dict)
 
     def to_numpy(self):
         import numpy as np
 
-        return np.frombuffer(self.pcm, dtype=np.float32)
+        return np.frombuffer(self.pcm, dtype="<i2")
 
 
 # A streaming iteration yields one of these per output chunk.
