@@ -177,15 +177,16 @@ def fused_temperature_softmax(
     mask_stride_v = seen_mask.stride(1) if apply_penalty else 0
     grid = (B,)
     # BLOCK_SIZE is picked by @triton.autotune (not passed here).
-    _fused_sampling_prep_kernel[grid](
-        logits, temperature, pen_ptr, mask_ptr, probs,
-        V,
-        logits.stride(0), logits.stride(1),
-        probs.stride(0), probs.stride(1),
-        mask_stride_b, mask_stride_v,
-        APPLY_PENALTY=apply_penalty,
-        INCLUDE_GREEDY=include_greedy,
-    )
+    with torch.cuda.device(logits.device):
+        _fused_sampling_prep_kernel[grid](
+            logits, temperature, pen_ptr, mask_ptr, probs,
+            V,
+            logits.stride(0), logits.stride(1),
+            probs.stride(0), probs.stride(1),
+            mask_stride_b, mask_stride_v,
+            APPLY_PENALTY=apply_penalty,
+            INCLUDE_GREEDY=include_greedy,
+        )
     return probs
 
 

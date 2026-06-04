@@ -665,7 +665,6 @@ class Conductor:
             self._set_partition_worker_graph_ids(
                 body.request_id, p.name, fwd_args.full_metadata.graph_walk,
             )
-            self._update_persist_ref_counts(body.request_id, fwd_args.inputs)
             partition_fwd_args[p.name] = fwd_args
 
         # Send NewRequest to each worker with the appropriate partition's inputs
@@ -680,6 +679,11 @@ class Conductor:
                     sharding_config=request_data.sharding_config,
                     inputs=fwd_args.inputs,
                     graph_walk=fwd_args.full_metadata.graph_walk,
+                )
+
+                self._update_persist_ref_counts(
+                    body.request_id,
+                    inputs_per_worker.get(worker_id, [])
                 )
 
                 message = NewRequest(
@@ -916,8 +920,6 @@ class Conductor:
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
 
-        self._update_persist_ref_counts(request_id, fwd_args.inputs)
-
         inputs_per_worker = self._split_inputs_to_workers(
             sharding_config=request_data.sharding_config,
             inputs=fwd_args.inputs,
@@ -925,6 +927,7 @@ class Conductor:
         )
 
         for worker, inputs in inputs_per_worker.items():
+            self._update_persist_ref_counts(request_id, inputs)
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
