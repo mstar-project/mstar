@@ -55,6 +55,7 @@ class SpeechRequest(BaseModel):
     stream: bool | None = False
     temperature: float | None = None
     top_p: float | None = None
+    seed: int | None = None
 
 
 class ImageGenerationRequest(BaseModel):
@@ -67,6 +68,7 @@ class ImageGenerationRequest(BaseModel):
     n: int | None = 1
     size: str | None = None
     response_format: str = "b64_json"
+    seed: int | None = None
 
 
 class ModelCard(BaseModel):
