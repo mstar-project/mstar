@@ -700,7 +700,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
     # ---- batching ----
     def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
-        return batch.graph_walk == "thinker_decode"
+        return len(model_inputs) > 1
 
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
@@ -985,9 +985,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
           ``advance_seq_lens()`` is what advances the real state, and that
           path reads the side-channel.
         """
-        assert graph_walk in (
-            "thinker_decode", "prefill_text", "prefill_audio", "prefill_vision"
-        )
 
         # Packed dict from FlashInferPackedCudaGraphConfig is tensor-only by
         # design (the runner's static-buffer interning skips non-tensor
@@ -1019,7 +1016,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if is_prefill:
             qo_indptr_buf = cache_manager.get_qo_indptr_buf("main")
             assert qo_indptr_buf is not None, (
-                f"{graph_walk} forward_batched requires a CUDA-graph "
+                f"{graph_walk} forward_batched requires a properly initialized "
                 "FlashInferPrefillWrapper (qo_indptr static buffer); got None."
             )
             last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
@@ -1033,11 +1030,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 thinker_states = torch.cat(
                     [layer_0_embed, layer_0_embed], dim=-1,
                 )
-            
-            if graph_walk == "prefill_vision":
-                return {
-                    "__batched_thinker_states__": thinker_states,
-                }
+
             return {
                 "__batched_logits__": logits,
                 "__batched_thinker_states__": thinker_states,
@@ -1131,6 +1124,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
+        return_token = request_info.graph_walk == "thinker_decode" or \
+            request_info.step_metadata.get("is_last_prefill", False)
+        if not return_token:
+            outputs.pop("new_token", None)
+
         if not request_info.step_metadata.get("audio_output", True):
             # drop thinker_states and thinker_match
             outputs.pop("thinker_states", None)

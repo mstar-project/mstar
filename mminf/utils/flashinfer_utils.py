@@ -202,6 +202,11 @@ class FlashInferPrefillWrapper:
             paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
             paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
 
+        # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
+        # even if we're not in a cuda graph
+        if not self.use_cuda_graph:
+            self._qo_indptr_buf = qo_indptr
+    
         # Compute per-token page and offset for vectorized KV writes
         n_req = qo_indptr.shape[0] - 1
         starts = qo_indptr[:-1].to(torch.int32)
