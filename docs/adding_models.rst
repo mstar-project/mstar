@@ -20,13 +20,25 @@ A model in ``mminf`` is split into a handful of well-defined responsibilities:
   FlashInfer, CUDA graphs, batching). You pick an engine *type* per node; you rarely
   write a new engine.
 - **The graph** (``mminf/graph/base.py``) is how a model declares *what runs in what
-  order*: nodes, edges between them, and loops. Each named "graph walk" (e.g.
-  ``prefill``, ``decode``) is one graph.
+  order*: nodes, edges between them, and loops. Conceptually all of a model's work is
+  one large computation graph, and each named "graph walk" (e.g. ``prefill``,
+  ``decode``) is a *path* through it. For implementation purposes, though, you declare
+  each walk as its own standalone graph; nodes that appear in several walks (e.g. the
+  ``LLM``) are simply referenced by name in each, and the engine/submodule behind that
+  name — and its KV cache — is shared across them.
 - **The config YAML** (``configs/``) maps graph nodes to physical GPU ranks via
   ``node_groups``. This is where disaggregation happens — the same model code runs
   single-GPU or sharded across many depending only on the config.
 
-The flow at request time::
+A note on vocabulary used throughout this page: a **tensor bundle** routed between nodes
+is a ``NameToTensorList`` — i.e. ``dict[str, list[torch.Tensor]]``
+(``mminf/communication/tensors.py``), mapping an edge name to a (usually length-1) list
+of tensors.
+
+The flow at request time. This is the **conductor/model-level** flow, at the granularity
+of a *graph walk*: the conductor is notified when a walk completes and only then asks the
+model what to do next, so everything happening *within* a walk (the per-node execution
+described in later steps) is abstracted away here::
 
    process_prompt()              # text/media -> initial tensors
         │
@@ -34,7 +46,8 @@ The flow at request time::
    get_initial_forward_pass_args()   # seed the first graph walk (e.g. prefill)
         │
         ▼   (conductor walks the graph, running nodes via engines)
-   get_partition_forward_pass_args() # asked after each step: what's next? done?
+   get_partition_forward_pass_args() # asked after each graph walk completes:
+                                     #   what's next? done?
         │
         ▼
    postprocess()                 # model output tensor -> bytes for the client
@@ -117,7 +130,7 @@ The abstract methods you **must** implement:
    graph walk to start on and which input edges feed it.
 
 ``get_partition_forward_pass_args(self, partition_name, partition_metadata, persist_signals, new_tokens, incoming_connections=None) -> ForwardPassArgs``
-   Called by the conductor after each completed step to decide the *next* walk, its
+   Called by the conductor after each graph walk completes to decide the *next* walk, its
    inputs, and whether the request is done (``request_done=True``). For a simple
    prefill→decode model this flips ``is_prefill`` once and then loops decode until EOS.
 
@@ -189,28 +202,167 @@ contract:
 
 ``prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs``
    Convert the routed ``NameToTensorList`` into a typed ``NodeInputs`` (or
-   ``ARNodeInputs`` with ``input_ids`` / ``input_embeds`` / ``input_seq_len``). Runs
-   per request, on CPU-ish metadata only.
+   ``ARNodeInputs`` with ``input_ids`` / ``input_embeds`` / ``input_seq_len``). Runs once
+   per request and should do only **cheap, host-side ("CPU-ish") work** — shape/length
+   bookkeeping, building position metadata, slicing token id lists. Do not launch the
+   heavy GPU compute here (that is ``forward``); the engine may call this off the GPU
+   thread and well ahead of execution.
 
 ``preprocess(self, graph_walk, engine_inputs, inputs) -> dict``
-   Collate a batch of ``NodeInputs`` into the kwargs your ``forward`` expects. The base
-   default handles batch size 1; ``ARNodeSubmodule`` makes it abstract (implement
-   batching).
+   Collate a list of ``NodeInputs`` into the kwargs your ``forward`` expects. The base
+   default handles batch size 1 but can be overridden to support batching.
+   ``ARNodeSubmodule`` makes this method abstract, as autoregressive submodules typically
+   support continuous batching (though you can choose to disable batching for a node or
+   for specific graph walk(s) if needed — see :ref:`Step 4.5 <step-4-5>`).
 
 ``forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList``
-   The pure tensor → tensor computation (this is what gets CUDA-graphed/compiled). Keys
-   in the returned dict are the edge ``name`` s the graph routes downstream.
+   The pure tensor → tensor computation. Keys in the returned dict are the edge
+   ``name`` s the graph routes downstream. **Both** ``forward`` **and** ``forward_batched``
+   **are wrapped with** ``torch.compile`` **automatically** (and CUDA-graph captured when
+   you declare configs — see :ref:`Step 4.5 <step-4-5>`). Keep them
+   compile-friendly; any helper that must *not* be traced (data-dependent Python control
+   flow, host syncs) has to be excluded explicitly, e.g. with ``@torch.compiler.disable``.
 
 ``postprocess(...)`` (optional)
-   Metadata-only fixups that run on the GPU thread — **must not** read tensor values
-   (no ``.item()``/``.cpu()``). Use it to rebind output names for routing.
+   Metadata-only fixups that run on the GPU thread — must **not** read tensor values (no
+   ``.item()``/``.cpu()``/``.tolist()``). This is a **performance**, not a correctness,
+   constraint: reading a value here forces a host sync that stalls the GPU thread and
+   forfeits the worker's async-scheduling overlap. Use it only to rebind output names for
+   routing. Value-dependent decisions belong in ``check_stop``.
 
 ``check_stop(...) -> set[str]`` (optional)
    Runs off the GPU thread and *may* read tensor values. Return the names of the
    ``Loop`` s to stop (e.g. when you see the EOS token). This is how decode terminates.
 
-Optional knobs: ``can_batch`` / ``forward_batched`` (batching is off by default),
-``get_cuda_graph_configs`` (declare CUDA-graph captures), and ``cleanup_request``.
+The two batching/CUDA-graph knobs — ``can_batch`` / ``forward_batched`` and
+``get_cuda_graph_configs`` — are important enough to get their own step below;
+``cleanup_request`` (free per-request state on completion) is the one minor leftover.
+
+Loading weights
+~~~~~~~~~~~~~~~
+
+``get_submodule`` is where a node's parameters are actually loaded. Weight loading is
+standardized through ``mminf/model/loader/`` — using it (rather than an ad-hoc
+``load_state_dict``) is what lets the *same* code load both a single-GPU checkpoint and a
+tensor-parallel shard (see :ref:`Step 6 <tensor-parallelism>`). There are three layers:
+
+1. In ``get_submodule`` you build the ``nn.Module`` on the ``meta`` device, materialize it
+   with ``to_empty(device=...)``, then call the top-level driver
+   ``load_weights(module, source, device=...)`` from ``mminf.model.loader``. The driver
+   picks the right safetensors iterator (single file *or* a sharded HF directory) and
+   calls ``module.load_weights(weights)``.
+2. Your module implements ``load_weights(self, weights)`` and delegates to
+   ``load_hf_weights(self, weights, stacked_params=..., name_remapper=...)``, which streams
+   the ``(name, tensor)`` pairs and dispatches each to the matching parameter's
+   ``weight_loader``.
+3. ``stacked_params`` (a list of ``StackedParamRule``) route several checkpoint keys into
+   one fused parameter — e.g. HF ``q_proj`` / ``k_proj`` / ``v_proj`` into a single
+   ``qkv_proj`` (``LLAMA_STACKED_PARAMS`` is the ready-made Llama set). ``name_remapper``
+   rewrites or drops checkpoint keys that don't line up with your parameter paths.
+
+.. code-block:: python
+
+   # in the Model: build on meta, materialize, hand off to the driver
+   def _create_llm_submodule(self, device, tp_group=None):
+       from mminf.model.loader import load_weights
+       with torch.device("meta"):
+           language_model = OrpheusForCausalLM(self.config, comm_group=tp_group)
+       language_model.to_empty(device=device)
+       load_weights(language_model, local_dir, device=device)  # → module.load_weights(...)
+       ...
+
+   # in the nn.Module: declare the fused-shard routing and delegate
+   def load_weights(self, weights):
+       from mminf.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
+       return load_hf_weights(self, weights, stacked_params=LLAMA_STACKED_PARAMS)
+
+Each parameter's ``weight_loader`` is also where tensor-parallel sharding happens: when the
+module is built with a ``comm_group`` (``tp_world_size > 1``), the loader slices the
+incoming tensor along that parameter's shard dim before copying it in. That is why one
+``load_weights`` path serves both single-GPU and tensor-parallel runs without change.
+
+.. _step-4-5:
+
+Step 4.5 — Continuous batching and CUDA graphs
+----------------------------------------------
+
+Continuous batching and CUDA graphs are the two fundamental throughput optimizations a
+submodule opts into. They are optional, but for any autoregressive node you almost
+certainly want both, and getting their contracts right is the subtlest part of writing a
+submodule — hence this dedicated step.
+
+**Continuous batching.** The worker's micro-scheduler groups compatible in-flight
+requests into one GPU call. A submodule controls this with three methods:
+
+- ``can_batch(self, batch, model_inputs) -> bool`` — may these requests share a forward
+  pass? Returns ``False`` by default (batching off). Override to admit batches (e.g. same
+  graph walk, compatible shapes).
+- ``forward_batched(self, graph_walk, engine_inputs, **kwargs) -> dict[str, NameToTensorList]``
+  — the batched compute, returning per-request (``request_id`` → tensors) outputs. You
+  implement this *instead of* relying on the single-request ``forward`` when batched.
+- ``max_batch_size(self, graph_walk)`` — optional cap.
+
+``ARNodeSubmodule`` makes ``preprocess`` abstract precisely because AR nodes are expected
+to collate a batch; you can still disable batching for a specific node or walk by having
+``can_batch`` return ``False`` there.
+
+**CUDA graphs.** A submodule declares its capturable shapes from
+``get_cuda_graph_configs(self, device, tp_world_size=1) -> list[CudaGraphConfig]`` (empty
+by default → eager). The capture runs ``torch.compile`` first (the per-config ``compile``
+flag, default ``True``), then records a CUDA graph it can replay. Two config types live
+in ``mminf/engine/cuda_graph_config.py``, and they differ in *which* stage of the
+submodule pipeline they freeze:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 74
+
+   * - Config type
+     - When to use / what it captures
+   * - ``BasicBatchedCudaGraphConfig``
+     - **Decode-style** forward passes, where every request in the batch has the *same*
+       (typically single-token) length. You pass ``single_request_inputs`` (a one-request
+       ``ARNodeInputs``); the runner replicates it to size each captured batch. This config
+       fixes the output of ``prepare_inputs``, and ``preprocess`` is invoked on **both**
+       capture and replay.
+   * - ``FlashInferPackedCudaGraphConfig``
+     - **Prefill-style** AR forward passes that operate on **packed / ragged** sequences.
+       You pass ``packed_seq_len_to_inputs`` (a bucket → preprocess-output mapping), so this
+       config fixes the output of ``preprocess``. The CUDA-graph runner *plans* FlashInfer
+       attention at **capture** time; on **replay** the submodule's ``preprocess`` performs
+       the per-step attention planning into the captured buffers.
+
+Both share the base ``CudaGraphConfig`` fields: ``capture_graph_walk`` (the walk captured),
+``replay_graph_walks`` (walks allowed to replay this capture — lets one capture serve
+aliased walks, e.g. ``prefill_audio`` reusing ``prefill_text``), ``capture_batch_sizes``
+(which batch sizes to record), ``labels`` (which KV-cache labels are live, e.g.
+``["main"]`` or ``["main", "cfg_img"]``), and ``requires_cfg``.
+
+A concrete example — Orpheus's LLM submodule captures a basic-batched ``decode`` graph and
+a packed ``prefill`` graph:
+
+.. code-block:: python
+
+   def get_cuda_graph_configs(self, device, tp_world_size=1):
+       prefill_packed = {
+           n: self._build_prefill_packed(n, device) for n in self.PREFILL_TOKEN_BUCKETS
+       }
+       return [
+           BasicBatchedCudaGraphConfig(
+               capture_graph_walk="decode",
+               single_request_inputs=ARNodeInputs(
+                   input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                   input_seq_len=1,
+               ),
+           ),
+           FlashInferPackedCudaGraphConfig(
+               capture_graph_walk="prefill",
+               replay_graph_walks=["prefill"],
+               packed_seq_len_to_inputs=prefill_packed,
+               causal_attention=True,
+               capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+           ),
+       ]
 
 Step 5 — Choose engine types
 ----------------------------
@@ -259,6 +411,56 @@ Run it with:
 .. code-block:: bash
 
    mminf-serve --config configs/your_model.yaml --host 0.0.0.0 --port 8000
+
+.. _tensor-parallelism:
+
+Tensor parallelism (sharding)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A node can be sharded across several GPUs by adding ``tp_size`` to its ``node_groups``
+entry and listing ``tp_size`` ranks. The runtime splits the group's ranks into
+TP groups of that size and builds one ``comm_group`` per shard; the weight loaders
+(see `Loading weights`_) slice each sharded parameter automatically, so **no model code
+changes** are needed to go from single-GPU to tensor-parallel — only the YAML and a small
+sharding declaration. For example, running the Orpheus LLM tensor-parallel across two
+GPUs (``configs/orpheus_tp2.yaml``):
+
+.. code-block:: yaml
+
+   model: "orpheus"
+   node_groups:
+     - node_names: [LLM]
+       ranks: [0, 1]
+       tp_size: 2
+       graph_walks: [prefill, decode]
+     - node_names: [snac_decoder]
+       ranks: [0]
+       graph_walks: [snac_chunk]
+
+For a node to be eligible for ``tp_size > 1`` it must be declared TP-enabled by the model.
+Override ``get_default_sharding_config`` to return a ``ShardingConfig`` naming the
+shardable nodes (and any non-default shard dimensions):
+
+.. code-block:: python
+
+   def get_default_sharding_config(self):
+       from mminf.distributed.base import ShardingConfig
+       return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={})
+
+Two pieces split work across the TP group, and it helps to keep them separate:
+
+- **Weights** are sharded inside the components, by each parameter's ``weight_loader``
+  (column/row-parallel linear layers built with the ``comm_group``). This is automatic
+  once the module is constructed tensor-parallel — nothing extra in the config.
+- **Activations** crossing a node boundary are handled by ``shard_dim`` in the
+  ``ShardingConfig`` — a map from an inter-node *edge/signal name* to the dimension along
+  which that tensor is split across the group (absent or ``None`` ⇒ the tensor is
+  replicated to every rank). You only need entries here for edges whose producer and
+  consumer keep the data sharded; the common case (replicated activations) needs nothing.
+  ``shard_dim`` can also be supplied per-run under a ``sharding_config`` block in the YAML.
+
+A node group whose ``tp_size > 1`` names a node *not* in ``tp_enabled_nodes`` is rejected
+at load time. See ``configs/qwen3omni_thinker_tp2.yaml`` for a multi-node-type example.
 
 Worked example: Orpheus
 -----------------------
@@ -311,18 +513,29 @@ the pieces scale up.
 **Step 1 — Register.** Already done in ``registry.py``: ``"bagel": BagelModel`` plus an
 ``HF_MODELS`` entry pointing at ``ByteDance-Seed/BAGEL-7B-MoT``.
 
-**Step 2/5 — Nodes and engine types.** BAGEL declares four logical nodes; only the LLM
-carries a KV cache, everything else is stateless:
+**Step 2/5 — Nodes and engine types.** Only the LLM nodes carry a KV cache; everything
+else is stateless. The core of the model is four nodes — a ViT encoder, a VAE encoder, the
+LLM, and a VAE decoder — plus a few extra nodes for the CFG-parallel image-generation path
+described below (``init_latents``, the per-branch ``LLM_cfg_*`` nodes, and ``combine_cfg``).
+All are declared up front:
 
 .. code-block:: python
 
    def get_node_engine_types(self) -> dict[str, EngineType]:
        return {
-           "vit_encoder": EngineType.STATELESS,   # SigLIP2 ViT (understanding)
-           "vae_encoder": EngineType.STATELESS,   # FLUX VAE encode (editing/gen)
-           "LLM":         EngineType.KV_CACHE,     # Qwen2: embed + transformer + lm_head + CFG
-           "vae_decoder": EngineType.STATELESS,   # FLUX VAE decode → pixels
+           "vit_encoder":  EngineType.STATELESS,   # SigLIP2 ViT (understanding)
+           "vae_encoder":  EngineType.STATELESS,   # FLUX VAE encode (editing/gen)
+           "init_latents": EngineType.STATELESS,   # seed the image-gen latents
+           "LLM":          EngineType.KV_CACHE,    # Qwen2: embed + transformer + lm_head + CFG
+           "LLM_cfg_text": EngineType.KV_CACHE,    # CFG-parallel branch (text-only cond)
+           "LLM_cfg_img":  EngineType.KV_CACHE,    # CFG-parallel branch (image cond)
+           "combine_cfg":  EngineType.STATELESS,   # CFG combine + Euler step
+           "vae_decoder":  EngineType.STATELESS,   # FLUX VAE decode → pixels
        }
+
+The CFG nodes are always *declared* here, but they are only *used* when the config opts
+into CFG-parallel mode (covered under Step 6); a single-GPU config simply never routes to
+them.
 
 The ``LLM`` is intentionally a **"fat" node**: it absorbs text embedding, the lm_head,
 and the flow projection, because those always live on the same GPU and splitting them
