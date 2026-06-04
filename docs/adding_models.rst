@@ -112,7 +112,7 @@ The abstract methods you **must** implement:
 
 ``get_node_engine_types(self) -> dict[str, EngineType]``
    Maps each graph-node name to an :class:`mminf.engine.base.EngineType`
-   (``KV_CACHE`` or ``STATELESS``). See `Step 5 — Choose engine types`_ below.
+   (``KV_CACHE`` or ``STATELESS``). See `Step 6 — Choose engine types`_ below.
 
 ``get_graph_walk_graphs(self) -> dict[str, GraphSection]``
    The heart of the model: returns ``{walk_name: graph}``. See
@@ -216,13 +216,13 @@ contract:
    default handles batch size 1 but can be overridden to support batching.
    ``ARNodeSubmodule`` makes this method abstract, as autoregressive submodules typically
    support continuous batching (though you can choose to disable batching for a node or
-   for specific graph walk(s) if needed — see :ref:`Step 4.5 <step-4-5>`).
+   for specific graph walk(s) if needed — see :ref:`Step 5 <step-5>`).
 
 ``forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList``
    The pure tensor → tensor computation. Keys in the returned dict are the edge
    ``name`` s the graph routes downstream. **Both** ``forward`` **and** ``forward_batched``
    **are wrapped with** ``torch.compile`` **automatically** (and CUDA-graph captured when
-   you declare configs — see :ref:`Step 4.5 <step-4-5>`). Keep them
+   you declare configs — see :ref:`Step 5 <step-5>`). Keep them
    compile-friendly; any helper that must *not* be traced (data-dependent Python control
    flow, host syncs) has to be excluded explicitly, e.g. with ``@torch.compiler.disable``.
 
@@ -247,7 +247,7 @@ Loading weights
 ``get_submodule`` is where a node's parameters are actually loaded. Weight loading is
 standardized through ``mminf/model/loader/`` — using it (rather than an ad-hoc
 ``load_state_dict``) is what lets the *same* code load both a single-GPU checkpoint and a
-tensor-parallel shard (see :ref:`Step 6 <tensor-parallelism>`). There are three layers:
+tensor-parallel shard (see :ref:`Step 7 <tensor-parallelism>`). There are three layers:
 
 1. In ``get_submodule`` you build the ``nn.Module`` on the ``meta`` device, materialize it
    with ``to_empty(device=...)``, then call the top-level driver
@@ -284,10 +284,10 @@ module is built with a ``comm_group`` (``tp_world_size > 1``), the loader slices
 incoming tensor along that parameter's shard dim before copying it in. That is why one
 ``load_weights`` path serves both single-GPU and tensor-parallel runs without change.
 
-.. _step-4-5:
+.. _step-5:
 
-Step 4.5 — Continuous batching and CUDA graphs
-----------------------------------------------
+Step 5 — Continuous batching and CUDA graphs
+--------------------------------------------
 
 Continuous batching and CUDA graphs are the two fundamental throughput optimizations a
 submodule opts into. They are optional, but for any autoregressive node you almost
@@ -367,7 +367,7 @@ a packed ``prefill`` graph:
            ),
        ]
 
-Step 5 — Choose engine types
+Step 6 — Choose engine types
 ----------------------------
 
 You almost never write an engine; you assign one of the two
@@ -394,7 +394,7 @@ The engine type — not the submodule — decides whether the node gets a manage
 A model's job is just to label each node; the worker instantiates the right engine and
 gives ``KV_CACHE`` nodes their cache from ``get_kv_cache_config``.
 
-Step 6 — Write a config YAML
+Step 7 — Write a config YAML
 ----------------------------
 
 A config maps nodes to GPU ranks. The key under ``model:`` is your registry key; each
@@ -516,7 +516,7 @@ the pieces scale up.
 **Step 1 — Register.** Already done in ``registry.py``: ``"bagel": BagelModel`` plus an
 ``HF_MODELS`` entry pointing at ``ByteDance-Seed/BAGEL-7B-MoT``.
 
-**Step 2/5 — Nodes and engine types.** Only the LLM nodes carry a KV cache; everything
+**Step 2/6 — Nodes and engine types.** Only the LLM nodes carry a KV cache; everything
 else is stateless. The core of the model is four nodes — a ViT encoder, a VAE encoder, the
 LLM, and a VAE decoder — plus a few extra nodes for the CFG-parallel image-generation path
 described below (``init_latents``, the per-branch ``LLM_cfg_*`` nodes, and ``combine_cfg``).
@@ -537,7 +537,7 @@ All are declared up front:
        }
 
 The CFG nodes are always *declared* here, but they are only *used* when the config opts
-into CFG-parallel mode (covered under Step 6); a single-GPU config simply never routes to
+into CFG-parallel mode (covered under Step 7); a single-GPU config simply never routes to
 them.
 
 The ``LLM`` is intentionally a **"fat" node**: it absorbs text embedding, the lm_head,
@@ -613,7 +613,7 @@ richer state machine.
 a system prompt when ``think_mode``); ``postprocess`` branches on modality — ``decode`` →
 ``utf-8`` text, ``image`` → PNG bytes.
 
-**Step 6 — Config and disaggregation.** This is where BAGEL pays off. The *same* model
+**Step 7 — Config and disaggregation.** This is where BAGEL pays off. The *same* model
 code runs on one GPU:
 
 .. code-block:: yaml
