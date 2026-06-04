@@ -790,7 +790,7 @@ class KVCacheEngine(BaseEngine):
                 )
             )
         if self.enable_nvtx:
-            range_pop(synchronize=True)
+            range_pop(synchronize=False)
 
         return PreparedBatch(
             batch=batch,
