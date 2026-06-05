@@ -1166,7 +1166,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None=None,
+        input_embeds: torch.Tensor | None=None,
         requires_cfg: bool=False,
         **kwargs
     ) -> dict[str, NameToTensorList]:
@@ -1192,13 +1193,15 @@ class LLMSubmodule(ARNodeSubmodule):
                 requires_cfg=requires_cfg,
                 **kwargs
             ) # prefill is the same batched and unbatched
-            # Empty top-level dict (NOT ``{rid: []}``): prefill_text only
-            # populates the KV cache, no per-rid outputs. The runner's
-            # ``_sample_and_remap`` slow path falls through to
-            # ``outputs[rid] = {}`` for each rid when no ``__batched_logits__``
-            # sentinel is present and no dummy_rid keys exist in static_output;
-            # ``{rid: []}`` would AttributeError on ``[].items()`` in the
-            # per-rid collection loop.
+            return {}
+        elif graph_walk == "prefill_vit":
+            self._forward_prefill_vit(
+                cache_handle=cache_manager,
+                input_embeds=input_embeds,
+                requires_cfg=requires_cfg,
+                sample_prefill_token=True,
+                **kwargs
+            )
             return {}
         else:
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
@@ -1264,10 +1267,15 @@ class LLMSubmodule(ARNodeSubmodule):
             eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
         return torch.cat([boi_emb, emb, eoi_emb], dim=0)
 
+    def max_batch_size(self, graph_walk: str):
+        if graph_walk == "prefill_vit":
+            return 2
+        return None
+
     def can_batch(
         self, batch: NodeBatch, model_inputs: list[NodeInputs]
     ):
-        return batch.graph_walk in ["decode", "prefill_text"]
+        return batch.graph_walk in ["decode", "prefill_text", "prefill_vit"]
 
     def postprocess(
         self, request_id: str,

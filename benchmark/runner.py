@@ -388,12 +388,8 @@ class Benchmark:
         else:  # ONLINE
             wave_size = 1
 
-        # Replicate the first `wave_size` requests `num_warmup` times so we
-        # always have enough payloads even when the dataset is smaller than
-        # the wave size.
-        seed = requests[: max(1, wave_size)]
         warmup_total = wave_size * self.config.num_warmup
-        warmup_reqs = [seed[i % len(seed)] for i in range(warmup_total)]
+        warmup_reqs = [requests[i % len(requests)] for i in range(warmup_total)]
 
         if self.config.verbose:
             print(f"--- Warmup ({self.config.profiling_type.value}, {warmup_total} request(s), wave={wave_size}) ---")
@@ -486,6 +482,11 @@ def parse_args() -> BenchmarkConfig:
 
     # specific to image gen
     parser.add_argument("--disable-cfg", action="store_true")
+
+    # BAGEL-only: image preprocessing mode for our system's ViT/VAE encoders.
+    # "vllm" (default) matches vllm-omni's transforms for benchmark parity;
+    # "default" uses the BAGEL-codebase transforms.
+    parser.add_argument("--bagel-image-preprocess", choices=["default", "vllm"], default="vllm")
 
     # VBench args
     vbench = parser.add_argument_group("vbench")
@@ -588,7 +589,7 @@ def parse_args() -> BenchmarkConfig:
     # it so robotics models (Pi05, VJepa2AC) don't see a stray kwarg.
     model_type = ModelType(args.model)
     if model_type == ModelType.BAGEL:
-        model = model_type.inst(disable_cfg=args.disable_cfg)
+        model = model_type.inst(disable_cfg=args.disable_cfg, image_preprocess=args.bagel_image_preprocess)
     else:
         model = model_type.inst()
 
