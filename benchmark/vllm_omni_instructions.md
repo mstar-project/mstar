@@ -97,9 +97,17 @@ Or pass `--served-model-name inclusionAI/Ming-flash-omni-2.0` to `vllm serve`
 
 | Task | Status | Notes |
 |---|---|---|
-| T2T (text → text) | ✅ | offline B=1: 110 tok/s, closed-loop C=8: 493 tok/s |
-| I2T (image → text) | ✅ | TTFT 87ms, ~100 tok/s on Food101 |
+| T2T (text → text) | ✅ | offline B=1: 110 tok/s, closed-loop C=32: **1060 tok/s** (full scaling sweep in [`results/ming_t2t_sweep/SUMMARY.md`](../results/ming_t2t_sweep/SUMMARY.md)) |
+| I2T (image → text) | ✅ | TTFT 87 ms, ~100 tok/s on Food101 |
 | A2T (audio → text) | ✅ | English transcription + Chinese audio QA both work |
-| T2S (text → speech) | ✅ | RTF 0.14, 24 kHz mono PCM out |
-| V2T / V2S / I2S / A2S | not run | should work — same talker/thinker paths |
+| T2S (text → speech) | ✅ | RTF 0.14, 24 kHz mono PCM via harness; 44.1 kHz via direct OpenAI path |
+| V2T (video → text) | ✅ | Local Ming demo mp4s; coherent descriptions (`yoga.mp4` → yoga pose narration, `cup_change.mp4` → "shell game") |
+| V2S (video → speech) | ✅ | Local Ming demo mp4s; 2-3 MB WAV/clip @ 44.1 kHz |
+| I2S (image → speech) | ✅ | Food101 in, ~7 s/req for ~48 s of audio |
+| A2S (audio → speech) | ✅ | Ming sample wavs; 0.5-3 MB WAV/clip @ 44.1 kHz |
 | T2I / I2I (image gen) | not wired | requires `ming_flash_omni_image.yaml` + a benchmark wrapper similar to BAGEL's `/v1/images/generations` path |
+
+The V2T/V2S/A2S runs sidestep the bench harness's `UCF101Dataset` and
+`LibriSpeechDataset` (both want fresh HF-Hub downloads) by hitting
+`/v1/chat/completions` directly with base64-inlined media from local files
+(Ming repo's `figures/cases/*.mp4` and `data/wavs/*.wav`).
