@@ -8,10 +8,61 @@ scaffold today; everything below is the punch list to make it real.
 - `benchmark/base.py` has `MingFlashOmni` + `ModelType.MING_FLASH_OMNI`.
   Benchmarking against a vllm-omni server **works today** with
   `--inference-system vllm_omni` (see `benchmark/vllm_omni_instructions.md`).
-- `mminf/model/ming_omni_flash/` ships only the file/class shape.
-  `MingFlashOmniModel.__init__` and every abstractmethod raise
-  `NotImplementedError`. `mminf-serve --config configs/ming_flash_omni.yaml`
-  will fail at startup until the work below is done.
+- Step 1 (config port) — DONE. `mminf/model/ming_omni_flash/config.py`
+  loads the released ckpt; 10 tests in `test/modular/test_ming_flash_omni_config.py`.
+- Step 2 (tokenizer + processor wiring) — DONE.
+  `MingFlashOmniModel.__init__` resolves the snapshot, stages Ming source
+  files (see "Ming source dependency" below), and loads
+  `BailingTokenizer` + `BailingMM2Processor` with graceful fallback;
+  11 tests in `test/modular/test_ming_flash_omni_tokenizer.py`.
+- Everything else in `MingFlashOmniModel` still raises `NotImplementedError`
+  — `mminf-serve --config configs/ming_flash_omni.yaml` will fail at
+  startup until step 3+ lands.
+
+## Ming source dependency (loading the tokenizer/processor)
+
+The released HF checkpoint `inclusionAI/Ming-flash-omni-2.0` ships
+**only weights and sub-dir configs**. The tokenizer/processor Python
+modules (`configuration_bailingmm2.py`, `tokenization_bailing.py`,
+`processing_bailingmm2.py`, etc.) live in the source repo at
+https://github.com/inclusionAI/Ming . To load the tokenizer/processor:
+
+```bash
+# 1. Clone the source repo
+git clone https://github.com/inclusionAI/Ming.git /path/to/Ming
+
+# 2. Install extra Python deps Ming's modules depend on
+pip install opencv-python-headless openai-whisper
+
+# 3. Tell mminf where to find the source repo
+export MING_CODE_DIR=/path/to/Ming
+# (or pass ming_code_dir="/path/to/Ming" to MingFlashOmniModel)
+```
+
+`MingFlashOmniModel.__init__` (via `_prepare_tokenizer_dir`) symlinks
+the required .py and .json files from `$MING_CODE_DIR` alongside the
+snapshot's `config.json` so transformers' `trust_remote_code` machinery
+can resolve them. The snapshot dir is also pushed onto `sys.path` so
+the dynamic-module loader's sibling imports resolve.
+
+## Role-handling nuance (chat templates)
+
+Ming-flash-omni-2.0 ships **two** chat-template implementations with
+**different role conventions**:
+
+- `tokenizer.apply_chat_template(messages)` — uses the **jinja template
+  in `tokenizer_config.json`**. Accepts standard OpenAI roles
+  (`user` / `assistant` / `system`) and remaps them to Ming's uppercase
+  `HUMAN` / `ASSISTANT` / `SYSTEM` inside the template. This is the path
+  vllm-omni's serving layer uses → the benchmark side works unchanged.
+
+- `processor.apply_chat_template(messages, sys_prompt_exp=..., use_cot_system_prompt=...)`
+  — uses the **Python implementation in `BailingMM2Processor`** (Ming
+  source repo). **Strict**: asserts `role in [HUMAN, ASSISTANT]` and
+  raises `AssertionError` on lowercase OpenAI roles. The native mminf
+  `process_prompt` (step 7) will need this path for the multimodal
+  preprocessing (vision feature extraction, audio padding, etc.) and
+  must explicitly remap roles before calling.
 
 ## Upstream reference
 
@@ -53,16 +104,19 @@ graph-walk / partition / streaming patterns transfer 1:1.
 
 ## Punch list (in order)
 
-1. **Config port.** Fill `config.py` by mirroring vllm-omni's
-   `MingFlashOmniConfig` field tree. Add `from_pretrained` that reads
-   `config.json` from the HF snapshot. Verify by loading the released
-   checkpoint and printing key dims.
+1. **Config port — DONE.** `mminf/model/ming_omni_flash/config.py`
+   loads `config.json` + sibling subdir configs (talker / image-gen) into
+   a dataclass tree. Verified via 10 tests in
+   `test/modular/test_ming_flash_omni_config.py`.
 
-2. **Tokenizer + processor.** In `MingFlashOmniModel.__init__`, load the
-   HF `AutoTokenizer` + `AutoProcessor` from the snapshot with
-   `trust_remote_code=True`. Chat-template role map is `user→HUMAN`,
-   `assistant→ASSISTANT`, `system→SYSTEM` (uppercase internally); the HF
-   processor handles this — the wire-level OpenAI shape is unchanged.
+2. **Tokenizer + processor — DONE.** `MingFlashOmniModel.__init__`
+   resolves the snapshot, stages Ming source files alongside it (see
+   "Ming source dependency" above), and loads `BailingTokenizer` +
+   `BailingMM2Processor` with graceful fallback. The chat-template role
+   handling has two paths (see "Role-handling nuance" above); the native
+   `process_prompt` (step 7) will use the strict processor path and must
+   remap roles. Verified via 11 tests in
+   `test/modular/test_ming_flash_omni_tokenizer.py`.
 
 3. **Submodules (one per node) — start with the Thinker.** Define
    `submodules.py` registering each `NodeSubmodule` and a weight loader.

@@ -39,6 +39,8 @@ Mapping to vllm-omni source (use these as the porting cribsheet):
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from pathlib import Path
 
 import torch
@@ -65,6 +67,43 @@ _NOT_PORTED = (
 )
 
 
+# Files in the Ming GitHub repo (https://github.com/inclusionAI/Ming) that
+# the HF AutoTokenizer / AutoProcessor for Ming-flash-omni-2.0 needs to find
+# adjacent to the snapshot's ``config.json``. The HF checkpoint ships only
+# weights + sub-dir configs; the modeling/processing/tokenization Python
+# modules live in the source repo. ``_prepare_tokenizer_dir`` symlinks these
+# alongside the snapshot when both are available.
+_MING_CODE_FILES = (
+    # Python modules (configs, modeling, processing)
+    "configuration_audio.py",
+    "configuration_bailing_moe_v2.py",
+    "configuration_bailing_talker.py",
+    "configuration_bailingmm2.py",
+    "configuration_whisper_encoder.py",
+    "audio_processing_bailingmm2.py",
+    "bailingmm_utils.py",
+    "bailingmm_utils_video.py",
+    "chat_format.py",
+    "image_processing_bailingmm2.py",
+    "modeling_bailing_moe_v2.py",
+    "modeling_bailing_talker.py",
+    "modeling_bailingmm2.py",
+    "modeling_utils.py",
+    "modeling_whisper_encoder.py",
+    "processing_bailingmm2.py",
+    "qwen2_5_vit.py",
+    "qwen3_moe_vit.py",
+    "s3bpe_tokenizer.py",
+    "tokenization_bailing.py",
+    # JSON assets the processor / tokenizer load from disk
+    "preprocessor_config.json",
+    "processor_config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+)
+
+
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
     """Resolve a HF repo id to a local snapshot path (downloading if needed).
 
@@ -87,6 +126,58 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
     return str(Path(local_dir))
 
 
+def _find_ming_code_dir() -> str | None:
+    """Locate a clone of https://github.com/inclusionAI/Ming on disk.
+
+    Lookup order:
+      1. ``MING_CODE_DIR`` environment variable (explicit override).
+      2. ``./Ming`` or ``/tmp/ming_repo`` (common dev locations).
+      3. Any directory on ``sys.path`` containing ``configuration_bailingmm2.py``.
+
+    Returns ``None`` if nothing is found. Caller is responsible for surfacing
+    a clear error/warning in that case.
+    """
+    override = os.environ.get("MING_CODE_DIR")
+    candidates: list[str] = []
+    if override:
+        candidates.append(override)
+    candidates.extend(["./Ming", "/tmp/ming_repo"])
+    candidates.extend(sys.path)
+
+    for c in candidates:
+        if c and (Path(c) / "configuration_bailingmm2.py").exists():
+            return str(Path(c).resolve())
+    return None
+
+
+def _prepare_tokenizer_dir(snapshot_dir: str, ming_code_dir: str) -> None:
+    """Symlink Ming source files alongside the snapshot's ``config.json``.
+
+    ``transformers.AutoTokenizer.from_pretrained(snapshot, trust_remote_code=True)``
+    resolves ``auto_map`` references (e.g. ``configuration_bailingmm2.py``)
+    by file path adjacent to ``config.json`` — not via PYTHONPATH. We bridge
+    that by symlinking the .py files from ``ming_code_dir`` into the snapshot
+    dir. Idempotent: existing files (and existing symlinks) are skipped, so
+    re-running on a populated snapshot is a no-op.
+    """
+    snap = Path(snapshot_dir)
+    src = Path(ming_code_dir)
+    for name in _MING_CODE_FILES:
+        target = snap / name
+        if target.exists() or target.is_symlink():
+            continue
+        source = src / name
+        if not source.exists():
+            continue
+        try:
+            target.symlink_to(source)
+        except OSError as e:
+            # Snapshot may be on a filesystem without symlink support, or
+            # may be read-only. Don't crash — the loader below will surface
+            # a clearer error if the file is still missing.
+            logger.debug("Failed to symlink %s -> %s: %s", target, source, e)
+
+
 class MingFlashOmniModel(Model):
     """Thinker + Talker + ImageGen native port of Ming-flash-omni-2.0.
 
@@ -98,8 +189,25 @@ class MingFlashOmniModel(Model):
         self,
         model_path_hf: str = "inclusionAI/Ming-flash-omni-2.0",
         cache_dir: str | None = None,
+        ming_code_dir: str | None = None,
         **kwargs,
     ):
+        """Load config + (best-effort) tokenizer + processor.
+
+        Args:
+            model_path_hf: HF repo id or local path to the Ming snapshot.
+            cache_dir: Override HF Hub cache for snapshot_download.
+            ming_code_dir: Path to a clone of github.com/inclusionAI/Ming
+                (must contain ``configuration_bailingmm2.py`` etc.). Required
+                for the tokenizer + processor — the HF checkpoint ships only
+                weights, the Python modules live in the source repo. Falls
+                back to MING_CODE_DIR env var, then to ``./Ming``,
+                ``/tmp/ming_repo``, and sys.path.
+
+        Subclasses' abstractmethods all still raise NotImplementedError; this
+        constructor only stages config / tokenizer / processor so the
+        verification tests for step-1/step-2 can exercise the load path.
+        """
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
 
@@ -107,10 +215,65 @@ class MingFlashOmniModel(Model):
         self.local_dir = local_dir
         self.config = MingFlashOmniModelConfig.from_pretrained(local_dir)
 
-        # Config is loaded so step-1 verification can exercise this path;
-        # everything below (submodules, graph walks, weight loading) still
-        # raises until later porting steps land.
+        # Tokenizer + processor. The released checkpoint ships only weights
+        # and sub-dir configs — no top-level tokenizer.json / vocab.json, and
+        # none of the .py modules that AutoTokenizer / AutoProcessor's
+        # ``trust_remote_code`` path expects to find next to config.json.
+        # We resolve those from a separately-cloned Ming source repo and
+        # symlink them in. If neither is available, we warn loudly and
+        # leave self.tokenizer / self._processor as None — process_prompt
+        # (step 7) will raise a clearer error then.
+        code_dir = ming_code_dir or _find_ming_code_dir()
+        if code_dir is not None:
+            _prepare_tokenizer_dir(local_dir, code_dir)
+            # transformers' trust_remote_code loader resolves sibling imports
+            # (e.g. ``configuration_bailing_moe_v2``) via ``sys.path``, not by
+            # scanning the snapshot dir. Push the snapshot onto sys.path so
+            # those imports succeed during dynamic module loading.
+            if local_dir not in sys.path:
+                sys.path.insert(0, local_dir)
+        self.ming_code_dir = code_dir
+
+        self.tokenizer = None
+        self._processor = None
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                local_dir, cache_dir=cache_dir, trust_remote_code=True,
+            )
+        except Exception as e:
+            self._warn_tokenizer_unavailable("tokenizer", e)
+
+        try:
+            from transformers import AutoProcessor
+            self._processor = AutoProcessor.from_pretrained(
+                local_dir, cache_dir=cache_dir, trust_remote_code=True,
+            )
+        except Exception as e:
+            self._warn_tokenizer_unavailable("processor", e)
+
+        # Lazy submodule cache — empty until later porting steps land.
+        self._submodule_cache: dict[str, object] = {}
+
         raise NotImplementedError(_NOT_PORTED)
+
+    @staticmethod
+    def _warn_tokenizer_unavailable(what: str, err: Exception) -> None:
+        """Single-place explanation of how to make the tokenizer/processor load.
+
+        Tokenizer + processor live in the Ming source repo, not the HF
+        checkpoint. Without them ``process_prompt`` can't run; the rest of
+        the model loads fine.
+        """
+        logger.warning(
+            "Ming-flash-omni-2.0 %s could not be loaded (%s: %s). "
+            "To enable it: (1) git clone https://github.com/inclusionAI/Ming "
+            "(2) pip install opencv-python-headless openai-whisper "
+            "(3) set MING_CODE_DIR=<path/to/Ming>. The snapshot ships only "
+            "weights; the tokenizer/processor Python modules live in the "
+            "source repo.",
+            what, type(err).__name__, str(err)[:200],
+        )
 
     # ------------------------------------------------------------------
     # Model ABC — every method below is a stub. Implement by mirroring

@@ -226,11 +226,19 @@ class MingFlashOmni(Model):
     benchmark at a vllm-omni instance with ``--inference-system vllm_omni``.
 
     Wire shape mirrors :class:`Qwen3Omni`: standard OpenAI
-    ``/v1/chat/completions`` with multimodal content parts. The HF processor
-    (loaded by vllm-omni via ``trust_remote_code: true``) maps OpenAI roles
-    (``user``/``assistant``/``system``) to Ming's internal uppercase roles
-    (``HUMAN``/``ASSISTANT``/``SYSTEM``) inside ``apply_chat_template`` — so
-    the benchmark sends the standard OpenAI shape unchanged.
+    ``/v1/chat/completions`` with multimodal content parts. The role remap
+    from OpenAI's ``user``/``assistant``/``system`` to Ming's internal
+    ``HUMAN``/``ASSISTANT``/``SYSTEM`` happens inside the jinja chat_template
+    shipped in ``tokenizer_config.json`` — vllm-omni renders prompts via
+    ``tokenizer.apply_chat_template`` which uses that jinja, so the benchmark
+    sends the standard OpenAI shape unchanged.
+
+    Caveat: Ming ALSO ships a Python-side ``BailingMM2Processor.apply_chat_template``
+    (in the Ming source repo) that is strict about uppercase roles and would
+    AssertionError on ``user``/``assistant``. mminf's native port uses that
+    processor for full multimodal preprocessing (vision/audio feature
+    extraction) and remaps roles in ``process_prompt`` accordingly — see
+    ``mminf/model/ming_omni_flash/`` and its tokenizer tests.
     """
 
     def get_hf_url(self):
