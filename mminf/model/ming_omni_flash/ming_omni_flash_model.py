@@ -39,6 +39,7 @@ Mapping to vllm-omni source (use these as the porting cribsheet):
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import torch
 
@@ -51,6 +52,7 @@ from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
 from mminf.graph.base import GraphSection, TensorPointerInfo
 from mminf.model.base import ForwardPassArgs, Model
+from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,28 @@ _NOT_PORTED = (
     "(see benchmark/vllm_omni_instructions.md) until this lands. Reference "
     "implementation: /sgl-workspace/vllm-omni/vllm_omni/model_executor/models/ming_flash_omni/."
 )
+
+
+def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
+    """Resolve a HF repo id to a local snapshot path (downloading if needed).
+
+    Mirrors mminf/model/qwen3_omni/qwen3_omni_model.py:_resolve_local_hf_snapshot.
+    Returns the repo id unchanged if the download fails — that way an
+    air-gapped environment with a pre-populated cache (or a local-path repo
+    id) still resolves.
+    """
+    from huggingface_hub import snapshot_download
+
+    try:
+        local_dir = snapshot_download(
+            repo_id=repo_id,
+            cache_dir=cache_dir,
+            local_files_only=False,
+        )
+    except Exception as e:
+        logger.warning("Error downloading from HuggingFace: %s", str(e))
+        return repo_id
+    return str(Path(local_dir))
 
 
 class MingFlashOmniModel(Model):
@@ -78,9 +102,14 @@ class MingFlashOmniModel(Model):
     ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
-        # Deliberately fail loudly on instantiation: every method below also
-        # raises, but stopping at __init__ avoids triggering a half-loaded
-        # 238 GB snapshot download for a model whose graph isn't ready.
+
+        local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
+        self.local_dir = local_dir
+        self.config = MingFlashOmniModelConfig.from_pretrained(local_dir)
+
+        # Config is loaded so step-1 verification can exercise this path;
+        # everything below (submodules, graph walks, weight loading) still
+        # raises until later porting steps land.
         raise NotImplementedError(_NOT_PORTED)
 
     # ------------------------------------------------------------------
