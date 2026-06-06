@@ -214,6 +214,70 @@ class Qwen3Omni(Model):
         }
 
 
+class MingFlashOmni(Model):
+    """Ming-flash-omni-2.0 (inclusionAI), the Ling-2.0 sparse-MoE omni model
+    (100B total / 6B active params) released 2026-02-11.
+
+    Reachable today via the vllm-omni server using
+    ``vllm_omni/deploy/ming_flash_omni.yaml`` (thinker+talker) or
+    ``ming_flash_omni_thinker_only.yaml`` (text-only). The native ``ours`` /
+    ``ours_openai`` backends will work once the mminf-side port under
+    ``mminf/model/ming_omni_flash/`` is finished — until then, point the
+    benchmark at a vllm-omni instance with ``--inference-system vllm_omni``.
+
+    Wire shape mirrors :class:`Qwen3Omni`: standard OpenAI
+    ``/v1/chat/completions`` with multimodal content parts. The HF processor
+    (loaded by vllm-omni via ``trust_remote_code: true``) maps OpenAI roles
+    (``user``/``assistant``/``system``) to Ming's internal uppercase roles
+    (``HUMAN``/``ASSISTANT``/``SYSTEM``) inside ``apply_chat_template`` — so
+    the benchmark sends the standard OpenAI shape unchanged.
+    """
+
+    def get_hf_url(self):
+        return "inclusionAI/Ming-flash-omni-2.0"
+
+    def get_openai_system_message(self) -> Optional[dict]:
+        # Ming-flash-omni-2.0's cookbook uses ``sys_prompt_exp=None`` and
+        # ``use_cot_system_prompt=False`` by default — there's no required
+        # "You are Ming…"-style preamble equivalent to Qwen3-Omni's. The HF
+        # processor's chat_template fills in any internal system text on its
+        # own, and vllm-omni's serving layer goes through that template via
+        # ``trust_remote_code``. Sending an explicit system message here only
+        # risks overriding the model's own defaults, so default to None.
+        return None
+
+    def get_model_kwargs(self, request_type: RequestType):
+        # Cap thinker output at 256 tokens for cross-system fairness — same
+        # rationale as Qwen3Omni: comparable runs need a fixed decode budget.
+        # vllm-omni's released stage default is ``max_tokens: 2048`` (see
+        # ``vllm_omni/deploy/ming_flash_omni.yaml`` stage 0); we lower it for
+        # benchmark parity. Send both ``max_tokens`` (OpenAI convention) and
+        # ``max_output_tokens`` (mminf's native kwarg) so the cap survives
+        # whichever ``--inference-system`` is in use.
+        #
+        # Force greedy on the thinker (``temperature=0.0`` at payload top-level
+        # in VLLMOmni.send_request) for deterministic text. The talker's
+        # sampling defaults live server-side in the deploy yaml
+        # (``stage_id: 1`` → ``temperature: 0.0`` per the released config) —
+        # we don't override them here.
+        return {
+            "max_tokens": 256,
+            "max_output_tokens": 256,
+        }
+
+    def get_supported_modalities(self):
+        return {
+            RequestType.T2T,
+            RequestType.T2S,
+            RequestType.I2T,
+            RequestType.I2S,
+            RequestType.A2T,
+            RequestType.A2S,
+            RequestType.V2T,
+            RequestType.V2S,
+        }
+
+
 class Pi05(Model):
     """Physical Intelligence Pi0.5 VLA model.
 
@@ -268,6 +332,7 @@ class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
     QWEN3OMNI = "qwen3omni"
+    MING_FLASH_OMNI = "ming_flash_omni"
     PI05 = "pi05"
     VJEPA2AC = "vjepa2ac"
 
@@ -278,6 +343,8 @@ class ModelType(Enum):
             return Orpheus(**kwargs)
         if self == ModelType.QWEN3OMNI:
             return Qwen3Omni(**kwargs)
+        if self == ModelType.MING_FLASH_OMNI:
+            return MingFlashOmni(**kwargs)
         if self == ModelType.PI05:
             return Pi05(**kwargs)
         if self == ModelType.VJEPA2AC:

@@ -1,0 +1,18 @@
+# Ming-flash-omni-2.0 — thinker-only deploy (text out, no talker).
+#
+# WIP: requires the native mminf port at mminf/model/ming_omni_flash/.
+#
+# Mirrors vllm-omni/deploy/ming_flash_omni_thinker_only.yaml: Thinker
+# (Ling-2.0 MoE) on TP=4 with full GPU memory budget. Useful for cheaper
+# benchmarking of the multimodal understanding path when speech output
+# isn't needed.
+
+model: "ming_flash_omni"
+max_seq_len: 32768
+node_groups:
+  - node_names: [audio_encoder, vision_encoder]
+    ranks: [0]
+
+  - node_names: [Thinker]
+    ranks: [0, 1, 2, 3]
+    tp_size: 4

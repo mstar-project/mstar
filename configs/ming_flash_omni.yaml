@@ -1,0 +1,31 @@
+# Ming-flash-omni-2.0 — thinker + talker + audio VAE.
+#
+# WIP: the native mminf model port at mminf/model/ming_omni_flash/ is a
+# scaffold (every abstractmethod raises NotImplementedError), so
+# `mminf-serve --config configs/ming_flash_omni.yaml` will fail at startup
+# until that port lands. Until then, benchmark Ming-flash-omni-2.0 via the
+# vllm-omni server (see benchmark/vllm_omni_instructions.md).
+#
+# Target topology mirrors vllm-omni/deploy/ming_flash_omni.yaml:
+#   * Thinker (Ling-2.0 sparse MoE LLM, the multimodal understanding core)
+#     wants TP=4 across GPUs 0-3.
+#   * Talker (CFM-based audio generator) colocates on GPU 3.
+#   * Audio VAE (codec -> waveform) and stateless encoders (vision / audio)
+#     can ride on rank 0.
+#
+# Node names below are the placeholders the scaffold will reference; rename
+# in lockstep with mminf/model/ming_omni_flash/ming_omni_flash_model.py once
+# the graph walks are implemented.
+
+model: "ming_flash_omni"
+max_seq_len: 32768
+node_groups:
+  - node_names: [audio_encoder, vision_encoder, AudioVAE]
+    ranks: [0]
+
+  - node_names: [Thinker]
+    ranks: [0, 1, 2, 3]
+    tp_size: 4
+
+  - node_names: [Talker]
+    ranks: [3]
