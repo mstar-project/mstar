@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mminf.model.components.linear import FusedColumnLinear
+
 
 def _resolve_activation(activation: str | Callable) -> Callable:
     """Resolve an activation name to a callable. Accepts the canonical
@@ -86,6 +88,48 @@ class GatedMLP(nn.Module):
         gate_up = F.linear(x, self.gate_up_proj_weight)
         gate, up = gate_up.split(self.intermediate_size, dim=-1)
         return self.down_proj(self.act(gate) * up)
+
+
+class FusedGatedMLP(nn.Module):
+    """SwiGLU-style gated MLP with the gate + up projections fused into a
+    single ``FusedColumnLinear`` (one GEMM instead of two): ``down(act(gate)
+    * up)``.
+    Unlike ``GatedMLP`` (separate Linears + post-load
+    ``consolidate_gate_up_weight``), this fuses from construction and loads
+    the separate ``gate_proj`` / ``up_proj`` checkpoint tensors straight
+    into the fused parameter via the loader's stacked-param rules (gate is
+    shard ``0``, up is shard ``1``). Use for models that fuse but don't
+    need TP.
+    Args:
+        hidden_size: input/output feature dim.
+        intermediate_size: gate/up output and down input feature dim.
+        activation: activation applied to the gate path. Either an HF
+            string (``silu`` / ``gelu`` / ``gelu_tanh``) or a callable.
+        bias: whether the linears have a bias term.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: str | Callable = "silu",
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.act = _resolve_activation(activation)
+        self.gate_up_proj = FusedColumnLinear(
+            hidden_size,
+            {0: intermediate_size, 1: intermediate_size},
+            bias=bias,
+        )
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = self.gate_up_proj(x).split(self.intermediate_size, dim=-1)
+        return self.down_proj(self.act(gate) * up)
+
 
 
 class MLP(nn.Module):

@@ -701,6 +701,10 @@ class LLMSubmodule(ARNodeSubmodule):
         result = ARNodeInputs.collate(inputs, stacking_method=StackingMethod.CAT)
         result["seq_lens"] = seq_lens
         result["requires_cfg"] =  requires_cfg
+        result["sample_token"] = any([
+            info.step_metadata.get("sample_prefill_token", True) \
+                for info in engine_inputs.per_request_info.values()
+        ])
         return result
 
     def _plan_for_graph_walk(
@@ -1183,6 +1187,7 @@ class LLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor | None=None,
         input_embeds: torch.Tensor | None=None,
+        sample_token: bool=False,
         requires_cfg: bool=False,
         **kwargs
     ) -> dict[str, NameToTensorList]:
@@ -1216,10 +1221,6 @@ class LLMSubmodule(ARNodeSubmodule):
                     out[rid] = {"logits": [out["__batched_logits__"][i]]}
             return out
         elif graph_walk == "prefill_vit":
-            sample_token = any([
-                info.step_metadata.get("sample_prefill_token", True) \
-                    for info in engine_inputs.per_request_info.values()
-            ])
             out = self._forward_prefill_vit(
                 cache_handle=cache_manager,
                 input_embeds=input_embeds,

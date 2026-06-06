@@ -67,6 +67,7 @@ from mminf.model.bagel.submodules import (
     ViTEncoderSubmodule,
 )
 from mminf.model.base import DECODE, ForwardPassArgs, Model
+from mminf.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mminf.model.submodule_base import NodeSubmodule
 from mminf.model.loader import iter_safetensors_file, load_hf_weights
 from mminf.utils.sampling import SamplingConfig
@@ -143,19 +144,47 @@ class _BagelViTEMA(nn.Module):
         self.vit_pos_embed = vit_pos_embed
 
 
+def _stacked_source_keys(
+    expected: set[str], stacked_params: list[StackedParamRule] | None,
+) -> set[str]:
+    """Expand fused parameter names into the per-shard checkpoint keys they
+    are loaded from.
+    ``_load_into`` filters the safetensors read to ``expected`` (the
+    module's own parameter names). When ``stacked_params`` fuse several
+    checkpoint tensors into one parameter (``q_proj`` / ``k_proj`` /
+    ``v_proj`` → ``qkv_proj``), the source keys differ from the fused name,
+    so they must be added to the read filter or the iterator would skip
+    them.
+    """
+    if not stacked_params:
+        return expected
+    keys = set(expected)
+    for name in expected:
+        for rule in stacked_params:
+            if rule.target_suffix in name:
+                keys.add(name.replace(rule.target_suffix, rule.source_suffix))
+    return keys
+
+
 def _load_into(
     module: nn.Module, source_path: Path, device: str,
+    stacked_params: list[StackedParamRule] | None = None,
 ) -> None:
     """Materialise ``module`` on ``device`` and load every parameter from
     ``source_path``. Raises ``KeyError`` if any parameter is missing from
     the checkpoint — the equivalent of the old ``enforce_missing_keys=True``
     safety net.
+    ``stacked_params`` routes per-shard checkpoint tensors into fused
+    parameters (e.g. ``q/k/v_proj`` → ``qkv_proj``); pass it for modules
+    that use ``FusedColumnLinear`` projections.
     """
     module.to_empty(device=device)
     expected = set(dict(module.named_parameters()).keys())
+    read_keys = _stacked_source_keys(expected, stacked_params)
     loaded = load_hf_weights(
         module,
-        iter_safetensors_file(source_path, device=device, keys=expected),
+        iter_safetensors_file(source_path, device=device, keys=read_keys),
+        stacked_params=stacked_params
     )
     missing = expected - loaded
     if missing:
@@ -272,6 +301,7 @@ class BagelModel(Model):
         _load_into(
             _BagelLLMEMA(self.language_model, self.llm2vae),
             ema_path, device,
+            stacked_params=LLAMA_STACKED_PARAMS,
         )
 
         if not self.vae_initialized:

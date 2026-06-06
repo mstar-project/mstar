@@ -11,7 +11,8 @@ room for that.
 """
 from mminf.model.components.attention import Attention
 from mminf.model.components.decoder_layer import DecoderLayer, GatedDecoderLayer
-from mminf.model.components.mlp import MLP, GatedMLP
+from mminf.model.components.linear import FusedColumnLinear
+from mminf.model.components.mlp import MLP, FusedGatedMLP, GatedMLP
 from mminf.model.components.moe import (
     ParallelSparseMoeBlock,
     ParallelSparseMoeBlockWithSharedExpert,
@@ -23,9 +24,11 @@ from mminf.model.components.moe import (
 from mminf.model.components.norm import AdaRMSNorm, RMSNorm
 
 __all__ = [
-    "Attention",
+        "Attention",
     "DecoderLayer",
     "GatedDecoderLayer",
+    "FusedColumnLinear",
+    "FusedGatedMLP",
     "MLP",
     "GatedMLP",
     "ParallelSparseMoeBlock",

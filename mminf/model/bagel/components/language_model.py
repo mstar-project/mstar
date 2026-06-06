@@ -18,6 +18,7 @@ from transformers.activations import ACT2FN
 
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.model.bagel.config import BagelModelConfig
+from mminf.model.components import FusedColumnLinear, FusedGatedMLP
 from mminf.utils.flashinfer_utils import run_rms_norm
 
 
@@ -44,18 +45,14 @@ class BagelRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-class BagelMLP(nn.Module):
+class BagelMLP(FusedGatedMLP):
     def __init__(self, config: BagelModelConfig):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, hidden_state):
-        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+        super().__init__(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            activation=ACT2FN[config.hidden_act],
+            bias=False,
+        )
 
 
 def split_function_mot(
@@ -108,9 +105,14 @@ class BagelAttentionMoT(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+        # Fused QKV: q/k/v are loaded from the separate ``q_proj`` / ``k_proj``
+        # / ``v_proj`` checkpoint tensors into one GEMM via the loader's
+        # stacked-param rules. ``_split_qkv`` slices the fused output back
+        # into per-head q / k / v.
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_key_value_heads * self.head_dim
+        qkv_shards = {"q": self.q_size, "k": self.kv_size, "v": self.kv_size}
+        self.qkv_proj = FusedColumnLinear(self.hidden_size, qkv_shards, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
         if self.config.qk_norm:
@@ -124,10 +126,19 @@ class BagelAttentionMoT(nn.Module):
             self.q_norm_moe_gen = nn.Identity()
             self.k_norm_moe_gen = nn.Identity()
 
-        self.q_proj_moe_gen = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+        self.qkv_proj_moe_gen = FusedColumnLinear(self.hidden_size, qkv_shards, bias=True)
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+    def _split_qkv(
+        self, qkv: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Slice a fused ``[N, q + k + v]`` projection into per-head q / k / v."""
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        return (
+            q.view(-1, self.num_heads, self.head_dim),
+            k.view(-1, self.num_key_value_heads, self.head_dim),
+            v.view(-1, self.num_key_value_heads, self.head_dim),
+        )
 
     def forward(
         self,
@@ -140,14 +151,8 @@ class BagelAttentionMoT(nn.Module):
         text_mask=None,
     ):
         if mode == "und":
-            query_states = self.q_proj(query_sequence).view(
-                -1, self.num_heads, self.head_dim
-            )
-            key_states = self.k_proj(query_sequence).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
-            value_states = self.v_proj(query_sequence).view(
-                -1, self.num_key_value_heads, self.head_dim
+            query_states, key_states, value_states = self._split_qkv(
+                self.qkv_proj(query_sequence)
             )
 
             query_states = run_rms_norm(
@@ -159,51 +164,44 @@ class BagelAttentionMoT(nn.Module):
 
         elif mode == "gen":
             mot_kwargs = dict(
-                query_sequence=query_sequence,
                 text_idxs=text_indexes,
                 img_idxs=vae_token_indexes,
                 text_mask=text_mask,
                 static_vae_idxs=static_vae_idxs
             )
+            # MoT-route the fused QKV projection (text tokens use the
+            # understanding expert, image/VAE tokens use the gen expert),
+            # then slice into per-head q / k / v.
+            query_states, key_states, value_states = self._split_qkv(
+                split_function_mot(
+                    text_function=self.qkv_proj,
+                    image_fuction=self.qkv_proj_moe_gen,
+                    query_sequence=query_sequence,
+                    **mot_kwargs,
+                )
+            )
+            # QK-norm weights also differ per expert, so route them too.
             query_states = split_function_mot(
                 text_function=lambda seq: run_rms_norm(
-                    self.q_proj(seq).view(
-                        -1, self.num_heads, self.head_dim
-                    ),
-                    self.q_norm.weight,
-                    eps=self.q_norm.variance_epsilon
+                    seq, self.q_norm.weight, eps=self.q_norm.variance_epsilon
                 ),
                 image_fuction=lambda seq: run_rms_norm(
-                    self.q_proj_moe_gen(seq).view(
-                        -1, self.num_heads, self.head_dim
-                    ),
-                    self.q_norm_moe_gen.weight,
-                    eps=self.q_norm_moe_gen.variance_epsilon
-                ), **mot_kwargs
+                    seq, self.q_norm_moe_gen.weight,
+                    eps=self.q_norm_moe_gen.variance_epsilon,
+                ),
+                query_sequence=query_states,
+                **mot_kwargs,
             )
             key_states = split_function_mot(
                 text_function=lambda seq: run_rms_norm(
-                    self.k_proj(seq).view(
-                        -1, self.num_key_value_heads, self.head_dim
-                    ),
-                    self.k_norm.weight,
-                    eps=self.k_norm.variance_epsilon
+                    seq, self.k_norm.weight, eps=self.k_norm.variance_epsilon
                 ),
                 image_fuction=lambda seq: run_rms_norm(
-                    self.k_proj_moe_gen(seq).view(
-                        -1, self.num_key_value_heads, self.head_dim
-                    ),
-                    self.k_norm_moe_gen.weight,
-                    eps=self.k_norm_moe_gen.variance_epsilon
-                ), **mot_kwargs
-            )
-            value_states = split_function_mot(
-                text_function=lambda seq: self.v_proj(seq).view(
-                    -1, self.num_key_value_heads, self.head_dim
+                    seq, self.k_norm_moe_gen.weight,
+                    eps=self.k_norm_moe_gen.variance_epsilon,
                 ),
-                image_fuction=lambda seq: self.v_proj_moe_gen(seq).view(
-                    -1, self.num_key_value_heads, self.head_dim
-                ), **mot_kwargs
+                query_sequence=key_states,
+                **mot_kwargs,
             )
 
         # RoPE: pos_ids pre-computed by plan_rope before the LLM forward
