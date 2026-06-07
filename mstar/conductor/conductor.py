@@ -899,6 +899,10 @@ class Conductor:
             pstate.produced_edge_idx[name] = max(pstate.produced_edge_idx.get(name, 0), idx)
         for name, idx in body.new_consumed_edge_idx.items():
             pstate.consumed_edge_idx[name] = max(pstate.consumed_edge_idx.get(name, 0), idx)
+        # Unlike the indices above, graph walks have no ordering to max-merge on,
+        # so this is a plain last-writer-wins update. Contract: a reporting rank
+        # must send either the correct (just-applied) consumer walk or nothing —
+        # a non-emitting TP sibling sends an empty dict, never a stale walk.
         pstate.tracked_consumer_graph_walks.update(body.consumer_graph_walk_transitions)
 
         # Persist signals: every rank contributes its shard (different uuid +
