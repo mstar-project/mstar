@@ -819,7 +819,7 @@ class Worker:
                         request_id=request_id, uuid=info.uuid
                     ) for info in edge.tensor_info
                 ]
-                if edge.is_streaming and edge._final_stream_chunk:
+                if edge._final_stream_chunk:
                     final_stream_rids.add(request_id)
             per_request_inputs[request_id] = tensors
             per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
