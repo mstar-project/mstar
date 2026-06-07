@@ -1,5 +1,3 @@
-from copy import deepcopy
-from itertools import chain
 import logging
 import os
 import sys
@@ -490,7 +488,7 @@ class Worker:
         # a conductor-triggered forward pass, not just streaming data from another
         # partition). Streaming-only InputSignals must not overwrite the current
         # partition's fwd_info.
-        if non_streaming:
+        if non_streaming or not body.inputs:
             # Tag each input with the walk the conductor intends it for. Must be
             # done BEFORE update_request_info: for producer-triggered partitions
             # that call rewrites body.request_info.graph_walk to the stream walk.
@@ -738,7 +736,6 @@ class Worker:
 
                 if not self.worker_graphs_manager.has_partition(request_id, partition_name):
                     continue
-                wgid = self.worker_graphs_manager.get_worker_graph_id_for_node(request_id, consumer_node)
 
                 # Only transition the walk when the worker graph is in a fully
                 # reset (clean) state — no partial progress that the scheduler
@@ -977,6 +974,7 @@ class Worker:
     def _send_outputs(
         self, request_id: str, outputs: NodeOutputRouting,
         nested_loop_indices: NestedLoopIndices,
+        consumer_graph_walk_transitions,
         graph_walk: str | None = None,
         partition_name: str | None = None,
         prematerialized_new_tokens: dict[str, list[int]] | None = None,
@@ -1060,47 +1058,8 @@ class Worker:
                 )
                 self.communicator.send("api_server", message)
 
-        produced_streaming_edges: set[str] = set()
-        consumer_graph_walk_transitions: dict[str, WalkTransition] = {}
-
-        # Handle streaming edges
-        # Local streaming: route to StreamBuffer
         req_info = self.worker_graphs_manager.per_request_info[request_id]
         fwd_info = self.worker_graphs_manager.get_fwd_info(request_id, partition_name)
-
-        # One stream index per logical edge per pass. A single edge may fan out
-        # to several physical copies (local + one per consumer-shard worker);
-        # they all carry the same _index so the consumer's dedup/PD-reseed sees
-        # one item, not N. Assign the index once, reuse it for every copy.
-        edge_indices: dict[str, int] = {}
-        for edge in chain(outputs.streaming_local, *outputs.streaming_to_workers.values()):
-            if edge.name not in produced_streaming_edges:
-                produced_streaming_edges.add(edge.name)
-                edge_indices[edge.name] = fwd_info.produced_edge_idx.get(edge.name, 0)
-                fwd_info.produced_edge_idx[edge.name] = edge_indices[edge.name] + 1
-                conn = self.edge_to_connection.get(edge.name)
-                if conn and conn.consumer_walk_transition:
-                    consumer_graph_walk_transitions[edge.name] = conn.consumer_walk_transition(
-                        ConsumerTransitionCtx(
-                            producer_walk=graph_walk,
-                            consumer_walk=fwd_info.tracked_consumer_graph_walks.get(
-                                conn.to_partition
-                            ),
-                            producer_fwd=fwd_info
-                        )
-                    )
-
-            edge._index = edge_indices[edge.name]
-            walk_transition = consumer_graph_walk_transitions.get(edge.name)
-            edge._graph_walk_transition = walk_transition.graph_walk if walk_transition else None
-
-        # Advance our local view of each consumer's walk by the transition just
-        # emitted: inside a dynamic loop there is no conductor round-trip to
-        # refresh tracked_consumer_graph_walks. After the edge loop so all edges
-        # of a pass see the same (pre-update) consumer walk.
-        for edge_name, wt in consumer_graph_walk_transitions.items():
-            to_partition = self.edge_to_connection[edge_name].to_partition
-            fwd_info.tracked_consumer_graph_walks[to_partition] = wt.graph_walk
 
         for edge in outputs.streaming_local:
             stream_buf = req_info.stream_buffers[edge.name]
@@ -1806,6 +1765,7 @@ class Worker:
         # Mark nodes complete and route
         routing_per_request: dict[str, NodeOutputRouting] = {}
         per_request_uuids: dict[str, set[str]] = {}
+        consumer_walk_transitions_per_rid: dict[str, dict[str, WalkTransition]] = {}
         for rid, wg_id in batch_N.batch.request_to_worker_graph.items():
             # Store output tensors before marking the node as complete so that
             # loop outputs can be buffered properly.
@@ -1830,6 +1790,52 @@ class Worker:
                 rid, wg_id, batch_N.node_name
             )
             real_outputs = [edge.clone() for edge in completion_output.output_edges]
+
+            # Handle streaming edges
+            # Local streaming: route to StreamBuffer
+            req_info = self.worker_graphs_manager.per_request_info[rid]
+            fwd_info = self.worker_graphs_manager.get_fwd_info(rid, batch_N.partition)
+            produced_streaming_edges: set[str] = set()
+            consumer_graph_walk_transitions: dict[str, WalkTransition] = {}
+
+            # One stream index per logical edge per pass. A single edge may fan out
+            # to several physical copies (local + one per consumer-shard worker);
+            # they all carry the same _index so the consumer's dedup/PD-reseed sees
+            # one item, not N. Assign the index once, reuse it for every copy.
+            edge_indices: dict[str, int] = {}
+            for edge in real_outputs:
+                if not edge.is_streaming:
+                    continue
+                if edge.name not in produced_streaming_edges:
+                    produced_streaming_edges.add(edge.name)
+                    edge_indices[edge.name] = fwd_info.produced_edge_idx.get(edge.name, 0)
+                    fwd_info.produced_edge_idx[edge.name] = edge_indices[edge.name] + 1
+                    conn = self.edge_to_connection.get(edge.name)
+                    if conn and conn.consumer_walk_transition:
+                        consumer_graph_walk_transitions[edge.name] = conn.consumer_walk_transition(
+                            ConsumerTransitionCtx(
+                                producer_walk=batch_N.graph_walk,
+                                consumer_walk=fwd_info.tracked_consumer_graph_walks.get(
+                                    conn.to_partition
+                                ),
+                                producer_fwd=fwd_info
+                            )
+                        )
+
+                edge._index = edge_indices[edge.name]
+                walk_transition = consumer_graph_walk_transitions.get(edge.name)
+                edge._graph_walk_transition = walk_transition.graph_walk if walk_transition else \
+                    fwd_info.tracked_consumer_graph_walks.get(
+                        self.edge_to_connection[edge.name].to_partition
+                    )
+            # Advance our local view of each consumer's walk by the transition just
+            # emitted: inside a dynamic loop there is no conductor round-trip to
+            # refresh tracked_consumer_graph_walks. After the edge loop so all edges
+            # of a pass see the same (pre-update) consumer walk.
+            for edge_name, wt in consumer_graph_walk_transitions.items():
+                to_partition = self.edge_to_connection[edge_name].to_partition
+                fwd_info.tracked_consumer_graph_walks[to_partition] = wt.graph_walk
+            consumer_walk_transitions_per_rid[rid] = consumer_graph_walk_transitions
 
             routing_per_request[rid] = self.worker_graphs_manager.process_node_outputs(
                 rid, node_name=batch_N.node_name,
@@ -1871,6 +1877,7 @@ class Worker:
             self._send_outputs(
                 rid, routing,
                 nested_loop_indices=per_req_nested_idxs[rid],
+                consumer_graph_walk_transitions=consumer_walk_transitions_per_rid.get(rid, {}),
                 graph_walk=batch_N.graph_walk,
                 partition_name=batch_N.partition,
                 node_speculatively_scheduled=batch_N.batch.node_objects[rid]._speculatively_scheduled

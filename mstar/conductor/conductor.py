@@ -217,8 +217,23 @@ class Conductor:
 
         # (1) Set up worker graph TP ranks
         # (2) Assert that streaming consumers don't have graph-walk-specific sharding config
-        self.streaming_consumers = set()
+        self.state_machine_streaming_consumers = set()
+        state_machine_controlled_walks = set()
+        self.gw_to_part = {}
+        self.part_to_walks: dict[str, set[str]] = {}
+        for part_def in self.model.get_partitions():
+            if part_def.transition_source == TransitionSource.STATE_MACHINE:
+                state_machine_controlled_walks.update(part_def.graph_walks)
+            self.gw_to_part.update({
+                gw: part_def.name for gw in part_def.graph_walks
+            })
+            self.part_to_walks[part_def.name] = set(part_def.graph_walks)
+
         self.node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
+
+
+        # partition name -> producer-triggered streaming consumer node names
+        self.producer_triggered_nodes: dict[str, set[str]] = dict()
 
         # (worker idx) -> {tp_group_str: tp_rank}
         self.worker_tp_group_to_tp_rank: dict[int, dict[str, int]] = {}
@@ -228,10 +243,20 @@ class Conductor:
             for walk in wg.graph_walks:
                 graph_walks.add(walk)
             for name, node in wg.section.get_nodes().items():
+                state_machine_controlled = False
                 for walk in wg.graph_walks:
                     self.node_walk_to_wg[(name, walk)] = wg
-                if node.consumes_stream:
-                    self.streaming_consumers.add(name)
+                    if walk in state_machine_controlled_walks:
+                        state_machine_controlled = True
+                if node.consumes_stream and state_machine_controlled:
+                    self.state_machine_streaming_consumers.add(name)
+                elif node.consumes_stream and wg.graph_walks:
+                    # Producer-triggered streaming consumer (e.g. PD-disaggregated
+                    # Talker). All walks of a wg belong to one partition, so any
+                    # of them resolves the partition.
+                    self.producer_triggered_nodes.setdefault(
+                        self.gw_to_part[next(iter(wg.graph_walks))], set()
+                    ).add(name)
 
         # v1: one sharding group per worker graph. Track which group "owns"
         # each wg so we can assert single-group-per-wg.
@@ -239,7 +264,7 @@ class Conductor:
 
         for group in self.default_sharding_config.groups:
             if group.graph_walks is not None and any([
-                node in self.streaming_consumers for node in group.nodes
+                node in self.state_machine_streaming_consumers for node in group.nodes
             ]):
                 raise RuntimeError((
                     f"Sharding group with nodes {group.nodes} includes a streaming consumer but "
@@ -461,7 +486,7 @@ class Conductor:
                 for node_name in wg.section.get_nodes():
                     node_to_workers[NodeAndGraphWalk(node_name, walk)] = worker_ids
         cfg.setup(node_to_workers)
-        cfg.assert_stream_consumer_compatibility(self.streaming_consumers)
+        cfg.assert_stream_consumer_compatibility(self.state_machine_streaming_consumers)
         return cfg
 
     def _split_inputs_to_workers(
@@ -478,6 +503,19 @@ class Conductor:
         per dest, which the consumer's fan-in path consolidates.
         """
         inputs_per_worker: dict[str, list[GraphEdge]] = defaultdict(list)
+
+        # Seed empty inputs for producer-triggered streaming consumers (PD disag)
+        # across ALL the partition's walks, not just the conductor's current
+        # (lagging) walk — otherwise only the prefill worker is reached, never
+        # decode. set_index is monotonic, so re-seeding is a no-op.
+        part = self.gw_to_part.get(graph_walk)
+        for node in self.producer_triggered_nodes.get(part, set()):
+            for walk in self.part_to_walks.get(part, set()):
+                for worker in sharding_config.node_to_worker.get(
+                    NodeAndGraphWalk(node, walk), [],
+                ):
+                    inputs_per_worker.setdefault(worker, [])
+
         for edge in inputs:
             if not edge.tensor_info:
                 # Signal-only — broadcast to every dest worker.
@@ -978,8 +1016,8 @@ class Conductor:
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
                     self._send_producer_done(request_id, conn.from_partition, conn.to_partition)
-        elif fwd_args.inputs:
-            # Partition has inputs to send — conductor-driven
+        else:
+            # Always send partition inputs so that stream buffer counts are updated properly
             self._send_partition_inputs(request_id, partition_name, fwd_args)
         # else: no inputs — partition self-triggers via StreamBuffer
 

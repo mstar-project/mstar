@@ -68,6 +68,7 @@ class StreamBuffer:
 
     def _update_buffer(self):
         while self._current_index in self._tensors:
+            print(f"{self.edge_name} INGEST {self._current_index}")
             self._buffer.append(self._tensors.pop(self._current_index))
             self._current_index += 1
 

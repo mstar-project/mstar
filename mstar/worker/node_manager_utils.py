@@ -18,6 +18,7 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, SPECIAL_DESTINATIONS
 from mstar.model.base import WorkerGraph
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.streaming.topology import StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
 
@@ -565,7 +566,7 @@ class WorkerGraphsManager:
             fanout = sharding_config.fanout_graph_edges(
                 edge, source_node=node_name,
                 source_graph_walk=graph_walk,
-                dest_graph_walk=None
+                dest_graph_walk=edge._graph_walk_transition
             )
             this_worker_edge = fanout.pop(self.worker_id, None)
             if this_worker_edge:
