@@ -595,6 +595,7 @@ class Qwen3OmniModel(Model):
         )
 
         first_walk = schedule[0][0] if schedule else "thinker_decode"
+        is_last_prefill = (schedule and len(schedule) == 1)
 
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
@@ -623,7 +624,7 @@ class Qwen3OmniModel(Model):
                 # Tell the Thinker whether to emit thinker_states.  Text only
                 # requests skip it to save cross-partition bandwidth.
                 "audio_output": audio_output,
-                "is_last_prefill": len(schedule) == 1
+                "is_last_prefill": is_last_prefill
             },
         )
 
