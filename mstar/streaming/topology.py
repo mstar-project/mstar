@@ -32,6 +32,8 @@ class StreamingGraphEdge(GraphEdge):
             is_streaming=self.is_streaming,
             output_modality=self.output_modality,
             _persist_for_loop=self._persist_for_loop,
+            _total_fanin=self._total_fanin,
+            _shard_dim=self._shard_dim,
             _target_graph_walk=self._target_graph_walk,
             target_partition=self.target_partition,
             _index=self._index,

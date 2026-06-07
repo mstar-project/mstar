@@ -31,6 +31,7 @@ from mstar.utils.ipc_format import (
     ConductorMessageType,
     InputSignals,
     NewRequest,
+    ProducerDone,
     RemoveRequest,
     ScheduleTPNode,
     SetupDone,
@@ -460,6 +461,16 @@ class Worker:
             self.tensor_manager.dereference(
                 body.request_id, uuid, n=ref_cnt
             )
+    
+    def _handle_producer_done(self, body: ProducerDone) -> None:
+        # Handle producer_done signal: mark all StreamBuffers for this request as done
+        req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
+        if req_info:
+            for sbuf in req_info.stream_buffers.values():
+                if sbuf.from_partition in body.producer_done:
+                    # If we have multiple consumer partitions colocated, we need to signal
+                    # the right one
+                    sbuf.signal_done()
 
     def _process_new_inputs(self, body: InputSignals) -> None:
         logger.debug(
@@ -470,14 +481,6 @@ class Worker:
 
         if self.enable_nvtx:
             range_push("process_new_inputs.routing_update")
-        # Handle producer_done signal: mark all StreamBuffers for this request as done
-        if body.producer_done:
-            if req_info:
-                for sbuf in req_info.stream_buffers.values():
-                    if sbuf.from_partition in body.producer_done:
-                        # If we have multiple consumer partitions colocated, we need to signal
-                        # the right one
-                        sbuf.signal_done()
 
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
@@ -575,7 +578,8 @@ class Worker:
         msg_types_needing_active_request = [
             WorkerMessageType.REMOVE_REQUEST,
             WorkerMessageType.INPUT_SIGNALS,
-            WorkerMessageType.STOP_LOOPS
+            WorkerMessageType.STOP_LOOPS,
+            WorkerMessageType.PRODUCER_DONE
         ]
         for message in messages:
             if (
@@ -593,6 +597,8 @@ class Worker:
                 self._remove_request(message.body)
             elif message.message_type == WorkerMessageType.INPUT_SIGNALS:
                 self._process_new_inputs(message.body)
+            elif message.message_type == WorkerMessageType.PRODUCER_DONE:
+                self._handle_producer_done(message.body)
             elif message.message_type == WorkerMessageType.TENSOR_RECEIVED:
                 self._handle_tensor_received(message.body)
             elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:

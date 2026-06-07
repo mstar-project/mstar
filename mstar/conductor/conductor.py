@@ -34,6 +34,7 @@ from mstar.utils.ipc_format import (
     InputSignals,
     NewRequest,
     NewRequestConductor,
+    ProducerDone,
     RemoveRequest,
     UnpersistTensors,
     WorkerGraphsDone,
@@ -1017,9 +1018,10 @@ class Conductor:
                     conn.producer_done = True
                     self._send_producer_done(request_id, conn.from_partition, conn.to_partition)
         else:
-            # Always send partition inputs so that stream buffer counts are updated properly
+            # Call even with no inputs: a no-op for self-triggering partitions
+            # (empty inputs_per_worker → no messages), but lets producer-triggered
+            # consumers get seeded (PD) / their consumed_edge_idx propagated.
             self._send_partition_inputs(request_id, partition_name, fwd_args)
-        # else: no inputs — partition self-triggers via StreamBuffer
 
         self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
 
@@ -1085,7 +1087,6 @@ class Conductor:
     ):
         """Send producer_done signal to the consumer partition's worker(s)."""
         request_data = self.requests[request_id]
-        pstate = request_data.partition_states[consumer_partition_name]
 
         # Find which workers handle this consumer partition
         consumer_workers = set()
@@ -1097,23 +1098,9 @@ class Conductor:
 
         for worker_id in consumer_workers:
             message = WorkerMessage(
-                message_type=WorkerMessageType.INPUT_SIGNALS,
-                body=InputSignals(
+                message_type=WorkerMessageType.PRODUCER_DONE,
+                body=ProducerDone(
                     request_id=request_id,
-                    inputs=[],
-                    request_info=CurrentForwardPassInfo(
-                        request_id=request_id,
-                        graph_walk=pstate.metadata.graph_walk or "",
-                        fwd_index=pstate.fwd_pass_number,
-                        random_seed=pstate.random_seed,
-                        requires_cfg=False,
-                        partition_name=consumer_partition_name,
-                        max_tokens=request_data.max_output_tokens,
-                        sampling_config=request_data.sampling_config,
-                        produced_edge_idx=pstate.produced_edge_idx,
-                        consumed_edge_idx=pstate.consumed_edge_idx,
-                        tracked_consumer_graph_walks=pstate.tracked_consumer_graph_walks,
-                    ),
                     partition_name=consumer_partition_name,
                     producer_done=set([producer_partition]),
                 ),

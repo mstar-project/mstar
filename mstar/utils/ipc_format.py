@@ -30,6 +30,7 @@ class WorkerMessageType(Enum):
     NEW_REQUEST = "new_request"
     REMOVE_REQUEST = "remove_request"
     INPUT_SIGNALS = "input_signals"
+    PRODUCER_DONE = "producer_done"
     UNPERSIST_TENSORS = "unpersist"
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
@@ -56,6 +57,12 @@ class InputSignals(MessageBody):
     inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
     partition_name: str = "default"
+
+
+@dataclass
+class ProducerDone(MessageBody):
+    request_id: str
+    partition_name: str
     producer_done: set = field(default_factory=set)
 
 

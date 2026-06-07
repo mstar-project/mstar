@@ -135,7 +135,6 @@ class FixedChunkPolicy(ChunkPolicy):
             the producer finishes and all buffered items are consumed.
     """
 
-    # TODO: make continue_after_done a set of graph walks
     def __init__(self, chunk_size: int, continue_after_done: set[str] | None=None):
         super().__init__()
         self._chunk_size = chunk_size

@@ -79,6 +79,7 @@ class StreamBuffer:
         the duplicate is dropped (first-arrival-wins). This handles the case
         where multiple colocated producer ranks emit the same streaming item.
         """
+        self._num_buffer_writes += 1
         if index < self._current_index or index in self._tensors:
             return
         self._tensors[index] = StreamingTensor(
@@ -86,7 +87,6 @@ class StreamBuffer:
             tensor=item,
             graph_walk=graph_walk,
         )
-        self._num_buffer_writes += 1
 
     def signal_done(self) -> None:
         """Producer signals no more items will arrive."""
