@@ -39,8 +39,8 @@ class ChunkPolicy(ABC):
         """Whether the buffer should keep producing (empty) chunks after the
         producer signals done and all buffered items have been consumed.
 
-        Default ``False``: the buffer sets ``reached_final_chunk`` after the
-        last item is flushed, which propagates partition-done to the conductor.
+        Default ``False``: partition-done is propagated to the conductor after
+        the last item is flushed.
 
         Set to ``True`` for connections where the consumer must keep running
         after the producer finishes (e.g., Thinker→Talker: the Talker

@@ -42,6 +42,9 @@ class NodeBatch:
     per_request_input_tensors: dict[str, NameToTensorList]
     per_request_info: dict[str, CurrentForwardPassInfo] = field(default_factory=dict)
     metadata: dict = field(default_factory=dict)
+    # rids whose consumed streaming input was the final chunk — this pass
+    # reports the partition done (see worker._postprocess_batch)
+    final_stream_rids: set[str] = field(default_factory=set)
 
 
 @dataclass

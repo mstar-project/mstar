@@ -299,10 +299,10 @@ class APIServer:
                                 self.pending_requests[rid]["final_outputs"] = \
                                     message.body.final_outputs
                         elif rid in self.recently_completed:
-                            logger.debug("Late message for completed %s", rid)
+                            logger.debug("Late message for completed %s: %s", rid, message.message_type)
                         else:
                             logger.warning(
-                                "Message for unknown request %s", rid
+                                "Message for unknown request %s: %s", rid, message.message_type
                             )
                 for result_chunk in self.preprocess_worker.get_result_chunks():
                     logger.debug(

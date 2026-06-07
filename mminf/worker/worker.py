@@ -622,6 +622,7 @@ class Worker:
                     next_node=consumer_node,
                     name=edge_name,
                     tensor_info=[],
+                    _final_stream_chunk=chunk.is_final,
                 )
             else:
                 # Normal chunk — store tensor and create edge with tensor_info.
@@ -639,6 +640,7 @@ class Worker:
                     next_node=consumer_node,
                     name=edge_name,
                     tensor_info=tensor_infos.get(edge_name, []),
+                    _final_stream_chunk=chunk.is_final,
                 )
         return synthetic_edge
 
@@ -672,23 +674,23 @@ class Worker:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
         for request_id, req_info in list(self.worker_graphs_manager.per_request_info.items()):
             for edge_name, sbuf in req_info.stream_buffers.items():
-                consumer_node = self._consumer_node_cache.get(edge_name, "")
-                partition_name = self.worker_graphs_manager.get_partition_for_node(consumer_node)
                 synthetic_edge = self._pop_streaming_edge(sbuf, edge_name, request_id)
 
                 if synthetic_edge is not None:
                     # Streaming edges go through the same path as regular ones —
                     # ReadySignals.is_ready_for_streaming flips on as soon as
                     # the streaming inputs are the only ones missing. Empty
-                    # leftover list means the edge was claimed.
+                    # leftover list means the edge was claimed. The final-chunk
+                    # signal rides the synthetic edge to the consuming pass,
+                    # which reports the partition done in _postprocess_batch —
+                    # NOT here, where an earlier in-flight pass's WGD could read
+                    # it before the final output chunk is emitted.
                     leftovers = self.worker_graphs_manager.process_new_streaming_inputs(
                         request_id=request_id, inputs=[synthetic_edge],
                         can_buffer=False # important: only ingest for this loop iter only!
                     )
                     if leftovers:
                         sbuf.store_uningested_edge(synthetic_edge)
-                    elif sbuf.reached_final_chunk:
-                        req_info.per_partition_info[partition_name].stream_partition_done = True
 
 
     def _check_ready_tensors(self) -> None:
@@ -805,6 +807,7 @@ class Worker:
         """Gather input tensors from tensor_manager for all requests in the batch."""
         per_request_inputs: dict[str, NameToTensorList] = {}
         per_request_info: dict[CurrentForwardPassInfo] = {}
+        final_stream_rids: set[str] = set()
         batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
         for request_id, node in batch.node_objects.items():
@@ -816,6 +819,8 @@ class Worker:
                         request_id=request_id, uuid=info.uuid
                     ) for info in edge.tensor_info
                 ]
+                if edge.is_streaming and edge._final_stream_chunk:
+                    final_stream_rids.add(request_id)
             per_request_inputs[request_id] = tensors
             per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
 
@@ -824,7 +829,8 @@ class Worker:
             graph_walk=batch.graph_walk,
             request_ids=list(batch.node_objects.keys()),
             per_request_input_tensors=per_request_inputs,
-            per_request_info=per_request_info
+            per_request_info=per_request_info,
+            final_stream_rids=final_stream_rids,
         )
     
     def maybe_send_zmq_to_tp_followers(
@@ -897,6 +903,7 @@ class Worker:
         graph_walk: str | None = None,
         partition_name: str | None = None,
         prematerialized_new_tokens: dict[str, list[int]] | None = None,
+        node_speculatively_scheduled: bool=False
     ) -> None:
         """
         Send outputs to other workers and to the conductor.
@@ -1002,8 +1009,10 @@ class Worker:
             if partition_name is None:
                 partition_name = getattr(fwd_info, 'partition_name', 'default')
             req_info = self.worker_graphs_manager.per_request_info.get(request_id)
-            p_done = req_info.per_partition_info[partition_name].stream_partition_done \
-                if req_info else False
+            p_done = (
+                req_info.per_partition_info[partition_name].stream_partition_done \
+                    and not node_speculatively_scheduled
+            ) if req_info else False
 
             # Collect stream consumption info
             stream_consumed = {}
@@ -1471,6 +1480,10 @@ class Worker:
                     rid, partition_N
                 ) for rid in request_ids
             },
+            final_stream_rids={
+                rid for rid, edges in consumed_streaming_edges.items()
+                if any(e._final_stream_chunk for e in edges)
+            },
         )
 
         logger.debug(f"Speculating: {spec_node_info.node_name} {spec_node_batch.request_ids}")
@@ -1718,6 +1731,13 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.send_outputs", synchronize=False)
 
+        # The consuming pass (not the earlier ingest) reports the partition
+        # done, so it rides this pass's WGD with the final output loop index.
+        for rid in batch_N.node_batch.final_stream_rids:
+            req_info = self.worker_graphs_manager.per_request_info.get(rid)
+            if req_info is not None:
+                req_info.per_partition_info[batch_N.partition].stream_partition_done = True
+
         # TODO: wire up the new token path (currently unused for any of the models)
         for rid, routing in routing_per_request.items():
             self._send_outputs(
@@ -1725,6 +1745,7 @@ class Worker:
                 nested_loop_indices=per_req_nested_idxs[rid],
                 graph_walk=batch_N.graph_walk,
                 partition_name=batch_N.partition,
+                node_speculatively_scheduled=batch_N.batch.node_objects[rid]._speculatively_scheduled
             )
 
         if self.enable_nvtx:

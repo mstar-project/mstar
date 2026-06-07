@@ -39,7 +39,6 @@ class StreamBuffer:
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
     _chunks_popped: int = 0
-    reached_final_chunk: bool = False
     producer_done: bool = False
 
     _num_tensors_registered = 0
@@ -121,7 +120,6 @@ class StreamBuffer:
         # consumer decides when it's done via its own model logic.
         if self.policy.continue_after_producer_done():
             is_final = False
-        self.reached_final_chunk = is_final
 
         chunk = StreamChunk(
             data=self._collate(items),

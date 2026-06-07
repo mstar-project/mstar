@@ -63,6 +63,9 @@ class GraphEdge:
     # only for EMIT_TO_CLIENT
     output_modality: str = field(default="")  # text | image | video | audio
     _persist_for_loop: bool = field(default=False)
+    # set on a synthetic streaming-input edge carrying the final chunk, so the
+    # consuming pass (not the earlier ingest) reports the partition done
+    _final_stream_chunk: bool = field(default=False)
 
     # Set for sharded configurations
     _total_fanin: int = 1
@@ -77,7 +80,8 @@ class GraphEdge:
             conductor_new_token=self.conductor_new_token,
             is_streaming=self.is_streaming,
             output_modality=self.output_modality,
-            _persist_for_loop=self._persist_for_loop
+            _persist_for_loop=self._persist_for_loop,
+            _final_stream_chunk=self._final_stream_chunk,
         )
 
 
