@@ -86,6 +86,8 @@ def test_ling_moe_block_text_only_forward_shape() -> None:
     with torch.no_grad():
         moe.experts.gate_up_proj.normal_(std=0.05)
         moe.experts.down_proj.normal_(std=0.05)
+        for p in moe.shared_expert.parameters():
+            p.normal_(std=0.05)
     x = torch.randn(6, 16)
     out = moe(x)
     assert out.shape == x.shape
@@ -112,6 +114,10 @@ def test_ling_moe_block_image_mask_routes_through_image_gate() -> None:
         moe.audio_gate.gate.weight.zero_()
         moe.experts.gate_up_proj.normal_(std=0.05)
         moe.experts.down_proj.normal_(std=0.05)
+        # ParallelGatedMLP shared expert uses torch.empty for init;
+        # initialise so forward doesn't produce NaN.
+        for p in moe.shared_expert.parameters():
+            p.normal_(std=0.05)
 
     N = 6
     x = torch.zeros(N, 16)
@@ -161,11 +167,19 @@ def test_ling_moe_block_shared_expert_contributes() -> None:
 
 
 def test_ling_moe_block_rejects_bad_mask_shape() -> None:
-    """A mask whose total elements don't match num_tokens raises."""
+    """A mask whose total elements don't match num_tokens raises.
+
+    The shape check happens before any heavy forward work, so init
+    isn't strictly necessary — but keeping it consistent with the other
+    tests means a future "rejects after partial forward" failure also
+    surfaces cleanly.
+    """
     moe = _make_moe()
     with torch.no_grad():
         moe.experts.gate_up_proj.normal_(std=0.05)
         moe.experts.down_proj.normal_(std=0.05)
+        for p in moe.shared_expert.parameters():
+            p.normal_(std=0.05)
     x = torch.randn(5, 16)
     bad = torch.zeros(3, dtype=torch.bool)   # wrong length
     with pytest.raises(ValueError, match="image_mask"):
@@ -200,13 +214,21 @@ def _tiny_model_kwargs() -> dict:
 
 
 def _init_dispatch_weights(model: LingMoeModel) -> None:
-    """Initialise fused expert tensors so _dispatch produces non-trivial
-    output (the constructor allocates them ``torch.empty``)."""
+    """Initialise every param the constructor allocated with
+    ``torch.empty`` (the Parallel* modules + the fused MoE experts).
+    Real weight loading overwrites these in production; tests need
+    init so we don't get NaN logits."""
     with torch.no_grad():
-        for layer in model.layers:
-            if layer.is_moe:
-                layer.mlp.experts.gate_up_proj.normal_(std=0.05)
-                layer.mlp.experts.down_proj.normal_(std=0.05)
+        for name, p in model.named_parameters():
+            if "norm" in name or "embed" in name:
+                # Norm weights default to 1.0 (initialise so RMSNorm is identity).
+                # Embed defaults to normal — match nn.Embedding init.
+                if "norm" in name:
+                    p.fill_(1.0)
+                else:
+                    p.normal_(std=0.02)
+            else:
+                p.normal_(std=0.05)
 
 
 def test_ling_moe_model_input_ids_xor_embeds_required() -> None:

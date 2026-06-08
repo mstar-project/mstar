@@ -1,12 +1,13 @@
-"""Ling-2.0 decoder layer (cache-aware, hybrid dense / MoE)."""
+"""Ling-2.0 decoder layer (TP-aware, hybrid dense / MoE)."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 
+from mminf.distributed.communication import TPCommGroup
 from mminf.engine.cache_manager import BatchedCacheManager
-from mminf.model.components.mlp import GatedMLP
+from mminf.model.components.distributed.mlp import ParallelGatedMLP
 from mminf.model.components.norm import RMSNorm
 from mminf.model.ming_omni_flash.components.attention import LingAttention
 from mminf.model.ming_omni_flash.components.moe import LingMoeBlock
@@ -18,11 +19,9 @@ from mminf.model.ming_omni_flash.components.rope import (
 class LingDecoderLayer(nn.Module):
     """One Ling-2.0 decoder layer; layer_idx decides dense-vs-MoE FFN.
 
-    Forward: pre-norm pattern, threads ``cache_handle`` to attention,
-    threads optional modality masks to the MoE branch. Dense layers
-    ignore the masks.
-
-    See step 3b plan for full constructor docs.
+    All sub-modules receive ``comm_group``; defaults to single-rank
+    trivial when not set. Dense layer-0 MLP uses :class:`ParallelGatedMLP`
+    so its `down_proj` all-reduces across ranks.
     """
 
     def __init__(
@@ -45,8 +44,11 @@ class LingDecoderLayer(nn.Module):
         rotary: LingPartialMRotaryEmbedding,
         use_qkv_bias: bool = False,
         use_bias: bool = False,
+        comm_group: TPCommGroup | None = None,
     ) -> None:
         super().__init__()
+        if comm_group is None:
+            comm_group = TPCommGroup.trivial()
         self.layer_idx = layer_idx
         self.is_moe = layer_idx >= first_k_dense_replace
 
@@ -62,6 +64,7 @@ class LingDecoderLayer(nn.Module):
             rotary=rotary,
             use_qkv_bias=use_qkv_bias,
             use_bias=use_bias,
+            comm_group=comm_group,
         )
 
         if self.is_moe:
@@ -74,12 +77,15 @@ class LingDecoderLayer(nn.Module):
                 n_group=n_group,
                 topk_group=topk_group,
                 routed_scaling_factor=routed_scaling_factor,
+                comm_group=comm_group,
             )
         else:
-            self.mlp = GatedMLP(
+            # Dense layer-0 MLP — ParallelGatedMLP so its column-parallel
+            # gate/up + row-parallel down handle TP sharding internally.
+            self.mlp = ParallelGatedMLP(
+                comm_group=comm_group,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                activation="silu",
                 bias=False,
             )
 

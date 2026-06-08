@@ -465,46 +465,63 @@ class MingFlashOmniModel(Model):
     # Submodule construction
     # ------------------------------------------------------------------
 
+    def get_default_sharding_config(self):
+        """Thinker is TP-capable; engine's worker maps `tp_size` from
+        the yaml's node_group to the rank's comm_group."""
+        from mminf.distributed.base import ShardingConfig
+
+        return ShardingConfig(
+            groups=[],
+            tp_enabled_nodes={"Thinker"},
+            shard_dim={},
+        )
+
     def get_submodule(self, node_name: str, device="cpu", tp_group=None):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         if node_name != "Thinker":
             raise ValueError(
-                f"Unknown node: {node_name!r}. Step 3d only registers "
+                f"Unknown node: {node_name!r}. Step 3d-3e registers only "
                 f"'Thinker'; audio_encoder / vision_encoder / Talker / "
                 f"AudioVAE follow in steps 4+."
             )
 
-        # Build LingMoeModel on the meta device, materialise it on the
-        # target device, then load real weights.
+        # Build LingMoeModel on the meta device first so the constructor's
+        # `torch.empty(...)` allocations don't materialise on the target
+        # device. Then `.to_empty(device=device)` reallocates each Parameter
+        # in real memory, and the loader streams weights into them.
         llm = self.config.thinker_llm
-        ig = self.config.image_gen
         mrope = llm.mrope_section
-        model = LingMoeModel(
-            vocab_size=llm.vocab_size,
-            hidden_size=llm.hidden_size,
-            intermediate_size=llm.intermediate_size,
-            moe_intermediate_size=llm.moe_intermediate_size,
-            num_hidden_layers=llm.num_hidden_layers,
-            num_attention_heads=llm.num_attention_heads,
-            num_kv_heads=llm.num_key_value_heads,
-            head_dim=llm.head_dim,
-            rms_norm_eps=llm.rms_norm_eps,
-            rope_theta=llm.rope_theta,
-            max_position_embeddings=llm.max_position_embeddings,
-            partial_rotary_factor=llm.partial_rotary_factor,
-            mrope_section=mrope,
-            num_experts=llm.num_experts,
-            num_experts_per_tok=llm.num_experts_per_tok,
-            num_shared_experts=llm.num_shared_experts,
-            n_group=llm.n_group,
-            topk_group=llm.topk_group,
-            routed_scaling_factor=llm.moe_router_topk_scaling_factor,
-            first_k_dense_replace=llm.first_k_dense_replace,
-            tie_word_embeddings=llm.tie_word_embeddings,
-            use_qkv_bias=llm.use_qkv_bias,
-            use_bias=llm.use_bias,
-        ).to(self.get_autocast_dtype()).to(device)
+        with torch.device("meta"):
+            model = LingMoeModel(
+                vocab_size=llm.vocab_size,
+                hidden_size=llm.hidden_size,
+                intermediate_size=llm.intermediate_size,
+                moe_intermediate_size=llm.moe_intermediate_size,
+                num_hidden_layers=llm.num_hidden_layers,
+                num_attention_heads=llm.num_attention_heads,
+                num_kv_heads=llm.num_key_value_heads,
+                head_dim=llm.head_dim,
+                rms_norm_eps=llm.rms_norm_eps,
+                rope_theta=llm.rope_theta,
+                max_position_embeddings=llm.max_position_embeddings,
+                partial_rotary_factor=llm.partial_rotary_factor,
+                mrope_section=mrope,
+                num_experts=llm.num_experts,
+                num_experts_per_tok=llm.num_experts_per_tok,
+                num_shared_experts=llm.num_shared_experts,
+                n_group=llm.n_group,
+                topk_group=llm.topk_group,
+                routed_scaling_factor=llm.moe_router_topk_scaling_factor,
+                first_k_dense_replace=llm.first_k_dense_replace,
+                tie_word_embeddings=llm.tie_word_embeddings,
+                use_qkv_bias=llm.use_qkv_bias,
+                use_bias=llm.use_bias,
+                comm_group=tp_group,
+            )
+        # Materialise + cast to bf16 (matches the released ckpt's torch_dtype).
+        model.to_empty(device=device)
+        model.to(self.get_autocast_dtype())
 
         load_thinker_weights(model, self.local_dir, device=device, strict=True)
         model.eval()

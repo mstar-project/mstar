@@ -137,6 +137,41 @@ graph-walk / partition / streaming patterns transfer 1:1.
      forward — output is finite bf16 logits at the expected
      `(T, vocab_size)` shape. 6 tests in
      `test_ming_flash_omni_loader.py` (4 pure-Python + 2 CUDA+snapshot).
+   - **3e — DONE** (TP-aware variants): `LingAttention` uses
+     `QKVParallelLinear` + `RowParallelLinear` (per-rank heads + dense
+     row-parallel); `LingMoeBlock` shards fused experts by
+     `shard_inter = moe_intermediate_size / tp_size` and uses mminf's
+     existing `_gate_up_weight_loader` / `_down_proj_weight_loader`
+     for per-rank weight slicing; dense layer-0 MLP uses
+     `ParallelGatedMLP`; `LingMoeModel` threads `comm_group` through
+     every decoder layer. Weight loader refactored onto mminf's
+     `load_hf_weights` + 770 `StackedParamRule`s (3 per expert ×
+     num_experts + dense MLP + synthetic QKV). The packed
+     `attention.query_key_value.weight` from the checkpoint is split
+     into synthetic `q_proj` / `k_proj` / `v_proj` keys by
+     `_split_packed_qkv` so `QKVParallelLinear`'s standard weight
+     loader handles per-rank head slicing.
+
+     **Verified via TP=8 mminf-serve smoke** (8 H100s): server starts,
+     all 8 workers load 507 thinker params each (one per packed
+     parameter; per-rank ~40 GB), KVCacheEngine warmup_and_capture
+     completes, torch.compile applies, dedicated GPU threads spin up,
+     port 8092 listens. Per-rank model + KV cache is well under 80 GB.
+     TP=4 was tried first and OOMed at 78.58 GB / 80 GB; TP=8 has
+     plenty of headroom.
+
+     **Known gap (not blocking 3e commit)**: first text request to
+     `/generate` hits `IndexError` in
+     `BailingMoeV2ThinkerSubmodule.prepare_inputs` — the per-request
+     `text_inputs` list arrives empty. This is an integration bug
+     between `get_initial_forward_pass_args` / graph-walk wiring /
+     the conductor's prompt-to-input-signals routing (NOT a model
+     code bug — all the heavy machinery loaded and warmed up cleanly).
+     Likely fix: either change the graph node's `input_names` /
+     ckpt edge-naming or add a fallback in `prepare_inputs` that
+     pulls the prompt tokens from `fwd_info` when the input list is
+     empty. Standalone follow-up.
+
    - **3d — DONE** (cache wiring + submodule + engine integration):
      `LingAttention` now uses `cache_handle.run_attention` for paged
      KV-cache attention (keeps the custom partial-3D rope inline);

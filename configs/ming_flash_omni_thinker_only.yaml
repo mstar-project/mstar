@@ -1,15 +1,20 @@
 # Ming-flash-omni-2.0 — thinker-only deploy (text out, no talker).
 #
-# Step 3d: registers only the Thinker node; audio_encoder, vision_encoder,
-# Talker, AudioVAE land at step 4+. Single-rank by default — TP-aware
-# variants of LingAttention / LingMoeBlock land at step 3e, so a single
-# rank here will OOM trying to fit all 100B params on one GPU. Useful
-# right now for: (a) engine startup smoke (does the model class load
-# correctly?), (b) catching plumbing bugs before TP infrastructure is
-# in place. Real serving needs TP=4 across 4 H100s (step 3e).
+# Step 3e: TP=8 across 8 H100s. Per-rank shard_inter = 1024/8 = 128;
+# experts.gate_up_proj is (256, 2*128, 4096) per rank, ~33 GB across
+# 31 MoE layers. With embed + lm_head + attention + dense layer 0 +
+# KV cache, ~40 GB per rank fits the 80 GB H100s comfortably.
+#
+# TP=4 was tried but hit OOM at ~78.5 GB / 80 GB per rank (loader
+# overhead during ckpt streaming pushed past the 80 GB limit). TP=8
+# halves the model footprint with plenty of headroom.
+#
+# Audio / vision / talker / image-gen are step 4+; this config is for
+# text-only T2T benchmarking and the first mminf-served Ming forward.
 
 model: "ming_flash_omni"
 max_seq_len: 32768
 node_groups:
   - node_names: [Thinker]
-    ranks: [0]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8

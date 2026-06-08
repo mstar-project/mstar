@@ -1,203 +1,230 @@
-"""Weight loader for the Ling-2.0 thinker.
+"""Weight loader for the Ling-2.0 thinker (TP-aware via load_hf_weights).
 
-Maps the released ``inclusionAI/Ming-flash-omni-2.0`` checkpoint's key
-namespace into :class:`mminf.model.ming_omni_flash.components.model.LingMoeModel`'s
-``state_dict`` and runs the per-expert fusion that packs 256 separate
-``gate_proj`` / ``up_proj`` / ``down_proj`` weights into the dense
-``experts.gate_up_proj`` and ``experts.down_proj`` tensors that mminf's
-fused-MoE kernel expects.
+Step 3e refactor: instead of a custom per-shard loop, we now stream
+the checkpoint through mminf's :func:`load_hf_weights` machinery.
+Per-rank slicing happens inside the parameter-attached
+``weight_loader`` callbacks of the TP-aware modules — same pattern as
+Qwen3-Omni's loader at
+``mminf/model/qwen3_omni/qwen3_omni_model.py:1242-1334``.
 
-Step-3c scope: thinker only, no KV cache, no engine glue. The submodule
-wrapping that exposes this to ``mminf-serve`` is step 3d.
+## What this loader handles
 
-## Key mapping
+1. **Outer prefix strip**: ``model.X.Y`` → ``X.Y`` (the wrapper is
+   ``BailingMM2NativeForConditionalGeneration.model``).
+2. **Per-layer renames**: ``model.layers.{i}.attention.{query_key_value,
+   dense,q_norm,k_norm}.weight`` → ``layers.{i}.self_attn.{qkv_proj,
+   dense,q_norm,k_norm}.weight``; ``mlp.{gate,image_gate,audio_gate}.weight``
+   → ``mlp.{...}.gate.weight`` (extra nesting for the router's inner
+   nn.Linear); ``mlp.shared_experts.*`` → ``mlp.shared_expert.*``.
+3. **Packed QKV split**: ``attention.query_key_value.weight`` is one
+   `(Q+2K)*D x H` tensor in the checkpoint, but :class:`QKVParallelLinear`
+   wants three calls (one each with shard_id ``"q"``/``"k"``/``"v"``).
+   Done by ``_split_packed_qkv`` which intercepts QKV keys and emits
+   three synthetic stream entries.
+4. **Per-expert fusion**: 256 separate ``experts.N.gate_proj.weight``
+   keys per layer → packed ``experts.gate_up_proj`` tensor.
+   ``_remap_thinker_keys`` rewrites them to
+   ``experts.{gate,up,down}_proj.__expertN__.weight`` so
+   :class:`StackedParamRule.source_suffix` matching works; the per-rule
+   ``shard_id="gate:N"`` / ``"up:N"`` / ``"down:N"`` strings drive
+   mminf's per-rank ``_gate_up_weight_loader`` / ``_down_proj_weight_loader``
+   to write into the right expert slot per rank.
 
-The released checkpoint stores the LLM weights under ``model.model.*``
-(the outer ``model.`` is the multimodal wrapper, the inner ``model.``
-is HF's convention for ``BailingMoeV2ForCausalLM.model``). Translation
-to my :class:`LingMoeModel` state dict::
-
-    model.lm_head.weight                                 →  lm_head.weight
-    model.model.word_embeddings.weight                   →  embed_tokens.weight
-    model.model.norm.weight                              →  norm.weight
-    model.model.layers.{i}.input_layernorm.weight        →  layers.{i}.input_layernorm.weight
-    model.model.layers.{i}.post_attention_layernorm.w    →  layers.{i}.post_attention_layernorm.weight
-    model.model.layers.{i}.attention.query_key_value.w   →  layers.{i}.self_attn.qkv_proj.weight
-    model.model.layers.{i}.attention.dense.weight        →  layers.{i}.self_attn.dense.weight
-    model.model.layers.{i}.attention.q_norm.weight       →  layers.{i}.self_attn.q_norm.weight
-    model.model.layers.{i}.attention.k_norm.weight       →  layers.{i}.self_attn.k_norm.weight
-    # dense layer 0 (first_k_dense_replace=1)
-    model.model.layers.0.mlp.{gate,up,down}_proj.w       →  layers.0.mlp.{gate,up,down}_proj.weight
-    # MoE layers 1..31 (router weights nest through LingMoeRouter's inner nn.Linear)
-    model.model.layers.{i}.mlp.{gate,image_gate,audio_gate}.weight        →  layers.{i}.mlp.{...}.gate.weight
-    model.model.layers.{i}.mlp.{gate,image_gate,audio_gate}.expert_bias   →  layers.{i}.mlp.{...}.expert_bias
-    model.model.layers.{i}.mlp.experts.{j}.gate_proj.weight  ─┐
-    model.model.layers.{i}.mlp.experts.{j}.up_proj.weight    ─┴─→  layers.{i}.mlp.experts.gate_up_proj
-    model.model.layers.{i}.mlp.experts.{j}.down_proj.weight                →  layers.{i}.mlp.experts.down_proj
-    model.model.layers.{i}.mlp.shared_experts.{g,u,d}_proj.weight          →  layers.{i}.mlp.shared_expert.{...}.weight
-
-The expert-fusion (the last 3 lines above) uses the same
-``MergeModulelist`` + ``Concatenate`` :class:`Operation`s that
-Qwen3-Omni already relies on
-(:mod:`mminf.model.qwen3_omni.qwen3_omni_model`).
+Per-rank TP slicing happens automatically — every TP-aware module
+(``QKVParallelLinear``, ``RowParallelLinear``, ``ParallelGatedMLP``,
+``LingMoeBlock.experts``) attaches its own ``weight_loader`` callback
+that knows its ``tp_rank``/``tp_size`` and slices the loaded tensor
+accordingly.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 
 import torch
 
+from mminf.model.loader.base import StackedParamRule, load_hf_weights
 from mminf.model.loader.iterators import iter_safetensors_shards
 from mminf.model.ming_omni_flash.components.model import LingMoeModel
-from mminf.model.utils import (
-    KeysAndConverter,
-    Operation,
-    WeightConverter,
-    _apply_operations,
-)
 
 logger = logging.getLogger(__name__)
 
 
-# Outermost prefix on the checkpoint — strip before applying renames.
+# Outermost ckpt prefix — strip before everything else.
 _CKPT_THINKER_PREFIX = "model."
 
 
-def build_ling_weight_converters() -> list[WeightConverter]:
-    """Per-expert fusion converters for the MoE layers.
+# Per-key static rename rules (only the substring matters; expert
+# fusion + QKV split are handled separately).
+_SUBSTRING_RENAMES: list[tuple[str, str]] = [
+    # Embed / norm / lm_head (after the outer model. strip).
+    # `lm_head.weight` lands directly.
+    # `model.word_embeddings.weight` → `embed_tokens.weight`
+    # `model.norm.weight` → `norm.weight`
+    # The substring matcher below handles `model.` → `` only when it's a prefix.
 
-    These run AFTER the key-rename pass; the source_patterns are matched
-    against the post-rename keys (which preserve the ``mlp.experts.N.*``
-    structure from the checkpoint — only the layer-level prefix changes).
-    """
-    return [
-        WeightConverter(
-            source_patterns=[
-                "mlp.experts.*.gate_proj.weight",
-                "mlp.experts.*.up_proj.weight",
-            ],
-            target_patterns="mlp.experts.gate_up_proj",
-            operations=[
-                Operation("MergeModulelist", dim=0),  # 256 → (256, inter, hidden)
-                Operation("Concatenate", dim=1),       # 2 of (256, inter, hidden) → (256, 2*inter, hidden)
-            ],
-        ),
-        WeightConverter(
-            source_patterns=["mlp.experts.*.down_proj.weight"],
-            target_patterns="mlp.experts.down_proj",
-            operations=[
-                Operation("MergeModulelist", dim=0),  # 256 → (256, hidden, inter)
-            ],
-        ),
-    ]
-
-
-# Per-key rename rules, applied AFTER the ``model.`` outer-prefix strip.
-# Order matters: longer matches first so e.g. ``attention.query_key_value``
-# isn't half-rewritten by a shorter pattern.
-_RENAME_RULES: list[tuple[str, str]] = [
-    # Top-level
-    ("model.word_embeddings.weight", "embed_tokens.weight"),
-    ("model.norm.weight", "norm.weight"),
-    # The ``model.lm_head.weight`` key has no ``model.model.*`` prefix in
-    # the checkpoint, so after stripping the outer ``model.`` it's just
-    # ``lm_head.weight`` — no rename needed.
-
-    # Attention (per layer) — substring replacement so it works for any
-    # layer index.
-    ("model.layers.{}.attention.query_key_value.weight",
-     "layers.{}.self_attn.qkv_proj.weight"),
-    ("model.layers.{}.attention.dense.weight",
-     "layers.{}.self_attn.dense.weight"),
-    ("model.layers.{}.attention.q_norm.weight",
-     "layers.{}.self_attn.q_norm.weight"),
-    ("model.layers.{}.attention.k_norm.weight",
-     "layers.{}.self_attn.k_norm.weight"),
-
-    # Norms (per layer) — strip outer model.
-    ("model.layers.{}.input_layernorm.weight",
-     "layers.{}.input_layernorm.weight"),
-    ("model.layers.{}.post_attention_layernorm.weight",
-     "layers.{}.post_attention_layernorm.weight"),
-
-    # MoE routers — checkpoint has ``mlp.gate.weight`` directly; mine has
-    # ``mlp.gate.gate.weight`` because LingMoeRouter wraps an nn.Linear.
-    # Same for image_gate / audio_gate.
-    ("model.layers.{}.mlp.gate.weight",
-     "layers.{}.mlp.gate.gate.weight"),
-    ("model.layers.{}.mlp.gate.expert_bias",
-     "layers.{}.mlp.gate.expert_bias"),
-    ("model.layers.{}.mlp.image_gate.weight",
-     "layers.{}.mlp.image_gate.gate.weight"),
-    ("model.layers.{}.mlp.image_gate.expert_bias",
-     "layers.{}.mlp.image_gate.expert_bias"),
-    ("model.layers.{}.mlp.audio_gate.weight",
-     "layers.{}.mlp.audio_gate.gate.weight"),
-    ("model.layers.{}.mlp.audio_gate.expert_bias",
-     "layers.{}.mlp.audio_gate.expert_bias"),
-
-    # MoE experts (per-expert per-layer) — preserve the ``mlp.experts.N.*``
-    # structure for the WeightConverter to match later.
-    ("model.layers.{}.mlp.experts.{}.gate_proj.weight",
-     "layers.{}.mlp.experts.{}.gate_proj.weight"),
-    ("model.layers.{}.mlp.experts.{}.up_proj.weight",
-     "layers.{}.mlp.experts.{}.up_proj.weight"),
-    ("model.layers.{}.mlp.experts.{}.down_proj.weight",
-     "layers.{}.mlp.experts.{}.down_proj.weight"),
-
-    # MoE shared expert (singular in mminf vs plural in ckpt).
-    ("model.layers.{}.mlp.shared_experts.gate_proj.weight",
-     "layers.{}.mlp.shared_expert.gate_proj.weight"),
-    ("model.layers.{}.mlp.shared_experts.up_proj.weight",
-     "layers.{}.mlp.shared_expert.up_proj.weight"),
-    ("model.layers.{}.mlp.shared_experts.down_proj.weight",
-     "layers.{}.mlp.shared_expert.down_proj.weight"),
-
-    # Dense layer-0 MLP — no rename, just strip the outer model.
-    ("model.layers.{}.mlp.gate_proj.weight",
-     "layers.{}.mlp.gate_proj.weight"),
-    ("model.layers.{}.mlp.up_proj.weight",
-     "layers.{}.mlp.up_proj.weight"),
-    ("model.layers.{}.mlp.down_proj.weight",
-     "layers.{}.mlp.down_proj.weight"),
+    # Attention rename (per-layer, applies to any layer index).
+    # query_key_value isn't actually emitted past _split_packed_qkv (the
+    # split produces synthetic q_proj/k_proj/v_proj keys instead), but
+    # the rule's harmless and documents intent.
+    ("attention.query_key_value", "self_attn.qkv_proj"),
+    # Synthetic q/k/v keys emitted by _split_packed_qkv. Their StackedParamRule
+    # routes them into the fused self_attn.qkv_proj via shard_id "q"/"k"/"v".
+    ("attention.q_proj", "self_attn.q_proj"),
+    ("attention.k_proj", "self_attn.k_proj"),
+    ("attention.v_proj", "self_attn.v_proj"),
+    ("attention.dense", "self_attn.dense"),
+    ("attention.q_norm", "self_attn.q_norm"),
+    ("attention.k_norm", "self_attn.k_norm"),
+    # Router renames (per-layer, applies to gate / image_gate / audio_gate).
+    # mlp.gate.weight → mlp.gate.gate.weight (nested through the router's nn.Linear)
+    ("mlp.gate.weight", "mlp.gate.gate.weight"),
+    ("mlp.image_gate.weight", "mlp.image_gate.gate.weight"),
+    ("mlp.audio_gate.weight", "mlp.audio_gate.gate.weight"),
+    # Shared expert (singular in mminf vs plural in ckpt).
+    ("mlp.shared_experts.", "mlp.shared_expert."),
 ]
 
 
-def _compile_rename_rules() -> list[tuple[re.Pattern, str]]:
-    """Compile the ``{}``-style rule patterns into regex + format strings.
+_EXPERT_KEY_RE = re.compile(
+    r"^(.*)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+)
 
-    Each ``{}`` becomes a numeric capture group; the replacement uses
-    ``\1``, ``\2``, ... in declaration order.
+
+def _strip_outer_model_prefix(key: str) -> str | None:
+    """Strip the outermost ``model.`` (the wrapper). Returns None for
+    keys we don't expect (audio.*, vision.*, etc. — these aren't part
+    of the thinker text-only path)."""
+    if not key.startswith(_CKPT_THINKER_PREFIX):
+        return None
+    stripped = key[len(_CKPT_THINKER_PREFIX):]
+    # After the strip the LLM is rooted at "model.layers..." / "model.norm..." /
+    # "model.word_embeddings..." (the inner HF wrapper). lm_head.weight is
+    # directly here without an extra "model." prefix.
+    return stripped
+
+
+def _apply_substring_renames(key: str) -> str:
+    for src, dst in _SUBSTRING_RENAMES:
+        if src in key:
+            key = key.replace(src, dst)
+    # Embed / norm: strip the inner ``model.`` prefix where applicable.
+    # `model.word_embeddings.weight` → `embed_tokens.weight`
+    if key.startswith("model.word_embeddings"):
+        key = key.replace("model.word_embeddings", "embed_tokens", 1)
+    # `model.norm.weight` → `norm.weight`
+    elif key.startswith("model.norm"):
+        key = key.replace("model.norm", "norm", 1)
+    # `model.layers.X` → `layers.X`
+    elif key.startswith("model.layers."):
+        key = key[len("model."):]
+    return key
+
+
+def _remap_thinker_keys(key: str) -> str | None:
+    """Full name remapping for thinker keys.
+
+    Returns the post-rename key, or None to drop the key entirely.
     """
-    compiled: list[tuple[re.Pattern, str]] = []
-    for src, tgt in _RENAME_RULES:
-        # Anchor with ^ ... $ so we match the full key, not a substring
-        # (avoids accidentally matching nested ``mlp.experts.*.gate_proj``
-        # via the dense-MLP rule).
-        src_regex = "^" + re.escape(src).replace(r"\{\}", r"(\d+)") + "$"
-        # Replacement template: convert each ``\{\}`` (literal) in tgt
-        # to a ``\1``, ``\2``, ... backreference.
-        n_groups = src.count("{}")
-        tgt_template = tgt
-        for i in range(n_groups):
-            tgt_template = tgt_template.replace("{}", f"\\{i + 1}", 1)
-        compiled.append((re.compile(src_regex), tgt_template))
-    return compiled
+    stripped = _strip_outer_model_prefix(key)
+    if stripped is None:
+        return None  # not a thinker key (audio.*, vision.*, etc.)
+
+    # Per-expert fusion marker: rewrite so the StackedParamRule's
+    # suffix-match picks them up.
+    m = _EXPERT_KEY_RE.match(stripped)
+    if m:
+        prefix, expert_idx, proj = m.groups()
+        # prefix looks like "model.layers.5"; strip the inner "model."
+        if prefix.startswith("model.layers."):
+            prefix = prefix[len("model."):]
+        return f"{prefix}.mlp.experts.{proj}.__expert{expert_idx}__.weight"
+
+    renamed = _apply_substring_renames(stripped)
+    return renamed
 
 
-def _rename_key(key: str, compiled: list[tuple[re.Pattern, str]]) -> str | None:
-    """Apply rename rules to a single (already-prefix-stripped) ckpt key.
+def _build_thinker_stacked_params(num_experts: int) -> list[StackedParamRule]:
+    """Build the per-expert + dense-MLP rules.
 
-    Returns the renamed key, or ``None`` if no rule matches (caller
-    decides whether to raise or skip).
+    Per-expert rules MUST come first because the dense-MLP ``.gate_proj``
+    / ``.up_proj`` / ``.down_proj`` suffixes would also match the
+    remapped MoE keys otherwise — :func:`_apply_stacked` returns on first
+    match.
     """
-    for regex, template in compiled:
-        m = regex.match(key)
-        if m:
-            return regex.sub(template, key)
-    return None
+    rules: list[StackedParamRule] = []
+    for i in range(num_experts):
+        rules.append(StackedParamRule(
+            target_suffix=".experts.gate_up_proj",
+            source_suffix=f".experts.gate_proj.__expert{i}__.weight",
+            shard_id=f"gate:{i}",
+        ))
+        rules.append(StackedParamRule(
+            target_suffix=".experts.gate_up_proj",
+            source_suffix=f".experts.up_proj.__expert{i}__.weight",
+            shard_id=f"up:{i}",
+        ))
+        rules.append(StackedParamRule(
+            target_suffix=".experts.down_proj",
+            source_suffix=f".experts.down_proj.__expert{i}__.weight",
+            shard_id=f"down:{i}",
+        ))
+    # Dense layer-0 MLP fusion (ParallelGatedMLP holds gate_up_proj).
+    rules.append(StackedParamRule(".gate_up_proj", ".gate_proj", 0))
+    rules.append(StackedParamRule(".gate_up_proj", ".up_proj", 1))
+    # Attention QKV fusion: synthetic q/k/v keys from _split_packed_qkv
+    # route into the fused self_attn.qkv_proj.weight via shard_id strings.
+    # QKVParallelLinear's weight_loader does per-rank head-axis slicing.
+    rules.append(StackedParamRule(".qkv_proj", ".q_proj", "q"))
+    rules.append(StackedParamRule(".qkv_proj", ".k_proj", "k"))
+    rules.append(StackedParamRule(".qkv_proj", ".v_proj", "v"))
+    return rules
+
+
+def _split_packed_qkv(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    num_attention_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Stream-transform: split each ``attention.query_key_value.weight``
+    into 3 synthetic ``self_attn.{q,k,v}_proj.weight`` entries.
+
+    ``QKVParallelLinear`` doesn't have a single ``query_key_value``
+    weight_loader; it dispatches via shard_id ``"q"``/``"k"``/``"v"``
+    on three separate keys. We emit those keys here so the stacked rules
+    (``.qkv_proj``, ``.q_proj`` / ``.k_proj`` / ``.v_proj``) route them
+    into the right slots.
+
+    Packing in ckpt: weight is `(num_heads + 2*num_kv_heads)*head_dim x hidden`,
+    rows ordered [Q rows, K rows, V rows].
+    """
+    q_size = num_attention_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    qkv_total = q_size + 2 * kv_size
+
+    pattern = re.compile(r"^(.*attention\.)query_key_value\.weight$")
+
+    for raw_key, tensor in weights:
+        m = pattern.match(raw_key)
+        if m is None:
+            yield raw_key, tensor
+            continue
+        if tensor.shape[0] != qkv_total:
+            raise ValueError(
+                f"{raw_key}: expected first dim {qkv_total} "
+                f"(num_heads={num_attention_heads}, num_kv_heads={num_kv_heads},"
+                f" head_dim={head_dim}); got {tensor.shape[0]}"
+            )
+        prefix = m.group(1)
+        q_slice = tensor[0:q_size, :]
+        k_slice = tensor[q_size:q_size + kv_size, :]
+        v_slice = tensor[q_size + kv_size:qkv_total, :]
+        yield f"{prefix}q_proj.weight", q_slice
+        yield f"{prefix}k_proj.weight", k_slice
+        yield f"{prefix}v_proj.weight", v_slice
 
 
 def load_thinker_weights(
@@ -206,145 +233,89 @@ def load_thinker_weights(
     device: str = "cpu",
     strict: bool = True,
 ) -> None:
-    """Load Ling-2.0 thinker weights from a local snapshot dir into ``model``.
+    """Stream the checkpoint into the TP-aware LingMoeModel.
+
+    Sequencing:
+      1. Iterate sharded safetensors via mminf's `iter_safetensors_shards`.
+      2. Pre-split packed QKV keys into synthetic q/k/v keys.
+      3. Pass through `load_hf_weights` with our `name_remapper` +
+         per-expert StackedParamRules + dense-MLP rules. mminf's
+         parameter-attached `weight_loader`s do per-rank slicing.
 
     Args:
-        model: an instantiated :class:`LingMoeModel` (constructor sets
-            up empty params; this fills them).
-        local_dir: path to the HF snapshot (containing
-            ``model.safetensors.index.json`` and shards).
-        device: where to materialise the tensors (``"cpu"`` / ``"cuda"``
-            / ``"cuda:N"``).
-        strict: if True, raise when the model has parameters with no
-            matching checkpoint keys (after the per-layer index drops
-            keys for layers beyond ``model.num_hidden_layers``).
-            Default True — silent param holes produce garbage outputs.
+        model: LingMoeModel constructed with the right comm_group; param
+            tensors must already be on `device`.
+        local_dir: path to the Ming snapshot.
+        device: where to materialise loaded tensors (`"cpu"` /
+            `"cuda"` / `"cuda:N"`).
+        strict: if True, raise when any LingMoeModel parameter received
+            no checkpoint tensor.
     """
-    compiled = _compile_rename_rules()
-    # Pre-build the set of param keys the *model* expects; anything not
-    # in this set (after renaming) gets silently skipped (saves memory
-    # when loading e.g. a 1-layer subset of a 32-layer checkpoint).
-    target_keys = set(model.state_dict().keys())
-    # For the fused experts, the target key after the converter is e.g.
-    # ``layers.1.mlp.experts.gate_up_proj`` — that's already in
-    # ``target_keys``. The pre-fusion per-expert keys (``...experts.5.gate_proj.weight``)
-    # are NOT in target_keys; they're collected separately for the
-    # converter to consume.
+    llm_cfg = None
+    # Reach into the model to recover num_heads / num_kv_heads / head_dim
+    # for the QKV split — we don't have the config here directly.
+    first_attn = model.layers[0].self_attn
+    num_heads = first_attn.total_num_heads
+    num_kv = first_attn.total_num_kv_heads
+    head_dim = first_attn.head_dim
 
-    # Two buckets:
-    #   - per_key_state: directly-loadable tensors keyed by the final
-    #     target name.
-    #   - per_layer_expert_keys: nested dict
-    #     {layer_idx: {sub_pattern: {target_param_name: {expert_key_path: tensor}}}}
-    #     where sub_pattern is one of the WeightConverter patterns.
-    per_key_state: dict[str, torch.Tensor] = {}
-    # For each layer, collect expert tensors so we can run the converters
-    # once per layer at the end.
-    per_layer_expert: dict[int, dict[str, torch.Tensor]] = {}
-
-    converters = build_ling_weight_converters()
-    # Compile expert-key matchers so we know which keys to route to the
-    # per-layer expert bucket (vs the direct per-key state).
-    # A renamed expert key looks like ``layers.{i}.mlp.experts.{j}.gate_proj.weight``.
-    expert_key_re = re.compile(
-        r"^layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+    # Look up via the safetensors index: each layer's experts.{N} keys
+    # might land in a different shard. iter_safetensors_shards yields
+    # all matching keys across shards. We pre-strip to thinker-only keys
+    # via the prefix arg so vision / audio shards (only present in 100B
+    # model? not sure) don't get streamed.
+    raw_weights = iter_safetensors_shards(
+        local_dir, device=device, prefix=_CKPT_THINKER_PREFIX,
     )
 
-    unmatched_ckpt_keys: list[str] = []
+    # Wrap with the QKV split + name remapper. load_hf_weights handles
+    # the rest (stacked rules, weight_loader dispatch).
+    split_weights = _split_packed_qkv(
+        raw_weights,
+        num_attention_heads=num_heads,
+        num_kv_heads=num_kv,
+        head_dim=head_dim,
+    )
 
-    for raw_key, tensor in iter_safetensors_shards(
-        local_dir, device=device, prefix=_CKPT_THINKER_PREFIX,
-    ):
-        # 1. Strip the outermost ``model.`` (everything starts with it).
-        if not raw_key.startswith(_CKPT_THINKER_PREFIX):
-            continue
-        stripped = raw_key[len(_CKPT_THINKER_PREFIX):]
+    stacked = _build_thinker_stacked_params(
+        num_experts=model.layers[-1].mlp.num_experts if model.layers[-1].is_moe
+        else 0,  # if there's no MoE layer (e.g. tiny test model), skip
+    )
 
-        # 2. The bare ``lm_head.weight`` survives the strip and lands
-        #    straight at the right name — no renaming needed.
-        if stripped in target_keys:
-            per_key_state[stripped] = tensor
-            continue
+    loaded = load_hf_weights(
+        model, split_weights,
+        stacked_params=stacked,
+        name_remapper=_remap_thinker_keys,
+    )
 
-        # 3. Try the rename rules.
-        renamed = _rename_key(stripped, compiled)
-        if renamed is None:
-            unmatched_ckpt_keys.append(raw_key)
-            continue
+    if strict:
+        target_keys = set(model.state_dict().keys())
+        # Filter expert keys: each fused param gets loaded multiple times
+        # (one per expert / shard); load_hf_weights returns the param
+        # name once per first hit. That's fine — but it means we can't
+        # check "every param was touched at least once". Instead, check
+        # the simpler thing: every param that ISN'T a fused expert tensor
+        # was touched.
+        missing = []
+        for k in target_keys:
+            if k.endswith(".experts.gate_up_proj") or k.endswith(".experts.down_proj"):
+                # Fused; load_hf_weights's `loaded` set has the target
+                # name once per shard rule that matched, so if any one
+                # rule matched we're OK. Just check it's in `loaded`.
+                if k not in loaded:
+                    missing.append(k)
+            elif k not in loaded:
+                missing.append(k)
+        if missing:
+            raise KeyError(
+                f"Missing thinker parameters after load (strict=True). "
+                f"Sample missing keys: {sorted(missing)[:10]} "
+                f"(total {len(missing)})"
+            )
 
-        # 4. If this is a per-expert pre-fusion key, bucket it for the
-        #    converter; otherwise it's a direct load.
-        m = expert_key_re.match(renamed)
-        if m:
-            layer_idx = int(m.group(1))
-            # Filter early: only keep keys for layers the model actually has.
-            if layer_idx >= model.num_hidden_layers:
-                continue
-            per_layer_expert.setdefault(layer_idx, {})[renamed] = tensor
-        else:
-            # Filter directly-loadable per-layer keys for in-range layers too.
-            m_layer = re.match(r"^layers\.(\d+)\.", renamed)
-            if m_layer and int(m_layer.group(1)) >= model.num_hidden_layers:
-                continue
-            if renamed in target_keys:
-                per_key_state[renamed] = tensor
-            elif renamed.startswith("layers."):
-                # In-range layer but our model variant doesn't have this
-                # specific module (e.g. a dense-MLP-only test loads a
-                # MoE layer's gate weight). Silently skip.
-                continue
-            else:
-                unmatched_ckpt_keys.append(raw_key)
-
-    # Apply expert-fusion converters per layer.
-    for layer_idx, expert_kvs in per_layer_expert.items():
-        for conv in converters:
-            target_key = f"layers.{layer_idx}.{conv.target_patterns}"
-            if target_key not in target_keys:
-                continue
-            # Filter the per-expert keys to just the ones this converter's
-            # source patterns can match (each converter wants the right
-            # subset).
-            kac = KeysAndConverter(converter=conv)
-            matched_kvs: dict[str, torch.Tensor] = {}
-            for pat in conv.source_patterns:
-                pat_regex = re.compile(
-                    r"^layers\." + str(layer_idx) + r"\." +
-                    re.escape(pat).replace(r"\*", r"\d+") + "$"
-                )
-                for k, v in expert_kvs.items():
-                    if pat_regex.match(k):
-                        matched_kvs[k] = v
-                        kac.append_key(k)
-            if not matched_kvs:
-                # Converter target exists in the model but no source keys
-                # found in the checkpoint — strict mode treats this as
-                # missing-param territory; non-strict skips.
-                continue
-            per_key_state[target_key] = _apply_operations(matched_kvs, conv)
-
-    # Finally, load into the model.
-    missing_keys = sorted(target_keys - set(per_key_state.keys()))
-    if missing_keys and strict:
-        raise KeyError(
-            f"Missing thinker parameters after load (strict=True). "
-            f"Sample missing keys: {missing_keys[:10]} "
-            f"(total {len(missing_keys)})"
-        )
-    if unmatched_ckpt_keys and strict:
-        raise KeyError(
-            f"{len(unmatched_ckpt_keys)} checkpoint keys had no rename "
-            f"rule and were not directly loadable. "
-            f"Sample: {unmatched_ckpt_keys[:10]}"
-        )
-
-    _, unexpected = model.load_state_dict(per_key_state, strict=False, assign=True)
-    if unexpected and strict:
-        raise KeyError(
-            f"load_state_dict reported unexpected keys (shouldn't happen "
-            f"after our filtering): {unexpected[:10]}"
-        )
     logger.info(
-        "Loaded %d thinker params into LingMoeModel(num_hidden_layers=%d) from %s",
-        len(per_key_state), model.num_hidden_layers, local_dir,
+        "Loaded %d unique target params into LingMoeModel(num_hidden_layers=%d) "
+        "from %s (rank %d/%d).",
+        len(loaded), model.num_hidden_layers, local_dir,
+        model.comm_group.rank, model.comm_group.world_size,
     )

@@ -1,10 +1,10 @@
-"""Tests for the Ling-2.0 weight loader.
+"""Tests for the Ling-2.0 weight loader (TP-aware, step 3e).
 
-Three pure-Python tests verify the rename map + expert fusion converters
-in isolation. Two CUDA/snapshot-gated tests load the real released
-checkpoint into a 1-layer LingMoeModel and verify a forward pass
-produces finite logits — the strongest signal we have that the model
-code matches the upstream architecture byte-for-byte.
+Three pure-Python tests verify the new name remapper + QKV split +
+per-expert StackedParamRules in isolation. Two CUDA/snapshot-gated
+tests load the real released checkpoint and verify forward + per-param
+shape — the strongest signal that the model code matches the upstream
+architecture byte-for-byte.
 
 Snapshot lookup mirrors the other ming tests: ``MING_FLASH_OMNI_DIR``
 env var, then the default HF Hub cache layout.
@@ -12,7 +12,6 @@ env var, then the default HF Hub cache layout.
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
@@ -21,12 +20,11 @@ import torch
 
 from mminf.model.ming_omni_flash.components.model import LingMoeModel
 from mminf.model.ming_omni_flash.loader import (
-    _compile_rename_rules,
-    _rename_key,
-    build_ling_weight_converters,
+    _build_thinker_stacked_params,
+    _remap_thinker_keys,
+    _split_packed_qkv,
     load_thinker_weights,
 )
-from mminf.model.utils import _apply_operations
 
 
 def _find_local_snapshot() -> str | None:
@@ -45,9 +43,7 @@ def _find_local_snapshot() -> str | None:
     return None
 
 
-# Real-config values for the released ckpt, used by tests that
-# instantiate a model matching the real architecture's hidden dims
-# (so weight shapes line up).
+# Real-config values for the released ckpt (so weight shapes line up).
 def _real_thinker_dims(num_hidden_layers: int = 1) -> dict:
     return dict(
         vocab_size=157184,
@@ -74,160 +70,129 @@ def _real_thinker_dims(num_hidden_layers: int = 1) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Rename map + fusion converter unit tests
+# Pure-Python unit tests for the new loader helpers
 # ---------------------------------------------------------------------------
 
 
-def test_rename_rules_resolve_layer0_keys() -> None:
-    """Every layer-0 LLM ckpt key (after stripping ``model.``) renames to
-    a parameter that exists in a 1-layer dense-only LingMoeModel."""
-    compiled = _compile_rename_rules()
-    # Build a small but architecturally-shaped 1-layer dense model.
+def test_remap_thinker_keys_resolves_layer0_keys() -> None:
+    """Every layer-0 LLM ckpt key remaps to a parameter that exists in
+    a 1-layer dense-only LingMoeModel (after the synthetic q/k/v
+    expansion from the QKV split; we test that separately)."""
     model = LingMoeModel(**_real_thinker_dims(num_hidden_layers=1))
     target_keys = set(model.state_dict().keys())
 
-    # The layer-0 ckpt keys we expect to map. Outer ``model.`` is the
-    # multimodal wrapper (BailingMM2NativeForConditionalGeneration); inner
-    # ``model.`` is HF's BailingMoeV2ForCausalLM.model convention — except
-    # for ``model.lm_head.weight`` which sits directly under the wrapper.
-    layer0_ckpt_keys = [
-        "model.lm_head.weight",                  # → stripped: lm_head.weight (direct match)
-        "model.model.word_embeddings.weight",
-        "model.model.norm.weight",
-        "model.model.layers.0.input_layernorm.weight",
-        "model.model.layers.0.post_attention_layernorm.weight",
-        "model.model.layers.0.attention.query_key_value.weight",
-        "model.model.layers.0.attention.dense.weight",
-        "model.model.layers.0.attention.q_norm.weight",
-        "model.model.layers.0.attention.k_norm.weight",
-        "model.model.layers.0.mlp.gate_proj.weight",
-        "model.model.layers.0.mlp.up_proj.weight",
-        "model.model.layers.0.mlp.down_proj.weight",
-    ]
-    for k in layer0_ckpt_keys:
-        # Loader strips the outer ``model.`` prefix first; if the stripped
-        # form is already a target key, no rename runs.
-        stripped = k.removeprefix("model.")
-        if stripped in target_keys:
-            continue
-        renamed = _rename_key(stripped, compiled)
-        assert renamed is not None, f"No rename rule for {stripped!r}"
-        assert renamed in target_keys, (
-            f"Renamed {stripped!r} → {renamed!r} not in model state_dict"
-        )
-
-
-def test_rename_rules_resolve_moe_layer_keys() -> None:
-    """MoE-layer (layer 1+) keys map to a 2-layer model's state_dict."""
-    compiled = _compile_rename_rules()
-    model = LingMoeModel(**_real_thinker_dims(num_hidden_layers=2))
-    target_keys = set(model.state_dict().keys())
-
-    # Pass the post-outer-strip form to _rename_key (same as the loader does).
-    moe_ckpt_keys = [
-        "model.model.layers.1.mlp.gate.weight",
-        "model.model.layers.1.mlp.gate.expert_bias",
-        "model.model.layers.1.mlp.image_gate.weight",
-        "model.model.layers.1.mlp.audio_gate.weight",
-        "model.model.layers.1.mlp.shared_experts.gate_proj.weight",
-        "model.model.layers.1.mlp.shared_experts.up_proj.weight",
-        "model.model.layers.1.mlp.shared_experts.down_proj.weight",
-    ]
-    for k in moe_ckpt_keys:
-        stripped = k.removeprefix("model.")
-        renamed = _rename_key(stripped, compiled)
-        assert renamed is not None, f"No rename rule for {stripped!r}"
-        assert renamed in target_keys, (
-            f"Renamed {stripped!r} → {renamed!r} not in model state_dict"
-        )
-
-    # Per-expert keys aren't IN target_keys directly (they fuse into
-    # ``experts.gate_up_proj`` etc.), but the rename must still produce
-    # a parseable, layer-correct name.
-    expert_ckpt_keys = [
-        "model.model.layers.1.mlp.experts.0.gate_proj.weight",
-        "model.model.layers.1.mlp.experts.255.down_proj.weight",
-    ]
-    for k in expert_ckpt_keys:
-        stripped = k.removeprefix("model.")
-        renamed = _rename_key(stripped, compiled)
-        assert renamed is not None and renamed.startswith("layers.1.mlp.experts."), \
-            f"Expert key {stripped!r} renamed badly: {renamed!r}"
-
-
-def test_expert_fusion_converter_packs_correctly() -> None:
-    """Hand-build per-expert tensors, run them through the WeightConverters,
-    verify ``gate_up_proj`` packing is [gate, up] in dim=1 and that
-    expert k's weights end up at slice k along dim=0."""
-    converters = build_ling_weight_converters()
-    moe_inter, hidden = 16, 8
-    num_experts = 4
-
-    # Per-expert gate/up/down tensors with distinguishable values.
-    expert_kvs = {}
-    for j in range(num_experts):
-        expert_kvs[f"layers.5.mlp.experts.{j}.gate_proj.weight"] = (
-            torch.full((moe_inter, hidden), float(j * 10 + 1))
-        )
-        expert_kvs[f"layers.5.mlp.experts.{j}.up_proj.weight"] = (
-            torch.full((moe_inter, hidden), float(j * 10 + 2))
-        )
-        expert_kvs[f"layers.5.mlp.experts.{j}.down_proj.weight"] = (
-            torch.full((hidden, moe_inter), float(j * 10 + 3))
-        )
-
-    # Fuse gate + up.
-    gate_up_conv = converters[0]
-    gate_up_subset = {
-        k: v for k, v in expert_kvs.items()
-        if "gate_proj" in k or "up_proj" in k
+    # Direct-load keys (not QKV — that's split separately).
+    direct_keys = {
+        "model.lm_head.weight": "lm_head.weight",
+        "model.model.word_embeddings.weight": "embed_tokens.weight",
+        "model.model.norm.weight": "norm.weight",
+        "model.model.layers.0.input_layernorm.weight":
+            "layers.0.input_layernorm.weight",
+        "model.model.layers.0.post_attention_layernorm.weight":
+            "layers.0.post_attention_layernorm.weight",
+        "model.model.layers.0.attention.dense.weight":
+            "layers.0.self_attn.dense.weight",
+        "model.model.layers.0.attention.q_norm.weight":
+            "layers.0.self_attn.q_norm.weight",
+        "model.model.layers.0.attention.k_norm.weight":
+            "layers.0.self_attn.k_norm.weight",
     }
-    gate_up_packed = _apply_operations(gate_up_subset, gate_up_conv)
-    assert gate_up_packed.shape == (num_experts, 2 * moe_inter, hidden)
-    # Expert 0's gate slice (first half of dim 1) should be all 1.0
-    # (= 0 * 10 + 1).
-    assert torch.equal(
-        gate_up_packed[0, :moe_inter], torch.full((moe_inter, hidden), 1.0)
-    )
-    # Expert 0's up slice (second half of dim 1) should be all 2.0.
-    assert torch.equal(
-        gate_up_packed[0, moe_inter:], torch.full((moe_inter, hidden), 2.0)
-    )
-    # Expert 2's gate slice should be all 21.0.
-    assert torch.equal(
-        gate_up_packed[2, :moe_inter], torch.full((moe_inter, hidden), 21.0)
-    )
-
-    # Fuse down_proj.
-    down_conv = converters[1]
-    down_subset = {
-        k: v for k, v in expert_kvs.items() if "down_proj" in k
-    }
-    down_packed = _apply_operations(down_subset, down_conv)
-    assert down_packed.shape == (num_experts, hidden, moe_inter)
-    assert torch.equal(
-        down_packed[3], torch.full((hidden, moe_inter), 33.0)
-    )
+    for raw, expected in direct_keys.items():
+        renamed = _remap_thinker_keys(raw)
+        assert renamed == expected, f"{raw} → {renamed!r}, expected {expected!r}"
+        assert renamed in target_keys, f"{renamed!r} not in model.state_dict()"
 
 
-def test_loader_strict_raises_on_missing_params(tmp_path: Path) -> None:
-    """A snapshot with only ``lm_head.weight`` (missing every other param)
-    must trigger the strict-mode KeyError."""
-    # Build a minimal snapshot with one shard + index.json.
-    from safetensors.torch import save_file
-    shard = tmp_path / "model-00001-of-00001.safetensors"
-    save_file({"model.lm_head.weight": torch.zeros(157184, 4096)}, shard)
-    index = {
-        "metadata": {"total_size": 0},
-        "weight_map": {"model.lm_head.weight": shard.name},
-    }
-    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+def test_remap_thinker_keys_handles_moe_layer() -> None:
+    """MoE-layer renames + per-expert rewrite."""
+    # Routers + shared expert.
+    assert (
+        _remap_thinker_keys("model.model.layers.5.mlp.gate.weight")
+        == "layers.5.mlp.gate.gate.weight"
+    )
+    assert (
+        _remap_thinker_keys("model.model.layers.5.mlp.image_gate.weight")
+        == "layers.5.mlp.image_gate.gate.weight"
+    )
+    assert (
+        _remap_thinker_keys("model.model.layers.5.mlp.audio_gate.expert_bias")
+        == "layers.5.mlp.audio_gate.expert_bias"
+    )
+    assert (
+        _remap_thinker_keys("model.model.layers.5.mlp.shared_experts.gate_proj.weight")
+        == "layers.5.mlp.shared_expert.gate_proj.weight"
+    )
+    # Per-expert: rewritten with __expertN__ marker so StackedParamRule
+    # suffix-match works downstream.
+    assert (
+        _remap_thinker_keys("model.model.layers.5.mlp.experts.42.gate_proj.weight")
+        == "layers.5.mlp.experts.gate_proj.__expert42__.weight"
+    )
+    assert (
+        _remap_thinker_keys("model.model.layers.5.mlp.experts.255.down_proj.weight")
+        == "layers.5.mlp.experts.down_proj.__expert255__.weight"
+    )
 
-    # Tiny dim variant so the 1-layer model fits easily.
-    dims = _real_thinker_dims(num_hidden_layers=1)
-    model = LingMoeModel(**dims)
-    with pytest.raises(KeyError, match="Missing thinker parameters"):
-        load_thinker_weights(model, str(tmp_path), device="cpu", strict=True)
+
+def test_remap_thinker_keys_drops_non_thinker_prefixes() -> None:
+    """audio.* / vision.* keys aren't part of the thinker port; return None."""
+    assert _remap_thinker_keys("audio.encoder.layers.0.weight") is None
+    assert _remap_thinker_keys("vision.patch_embed.weight") is None
+
+
+def test_build_stacked_params_covers_every_expert() -> None:
+    """3 rules per expert × num_experts, plus dense MLP rules."""
+    rules = _build_thinker_stacked_params(num_experts=8)
+    # 3 × 8 expert rules + 2 dense-MLP rules = 26
+    assert len(rules) == 3 * 8 + 2
+    expert_shard_ids = {r.shard_id for r in rules if isinstance(r.shard_id, str) and ":" in r.shard_id}
+    expected = set()
+    for i in range(8):
+        for kind in ("gate", "up", "down"):
+            expected.add(f"{kind}:{i}")
+    assert expert_shard_ids == expected
+
+
+def test_split_packed_qkv_emits_three_synthetic_keys() -> None:
+    """A single ``attention.query_key_value.weight`` becomes three
+    synthetic keys with the expected row slicing."""
+    # GQA shape: num_heads=4, num_kv_heads=2, head_dim=8 →
+    # q_size=32, kv_size=16, total=64.
+    packed = torch.arange(64 * 16, dtype=torch.float32).view(64, 16)
+    stream = [(
+        "layers.0.attention.query_key_value.weight", packed,
+    ), (
+        "layers.0.input_layernorm.weight", torch.ones(16),
+    )]
+    out = list(_split_packed_qkv(
+        iter(stream),
+        num_attention_heads=4, num_kv_heads=2, head_dim=8,
+    ))
+    # 3 synthetic + 1 passthrough = 4
+    assert len(out) == 4
+    names = [k for k, _ in out]
+    assert names[:3] == [
+        "layers.0.attention.q_proj.weight",
+        "layers.0.attention.k_proj.weight",
+        "layers.0.attention.v_proj.weight",
+    ]
+    # Row slicing: q=[0:32], k=[32:48], v=[48:64].
+    assert torch.equal(out[0][1], packed[0:32, :])
+    assert torch.equal(out[1][1], packed[32:48, :])
+    assert torch.equal(out[2][1], packed[48:64, :])
+    # Non-QKV key passes through unchanged.
+    assert names[3] == "layers.0.input_layernorm.weight"
+
+
+def test_split_packed_qkv_rejects_bad_shape() -> None:
+    """Wrong first-dim raises a clear error."""
+    bad = torch.zeros(50, 16)  # expected 64 for the dims below
+    stream = [("layers.0.attention.query_key_value.weight", bad)]
+    with pytest.raises(ValueError, match="expected first dim 64"):
+        list(_split_packed_qkv(
+            iter(stream),
+            num_attention_heads=4, num_kv_heads=2, head_dim=8,
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -247,21 +212,28 @@ def snapshot_dir() -> str:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),
-                    reason="real-ckpt smoke needs CUDA (embed + lm_head + 1 layer ≈ 3 GB)")
+                    reason="real-ckpt smoke needs CUDA")
 def test_load_layer0_real_weights_runs_forward(snapshot_dir: str) -> None:
-    """Load embed + dense-layer-0 + norm + lm_head from the real ckpt
-    into a 1-layer LingMoeModel; run a forward; verify shape + finite."""
+    """Load embed + dense layer 0 + norm + lm_head from the real ckpt
+    into a 1-layer LingMoeModel (TP=1, comm_group=None default); run a
+    forward; verify shape + finite."""
     dims = _real_thinker_dims(num_hidden_layers=1)
-    model = LingMoeModel(**dims).to(torch.bfloat16).cuda()
+    # Construct on meta + materialise on CUDA to avoid double allocation.
+    with torch.device("meta"):
+        model = LingMoeModel(**dims)
+    model.to_empty(device="cuda")
+    model.to(torch.bfloat16)
+
     load_thinker_weights(model, snapshot_dir, device="cuda", strict=True)
     model.eval()
 
-    # Run a forward on a handful of arbitrary in-vocab token ids.
+    # Minimal mock cache handle — passthrough SDPA, same as step 3d tests.
     import torch.nn.functional as F
 
     class _Cache:
         def set_layer_idx(self, i):
             pass
+
         def run_attention(self, q, k, v):
             num_heads = q.shape[1]
             num_kv = k.shape[1]
@@ -271,7 +243,9 @@ def test_load_layer0_real_weights_runs_forward(snapshot_dir: str) -> None:
             q4 = q.transpose(0, 1).unsqueeze(0)
             k4 = k.transpose(0, 1).unsqueeze(0)
             v4 = v.transpose(0, 1).unsqueeze(0)
-            out = F.scaled_dot_product_attention(q4, k4, v4, is_causal=True, scale=q.shape[-1] ** -0.5)
+            out = F.scaled_dot_product_attention(
+                q4, k4, v4, is_causal=True, scale=q.shape[-1] ** -0.5,
+            )
             return out.squeeze(0).transpose(0, 1).contiguous()
 
     input_ids = torch.tensor([100, 200, 300, 400], device="cuda")
@@ -287,11 +261,17 @@ def test_load_layer0_real_weights_runs_forward(snapshot_dir: str) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(),
                     reason="real-ckpt smoke needs CUDA")
 def test_layer0_attention_weights_match_expected_shapes(snapshot_dir: str) -> None:
-    """After load, every layer-0 attention parameter has the expected
-    shape (catches rename mistakes that swap two params of different
-    shape — e.g. q_norm vs k_norm if they happened to differ)."""
+    """After load, every layer-0 attention param has the expected shape.
+
+    With TP=1 these match the full per-rank-equals-total dims; the same
+    test under TP>1 would expect num_heads / num_kv_heads divided by
+    tp_size.
+    """
     dims = _real_thinker_dims(num_hidden_layers=1)
-    model = LingMoeModel(**dims).to(torch.bfloat16).cuda()
+    with torch.device("meta"):
+        model = LingMoeModel(**dims)
+    model.to_empty(device="cuda")
+    model.to(torch.bfloat16)
     load_thinker_weights(model, snapshot_dir, device="cuda", strict=True)
 
     head_dim = dims["head_dim"]
@@ -300,7 +280,11 @@ def test_layer0_attention_weights_match_expected_shapes(snapshot_dir: str) -> No
     n_kv = dims["num_kv_heads"]
 
     expected = {
-        "layers.0.self_attn.qkv_proj.weight": ((n_heads + 2 * n_kv) * head_dim, hidden),
+        # QKVParallelLinear packs (q + 2*kv) * head_dim along dim 0.
+        "layers.0.self_attn.qkv_proj.weight":
+            ((n_heads + 2 * n_kv) * head_dim, hidden),
+        # RowParallelLinear holds (output, input_per_partition); TP=1 →
+        # input_per_partition = full.
         "layers.0.self_attn.dense.weight": (hidden, n_heads * head_dim),
         "layers.0.self_attn.q_norm.weight": (head_dim,),
         "layers.0.self_attn.k_norm.weight": (head_dim,),

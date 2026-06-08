@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from mminf.distributed.communication import TPCommGroup
 from mminf.model.components.norm import RMSNorm
 from mminf.model.ming_omni_flash.components.decoder_layer import (
     LingDecoderLayer,
@@ -82,12 +83,18 @@ class LingMoeModel(nn.Module):
         tie_word_embeddings: bool = False,
         use_qkv_bias: bool = False,
         use_bias: bool = False,
+        comm_group: TPCommGroup | None = None,
     ) -> None:
         super().__init__()
+        if comm_group is None:
+            comm_group = TPCommGroup.trivial()
+        self.comm_group = comm_group
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
 
+        # embed_tokens + lm_head stay replicated. At hidden_size=4096
+        # they're 1.3 GB each — cheap compared to the layers.
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
 
         # Single rotary instance shared across every layer — inv_freq is
@@ -120,6 +127,7 @@ class LingMoeModel(nn.Module):
                 rotary=rotary,
                 use_qkv_bias=use_qkv_bias,
                 use_bias=use_bias,
+                comm_group=comm_group,
             )
             for i in range(num_hidden_layers)
         ])
