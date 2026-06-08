@@ -178,7 +178,9 @@ class CudaGraphRunner:
         self.device = device
         self.autocast_dtype = autocast_dtype
         self.buffer_manager = buffer_manager
-        self.default_sampling_config = default_sampling_config
+        # ``get_sampling_config`` is typed Optional; coalesce so the
+        # ``.vocab_size`` access below (and any future use) is None-safe.
+        self.default_sampling_config = default_sampling_config or SamplingConfig()
         self.enable_nvtx = False  # set by KVCacheEngine after construction
 
         self.graphs: dict[CudaGraphKey, CudaGraphData] = {}

@@ -206,6 +206,10 @@ def fused_temperature_softmax(
 
 @dataclass
 class SamplingConfig:
+    # Sizes the per-request seen-token mask for the repetition penalty. When set,
+    # it MUST equal the model's logit width (lm_head/codec_head output dim): the
+    # mask is indexed as ``[B, vocab_size]`` against ``logits[B, V]``, and on the
+    # CUDA-graph path it also gates allocation of the in-graph penalty buffers.
     vocab_size: int | None = None
     temperature: float = 0.6
     top_k: int = 0
