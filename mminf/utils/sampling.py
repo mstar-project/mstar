@@ -18,7 +18,7 @@ Usage:
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 import logging
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import triton
@@ -181,7 +181,15 @@ def fused_temperature_softmax(
     mask_stride_v = seen_mask.stride(1) if apply_penalty else 0
     grid = (B,)
     with torch.cuda.device(logits.device):
-        # BLOCK_SIZE is picked by @triton.autotune (not passed here).
+        # BLOCK_SIZE is picked by @triton.autotune (not passed here). The first
+        # launch for a given key benchmarks every config (do_bench), which can
+        # leave probs in a state not ordered on the current stream relative to
+        # the downstream FlashInfer read -> garbage. We can't gate the sync on
+        # autotune alone (that wasn't enough on its own); pairing it with the
+        # device context above is what fixes it. Detect the autotune call by the
+        # config cache growing, and sync only then -- steady state stays sync-free.
+        cache = getattr(_fused_sampling_prep_kernel, "cache", None)
+        cache_size_before = len(cache) if cache is not None else 0
         _fused_sampling_prep_kernel[grid](
             logits, temperature, pen_ptr, mask_ptr, probs,
             V,
@@ -191,6 +199,8 @@ def fused_temperature_softmax(
             APPLY_PENALTY=apply_penalty,
             INCLUDE_GREEDY=include_greedy,
         )
+        if cache is not None and len(cache) > cache_size_before:
+            torch.cuda.current_stream().synchronize()
     return probs
 
 
@@ -281,7 +291,11 @@ class Sampler(BaseSampler):
     device: torch.device
     _sampling_config: dict[str, SamplingConfig] = field(default_factory=dict)
     _seen_token_mask: dict[str, SeenTokenMask]= field(default_factory=dict)
-    _autotune_sync_budget_remaining: int = 64
+    # Per-request RNG offset, advanced once per sampled step. Paired with the
+    # request's fixed seed, this steps the philox stream so deterministic
+    # (seeded) sampling draws a fresh number each step — otherwise identical
+    # (seed, offset=0) draws repeat forever and stable logits never reach EOS.
+    _step_offset: dict[str, int] = field(default_factory=dict)
     tp_group: "TPCommGroup | None" = None  # noqa: F821
 
     def add_request(self, request_id: str):
@@ -291,8 +305,9 @@ class Sampler(BaseSampler):
             vocab_size=None,
             device=self.device
         )
+        self._step_offset[request_id] = 0
         # lazy init _seen_token_mask, taking vocab size from logits or cfg
-    
+
     def get_token_mask(self, request_id: str):
         return self._seen_token_mask[request_id]
 
@@ -301,6 +316,7 @@ class Sampler(BaseSampler):
             del self._sampling_config[request_id]
         if request_id in self._seen_token_mask:
             del self._seen_token_mask[request_id]
+        self._step_offset.pop(request_id, None)
 
     def set_config(self, request_id: str, **kwargs):
         old_vocab_size = self._sampling_config[request_id].vocab_size
@@ -334,7 +350,10 @@ class Sampler(BaseSampler):
         top_p = torch.tensor([c.top_p for c in configs], device=logits.device)
         r_pen = torch.tensor([c.repetition_penalty for c in configs], device=logits.device)
         seed = torch.tensor([c.seed for c in configs], device=logits.device, dtype=torch.long)
-        rand_offset = torch.zeros_like(seed)
+        rand_offset = torch.tensor(
+            [self._step_offset.get(rid, 0) for rid in request_ids],
+            device=logits.device, dtype=torch.long,
+        )
     
         any_rep_pen = any(c.repetition_penalty != 1.0 for c in configs)
         any_greedy = any(c.temperature == 0 for c in configs)
@@ -342,7 +361,7 @@ class Sampler(BaseSampler):
         all_top_k_zero = all(c.top_k == 0 for c in configs)
 
         for rid in request_ids:
-            if self._sampling_config[rid].vocab_size is None:
+            if self._seen_token_mask[rid]._seen_token_mask is None:
                 self._seen_token_mask[rid] = SeenTokenMask.new(
                     rid, vocab_size=logits.shape[1],
                     device=self.device
@@ -366,7 +385,6 @@ class Sampler(BaseSampler):
             all_top_k_zero=all_top_k_zero,
             seed=seed,
             rand_offset=rand_offset,
-            cuda_sync_function=self._sync,
         )
 
         # TODO: make this scatter async. Currently runs 2 kernels per rid
@@ -386,13 +404,11 @@ class Sampler(BaseSampler):
             for i, rid in enumerate(request_ids):
                 self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
 
-        return tokens
+        # Advance the per-request RNG offset so the next step draws fresh.
+        for rid in request_ids:
+            self._step_offset[rid] = self._step_offset.get(rid, 0) + 1
 
-    def _sync(self) -> None:
-        # Sync between Triton's fused_temperature_softmax (writes probs)
-        # and FlashInfer's sampling kernel (reads probs). They live on
-        # different CUDA streams in some configurations.
-        torch.cuda.current_stream().synchronize()
+        return tokens
 
 
 @torch.compiler.disable
@@ -408,7 +424,6 @@ def sample_tokens(
     all_top_k_zero: bool | None = None,
     seed: torch.Tensor | None = None,
     rand_offset: torch.Tensor | None = None,
-    cuda_sync_function: Callable[[], None] | None = None,
 ) -> torch.Tensor:
     """Sample tokens from logits with temperature, top-k, top-p, and repetition penalty.
 
@@ -442,37 +457,42 @@ def sample_tokens(
 
     import flashinfer
 
-    # Fast path: top_k is disabled for every request in the batch. One Triton
-    # kernel fuses (optional rep-penalty) + (temperature-scaled softmax) +
-    # (argmax → one-hot for greedy rows). FlashInfer's sample-from-probs then
-    # deterministically picks argmax on one-hot rows, matching greedy semantics.
-    if all_top_k_zero is True:
+    # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
+    # (reads probs) to the same device/stream so the write-before-read is
+    # ordered without an explicit sync. Otherwise FlashInfer runs on the
+    # worker's current-device stream while probs lives off-device (e.g. BAGEL
+    # LLM on rank 1) — a cross-stream race that yields garbage.
+    with torch.cuda.device(logits.device):
+        # Fast path: top_k is disabled for every request in the batch. One Triton
+        # kernel fuses (optional rep-penalty) + (temperature-scaled softmax) +
+        # (argmax → one-hot for greedy rows). FlashInfer's sample-from-probs then
+        # deterministically picks argmax on one-hot rows, matching greedy semantics.
+        if all_top_k_zero is True:
+            probs = fused_temperature_softmax(
+                logits, temperature,
+                penalty=repetition_penalty if seen_token_mask is not None else None,
+                seen_mask=seen_token_mask,
+                include_greedy=run_greedy,
+            )
+            result = flashinfer.sampling.top_p_sampling_from_probs(
+                probs, top_p,
+                deterministic=True,
+                seed=seed, offset=rand_offset,
+            )
+            return result[0] if isinstance(result, tuple) else result
+
         probs = fused_temperature_softmax(
             logits, temperature,
             penalty=repetition_penalty if seen_token_mask is not None else None,
             seen_mask=seen_token_mask,
             include_greedy=run_greedy,
         )
-
-        if cuda_sync_function is not None:
-            cuda_sync_function()
-        result = flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
+        result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, top_p,
+            deterministic=True,
+            seed=seed, offset=rand_offset
+        )
         return result[0] if isinstance(result, tuple) else result
-    
-    probs = fused_temperature_softmax(
-        logits, temperature,
-        penalty=repetition_penalty if seen_token_mask is not None else None,
-        seen_mask=seen_token_mask,
-        include_greedy=run_greedy,
-    )
-    if cuda_sync_function is not None:
-        cuda_sync_function()
-    result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-        probs, top_k, top_p,
-        deterministic=True,
-        seed=seed, offset=rand_offset
-    )
-    return result[0] if isinstance(result, tuple) else result
 
 
 def _to_tensor(
@@ -494,9 +514,9 @@ def _to_tensor(
 # Reads top_k / top_p / temperature from preallocated device tensors so the
 # call can sit inside a CUDA graph capture region without allocating, syncing,
 # or branching on CPU-side values. The full ``Sampler`` class is *not* graph
-# capturable (repetition-penalty state, ``@torch.compiler.disable``, the CPU
-# stream sync inside ``sample_tokens``), so the unrolled MTP loop uses this
-# narrower path. ``deterministic=True`` disables the CPU-RNG-seeded path that
+# capturable (repetition-penalty state, ``@torch.compiler.disable``, the
+# device-context switch inside ``sample_tokens``), so the unrolled MTP loop uses
+# this narrower path. ``deterministic=True`` disables the CPU-RNG-seeded path that
 # FlashInfer would otherwise take.
 
 def sample_cuda_graphable_gpu(
@@ -746,7 +766,7 @@ class SamplerBuffers:
         self._master_temperature[slot:slot + 1].copy_(self._row_temp_cpu, non_blocking=True)
         self._master_top_k[slot:slot + 1].copy_(self._row_top_k_cpu, non_blocking=True)
         self._master_top_p[slot:slot + 1].copy_(self._row_top_p_cpu, non_blocking=True)
-        self._row_seed_cpu[slot:slot + 1].copy_(self._row_seed_cpu, non_blocking=True)
+        self._master_seed[slot:slot + 1].copy_(self._row_seed_cpu, non_blocking=True)
 
     def _grow_master(self, new_capacity: int) -> None:
         """Double-and-copy the master buffers up to at least ``new_capacity``.

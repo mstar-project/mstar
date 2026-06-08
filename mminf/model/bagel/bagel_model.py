@@ -446,8 +446,10 @@ class BagelModel(Model):
         "<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n"
     )
     VLM_UNDERSTANDING_SUFFIX = "\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-    VLM_UNDERSTANDING_TEMPLATE = "<|im_start|>system\n{system_prompt}<|im_end|>" + \
-        "\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+    # For text-to-text, BAGEL doesn't seem to do as well with the "user... assistant..." format
+    VLM_UNDERSTANDING_TEMPLATE = "<|im_start|>{system_prompt}<|im_end|>" + \
+        "s<|im_start|>{prompt}<|im_end|><|im_start|>"
 
     # Image generation (T2I/I2I): bare wrapping, no system prompt or roles. Input
     # image (I2I) is positioned before this by the prefill_vae/vit walks.
@@ -497,7 +499,7 @@ class BagelModel(Model):
             elif is_understanding:
                 if think_mode:
                     system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
-                segments = [self.VLM_UNDERSTANDING_TEMPLATE.format(
+                segments = [self.GEN_TEMPLATE.format(
                     system_prompt=system_prompt, prompt=prompt
                 )]
             else:
