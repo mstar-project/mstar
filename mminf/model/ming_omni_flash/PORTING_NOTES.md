@@ -128,10 +128,21 @@ graph-walk / partition / streaming patterns transfer 1:1.
      per-token swap), `LingDecoderLayer` (hybrid dense/MoE per
      `first_k_dense_replace`), full `LingMoeModel` (embed + N layers +
      RMSNorm + lm_head). 9 tests in `test_ming_flash_omni_model.py`.
-   - **3c — TODO**: weight loader (safetensors → params, with per-expert
-     gate/up/down fusion into packed tensors), `BailingMoeV2ThinkerSubmodule`
-     in `submodules.py` registering with mminf's engine, real-checkpoint
-     smoke test against the released shards.
+   - **3c — DONE** (`loader.py`): weight loader that maps the released
+     ckpt's `model.model.*` namespace to `LingMoeModel`'s state_dict,
+     with per-expert gate/up/down fusion into the packed
+     `experts.gate_up_proj` tensor via mminf's existing
+     `WeightConverter` machinery. Real-ckpt smoke test loads embed +
+     dense layer 0 + lm_head from the released shards and runs a
+     forward — output is finite bf16 logits at the expected
+     `(T, vocab_size)` shape. 6 tests in
+     `test_ming_flash_omni_loader.py` (4 pure-Python + 2 CUDA+snapshot).
+   - **3d — TODO**: KV cache integration on `LingAttention` (wire
+     `cache_handle`, replace inline SDPA with mminf's cached-attention
+     path), `BailingMoeV2ThinkerSubmodule` in `submodules.py` registering
+     with mminf's engine (prepare_inputs / preprocess / forward /
+     postprocess). After 3d, `mminf-serve --config configs/ming_flash_omni.yaml`
+     should reach a first forward pass.
 
    Note: expert layout doesn't share with Qwen3-Omni's MoE block —
    `MultiRouter` (3 gates + modality masks) is Ling-specific, and
