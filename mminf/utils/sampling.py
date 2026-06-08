@@ -239,7 +239,7 @@ class BaseSampler(ABC):
 
     @abstractmethod
     def sample(
-        self, request_ids: list[str], logits: torch.Tensor
+        self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         pass
 
@@ -338,7 +338,7 @@ class Sampler(BaseSampler):
             )
 
     def sample(
-        self, request_ids: list[str], logits: torch.Tensor
+        self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         """Return the sampled tokens as a single [B] int tensor.
 

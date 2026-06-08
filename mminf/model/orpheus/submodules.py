@@ -13,7 +13,7 @@ from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
 from mminf.model.orpheus.config import OrpheusModelConfig
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mminf.utils.sampling import SeenTokenMask
+from mminf.utils.sampling import CudaGraphableSampler, Sampler, SeenTokenMask
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
 
-    PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024]
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
     def _build_prefill_packed(
@@ -202,12 +202,14 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             return self._forward_decode_batched(
                 cache_manager=cache_handle,
                 request_ids=engine_inputs.request_ids,
+                sampler=engine_inputs.sampler,
                 text_inputs=text_inputs,
             )
         elif graph_walk == "prefill":
             return self._forward_prefill_batched(
                 cache_handle=cache_handle,
                 request_ids=engine_inputs.request_ids,
+                sampler=engine_inputs.sampler,
                 text_inputs=text_inputs,
             )
         else:
@@ -216,6 +218,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     def _forward_prefill_batched(
         self,
         cache_handle: BatchedCacheManager,
+        sampler: Sampler,
         request_ids: list[str],
         text_inputs: torch.Tensor,
     ) -> dict[str, NameToTensorList]:
@@ -232,16 +235,19 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         last_hidden = hidden.index_select(0, last_token_indices)
         logits = self.lm_head(last_hidden)  # (bs, vocab)
 
+        new_tokens = sampler.sample(
+            request_ids, logits, apply_penalty=True
+        )
         out: dict = {
-            rid: {"logits": [logits[i : i + 1]]}
+            rid: {"new_token": [new_tokens[i : i + 1]]}
             for i, rid in enumerate(request_ids)
         }
-        out["__batched_logits__"] = logits
         return out
 
     def _forward_decode_batched(
         self,
         cache_manager: BatchedCacheManager,
+        sampler: Sampler,
         request_ids: list[str],
         text_inputs: torch.Tensor,
     ) -> dict[str, NameToTensorList]:
@@ -252,14 +258,13 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         hidden = self.language_model(embs, cache_handle=cache_manager)
 
         logits = self.lm_head(hidden)
-
-        # Expose the stacked [B, V] tensor under a sentinel key so the CUDA
-        # graph runner can sample directly without concatenating per-rid slices.
+        new_tokens = sampler.sample(
+            request_ids, logits, apply_penalty=True
+        )
         out: dict = {
-            rid: {"logits": [logits[i : i + 1]]}
+            rid: {"new_token": [new_tokens[i : i + 1]]}
             for i, rid in enumerate(request_ids)
         }
-        out["__batched_logits__"] = logits
         return out
 
     def postprocess(
