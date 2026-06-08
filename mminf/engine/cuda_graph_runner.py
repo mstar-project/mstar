@@ -90,6 +90,7 @@ class CudaGraphData:
     # GPU thread (replay) and plan_executor thread (pre-plan) always agree on
     # which slot a given iter targets.
     next_slot: int = 0
+    applied_penalty_in_graph: bool = False
 
 
 @dataclass(frozen=True)
@@ -160,6 +161,7 @@ class CudaGraphRunner:
         buffer_manager: WorkspaceBufferManager,
         device: torch.device,
         autocast_dtype: torch.dtype,
+        default_sampling_config: SamplingConfig,
         tp_group=None,
     ):
         from mminf.distributed.communication import TPCommGroup
@@ -176,6 +178,7 @@ class CudaGraphRunner:
         self.device = device
         self.autocast_dtype = autocast_dtype
         self.buffer_manager = buffer_manager
+        self.default_sampling_config = default_sampling_config
         self.enable_nvtx = False  # set by KVCacheEngine after construction
 
         self.graphs: dict[CudaGraphKey, CudaGraphData] = {}
@@ -210,6 +213,11 @@ class CudaGraphRunner:
         self.sampler_buffer: SamplerBuffers = SamplerBuffers.allocate(
             max_batch_size=self.max_bs, device=device,
             tp_group=self.tp_group,
+            # A vocab size on the model's default sampling config enables the
+            # seen-token mask buffers (allocated before capture) so submodules
+            # that sample with a repetition penalty in-graph (e.g. the
+            # Qwen3-Omni Talker) can apply it. None => no mask buffers.
+            vocab_size=self.default_sampling_config.vocab_size,
         )
 
     def warmup_and_capture(self) -> None:
@@ -482,6 +490,7 @@ class CudaGraphRunner:
         config: CudaGraphConfig,
         bs: int,
         slots: list[CudaGraphSlot],
+        applied_penalty_in_graph: bool=False
     ) -> None:
         """Register a populated CudaGraphData under all replay graph walks.
 
@@ -506,6 +515,7 @@ class CudaGraphRunner:
                 bs=bs,
                 slots=slots,
                 next_slot=0,
+                applied_penalty_in_graph=applied_penalty_in_graph
             )
 
     def _capture_slots(
@@ -527,6 +537,7 @@ class CudaGraphRunner:
         """
         captured_slots: list[CudaGraphSlot] = []
         dummy_rids_to_free: list[list[str]] = []
+        applied_penalty_in_graph = False
 
         try:
             for slot_idx in range(self.NUM_SLOTS):
@@ -541,6 +552,7 @@ class CudaGraphRunner:
                         fullgraph=False,
                         dynamic=False,
                     )
+                spec.engine_inputs.sampler.applied_penalty_in_graph = False
 
                 def run_forward(
                     _forward=forward,
@@ -580,9 +592,13 @@ class CudaGraphRunner:
                     cache_manager=spec.cache_manager,
                 )
                 captured_slots.append(slot)
+                
+                applied_penalty_in_graph = applied_penalty_in_graph or \
+                    spec.engine_inputs.sampler.applied_penalty_in_graph
 
             self._register_graph_data(
                 key=key, config=config, bs=key.bs, slots=captured_slots,
+                applied_penalty_in_graph=applied_penalty_in_graph
             )
         finally:
             for rids in dummy_rids_to_free:
@@ -850,7 +866,8 @@ class CudaGraphRunner:
 
     def _get_sampler(
         self, per_request_info: dict[str, CurrentForwardPassInfo],
-        request_ids: list[str], padded_bs: int
+        request_ids: list[str], padded_bs: int,
+        gather_seen_tokens: bool = True,
     ):
         # Per-request sampling configs are pre-staged on master GPU buffers
         # (see ``register_request`` / ``update_request_config`` from KVCacheEngine);
@@ -860,6 +877,7 @@ class CudaGraphRunner:
         del per_request_info
         return self.sampler_buffer.gather_for_request_ids(
             request_ids=request_ids, padded_bs=padded_bs,
+            gather_seen_tokens=gather_seen_tokens,
         )
 
     def register_request(
@@ -1269,6 +1287,14 @@ class CudaGraphRunner:
                 dummy_rids, request_ids, real_bs,
                 per_request_info, static["dummy_metadata"],
             )
+            # Stage the live seen-token masks into master before the gather so
+            # the per-step buffer reflects the request's accumulated tokens for
+            # the in-graph penalty. Gated per-config; no-op for non-penalty graphs.
+            if graph_data.applied_penalty_in_graph:
+                self.sampler_buffer.stage_seen_token_masks(
+                    request_ids,
+                    [self.sampler._seen_token_mask[rid] for rid in request_ids],
+                )
             engine_inputs = ModelInputsFromEngine(
                 request_ids=dummy_rids,
                 per_request_info=real_metadata,
@@ -1276,7 +1302,8 @@ class CudaGraphRunner:
                 sampler=self._get_sampler(
                     per_request_info=per_request_info,
                     request_ids=request_ids,
-                    padded_bs=padded_bs
+                    padded_bs=padded_bs,
+                    gather_seen_tokens=graph_data.applied_penalty_in_graph,
                 )
             )
             if self.enable_nvtx:
@@ -1328,6 +1355,12 @@ class CudaGraphRunner:
                 range_pop(synchronize=False)
                 range_pop(synchronize=False)
                 mark("gpu_thread.cuda_graph_end")
+            
+
+            if graph_data.applied_penalty_in_graph:
+                engine_inputs.sampler.sync_seen_token_masks(
+                    [self.sampler._seen_token_mask[rid] for rid in request_ids]
+                )
 
             # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
             # advance_seq_lens is not captured in the graph; we call it manually so
@@ -1478,6 +1511,14 @@ class CudaGraphRunner:
                 dummy_rids, request_ids, real_bs,
                 per_request_info, static["dummy_metadata"],
             )
+            # Stage the live seen-token masks into master before the gather so
+            # the per-step buffer reflects the request's accumulated tokens for
+            # the in-graph penalty. Gated per-config; no-op for non-penalty graphs.
+            if graph_data.applied_penalty_in_graph:
+                self.sampler_buffer.stage_seen_token_masks(
+                    request_ids,
+                    [self.sampler._seen_token_mask[rid] for rid in request_ids],
+                )
             engine_inputs = ModelInputsFromEngine(
                 request_ids=dummy_rids,
                 per_request_info=real_metadata,
@@ -1485,7 +1526,8 @@ class CudaGraphRunner:
                 sampler=self._get_sampler(
                     per_request_info=per_request_info,
                     request_ids=request_ids,
-                    padded_bs=padded_bs
+                    padded_bs=padded_bs,
+                    gather_seen_tokens=graph_data.applied_penalty_in_graph,
                 )
             )
             if self.enable_nvtx:
@@ -1530,6 +1572,11 @@ class CudaGraphRunner:
                 range_pop(synchronize=False)
                 range_pop(synchronize=False)
                 mark("gpu_thread.cuda_graph_end")
+            
+            if graph_data.applied_penalty_in_graph:
+                engine_inputs.sampler.sync_seen_token_masks(
+                    [self.sampler._seen_token_mask[rid] for rid in request_ids]
+                )
 
             # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
             if self.enable_nvtx:

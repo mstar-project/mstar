@@ -28,7 +28,7 @@ from mminf.engine.kv_store import (
 )
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
 from mminf.utils.profiler import range_pop, range_push
-from mminf.utils.sampling import Sampler
+from mminf.utils.sampling import Sampler, SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ class SubmoduleManagement:
     submodule: ARNodeSubmodule
     kv_management: KVManagement
     tp_group: TPCommGroup
+    default_sampling_config: SamplingConfig
     sampler: Sampler = field(default_factory=Sampler)
     cuda_graph_runner: CudaGraphRunner | None = None
 
@@ -95,6 +96,7 @@ class KVCacheEngine(BaseEngine):
         kv_cache_config: list[KVCacheConfig],
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
+        default_sampling_config: dict[str, SamplingConfig],
         kv_cache_type=None,
     ) -> None:
         self.device = device
@@ -169,6 +171,9 @@ class KVCacheEngine(BaseEngine):
                 submodule=submodule,
                 kv_management=node_to_kv_mgmt[node_name],
                 tp_group=tp_group,
+                default_sampling_config=default_sampling_config.get(
+                    node_name, SamplingConfig()
+                ),
                 sampler=Sampler(
                     device=self.device, tp_group=tp_group
                 ),
@@ -248,6 +253,7 @@ class KVCacheEngine(BaseEngine):
                 device=self.device,
                 autocast_dtype=self.autocast_dtype,
                 tp_group=submodule_mgmt.tp_group,
+                default_sampling_config=submodule_mgmt.default_sampling_config,
             )
             runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()

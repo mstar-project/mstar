@@ -137,6 +137,10 @@ class EngineManager:
                 device=device,
                 transfer_engine_info=transfer_engine_info,
                 kv_cache_type=autocast_dtype,
+                default_sampling_config={
+                    node: model.get_sampling_config(node, {}) \
+                        for node in submodules
+                }
             )
             log_key = engine_type_str if flavor is None else f"{engine_type_str}.{flavor}"
             logger.info("Engine %s loaded in on device %s", log_key, str(device))
