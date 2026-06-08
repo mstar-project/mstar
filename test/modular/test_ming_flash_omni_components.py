@@ -15,6 +15,7 @@ import importlib
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from mminf.model.ming_omni_flash.components.attention import LingAttention
 from mminf.model.ming_omni_flash.components.rope import (
@@ -23,6 +24,46 @@ from mminf.model.ming_omni_flash.components.rope import (
 from mminf.model.ming_omni_flash.components.router import LingMoeRouter
 
 torch.manual_seed(2026)
+
+
+class _MockCacheHandle:
+    """Stand-in for :class:`BatchedCacheManager` in unit tests.
+
+    Implements just ``set_layer_idx`` + ``run_attention`` — the two
+    methods :class:`LingAttention` and :class:`LingMoeModel` call. The
+    ``run_attention`` runs standard causal SDPA, matching what the
+    inline path did before the cache_handle refactor. No KV cache state
+    is preserved across calls (single-shot per layer is enough for unit
+    tests; the real engine handles paging).
+    """
+
+    def __init__(self) -> None:
+        self.layer_idx = 0
+
+    def set_layer_idx(self, layer_idx: int) -> None:
+        self.layer_idx = layer_idx
+
+    def run_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Plain causal SDPA. ``q``/``k``/``v``:
+        ``(num_tokens, num_heads_or_kv, head_dim)``. Returns
+        ``(num_tokens, num_heads, head_dim)``.
+        """
+        num_heads = q.shape[1]
+        num_kv = k.shape[1]
+        kv_groups = num_heads // num_kv
+        if kv_groups > 1:
+            k = k.repeat_interleave(kv_groups, dim=1)
+            v = v.repeat_interleave(kv_groups, dim=1)
+        # SDPA expects (B, num_heads, T, head_dim); we have
+        # (T, num_heads, head_dim). Unsqueeze a batch + transpose.
+        q4 = q.transpose(0, 1).unsqueeze(0)
+        k4 = k.transpose(0, 1).unsqueeze(0)
+        v4 = v.transpose(0, 1).unsqueeze(0)
+        scale = q.shape[-1] ** -0.5
+        out = F.scaled_dot_product_attention(q4, k4, v4, is_causal=True, scale=scale)
+        return out.squeeze(0).transpose(0, 1).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +338,7 @@ def test_ling_attention_forward_runs_with_qk_norm() -> None:
     T = 5
     x = torch.randn(T, 64, device="cuda")
     pos = torch.arange(T, device="cuda")
-    out = attn(x, pos)
+    out = attn(x, _MockCacheHandle(), pos)
     assert out.shape == x.shape
     assert torch.isfinite(out).all()
 
@@ -346,11 +387,11 @@ def test_ling_attention_causal_mask() -> None:
     ).cuda().eval()
     x = torch.randn(3, 64, device="cuda")
     pos = torch.arange(3, device="cuda")
-    out_a = attn(x, pos)
+    out_a = attn(x, _MockCacheHandle(), pos)
 
     # Append a 4th token; first 3 outputs MUST equal out_a (causal).
     x4 = torch.cat([x, torch.randn(1, 64, device="cuda")], dim=0)
     pos4 = torch.arange(4, device="cuda")
-    out_b = attn(x4, pos4)
+    out_b = attn(x4, _MockCacheHandle(), pos4)
     assert torch.allclose(out_a, out_b[:3], atol=1e-4), \
         "causal mask leaked — adding a later token changed earlier outputs"

@@ -137,12 +137,33 @@ graph-walk / partition / streaming patterns transfer 1:1.
      forward — output is finite bf16 logits at the expected
      `(T, vocab_size)` shape. 6 tests in
      `test_ming_flash_omni_loader.py` (4 pure-Python + 2 CUDA+snapshot).
-   - **3d — TODO**: KV cache integration on `LingAttention` (wire
-     `cache_handle`, replace inline SDPA with mminf's cached-attention
-     path), `BailingMoeV2ThinkerSubmodule` in `submodules.py` registering
-     with mminf's engine (prepare_inputs / preprocess / forward /
-     postprocess). After 3d, `mminf-serve --config configs/ming_flash_omni.yaml`
-     should reach a first forward pass.
+   - **3d — DONE** (cache wiring + submodule + engine integration):
+     `LingAttention` now uses `cache_handle.run_attention` for paged
+     KV-cache attention (keeps the custom partial-3D rope inline);
+     `BailingMoeV2ThinkerSubmodule` in `submodules.py` implements
+     `prepare_inputs` / `preprocess` / `forward` / `check_stop` for
+     the prefill + decode walks; `MingFlashOmniModel.__init__` no
+     longer raises NotImplementedError and all Model ABC methods
+     (`get_kv_cache_config`, `get_graph_walk_graphs`, `get_partitions`,
+     `process_prompt`, `postprocess`, `get_submodule`, etc.) are
+     implemented for the text-only path. 12 tests in
+     `test_ming_flash_omni_model.py` + the existing 30+ Ming tests
+     still pass.
+
+     **Verified via `mminf-serve` smoke**: the engine instantiates the
+     model class, calls `get_submodule("Thinker")`, and reaches
+     `load_thinker_weights` — failing with OOM on a single GPU
+     (loaded ~75 GB before exhausting the 80 GB H100). The engine
+     plumbing itself works; **single-GPU OOM is the expected blocker
+     until step 3e brings TP-aware variants**. To actually serve the
+     full 100B model we need TP=4 distributing the experts + attention
+     across 4 H100s.
+
+   - **3e — TODO**: TP-aware variants (`ParallelAttention` replacement
+     of `nn.Linear` QKV, `ParallelMoeBlock` for routed experts,
+     TP-rank-aware weight loader slicing per-expert tensors per rank).
+     Then `mminf-serve --config configs/ming_flash_omni_thinker_only.yaml`
+     with TP=4 should actually answer a text request.
 
    Note: expert layout doesn't share with Qwen3-Omni's MoE block —
    `MultiRouter` (3 gates + modality masks) is Ling-specific, and

@@ -132,6 +132,7 @@ class LingMoeModel(nn.Module):
 
     def forward(
         self,
+        cache_handle,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
@@ -141,6 +142,11 @@ class LingMoeModel(nn.Module):
         """Run the full thinker forward.
 
         Args:
+            cache_handle: :class:`BatchedCacheManager` from the engine
+                (or a unit-test mock with ``set_layer_idx`` +
+                ``run_attention``). Required — the attention layer
+                writes K/V to its paged cache and runs FlashInfer
+                attention against it.
             input_ids: ``(T,)`` token ids — if provided, ``embed_tokens``
                 turns them into embeddings.
             input_embeds: ``(T, hidden_size)`` precomputed embeddings —
@@ -152,7 +158,7 @@ class LingMoeModel(nn.Module):
                 :class:`LingMoeBlock`. ``None`` ⇒ all text routing.
 
         Returns:
-            ``(T, vocab_size)`` logits. The caller (eventual submodule)
+            ``(T, vocab_size)`` logits. The caller (the submodule)
             slices the last position for next-token sampling.
         """
         if (input_ids is None) == (input_embeds is None):
@@ -168,18 +174,18 @@ class LingMoeModel(nn.Module):
 
         if h.dim() != 2:
             raise ValueError(
-                f"LingMoeModel expects ungrouped (T, hidden) input; got "
-                f"shape {tuple(h.shape)}. Batched inputs aren't supported "
-                f"in step-3b scope."
+                f"LingMoeModel expects packed (T, hidden) input; got "
+                f"shape {tuple(h.shape)}."
             )
 
         T = h.shape[0]
         if position_ids is None:
             position_ids = torch.arange(T, device=h.device)
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
+            cache_handle.set_layer_idx(layer_idx)
             h = layer(
-                h, position_ids,
+                h, cache_handle, position_ids,
                 image_mask=image_mask,
                 audio_mask=audio_mask,
             )

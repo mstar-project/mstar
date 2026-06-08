@@ -257,9 +257,26 @@ def test_load_layer0_real_weights_runs_forward(snapshot_dir: str) -> None:
     model.eval()
 
     # Run a forward on a handful of arbitrary in-vocab token ids.
+    import torch.nn.functional as F
+
+    class _Cache:
+        def set_layer_idx(self, i):
+            pass
+        def run_attention(self, q, k, v):
+            num_heads = q.shape[1]
+            num_kv = k.shape[1]
+            if num_heads // num_kv > 1:
+                k = k.repeat_interleave(num_heads // num_kv, dim=1)
+                v = v.repeat_interleave(num_heads // num_kv, dim=1)
+            q4 = q.transpose(0, 1).unsqueeze(0)
+            k4 = k.transpose(0, 1).unsqueeze(0)
+            v4 = v.transpose(0, 1).unsqueeze(0)
+            out = F.scaled_dot_product_attention(q4, k4, v4, is_causal=True, scale=q.shape[-1] ** -0.5)
+            return out.squeeze(0).transpose(0, 1).contiguous()
+
     input_ids = torch.tensor([100, 200, 300, 400], device="cuda")
     with torch.no_grad():
-        out = model(input_ids=input_ids)
+        out = model(_Cache(), input_ids=input_ids)
 
     assert out.shape == (4, dims["vocab_size"])
     assert torch.isfinite(out).all(), \

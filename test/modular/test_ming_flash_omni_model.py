@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from mminf.model.ming_omni_flash.components.decoder_layer import (
     LingDecoderLayer,
@@ -28,6 +29,33 @@ from mminf.model.ming_omni_flash.components.rope import (
 )
 
 torch.manual_seed(2026)
+
+
+class _MockCacheHandle:
+    """Stand-in for BatchedCacheManager in unit tests; duplicated from
+    test_ming_flash_omni_components.py because test/ isn't a package."""
+
+    def __init__(self) -> None:
+        self.layer_idx = 0
+
+    def set_layer_idx(self, layer_idx: int) -> None:
+        self.layer_idx = layer_idx
+
+    def run_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    ) -> torch.Tensor:
+        num_heads = q.shape[1]
+        num_kv = k.shape[1]
+        kv_groups = num_heads // num_kv
+        if kv_groups > 1:
+            k = k.repeat_interleave(kv_groups, dim=1)
+            v = v.repeat_interleave(kv_groups, dim=1)
+        q4 = q.transpose(0, 1).unsqueeze(0)
+        k4 = k.transpose(0, 1).unsqueeze(0)
+        v4 = v.transpose(0, 1).unsqueeze(0)
+        scale = q.shape[-1] ** -0.5
+        out = F.scaled_dot_product_attention(q4, k4, v4, is_causal=True, scale=scale)
+        return out.squeeze(0).transpose(0, 1).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -184,10 +212,11 @@ def _init_dispatch_weights(model: LingMoeModel) -> None:
 def test_ling_moe_model_input_ids_xor_embeds_required() -> None:
     """Both or neither of input_ids / input_embeds raises."""
     m = LingMoeModel(**_tiny_model_kwargs())
+    cache = _MockCacheHandle()
     with pytest.raises(ValueError, match="Exactly one"):
-        m(input_ids=None, input_embeds=None)
+        m(cache, input_ids=None, input_embeds=None)
     with pytest.raises(ValueError, match="Exactly one"):
-        m(input_ids=torch.zeros(3, dtype=torch.long),
+        m(cache, input_ids=torch.zeros(3, dtype=torch.long),
           input_embeds=torch.zeros(3, 32))
 
 
@@ -201,7 +230,7 @@ def test_ling_moe_model_forward_with_input_ids_shape() -> None:
     _init_dispatch_weights(m)
     T = 5
     input_ids = torch.randint(0, 64, (T,), device="cuda")
-    out = m(input_ids=input_ids)
+    out = m(_MockCacheHandle(), input_ids=input_ids)
     assert out.shape == (T, 64)
     assert torch.isfinite(out).all()
 
@@ -214,7 +243,7 @@ def test_ling_moe_model_forward_with_input_embeds_shape() -> None:
     _init_dispatch_weights(m)
     T = 4
     embeds = torch.randn(T, 32, device="cuda", dtype=torch.bfloat16)
-    out = m(input_embeds=embeds)
+    out = m(_MockCacheHandle(), input_embeds=embeds)
     assert out.shape == (T, 64)
     assert torch.isfinite(out).all()
 
@@ -254,8 +283,8 @@ def test_ling_decoder_layer_dense_vs_moe_paths_differ() -> None:
     assert dense.is_moe is False and moe.is_moe is True
     x = torch.randn(3, 32, device="cuda", dtype=torch.bfloat16)
     pos = torch.arange(3, device="cuda")
-    out_dense = dense(x, pos)
-    out_moe = moe(x, pos)
+    out_dense = dense(x, _MockCacheHandle(), pos)
+    out_moe = moe(x, _MockCacheHandle(), pos)
     assert not torch.allclose(out_dense, out_moe), (
         "dense and MoE layer paths produced identical output"
     )
@@ -272,10 +301,10 @@ def test_ling_moe_model_causal() -> None:
     m = LingMoeModel(**_tiny_model_kwargs()).cuda().to(torch.bfloat16).eval()
     _init_dispatch_weights(m)
     input_ids = torch.randint(0, 64, (4,), device="cuda")
-    out_a = m(input_ids=input_ids)
+    out_a = m(_MockCacheHandle(), input_ids=input_ids)
 
     extended = torch.cat([input_ids, torch.randint(0, 64, (1,), device="cuda")])
-    out_b = m(input_ids=extended)
+    out_b = m(_MockCacheHandle(), input_ids=extended)
     # bf16 tolerance — 2 layers' worth of bf16 ops drift more than fp32.
     assert torch.allclose(out_a, out_b[:4], atol=0.05), (
         "causal mask leaked: appending a token changed earlier-position logits"

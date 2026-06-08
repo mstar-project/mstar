@@ -1,10 +1,7 @@
 """MingFlashOmniModel: native mminf port of Ming-flash-omni-2.0.
 
-WIP SCAFFOLD — does not run end-to-end yet.
-
-Until this port is complete, benchmark Ming-flash-omni-2.0 via the
-``vllm_omni`` inference system against a vllm-omni server (see
-``benchmark/vllm_omni_instructions.md``).
+Step 3d: text-only thinker path is wired end-to-end. Vision / audio /
+talker / image-gen are step 4+.
 
 The released checkpoint (``inclusionAI/Ming-flash-omni-2.0``, 2026-02-11) is a
 Ling-2.0 sparse-MoE omni model: 100B total / 6B active params, ~238 GB / 42
@@ -48,13 +45,27 @@ import torch
 from mminf.communication.tensors import NameToTensorList
 from mminf.conductor.request_info import (
     CurrentForwardConductorMetadata,
+    PartitionDefinition,
     StreamingConnectionState,
 )
 from mminf.engine.base import EngineType
 from mminf.engine.kv_store import KVCacheConfig
-from mminf.graph.base import GraphSection, TensorPointerInfo
+from mminf.graph.base import (
+    GraphEdge,
+    GraphNode,
+    GraphSection,
+    Loop,
+    TensorPointerInfo,
+)
+from mminf.graph.special_destinations import EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model
+from mminf.model.ming_omni_flash.components.model import LingMoeModel
 from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig
+from mminf.model.ming_omni_flash.loader import load_thinker_weights
+from mminf.model.ming_omni_flash.submodules import (
+    BailingMoeV2ThinkerSubmodule,
+)
+from mminf.streaming.topology import PartitionTopology
 
 logger = logging.getLogger(__name__)
 
@@ -252,10 +263,8 @@ class MingFlashOmniModel(Model):
         except Exception as e:
             self._warn_tokenizer_unavailable("processor", e)
 
-        # Lazy submodule cache — empty until later porting steps land.
+        # Lazy submodule cache — populated on first get_submodule call.
         self._submodule_cache: dict[str, object] = {}
-
-        raise NotImplementedError(_NOT_PORTED)
 
     @staticmethod
     def _warn_tokenizer_unavailable(what: str, err: Exception) -> None:
@@ -276,35 +285,69 @@ class MingFlashOmniModel(Model):
         )
 
     # ------------------------------------------------------------------
-    # Model ABC — every method below is a stub. Implement by mirroring
-    # mminf/model/qwen3_omni/qwen3_omni_model.py and the upstream
-    # vllm-omni files listed in the module docstring.
+    # Model ABC: KV cache config (thinker only for step 3d)
     # ------------------------------------------------------------------
 
     def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        # Port: separate KVCacheConfig for Thinker (Ling MoE) and Talker.
-        # Pull dims from MingFlashOmniModelConfig.thinker / .talker after
-        # the config port is done. Cribsheet: qwen3_omni_model.get_kv_cache_config.
-        raise NotImplementedError(_NOT_PORTED)
+        llm = self.config.thinker_llm
+        return [KVCacheConfig(
+            num_layers=llm.num_hidden_layers,
+            num_kv_heads=llm.num_key_value_heads,
+            head_dim=llm.head_dim,
+            max_seq_len=llm.max_position_embeddings,
+            num_qo_heads=llm.num_attention_heads,
+            nodes=["Thinker"],
+        )]
 
     def get_node_engine_types(self) -> dict[str, EngineType]:
-        # Likely shape (mirrors Qwen3-Omni's set):
-        #   "audio_encoder": STATELESS
-        #   "vision_encoder": STATELESS
-        #   "Thinker": KV_CACHE
-        #   "Talker": KV_CACHE   (CFM still runs autoregressively token-side)
-        #   "AudioVAE": STATELESS
-        #   "ImageGen": STATELESS  (DiT, no KV cache)
-        raise NotImplementedError(_NOT_PORTED)
+        # Text-only thinker for step 3d. audio_encoder / vision_encoder /
+        # Talker / AudioVAE / ImageGen fold in at step 4+.
+        return {"Thinker": EngineType.KV_CACHE}
+
+    # ------------------------------------------------------------------
+    # Graph walks: prefill + decode loop, text-only
+    # ------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # Walks to port:
-        #   prefill_text / prefill_audio / prefill_vision / prefill_video
-        #   thinker_decode
-        #   talker_prefill / talker_decode
-        #   audio_vae_decode  (codec tokens -> waveform)
-        #   image_gen         (ImageGen partition, separate deploy yaml)
-        raise NotImplementedError(_NOT_PORTED)
+        prefill = GraphNode(
+            name="Thinker",
+            input_names=["text_inputs"],
+            outputs=[GraphEdge(
+                next_node=EMPTY_DESTINATION,
+                name="new_token",
+                conductor_new_token=True,
+                persist=True,
+            )],
+        )
+        decode = Loop(
+            name="decode_loop",
+            section=GraphNode(
+                name="Thinker",
+                input_names=["text_inputs"],
+                outputs=[GraphEdge(
+                    next_node="Thinker",
+                    name="text_inputs",
+                )],
+            ),
+            max_iters=self.get_max_output_tokens(),
+            outputs=[],
+        )
+        return {"prefill": prefill, "decode": decode}
+
+    def get_partition_topology(self) -> PartitionTopology:
+        return PartitionTopology(partitions=["Thinker"], connections=[])
+
+    def get_partitions(self) -> list[PartitionDefinition]:
+        return [PartitionDefinition(
+            name="Thinker",
+            graph_walks={"prefill", "decode"},
+            initial_walk="prefill",
+            producer_partitions=[],
+        )]
+
+    # ------------------------------------------------------------------
+    # Forward-pass arg builders — mirrors Orpheus's LLM-partition flow
+    # ------------------------------------------------------------------
 
     def get_initial_forward_pass_args(
         self,
@@ -314,7 +357,22 @@ class MingFlashOmniModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        raise NotImplementedError(_NOT_PORTED)
+        if partition_name != "Thinker":
+            raise ValueError(f"Unknown partition: {partition_name!r}")
+        full_metadata = CurrentForwardConductorMetadata(
+            input_modalities=input_modalities,
+            output_modalities=output_modalities,
+            graph_walk="prefill",
+            is_prefill=True,
+        )
+        graph_edge = GraphEdge(next_node="Thinker", name="text_inputs")
+        graph_edge.tensor_info = input_signals.get("text_inputs", [])
+        return ForwardPassArgs(
+            full_metadata=full_metadata,
+            inputs=[graph_edge],
+            unpersist_tensors=list(graph_edge.tensor_info),
+            step_metadata={"is_prefill": True},
+        )
 
     def get_partition_forward_pass_args(
         self,
@@ -324,7 +382,41 @@ class MingFlashOmniModel(Model):
         new_tokens: dict[str, list[int]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        raise NotImplementedError(_NOT_PORTED)
+        """Thinker partition: prefill → decode loop until EOS or max tokens.
+
+        Same shape as Orpheus's _get_llm_partition_forward.
+        """
+        if partition_name != "Thinker":
+            raise ValueError(f"Unknown partition: {partition_name!r}")
+
+        request_done = False
+        if partition_metadata.is_prefill:
+            partition_metadata.is_prefill = False
+            partition_metadata.graph_walk = "decode"
+        elif partition_metadata.graph_walk == "decode":
+            request_done = True
+            partition_metadata.kwargs["decode_finished"] = True
+
+        if request_done:
+            return ForwardPassArgs(
+                full_metadata=partition_metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
+            )
+
+        graph_edge = GraphEdge(next_node="Thinker", name="text_inputs")
+        graph_edge.tensor_info = persist_signals.get("new_token", [])
+        return ForwardPassArgs(
+            full_metadata=partition_metadata,
+            inputs=[graph_edge],
+            unpersist_tensors=list(graph_edge.tensor_info),
+            step_metadata={"is_prefill": partition_metadata.is_prefill},
+        )
+
+    # ------------------------------------------------------------------
+    # Prompt / output handling
+    # ------------------------------------------------------------------
 
     def process_prompt(
         self,
@@ -334,17 +426,92 @@ class MingFlashOmniModel(Model):
         tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        # Build the chat-template prompt and (when output is image) append
-        # the <image><imagePatch>*N</image> query-token block via
-        # ``vllm_omni/.../prompt_utils.py:maybe_expand_image_gen_prompt``.
-        # OpenAI roles (user/assistant/system) map to Ming's uppercase
-        # HUMAN/ASSISTANT/SYSTEM inside the HF processor's chat_template.
-        raise NotImplementedError(_NOT_PORTED)
+        """Tokenize a text prompt via the chat template.
 
-    def postprocess(self, output: torch.Tensor, modality: str) -> bytes:
-        # Text -> utf-8; image -> PNG; audio -> 16-bit PCM @ get_output_sample_rate().
-        raise NotImplementedError(_NOT_PORTED)
+        The jinja chat_template in ``tokenizer_config.json`` accepts
+        OpenAI-standard ``user``/``assistant``/``system`` roles and
+        remaps them to Ming's internal HUMAN/ASSISTANT/SYSTEM. We
+        send a plain ``{"role": "user", "content": <prompt>}`` and
+        let the template handle the rest.
+        """
+        if prompt is None:
+            return {}
+        if self.tokenizer is None:
+            raise RuntimeError(
+                "MingFlashOmniModel.process_prompt called but tokenizer "
+                "is not loaded. See _warn_tokenizer_unavailable for setup."
+            )
+        messages = [{"role": "user", "content": prompt}]
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        input_ids = self.tokenizer(text, return_tensors="pt").input_ids[0]
+        return {"text_inputs": [input_ids]}
+
+    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
+        if modality != "text":
+            raise ValueError(
+                f"Unsupported modality for Ming-flash-omni-2.0 step 3d: "
+                f"{modality!r}. Audio/image lands in step 4+."
+            )
+        if self.tokenizer is None:
+            return b""
+        if output.numel() == 0:
+            return b""
+        text = self.tokenizer.decode(output.tolist(), skip_special_tokens=True)
+        return text.encode("utf-8")
+
+    # ------------------------------------------------------------------
+    # Submodule construction
+    # ------------------------------------------------------------------
 
     def get_submodule(self, node_name: str, device="cpu", tp_group=None):
-        # Per-node nn.Module factory. Lazy-cache like qwen3_omni does.
-        raise NotImplementedError(_NOT_PORTED)
+        if node_name in self._submodule_cache:
+            return self._submodule_cache[node_name]
+        if node_name != "Thinker":
+            raise ValueError(
+                f"Unknown node: {node_name!r}. Step 3d only registers "
+                f"'Thinker'; audio_encoder / vision_encoder / Talker / "
+                f"AudioVAE follow in steps 4+."
+            )
+
+        # Build LingMoeModel on the meta device, materialise it on the
+        # target device, then load real weights.
+        llm = self.config.thinker_llm
+        ig = self.config.image_gen
+        mrope = llm.mrope_section
+        model = LingMoeModel(
+            vocab_size=llm.vocab_size,
+            hidden_size=llm.hidden_size,
+            intermediate_size=llm.intermediate_size,
+            moe_intermediate_size=llm.moe_intermediate_size,
+            num_hidden_layers=llm.num_hidden_layers,
+            num_attention_heads=llm.num_attention_heads,
+            num_kv_heads=llm.num_key_value_heads,
+            head_dim=llm.head_dim,
+            rms_norm_eps=llm.rms_norm_eps,
+            rope_theta=llm.rope_theta,
+            max_position_embeddings=llm.max_position_embeddings,
+            partial_rotary_factor=llm.partial_rotary_factor,
+            mrope_section=mrope,
+            num_experts=llm.num_experts,
+            num_experts_per_tok=llm.num_experts_per_tok,
+            num_shared_experts=llm.num_shared_experts,
+            n_group=llm.n_group,
+            topk_group=llm.topk_group,
+            routed_scaling_factor=llm.moe_router_topk_scaling_factor,
+            first_k_dense_replace=llm.first_k_dense_replace,
+            tie_word_embeddings=llm.tie_word_embeddings,
+            use_qkv_bias=llm.use_qkv_bias,
+            use_bias=llm.use_bias,
+        ).to(self.get_autocast_dtype()).to(device)
+
+        load_thinker_weights(model, self.local_dir, device=device, strict=True)
+        model.eval()
+
+        submodule = BailingMoeV2ThinkerSubmodule(
+            model=model,
+            eos_token_id=llm.eos_token_id,
+        )
+        self._submodule_cache[node_name] = submodule
+        return submodule
