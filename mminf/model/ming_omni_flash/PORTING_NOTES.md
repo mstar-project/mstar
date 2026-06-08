@@ -118,11 +118,24 @@ graph-walk / partition / streaming patterns transfer 1:1.
    remap roles. Verified via 11 tests in
    `test/modular/test_ming_flash_omni_tokenizer.py`.
 
-3. **Submodules (one per node) — start with the Thinker.** Define
-   `submodules.py` registering each `NodeSubmodule` and a weight loader.
-   Port the Ling-2.0 MoE backbone (`modeling_bailing_moe_v2.py`) first;
-   it's the largest single chunk and unblocks everything else. Don't try to
-   share with Qwen3-Omni's MoE block — expert layout differs.
+3. **Ling-2.0 thinker LLM port — IN PROGRESS.**
+   - **3a — DONE** (`components/router.py`, `rope.py`, `attention.py`):
+     architecture-novel pieces (MultiRouter group-limited top-k, partial
+     3D `video_rope`, QK-norm attention). 12 tests in
+     `test/modular/test_ming_flash_omni_components.py`.
+   - **3b — DONE** (`components/moe.py`, `decoder_layer.py`, `model.py`):
+     `LingMoeBlock` (3-router text/image/audio with `torch.where`
+     per-token swap), `LingDecoderLayer` (hybrid dense/MoE per
+     `first_k_dense_replace`), full `LingMoeModel` (embed + N layers +
+     RMSNorm + lm_head). 9 tests in `test_ming_flash_omni_model.py`.
+   - **3c — TODO**: weight loader (safetensors → params, with per-expert
+     gate/up/down fusion into packed tensors), `BailingMoeV2ThinkerSubmodule`
+     in `submodules.py` registering with mminf's engine, real-checkpoint
+     smoke test against the released shards.
+
+   Note: expert layout doesn't share with Qwen3-Omni's MoE block —
+   `MultiRouter` (3 gates + modality masks) is Ling-specific, and
+   the per-expert fused weight tensor has its own shape constraints.
 
 4. **Vision + audio encoders.** Stateless graph nodes. Port
    `vision_encoder.py` + `projectors.py` and `audio_encoder.py`. Wire into
