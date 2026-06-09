@@ -40,6 +40,7 @@ from mminf.model.components.moe import (
     _dispatch,
     _down_proj_weight_loader,
     _gate_up_weight_loader,
+    dispatch_experts_fused,
 )
 from mminf.model.ming_omni_flash.components.router import LingMoeRouter
 
@@ -261,21 +262,42 @@ class LingMoeBlock(nn.Module):
         the per-rank partial results across TP ranks, then sum-reduces
         across top-k. Result is the full-precision routed output at
         every rank.
-        """
-        from mminf.utils.fused_moe import fused_experts, moe_sum_reduce_triton
 
-        cache3 = fused_experts(
+        Falls back to the naive per-expert loop in
+        :func:`dispatch_experts_fused` when ``sgl_kernel`` isn't loadable
+        (e.g. ABI-mismatched against the installed torch). The naive path
+        already returns ``(tokens, hidden)`` summed across top-k, so we
+        all-reduce that directly — math is equivalent because sum-over-TP
+        and sum-over-top-k commute.
+        """
+        from mminf.utils.fused_moe.align import has_sgl_kernel
+
+        if has_sgl_kernel():
+            from mminf.utils.fused_moe import fused_experts, moe_sum_reduce_triton
+
+            cache3 = fused_experts(
+                flat,
+                self.experts.gate_up_proj,
+                self.experts.down_proj,
+                routing_weights,
+                selected_experts,
+                reduce_results=False,
+            )
+            self.comm_group.all_reduce(cache3)
+            output = torch.empty_like(flat)
+            moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
+            return output
+
+        partial = dispatch_experts_fused(
             flat,
             self.experts.gate_up_proj,
             self.experts.down_proj,
-            routing_weights,
+            self.experts.gate_up_proj.shape[0],
             selected_experts,
-            reduce_results=False,
+            routing_weights,
         )
-        self.comm_group.all_reduce(cache3)
-        output = torch.empty_like(flat)
-        moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
-        return output
+        self.comm_group.all_reduce(partial)
+        return partial
 
 
 __all__ = ["LingMoeBlock", "GatedMLP"]  # GatedMLP re-export for back-compat

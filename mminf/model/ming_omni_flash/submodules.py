@@ -160,6 +160,28 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         last_logits = logits[-1:, :]
         return {"logits": [last_logits]}
 
+    def postprocess(
+        self,
+        request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        **kwargs,
+    ) -> None:
+        """Rebind ``new_token`` → ``text_inputs`` for the decode loop.
+
+        The decode walk's output edge is named ``text_inputs`` so the loop
+        feeds the previous sampled token back into the next iteration.
+        ``submodule.forward`` returns ``{"logits": [...]}``; the KV-cache
+        engine samples that into ``{"new_token": [...]}``; this hook then
+        publishes the same tensor under the ``text_inputs`` key so the
+        graph router finds an output to attach to the loop edge.
+
+        Mirrors :meth:`OrpheusLLMSubmodule.postprocess`.
+        """
+        if "new_token" not in outputs:
+            return
+        outputs["text_inputs"] = outputs["new_token"]
+
     # ------------------------------------------------------------------
     # Stop conditions
     # ------------------------------------------------------------------

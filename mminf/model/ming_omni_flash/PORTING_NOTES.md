@@ -160,17 +160,7 @@ graph-walk / partition / streaming patterns transfer 1:1.
      TP=4 was tried first and OOMed at 78.58 GB / 80 GB; TP=8 has
      plenty of headroom.
 
-     **Known gap (not blocking 3e commit)**: first text request to
-     `/generate` hits `IndexError` in
-     `BailingMoeV2ThinkerSubmodule.prepare_inputs` — the per-request
-     `text_inputs` list arrives empty. This is an integration bug
-     between `get_initial_forward_pass_args` / graph-walk wiring /
-     the conductor's prompt-to-input-signals routing (NOT a model
-     code bug — all the heavy machinery loaded and warmed up cleanly).
-     Likely fix: either change the graph node's `input_names` /
-     ckpt edge-naming or add a fallback in `prepare_inputs` that
-     pulls the prompt tokens from `fwd_info` when the input list is
-     empty. Standalone follow-up.
+     **Known gap (resolved in 3f)**: see step 3f.
 
    - **3d — DONE** (cache wiring + submodule + engine integration):
      `LingAttention` now uses `cache_handle.run_attention` for paged
@@ -194,11 +184,70 @@ graph-walk / partition / streaming patterns transfer 1:1.
      full 100B model we need TP=4 distributing the experts + attention
      across 4 H100s.
 
-   - **3e — TODO**: TP-aware variants (`ParallelAttention` replacement
-     of `nn.Linear` QKV, `ParallelMoeBlock` for routed experts,
-     TP-rank-aware weight loader slicing per-expert tensors per rank).
-     Then `mminf-serve --config configs/ming_flash_omni_thinker_only.yaml`
-     with TP=4 should actually answer a text request.
+   - **3f — DONE** (graph wiring for the text-only generate loop):
+     two model-side bugs blocked the first end-to-end `/generate`
+     response on top of step 3e.
+
+     (a) `BailingMoeV2ThinkerSubmodule` had no `postprocess` hook.
+     The decode loop's output edge is named `text_inputs` so the
+     loop feeds the previous sampled token back into the next
+     iteration. `submodule.forward` returns `{"logits": [...]}`;
+     the KV-cache engine samples into `{"new_token": [...]}`; but
+     the graph router needs a `text_inputs` key under that name.
+     Added `postprocess` that rebinds `new_token → text_inputs`,
+     mirroring :meth:`OrpheusLLMSubmodule.postprocess`. Without
+     this, every decode iteration hit `IndexError` at
+     `prepare_inputs` (`text_inputs` list arrived empty), which
+     is the same symptom the 3e notes called out.
+
+     (b) The prefill / decode output edges used `EMPTY_DESTINATION`
+     + `conductor_new_token=True` rather than
+     `EMIT_TO_CLIENT` + `output_modality="text"`. With (a) fixed
+     the loop produced tokens, but the API server received
+     `{"outputs": {}}` because no edge routed `new_token` to the
+     client. Switched to Qwen3-Omni's pattern: prefill emits its
+     first token to the client and the decode-loop section emits
+     each subsequent sampled token via a parallel
+     `EMIT_TO_CLIENT, name="new_token", output_modality="text"`
+     edge alongside the `text_inputs` loopback.
+
+     **Environment / dependency patches collected along the way**
+     (not Ming code, but required on this box to reach a working
+     forward):
+
+     * `BailingTokenizer` doesn't load under transformers >= 5.0:
+       (i) accessor properties reference `self.verbose`, removed
+       in 5.x — set a class-level `verbose = False`; (ii)
+       `__init__` sets `self.add_bos_token` before
+       `super().__init__()` and the 5.x setter calls
+       `update_post_processor()` which dereferences the not-yet-
+       built `self._tokenizer`. Both patches live in
+       `_patch_bailing_tokenizer_for_transformers5` in
+       `ming_omni_flash_model.py`, applied once after the first
+       `AutoTokenizer.from_pretrained` raises an `AttributeError`
+       matching either signature.
+
+     * `LingMoeBlock._dispatch_tp` always called
+       `mminf.utils.fused_moe.fused_experts`, which hard-requires
+       `sgl_kernel`. On boxes where the installed `sgl_kernel.so`
+       has an ABI mismatch against the running torch (the
+       importlib-level error doesn't propagate as a normal
+       `ImportError` until you actually call into the .so), this
+       crashes mid-forward. Added a naive fallback that calls
+       `dispatch_experts_fused` on each rank's expert shard then
+       all-reduces; math is equivalent because sum-over-TP and
+       sum-over-top-k commute.
+
+     * `flashinfer-python` 0.6.6 ships a Python wrapper that
+       passes 10 args to the bundled `top_p_sampling_from_probs`
+       op while `flashinfer-jit-cache` 0.6.2 expects 8. Pin
+       `flashinfer-python==0.6.2` (via `pip install --no-deps`)
+       to match the jit-cache; the alternative would be rebuilding
+       the cache against 0.6.6.
+
+     **Verified via `mminf-serve` smoke (TP=8 on 8 H100s)**:
+     /generate returns real model text. <details to be filled in
+     by the verification curl in step 3g (benchmark wiring).>
 
    Note: expert layout doesn't share with Qwen3-Omni's MoE block —
    `MultiRouter` (3 gates + modality masks) is Ling-specific, and

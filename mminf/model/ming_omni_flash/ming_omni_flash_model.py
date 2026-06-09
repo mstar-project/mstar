@@ -57,7 +57,7 @@ from mminf.graph.base import (
     Loop,
     TensorPointerInfo,
 )
-from mminf.graph.special_destinations import EMPTY_DESTINATION
+from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mminf.model.base import ForwardPassArgs, Model
 from mminf.model.ming_omni_flash.components.model import LingMoeModel
 from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig
@@ -189,6 +189,57 @@ def _prepare_tokenizer_dir(snapshot_dir: str, ming_code_dir: str) -> None:
             logger.debug("Failed to symlink %s -> %s: %s", target, source, e)
 
 
+def _patch_bailing_tokenizer_for_transformers5() -> None:
+    """Make BailingTokenizer load under transformers >= 5.0.
+
+    Two upstream incompatibilities, both in
+    ``tokenization_bailing.BailingTokenizer``:
+
+    (1) transformers 5.x removed ``PreTrainedTokenizerBase.verbose``, but
+    Ming's accessor properties (``gmask_token`` etc.) still reference
+    ``self.verbose`` in their not-set fallback paths.  Backport a class-level
+    default so ``check_special_tokens`` doesn't blow up.
+
+    (2) ``BailingTokenizer.__init__`` sets ``self.add_bos_token = ...``
+    BEFORE calling ``super().__init__()``.  In transformers 5.x the
+    ``PreTrainedTokenizerFast.add_bos_token`` setter immediately calls
+    ``update_post_processor()``, which dereferences ``self._tokenizer`` —
+    but that attribute is only created inside the deferred ``super``
+    call.  Wrap ``update_post_processor`` to no-op when ``_tokenizer``
+    isn't built yet; the deferred super call runs it for real.
+
+    The module is loaded dynamically by ``transformers``' trust_remote_code
+    machinery; look it up in ``sys.modules`` rather than importing it.
+    """
+    import sys as _sys
+    for mod_name, mod in list(_sys.modules.items()):
+        if mod is None or not mod_name.endswith("tokenization_bailing"):
+            continue
+        cls = getattr(mod, "BailingTokenizer", None)
+        if cls is None:
+            continue
+        if not hasattr(cls, "verbose"):
+            cls.verbose = False
+
+    # (2) — patch update_post_processor on the parent fast-tokenizer class
+    # once. Guard against re-patching across multiple model instantiations.
+    try:
+        from transformers import PreTrainedTokenizerFast
+    except ImportError:
+        return
+    if getattr(PreTrainedTokenizerFast.update_post_processor, "_mminf_patched", False):
+        return
+    _orig_upp = PreTrainedTokenizerFast.update_post_processor
+
+    def _safe_update_post_processor(self):
+        if getattr(self, "_tokenizer", None) is None:
+            return
+        return _orig_upp(self)
+
+    _safe_update_post_processor._mminf_patched = True
+    PreTrainedTokenizerFast.update_post_processor = _safe_update_post_processor
+
+
 class MingFlashOmniModel(Model):
     """Thinker + Talker + ImageGen native port of Ming-flash-omni-2.0.
 
@@ -252,6 +303,20 @@ class MingFlashOmniModel(Model):
             self.tokenizer = AutoTokenizer.from_pretrained(
                 local_dir, cache_dir=cache_dir, trust_remote_code=True,
             )
+        except AttributeError as e:
+            # Two BailingTokenizer/transformers-5.x incompats — see
+            # _patch_bailing_tokenizer_for_transformers5 for the full story.
+            # Patch once and retry; surface only the second error.
+            if "verbose" in str(e) or "post_processor" in str(e):
+                _patch_bailing_tokenizer_for_transformers5()
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        local_dir, cache_dir=cache_dir, trust_remote_code=True,
+                    )
+                except Exception as e2:
+                    self._warn_tokenizer_unavailable("tokenizer", e2)
+            else:
+                self._warn_tokenizer_unavailable("tokenizer", e)
         except Exception as e:
             self._warn_tokenizer_unavailable("tokenizer", e)
 
@@ -313,9 +378,9 @@ class MingFlashOmniModel(Model):
             name="Thinker",
             input_names=["text_inputs"],
             outputs=[GraphEdge(
-                next_node=EMPTY_DESTINATION,
+                next_node=EMIT_TO_CLIENT,
                 name="new_token",
-                conductor_new_token=True,
+                output_modality="text",
                 persist=True,
             )],
         )
@@ -324,10 +389,18 @@ class MingFlashOmniModel(Model):
             section=GraphNode(
                 name="Thinker",
                 input_names=["text_inputs"],
-                outputs=[GraphEdge(
-                    next_node="Thinker",
-                    name="text_inputs",
-                )],
+                outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="new_token",
+                        output_modality="text",
+                    ),
+                    GraphEdge(
+                        next_node="Thinker",
+                        name="text_inputs",
+                        output_modality="text",
+                    ),
+                ],
             ),
             max_iters=self.get_max_output_tokens(),
             outputs=[],
