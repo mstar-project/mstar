@@ -348,16 +348,58 @@ graph-walk / partition / streaming patterns transfer 1:1.
        `_create_audio_encoder_submodule` on the real ckpt — verifies
        Conv1 + projector params are non-zero post-load).
 
-   - **5b — TODO** (Thinker prefill dispatch): extend
-     `BailingMoeV2ThinkerSubmodule.prepare_inputs` to handle
-     `prefill_vision` / `prefill_audio` graph walks — splice
-     vision/audio embeddings into the input sequence around the
-     `image_start`/`image_end` (or `audio_start`/`audio_end`) sentinel
-     tokens, build the partial-3D MRoPE position IDs for the modality
-     span. Mirror Qwen3-Omni's `ThinkerSubmodule.prepare_inputs`
-     dispatch + the per-modality `get_rope_index_*` helpers, adapted
-     for Ling-2.0's `mrope_section=[8,12,12]` and
-     `partial_rotary_factor=0.5`.
+   - **5b — DONE** (Thinker prefill dispatch + position helpers):
+     `BailingMoeV2ThinkerSubmodule.prepare_inputs` now dispatches on
+     `graph_walk` and emits either `input_ids` (text-only walks) or
+     `input_embeds` + `custom_pos_ids` (multimodal walks). `preprocess`
+     and `forward` route both shapes through to `LingMoeModel`'s
+     existing dual input_ids/input_embeds + 1D/3D position_ids
+     handling — no new model.py path needed.
+
+     Three new position-id helpers live in `components/positions.py`,
+     each producing `(3, T)` long tensors compatible with
+     `LingPartialMRotaryEmbedding`'s `video_rope` branch:
+
+     * `get_rope_index_text(seq_len, start_pos)` — three identical
+       sequential rows. Matches `modeling_bailing_moe_v2.get_rope_index`'s
+       pure-text branch (`:658-675`).
+     * `get_rope_index_audio` — alias to the text helper (Ming
+       does not special-case audio in `get_rope_index`).
+     * `get_rope_index_vision(grid_thw, start_pos, spatial_merge_size,
+       second_per_grid_t=None, tokens_per_second=2)` — per-image
+       3D grid math from `:625-647`. Optional video timestamp
+       scaling via `second_per_grid_t * tokens_per_second`.
+
+     The Thinker dispatch:
+
+     * `prefill` / `prefill_text` — backward-compat text path
+       (unchanged from step 3f).
+     * `prefill_audio` — wraps `audio_embeds` with `audio_start`
+       / `audio_end` sentinel embeddings, builds text-like positions
+       for the span.
+     * `prefill_vision` / `prefill_video` — wraps `vision_embeds`
+       with `image_start`/`image_end` (or `video_start`/`video_end`),
+       builds grid-aware 3D positions; `eos` sentinel sits at
+       `global_max(vision_pos) + 1` so the next walk's text positions
+       can resume without collision (matches Ming source's
+       `llm_pos_ids_list[-1].max() + 1` accounting).
+     * `decode` / `thinker_decode` — single-token AR step (unchanged).
+
+     Sentinel embeds are lazily computed per device on first use.
+     The model.py construction now passes `config=self.config` to the
+     submodule so it can read `vision.spatial_merge_size`,
+     `thinker_llm.tokens_per_second`, and the `*_start_token` /
+     `*_end_token` ids.
+
+     Step 5b restricts to single-image / single-clip requests
+     (multi-image splice via `Sequential` graph wiring lands in 5c).
+
+     21 new tests across `test_ming_flash_omni_positions.py` (11) and
+     `test_ming_flash_omni_submodules.py` (10): position-id shape /
+     offset / abs-time math, missing-input error paths,
+     multi-image rejection, sentinel embed correctness for audio /
+     image / video walks, start_pos advancement, legacy `prefill`
+     walk name compat. All green.
 
    - **5c — TODO** (graph wiring): replace the text-only `prefill` /
      `decode` walks in `get_graph_walk_graphs` with

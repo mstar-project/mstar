@@ -282,6 +282,248 @@ def _find_local_snapshot() -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# BailingMoeV2ThinkerSubmodule.prepare_inputs dispatch (step 5b)
+# ---------------------------------------------------------------------------
+#
+# These build a fake LingMoeModel-like stub so we can exercise the
+# prepare_inputs dispatch (sentinel embed splice, position-id math)
+# without a multi-GB MoE forward pass. The model.forward is never
+# called in these tests; only prepare_inputs.
+
+
+class _StubEmbedTokens(torch.nn.Module):
+    """Identity-like embed for sentinel-id lookups in CPU unit tests.
+
+    Returns a deterministic vector per token id so tests can verify
+    the splice landed the right token at the right position.
+    """
+
+    def __init__(self, vocab_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        # Per-token unit vector: token_id one-hot expanded into hidden_size
+        # by tiling so we can read it back.
+        table = torch.zeros(vocab_size, hidden_size, dtype=torch.float32)
+        for i in range(vocab_size):
+            table[i, i % hidden_size] = float(i + 1)
+        self.weight = torch.nn.Parameter(table, requires_grad=False)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.weight[ids]
+
+
+class _StubLingMoeModel(torch.nn.Module):
+    """Minimal LingMoeModel surface used by the Thinker submodule init.
+
+    Only ``embed_tokens`` and ``lm_head`` are accessed by the submodule
+    constructor; forward isn't called in the prepare_inputs tests.
+    """
+
+    def __init__(self, vocab_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.embed_tokens = _StubEmbedTokens(vocab_size, hidden_size)
+        self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+
+
+def _build_thinker_submodule(
+    hidden_size: int = 32,
+    vocab_size: int | None = None,
+):
+    """Build a Thinker submodule on top of a tiny stub model.
+
+    vocab_size defaults to one above the largest sentinel token id
+    in the released ckpt's config so the embed lookups stay in range.
+    """
+    from mminf.model.ming_omni_flash.submodules import (
+        BailingMoeV2ThinkerSubmodule,
+    )
+    cfg = _tiny_config()
+    if vocab_size is None:
+        # Largest modal sentinel id on the released ckpt is video_patch_token = 157175.
+        vocab_size = cfg.thinker_llm.video_patch_token + 100
+    cfg.thinker_llm.vocab_size = vocab_size
+    cfg.thinker_llm.hidden_size = hidden_size
+    cfg.thinker_llm.head_dim = max(hidden_size // 4, 1)
+    cfg.thinker_llm.num_attention_heads = 4
+    cfg.thinker_llm.num_key_value_heads = 2
+    model = _StubLingMoeModel(vocab_size=vocab_size, hidden_size=hidden_size)
+    return BailingMoeV2ThinkerSubmodule(model=model, config=cfg)
+
+
+def test_thinker_prepare_inputs_prefill_text_uses_input_ids() -> None:
+    """Text prefill returns input_ids path (no splice, no embeds)."""
+    sub = _build_thinker_submodule(hidden_size=32)
+    token_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
+    out = sub.prepare_inputs(
+        graph_walk="prefill_text", fwd_info=None,
+        inputs={"text_inputs": [token_ids]},
+    )
+    assert out.input_seq_len == 5
+    assert out.input_embeds is None
+    assert out.custom_pos_ids is None
+    torch.testing.assert_close(out.input_ids, token_ids)
+
+
+def test_thinker_prepare_inputs_legacy_prefill_walk_still_works() -> None:
+    """``prefill`` (the step 3f name) routes the same as prefill_text."""
+    sub = _build_thinker_submodule()
+    token_ids = torch.tensor([10, 20, 30], dtype=torch.long)
+    out = sub.prepare_inputs(
+        graph_walk="prefill", fwd_info=None,
+        inputs={"text_inputs": [token_ids]},
+    )
+    assert out.input_embeds is None
+    torch.testing.assert_close(out.input_ids, token_ids)
+
+
+def test_thinker_prepare_inputs_decode_path() -> None:
+    """thinker_decode returns input_ids path with seq_len=1."""
+    sub = _build_thinker_submodule()
+    out = sub.prepare_inputs(
+        graph_walk="thinker_decode", fwd_info=None,
+        inputs={"text_inputs": [torch.tensor([42], dtype=torch.long)]},
+    )
+    assert out.input_seq_len == 1
+    assert out.input_ids.tolist() == [42]
+
+
+def test_thinker_prepare_inputs_prefill_audio_splices_bos_eos() -> None:
+    """prefill_audio wraps audio_embeds with audio_start / audio_end sentinels."""
+    sub = _build_thinker_submodule(hidden_size=32)
+    audio_embeds = torch.randn(4, 32)
+    out = sub.prepare_inputs(
+        graph_walk="prefill_audio", fwd_info=None,
+        inputs={"audio_embeds": [audio_embeds]},
+    )
+    # Seq len = 1 (bos) + 4 (audio) + 1 (eos) = 6.
+    assert out.input_seq_len == 6
+    assert out.input_embeds.shape == (6, 32)
+    # First row should match the audio_start_token embed; last row the
+    # audio_end_token embed.
+    cfg = sub.config.thinker_llm
+    expected_bos = sub.embed_tokens.weight[cfg.audio_start_token]
+    expected_eos = sub.embed_tokens.weight[cfg.audio_end_token]
+    torch.testing.assert_close(out.input_embeds[0].float(), expected_bos.float())
+    torch.testing.assert_close(out.input_embeds[-1].float(), expected_eos.float())
+    # Middle rows are the audio embeds as supplied.
+    torch.testing.assert_close(out.input_embeds[1:5], audio_embeds)
+    # 3D positions, text-like.
+    assert out.custom_pos_ids.shape == (3, 6)
+    assert out.custom_pos_ids[0].tolist() == [0, 1, 2, 3, 4, 5]
+
+
+def test_thinker_prepare_inputs_prefill_audio_advances_with_start_pos() -> None:
+    """Audio span at start_pos=10 produces positions [10..15]."""
+    from mminf.engine.kv_store import PositionInfo
+    sub = _build_thinker_submodule(hidden_size=32)
+    audio_embeds = torch.randn(2, 32)
+    out = sub.prepare_inputs(
+        graph_walk="prefill_audio", fwd_info=None,
+        inputs={"audio_embeds": [audio_embeds]},
+        pos_info={"main": PositionInfo(position_id_start=10)},
+    )
+    assert out.input_seq_len == 4   # bos + 2 + eos
+    assert out.custom_pos_ids[0].tolist() == [10, 11, 12, 13]
+
+
+def test_thinker_prepare_inputs_prefill_audio_raises_on_missing_audio_embeds() -> None:
+    sub = _build_thinker_submodule()
+    with pytest.raises(ValueError, match="missing 'audio_embeds'"):
+        sub.prepare_inputs(
+            graph_walk="prefill_audio", fwd_info=None, inputs={},
+        )
+
+
+def test_thinker_prepare_inputs_prefill_vision_splices_bos_eos() -> None:
+    """prefill_vision wraps vision_embeds with image_start / image_end sentinels."""
+    sub = _build_thinker_submodule(hidden_size=32)
+    # grid (1, 4, 4), spatial_merge=2 → 4 tokens.
+    vision_embeds = torch.randn(4, 32)
+    out = sub.prepare_inputs(
+        graph_walk="prefill_vision", fwd_info=None,
+        inputs={
+            "vision_embeds": [vision_embeds],
+            "image_grid_thw": [torch.tensor([1, 4, 4], dtype=torch.long)],
+        },
+    )
+    # seq_len = 1 (image_start) + 4 (vision) + 1 (image_end) = 6
+    assert out.input_seq_len == 6
+    assert out.input_embeds.shape == (6, 32)
+    cfg = sub.config.thinker_llm
+    expected_bos = sub.embed_tokens.weight[cfg.image_start_token]
+    expected_eos = sub.embed_tokens.weight[cfg.image_end_token]
+    torch.testing.assert_close(out.input_embeds[0].float(), expected_bos.float())
+    torch.testing.assert_close(out.input_embeds[-1].float(), expected_eos.float())
+    # 3D positions, grid-aware.
+    assert out.custom_pos_ids.shape == (3, 6)
+    # Position 0 is the image_start sentinel at start_pos=0; vision span
+    # at start_pos+1=1, single-frame grid (1, 4, 4)/spatial_merge=2 →
+    # llm_grid = (1, 2, 2) = 4 tokens. T row constant at 1; H row
+    # cycles [1, 1, 2, 2]; W row cycles [1, 2, 1, 2]. Max position
+    # across all rows = 2; eos sentinel goes at 2 + 1 = 3 in every row
+    # (Ming uses ``llm_pos_ids_list[-1].max() + 1`` — global max, not
+    # per-row, see modeling_bailing_moe_v2.get_rope_index:632).
+    assert out.custom_pos_ids[0].tolist() == [0, 1, 1, 1, 1, 3]   # T row
+    assert out.custom_pos_ids[1].tolist() == [0, 1, 1, 2, 2, 3]   # H row
+    assert out.custom_pos_ids[2].tolist() == [0, 1, 2, 1, 2, 3]   # W row
+
+
+def test_thinker_prepare_inputs_prefill_video_uses_video_sentinels() -> None:
+    """prefill_video selects video_start / video_end sentinels."""
+    sub = _build_thinker_submodule(hidden_size=32)
+    vision_embeds = torch.randn(2, 32)   # grid (1, 2, 2) → 1 token; here just 2
+    # Use grid (2, 2, 2) which gives 2 tokens for spatial_merge=2.
+    out = sub.prepare_inputs(
+        graph_walk="prefill_video", fwd_info=None,
+        inputs={
+            "vision_embeds": [vision_embeds],
+            "image_grid_thw": [torch.tensor([2, 2, 2], dtype=torch.long)],
+            "video_second_per_grid": [torch.tensor(1.0)],
+        },
+    )
+    assert out.input_seq_len == 4   # bos + 2 + eos
+    cfg = sub.config.thinker_llm
+    expected_bos = sub.embed_tokens.weight[cfg.video_start_token]
+    expected_eos = sub.embed_tokens.weight[cfg.video_end_token]
+    torch.testing.assert_close(out.input_embeds[0].float(), expected_bos.float())
+    torch.testing.assert_close(out.input_embeds[-1].float(), expected_eos.float())
+
+
+def test_thinker_prepare_inputs_prefill_vision_raises_on_missing_grid_thw() -> None:
+    sub = _build_thinker_submodule()
+    with pytest.raises(ValueError, match="missing 'image_grid_thw'"):
+        sub.prepare_inputs(
+            graph_walk="prefill_vision", fwd_info=None,
+            inputs={"vision_embeds": [torch.randn(4, 32)]},
+        )
+
+
+def test_thinker_prepare_inputs_prefill_vision_rejects_multi_image() -> None:
+    sub = _build_thinker_submodule()
+    with pytest.raises(NotImplementedError, match="multi-image"):
+        sub.prepare_inputs(
+            graph_walk="prefill_vision", fwd_info=None,
+            inputs={
+                "vision_embeds": [torch.randn(4, 32)],
+                "image_grid_thw": [torch.tensor([[1, 4, 4], [1, 4, 4]], dtype=torch.long)],
+            },
+        )
+
+
+def test_thinker_prepare_inputs_unknown_walk_raises() -> None:
+    sub = _build_thinker_submodule()
+    with pytest.raises(ValueError, match="unknown graph_walk"):
+        sub.prepare_inputs(
+            graph_walk="prefill_unicorn", fwd_info=None, inputs={},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Snapshot-gated: end-to-end submodule construction with real weights
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.skipif(
     _find_local_snapshot() is None,
     reason="Need Ming-flash-omni-2.0 snapshot (set MING_FLASH_OMNI_DIR).",

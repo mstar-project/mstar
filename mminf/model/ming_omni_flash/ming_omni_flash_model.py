@@ -620,6 +620,7 @@ class MingFlashOmniModel(Model):
 
         submodule = BailingMoeV2ThinkerSubmodule(
             model=model,
+            config=self.config,
             eos_token_id=llm.eos_token_id,
         )
         self._submodule_cache[node_name] = submodule

@@ -271,27 +271,106 @@ class AudioEncoderSubmodule(NodeSubmodule):
 
 
 class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
-    """Text-only thinker submodule for Ming-flash-omni-2.0.
+    """Thinker submodule for Ming-flash-omni-2.0.
 
-    Two graph walks:
-      * ``prefill``: embed text token ids, fill KV cache, sample first
-        token's logits.
-      * ``decode``: embed the previous token, single-step forward,
-        sample next-token logits.
+    Graph walks the dispatch handles:
+      * ``prefill`` / ``prefill_text``: embed text token ids, fill KV
+        cache, sample first token's logits. (``prefill`` is the legacy
+        text-only name kept for backward compat with step 3f; step 5c
+        renames the walk to ``prefill_text``.)
+      * ``prefill_audio``: splice precomputed audio embeddings between
+        ``audio_start`` / ``audio_end`` sentinel embeddings; build
+        text-like 3D MRoPE positions for the span; fill KV cache;
+        sample first token's logits.
+      * ``prefill_vision`` / ``prefill_video``: splice precomputed
+        vision embeddings between ``image_start`` / ``image_end``
+        (or ``video_start`` / ``video_end``) sentinel embeddings;
+        build grid-aware 3D MRoPE positions per
+        ``modeling_bailing_moe_v2.get_rope_index:625-647``; fill KV
+        cache; sample first token's logits.
+      * ``decode`` / ``thinker_decode``: embed the previous token,
+        single-step forward, sample next-token logits.
 
     The submodule does NOT use ``cache_handle.apply_rope`` — Ling-2.0's
     partial 3D ``video_rope`` is applied inline by
     :class:`LingAttention` using the explicit ``position_ids`` argument.
     """
 
-    def __init__(self, model: LingMoeModel, eos_token_id: int = 156895) -> None:
+    # Walk names treated as text-only prefill (no embed splicing).
+    _TEXT_PREFILL_WALKS = ("prefill", "prefill_text")
+    # Walk names treated as autoregressive decode (one-token step).
+    _DECODE_WALKS = ("decode", "thinker_decode")
+
+    def __init__(
+        self,
+        model: LingMoeModel,
+        config: MingFlashOmniModelConfig | None = None,
+        eos_token_id: int = 156895,
+    ) -> None:
         super().__init__()
         self.model = model
+        self.config = config
         self.eos_token_id = eos_token_id
         # Stash the embed_tokens / lm_head as direct attributes so the
         # engine's CUDA-graph captures don't reach through .model.
         self.embed_tokens = model.embed_tokens
         self.lm_head = model.lm_head
+
+        # Lazily-cached sentinel token embeddings (1, hidden_size each).
+        # Recomputed on first use per device; allocated lazily so CPU
+        # tests don't materialise the embed table at import time.
+        self._image_start_embed: torch.Tensor | None = None
+        self._image_end_embed: torch.Tensor | None = None
+        self._video_start_embed: torch.Tensor | None = None
+        self._video_end_embed: torch.Tensor | None = None
+        self._audio_start_embed: torch.Tensor | None = None
+        self._audio_end_embed: torch.Tensor | None = None
+
+    # ------------------------------------------------------------------
+    # Sentinel embedding helpers
+    # ------------------------------------------------------------------
+
+    def _sentinel_embed(self, token_id: int, device: torch.device) -> torch.Tensor:
+        """Embed a single sentinel token id; small enough to recompute."""
+        tok = torch.tensor([int(token_id)], dtype=torch.long, device=device)
+        return self.embed_tokens(tok)  # (1, hidden_size)
+
+    def _get_vision_bos_eos(
+        self, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.config is None:
+            raise RuntimeError(
+                "BailingMoeV2ThinkerSubmodule.config is None — required for "
+                "vision sentinel embeddings. Pass config=... at construction "
+                "(step 5b)."
+            )
+        llm = self.config.thinker_llm
+        if self._image_start_embed is None or self._image_start_embed.device != device:
+            self._image_start_embed = self._sentinel_embed(llm.image_start_token, device)
+            self._image_end_embed = self._sentinel_embed(llm.image_end_token, device)
+        return self._image_start_embed, self._image_end_embed
+
+    def _get_video_bos_eos(
+        self, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.config is None:
+            raise RuntimeError("config required for video sentinels.")
+        llm = self.config.thinker_llm
+        if self._video_start_embed is None or self._video_start_embed.device != device:
+            self._video_start_embed = self._sentinel_embed(llm.video_start_token, device)
+            self._video_end_embed = self._sentinel_embed(llm.video_end_token, device)
+        return self._video_start_embed, self._video_end_embed
+
+    def _get_audio_bos_eos(
+        self, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.config is None:
+            raise RuntimeError("config required for audio sentinels.")
+        llm = self.config.thinker_llm
+        if self._audio_start_embed is None or self._audio_start_embed.device != device:
+            self._audio_start_embed = self._sentinel_embed(llm.audio_start_token, device)
+            self._audio_end_embed = self._sentinel_embed(llm.audio_end_token, device)
+        return self._audio_start_embed, self._audio_end_embed
 
     # ------------------------------------------------------------------
     # ARNodeSubmodule contract
@@ -304,17 +383,163 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         pos_info: dict[str, PositionInfo] = {},
     ) -> ARNodeInputs:
-        """Build per-request ARNodeInputs from the engine-provided tensors.
+        """Dispatch on graph_walk to build per-request ARNodeInputs.
 
-        ``inputs["text_inputs"]`` is the token-id tensor — either the
-        full prompt (prefill) or the single previous token (decode).
-        Mirrors :class:`OrpheusLLMSubmodule.prepare_inputs` since the
-        Ling thinker also takes packed token ids.
+        Text-only walks return ``input_ids`` (LingMoeModel embeds them
+        inline). Multimodal walks return precomputed ``input_embeds``
+        + ``custom_pos_ids`` so the position counter stays in sync
+        with the sentinel + modality span structure
+        ``modeling_bailing_moe_v2.get_rope_index`` would have produced.
         """
-        token_ids = inputs["text_inputs"][0]
+        device = self.get_device()
+        start_pos = int(
+            pos_info.get("main", PositionInfo()).position_id_start
+        )
+
+        if graph_walk in self._DECODE_WALKS or graph_walk in self._TEXT_PREFILL_WALKS:
+            token_ids = inputs["text_inputs"][0].to(device)
+            return ARNodeInputs(
+                input_ids=token_ids,
+                input_seq_len=token_ids.shape[0],
+            )
+
+        if graph_walk == "prefill_audio":
+            return self._prepare_prefill_audio(inputs, device, start_pos)
+
+        if graph_walk in ("prefill_vision", "prefill_video"):
+            return self._prepare_prefill_vision(
+                inputs, device, start_pos, video=(graph_walk == "prefill_video"),
+            )
+
+        raise ValueError(
+            f"BailingMoeV2ThinkerSubmodule: unknown graph_walk {graph_walk!r}. "
+            f"Supported: prefill / prefill_text / prefill_audio / prefill_vision "
+            f"/ prefill_video / decode / thinker_decode."
+        )
+
+    def _prepare_prefill_audio(
+        self,
+        inputs: NameToTensorList,
+        device: torch.device,
+        start_pos: int,
+    ) -> ARNodeInputs:
+        """Audio prefill: splice ``[bos, audio_embeds, eos]``, text positions."""
+        # Local import to keep the components/positions module a leaf in
+        # the dependency graph (avoids a circular import at module load).
+        from mminf.model.ming_omni_flash.components.positions import (
+            get_rope_index_text,
+        )
+        if "audio_embeds" not in inputs or not inputs["audio_embeds"]:
+            raise ValueError(
+                "prefill_audio walk: missing 'audio_embeds' input. "
+                "Make sure the prefill graph routes the AudioEncoder "
+                "output edge into the Thinker."
+            )
+        audio_embeds = inputs["audio_embeds"][0].to(device)
+        bos, eos = self._get_audio_bos_eos(device)
+        # Match dtype between sentinel embeds and audio embeds. The
+        # encoder's projector returns the LLM's autocast dtype while
+        # the embed_tokens table lives in the model's stored dtype —
+        # cast sentinels to the audio dtype so the cat is consistent.
+        bos = bos.to(audio_embeds.dtype)
+        eos = eos.to(audio_embeds.dtype)
+        embeds = torch.cat([bos, audio_embeds, eos], dim=0)
+        seq_len = embeds.shape[0]
+        pos_ids = get_rope_index_text(seq_len, start_pos, device=device)
         return ARNodeInputs(
-            input_ids=token_ids,
-            input_seq_len=token_ids.shape[0],
+            input_seq_len=seq_len,
+            input_embeds=embeds,
+            custom_pos_ids=pos_ids,
+        )
+
+    def _prepare_prefill_vision(
+        self,
+        inputs: NameToTensorList,
+        device: torch.device,
+        start_pos: int,
+        video: bool,
+    ) -> ARNodeInputs:
+        """Vision prefill: splice ``[bos, vision_embeds, eos]`` + grid positions."""
+        from mminf.model.ming_omni_flash.components.positions import (
+            get_rope_index_text,
+            get_rope_index_vision,
+        )
+        if "vision_embeds" not in inputs or not inputs["vision_embeds"]:
+            raise ValueError(
+                "prefill_vision walk: missing 'vision_embeds' input. "
+                "Make sure the prefill graph routes the VisionEncoder "
+                "output edge into the Thinker."
+            )
+        vision_embeds = inputs["vision_embeds"][0].to(device)
+        grid_thw = inputs.get(
+            "image_grid_thw", inputs.get("video_grid_thw", inputs.get("grid_thw", [None])),
+        )[0]
+        if grid_thw is None:
+            raise ValueError(
+                "prefill_vision walk: missing 'image_grid_thw' input. "
+                "process_prompt must forward this from the image processor."
+            )
+        grid_thw = grid_thw.to(device)
+        if grid_thw.dim() == 1:
+            grid = grid_thw
+        else:
+            # Multi-image / multi-clip support is step 5c (the graph
+            # router will sequence one Sequential per image). For 5b
+            # we restrict to a single image / clip per request.
+            if grid_thw.shape[0] > 1:
+                raise NotImplementedError(
+                    "prefill_vision: multi-image grid_thw not supported in "
+                    "step 5b; one image / clip per request only."
+                )
+            grid = grid_thw[0]
+
+        # Video walks honor a per-frame timestamp via
+        # ``video_second_per_grid``; image walks pass None (one frame).
+        seconds_per_grid: float | None = None
+        if video:
+            spg = inputs.get("video_second_per_grid", [None])[0]
+            if spg is not None:
+                seconds_per_grid = float(
+                    spg.item() if isinstance(spg, torch.Tensor) else spg
+                )
+            else:
+                seconds_per_grid = 1.0  # mirrors the upstream default
+
+        bos, eos = (
+            self._get_video_bos_eos(device) if video
+            else self._get_vision_bos_eos(device)
+        )
+        bos = bos.to(vision_embeds.dtype)
+        eos = eos.to(vision_embeds.dtype)
+        embeds = torch.cat([bos, vision_embeds, eos], dim=0)
+        seq_len = embeds.shape[0]
+
+        if self.config is None:
+            raise RuntimeError("config required for prefill_vision (spatial_merge_size).")
+        spatial_merge = self.config.vision.spatial_merge_size
+        bos_pos = get_rope_index_text(1, start_pos, device=device)
+        vision_pos = get_rope_index_vision(
+            grid_thw=grid,
+            start_pos=start_pos + 1,
+            spatial_merge_size=spatial_merge,
+            device=device,
+            second_per_grid_t=seconds_per_grid,
+            tokens_per_second=self.config.thinker_llm.tokens_per_second,
+        )
+        # eos goes one past the largest vision position so the next walk's
+        # text positions don't collide with the vision span's T/H/W ranges.
+        eos_pos_start = int(vision_pos.max().item()) + 1
+        eos_pos = get_rope_index_text(1, eos_pos_start, device=device)
+        pos_ids = torch.cat([bos_pos, vision_pos, eos_pos], dim=1)
+        if pos_ids.shape != (3, seq_len):
+            raise AssertionError(
+                f"prefill_vision: position_ids shape {tuple(pos_ids.shape)} "
+                f"does not match seq_len={seq_len} (3, T) expectation."
+            )
+        return ARNodeInputs(
+            input_seq_len=seq_len,
+            input_embeds=embeds,
+            custom_pos_ids=pos_ids,
         )
 
     def preprocess(
@@ -323,10 +548,14 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        """Plan attention for the engine; pack token ids for forward.
+        """Plan attention; pack inputs for forward.
 
         Single-request only in step 3d; batched preprocess folds in
-        step 3e+ via ``can_batch`` + ``forward_batched``.
+        step 3e+ via ``can_batch`` + ``forward_batched``. The text and
+        multimodal paths use mutually exclusive keys downstream so the
+        forward can branch on which one is set: ``text_inputs`` for
+        the input-ids path, ``input_embeds`` + ``position_ids`` for
+        the embeds path.
         """
         if len(inputs) > 1:
             raise NotImplementedError(
@@ -346,6 +575,13 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         # — keep this call for parity with Orpheus.
         cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
 
+        inp = inputs[0]
+        if inp.input_embeds is not None:
+            # Multimodal path: forward gets embeds + explicit positions.
+            return {
+                "input_embeds": inp.input_embeds,
+                "position_ids": inp.custom_pos_ids,
+            }
         return {
             "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
         }
@@ -354,39 +590,55 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor,
+        text_inputs: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
         cache_handle = engine_inputs.cache_manager
-        # Resolve position_ids from per-request position state. For
-        # text-only the rope only needs 1D positions: a contiguous span
-        # starting at ``position_id_start``.
         request_info = engine_inputs.single_request_info
-        start_pos = 0
-        try:
-            start_pos = (
-                request_info.position_info.get("main", PositionInfo())
-                .position_id_start
+
+        if input_embeds is not None:
+            if position_ids is None:
+                raise ValueError(
+                    "BailingMoeV2ThinkerSubmodule.forward: input_embeds "
+                    "provided but position_ids is None. prepare_inputs "
+                    "must emit custom_pos_ids alongside embeds."
+                )
+            logits = self.model(
+                cache_handle,
+                input_embeds=input_embeds,
+                position_ids=position_ids,
             )
-        except AttributeError:
-            # ARNodeSubmodule contract may not always provide
-            # position_info; fall back to 0 for prefill, 1 + len for decode.
-            pass
+        else:
+            if text_inputs is None:
+                raise ValueError(
+                    "BailingMoeV2ThinkerSubmodule.forward: neither "
+                    "text_inputs nor input_embeds provided."
+                )
+            # Text-only path: build 1D positions from the request's
+            # position counter (same as step 3f).
+            start_pos = 0
+            try:
+                start_pos = (
+                    request_info.position_info.get("main", PositionInfo())
+                    .position_id_start
+                )
+            except AttributeError:
+                # ARNodeSubmodule contract may not always provide
+                # position_info; fall back to 0.
+                pass
 
-        num_tokens = text_inputs.shape[0]
-        position_ids = torch.arange(
-            start_pos, start_pos + num_tokens,
-            dtype=torch.long, device=text_inputs.device,
-        )
-
-        # Embed + transformer + lm_head. The LingMoeModel forward calls
-        # cache_handle.set_layer_idx per layer + cache_handle.run_attention
-        # inside LingAttention.
-        logits = self.model(
-            cache_handle,
-            input_ids=text_inputs,
-            position_ids=position_ids,
-        )
+            num_tokens = text_inputs.shape[0]
+            position_ids_1d = torch.arange(
+                start_pos, start_pos + num_tokens,
+                dtype=torch.long, device=text_inputs.device,
+            )
+            logits = self.model(
+                cache_handle,
+                input_ids=text_inputs,
+                position_ids=position_ids_1d,
+            )
 
         # Advance the cache's sequence lengths so the next decode step
         # knows where to read/write. This is the standard post-forward
@@ -394,8 +646,6 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         cache_handle.advance_seq_lens()
 
         # Sample only the last position's logits (next-token sampling).
-        # Engine expects "new_token" downstream, but for prefill we
-        # also publish logits so the engine's sampling layer can run.
         last_logits = logits[-1:, :]
         return {"logits": [last_logits]}
 
