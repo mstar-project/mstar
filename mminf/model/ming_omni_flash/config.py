@@ -245,43 +245,213 @@ class AudioEncoderConfig:
 
 
 # ---------------------------------------------------------------------------
-# Talker (SKELETON — step 6 of PORTING_NOTES will fill in field semantics)
+# Talker — CFM (continuous flow matching) head + Qwen2 LLM backbone
 # ---------------------------------------------------------------------------
+#
+# Step 6a (this commit) lifts the on-disk talker config tree into proper
+# typed dataclasses so the downstream modeling code (CFM head, DiT
+# blocks, Aggregator, Qwen2 backbone) can read dims off `config.talker`
+# directly. The on-disk layout is::
+#
+#   talker/config.json        — top-level BailingTalker2 config (CFM steps,
+#                                patch sizes, flowmodel + aggregator blocks)
+#   talker/llm/config.json    — Qwen2 LLM backbone (896-dim, 24 layers)
+#   talker/vae/config.json    — AudioVAE (44.1 kHz output, latent_dim=64)
+#
+# The flowmodel / aggregator blocks share the same DiTBlockConfig shape
+# (depth, hidden_size, num_heads, mlp_ratio, dropout, in_channels) so we
+# reuse one dataclass for both.
+
+
+@dataclass
+class TalkerLLMConfig:
+    """Qwen2 LLM backbone used inside the talker.
+
+    Distinct from `ThinkerLLMConfig` — different vocab, smaller dims, no
+    MoE, GQA with sliding-window attention. Field set mirrors the
+    populated keys in `talker/llm/config.json` on the released ckpt.
+    """
+
+    vocab_size: int = 151936
+    hidden_size: int = 896
+    intermediate_size: int = 4864
+    num_hidden_layers: int = 24
+    num_attention_heads: int = 14
+    num_key_value_heads: int = 2
+
+    # Norm / activation
+    hidden_act: str = "silu"
+    rms_norm_eps: float = 1e-6
+    tie_word_embeddings: bool = True
+
+    # Position / RoPE
+    max_position_embeddings: int = 32768
+    rope_theta: float = 1_000_000.0
+
+    # Sliding window attention. On the released ckpt the talker LLM has
+    # use_sliding_window=False but a non-trivial sliding_window value;
+    # we expose both so the eventual attention impl can branch correctly.
+    use_sliding_window: bool = False
+    sliding_window: int = 32768
+    max_window_layers: int = 21
+
+    # Misc
+    bos_token_id: int = 151643
+    eos_token_id: int = 151645
+    attention_dropout: float = 0.0
+    use_cache: bool = True
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> TalkerLLMConfig:
+        fnames = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in fnames})
+
+
+@dataclass
+class DiTBlockConfig:
+    """Shared shape for the talker's `flowmodel` and `aggregator` DiT stacks.
+
+    Both blocks live under the talker top-level config with identical
+    fields (only the dropout value differs — flowmodel=0, aggregator=0.1).
+    The block builds out as Attention + RMSNorm + FeedForward(GeGLU);
+    individual layers are stacked `depth` times.
+    """
+
+    attn_backend: str = "torch"
+    attn_mask_enabled: bool = False
+    depth: int = 8
+    dropout: float = 0.0
+    hidden_size: int = 1024
+    in_channels: int = 64
+    mlp_ratio: int = 4
+    num_heads: int = 16
+    pe_attn_head: Any | None = None
+    qk_norm: Any | None = None
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_heads
+
+    @property
+    def intermediate_size(self) -> int:
+        return self.hidden_size * self.mlp_ratio
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> DiTBlockConfig:
+        fnames = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in fnames})
+
+
+@dataclass
+class AudioVAEConfig:
+    """Audio VAE: encoder (waveform → latent) + decoder (latent → ISTFT mag/phase).
+
+    Both encoder and decoder are Qwen2-LLM-shaped sliding-window attention
+    backbones (`enc_kwargs.backbone` / `dec_kwargs.backbone` on disk —
+    nearly identical to `TalkerLLMConfig` but with vocab_size=1 since they
+    don't tokenize text). The encoder takes waveform features and outputs
+    `latent_dim` channels; the decoder consumes the latent and projects to
+    `output_dim` STFT bins (882 on the released ckpt) for an ISTFT head.
+
+    Discriminator + loss-weight fields (`hifi_gan_disc_kwargs`,
+    `lambda_*`) are training-time only and stored as raw dicts here —
+    inference doesn't read them.
+    """
+
+    sample_rate: int = 44100
+    patch_size: int = 4
+    init_method: str = "kaiming"
+
+    # Encoder / decoder dims pulled out of enc_kwargs / dec_kwargs.
+    latent_dim: int = 64
+    encoder_input_dim: int = 80    # mel bins (default; overridden below)
+    encoder_hop_size: int = 320    # frames-per-latent (default)
+    decoder_output_dim: int = 882  # STFT bins fed to ISTFTHead
+
+    # The full Qwen2-shaped backbones for enc/dec are kept as raw dicts
+    # here; the modeling code (step 6d) will lift the relevant fields
+    # into its own block-builder.
+    enc_backbone: dict[str, Any] = field(default_factory=dict)
+    dec_backbone: dict[str, Any] = field(default_factory=dict)
+
+    # Training-time only; not consumed by inference. Stored verbatim so a
+    # full round-trip remains possible.
+    hifi_gan_disc_kwargs: dict[str, Any] = field(default_factory=dict)
+    spec_disc_kwargs: dict[str, Any] = field(default_factory=dict)
+    semantic_module_kwargs: dict[str, Any] | None = None
+    lambda_adv: float = 1.0
+    lambda_disc: float = 1.0
+    lambda_feat_match_loss: float = 1.0
+    lambda_mel_loss: float = 1.0
+    lambda_semantic: float = 2.0
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> AudioVAEConfig:
+        enc_kwargs = d.get("enc_kwargs") or {}
+        dec_kwargs = d.get("dec_kwargs") or {}
+        return cls(
+            sample_rate=int(d.get("sample_rate", 44100)),
+            patch_size=int(d.get("patch_size", 4)),
+            init_method=str(d.get("init_method", "kaiming")),
+            latent_dim=int(enc_kwargs.get("latent_dim", dec_kwargs.get("latent_dim", 64))),
+            encoder_input_dim=int(enc_kwargs.get("input_dim", 80)),
+            encoder_hop_size=int(enc_kwargs.get("hop_size", 320)),
+            decoder_output_dim=int(dec_kwargs.get("output_dim", 882)),
+            enc_backbone=dict(enc_kwargs.get("backbone", {})),
+            dec_backbone=dict(dec_kwargs.get("backbone", {})),
+            hifi_gan_disc_kwargs=dict(d.get("hifi_gan_disc_kwargs") or {}),
+            spec_disc_kwargs=dict(d.get("spec_disc_kwargs") or {}),
+            semantic_module_kwargs=d.get("semantic_module_kwargs"),
+            lambda_adv=float(d.get("lambda_adv", 1.0)),
+            lambda_disc=float(d.get("lambda_disc", 1.0)),
+            lambda_feat_match_loss=float(d.get("lambda_feat_match_loss", 1.0)),
+            lambda_mel_loss=float(d.get("lambda_mel_loss", 1.0)),
+            lambda_semantic=float(d.get("lambda_semantic", 2.0)),
+        )
+
 
 @dataclass
 class TalkerConfig:
     """Ming-flash-omni-2.0 talker (BailingTalker2) — Qwen2 LLM + CFM head.
 
-    SKELETON. Today this captures the structure of the on-disk talker config
-    tree (talker/config.json + talker/llm/config.json + talker/vae/config.json)
-    but the field set is deliberately minimal — exhaustive porting happens
-    when the talker submodule actually gets implemented (step 6 of
-    PORTING_NOTES.md). The fields below are the ones plausibly read at
-    higher-level coordination time (sample rate for postprocess, cfg_strength
-    for sampling, latent_dim for tensor shape sanity checks).
+    Sub-configs:
+      * ``llm`` — Qwen2-based AR LLM that consumes thinker hidden states
+        + voice prompt and emits CFM-driving latents.
+      * ``flowmodel`` / ``aggregator`` — DiT stacks (CFM + condition
+        aggregator); identical shape, different dropout.
+      * ``vae`` — AudioVAE for waveform synthesis from CFM-generated
+        latents.
+
+    Inference-time scalars (`steps`, `cfg_strength`, `patch_size`,
+    `history_patch_size`) drive the CFM sampling loop.
     """
 
-    # From talker/config.json
+    # Top-level scalars from talker/config.json
     steps: int = 10
     patch_size: int = 4
     history_patch_size: int = 32
     cfg_strength: float = 2.0
-    # The full ``flowmodel`` and ``aggregator`` blocks are kept as raw dicts —
-    # they're sub-module-internal and will be lifted into dataclasses when
-    # step 6 implements the CFM head.
-    flowmodel: dict[str, Any] = field(default_factory=dict)
-    aggregator: dict[str, Any] = field(default_factory=dict)
 
-    # From talker/llm/config.json (Qwen2). Kept as a raw dict for now — the
-    # talker LLM is a separate model_type from the thinker, so reusing
-    # ThinkerLLMConfig would be misleading.
-    llm: dict[str, Any] | None = None
+    # Typed sub-configs (replaces step-1's raw-dict skeletons).
+    llm: TalkerLLMConfig = field(default_factory=TalkerLLMConfig)
+    flowmodel: DiTBlockConfig = field(default_factory=DiTBlockConfig)
+    aggregator: DiTBlockConfig = field(default_factory=DiTBlockConfig)
+    vae: AudioVAEConfig = field(default_factory=AudioVAEConfig)
 
-    # From talker/vae/config.json (AudioVAE). 44.1 kHz output is the
-    # load-bearing field — Model.get_output_sample_rate() reads it.
-    vae_sample_rate: int = 44100
-    vae_patch_size: int = 4
-    vae: dict[str, Any] | None = None
+    # Convenience accessors used by Model.get_output_sample_rate (kept
+    # for backward compat with code that previously read `vae_sample_rate`
+    # / `vae_patch_size` directly off this dataclass).
+    @property
+    def vae_sample_rate(self) -> int:
+        return self.vae.sample_rate
+
+    @property
+    def vae_patch_size(self) -> int:
+        return self.vae.patch_size
 
     @classmethod
     def from_subdir(cls, talker_dir: str | os.PathLike[str]) -> TalkerConfig | None:
@@ -294,31 +464,39 @@ class TalkerConfig:
         with open(cfg_path) as f:
             raw = json.load(f)
 
-        fnames = {f.name for f in cls.__dataclass_fields__.values()}
-        scalars = {k: v for k, v in raw.items() if k in fnames}
+        # Top-level scalars
+        steps = int(raw.get("steps", 10))
+        patch_size = int(raw.get("patch_size", 4))
+        history_patch_size = int(raw.get("history_patch_size", 32))
+        cfg_strength = float(raw.get("cfg_strength", 2.0))
 
-        llm: dict[str, Any] | None = None
+        # flowmodel + aggregator sub-blocks
+        flowmodel = DiTBlockConfig.from_dict(raw.get("flowmodel", {}))
+        aggregator = DiTBlockConfig.from_dict(raw.get("aggregator", {}))
+
+        # LLM sub-config
+        llm = TalkerLLMConfig()
         llm_path = talker_dir / "llm" / "config.json"
         if llm_path.exists():
             with open(llm_path) as f:
-                llm = json.load(f)
+                llm = TalkerLLMConfig.from_dict(json.load(f))
 
-        vae: dict[str, Any] | None = None
-        vae_sample_rate = 44100
-        vae_patch_size = 4
+        # VAE sub-config
+        vae = AudioVAEConfig()
         vae_path = talker_dir / "vae" / "config.json"
         if vae_path.exists():
             with open(vae_path) as f:
-                vae = json.load(f)
-            vae_sample_rate = int(vae.get("sample_rate", vae_sample_rate))
-            vae_patch_size = int(vae.get("patch_size", vae_patch_size))
+                vae = AudioVAEConfig.from_dict(json.load(f))
 
         return cls(
-            **scalars,
+            steps=steps,
+            patch_size=patch_size,
+            history_patch_size=history_patch_size,
+            cfg_strength=cfg_strength,
             llm=llm,
+            flowmodel=flowmodel,
+            aggregator=aggregator,
             vae=vae,
-            vae_sample_rate=vae_sample_rate,
-            vae_patch_size=vae_patch_size,
         )
 
 
