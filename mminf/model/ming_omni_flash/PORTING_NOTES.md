@@ -454,10 +454,54 @@ graph-walk / partition / streaming patterns transfer 1:1.
    than discrete-codec-AR like Qwen3-Omni's — the streaming topology will
    differ. Re-read `mminf/streaming/topology.py` before wiring connections.
 
-7. **Process_prompt.** Build the ChatML-ish prompt via the processor's
-   `apply_chat_template(messages, sys_prompt_exp=None, use_cot_system_prompt=False)`.
-   For image-gen requests append the `<image><imagePatch>*256</image>`
-   query-token block (see `prompt_utils.maybe_expand_image_gen_prompt`).
+7. **Process_prompt — DONE.** `MingFlashOmniModel.process_prompt` now
+   produces the full `NameToTensorList` consumed by step 5c's prefill
+   scheduler. Strategy mirrors `qwen3_omni`'s `process_prompt`: apply
+   the chat template to TEXT-ONLY messages (so the tokenizer doesn't
+   insert placeholder tokens we'd later have to strip), then run the
+   image / video / audio sub-processors separately for each modality.
+   The Ming chat template path uses `tokenizer.apply_chat_template`
+   (jinja, accepts OpenAI roles `user`/`assistant`/`system`) rather
+   than `processor.apply_chat_template` (Python implementation in
+   `BailingMM2Processor`, asserts on lowercase OpenAI roles — see
+   "Role-handling nuance" above).
+
+   Input convention (`tensors: NameToTensorList`):
+     * `image_inputs` — list of CHW float [0,1] tensors per image.
+       Internal `_image_to_processor_input` converts to HWC uint8 to
+       avoid the upstream's double-rescale near-zero bug
+       (`qwen3_omni_model.py:1033-1038` documents the same gotcha).
+       Single-channel inputs auto-broadcast to 3 channels.
+     * `audio_inputs` — list of either raw 1-D float tensors (sample
+       rate inferred from processor default 16 kHz) or
+       `(waveform, sample_rate)` tuples.
+     * `video_inputs` — list of (T, C, H, W) float tensors. Per-frame
+       `second_per_grid` defaults to 1.0; override via
+       `kwargs["input_metadata"]["video"][i]["second_per_grid"]`.
+
+   Output keys consumed by `_build_thinker_prefill_schedule`:
+     * `text_inputs` — list of 1-D long tensors (one per text turn).
+     * `pixel_values`, `image_grid_thw` — one entry per image.
+     * `pixel_values_videos`, `video_grid_thw`,
+       `video_second_per_grid` — one entry per video clip.
+     * `audio_features` (n_mels, T) + `audio_seqlens` (length-1 long)
+       — one entry per audio clip. Note: upstream returns audio_feats
+       as (B, T, n_mels); we transpose to (n_mels, T) per clip so
+       `AudioEncoderSubmodule.prepare_inputs` can splice without a
+       reshape.
+
+   17 tests in `test/modular/test_ming_flash_omni_process_prompt.py`:
+   text-only happy path, no-prompt audio-only path, image conversion
+   correctness (CHW float [0,1] → HWC uint8, grayscale broadcast,
+   uint8 pass-through), per-modality dispatch, missing-processor
+   error paths, multi-image / mixed-modality combinations, video
+   metadata override, snapshot-gated text+image E2E with the real
+   `BailingMM2Processor`. 16 green + 1 env-skip on this box.
+
+   Image-gen-specific `<image><imagePatch>*256</image>` block (the
+   query-token expansion for the imagegen DiT path) is deferred to
+   step 9 (ImageGen partition), since today's prefill schedule only
+   covers text-out generation.
 
 8. **TTS caption template (optional, talker-only deploy).** Port
    `prompt_utils.BASE_CAPTION_TEMPLATE` + `create_instruction` so the

@@ -766,27 +766,217 @@ class MingFlashOmniModel(Model):
         tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Tokenize a text prompt via the chat template.
+        """Build text_inputs + modality tensors for the prefill schedule.
 
-        The jinja chat_template in ``tokenizer_config.json`` accepts
-        OpenAI-standard ``user``/``assistant``/``system`` roles and
-        remaps them to Ming's internal HUMAN/ASSISTANT/SYSTEM. We
-        send a plain ``{"role": "user", "content": <prompt>}`` and
-        let the template handle the rest.
+        Strategy mirrors qwen3_omni's process_prompt (step 7 of porting
+        notes): apply the chat template to TEXT-ONLY messages (so the
+        tokenizer doesn't insert placeholder tokens we'd later have to
+        strip), then run the image / audio sub-processors separately
+        on each modality input.
+
+        The Ming chat template (`tokenizer.apply_chat_template`) is the
+        jinja path that accepts OpenAI roles (user / assistant /
+        system) and rewrites them to Ming's HUMAN / ASSISTANT / SYSTEM.
+        The processor's Python `apply_chat_template` (`BailingMM2Processor`)
+        is stricter and asserts on lowercase roles — see PORTING_NOTES
+        "Role-handling nuance". Using the tokenizer path keeps the
+        interface OpenAI-compatible.
+
+        Input shape (`tensors`):
+
+          * ``image_inputs`` — list of CHW float32 [0, 1] tensors (one
+            per image). Converted to HWC uint8 [0, 255] before the
+            image processor (the upstream BailingMM2ImageProcessor
+            assumes uint8; double-rescaling near-zeros the tensor).
+          * ``audio_inputs`` — list of ``(waveform, sampling_rate)``
+            tuples OR list of 1-D float tensors (sample rate inferred
+            from the processor's default — 16 kHz on the released ckpt).
+          * ``video_inputs`` — list of 4-D (T, C, H, W) float tensors.
+            Currently treated like a stack of images via the image
+            processor's video path; per-frame timestamp scaffolding
+            (``video_second_per_grid``) defaults to 1.0 unless an
+            ``input_metadata["video"][i]["second_per_grid"]`` override
+            is supplied via ``**kwargs``.
+
+        Output shape — keys consumed by
+        ``_build_thinker_prefill_schedule`` in step 5c:
+
+          * ``text_inputs`` — list of 1-D long tensors.
+          * ``pixel_values``, ``image_grid_thw`` — one entry per image.
+          * ``pixel_values_videos``, ``video_grid_thw``,
+            ``video_second_per_grid`` — one entry per video clip.
+          * ``audio_features``, ``audio_seqlens`` — one entry per
+            audio clip; ``audio_features`` is (n_mels, T) and
+            ``audio_seqlens`` is a length-1 int tensor.
         """
-        if prompt is None:
-            return {}
         if self.tokenizer is None:
             raise RuntimeError(
                 "MingFlashOmniModel.process_prompt called but tokenizer "
                 "is not loaded. See _warn_tokenizer_unavailable for setup."
             )
-        messages = [{"role": "user", "content": prompt}]
-        text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        input_ids = self.tokenizer(text, return_tensors="pt").input_ids[0]
-        return {"text_inputs": [input_ids]}
+
+        result: NameToTensorList = {
+            "text_inputs": [],
+            "pixel_values": [],
+            "image_grid_thw": [],
+            "pixel_values_videos": [],
+            "video_grid_thw": [],
+            "video_second_per_grid": [],
+            "audio_features": [],
+            "audio_seqlens": [],
+        }
+
+        # ----- Text path (always present, even for image-/audio-only
+        # turns since the chat template emits role markers + an
+        # assistant-prompt suffix the model needs to start decoding).
+        if prompt is not None:
+            messages = [{"role": "user", "content": prompt}]
+            text = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            input_ids = self.tokenizer(text, return_tensors="pt").input_ids[0]
+            result["text_inputs"].append(input_ids)
+
+        if tensors is None:
+            return result
+
+        # ----- Image path
+        raw_images = tensors.get("image_inputs", []) or []
+        if raw_images:
+            self._process_image_inputs(raw_images, result)
+
+        # ----- Video path
+        raw_videos = tensors.get("video_inputs", []) or []
+        if raw_videos:
+            video_metadata = kwargs.get("input_metadata", {}).get("video", [])
+            self._process_video_inputs(raw_videos, video_metadata, result)
+
+        # ----- Audio path
+        raw_audios = tensors.get("audio_inputs", []) or []
+        if raw_audios:
+            self._process_audio_inputs(raw_audios, result)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Per-modality helpers (split out so process_prompt stays readable)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _image_to_processor_input(img: "torch.Tensor"):
+        """Convert a CHW float [0,1] tensor to HWC uint8 numpy for HF.
+
+        BailingMM2ImageProcessor (and most HF image processors)
+        assume PIL/uint8 inputs with ``do_rescale=True`` by default.
+        Passing a float [0,1] tensor would double-rescale it to
+        near-zero. Mirror qwen3_omni's conversion (qwen3_omni_model.py:
+        1027-1039).
+        """
+        import numpy as np
+        x = img
+        if x.dtype.is_floating_point:
+            x = (x * 255.0).clamp(0, 255).to(torch.uint8)
+        if x.dim() == 3 and x.shape[0] in (1, 3):
+            x = x.permute(1, 2, 0)  # CHW -> HWC
+        arr = x.cpu().contiguous().numpy()
+        if arr.shape[-1] == 1:
+            arr = np.repeat(arr, 3, axis=-1)
+        return arr
+
+    def _process_image_inputs(
+        self,
+        raw_images: list["torch.Tensor"],
+        result: NameToTensorList,
+    ) -> None:
+        if self._processor is None:
+            raise RuntimeError(
+                "process_prompt: image inputs supplied but processor is None. "
+                "See PORTING_NOTES 'Ming source dependency' for setup."
+            )
+        img_proc = self._processor.image_processor
+        for img in raw_images:
+            arr = self._image_to_processor_input(img)
+            out = img_proc(images=[arr], return_tensors="pt")
+            # ``pixel_values`` is (n_patches, C, ph, pw); the encoder
+            # consumes it directly. ``image_grid_thw`` is (1, 3).
+            result["pixel_values"].append(out["pixel_values"])
+            grid = out["image_grid_thw"]
+            if not isinstance(grid, torch.Tensor):
+                grid = torch.as_tensor(grid)
+            result["image_grid_thw"].append(grid[0])
+
+    def _process_video_inputs(
+        self,
+        raw_videos: list["torch.Tensor"],
+        video_metadata: list[dict],
+        result: NameToTensorList,
+    ) -> None:
+        if self._processor is None:
+            raise RuntimeError(
+                "process_prompt: video inputs supplied but processor is None."
+            )
+        img_proc = self._processor.image_processor
+        # Per-frame timestamp override; default 1.0 second/frame so the
+        # Thinker's temporal positions advance once per grid step
+        # (matches modeling_bailing_moe_v2.get_rope_index's `else: 1.0`).
+        for i, video in enumerate(raw_videos):
+            # Convert (T, C, H, W) float [0,1] to (T, H, W, C) uint8.
+            frames = []
+            for t in range(video.shape[0]):
+                frames.append(self._image_to_processor_input(video[t]))
+            out = img_proc(
+                images=None,
+                videos=[frames],
+                **({} if not video_metadata else {}),
+            )
+            result["pixel_values_videos"].append(out["pixel_values_videos"])
+            grid = out["video_grid_thw"]
+            if not isinstance(grid, torch.Tensor):
+                grid = torch.as_tensor(grid)
+            result["video_grid_thw"].append(grid[0])
+            spg = 1.0
+            if i < len(video_metadata):
+                spg = float(video_metadata[i].get("second_per_grid", 1.0))
+            result["video_second_per_grid"].append(torch.tensor(spg))
+
+    def _process_audio_inputs(
+        self,
+        raw_audios: list,
+        result: NameToTensorList,
+    ) -> None:
+        if self._processor is None:
+            raise RuntimeError(
+                "process_prompt: audio inputs supplied but processor is None."
+            )
+        audio_proc = self._processor.audio_processor
+        # Normalise each input into the (waveform, sampling_rate) tuple
+        # the processor expects. Accept either:
+        #   * raw 1-D float tensor (assume the processor's default SR)
+        #   * (waveform_tensor, int sr) tuple
+        default_sr = getattr(audio_proc, "sampling_rate", 16000)
+        for audio in raw_audios:
+            if isinstance(audio, tuple) and len(audio) == 2:
+                waveform, sr = audio
+            else:
+                waveform, sr = audio, default_sr
+            if isinstance(waveform, torch.Tensor):
+                waveform_np = waveform.detach().cpu().numpy()
+            else:
+                waveform_np = waveform
+            out = audio_proc([(waveform_np, sr)])
+            # `audio_feats` is (B, T, n_mels); transpose to (n_mels, T)
+            # per clip — that's what the AudioEncoderSubmodule expects
+            # for a single-clip prepare_inputs.
+            feats = out["audio_feats"]
+            if not isinstance(feats, torch.Tensor):
+                feats = torch.as_tensor(feats)
+            # B=1 per clip in our loop.
+            mel = feats[0].transpose(0, 1).contiguous()  # (n_mels, T)
+            length = out["audio_feats_lengths"]
+            if not isinstance(length, torch.Tensor):
+                length = torch.as_tensor(length)
+            result["audio_features"].append(mel)
+            result["audio_seqlens"].append(length.to(torch.long))
 
     def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
         if modality != "text":
