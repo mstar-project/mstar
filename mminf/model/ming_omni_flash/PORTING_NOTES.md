@@ -687,10 +687,53 @@ graph-walk / partition / streaming patterns transfer 1:1.
        and vice versa — proves the eventual loader will be a clean
        prefix-strip + load_state_dict.
 
-   - **6e — TODO** (Talker submodule + graph walks): wire the talker
-     into mminf's graph + partition system. Need a streaming topology
-     for the CFM-step → audio-chunk flow (different shape from
-     qwen3_omni's discrete-codec talker).
+   - **6e — IN PROGRESS** (Talker submodule + graph walks): split into
+     6e-1 (orchestration helper) + 6e-2 (mminf graph wiring).
+
+     - **6e-1 — DONE** (`components/talker_generator.py`): port of
+       upstream `MingAudioGenerator` (talker_module.py:854-1146) plus
+       the streaming-decode utilities `silence_holder` /
+       `trim_trailing_silence`. Stateless-per-request `TalkerGenerator`
+       binds Qwen2 LLM + CFM + Aggregator + stop_head + AudioVAE and
+       exposes:
+       * `generate_latents(inputs_embeds, ...)` — the AR loop:
+         repeated (`llm_step` → `cfm_sample_step` → stop check). Each
+         step emits one `(B, patch_size, latent_dim)` latent; the
+         Aggregator output becomes the next step's `inputs_embeds`;
+         the stop_head softmax gates early termination after
+         `min_new_token` steps.
+       * `cfm_sample_step` — one CFM substep-integration + Aggregator
+         + stop classification.
+       * `llm_step` — single Qwen2 forward with `StaticCache`
+         `cache_position` bookkeeping on step > 0.
+       * `decode_to_waveform(latents, stream_decode=True)` — one-shot
+         or chunked AudioVAE decode; the streaming path threads
+         `silence_holder` + a sliding `decode_pad` window across chunks.
+       * `duration_capped_steps` — the text-length → max-steps prosody
+         heuristic.
+       * `_init_his_lat` / `_update_his_lat` — history-latent sliding
+         window (right-aligns a voice-prompt latent when supplied).
+
+       Skipped from upstream: `CFMGraphExecutorPool` / `CFMGraphExecutor`
+       (vllm CUDA-graph batching — mminf's engine handles capture);
+       `build_tts_input` / `_looks_like_music_prompt` (→ step 8).
+
+       24 tests in `test_ming_flash_omni_talker_generator.py`:
+       trim_trailing_silence (empty / short-clip / silent-tail trim /
+       weird-shape passthrough), silence_holder (cache init, sub-frame
+       buffering until last_chunk), generator construction (with /
+       without VAE), his-lat zeros + right-align + window update +
+       unsupported-shape guard, cfm_sample_step output shapes +
+       stop-softmax-sums-to-1, llm_step step-0 path, generate_latents
+       per-step collection + max_steps cap, duration_capped_steps
+       heuristic, decode_to_waveform one-shot / streaming / empty /
+       no-VAE-raises, instance trim_trailing_silence.
+
+     - **6e-2 — TODO** (graph wiring): `TalkerSubmodule` (AR engine)
+       + audio-output submodule wrapping `decode_to_waveform`, plus
+       the `talker_prefill` / `talker_decode` / `audio_chunk` graph
+       walks, partition definitions, and Thinker→Talker streaming
+       connections. This is where audio-out `/generate` becomes live.
 
    - **6f — DONE** (weight loaders): `loader.py` exposes five new
      entry points on top of the step-4b `_load_prefixed_state_dict`
