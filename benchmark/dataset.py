@@ -777,7 +777,10 @@ class DROIDDataset(BaseDataset):
             chunk_video = download_fn(self._chunk_video_path(ep_id, cam_key, chunks_size))
             png_path    = os.path.join(self.local_file_dir, f"ep{ep_id}_cam{len(image_paths)}.png")
             _decode_frames_to_png_and_video(
-                chunk_video, [first_local], png_path=png_path, mp4_path=None
+                video_path=chunk_video,
+                frame_indices=[first_local],
+                png_path=png_path,
+                mp4_path=None
             )
             image_paths.append(png_path)
 
@@ -793,7 +796,9 @@ class DROIDDataset(BaseDataset):
             req_type=RequestType.VLA,
             prompt=language or "manipulate the object",
             image_path=image_paths[0],
-            extra_image_paths=image_paths[1:],
+            # openpi droid policy only uses the first extra image path! So, to be consistent
+            # we emit the remainder entirely from bechmarking
+            extra_image_paths=image_paths[1:2],
             model_kwargs={"robot_state": state},
         )
 
@@ -824,7 +829,9 @@ class DROIDDataset(BaseDataset):
         )
         mp4_path = os.path.join(self.local_file_dir, f"ep{ep_id}.mp4")
         _decode_frames_to_png_and_video(
-            chunk_video, video_local_indices, png_path=None, mp4_path=mp4_path
+            video_path=chunk_video,
+            frame_indices=video_local_indices,
+            png_path=None, mp4_path=mp4_path
         )
 
         actions = [_to_float_list(f.get(action_col), self.action_dim)
@@ -841,7 +848,7 @@ class DROIDDataset(BaseDataset):
                 "rollout_horizon": self.rollout_horizon,
             },
         )
-
+    
     @property
     def num_requests(self) -> int:
         return self._num_requests
@@ -852,7 +859,7 @@ class DROIDDataset(BaseDataset):
     def __getitem__(self, idx: int) -> RequestInput:
         return self.items[idx]
 
-    # ------------------------------------------------------------------
+
 class VideoMMEDataset(BaseDataset):
     """
     Dataset loader for Video-MME (https://video-mme.github.io/).
