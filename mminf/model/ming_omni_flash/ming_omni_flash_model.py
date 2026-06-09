@@ -63,7 +63,9 @@ from mminf.model.ming_omni_flash.components.model import LingMoeModel
 from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig
 from mminf.model.ming_omni_flash.loader import load_thinker_weights
 from mminf.model.ming_omni_flash.submodules import (
+    AudioEncoderSubmodule,
     BailingMoeV2ThinkerSubmodule,
+    VisionEncoderSubmodule,
 )
 from mminf.streaming.topology import PartitionTopology
 
@@ -365,9 +367,18 @@ class MingFlashOmniModel(Model):
         )]
 
     def get_node_engine_types(self) -> dict[str, EngineType]:
-        # Text-only thinker for step 3d. audio_encoder / vision_encoder /
-        # Talker / AudioVAE / ImageGen fold in at step 4+.
-        return {"Thinker": EngineType.KV_CACHE}
+        # Step 5a: vision + audio encoders are stateless graph nodes
+        # alongside the Thinker. Talker / AudioVAE / ImageGen fold in
+        # at step 6+. The encoders only register as nodes here when
+        # the snapshot ships the corresponding sub-configs — a
+        # thinker-only config (configs/ming_flash_omni_thinker_only.yaml)
+        # will still want only Thinker, so callers wire encoder nodes
+        # in their yaml only when needed.
+        return {
+            "Thinker": EngineType.KV_CACHE,
+            "vision_encoder": EngineType.STATELESS,
+            "audio_encoder": EngineType.STATELESS,
+        }
 
     # ------------------------------------------------------------------
     # Graph walks: prefill + decode loop, text-only
@@ -552,11 +563,19 @@ class MingFlashOmniModel(Model):
     def get_submodule(self, node_name: str, device="cpu", tp_group=None):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
+        if node_name == "vision_encoder":
+            submodule = self._create_vision_encoder_submodule(device)
+            self._submodule_cache[node_name] = submodule
+            return submodule
+        if node_name == "audio_encoder":
+            submodule = self._create_audio_encoder_submodule(device)
+            self._submodule_cache[node_name] = submodule
+            return submodule
         if node_name != "Thinker":
             raise ValueError(
-                f"Unknown node: {node_name!r}. Step 3d-3e registers only "
-                f"'Thinker'; audio_encoder / vision_encoder / Talker / "
-                f"AudioVAE follow in steps 4+."
+                f"Unknown node: {node_name!r}. Step 5a registers "
+                f"'Thinker', 'vision_encoder', 'audio_encoder'; Talker / "
+                f"AudioVAE / ImageGen follow in steps 6+."
             )
 
         # Build LingMoeModel on the meta device first so the constructor's
@@ -605,3 +624,108 @@ class MingFlashOmniModel(Model):
         )
         self._submodule_cache[node_name] = submodule
         return submodule
+
+    # ------------------------------------------------------------------
+    # Encoder construction helpers (step 5a)
+    # ------------------------------------------------------------------
+
+    def _create_vision_encoder_submodule(self, device: str):
+        """Build Qwen3MoeVisionTransformer + MingVisionProjector, load weights.
+
+        The vision encoder lives on a single rank (no TP) per the
+        typical topology. Uses bf16 to match the released ckpt's dtype.
+        ``attn_implementation`` defaults to ``flash_attention_2`` for
+        video performance (same gotcha as qwen3_omni:1508-1519); fall
+        back to eager only when explicitly disabled via env var.
+        """
+        from mminf.model.ming_omni_flash.components.projectors import (
+            MingVisionProjector,
+        )
+        from mminf.model.ming_omni_flash.components.vision_encoder import (
+            build_vision_encoder,
+        )
+        from mminf.model.ming_omni_flash.loader import (
+            load_vision_encoder_weights,
+            load_vision_projector_weights,
+        )
+
+        dtype = self.get_autocast_dtype()
+        attn = os.environ.get("MING_VISION_ATTN_IMPL", "flash_attention_2")
+
+        vision_encoder = build_vision_encoder(
+            config=self.config.vision,
+            dtype=dtype,
+            device=device,
+            attn_implementation=attn,
+            local_dir=self.local_dir,
+        )
+        load_vision_encoder_weights(
+            vision_encoder, self.local_dir, device=device, strict=True,
+        )
+
+        vision_projector = MingVisionProjector(
+            vision_dim=self.config.vision.out_hidden_size,
+            llm_dim=self.config.thinker_llm.hidden_size,
+            mlp_depth=self.config.mlp_depth,
+        )
+        vision_projector = vision_projector.to(dtype=dtype, device=device)
+        load_vision_projector_weights(
+            vision_projector, self.local_dir, device=device, strict=True,
+        )
+        vision_projector.eval()
+
+        return VisionEncoderSubmodule(
+            vision_encoder=vision_encoder,
+            vision_projector=vision_projector,
+            config=self.config,
+        )
+
+    def _create_audio_encoder_submodule(self, device: str):
+        """Build MingAudioEncoder + MingAudioProjector, load weights.
+
+        Audio encoder is the self-contained Whisper port from step 4a
+        (no openai-whisper runtime dep). Uses bf16 to match the
+        released ckpt's dtype. Flash-attn varlen kicks in when
+        available; otherwise the manual padded-attention fallback runs.
+        """
+        from mminf.model.ming_omni_flash.components.audio_encoder import (
+            build_audio_encoder,
+        )
+        from mminf.model.ming_omni_flash.components.projectors import (
+            MingAudioProjector,
+        )
+        from mminf.model.ming_omni_flash.loader import (
+            load_audio_encoder_weights,
+            load_audio_projector_weights,
+        )
+
+        dtype = self.get_autocast_dtype()
+
+        audio_encoder = build_audio_encoder(
+            audio_config=self.config.audio_encoder,
+            dtype=dtype,
+            device=device,
+            use_flash_attn=True,
+        )
+        load_audio_encoder_weights(
+            audio_encoder, self.local_dir, device=device, strict=True,
+        )
+
+        audio_projector = MingAudioProjector(
+            audio_dim=self.config.audio_encoder.d_model,
+            llm_dim=self.config.thinker_llm.hidden_size,
+            ds_kernel_size=self.config.audio_encoder.ds_kernel_size,
+            ds_stride=self.config.audio_encoder.ds_stride,
+            mlp_depth=self.config.mlp_depth,
+        )
+        audio_projector = audio_projector.to(dtype=dtype, device=device)
+        load_audio_projector_weights(
+            audio_projector, self.local_dir, device=device, strict=True,
+        )
+        audio_projector.eval()
+
+        return AudioEncoderSubmodule(
+            audio_encoder=audio_encoder,
+            audio_projector=audio_projector,
+            config=self.config,
+        )

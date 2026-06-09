@@ -315,6 +315,57 @@ graph-walk / partition / streaming patterns transfer 1:1.
    `prefill_video`, `thinker_decode`. Follow Qwen3-Omni's pattern for
    conditional walks based on `input_modalities`.
 
+   - **5a — DONE** (`submodules.py`, `ming_omni_flash_model.py`): the two
+     encoder NodeSubmodules and their construction paths.
+
+     * `VisionEncoderSubmodule` wraps Ming's `Qwen3MoeVisionTransformer`
+       + `MingVisionProjector`, mirrors
+       `modeling_bailingmm2.extract_image_feature` (encoder → projector
+       → L2 norm). `prepare_inputs` raises clearly on missing
+       `pixel_values` / `image_grid_thw` and promotes 1-D
+       `[T, H, W]` grid_thw to `(1, 3)`.
+
+     * `AudioEncoderSubmodule` wraps `MingAudioEncoder` +
+       `MingAudioProjector`. Accepts either a single `(n_mels, T)` clip
+       or a `(B, n_mels, T)` batched tensor and optionally trims the
+       padded tail using `audio_seqlens`. Per-clip embeddings are
+       concatenated along time; L2-norm is applied when
+       `audio_config.norm_query_embeds` is set (true on the released
+       ckpt — matches `modeling_bailingmm2.extract_audio_feature`).
+
+     * `get_node_engine_types` now registers
+       `vision_encoder` / `audio_encoder` as `EngineType.STATELESS`
+       alongside the KV-cache Thinker. Construction routes through
+       new `_create_vision_encoder_submodule` /
+       `_create_audio_encoder_submodule` helpers that build, dtype-cast,
+       and weight-load via the loaders from step 4b.
+
+     * 12 tests in `test/modular/test_ming_flash_omni_submodules.py`:
+       10 pure-Python (input-validation, output shape, L2 norm,
+       audio batched-vs-single equivalence, audio_seqlens trim,
+       grid_thw promotion, node-type registration, friendly error on
+       unknown node) + 2 snapshot-gated (full
+       `_create_audio_encoder_submodule` on the real ckpt — verifies
+       Conv1 + projector params are non-zero post-load).
+
+   - **5b — TODO** (Thinker prefill dispatch): extend
+     `BailingMoeV2ThinkerSubmodule.prepare_inputs` to handle
+     `prefill_vision` / `prefill_audio` graph walks — splice
+     vision/audio embeddings into the input sequence around the
+     `image_start`/`image_end` (or `audio_start`/`audio_end`) sentinel
+     tokens, build the partial-3D MRoPE position IDs for the modality
+     span. Mirror Qwen3-Omni's `ThinkerSubmodule.prepare_inputs`
+     dispatch + the per-modality `get_rope_index_*` helpers, adapted
+     for Ling-2.0's `mrope_section=[8,12,12]` and
+     `partial_rotary_factor=0.5`.
+
+   - **5c — TODO** (graph wiring): replace the text-only `prefill` /
+     `decode` walks in `get_graph_walk_graphs` with
+     `prefill_text` / `prefill_audio` / `prefill_vision` /
+     `prefill_video` + `thinker_decode`, updating `get_partitions`
+     and `get_initial_forward_pass_args` to route based on
+     `input_modalities`.
+
 6. **Talker + Audio VAE.** Port `ming_flash_omni_talker.py` + `talker_module.py`
    + `audio_vae.py`. The talker is CFM-based (continuous flow matching) rather
    than discrete-codec-AR like Qwen3-Omni's — the streaming topology will
