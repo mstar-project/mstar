@@ -729,11 +729,49 @@ graph-walk / partition / streaming patterns transfer 1:1.
        heuristic, decode_to_waveform one-shot / streaming / empty /
        no-VAE-raises, instance trim_trailing_silence.
 
-     - **6e-2 — TODO** (graph wiring): `TalkerSubmodule` (AR engine)
-       + audio-output submodule wrapping `decode_to_waveform`, plus
-       the `talker_prefill` / `talker_decode` / `audio_chunk` graph
-       walks, partition definitions, and Thinker→Talker streaming
-       connections. This is where audio-out `/generate` becomes live.
+     - **6e-2 — DONE** (TalkerSubmodule + construction + node
+       registration): the talker is a STATELESS node, not an AR /
+       streaming-codec node. Ming's thinker→talker bridge passes
+       DETOKENIZED TEXT (the talker re-encodes with its own
+       `talker/llm` tokenizer — see vllm-omni `pipeline.py`'s
+       `thinker2talker`), and the CFM step count is stop_head-
+       determined rather than a conductor decode loop. So the whole
+       per-request generation (LLM prefill + CFM AR decode + AudioVAE
+       decode) runs inside one `TalkerSubmodule.forward` call.
+
+       * `TalkerSubmodule` (`submodules.py`): `prepare_inputs` embeds
+         `talker_text_inputs` token ids via the talker LLM's
+         `embed_tokens`; `forward` runs `generate_latents` →
+         `decode_to_waveform` → `trim_trailing_silence` and returns
+         `{"audio_chunk": [waveform]}` (`(1, 1, num_samples)` at the
+         VAE sample rate). `get_stateless_flavor` returns
+         `"audio_codec"` (no autocast / no torch.compile — the CFM
+         ODE loop + ISTFT are numerically sensitive).
+
+       * `get_node_engine_types` registers `Talker` as
+         `EngineType.STATELESS` when the snapshot ships a `talker/`
+         subdir; thinker-only configs omit it.
+
+       * `_create_talker_submodule` builds the full stack
+         (`build_talker_llm` + `build_talker_cfm` + `build_aggregator`
+         + `build_talker_heads` + `build_audio_vae`), loads every
+         subtree via the step-6f loaders, wraps in a
+         `TalkerGenerator` → `TalkerSubmodule`.
+
+       12 tests across `test_ming_flash_omni_talker_submodule.py` (9)
+       + an updated `test_get_submodule_rejects_unknown_node`:
+       stateless flavor, prepare_inputs embed (1-D + 2-D ids) +
+       missing-input guard, forward returns finite audio_chunk,
+       node-type registration (with / without talker config),
+       `_create_talker_submodule` no-talker guard, plus a
+       snapshot-gated end-to-end that builds the full talker from
+       real weights and generates a finite waveform.
+
+     - **6e-3 — TODO** (graph walks + Thinker→Talker bridge): add the
+       `talker` graph walk + partition + `audio_chunk` `EMIT_TO_CLIENT`
+       edge, plus the detokenize-and-retokenize text bridge from the
+       Thinker partition to the Talker. After 6e-3, audio-out
+       `/generate` is live end-to-end.
 
    - **6f — DONE** (weight loaders): `loader.py` exposes five new
      entry points on top of the step-4b `_load_prefixed_state_dict`

@@ -375,11 +375,19 @@ class MingFlashOmniModel(Model):
         # thinker-only config (configs/ming_flash_omni_thinker_only.yaml)
         # will still want only Thinker, so callers wire encoder nodes
         # in their yaml only when needed.
-        return {
+        types = {
             "Thinker": EngineType.KV_CACHE,
             "vision_encoder": EngineType.STATELESS,
             "audio_encoder": EngineType.STATELESS,
         }
+        # Step 6e-2: register the Talker as a stateless TTS node when the
+        # snapshot ships a talker/ subdir. The talker runs its full
+        # AR-decode + VAE-decode internally (the CFM step count is
+        # stop_head-determined, not a conductor decode loop), so a single
+        # STATELESS node suffices. Thinker-only configs leave this off.
+        if self.config.talker is not None:
+            types["Talker"] = EngineType.STATELESS
+        return types
 
     # ------------------------------------------------------------------
     # Graph walks: text + audio + vision/video prefill + AR decode (step 5c)
@@ -1017,11 +1025,15 @@ class MingFlashOmniModel(Model):
             submodule = self._create_audio_encoder_submodule(device)
             self._submodule_cache[node_name] = submodule
             return submodule
+        if node_name == "Talker":
+            submodule = self._create_talker_submodule(device)
+            self._submodule_cache[node_name] = submodule
+            return submodule
         if node_name != "Thinker":
             raise ValueError(
-                f"Unknown node: {node_name!r}. Step 5a registers "
-                f"'Thinker', 'vision_encoder', 'audio_encoder'; Talker / "
-                f"AudioVAE / ImageGen follow in steps 6+."
+                f"Unknown node: {node_name!r}. Registers "
+                f"'Thinker', 'vision_encoder', 'audio_encoder', 'Talker'; "
+                f"ImageGen follows in step 9."
             )
 
         # Build LingMoeModel on the meta device first so the constructor's
@@ -1176,3 +1188,72 @@ class MingFlashOmniModel(Model):
             audio_projector=audio_projector,
             config=self.config,
         )
+
+    def _create_talker_submodule(self, device: str):
+        """Build the full talker stack + load weights, wrap in a submodule.
+
+        Assembles Qwen2 LLM + CFM(DiT) + Aggregator + stop/spk heads +
+        AudioVAE via the step-6b/6c/6d factories, loads each subtree
+        with the step-6f loaders, and wraps the lot in a
+        :class:`TalkerSubmodule` around a :class:`TalkerGenerator`.
+
+        The talker colocates on a single rank (no TP) — bf16 to match
+        the released ckpt's torch_dtype.
+        """
+        if self.config.talker is None:
+            raise RuntimeError(
+                "MingFlashOmniModel: 'Talker' node requested but the snapshot "
+                "has no talker/ subdir (thinker-only checkpoint)."
+            )
+        from mminf.model.ming_omni_flash.components.audio_vae import (
+            build_audio_vae,
+        )
+        from mminf.model.ming_omni_flash.components.talker_dit import (
+            build_aggregator,
+            build_talker_cfm,
+            build_talker_heads,
+            build_talker_llm,
+        )
+        from mminf.model.ming_omni_flash.components.talker_generator import (
+            TalkerGenerator,
+        )
+        from mminf.model.ming_omni_flash.loader import (
+            load_talker_aggregator_weights,
+            load_talker_audio_vae_weights,
+            load_talker_cfm_weights,
+            load_talker_heads_weights,
+            load_talker_llm_weights,
+        )
+        from mminf.model.ming_omni_flash.submodules import TalkerSubmodule
+
+        talker = self.config.talker
+        dtype = self.get_autocast_dtype()
+
+        llm = build_talker_llm(talker.llm, dtype=dtype, device=device)
+        load_talker_llm_weights(llm, self.local_dir, device=device, strict=True)
+
+        cfm = build_talker_cfm(talker, dtype=dtype, device=device)
+        load_talker_cfm_weights(cfm, self.local_dir, device=device, strict=True)
+
+        aggregator = build_aggregator(talker, dtype=dtype, device=device)
+        load_talker_aggregator_weights(
+            aggregator, self.local_dir, device=device, strict=True,
+        )
+
+        heads = build_talker_heads(talker, dtype=dtype, device=device)
+        load_talker_heads_weights(heads, self.local_dir, device=device, strict=True)
+
+        audio_vae = build_audio_vae(talker.vae, dtype=dtype, device=device)
+        load_talker_audio_vae_weights(
+            audio_vae, self.local_dir, device=device, strict=True,
+        )
+
+        generator = TalkerGenerator(
+            talker_config=talker,
+            llm=llm,
+            cfm=cfm,
+            aggregator=aggregator,
+            stop_head=heads["stop_head"],
+            audio_vae=audio_vae,
+        )
+        return TalkerSubmodule(generator=generator, config=self.config)
