@@ -48,7 +48,7 @@ from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
-from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
+from mstar.model.pi05.components.siglip import SIGLIP_STACKED_PARAMS, Pi05SiglipEncoder
 from mstar.model.pi05.components.tokenization import Pi05Tokenizer
 from mstar.model.pi05.config import Pi05Config, load_pi05_config
 from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
@@ -364,12 +364,13 @@ class Pi05Model(Model):
             if inner.startswith("vision_tower.vision_model."):
                 # The lerobot key is
                 #   paligemma.model.vision_tower.vision_model.<rest>
-                # Pi05SiglipEncoder owns ``self.vision_model = SiglipVisionModel(...)``,
-                # and HF's SiglipVisionModel has its own inner ``.vision_model``
-                # attribute, so the corresponding key is
-                # ``vision_model.vision_model.<rest>``. We replace
-                # ``vision_tower`` with ``vision_model`` to make that explicit.
-                out["vision_model." + inner.removeprefix("vision_tower.")] = tensor
+                # Pi05SiglipEncoder owns ``self.vision_model`` (our native
+                # _SiglipVisionTransformer) directly, so the matching key is
+                # ``vision_model.<rest>``. Stripping ``vision_tower.`` yields
+                # exactly that. The separate q/k/v_proj keys under
+                # ``<rest> = encoder.layers.N.self_attn.*`` are fused into
+                # ``qkv_proj`` by SIGLIP_STACKED_PARAMS at load time.
+                out[inner.removeprefix("vision_tower.")] = tensor
             elif inner.startswith("multi_modal_projector.linear."):
                 sub = inner.removeprefix("multi_modal_projector.linear.")
                 out[f"connector.{sub}"] = tensor
@@ -641,7 +642,9 @@ class Pi05Model(Model):
         # parameter in the target module, so the leftover keys are dropped
         # without needing an explicit ``strict=False`` switch.
         siglip_sd = self._extract_siglip_state_dict(flat)
-        load_hf_weights(self.siglip, siglip_sd.items())
+        load_hf_weights(
+            self.siglip, siglip_sd.items(), stacked_params=SIGLIP_STACKED_PARAMS,
+        )
 
     def _init_llm_components(self, device: str):
         if self.embed_tokens is not None:
