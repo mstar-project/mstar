@@ -40,7 +40,6 @@ from mstar.graph.base import (
     GraphEdge,
     GraphNode,
     GraphSection,
-    Loop,
     Sequential,
     TensorPointerInfo,
 )
@@ -417,33 +416,19 @@ class Pi05Model(Model):
             ]
         )
 
-        # NOTE: The Loop's terminal ``outputs`` are matched into the section's
-        # node outputs by **name** (see Loop._replace_outputs_for_final_iter
-        # in mstar/graph/base.py): on the final iteration, any section-output
-        # edge whose name matches a terminal output's name is replaced with
-        # the terminal version. This is the same convention BAGEL's image_gen
-        # uses (section returns ``latents`` looping back to LLM, terminal
-        # output is ``name="latents" → vae_decoder``). So our terminal output
-        # MUST be named ``noisy_actions`` to match the section's loop-back
-        # edge — the name is just a graph-internal key, while the actual
-        # client-facing modality bucket is determined by ``output_modality``.
-        action_gen = Loop(
-            section=GraphNode(
-                name="LLM",
-                input_names=["noisy_actions", "timestep_index"],
-                outputs=[
-                    GraphEdge(next_node="LLM", name="noisy_actions"),
-                    GraphEdge(next_node="LLM", name="timestep_index"),
-                ],
-            ),
-            max_iters=self.config.num_flow_steps,
+        # NOTE: the full action generation flow loop is extremely short (total < 50ms), so
+        # we opt to have it as one node to reduce cuda graph startup, flashinfer planning,
+        # etc. overhead. Cache planning only needs to happen at the beginning of the flow
+        # loop, so this collapsed loop is valid.
+        action_gen = GraphNode(
+            name="LLM",
+            input_names=["noisy_actions"],
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
-                    name="noisy_actions",
+                    name="actions",
                     output_modality="action",
-                    persist=True,
-                ),
+                )
             ],
         )
 

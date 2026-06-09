@@ -509,22 +509,20 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         action_horizon = self.config.action_horizon
         action_dim = self.config.action_dim
 
-        if "noisy_actions" not in inputs or len(inputs["noisy_actions"]) == 0:
-            generator = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
-            noisy = torch.randn(
-                action_horizon, action_dim, device=device, generator=generator
-            )
-            ts = torch.zeros(1, device=device, dtype=torch.long)
-        else:
-            noisy = inputs["noisy_actions"][0]
-            ts = inputs["timestep_index"][0]
+        generator = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
+        noisy = torch.randn(
+            action_horizon, action_dim, device=device, generator=generator
+        )
+        ts = torch.zeros(1, device=device, dtype=torch.long)
 
         seq_len = action_horizon
-        return ARNodeInputs(input_seq_len=seq_len,
-                            tensor_inputs={
-                                "noisy_actions": noisy,
-                                "ts": ts
-                            })
+        return ARNodeInputs(
+            input_seq_len=seq_len,
+            tensor_inputs={
+                "noisy_actions": noisy,
+                "ts": ts
+            }
+        )
 
 
     def preprocess(
@@ -678,12 +676,13 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
 
         horizon = self.config.action_horizon
 
-        next_actions, next_index = self._euler_step(
-            noisy_actions, timestep_index,
-            fraction=fraction,
-            time_emb_buffer=time_emb_buffer,
-            cache_handle=cache_manager
-        )
+        for _ in range(self.config.num_flow_steps):
+            noisy_actions, timestep_index = self._euler_step(
+                noisy_actions, timestep_index,
+                fraction=fraction,
+                time_emb_buffer=time_emb_buffer,
+                cache_handle=cache_manager
+            )
 
         # Split back per-request by horizon.
         result: dict[str, NameToTensorList] = {}
@@ -691,8 +690,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             start = i * horizon
             end = start + horizon
             result[rid] = {
-                "noisy_actions": [next_actions[start:end]],
-                "timestep_index": [next_index[i:i+1]],
+                "actions": [noisy_actions[start:end]],
             }
         return result
 
@@ -733,12 +731,13 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         if isinstance(timestep_index, list):
             timestep_index = timestep_index[0]
 
-        next_actions, next_index = self._euler_step(
-            noisy_actions, timestep_index,
-            fraction=fraction,
-            time_emb_buffer=time_emb_buffer,
-            cache_handle=cache_handle
-        )
+        for _ in range(self.config.num_flow_steps):
+            noisy_actions, timestep_index = self._euler_step(
+                noisy_actions, timestep_index,
+                fraction=fraction,
+                time_emb_buffer=time_emb_buffer,
+                cache_handle=cache_handle
+            )
         # We ALWAYS return both loop-back edges, even on the final iteration.
         # The Loop primitive (mstar/graph/base.py:Loop) handles the final-iter
         # swap automatically: it matches the section's output ``noisy_actions``
@@ -747,8 +746,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         # filters out the ``timestep_index`` loop-back edge. Same convention
         # BAGEL's image_gen uses for ``latents`` / ``time_index``.
         return {
-            "noisy_actions": [next_actions],
-            "timestep_index": [next_index],
+            "actions": [noisy_actions],
         }
 
     def _euler_step(
