@@ -663,6 +663,17 @@ class DROIDDataset(BaseDataset):
         # producing 8 token-frames; only the first is used as rollout context.
         self.num_video_frames = num_video_frames
 
+        # Fast path: reuse a manifest (PNG paths + robot_state + prompt) built
+        # on a previous run so repeat benchmarks skip the full-parquet load and
+        # the per-frame video decode entirely. Only pi05 caches; vjepa2_ac
+        # streams the episode mp4 directly and is left uncached.
+        if task == "pi05":
+            cached = self._load_manifest()
+            if cached is not None:
+                print(f"  [cache] reusing {len(cached)} pi05 items from manifest")
+                self.items = self._resize_data(cached)
+                return
+
         def _dl(filename):
             return hf_hub_download(
                 self.HF_REPO, filename, repo_type="dataset", cache_dir=cache_dir
@@ -724,7 +735,13 @@ class DROIDDataset(BaseDataset):
             for frames in episodes.values():
                 frames.sort(key=lambda r: int(r[frame_col]))
 
-        ep_ids = sorted(episodes.keys())[:num_requests]
+        # pi05 caches a complete manifest, so build every episode once
+        # (_resize_data truncates to num_requests below) and the cache is reused
+        # for any num_requests. vjepa2_ac streams mp4s uncached, so keep the
+        # original [:num_requests] cap to bound its first-run decode cost.
+        ep_ids = sorted(episodes.keys())
+        if task != "pi05":
+            ep_ids = ep_ids[:num_requests]
         print(f"  using {len(ep_ids)} of {len(episodes)} episodes")
 
         self.items: list[RequestInput] = []
@@ -748,6 +765,9 @@ class DROIDDataset(BaseDataset):
                 item = None
             if item is not None:
                 self.items.append(item)
+
+        if task == "pi05":
+            self._save_manifest(self.items)
 
         self.items = self._resize_data(self.items)
 
@@ -849,6 +869,79 @@ class DROIDDataset(BaseDataset):
             },
         )
     
+    # ------------------------------------------------------------------
+    # pi05 manifest cache
+    # ------------------------------------------------------------------
+
+    def _manifest_path(self) -> str:
+        """Manifest filename keyed by the params that change the built items."""
+        return os.path.join(
+            self.local_file_dir,
+            f"manifest_pi05_nvf{self.num_video_frames}_ad{self.action_dim}.json",
+        )
+
+    def _load_manifest(self) -> list[RequestInput] | None:
+        """Return cached pi05 RequestInputs, or None to force a rebuild.
+
+        Returns None if the manifest is absent, unreadable, or references a PNG
+        that no longer exists on disk.
+        """
+        import json as _json
+
+        path = self._manifest_path()
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                data = _json.load(f)
+            items: list[RequestInput] = []
+            for entry in data["items"]:
+                img = os.path.join(self.local_file_dir, entry["image_path"])
+                extra = [os.path.join(self.local_file_dir, p)
+                         for p in entry.get("extra_image_paths", [])]
+                for p in (img, *extra):
+                    if not os.path.exists(p):
+                        print(f"  [cache] missing {p}; rebuilding")
+                        return None
+                items.append(RequestInput(
+                    req_type=RequestType.VLA,
+                    prompt=entry["prompt"],
+                    image_path=img,
+                    extra_image_paths=extra,
+                    model_kwargs=entry.get("model_kwargs", {}),
+                ))
+            return items or None
+        except Exception as e:
+            print(f"  [cache] manifest unreadable ({e}); rebuilding")
+            return None
+
+    def _save_manifest(self, items: list[RequestInput]) -> None:
+        """Persist built pi05 items so the next run can skip parquet + decode.
+
+        PNG paths are stored as basenames (relative to local_file_dir) and the
+        write is atomic (tmp + os.replace) so an interrupted run never leaves a
+        half-written manifest that would later be reused.
+        """
+        import json as _json
+
+        entries = [{
+            "prompt": it.prompt,
+            "image_path": os.path.basename(it.image_path),
+            "extra_image_paths": [os.path.basename(p) for p in it.extra_image_paths],
+            "model_kwargs": it.model_kwargs,
+        } for it in items]
+        payload = {
+            "version": 1,
+            "task": "pi05",
+            "num_video_frames": self.num_video_frames,
+            "action_dim": self.action_dim,
+            "items": entries,
+        }
+        tmp = self._manifest_path() + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(payload, f)
+        os.replace(tmp, self._manifest_path())
+
     @property
     def num_requests(self) -> int:
         return self._num_requests
