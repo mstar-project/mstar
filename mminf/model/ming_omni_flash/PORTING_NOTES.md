@@ -257,6 +257,48 @@ graph-walk / partition / streaming patterns transfer 1:1.
    `vision_encoder.py` + `projectors.py` and `audio_encoder.py`. Wire into
    the prefill graph walks.
 
+   - **4a — DONE** (`components/projectors.py`,
+     `components/vision_encoder.py`, `components/audio_encoder.py`):
+     pure-port encoder + projector modules with weight-key parity
+     against the released ckpt's top-level prefixes
+     (`vision.*`, `audio.*`, `linear_proj.*`, `linear_proj_audio.*`).
+
+     * `MingVisionProjector` / `MingAudioProjector` mirror the
+       `nn.Sequential` chains built inline in
+       `modeling_bailingmm2.py` (Linear→GELU→Linear for vision,
+       Conv1d→Transpose→GELU→Linear→Transpose for audio). Layer
+       indices match the on-disk keys (`linear_proj.{0,2}` vision,
+       `linear_proj_audio.{0,3}` audio).
+
+     * `build_vision_encoder` constructs Ming's
+       `Qwen3MoeVisionTransformer` via dynamic import from the staged
+       Ming source dir (same path used by the tokenizer + processor).
+       Reused as-is rather than forked — no vLLM dep, ~1 GB at bf16,
+       runs on a single GPU.
+
+     * `MingAudioEncoder` is a self-contained port of vllm-omni's
+       packed-sequence Whisper encoder (~250 LOC) — no
+       `openai-whisper` runtime dep, optional flash-attn varlen fast
+       path with a manual fallback. Param names match upstream
+       Whisper (`query` / `key` / `value` / `out`,
+       `mlp.{0,2}.{weight,bias}`) so the released ckpt's
+       `audio.blocks.N.*` keys load by state-dict equality.
+
+     * 17 tests in `test/modular/test_ming_flash_omni_encoders.py`:
+       12 pure-Python (projector shape / layer indices / forward /
+       audio encoder weight-key parity / packed-attention fallback
+       shape) + 1 snapshot-gated (vision encoder builds from the
+       real `VisionEncoderConfig`) + 1 CUDA-gated (forward smoke
+       under eager attention — currently skipped on this box for
+       missing libnvrtc-builtins, not a code bug).
+
+   - **4b — TODO** (encoder weight loading): extend `loader.py` with
+     `load_vision_encoder_weights` / `load_audio_encoder_weights`
+     that map `vision.*` / `audio.*` / `linear_proj{,_audio}.*` from
+     the snapshot's safetensors shards into the new modules.
+     Today the loader handles only the thinker LLM
+     (`model.model.*` + `model.lm_head.*`).
+
 5. **Thinker graph walks.** `prefill_text`, `prefill_audio`, `prefill_vision`,
    `prefill_video`, `thinker_decode`. Follow Qwen3-Omni's pattern for
    conditional walks based on `input_modalities`.
