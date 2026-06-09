@@ -454,6 +454,71 @@ graph-walk / partition / streaming patterns transfer 1:1.
    than discrete-codec-AR like Qwen3-Omni's — the streaming topology will
    differ. Re-read `mminf/streaming/topology.py` before wiring connections.
 
+   Broken out into sub-steps because the upstream code is ~2,100 LOC
+   across three files (`ming_flash_omni_talker.py` 586 LOC +
+   `talker_module.py` 1,145 LOC + `audio_vae.py` 392 LOC):
+
+   - **6a — DONE** (config port): replaced the step-1 raw-dict
+     skeleton `TalkerConfig` with typed sub-config dataclasses so the
+     modeling code (CFM head + DiT blocks + Aggregator + AudioVAE)
+     can read dims off `config.talker.*` directly.
+
+     New dataclasses in `components/config.py` (under `TalkerConfig`):
+     * `TalkerLLMConfig` — Qwen2 backbone (896-dim, 24L, 14H/2KV,
+       sliding-window=False, RoPE θ=1e6). Distinct from
+       `ThinkerLLMConfig` (different vocab, no MoE, smaller dims).
+       `head_dim` property computes 896/14=64.
+     * `DiTBlockConfig` — shared shape for `flowmodel` and
+       `aggregator` (depth=8, hidden_size=1024, num_heads=16,
+       mlp_ratio=4, in_channels=64); only `dropout` differs (0 vs
+       0.1 on the released ckpt). `head_dim` / `intermediate_size`
+       properties for convenience.
+     * `AudioVAEConfig` — encoder + decoder dims (latent_dim=64,
+       input_dim=80, hop_size=320, output_dim=882),
+       `sample_rate=44100`, `patch_size=4`. Encoder/decoder Qwen2
+       backbones kept as raw dicts (`enc_backbone` /
+       `dec_backbone`) for the eventual block-builder to lift.
+       Discriminator + loss-weight fields retained for round-trip
+       fidelity but not consumed at inference.
+
+     `TalkerConfig.from_subdir` now constructs the typed sub-configs
+     directly (was raw-dict assignment); `vae_sample_rate` /
+     `vae_patch_size` retained as `@property` accessors for backward
+     compat with `Model.get_output_sample_rate`.
+
+     8 new tests in `test_ming_flash_omni_config.py` (7 freshly
+     authored + 1 updated to assert the new typed shape):
+     - `TalkerLLMConfig` defaults / head_dim / unknown-key filter
+     - `DiTBlockConfig` intermediate_size / head_dim derivations
+     - `AudioVAEConfig` enc/dec kwarg lifting + fallback when
+       enc_kwargs missing latent_dim
+     - `TalkerConfig.from_subdir` end-to-end with synthetic tmp dirs
+       (round-trips all three sub-configs)
+     - Default-factory check that `TalkerConfig()` with no args yields
+       typed sub-configs
+
+     Verified by re-running the existing snapshot-gated
+     `test_subdir_configs_load_when_present` against the real
+     `/dev/shm/ming-hybrid/talker/` tree — typed fields read
+     correctly (LLM hidden_size=896, VAE sample_rate=44100,
+     flowmodel depth=8, aggregator dropout=0.1).
+
+   - **6b — TODO** (CFM + DiT building blocks): port
+     `talker_module.py`'s RMSNorm, FeedForward, Attention, DiTBlock,
+     FinalLayer, CondEmbedder, DiT, CFM, get_epss_timesteps. CFM
+     sampling loop drives Talker generation.
+
+   - **6c — TODO** (Aggregator + Qwen2 backbone): port `Aggregator`
+     (talker_module.py:702) and the talker's Qwen2 LLM stack.
+
+   - **6d — TODO** (AudioVAE): port `audio_vae.py`'s Encoder, Decoder,
+     ISTFTHead, ISTFT, StreamingLinearUpsample.
+
+   - **6e — TODO** (Talker submodule + graph walks): wire the talker
+     into mminf's graph + partition system. Need a streaming topology
+     for the CFM-step → audio-chunk flow (different shape from
+     qwen3_omni's discrete-codec talker).
+
 7. **Process_prompt — DONE.** `MingFlashOmniModel.process_prompt` now
    produces the full `NameToTensorList` consumed by step 5c's prefill
    scheduler. Strategy mirrors `qwen3_omni`'s `process_prompt`: apply

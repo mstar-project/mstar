@@ -133,12 +133,16 @@ def test_subdir_configs_load_when_present(config: MingFlashOmniModelConfig) -> N
     assert config.talker.vae_sample_rate == 44100
     assert config.talker.patch_size == 4
     assert config.talker.history_patch_size == 32
-    # llm/ dict load
-    assert config.talker.llm is not None
-    assert config.talker.llm.get("model_type") == "qwen2"
-    # vae/ dict load
-    assert config.talker.vae is not None
-    assert config.talker.vae.get("sample_rate") == 44100
+    # Step 6a: llm + vae are typed dataclasses (used to be raw dicts).
+    assert config.talker.llm.hidden_size == 896
+    assert config.talker.llm.num_hidden_layers == 24
+    assert config.talker.llm.num_key_value_heads == 2
+    assert config.talker.vae.sample_rate == 44100
+    assert config.talker.vae.latent_dim == 64
+    # flowmodel + aggregator share shape; only dropout differs (0 vs 0.1).
+    assert config.talker.flowmodel.depth == 8
+    assert config.talker.flowmodel.hidden_size == 1024
+    assert config.talker.aggregator.dropout == pytest.approx(0.1)
 
     assert config.image_gen is not None, "imagegen subdirs should have populated"
     assert config.image_gen.num_query_tokens == 256  # img_gen_scales=[16] => 16*16
@@ -271,3 +275,146 @@ def test_talker_from_subdir_returns_none_for_missing_dir() -> None:
     """Missing talker/ subdir must return None, not raise."""
     with tempfile.TemporaryDirectory() as tmp:
         assert TalkerConfig.from_subdir(Path(tmp) / "talker") is None
+
+
+# ---------------------------------------------------------------------------
+# Step 6a: TalkerLLMConfig / DiTBlockConfig / AudioVAEConfig
+# ---------------------------------------------------------------------------
+
+
+def test_talker_llm_config_defaults_match_released_ckpt() -> None:
+    """Defaults track the released talker/llm/config.json values."""
+    from mminf.model.ming_omni_flash.config import TalkerLLMConfig
+    llm = TalkerLLMConfig()
+    assert llm.vocab_size == 151936
+    assert llm.hidden_size == 896
+    assert llm.intermediate_size == 4864
+    assert llm.num_hidden_layers == 24
+    assert llm.num_attention_heads == 14
+    assert llm.num_key_value_heads == 2
+    assert llm.head_dim == 64  # 896 / 14
+    assert llm.rope_theta == 1_000_000.0
+    assert llm.tie_word_embeddings is True
+
+
+def test_talker_llm_config_from_dict_filters_unknown_keys() -> None:
+    """Released config has fields we don't model (`transformers_version` etc.)
+    — `from_dict` must silently ignore them."""
+    from mminf.model.ming_omni_flash.config import TalkerLLMConfig
+    llm = TalkerLLMConfig.from_dict({
+        "hidden_size": 1024,
+        "transformers_version": "4.43.1",
+        "_attn_implementation": "flash_attention_2",
+    })
+    assert llm.hidden_size == 1024
+    assert llm.num_hidden_layers == 24  # default preserved
+
+
+def test_dit_block_config_intermediate_size_and_head_dim() -> None:
+    from mminf.model.ming_omni_flash.config import DiTBlockConfig
+    blk = DiTBlockConfig()
+    assert blk.intermediate_size == 1024 * 4
+    assert blk.head_dim == 1024 // 16
+
+
+def test_audio_vae_config_lifts_latent_and_output_dims_from_kwargs() -> None:
+    """`enc_kwargs.latent_dim` and `dec_kwargs.output_dim` get pulled out."""
+    from mminf.model.ming_omni_flash.config import AudioVAEConfig
+    cfg = AudioVAEConfig.from_dict({
+        "sample_rate": 44100,
+        "patch_size": 4,
+        "enc_kwargs": {
+            "latent_dim": 64,
+            "input_dim": 80,
+            "hop_size": 320,
+            "backbone": {"hidden_size": 896, "num_hidden_layers": 24},
+        },
+        "dec_kwargs": {
+            "latent_dim": 64,
+            "output_dim": 882,
+            "backbone": {"hidden_size": 896, "num_hidden_layers": 24},
+        },
+        "init_method": "kaiming",
+        "lambda_mel_loss": 1.0,
+    })
+    assert cfg.sample_rate == 44100
+    assert cfg.latent_dim == 64
+    assert cfg.encoder_input_dim == 80
+    assert cfg.encoder_hop_size == 320
+    assert cfg.decoder_output_dim == 882
+    assert cfg.enc_backbone["hidden_size"] == 896
+    assert cfg.dec_backbone["num_hidden_layers"] == 24
+    assert cfg.lambda_mel_loss == 1.0
+
+
+def test_audio_vae_config_falls_back_when_enc_kwargs_missing_latent() -> None:
+    """If enc_kwargs has no latent_dim, fall back to dec_kwargs.latent_dim."""
+    from mminf.model.ming_omni_flash.config import AudioVAEConfig
+    cfg = AudioVAEConfig.from_dict({
+        "enc_kwargs": {"input_dim": 80, "hop_size": 320},
+        "dec_kwargs": {"latent_dim": 128, "output_dim": 512},
+    })
+    assert cfg.latent_dim == 128
+
+
+def test_talker_config_from_subdir_typed_subfields() -> None:
+    """from_subdir produces typed TalkerLLMConfig / DiTBlockConfig / AudioVAEConfig."""
+    from mminf.model.ming_omni_flash.config import (
+        AudioVAEConfig,
+        DiTBlockConfig,
+        TalkerConfig,
+        TalkerLLMConfig,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        talker_dir = Path(tmp) / "talker"
+        talker_dir.mkdir()
+        # Minimal valid config.json (top-level scalars + flowmodel + aggregator).
+        (talker_dir / "config.json").write_text(json.dumps({
+            "steps": 12,
+            "patch_size": 8,
+            "history_patch_size": 64,
+            "cfg_strength": 1.5,
+            "flowmodel": {"depth": 4, "hidden_size": 512, "num_heads": 8, "dropout": 0.0},
+            "aggregator": {"depth": 4, "hidden_size": 512, "num_heads": 8, "dropout": 0.1},
+        }))
+        (talker_dir / "llm").mkdir()
+        (talker_dir / "llm" / "config.json").write_text(json.dumps({
+            "hidden_size": 512, "num_hidden_layers": 12,
+        }))
+        (talker_dir / "vae").mkdir()
+        (talker_dir / "vae" / "config.json").write_text(json.dumps({
+            "sample_rate": 22050,
+            "patch_size": 2,
+            "enc_kwargs": {"latent_dim": 32, "input_dim": 80, "hop_size": 256},
+            "dec_kwargs": {"latent_dim": 32, "output_dim": 401},
+        }))
+
+        cfg = TalkerConfig.from_subdir(talker_dir)
+        assert cfg is not None
+        assert cfg.steps == 12
+        assert isinstance(cfg.llm, TalkerLLMConfig)
+        assert cfg.llm.hidden_size == 512
+        assert isinstance(cfg.flowmodel, DiTBlockConfig)
+        assert cfg.flowmodel.depth == 4
+        assert cfg.aggregator.dropout == pytest.approx(0.1)
+        assert isinstance(cfg.vae, AudioVAEConfig)
+        assert cfg.vae.sample_rate == 22050
+        assert cfg.vae.latent_dim == 32
+        # Convenience accessor still works.
+        assert cfg.vae_sample_rate == 22050
+
+
+def test_talker_config_default_factories_yield_real_dataclasses() -> None:
+    """``TalkerConfig()`` with no args still produces typed sub-configs."""
+    from mminf.model.ming_omni_flash.config import (
+        AudioVAEConfig,
+        DiTBlockConfig,
+        TalkerConfig,
+        TalkerLLMConfig,
+    )
+    t = TalkerConfig()
+    assert isinstance(t.llm, TalkerLLMConfig)
+    assert isinstance(t.flowmodel, DiTBlockConfig)
+    assert isinstance(t.aggregator, DiTBlockConfig)
+    assert isinstance(t.vae, AudioVAEConfig)
+    assert t.vae_sample_rate == 44100   # convenience property
