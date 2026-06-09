@@ -503,10 +503,64 @@ graph-walk / partition / streaming patterns transfer 1:1.
      correctly (LLM hidden_size=896, VAE sample_rate=44100,
      flowmodel depth=8, aggregator dropout=0.1).
 
-   - **6b — TODO** (CFM + DiT building blocks): port
-     `talker_module.py`'s RMSNorm, FeedForward, Attention, DiTBlock,
-     FinalLayer, CondEmbedder, DiT, CFM, get_epss_timesteps. CFM
-     sampling loop drives Talker generation.
+   - **6b — DONE** (CFM + DiT building blocks): new
+     `components/talker_dit.py` ports the modeling primitives from
+     upstream `talker_module.py:1-402`. Module names mirror upstream
+     so the released ckpt's `talker/model.safetensors` keys
+     (`flowmodel.blocks.N.attn.to_q.weight`,
+     `flowmodel.blocks.N.mlp.ff.0.0.weight` etc.) will load by
+     state-dict equality once the loader path lands.
+
+     Two external deps replaced with minimal in-tree ports:
+     * `DiTTimestepEmbedding` — sinusoidal pos-emb + Linear+SiLU+Linear
+       MLP, matching vllm-omni's `timestep_embedding.DiTTimestepEmbedding`.
+     * `RotaryEmbedding` — non-xpos 1-D RoPE matching
+       `x_transformers.RotaryEmbedding.forward_from_seq_len` exactly,
+       including the INTERLEAVED-pair `rotate_half(x1, x2) = (-x2, x1)`
+       layout. This is DIFFERENT from Ling-2.0 thinker's neox-cat
+       layout — adjacent freq pairs share the same value here, while
+       Ling's halves repeat across the split. Required so the released
+       weights line up with the same RoPE shape they were trained
+       against.
+
+     The CFM module wraps the DiT and integrates an ODE/SDE step grid
+     from `get_epss_timesteps` with classifier-free guidance.
+     Sway-sampling-coef remap is honored (`-1.0` default packs more
+     steps near `t=0`). The released ckpt's `steps=10` schedule is
+     the predefined `[0, 2, 4, 6, 8, 12, 16, 20, 24, 28, 32] / 32`.
+
+     Skipped from `talker_module.py`: `CFMGraphExecutor`,
+     `CFMGraphExecutorPool` (vllm-specific batching), `Aggregator`
+     (lands in 6c), the resampling / silence-trim / `build_tts_input`
+     / `MingAudioGenerator` orchestration utilities (lands in 6e
+     where the Talker submodule wires the streaming graph).
+
+     New factory `build_talker_cfm(talker_config, llm_cond_dim=None,
+     dtype=..., device=...)` constructs DiT + CFM directly from a
+     `TalkerConfig` so 6e's `_create_talker_submodule` will be a
+     one-liner. `llm_cond_dim` defaults to `talker.llm.hidden_size`
+     (896 on the released ckpt).
+
+     28 tests in `test_ming_flash_omni_talker_dit.py`:
+     - RotaryEmbedding layout: rotate-half pair negation,
+       freqs.shape `(1, T, dim)`, adjacent-pair-shared-frequency
+       invariant, partial-rotary apply preserves passed-through tail.
+     - DiTTimestepEmbedding: shape, dtype-stability, even-dim guard.
+     - RMSNorm normalises to unit-rms per row.
+     - FeedForward layer indices align with the ckpt's
+       `ff.0.0` / `ff.0.1` / `ff.2` keys.
+     - Attention: `to_q/to_k/to_v/to_out.0` param names, qk_norm
+       branches, rope on/off shape preservation, unknown-qk_norm
+       rejection.
+     - DiTBlock + FinalLayer + CondEmbedder round-trip.
+     - DiT.forward output `(B, 1 + his + patch, out_channels)` for
+       no-spk and `(B, 2 + his + patch, ...)` with spk; CFG forward
+       returns trailing `x.shape[1]` rows.
+     - CFM.sample shape preservation + length / sde_rnd validation,
+       sway=None branch.
+     - `build_talker_cfm` from real `TalkerConfig` defaults yields
+       the expected DiT dims (1024 hidden, 8 layers, 16 heads,
+       cond_embedder input = 896) + `llm_cond_dim` override.
 
    - **6c — TODO** (Aggregator + Qwen2 backbone): port `Aggregator`
      (talker_module.py:702) and the talker's Qwen2 LLM stack.
