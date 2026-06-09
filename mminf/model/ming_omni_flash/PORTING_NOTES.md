@@ -933,9 +933,15 @@ graph-walk / partition / streaming patterns transfer 1:1.
    under vllm-omni's diffusion tree. Wire as a fourth partition with its own
    graph walk once #1–8 are landed. Needs `FlowEngine`-style integration.
 
-10. **Configs.** Update `configs/ming_flash_omni*.yaml` to match the final
-    node names emerging from #5 and #6. Add an image-gen variant when #9
-    lands.
+10. **Configs — DONE.** `configs/ming_flash_omni.yaml` rewritten to the
+    real registered node names: `vision_encoder` + `audio_encoder` +
+    `Talker` colocated on rank 0, `Thinker` TP=8 across all 8 GPUs.
+    Dropped the stale placeholders (`AudioVAE` is wrapped inside the
+    Talker submodule, not a separate node; TP=4 → TP=8 to match the
+    verified OOM finding). Node names cross-checked against
+    `get_node_engine_types` (a yaml-vs-registered assertion passes).
+    `configs/ming_flash_omni_thinker_only.yaml` unchanged (already
+    correct). An image-gen variant lands with step 9.
 
 11. **Benchmark `OursOpenAI` parity.** Once `mminf-serve` boots the model,
     extend `benchmark/request.py:OursOpenAI` to route Ming TTS through the
