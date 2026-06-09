@@ -319,3 +319,155 @@ def load_thinker_weights(
         len(loaded), model.num_hidden_layers, local_dir,
         model.comm_group.rank, model.comm_group.world_size,
     )
+
+
+# ===========================================================================
+# Vision / audio encoder + projector loaders (step 4b)
+# ===========================================================================
+#
+# These modules aren't TP-aware (run on a single rank in the typical
+# topology — vision_encoder + audio_encoder colocate on rank 0 per
+# configs/ming_flash_omni.yaml). Loading is a plain prefix-strip +
+# load_state_dict path; no per-rank slicing or stacked-rule fusion.
+#
+# Released ckpt's relevant top-level prefixes:
+#   vision.*              -> MingVisionEncoder (Qwen3MoeVisionTransformer)
+#   audio.*               -> MingAudioEncoder  (Whisper)
+#   linear_proj.*         -> MingVisionProjector (nn.Sequential under .proj)
+#   linear_proj_audio.*   -> MingAudioProjector  (nn.Sequential under .proj)
+
+
+def _load_prefixed_state_dict(
+    module: torch.nn.Module,
+    local_dir: str,
+    prefix: str,
+    inner_prefix: str = "",
+    device: str = "cpu",
+    strict: bool = True,
+    allow_missing: set[str] | None = None,
+) -> set[str]:
+    """Common path for the encoder/projector loaders.
+
+    Streams keys matching ``prefix`` from the safetensors shards, strips
+    that outer prefix, optionally prepends ``inner_prefix``, then runs
+    ``module.load_state_dict``.
+
+    Args:
+        module:        target nn.Module.
+        local_dir:     snapshot dir with model.safetensors{,.index.json}.
+        prefix:        outer ckpt prefix to filter shards by + strip.
+        inner_prefix:  prepended to the stripped key before lookup. Used
+                       by the projector loaders so ckpt's ``0.weight``
+                       hits ``proj.0.weight`` on our module.
+        device:        target device for loaded tensors.
+        strict:        if True, raise on any key mismatch (missing or
+                       unexpected) other than entries in ``allow_missing``.
+        allow_missing: parameter / buffer names in the module's
+                       state_dict that the ckpt is allowed to skip.
+                       (E.g. Whisper's ``positional_embedding`` buffer is
+                       regenerated locally — ckpt drops it.)
+
+    Returns the set of keys actually loaded (post-rename).
+    """
+    raw_weights = iter_safetensors_shards(local_dir, device=device, prefix=prefix)
+    state = {}
+    for key, tensor in raw_weights:
+        if not key.startswith(prefix):
+            # Defensive: iter_safetensors_shards should already filter.
+            continue
+        sub_key = key[len(prefix):]
+        if inner_prefix:
+            sub_key = f"{inner_prefix}{sub_key}"
+        state[sub_key] = tensor
+
+    if not state:
+        raise KeyError(
+            f"No checkpoint keys matched prefix {prefix!r} under {local_dir}. "
+            f"Snapshot may be a thinker-only / talker-only variant."
+        )
+
+    missing, unexpected = module.load_state_dict(state, strict=False)
+    allow_missing = allow_missing or set()
+    real_missing = [m for m in missing if m not in allow_missing]
+    if strict and (real_missing or unexpected):
+        raise KeyError(
+            f"State-dict mismatch loading prefix {prefix!r}: "
+            f"missing={real_missing[:10]} (total {len(real_missing)}); "
+            f"unexpected={list(unexpected)[:10]} (total {len(unexpected)})."
+        )
+
+    logger.info(
+        "Loaded %d params (prefix=%r) from %s (missing=%d, unexpected=%d).",
+        len(state), prefix, local_dir, len(missing), len(unexpected),
+    )
+    return set(state.keys())
+
+
+def load_vision_encoder_weights(
+    encoder: torch.nn.Module,
+    local_dir: str,
+    device: str = "cpu",
+    strict: bool = True,
+) -> set[str]:
+    """Load ``vision.*`` weights from the snapshot into a Ming vision encoder.
+
+    Works with the module returned by ``build_vision_encoder``
+    (``Qwen3MoeVisionTransformer`` from the staged Ming source). Key
+    names after the ``vision.`` strip already match the module's
+    state_dict — no further remapping needed.
+    """
+    return _load_prefixed_state_dict(
+        encoder, local_dir, prefix="vision.", device=device, strict=strict,
+    )
+
+
+def load_audio_encoder_weights(
+    encoder: torch.nn.Module,
+    local_dir: str,
+    device: str = "cpu",
+    strict: bool = True,
+) -> set[str]:
+    """Load ``audio.*`` weights from the snapshot into MingAudioEncoder.
+
+    The released ckpt ships its own (trained) ``positional_embedding``
+    that overrides the sinusoidal init in :func:`_sinusoids` — load
+    via ``load_state_dict``'s buffer support (no special-casing needed).
+    """
+    return _load_prefixed_state_dict(
+        encoder, local_dir, prefix="audio.", device=device, strict=strict,
+    )
+
+
+def load_vision_projector_weights(
+    projector: torch.nn.Module,
+    local_dir: str,
+    device: str = "cpu",
+    strict: bool = True,
+) -> set[str]:
+    """Load ``linear_proj.*`` into MingVisionProjector.
+
+    Ckpt key shape is ``linear_proj.{0,2}.{weight,bias}``; our module's
+    state_dict shape is ``proj.{0,2}.{weight,bias}``, so we prepend
+    ``proj.`` after stripping ``linear_proj.``.
+    """
+    return _load_prefixed_state_dict(
+        projector, local_dir, prefix="linear_proj.",
+        inner_prefix="proj.", device=device, strict=strict,
+    )
+
+
+def load_audio_projector_weights(
+    projector: torch.nn.Module,
+    local_dir: str,
+    device: str = "cpu",
+    strict: bool = True,
+) -> set[str]:
+    """Load ``linear_proj_audio.*`` into MingAudioProjector.
+
+    Ckpt key shape is ``linear_proj_audio.{0,3}.{weight,bias}``; module
+    has them under ``proj.{0,3}.{weight,bias}``.
+    """
+    return _load_prefixed_state_dict(
+        projector, local_dir, prefix="linear_proj_audio.",
+        inner_prefix="proj.", device=device, strict=strict,
+    )

@@ -292,12 +292,24 @@ graph-walk / partition / streaming patterns transfer 1:1.
        under eager attention — currently skipped on this box for
        missing libnvrtc-builtins, not a code bug).
 
-   - **4b — TODO** (encoder weight loading): extend `loader.py` with
-     `load_vision_encoder_weights` / `load_audio_encoder_weights`
-     that map `vision.*` / `audio.*` / `linear_proj{,_audio}.*` from
-     the snapshot's safetensors shards into the new modules.
-     Today the loader handles only the thinker LLM
-     (`model.model.*` + `model.lm_head.*`).
+   - **4b — DONE** (encoder weight loading): `loader.py` now exposes
+     `load_vision_encoder_weights`, `load_audio_encoder_weights`,
+     `load_vision_projector_weights`, `load_audio_projector_weights`
+     on top of a shared `_load_prefixed_state_dict` helper. None of
+     these are TP-aware — vision + audio encoders colocate on rank 0
+     in the typical topology (see `configs/ming_flash_omni.yaml`) so
+     a plain prefix-strip + `load_state_dict` path suffices. The
+     projector loaders also prepend `proj.` to the stripped key so
+     the on-disk `linear_proj.{0,2}.*` / `linear_proj_audio.{0,3}.*`
+     keys hit the `nn.Sequential` slot by integer index.
+
+     Verified by 4 snapshot-gated tests in
+     `test_ming_flash_omni_encoders.py` against the real
+     `/dev/shm/ming-hybrid` ckpt — all four prefixes load strictly
+     (no missing / unexpected). The audio encoder's
+     `positional_embedding` is loaded as a buffer (overrides the
+     sinusoidal init); the vision encoder loads all 27 blocks +
+     merger + deepstack_merger_list cleanly.
 
 5. **Thinker graph walks.** `prefill_text`, `prefill_audio`, `prefill_vision`,
    `prefill_video`, `thinker_decode`. Follow Qwen3-Omni's pattern for

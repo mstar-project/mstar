@@ -31,12 +31,32 @@ from mminf.model.ming_omni_flash.components.projectors import (
 
 
 def _find_local_snapshot() -> str | None:
+    """Locate a Ming-flash-omni-2.0 snapshot dir with shards reachable.
+
+    We need the shards (``model-00001-of-00042.safetensors`` etc.) to
+    live next to the index — the HF-Hub snapshot dir only carries the
+    index json symlink, with shards pulled out separately on this box.
+    Check the env override first, then the HF cache, then ``/dev/shm/
+    ming-hybrid`` (the local merged layout this dev machine uses).
+    """
+    def _has_shards(path: Path) -> bool:
+        return (
+            (path / "config.json").exists()
+            and (path / "model.safetensors.index.json").exists()
+            and (path / "model-00001-of-00042.safetensors").exists()
+        )
+
     override = os.environ.get("MING_FLASH_OMNI_DIR")
-    if override and (Path(override) / "config.json").exists():
+    if override and _has_shards(Path(override)):
         return override
 
-    # Try both upstream (inclusionAI) and Jonathan1909's mirror that's
-    # actually staged in /dev/shm on this dev box.
+    # The dev box's merged layout: shards + index colocate in /dev/shm.
+    hybrid = Path("/dev/shm/ming-hybrid")
+    if _has_shards(hybrid):
+        return str(hybrid)
+
+    # Fall back to the HF cache hub layout — accept it only if the
+    # snapshot dir also has the shards (not just the index symlink).
     hub_roots = [
         Path.home() / ".cache" / "huggingface" / "hub",
         Path("/dev/shm/hf-cache"),
@@ -51,7 +71,7 @@ def _find_local_snapshot() -> str | None:
             if not snap_root.exists():
                 continue
             for snap in sorted(snap_root.iterdir()):
-                if (snap / "config.json").exists():
+                if _has_shards(snap):
                     return str(snap)
     return None
 
@@ -382,3 +402,119 @@ def test_audio_encoder_build_from_config() -> None:
     enc = build_audio_encoder(cfg, dtype=torch.float32, device="cpu", use_flash_attn=False)
     assert enc.audio_emb_dim == cfg.d_model
     assert len(enc.blocks) == cfg.encoder_layers
+
+
+# ---------------------------------------------------------------------------
+# Snapshot-gated weight loaders (step 4b)
+# ---------------------------------------------------------------------------
+#
+# These exercise the prefix-strip + state_dict path against the real
+# released checkpoint. They're skipped when no snapshot is available.
+
+
+def _require_snapshot() -> str:
+    snap = _find_local_snapshot()
+    if snap is None:
+        pytest.skip("Need a Ming-flash-omni-2.0 snapshot. Set MING_FLASH_OMNI_DIR.")
+    return snap
+
+
+def test_load_vision_projector_weights_from_snapshot() -> None:
+    """``linear_proj.*`` keys load cleanly into MingVisionProjector(mlp_depth=2)."""
+    from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig
+    from mminf.model.ming_omni_flash.loader import load_vision_projector_weights
+
+    snap = _require_snapshot()
+    cfg = MingFlashOmniModelConfig.from_pretrained(snap)
+    proj = MingVisionProjector(
+        vision_dim=cfg.vision.out_hidden_size,
+        llm_dim=cfg.thinker_llm.hidden_size,
+        mlp_depth=cfg.mlp_depth,
+    )
+    proj = proj.float()
+    loaded = load_vision_projector_weights(proj, snap, device="cpu", strict=True)
+    # Two Linear blocks × {weight, bias} = 4 keys total at mlp_depth=2.
+    assert loaded == {"proj.0.weight", "proj.0.bias", "proj.2.weight", "proj.2.bias"}
+    # Sanity-check that the loaded weight is non-zero (a fresh nn.Linear
+    # would be too, but we want to know the param actually got overwritten).
+    assert (proj.proj[0].weight.abs().sum() > 0).item()
+
+
+def test_load_audio_projector_weights_from_snapshot() -> None:
+    """``linear_proj_audio.*`` keys load cleanly into MingAudioProjector(mlp_depth=2)."""
+    from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig
+    from mminf.model.ming_omni_flash.loader import load_audio_projector_weights
+
+    snap = _require_snapshot()
+    cfg = MingFlashOmniModelConfig.from_pretrained(snap)
+    proj = MingAudioProjector(
+        audio_dim=cfg.audio_encoder.d_model,
+        llm_dim=cfg.thinker_llm.hidden_size,
+        ds_kernel_size=cfg.audio_encoder.ds_kernel_size,
+        ds_stride=cfg.audio_encoder.ds_stride,
+        mlp_depth=cfg.mlp_depth,
+    )
+    proj = proj.float()
+    loaded = load_audio_projector_weights(proj, snap, device="cpu", strict=True)
+    # Conv1d + Linear × {weight, bias} = 4 keys total at mlp_depth=2.
+    assert loaded == {"proj.0.weight", "proj.0.bias", "proj.3.weight", "proj.3.bias"}
+
+
+def test_load_audio_encoder_weights_from_snapshot() -> None:
+    """``audio.*`` keys load cleanly into MingAudioEncoder.
+
+    Snapshot is bf16; we build the encoder in fp32 here so load_state_dict
+    dtype-promotes the loaded tensors without a downcast assertion.
+    """
+    from mminf.model.ming_omni_flash.components.audio_encoder import build_audio_encoder
+    from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig
+    from mminf.model.ming_omni_flash.loader import load_audio_encoder_weights
+
+    snap = _require_snapshot()
+    cfg = MingFlashOmniModelConfig.from_pretrained(snap)
+    # Full 32-layer encoder is ~5 GB at fp32; bf16 keeps it under 3 GB
+    # and still loads cleanly because both ckpt + module agree on dtype.
+    enc = build_audio_encoder(
+        cfg.audio_encoder, dtype=torch.bfloat16, device="cpu", use_flash_attn=False,
+    )
+    loaded = load_audio_encoder_weights(enc, snap, device="cpu", strict=True)
+    # 32 layers × (4 attn linears: query/key/value/out, 1 with bias=False
+    # so 7 attn params; + 2 LN × 2 + 2 mlp Linear × 2) = lots; just spot-check
+    # representative keys made it in.
+    assert "blocks.0.attn.query.weight" in loaded
+    assert "blocks.0.attn.key.weight" in loaded
+    assert "blocks.31.mlp.2.bias" in loaded
+    assert "ln_post.weight" in loaded
+    # Released ckpt ships its own (trained) positional_embedding that
+    # overrides the sinusoidal init — confirm it's loaded as a buffer.
+    assert "positional_embedding" in loaded
+    assert enc.positional_embedding.shape == (15000, cfg.audio_encoder.d_model)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA + Ming source modules to instantiate vision encoder")
+def test_load_vision_encoder_weights_from_snapshot(staged_snapshot: tuple[str, str]) -> None:
+    """``vision.*`` keys load cleanly into the Ming Qwen3MoeVisionTransformer.
+
+    Full vision encoder is 27 layers; instantiating it bf16 takes a couple
+    of seconds. CUDA-gated because Whisper's autograd-free Conv1d still
+    pulls in CUDA contexts in the upstream encoder module (constructor
+    calls .to()).
+    """
+    from mminf.model.ming_omni_flash.components.vision_encoder import build_vision_encoder
+    from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig
+    from mminf.model.ming_omni_flash.loader import load_vision_encoder_weights
+
+    snap, _ = staged_snapshot
+    cfg = MingFlashOmniModelConfig.from_pretrained(snap)
+    enc = build_vision_encoder(
+        config=cfg.vision,
+        dtype=torch.bfloat16,
+        device="cpu",
+        local_dir=snap,
+        attn_implementation="eager",
+    )
+    loaded = load_vision_encoder_weights(enc, snap, device="cpu", strict=True)
+    assert "blocks.0.attn.qkv.weight" in loaded
+    assert "blocks.0.mlp.linear_fc1.weight" in loaded
+    assert "merger.linear_fc1.weight" in loaded
+    assert f"blocks.{cfg.vision.depth - 1}.norm2.weight" in loaded
