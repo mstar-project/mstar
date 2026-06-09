@@ -152,9 +152,6 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         (num_cameras, 3, H, W). preprocess() stacks them to (bs, num_cameras,
         3, H, W) so shape[0] == bs, satisfying StatelessCudaGraphRunner's
         leading-dim == bs requirement.
-
-        compile=False because warmup() already applies torch.compile to
-        forward_batched; _capture_one captures the compiled callable directly.
         """
         from mstar.engine.cuda_graph_config import BasicBatchedCudaGraphConfig
         H = W = self.config.vit_image_size
@@ -172,7 +169,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
                     },
                 ),
                 capture_batch_sizes=[1],
-                compile=False,
+                compile=False, # empircally does better than compile=True for now
             )
         ]
 

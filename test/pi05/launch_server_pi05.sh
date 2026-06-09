@@ -45,7 +45,7 @@ mkdir -p "${PI05_CACHE_DIR}"
 
 # Pick the yaml: default to base pi05.yaml; override with PI05_CONFIG env var
 # to swap in a variant (e.g. configs/pi05_droid.yaml for the DROID benchmark).
-PI05_CONFIG_PATH="${PI05_CONFIG:-configs/pi05.yaml}"
+PI05_CONFIG_PATH="${PI05_CONFIG:-configs/pi05_droid.yaml}"
 
 echo "[pi05] launching server"
 echo "  user:    ${WHO}"

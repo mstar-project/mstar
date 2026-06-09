@@ -23,6 +23,7 @@ max_seq_len: 2048
 # time, never per-request — that's what this yaml override is for.
 model_kwargs:
   action_horizon: 15
+  num_cameras: 2
 
 node_groups:
   - node_names:
