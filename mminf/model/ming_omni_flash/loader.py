@@ -342,23 +342,34 @@ def _load_prefixed_state_dict(
     local_dir: str,
     prefix: str,
     inner_prefix: str = "",
+    subdir: str = "",
     device: str = "cpu",
     strict: bool = True,
     allow_missing: set[str] | None = None,
+    allow_unexpected: set[str] | None = None,
 ) -> set[str]:
-    """Common path for the encoder/projector loaders.
+    """Common path for the encoder/projector/talker/vae loaders.
 
-    Streams keys matching ``prefix`` from the safetensors shards, strips
-    that outer prefix, optionally prepends ``inner_prefix``, then runs
-    ``module.load_state_dict``.
+    Streams keys matching ``prefix`` from the safetensors shards under
+    ``<local_dir>/<subdir>``, strips that outer prefix, optionally
+    prepends ``inner_prefix``, then runs ``module.load_state_dict``.
 
     Args:
         module:        target nn.Module.
         local_dir:     snapshot dir with model.safetensors{,.index.json}.
         prefix:        outer ckpt prefix to filter shards by + strip.
+                       Pass ``""`` to load every key (no strip) — used
+                       by the AudioVAE loader where the ckpt's
+                       ``encoder.*`` and ``decoder.*`` are top-level
+                       siblings with no shared prefix.
         inner_prefix:  prepended to the stripped key before lookup. Used
                        by the projector loaders so ckpt's ``0.weight``
                        hits ``proj.0.weight`` on our module.
+        subdir:        relative subdirectory under ``local_dir`` to look
+                       for the safetensors shard set. Used by the
+                       talker loaders (``"talker"`` /
+                       ``"talker/vae"``); the thinker / vision / audio
+                       encoder loaders pass ``""`` (top-level).
         device:        target device for loaded tensors.
         strict:        if True, raise on any key mismatch (missing or
                        unexpected) other than entries in ``allow_missing``.
@@ -369,36 +380,44 @@ def _load_prefixed_state_dict(
 
     Returns the set of keys actually loaded (post-rename).
     """
-    raw_weights = iter_safetensors_shards(local_dir, device=device, prefix=prefix)
+    target_dir = f"{local_dir}/{subdir}" if subdir else local_dir
+    raw_weights = iter_safetensors_shards(
+        target_dir, device=device, prefix=prefix or None,
+    )
     state = {}
     for key, tensor in raw_weights:
-        if not key.startswith(prefix):
+        if prefix and not key.startswith(prefix):
             # Defensive: iter_safetensors_shards should already filter.
             continue
-        sub_key = key[len(prefix):]
+        sub_key = key[len(prefix):] if prefix else key
         if inner_prefix:
             sub_key = f"{inner_prefix}{sub_key}"
         state[sub_key] = tensor
 
     if not state:
         raise KeyError(
-            f"No checkpoint keys matched prefix {prefix!r} under {local_dir}. "
+            f"No checkpoint keys matched prefix {prefix!r} under {target_dir}. "
             f"Snapshot may be a thinker-only / talker-only variant."
         )
 
     missing, unexpected = module.load_state_dict(state, strict=False)
     allow_missing = allow_missing or set()
+    allow_unexpected = allow_unexpected or set()
+    # Resolve allow_unexpected against the post-rename keys we
+    # actually loaded (callers express these in the module's namespace,
+    # not the ckpt's).
     real_missing = [m for m in missing if m not in allow_missing]
-    if strict and (real_missing or unexpected):
+    real_unexpected = [u for u in unexpected if u not in allow_unexpected]
+    if strict and (real_missing or real_unexpected):
         raise KeyError(
-            f"State-dict mismatch loading prefix {prefix!r}: "
+            f"State-dict mismatch loading prefix {prefix!r} from {target_dir}: "
             f"missing={real_missing[:10]} (total {len(real_missing)}); "
-            f"unexpected={list(unexpected)[:10]} (total {len(unexpected)})."
+            f"unexpected={real_unexpected[:10]} (total {len(real_unexpected)})."
         )
 
     logger.info(
-        "Loaded %d params (prefix=%r) from %s (missing=%d, unexpected=%d).",
-        len(state), prefix, local_dir, len(missing), len(unexpected),
+        "Loaded %d params (prefix=%r, subdir=%r) from %s (missing=%d, unexpected=%d).",
+        len(state), prefix, subdir, local_dir, len(missing), len(unexpected),
     )
     return set(state.keys())
 
@@ -470,4 +489,130 @@ def load_audio_projector_weights(
     return _load_prefixed_state_dict(
         projector, local_dir, prefix="linear_proj_audio.",
         inner_prefix="proj.", device=device, strict=strict,
+    )
+
+
+# ===========================================================================
+# Talker + AudioVAE loaders (step 6f)
+# ===========================================================================
+#
+# The talker lives in two separate safetensors files under the snapshot:
+#
+#   talker/model.safetensors        — model.* (Qwen2 LLM backbone),
+#                                     cfm.*, aggregator.*, stop_head.*,
+#                                     spk_head.*
+#   talker/vae/model.safetensors    — encoder.* + decoder.* (AudioVAE)
+#
+# All loaders below are non-TP — the talker colocates on a single rank
+# in the typical topology and the snapshot's key layout matches the
+# upstream module tree 1:1, so a plain prefix-strip +
+# load_state_dict via _load_prefixed_state_dict is enough.
+
+
+def load_talker_llm_weights(
+    qwen2_model: torch.nn.Module,
+    local_dir: str,
+    device: str = "cpu",
+    strict: bool = True,
+) -> set[str]:
+    """Load ``model.*`` from ``talker/model.safetensors`` into a Qwen2Model.
+
+    Qwen2Model's own state_dict keys don't have a leading ``model.``
+    (HF wraps it in Qwen2ForCausalLM if you want that prefix). The
+    ckpt's ``model.embed_tokens.weight`` / ``model.layers.N.*`` keys
+    strip to ``embed_tokens.weight`` / ``layers.N.*`` which is what
+    Qwen2Model expects.
+    """
+    return _load_prefixed_state_dict(
+        qwen2_model, local_dir, prefix="model.", subdir="talker",
+        device=device, strict=strict,
+    )
+
+
+def load_talker_cfm_weights(
+    cfm: torch.nn.Module,
+    local_dir: str,
+    device: str = "cpu",
+    strict: bool = True,
+) -> set[str]:
+    """Load ``cfm.*`` from ``talker/model.safetensors`` into a `CFM` module.
+
+    ``CFM(model=DiT)`` so its state_dict has top-level ``model.<...>``
+    keys. The ckpt's ``cfm.model.blocks.N.attn.to_q.weight`` strips
+    to ``model.blocks.N.attn.to_q.weight`` — matches.
+
+    The ckpt ships ``cfm.model.rotary_embed.inv_freq`` but our
+    `RotaryEmbedding` registers `inv_freq` as ``persistent=False``,
+    so the buffer is absent from our state_dict and load_state_dict
+    flags it as unexpected. We allow it — the inv_freq table is
+    deterministic from ``head_dim`` and ``rope_theta``, so the
+    locally-recomputed buffer is numerically equivalent.
+    """
+    return _load_prefixed_state_dict(
+        cfm, local_dir, prefix="cfm.", subdir="talker",
+        device=device, strict=strict,
+        allow_unexpected={"model.rotary_embed.inv_freq"},
+    )
+
+
+def load_talker_aggregator_weights(
+    aggregator: torch.nn.Module,
+    local_dir: str,
+    device: str = "cpu",
+    strict: bool = True,
+) -> set[str]:
+    """Load ``aggregator.*`` from ``talker/model.safetensors``.
+
+    Same `rotary_embed.inv_freq` non-persistent-buffer story as the CFM
+    loader — accept it as expected-unexpected.
+    """
+    return _load_prefixed_state_dict(
+        aggregator, local_dir, prefix="aggregator.", subdir="talker",
+        device=device, strict=strict,
+        allow_unexpected={"rotary_embed.inv_freq"},
+    )
+
+
+def load_talker_heads_weights(
+    heads: dict[str, torch.nn.Module],
+    local_dir: str,
+    device: str = "cpu",
+    strict: bool = True,
+) -> dict[str, set[str]]:
+    """Load ``stop_head.*`` + ``spk_head.*`` into the matching heads dict.
+
+    Args:
+        heads: dict produced by `build_talker_heads`; must contain
+            both ``stop_head`` and ``spk_head`` keys.
+        local_dir: snapshot dir; the heads live in talker/model.safetensors.
+
+    Returns:
+        ``{"stop_head": loaded_keys, "spk_head": loaded_keys}``.
+    """
+    out: dict[str, set[str]] = {}
+    for name in ("stop_head", "spk_head"):
+        if name not in heads:
+            raise KeyError(f"`heads` dict missing required key {name!r}")
+        out[name] = _load_prefixed_state_dict(
+            heads[name], local_dir, prefix=f"{name}.", subdir="talker",
+            device=device, strict=strict,
+        )
+    return out
+
+
+def load_talker_audio_vae_weights(
+    audio_vae: torch.nn.Module,
+    local_dir: str,
+    device: str = "cpu",
+    strict: bool = True,
+) -> set[str]:
+    """Load ``encoder.*`` + ``decoder.*`` from ``talker/vae/model.safetensors``.
+
+    The ckpt's two top-level subtrees (`encoder.*`, `decoder.*`) match
+    `AudioVAE`'s state_dict structure directly — no prefix to strip.
+    Pass ``prefix=""`` so the helper loads every key.
+    """
+    return _load_prefixed_state_dict(
+        audio_vae, local_dir, prefix="", subdir="talker/vae",
+        device=device, strict=strict,
     )
