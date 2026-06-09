@@ -767,11 +767,57 @@ graph-walk / partition / streaming patterns transfer 1:1.
        snapshot-gated end-to-end that builds the full talker from
        real weights and generates a finite waveform.
 
-     - **6e-3 — TODO** (graph walks + Thinker→Talker bridge): add the
-       `talker` graph walk + partition + `audio_chunk` `EMIT_TO_CLIENT`
-       edge, plus the detokenize-and-retokenize text bridge from the
-       Thinker partition to the Talker. After 6e-3, audio-out
-       `/generate` is live end-to-end.
+     - **6e-3 — DONE** (graph walks + Thinker→Talker bridge): the
+       talker is now a second partition wired off the Thinker, gated
+       entirely on `config.talker is not None` (thinker-only configs
+       are byte-for-byte unchanged from step 5c).
+
+       Graph + partition additions (all in `ming_omni_flash_model.py`):
+       * `get_graph_walk_graphs` adds a `talker` walk — a single
+         `Talker` node consuming `thinker_tokens`, emitting one
+         `audio_chunk` `EMIT_TO_CLIENT` edge. The `thinker_decode`
+         loop gains a `StreamingGraphEdge(name="thinker_tokens",
+         target_partition="Talker")` so each decoded token streams to
+         the talker.
+       * `get_partition_topology` declares the Thinker→Talker
+         `Connection` with a `FixedChunkPolicy(chunk_size=1,
+         continue_after_done=True)` — the talker needs the FULL text
+         before it generates, so the policy keeps the consumer alive
+         past the Thinker's text EOS.
+       * `get_partitions` adds the `Talker` partition
+         (`producer_partitions=["Thinker"]`, `initial_walk=None`).
+       * `get_output_sample_rate("audio")` returns the talker VAE
+         sample rate (44.1 kHz).
+       * `get_initial_forward_pass_args` / `get_partition_forward_pass_args`
+         dispatch a Talker branch: `_get_talker_forward` waits for
+         `producer_done`, then fires the single `talker` walk once and
+         reports `request_done` on the next invocation.
+
+       Thinker→Talker text bridge: Ming passes DETOKENIZED TEXT, not
+       hidden states. `thinker_text_to_talker_inputs` decodes the
+       thinker output ids with the thinker tokenizer and re-encodes
+       with the talker's own `talker/llm` tokenizer (loaded lazily +
+       cached via `_get_talker_tokenizer`). `_create_talker_submodule`
+       injects this as the `TalkerSubmodule.text_bridge`, and
+       `TalkerSubmodule.prepare_inputs` accepts either pre-bridged
+       `talker_text_inputs` or raw `thinker_tokens` (running the
+       bridge in the latter case).
+
+       18 tests in `test_ming_flash_omni_talker_graph.py`: thinker-only
+       path unchanged (no talker walk / partition / streaming edge),
+       talker-enabled graph structure (walk, audio edge, streaming
+       edge to Talker), partition + topology + chunk-policy
+       continue-after-done, node-type registration, audio sample rate,
+       Talker state machine (waits for producer_done, fires once,
+       then done; audio-output gating), and the text bridge
+       (decode→re-encode round-trip + missing-tokenizer guard).
+       Updated two pre-existing tests that asserted Talker was an
+       unknown node/partition.
+
+     **Step 6 complete** — audio-out `/generate` is now wireable
+     end-to-end at the model layer (live bring-up still blocked by the
+     TP=4 OOM on the 4-GPU dev box; needs TP=8 thinker + talker on a
+     spare rank).
 
    - **6f — DONE** (weight loaders): `loader.py` exposes five new
      entry points on top of the step-4b `_load_prefixed_state_dict`

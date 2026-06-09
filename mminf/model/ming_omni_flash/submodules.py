@@ -732,12 +732,21 @@ class TalkerSubmodule(NodeSubmodule):
         config: MingFlashOmniModelConfig,
         max_steps: int = 1000,
         min_new_token: int = 10,
+        text_bridge: "Any" = None,
     ) -> None:
         super().__init__()
         self.generator = generator
         self.config = config
         self.max_steps = max_steps
         self.min_new_token = min_new_token
+        # Optional Thinker->Talker text bridge: a callable that maps
+        # thinker output token ids -> talker_text_inputs token ids
+        # (detokenize with the thinker tokenizer, re-encode with the
+        # talker/llm tokenizer). When the streaming edge delivers raw
+        # thinker tokens, prepare_inputs runs this first. When None
+        # (unit-test path / pre-bridged inputs), the inputs are assumed
+        # to already be talker-tokenizer ids.
+        self.text_bridge = text_bridge
         # Stash embed_tokens so prepare_inputs can map talker text ids ->
         # inputs_embeds without reaching through the generator each time.
         self.embed_tokens = generator.llm.embed_tokens
@@ -762,13 +771,26 @@ class TalkerSubmodule(NodeSubmodule):
         the talker's own ``talker/llm`` tokenizer. We embed it here so
         forward gets ready-to-run ``inputs_embeds``.
         """
-        if "talker_text_inputs" not in inputs or not inputs["talker_text_inputs"]:
+        # Two input shapes accepted:
+        #   * ``talker_text_inputs`` — already talker-tokenized ids
+        #     (unit-test path / pre-bridged).
+        #   * ``thinker_tokens`` — raw thinker output ids streamed from
+        #     the Thinker partition; run text_bridge to re-tokenize.
+        if "talker_text_inputs" in inputs and inputs["talker_text_inputs"]:
+            token_ids = inputs["talker_text_inputs"][0]
+        elif "thinker_tokens" in inputs and inputs["thinker_tokens"]:
+            if self.text_bridge is None:
+                raise RuntimeError(
+                    "TalkerSubmodule: received 'thinker_tokens' but no "
+                    "text_bridge is configured to re-tokenize them."
+                )
+            token_ids = self.text_bridge(inputs["thinker_tokens"][0])
+        else:
             raise ValueError(
-                "TalkerSubmodule: missing 'talker_text_inputs'. The "
-                "Thinker->Talker bridge (step 6e-3) must supply the "
-                "talker-tokenized text ids."
+                "TalkerSubmodule: missing 'talker_text_inputs' / "
+                "'thinker_tokens'. The Thinker->Talker bridge (step 6e-3) "
+                "must supply the text ids."
             )
-        token_ids = inputs["talker_text_inputs"][0]
         device = self.embed_tokens.weight.device
         if token_ids.dim() == 1:
             token_ids = token_ids.unsqueeze(0)  # (1, T)

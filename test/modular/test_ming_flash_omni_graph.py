@@ -368,10 +368,12 @@ def test_initial_args_no_modalities_returns_done() -> None:
 
 
 def test_initial_args_rejects_unknown_partition() -> None:
+    # Talker is now a valid partition name (step 6e-3); use an unported
+    # partition (ImageGen, step 9) as the canonical 'unknown' here.
     model = _bare_model()
-    with pytest.raises(ValueError, match="Unknown partition: 'Talker'"):
+    with pytest.raises(ValueError, match="Unknown partition: 'ImageGen'"):
         model.get_initial_forward_pass_args(
-            partition_name="Talker",
+            partition_name="ImageGen",
             input_modalities=["text"],
             output_modalities=["text"],
             input_signals={"text_inputs": [_StubTI("text")]},
