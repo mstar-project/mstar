@@ -698,3 +698,116 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
     def can_batch(self, batch, model_inputs) -> bool:
         # Step 3d is single-request; step 3e adds batching.
         return False
+
+
+# ===================================================================
+# 4. TalkerSubmodule (stateless TTS — text tokens -> waveform)
+# ===================================================================
+
+
+class TalkerSubmodule(NodeSubmodule):
+    """Stateless TTS node: talker text token ids -> audio waveform.
+
+    Ming's thinker->talker bridge passes DETOKENIZED TEXT, not streaming
+    hidden states (see vllm-omni's pipeline.py: ``thinker2talker`` re-encodes
+    the text with the talker's own ``talker/llm`` tokenizer). That makes the
+    talker a near-standalone TTS node — much simpler than qwen3_omni's
+    streaming-codec handoff. We model it as a single stateless node whose
+    forward runs the full AR loop + VAE decode via :class:`TalkerGenerator`.
+
+    The whole per-request generation (LLM prefill + CFM AR decode + AudioVAE
+    decode) happens inside one ``forward`` call rather than being unrolled
+    into a conductor-driven decode loop, because the CFM step count is
+    self-determined by the stop_head (not a token-by-token graph loop).
+    This keeps the graph wiring (step 6e-3) trivial: one Talker node,
+    one ``EMIT_TO_CLIENT`` audio edge.
+
+    Engine type: STATELESS (no KV cache managed by mminf — the talker LLM
+    manages its own ``StaticCache`` internally inside generate_latents).
+    """
+
+    def __init__(
+        self,
+        generator: "Any",  # TalkerGenerator (avoid import cycle at module load)
+        config: MingFlashOmniModelConfig,
+        max_steps: int = 1000,
+        min_new_token: int = 10,
+    ) -> None:
+        super().__init__()
+        self.generator = generator
+        self.config = config
+        self.max_steps = max_steps
+        self.min_new_token = min_new_token
+        # Stash embed_tokens so prepare_inputs can map talker text ids ->
+        # inputs_embeds without reaching through the generator each time.
+        self.embed_tokens = generator.llm.embed_tokens
+
+    def get_stateless_flavor(self) -> str:
+        # The talker runs in bf16 with autocast off; mirror the audio_codec
+        # flavor (no torch.compile, no autocast) since the CFM ODE loop +
+        # AudioVAE ISTFT are numerically sensitive.
+        return "audio_codec"
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs,
+    ) -> NodeInputs:
+        """Embed the talker text token ids into the LLM's input space.
+
+        ``talker_text_inputs`` is the token-id tensor produced by the
+        Thinker->Talker text bridge (step 6e-3) — already encoded with
+        the talker's own ``talker/llm`` tokenizer. We embed it here so
+        forward gets ready-to-run ``inputs_embeds``.
+        """
+        if "talker_text_inputs" not in inputs or not inputs["talker_text_inputs"]:
+            raise ValueError(
+                "TalkerSubmodule: missing 'talker_text_inputs'. The "
+                "Thinker->Talker bridge (step 6e-3) must supply the "
+                "talker-tokenized text ids."
+            )
+        token_ids = inputs["talker_text_inputs"][0]
+        device = self.embed_tokens.weight.device
+        if token_ids.dim() == 1:
+            token_ids = token_ids.unsqueeze(0)  # (1, T)
+        token_ids = token_ids.to(device)
+        inputs_embeds = self.embed_tokens(token_ids)
+
+        # Optional voice-prompt latent (zero-shot cloning); carried
+        # through as a tensor input when present.
+        prompt_wav_lat = inputs.get("prompt_wav_lat", [None])[0]
+        return NodeInputs(
+            tensor_inputs={
+                "inputs_embeds": inputs_embeds,
+                "prompt_wav_lat": prompt_wav_lat,
+            }
+        )
+
+    def forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs_embeds: torch.Tensor,
+        prompt_wav_lat: torch.Tensor | None = None,
+        **kwargs,
+    ) -> NameToTensorList:
+        """Run the full talker generation: AR latents -> VAE waveform.
+
+        Returns ``{"audio_chunk": [waveform]}`` where waveform is
+        ``(1, 1, num_samples)`` at the AudioVAE's sample rate. The
+        text-length duration cap is applied to ``max_steps``.
+        """
+        text_len = inputs_embeds.shape[1]
+        max_steps = self.generator.duration_capped_steps(text_len, self.max_steps)
+        with torch.no_grad():
+            latents = self.generator.generate_latents(
+                inputs_embeds,
+                prompt_wav_lat=prompt_wav_lat,
+                min_new_token=self.min_new_token,
+                max_steps=max_steps,
+            )
+            waveform = self.generator.decode_to_waveform(latents, stream_decode=True)
+            waveform = self.generator.trim_trailing_silence(waveform)
+        return {"audio_chunk": [waveform]}
