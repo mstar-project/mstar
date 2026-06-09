@@ -191,7 +191,9 @@ def test_dit_block_forward_runs_with_rope() -> None:
     blk = _DiTBlock(hidden_size=16, num_heads=2, mlp_ratio=2)
     rope = RotaryEmbedding(dim=8).forward_from_seq_len(5)
     x = torch.randn(2, 5, 16)
-    out = blk(x, rope)
+    # 6c added a mask argument to DiTBlock.forward (Aggregator needs it);
+    # the CFM/DiT call path passes mask=None.
+    out = blk(x, None, rope)
     assert out.shape == (2, 5, 16)
     assert torch.isfinite(out).all()
 
@@ -398,3 +400,203 @@ def test_build_talker_cfm_accepts_llm_cond_dim_override() -> None:
     cfg = TalkerConfig()
     cfm = build_talker_cfm(cfg, llm_cond_dim=4096, dtype=torch.float32, device="cpu")
     assert cfm.model.c_embedder.cond_embedder.in_features == 4096
+
+
+# ---------------------------------------------------------------------------
+# Step 6c — Attention mask handling
+# ---------------------------------------------------------------------------
+
+
+def test_attention_mask_zeros_output_at_padded_positions() -> None:
+    """``mask=False`` rows in input get zeroed in the output regardless of
+    `attn_mask_enabled` (mirrors upstream's unconditional masked_fill).
+    """
+    attn = _Attention(dim=8, heads=2, dim_head=4, attn_mask_enabled=False)
+    x = torch.randn(1, 4, 8)
+    mask = torch.tensor([[True, True, False, False]])
+    out = attn(x, mask=mask)
+    # First 2 rows should be the live attention output; last 2 zero.
+    assert (out[:, 2:].abs().sum() == 0).item()
+    assert (out[:, :2].abs().sum() > 0).item()
+
+
+def test_attention_mask_enabled_uses_sdpa_attn_mask() -> None:
+    """With attn_mask_enabled=True, padded keys shouldn't contribute to softmax.
+
+    Smoke check: forward runs without error and the live output rows
+    are still finite (we don't assert numerical equivalence to the
+    unmasked case since SDPA's mask changes attention weights).
+    """
+    attn = _Attention(dim=8, heads=2, dim_head=4, attn_mask_enabled=True)
+    x = torch.randn(1, 4, 8)
+    mask = torch.tensor([[True, True, False, False]])
+    out = attn(x, mask=mask)
+    assert torch.isfinite(out[:, :2]).all()
+
+
+def test_attention_no_mask_no_zeroing() -> None:
+    """mask=None must NOT zero anything (regression guard against the
+    upstream branch that only runs masked_fill when mask is not None).
+    """
+    attn = _Attention(dim=8, heads=2, dim_head=4, attn_mask_enabled=False)
+    x = torch.randn(1, 4, 8)
+    out = attn(x, mask=None)
+    assert (out.abs().sum() > 0).item()
+
+
+# ---------------------------------------------------------------------------
+# Step 6c — Aggregator
+# ---------------------------------------------------------------------------
+
+
+def _tiny_aggregator(llm_input_dim: int = 16) -> "Aggregator":
+    from mminf.model.ming_omni_flash.components.talker_dit import Aggregator
+    return Aggregator(
+        in_channels=8,
+        hidden_size=16,
+        depth=2,
+        num_heads=2,
+        mlp_ratio=2,
+        llm_input_dim=llm_input_dim,
+        dropout=0.0,
+    )
+
+
+def test_aggregator_outputs_cls_row_only() -> None:
+    """Aggregator returns ``(B, 1, llm_input_dim)`` — the [CLS] row."""
+    agg = _tiny_aggregator(llm_input_dim=16)
+    x = torch.randn(2, 5, 8)
+    out = agg(x)
+    assert out.shape == (2, 1, 16)
+    assert torch.isfinite(out).all()
+
+
+def test_aggregator_word_embedder_has_single_row() -> None:
+    """``nn.Embedding(1, hidden_size)`` — exactly one [CLS] token."""
+    agg = _tiny_aggregator()
+    assert agg.word_embedder.num_embeddings == 1
+    assert agg.word_embedder.embedding_dim == 16
+
+
+def test_aggregator_respects_mask_in_dit_blocks() -> None:
+    """With a key-padding mask, the masked rows still don't contaminate the
+    [CLS] output (since the DiT blocks zero them out before the final
+    layer).  Verify the forward at least runs through with a mask.
+    """
+    agg = _tiny_aggregator(llm_input_dim=16)
+    x = torch.randn(1, 5, 8)
+    # mark last 2 positions invalid
+    mask = torch.tensor([[True, True, True, False, False]])
+    out = agg(x, mask=mask)
+    assert out.shape == (1, 1, 16)
+    assert torch.isfinite(out).all()
+
+
+def test_aggregator_forward_matches_shape_for_various_T() -> None:
+    agg = _tiny_aggregator(llm_input_dim=16)
+    for T in (1, 4, 8):
+        out = agg(torch.randn(2, T, 8))
+        assert out.shape == (2, 1, 16)
+
+
+def test_build_aggregator_from_real_config() -> None:
+    """build_aggregator picks dims off TalkerConfig.aggregator."""
+    from mminf.model.ming_omni_flash.components.talker_dit import (
+        Aggregator,
+        build_aggregator,
+    )
+    cfg = TalkerConfig(
+        llm=TalkerLLMConfig(),
+        flowmodel=DiTBlockConfig(),
+        aggregator=DiTBlockConfig(),
+        vae=AudioVAEConfig(),
+    )
+    agg = build_aggregator(cfg, dtype=torch.float32, device="cpu")
+    assert isinstance(agg, Aggregator)
+    assert agg.hidden_size == cfg.aggregator.hidden_size   # 1024
+    assert len(agg.blocks) == cfg.aggregator.depth         # 8
+    # final_layer projects to llm_input_dim = talker.llm.hidden_size = 896.
+    assert agg.final_layer.linear.out_features == cfg.llm.hidden_size
+
+
+def test_build_aggregator_llm_input_dim_override() -> None:
+    from mminf.model.ming_omni_flash.components.talker_dit import build_aggregator
+    cfg = TalkerConfig()
+    agg = build_aggregator(cfg, llm_input_dim=2048, dtype=torch.float32, device="cpu")
+    assert agg.final_layer.linear.out_features == 2048
+
+
+# ---------------------------------------------------------------------------
+# Step 6c — Qwen2 talker LLM backbone
+# ---------------------------------------------------------------------------
+
+
+def test_build_talker_llm_returns_qwen2_model_with_correct_dims() -> None:
+    """Stock transformers.Qwen2Model with our TalkerLLMConfig dims."""
+    from mminf.model.ming_omni_flash.components.talker_dit import build_talker_llm
+    llm_cfg = TalkerLLMConfig(
+        vocab_size=128,            # tiny vocab for speed
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        sliding_window=32,
+        max_window_layers=0,
+    )
+    model = build_talker_llm(llm_cfg, dtype=torch.float32, device="cpu")
+    # The HF class is Qwen2Model.
+    from transformers import Qwen2Model
+    assert isinstance(model, Qwen2Model)
+    # Dims match what we passed in.
+    assert model.config.hidden_size == 64
+    assert model.config.num_hidden_layers == 2
+    assert model.config.num_attention_heads == 4
+    assert model.config.num_key_value_heads == 2
+    assert model.config.vocab_size == 128
+
+
+def test_build_talker_llm_forward_runs_on_tiny_input() -> None:
+    """Forward pass through the tiny Qwen2 backbone returns hidden states."""
+    from mminf.model.ming_omni_flash.components.talker_dit import build_talker_llm
+    llm_cfg = TalkerLLMConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=64,
+        num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+        max_position_embeddings=64, sliding_window=32, max_window_layers=0,
+    )
+    model = build_talker_llm(llm_cfg, dtype=torch.float32, device="cpu")
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    with torch.no_grad():
+        out = model(input_ids=input_ids)
+    # Qwen2Model.forward returns a BaseModelOutputWithPast.
+    assert out.last_hidden_state.shape == (1, 4, 32)
+    assert torch.isfinite(out.last_hidden_state).all()
+
+
+# ---------------------------------------------------------------------------
+# Step 6c — Talker heads
+# ---------------------------------------------------------------------------
+
+
+def test_build_talker_heads_emits_stop_head_and_spk_head() -> None:
+    """stop_head: hidden → 2 (binary), spk_head: 192 → hidden."""
+    from mminf.model.ming_omni_flash.components.talker_dit import build_talker_heads
+    cfg = TalkerConfig(llm=TalkerLLMConfig())  # hidden_size=896
+    heads = build_talker_heads(cfg, dtype=torch.float32, device="cpu")
+    assert "stop_head" in heads and "spk_head" in heads
+    sh = heads["stop_head"]
+    assert sh.in_features == cfg.llm.hidden_size   # 896
+    assert sh.out_features == 2
+    assert sh.bias is not None
+    spk = heads["spk_head"]
+    assert spk.in_features == 192
+    assert spk.out_features == cfg.llm.hidden_size  # 896
+    assert spk.bias is not None
+
+
+def test_build_talker_heads_spk_dim_override() -> None:
+    from mminf.model.ming_omni_flash.components.talker_dit import build_talker_heads
+    cfg = TalkerConfig(llm=TalkerLLMConfig())
+    heads = build_talker_heads(cfg, spk_embed_dim=512, dtype=torch.float32, device="cpu")
+    assert heads["spk_head"].in_features == 512

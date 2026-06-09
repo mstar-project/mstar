@@ -210,14 +210,27 @@ class _FeedForward(nn.Module):
 
 
 class _Attention(nn.Module):
-    """Single-block attention with optional QK-norm + interleaved RoPE.
+    """Single-block attention with optional QK-norm, RoPE, and key-padding mask.
 
-    Param names — `to_q`, `to_k`, `to_v`, `to_out.0`, (`to_out.1` is
-    a Dropout, no params) — mirror upstream exactly so the talker
-    ckpt's ``blocks.N.attn.to_q.weight`` etc. load by state_dict
-    equality. `q_norm` / `k_norm` are present only when
-    ``qk_norm="rms_norm"`` (released ckpt sets qk_norm=None, so both
-    are None and absent from state_dict).
+    Param names — `to_q`, `to_k`, `to_v`, `to_out.0`, (`to_out.1` is a
+    Dropout, no params) — mirror upstream exactly so the talker ckpt's
+    ``blocks.N.attn.to_q.weight`` etc. load by state_dict equality.
+    `q_norm` / `k_norm` are present only when ``qk_norm="rms_norm"``
+    (released ckpt sets qk_norm=None, so both are None and absent from
+    state_dict).
+
+    Mask handling matches upstream (`talker_module.Attention.forward`):
+      * ``mask`` is a ``(B, T)`` boolean key-padding mask — True for
+        valid positions, False for padding.
+      * When ``attn_mask_enabled=True``: build an SDPA attention mask
+        from ``mask`` so padded keys are excluded from softmax.
+      * Regardless of `attn_mask_enabled`: zero out output rows at
+        masked-out positions before returning (matches upstream's
+        unconditional ``x.masked_fill(~mask, 0.0)``).
+
+    The released flowmodel + aggregator configs set
+    ``attn_mask_enabled=False`` so the SDPA mask branch is a no-op on
+    the live model; we still preserve the parameter for parity.
     """
 
     def __init__(
@@ -227,6 +240,7 @@ class _Attention(nn.Module):
         dim_head: int = 64,
         dropout: float = 0.0,
         qk_norm: str | None = None,
+        attn_mask_enabled: bool = True,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -234,6 +248,7 @@ class _Attention(nn.Module):
         self.dim_head = dim_head
         self.inner_dim = dim_head * heads
         self.dropout = dropout
+        self.attn_mask_enabled = attn_mask_enabled
 
         self.to_q = nn.Linear(dim, self.inner_dim)
         self.to_k = nn.Linear(dim, self.inner_dim)
@@ -257,6 +272,7 @@ class _Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        mask: torch.Tensor | None = None,
         rope: tuple[torch.Tensor, torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         B = x.shape[0]
@@ -273,15 +289,37 @@ class _Attention(nn.Module):
             q = _apply_rotary_pos_emb(q, freqs)
             k = _apply_rotary_pos_emb(k, freqs)
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        # SDPA mask. Upstream builds a (B', H, T, T) bool mask from a
+        # (B, T) key-padding mask and uses additive masking via SDPA's
+        # attn_mask kwarg. We replicate the same shape so float weights
+        # see identical attention patterns.
+        attn_mask = None
+        if self.attn_mask_enabled and mask is not None:
+            # mask shape: (B, T). Expand to (B, H, Tq, Tk).
+            attn_mask = mask[:, None, None, :].expand(B, self.heads, q.shape[-2], k.shape[-2])
+
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False,
+        )
         out = out.transpose(1, 2).reshape(B, -1, self.inner_dim)
         out = self.to_out[0](out)
         out = self.to_out[1](out)
+
+        if mask is not None:
+            # Unconditional output-zeroing at masked positions (matches
+            # upstream's ``x.masked_fill(~mask, 0.0)``, executed even
+            # when attn_mask_enabled is False).
+            out = out.masked_fill(~mask[:, :, None], 0.0)
         return out
 
 
 class _DiTBlock(nn.Module):
-    """Pre-norm attention + pre-norm FFN with residuals (upstream DiTBlock)."""
+    """Pre-norm attention + pre-norm FFN with residuals (upstream DiTBlock).
+
+    Forward signature matches upstream `(x, mask, rope)` so the
+    Aggregator can pass a key-padding mask through to the attention.
+    For the CFM DiT path the caller passes mask=None.
+    """
 
     def __init__(
         self,
@@ -290,6 +328,7 @@ class _DiTBlock(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         qk_norm: str | None = None,
+        attn_mask_enabled: bool = True,
     ) -> None:
         super().__init__()
         self.norm1 = _RMSNorm(hidden_size)
@@ -299,6 +338,7 @@ class _DiTBlock(nn.Module):
             dim_head=hidden_size // num_heads,
             dropout=dropout,
             qk_norm=qk_norm,
+            attn_mask_enabled=attn_mask_enabled,
         )
         self.norm2 = _RMSNorm(hidden_size)
         self.mlp = _FeedForward(
@@ -308,9 +348,10 @@ class _DiTBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        mask: torch.Tensor | None,
         rope: tuple[torch.Tensor, torch.Tensor | None] | None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), rope=rope)
+        x = x + self.attn(self.norm1(x), mask=mask, rope=rope)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -363,6 +404,7 @@ class DiT(nn.Module):
         dropout: float = 0.0,
         qk_norm: str | None = None,
         spk_dim: int | None = None,
+        attn_mask_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -385,6 +427,7 @@ class DiT(nn.Module):
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
                 qk_norm=qk_norm,
+                attn_mask_enabled=attn_mask_enabled,
             )
             for _ in range(depth)
         ])
@@ -421,7 +464,9 @@ class DiT(nn.Module):
 
         rope = self.rotary_embed.forward_from_seq_len(x.shape[1])
         for block in self.blocks:
-            x = block(x, rope)
+            # DiT path: mask=None (CFM only uses RoPE; the Aggregator is
+            # what actually exercises the mask branch).
+            x = block(x, None, rope)
         return self.final_layer(x)
 
     def forward_with_cfg(
@@ -563,6 +608,7 @@ def build_talker_cfm(
         llm_cond_dim=llm_cond_dim,
         dropout=flow.dropout,
         qk_norm=flow.qk_norm,
+        attn_mask_enabled=flow.attn_mask_enabled,
     )
     cfm = CFM(model=dit, steps=talker_config.steps)
     cfm = cfm.to(dtype=dtype, device=device)
@@ -570,11 +616,239 @@ def build_talker_cfm(
     return cfm
 
 
+# ===========================================================================
+# Aggregator (DiT-shaped, maps audio latents back to LLM cond space)
+# ===========================================================================
+
+
+class Aggregator(nn.Module):
+    """Maps generated audio-latent patches back to LLM embedding space.
+
+    Port of upstream `talker_module.Aggregator` (lines 702-744). Same
+    DiTBlock stack as the CFM head but the input embedder is `nn.Linear`
+    (audio-latent → hidden) plus a learnable [CLS]-style `word_embedder`
+    prepended to the sequence; the output is the `[CLS]` row only,
+    projected to `llm_input_dim` so it can re-enter the talker LLM's
+    embedding space (closing the conditional-history loop).
+
+    The released aggregator block matches the flowmodel shape
+    (`depth=8, hidden_size=1024, num_heads=16, mlp_ratio=4, in_channels=64`)
+    except `dropout=0.1` and an `attn_mask_enabled=False` default that
+    still preserves the output-masking branch.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 64,
+        hidden_size: int = 1024,
+        depth: int = 8,
+        num_heads: int = 16,
+        mlp_ratio: float = 4.0,
+        llm_input_dim: int = 896,
+        dropout: float = 0.1,
+        qk_norm: str | None = None,
+        attn_mask_enabled: bool = False,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.num_heads = num_heads
+        self.hidden_size = hidden_size
+
+        # Learnable [CLS] token (single-row embedding table — exactly as
+        # upstream uses ``nn.Embedding(1, hidden_size)`` indexed at 0).
+        self.word_embedder = nn.Embedding(1, hidden_size)
+        self.x_embedder = nn.Linear(in_channels, hidden_size)
+
+        self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
+        self.blocks = nn.ModuleList([
+            _DiTBlock(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                qk_norm=qk_norm,
+                attn_mask_enabled=attn_mask_enabled,
+            )
+            for _ in range(depth)
+        ])
+        self.final_layer = _FinalLayer(hidden_size, llm_input_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,                 # (B, T, in_channels) audio latents
+        mask: torch.Tensor | None = None,   # (B, T) key-padding mask, True = valid
+    ) -> torch.Tensor:
+        """Returns the [CLS] row only: ``(B, 1, llm_input_dim)``.
+
+        Mirrors upstream `Aggregator.forward`: prepend a single learnable
+        [CLS] token, prepend a True-cell to the mask, run all DiT blocks,
+        project to ``llm_input_dim`` via `final_layer`, return the
+        leading row.
+        """
+        B = x.shape[0]
+        h = self.x_embedder(x)
+        cls_ids = torch.zeros((B, 1), dtype=torch.long, device=h.device)
+        cls_embed = self.word_embedder(cls_ids)
+        h = torch.cat([cls_embed, h], dim=1)
+
+        rope = self.rotary_embed.forward_from_seq_len(h.shape[1])
+        if mask is not None:
+            # Prepend a True column so the [CLS] row is never masked.
+            mask_pad = mask[:, :1].clone().detach()
+            mask = torch.cat([mask_pad, mask], dim=-1)
+
+        for block in self.blocks:
+            h = block(h, mask, rope)
+        h = self.final_layer(h)
+        return h[:, :1, :]
+
+
+def build_aggregator(
+    talker_config,
+    llm_input_dim: int | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str | torch.device = "cpu",
+) -> Aggregator:
+    """Construct an :class:`Aggregator` from a :class:`TalkerConfig`.
+
+    The released ckpt's aggregator block carries
+    ``in_channels=64, hidden_size=1024, depth=8, num_heads=16,
+    mlp_ratio=4, dropout=0.1``. ``llm_input_dim`` defaults to
+    ``talker_config.llm.hidden_size`` (896).
+    """
+    agg = talker_config.aggregator
+    if llm_input_dim is None:
+        llm_input_dim = talker_config.llm.hidden_size
+    module = Aggregator(
+        in_channels=agg.in_channels,
+        hidden_size=agg.hidden_size,
+        depth=agg.depth,
+        num_heads=agg.num_heads,
+        mlp_ratio=agg.mlp_ratio,
+        llm_input_dim=llm_input_dim,
+        dropout=agg.dropout,
+        qk_norm=agg.qk_norm,
+        attn_mask_enabled=agg.attn_mask_enabled,
+    )
+    module = module.to(dtype=dtype, device=device)
+    module.eval()
+    return module
+
+
+# ===========================================================================
+# Talker LLM backbone (Qwen2)
+# ===========================================================================
+
+
+def build_talker_llm(
+    talker_llm_config,
+    attn_implementation: str = "sdpa",
+    dtype: torch.dtype = torch.bfloat16,
+    device: str | torch.device = "cpu",
+):
+    """Construct a HF `Qwen2Model` from our `TalkerLLMConfig`.
+
+    The talker's LLM is a stock Qwen2 model — no custom modules, no
+    TP needed in the typical topology (the talker colocates on a
+    single rank). Reusing `transformers.Qwen2Model` keeps the surface
+    small and inherits HF's KV-cache + attention impl. The ckpt's
+    weight keys under `talker/model.safetensors` start with `model.`
+    and follow the standard Qwen2 layout, so the eventual loader
+    will be a simple prefix strip.
+
+    Args:
+        talker_llm_config: `TalkerLLMConfig` instance.
+        attn_implementation: passed through to Qwen2Config so the
+            model can use FA2 / SDPA. The upstream vllm-omni talker
+            uses ``"sdpa"`` (the ckpt's Qwen2 has
+            `_attn_implementation: flash_attention_2` baked into its
+            config dict but the vllm-omni runtime forcibly overrides
+            to sdpa to play nicely with vLLM's attention machinery
+            — we follow the same default).
+        dtype: cast the model to this dtype after construction.
+        device: device to materialise the model on.
+
+    Returns:
+        A `transformers.models.qwen2.modeling_qwen2.Qwen2Model`
+        instance with all parameters allocated (weights are still
+        random; the loader populates them later).
+    """
+    try:
+        from transformers import Qwen2Config, Qwen2Model
+    except ImportError as e:
+        raise ImportError(
+            "build_talker_llm requires transformers >= 4.43 (Qwen2 support). "
+            f"Original error: {e}"
+        ) from e
+
+    llm_cfg = Qwen2Config(
+        vocab_size=talker_llm_config.vocab_size,
+        hidden_size=talker_llm_config.hidden_size,
+        intermediate_size=talker_llm_config.intermediate_size,
+        num_hidden_layers=talker_llm_config.num_hidden_layers,
+        num_attention_heads=talker_llm_config.num_attention_heads,
+        num_key_value_heads=talker_llm_config.num_key_value_heads,
+        hidden_act=talker_llm_config.hidden_act,
+        max_position_embeddings=talker_llm_config.max_position_embeddings,
+        rms_norm_eps=talker_llm_config.rms_norm_eps,
+        rope_theta=talker_llm_config.rope_theta,
+        use_sliding_window=talker_llm_config.use_sliding_window,
+        sliding_window=talker_llm_config.sliding_window,
+        max_window_layers=talker_llm_config.max_window_layers,
+        tie_word_embeddings=talker_llm_config.tie_word_embeddings,
+        attention_dropout=talker_llm_config.attention_dropout,
+        use_cache=talker_llm_config.use_cache,
+        bos_token_id=talker_llm_config.bos_token_id,
+        eos_token_id=talker_llm_config.eos_token_id,
+        attn_implementation=attn_implementation,
+    )
+    model = Qwen2Model(llm_cfg)
+    model = model.to(dtype=dtype, device=device)
+    model.eval()
+    return model
+
+
+def build_talker_heads(
+    talker_config,
+    spk_embed_dim: int = 192,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str | torch.device = "cpu",
+) -> dict[str, nn.Module]:
+    """Build the talker's small per-purpose Linear heads.
+
+    Two heads sit alongside the LLM + CFM + Aggregator + AudioVAE:
+
+      * ``stop_head`` — ``Linear(hidden_size, 2, bias=True)``: binary
+        end-of-audio classifier consumed during the generation loop
+        to decide when to stop.
+      * ``spk_head`` — ``Linear(spk_embed_dim=192, hidden_size,
+        bias=True)``: projects a CAMPPlus speaker embedding into the
+        LLM hidden space; the projected embedding is prepended to
+        the prompt as a voice-condition token.
+
+    Returned as a dict so callers can wire them into the talker
+    forward without depending on a specific module-tree shape.
+    """
+    hidden = talker_config.llm.hidden_size
+    stop_head = nn.Linear(hidden, 2, bias=True)
+    spk_head = nn.Linear(spk_embed_dim, hidden, bias=True)
+    stop_head = stop_head.to(dtype=dtype, device=device)
+    spk_head = spk_head.to(dtype=dtype, device=device)
+    stop_head.eval()
+    spk_head.eval()
+    return {"stop_head": stop_head, "spk_head": spk_head}
+
+
 __all__ = [
     "DiT",
     "CFM",
+    "Aggregator",
     "DiTTimestepEmbedding",
     "RotaryEmbedding",
     "get_epss_timesteps",
     "build_talker_cfm",
+    "build_aggregator",
+    "build_talker_llm",
+    "build_talker_heads",
 ]

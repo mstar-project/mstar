@@ -562,8 +562,68 @@ graph-walk / partition / streaming patterns transfer 1:1.
        the expected DiT dims (1024 hidden, 8 layers, 16 heads,
        cond_embedder input = 896) + `llm_cond_dim` override.
 
-   - **6c — TODO** (Aggregator + Qwen2 backbone): port `Aggregator`
-     (talker_module.py:702) and the talker's Qwen2 LLM stack.
+   - **6c — DONE** (Aggregator + Qwen2 backbone + heads):
+
+     `_Attention` / `_DiTBlock` grew a `mask` parameter to match
+     upstream API exactly. For the CFM path the caller passes
+     `mask=None`, so behaviour is unchanged; the Aggregator's mask
+     branch is now exercised. Mask semantics mirror upstream's
+     `talker_module.Attention.forward`:
+     * `attn_mask_enabled=True` builds an SDPA `attn_mask` from the
+       (B, T) key-padding mask so padded keys are excluded from
+       softmax.
+     * Regardless of `attn_mask_enabled`, the masked-out output rows
+       are zeroed via `masked_fill(~mask, 0)` — matches upstream's
+       unconditional zeroing branch.
+
+     `Aggregator` (port of `talker_module.Aggregator:702-744`): same
+     DiTBlock stack as the CFM head, but the input embedder is
+     `nn.Linear` (audio-latent → hidden) plus a learnable [CLS]-style
+     `word_embedder` (`nn.Embedding(1, hidden_size)`) prepended to the
+     sequence. The output is the `[CLS]` row only, projected through
+     `final_layer` to `llm_input_dim` so the condition feedback loops
+     back into the talker LLM's embedding space.
+
+     `build_aggregator(talker_config, llm_input_dim=None, ...)` and
+     `build_talker_cfm(...)` both honor `attn_mask_enabled` from the
+     respective DiTBlockConfig (False on the released ckpt).
+
+     **Talker LLM backbone** — `build_talker_llm(talker_llm_config,
+     attn_implementation="sdpa", ...)` constructs a stock
+     `transformers.Qwen2Model` from `TalkerLLMConfig`. No custom modeling
+     path: the talker LLM colocates on a single rank in the typical
+     topology and the ckpt's `talker/model.safetensors` keys are
+     plain `model.*` Qwen2 keys, so reusing HF keeps the surface small
+     and inherits HF's KV-cache + attention impl. Matches what the
+     upstream `MingFlashOmniTalkerForConditionalGeneration.__init__`
+     does (line 116: `self.model = Qwen2Model(llm_config)`).
+
+     **Talker heads** — `build_talker_heads(talker_config,
+     spk_embed_dim=192, ...)` returns a dict of two `nn.Linear` heads:
+     * `stop_head` — `Linear(hidden_size, 2, bias=True)`: binary
+       end-of-audio classifier consumed during the generation loop.
+     * `spk_head` — `Linear(192, hidden_size, bias=True)`: projects
+       a CAMPPlus speaker embedding into the LLM hidden space; the
+       projected embedding is prepended to the prompt as a voice-
+       condition token.
+
+     13 new tests appended to `test_ming_flash_omni_talker_dit.py`:
+     - Attention mask output-zeroing (unconditional), SDPA attn_mask
+       branch (attn_mask_enabled=True), no-mask no-zeroing regression
+       guard.
+     - Aggregator: `[CLS]` row only output `(B, 1, llm_input_dim)`,
+       single-row `word_embedder`, mask propagation through DiT
+       blocks, shape stability across varying T, `build_aggregator`
+       from real TalkerConfig + `llm_input_dim` override.
+     - `build_talker_llm`: returns `transformers.Qwen2Model` with
+       correct dims; tiny-input forward returns hidden states.
+     - `build_talker_heads`: stop_head (h→2) + spk_head (192→h) with
+       biases; `spk_embed_dim` override.
+
+     Total talker_dit tests: 41 (28 from 6b + 13 from 6c). Full
+     Ming step-1..7 + 6a/6b/6c suite: **162 pass / 9 skipped / 0 fail
+     / 1 deselected** (deselected is pre-existing cuDNN-broken
+     attention forward, unrelated).
 
    - **6d — TODO** (AudioVAE): port `audio_vae.py`'s Encoder, Decoder,
      ISTFTHead, ISTFT, StreamingLinearUpsample.
