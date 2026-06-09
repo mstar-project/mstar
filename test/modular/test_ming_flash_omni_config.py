@@ -199,6 +199,52 @@ def test_invariant_check_rejects_out_of_vocab_multimodal_tokens() -> None:
         MingFlashOmniModelConfig(thinker_llm=bad)
 
 
+def test_invariant_check_covers_audio_and_end_tokens() -> None:
+    """The vocab-bounds check must cover every multimodal token field,
+    not just the four the ckpt ships. Regression for the audio + *_end
+    tokens added alongside the vision/audio encoder port."""
+    for field, bad_value in [
+        ("audio_patch_token", 200_000),
+        ("audio_start_token", 200_000),
+        ("audio_end_token", 200_000),
+        ("image_end_token", 200_000),
+        ("video_end_token", 200_000),
+    ]:
+        bad = ThinkerLLMConfig(vocab_size=160_000, **{field: bad_value})
+        with pytest.raises(ValueError, match=field):
+            MingFlashOmniModelConfig(thinker_llm=bad)
+
+
+def test_video_start_token_mislabel_auto_repaired(caplog: pytest.LogCaptureFixture) -> None:
+    """The inclusionAI ckpt's llm_config.video_start_token=157159 is
+    actually `</image>` per the tokenizer; the real `<video>` token is
+    157160. ThinkerLLMConfig.__post_init__ must repair the bogus value
+    AND emit a warning so the user sees what happened.
+    """
+    import logging
+    with caplog.at_level(logging.WARNING):
+        cfg = ThinkerLLMConfig.from_dict({
+            # Mimic the on-disk inclusionAI llm_config (minus head_dim noise).
+            "hidden_size": 4096, "num_attention_heads": 32, "vocab_size": 160_000,
+            "image_start_token": 157158,
+            "video_start_token": 157159,  # bogus per ckpt
+        })
+    # Repaired in place to the tokenizer-truth value.
+    assert cfg.video_start_token == 157160, (
+        f"video_start_token should auto-repair from 157159 to 157160; got {cfg.video_start_token}"
+    )
+    assert any("video_start_token=157159" in rec.message for rec in caplog.records), \
+        "expected a warning about the ckpt mislabel"
+
+    # If video_start_token is set to anything else (whether the corrected
+    # 157160 or a custom value), the repair must NOT fire and the value
+    # must pass through untouched.
+    cfg_ok = ThinkerLLMConfig(video_start_token=157160)
+    assert cfg_ok.video_start_token == 157160
+    cfg_custom = ThinkerLLMConfig(video_start_token=99_999, image_end_token=42)
+    assert cfg_custom.video_start_token == 99_999
+
+
 def test_invariant_check_rejects_bad_mrope_section() -> None:
     """Wrong mrope_section partition is exactly the kind of silent miswire
     we want loud failure on."""

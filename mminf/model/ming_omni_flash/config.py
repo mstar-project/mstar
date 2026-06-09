@@ -96,11 +96,30 @@ class ThinkerLLMConfig:
     eos_token_id: int = 156895
     use_interleaved_frame_timestamp: bool = True
 
-    # Multimodal token IDs (used by the prefill processor / chat template)
+    # Multimodal token IDs (used by the prefill processor / chat template).
+    # Defaults mirror the actual tokenizer (`tokenizer.json` added_tokens at
+    # the released ckpt; cross-checked against Jonathan1909's patched config
+    # and vllm-omni's BailingMoeV2Config defaults). Two gotchas the on-disk
+    # `config.json` of `inclusionAI/Ming-flash-omni-2.0` introduces:
+    #   * `video_start_token` is mislabeled as 157159 (= </image>) in the
+    #     ckpt config; the real `<video>` token is 157160. Jonathan1909's
+    #     patched config corrects this. `__post_init__` warns loudly if a
+    #     load picks up the bogus value.
+    #   * `audio_*` / `*_end` / `tokens_per_second` are not in the on-disk
+    #     llm_config at all; they're tokenizer-derived constants and are
+    #     hardcoded in vllm-omni. We mirror those defaults here so
+    #     vision/audio masking + MRoPE temporal-position math can read them
+    #     directly off `ThinkerLLMConfig`.
     image_patch_token: int = 157157
     video_patch_token: int = 157175
+    audio_patch_token: int = 157168
     image_start_token: int = 157158
-    video_start_token: int = 157159
+    video_start_token: int = 157160
+    audio_start_token: int = 157169
+    image_end_token: int = 157159
+    video_end_token: int = 157161
+    audio_end_token: int = 157170
+    tokens_per_second: int = 2
 
     def __post_init__(self) -> None:
         if self.head_dim is None:
@@ -117,6 +136,20 @@ class ThinkerLLMConfig:
                 "under llm_config.",
                 self.head_dim, self.hidden_size, self.num_attention_heads,
             )
+        # The inclusionAI ckpt's llm_config.video_start_token is mislabeled
+        # (157159 = </image> per tokenizer; the real <video> token is 157160).
+        # If we picked up the bogus value, repair it and warn loudly — vision
+        # masking would otherwise key on </image> for video-start markers.
+        if self.video_start_token == 157159 and self.image_end_token == 157159:
+            logger.warning(
+                "ThinkerLLMConfig: ckpt-supplied video_start_token=157159 "
+                "matches image_end_token (= </image> per tokenizer). The "
+                "released inclusionAI/Ming-flash-omni-2.0 config.json "
+                "mislabels this field; correcting to 157160 (= <video>). "
+                "If this is intentional, set video_start_token explicitly "
+                "after construction."
+            )
+            self.video_start_token = 157160
 
     @property
     def mrope_section(self) -> list[int]:
@@ -418,8 +451,9 @@ class MingFlashOmniModelConfig:
 
         # Multimodal token IDs must be within vocab.
         for name in (
-            "image_patch_token", "video_patch_token",
-            "image_start_token", "video_start_token",
+            "image_patch_token", "video_patch_token", "audio_patch_token",
+            "image_start_token", "video_start_token", "audio_start_token",
+            "image_end_token", "video_end_token", "audio_end_token",
         ):
             v = getattr(llm, name)
             if not (0 <= v < llm.vocab_size):

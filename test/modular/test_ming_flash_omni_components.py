@@ -312,6 +312,110 @@ def test_partial_mrope_rejects_inconsistent_section() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "mrope_section,head_dim,num_tokens",
+    [
+        # Released ckpt geometry (head_dim=128, rotary_dim=64, half=32).
+        ([8, 12, 12], 128, 1),
+        ([8, 12, 12], 128, 7),
+        ([8, 12, 12], 128, 64),
+        # hw_size == half (no temporal tail) — edge case for the
+        # ``offset+hw_size:offset+half`` slice.
+        ([0, 8, 8], 64, 5),
+        # hw_size < half by a wide margin.
+        ([14, 1, 1], 64, 5),
+        # Asymmetric Nh / Nw split.
+        ([2, 5, 1], 32, 11),
+    ],
+)
+def test_partial_mrope_video_rope_matches_vllm_omni(
+    mrope_section: list[int], head_dim: int, num_tokens: int,
+) -> None:
+    """Numeric parity vs vllm-omni's ``_remap_video_rope``.
+
+    The two implementations operate on differently-shaped inputs:
+
+    * mminf consumes the *full* ``(3, T, rotary_dim)`` neox-cat table and
+      writes both halves in a single ``for offset in (0, half)`` loop.
+    * vllm-omni consumes the *half* ``(3, T, rotary_dim/2)`` table — the
+      same one that ``cos_sin_cache.chunk(2)`` returns — and writes just
+      one half.
+
+    Since the neox cat duplicates each frequency into both halves, the
+    expected invariant is::
+
+        mminf_full[:, :half]  == vllm_half
+        mminf_full[:, half:]  == vllm_half  (identical, because both halves
+                                             carry the same freqs)
+
+    The ``offset+hw_size:offset+half`` slice in mminf is the bit most
+    likely to misalign for unusual ``mrope_section`` shapes — this
+    parametrisation exercises the edges.
+    """
+    try:
+        importlib.import_module("vllm_omni")
+        from vllm_omni.model_executor.models.ming_flash_omni.modeling_bailing_moe_v2 import (
+            MingVideoRopeMRotaryEmbedding,
+        )
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"vllm-omni not importable: {e}")
+
+    # vllm's ``_remap_video_rope`` only reads ``self.mrope_section``; build
+    # the thinnest possible stand-in so we can call it as an unbound method
+    # without constructing the full MRotaryEmbedding (which pulls in
+    # vllm's CUDA cache machinery).
+    import types
+    stub = types.SimpleNamespace(mrope_section=list(mrope_section))
+
+    rotary_dim = head_dim // 2  # partial_rotary_factor=0.5
+    half = rotary_dim // 2
+
+    # Synthesise per-axis half-tables with values drawn from a wide range so
+    # any wrong-axis pick shows up loudly.
+    torch.manual_seed(20260609)
+    cos_half = torch.randn(3, num_tokens, half, dtype=torch.float64) * 3.0
+    sin_half = torch.randn(3, num_tokens, half, dtype=torch.float64) * 3.0
+
+    # Reference (vllm-omni) — operates on half-tables.
+    ref_cos_half, ref_sin_half = MingVideoRopeMRotaryEmbedding._remap_video_rope(
+        stub, cos_half, sin_half,
+    )
+    assert ref_cos_half.shape == (num_tokens, half)
+    assert ref_sin_half.shape == (num_tokens, half)
+
+    # Ours (mminf) — operates on full neox-cat tables.
+    rope = LingPartialMRotaryEmbedding(
+        head_dim=head_dim, partial_rotary_factor=0.5,
+        mrope_section=list(mrope_section),
+        rope_theta=10000.0,
+        max_position_embeddings=128,
+    )
+    cos_full = torch.cat((cos_half, cos_half), dim=-1)
+    sin_full = torch.cat((sin_half, sin_half), dim=-1)
+    full_cos, full_sin = rope._remap_video_rope(cos_full, sin_full)
+    assert full_cos.shape == (num_tokens, rotary_dim)
+    assert full_sin.shape == (num_tokens, rotary_dim)
+
+    # Both halves of the full output must equal vllm's half output exactly
+    # (we used float64 to dodge fp32 quantisation noise).
+    assert torch.equal(full_cos[:, :half], ref_cos_half), (
+        f"mrope_section={mrope_section}, head_dim={head_dim}, T={num_tokens}: "
+        f"first half of cos diverges from vllm reference"
+    )
+    assert torch.equal(full_cos[:, half:], ref_cos_half), (
+        f"mrope_section={mrope_section}, head_dim={head_dim}, T={num_tokens}: "
+        f"second half of cos diverges from vllm reference"
+    )
+    assert torch.equal(full_sin[:, :half], ref_sin_half), (
+        f"mrope_section={mrope_section}, head_dim={head_dim}, T={num_tokens}: "
+        f"first half of sin diverges from vllm reference"
+    )
+    assert torch.equal(full_sin[:, half:], ref_sin_half), (
+        f"mrope_section={mrope_section}, head_dim={head_dim}, T={num_tokens}: "
+        f"second half of sin diverges from vllm reference"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Attention (QK-norm + partial MRoPE composition)
 # ---------------------------------------------------------------------------
