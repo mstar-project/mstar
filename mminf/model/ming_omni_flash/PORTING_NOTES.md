@@ -401,12 +401,53 @@ graph-walk / partition / streaming patterns transfer 1:1.
      image / video walks, start_pos advancement, legacy `prefill`
      walk name compat. All green.
 
-   - **5c — TODO** (graph wiring): replace the text-only `prefill` /
-     `decode` walks in `get_graph_walk_graphs` with
-     `prefill_text` / `prefill_audio` / `prefill_vision` /
-     `prefill_video` + `thinker_decode`, updating `get_partitions`
-     and `get_initial_forward_pass_args` to route based on
-     `input_modalities`.
+   - **5c — DONE** (graph wiring + multimodal scheduling):
+     `get_graph_walk_graphs` now returns five walks instead of the
+     step 3f text-only `prefill` / `decode` pair:
+
+     * `prefill_text` — bare `Thinker` node.
+     * `prefill_audio` — `Sequential([audio_encoder, Thinker])`
+       where the encoder emits `audio_embeds` into the Thinker.
+     * `prefill_vision` — `Sequential([vision_encoder, Thinker])`;
+       `image_grid_thw` routes to BOTH the encoder (for spatial
+       positions on the patches) AND the Thinker (for 3D MRoPE math
+       around the vision span).
+     * `prefill_video` — same shape as `prefill_vision` plus
+       `video_second_per_grid` routed into the Thinker.
+     * `thinker_decode` — AR loop, renamed from step 3f's `decode`.
+
+     `get_partitions` lists all five walks under the single `Thinker`
+     partition with `initial_walk="prefill_text"`. Two new helpers
+     drive the scheduling:
+
+     * `_build_thinker_prefill_schedule(input_modalities, input_signals)`
+       — one schedule step per modality, in `input_modalities` order;
+       each step is `(walk_name, {input_name: TensorPointerInfo})`.
+       Modalities listed without matching tensors in `input_signals`
+       are silently skipped (parity with qwen3_omni).
+     * `_get_thinker_prefill_inputs(metadata, input_signals)` — emits
+       one `GraphEdge` per input for the current step, routing each
+       to the right node (encoder vs Thinker), including the dual
+       `image_grid_thw` edge for vision walks.
+
+     `get_initial_forward_pass_args` builds the schedule, picks the
+     first walk, and stashes the schedule + step counter on the
+     metadata. `get_partition_forward_pass_args` is the Thinker state
+     machine: advance schedule → transition to `thinker_decode` →
+     return `request_done=True` after the decode loop unwinds. Mirrors
+     `mminf/model/qwen3_omni/qwen3_omni_model.py:765+` minus the
+     Talker / Code2Wav partitions (which land in step 6+).
+
+     Empty-schedule edge case (no usable modalities) short-circuits
+     to `request_done=True` so the conductor doesn't hang.
+
+     21 tests in `test/modular/test_ming_flash_omni_graph.py`:
+     graph-walk structure (5 walks, encoder→Thinker chaining, dual
+     grid_thw edge, loop feedback edge), partition listing, prefill
+     schedule construction for text-only / text+audio+image / video /
+     unknown-modality / no-inputs cases, edge routing for each walk
+     type, full state-machine drive across a text+audio request
+     (init → audio prefill → decode → done).
 
 6. **Talker + Audio VAE.** Port `ming_flash_omni_talker.py` + `talker_module.py`
    + `audio_vae.py`. The talker is CFM-based (continuous flow matching) rather

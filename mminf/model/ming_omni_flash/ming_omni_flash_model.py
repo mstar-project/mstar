@@ -55,6 +55,7 @@ from mminf.graph.base import (
     GraphNode,
     GraphSection,
     Loop,
+    Sequential,
     TensorPointerInfo,
 )
 from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -381,22 +382,92 @@ class MingFlashOmniModel(Model):
         }
 
     # ------------------------------------------------------------------
-    # Graph walks: prefill + decode loop, text-only
+    # Graph walks: text + audio + vision/video prefill + AR decode (step 5c)
     # ------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        prefill = GraphNode(
-            name="Thinker",
-            input_names=["text_inputs"],
-            outputs=[GraphEdge(
-                next_node=EMIT_TO_CLIENT,
-                name="new_token",
-                output_modality="text",
-                persist=True,
-            )],
-        )
-        decode = Loop(
-            name="decode_loop",
+        """Five graph walks covering all modality inputs + autoregressive decode.
+
+        * ``prefill_text`` — Thinker only; text tokens → first sampled
+          token (also the legacy ``prefill`` walk in step 3f).
+        * ``prefill_audio`` — ``audio_encoder`` → Thinker. Audio encoder
+          emits ``audio_embeds`` that the Thinker splices between
+          ``audio_start``/``audio_end`` sentinels (step 5b).
+        * ``prefill_vision`` — ``vision_encoder`` → Thinker. Image
+          inputs; the Thinker splices between ``image_start``/``image_end``.
+        * ``prefill_video`` — ``vision_encoder`` → Thinker. Video inputs
+          (same encoder; the Thinker dispatch reads
+          ``video_second_per_grid`` and switches to video sentinels).
+        * ``thinker_decode`` — single-step AR loop (also the legacy
+          ``decode`` walk in step 3f).
+
+        Each prefill walk's final Thinker node emits the first sampled
+        token to the client (``EMIT_TO_CLIENT`` + ``output_modality="text"``)
+        and the decode loop emits + loops each subsequent token, exactly
+        like step 3f's text-only path.
+        """
+        max_decode = self.get_max_output_tokens()
+
+        def _thinker_prefill_node(input_names: list[str]) -> GraphNode:
+            return GraphNode(
+                name="Thinker",
+                input_names=input_names,
+                outputs=[GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="new_token",
+                    output_modality="text",
+                    persist=True,
+                )],
+            )
+
+        prefill_text = _thinker_prefill_node(["text_inputs"])
+
+        # Audio prefill: encoder consumes (audio_features, audio_seqlens)
+        # and emits ``audio_embeds`` → Thinker. The Thinker submodule's
+        # prefill_audio dispatch wraps that with audio_start/audio_end
+        # sentinel embeds and builds text-like 3D MRoPE positions.
+        prefill_audio = Sequential([
+            GraphNode(
+                name="audio_encoder",
+                input_names=["audio_features", "audio_seqlens"],
+                outputs=[GraphEdge(next_node="Thinker", name="audio_embeds")],
+            ),
+            _thinker_prefill_node(["audio_embeds"]),
+        ])
+
+        # Vision prefill (image): encoder takes (pixel_values,
+        # image_grid_thw) and emits ``vision_embeds``. The Thinker still
+        # needs the grid for its 3D MRoPE math, so route grid_thw
+        # straight into the Thinker via a parallel edge from the
+        # conductor's initial inputs (see _get_thinker_prefill_inputs).
+        prefill_vision = Sequential([
+            GraphNode(
+                name="vision_encoder",
+                input_names=["pixel_values", "image_grid_thw"],
+                outputs=[GraphEdge(next_node="Thinker", name="vision_embeds")],
+            ),
+            _thinker_prefill_node(["vision_embeds", "image_grid_thw"]),
+        ])
+
+        # Video prefill: same encoder, plus video_second_per_grid for the
+        # timestamp-scaled temporal positions. The Thinker dispatches on
+        # walk name (prefill_video) so it picks video_start/video_end
+        # sentinels instead of image_*.
+        prefill_video = Sequential([
+            GraphNode(
+                name="vision_encoder",
+                input_names=["pixel_values", "image_grid_thw"],
+                outputs=[GraphEdge(next_node="Thinker", name="vision_embeds")],
+            ),
+            _thinker_prefill_node([
+                "vision_embeds", "image_grid_thw", "video_second_per_grid",
+            ]),
+        ])
+
+        # Thinker decode loop — same shape as step 3f's `decode` walk,
+        # renamed for symmetry with the prefill walks.
+        thinker_decode = Loop(
+            name="thinker_decode_loop",
             section=GraphNode(
                 name="Thinker",
                 input_names=["text_inputs"],
@@ -413,10 +484,16 @@ class MingFlashOmniModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=max_decode,
             outputs=[],
         )
-        return {"prefill": prefill, "decode": decode}
+        return {
+            "prefill_text": prefill_text,
+            "prefill_audio": prefill_audio,
+            "prefill_vision": prefill_vision,
+            "prefill_video": prefill_video,
+            "thinker_decode": thinker_decode,
+        }
 
     def get_partition_topology(self) -> PartitionTopology:
         return PartitionTopology(partitions=["Thinker"], connections=[])
@@ -424,13 +501,136 @@ class MingFlashOmniModel(Model):
     def get_partitions(self) -> list[PartitionDefinition]:
         return [PartitionDefinition(
             name="Thinker",
-            graph_walks={"prefill", "decode"},
-            initial_walk="prefill",
+            graph_walks={
+                "prefill_text", "prefill_audio",
+                "prefill_vision", "prefill_video",
+                "thinker_decode",
+            },
+            initial_walk="prefill_text",
             producer_partitions=[],
         )]
 
     # ------------------------------------------------------------------
-    # Forward-pass arg builders — mirrors Orpheus's LLM-partition flow
+    # Prefill scheduling — mirrors qwen3_omni's _build_thinker_prefill_schedule
+    # ------------------------------------------------------------------
+
+    def _build_thinker_prefill_schedule(
+        self,
+        input_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+    ) -> list[tuple[str, dict[str, TensorPointerInfo]]]:
+        """Walk-name + per-input tensor map per modality, in input order.
+
+        Mirrors qwen3_omni's helper: each ``input_modalities`` entry
+        yields one schedule step. The audio walk needs
+        ``audio_features`` (+ optional ``audio_seqlens``); image / video
+        walks need ``pixel_values`` + ``image_grid_thw``; video walks
+        also take ``video_second_per_grid``. Steps the conductor's
+        ``input_signals`` does not actually have (e.g. ``audio`` listed
+        but no ``audio_features`` provided) are silently skipped.
+        """
+        texts = input_signals.get("text_inputs", [])
+        audio_features = input_signals.get("audio_features", [])
+        audio_seqlens = input_signals.get("audio_seqlens", [])
+        pixel_values = input_signals.get("pixel_values", [])
+        image_grid_thws = input_signals.get("image_grid_thw", [])
+        # Video uses pixel_values_videos in HF; accept both keys
+        # for parity with qwen3_omni's helper.
+        pixel_values_videos = input_signals.get("pixel_values_videos", [])
+        video_grid_thws = input_signals.get("video_grid_thw", [])
+        video_second_per_grid = input_signals.get("video_second_per_grid", [])
+
+        schedule: list[tuple[str, dict[str, TensorPointerInfo]]] = []
+        text_idx = audio_idx = vision_idx = video_idx = 0
+        for mod in input_modalities:
+            if mod == "text":
+                if text_idx < len(texts):
+                    schedule.append((
+                        "prefill_text",
+                        {"text_inputs": texts[text_idx]},
+                    ))
+                    text_idx += 1
+            elif mod == "audio":
+                if audio_idx < len(audio_features):
+                    entry: dict[str, TensorPointerInfo] = {
+                        "audio_features": audio_features[audio_idx],
+                    }
+                    if audio_idx < len(audio_seqlens):
+                        entry["audio_seqlens"] = audio_seqlens[audio_idx]
+                    schedule.append(("prefill_audio", entry))
+                    audio_idx += 1
+            elif mod == "image":
+                if vision_idx < len(pixel_values):
+                    entry = {"pixel_values": pixel_values[vision_idx]}
+                    if vision_idx < len(image_grid_thws):
+                        entry["image_grid_thw"] = image_grid_thws[vision_idx]
+                    schedule.append(("prefill_vision", entry))
+                    vision_idx += 1
+            elif mod == "video":
+                if video_idx < len(pixel_values_videos):
+                    entry = {"pixel_values": pixel_values_videos[video_idx]}
+                    if video_idx < len(video_grid_thws):
+                        entry["image_grid_thw"] = video_grid_thws[video_idx]
+                    if video_idx < len(video_second_per_grid):
+                        entry["video_second_per_grid"] = video_second_per_grid[video_idx]
+                    schedule.append(("prefill_video", entry))
+                    video_idx += 1
+        return schedule
+
+    def _get_thinker_prefill_inputs(
+        self,
+        metadata: CurrentForwardConductorMetadata,
+        input_signals: dict[str, list[TensorPointerInfo]],
+    ) -> list[GraphEdge]:
+        """Build the GraphEdges for the current prefill step.
+
+        For audio/vision/video walks the encoder is the first graph
+        node, so each ``input_name`` from the schedule entry routes
+        to that encoder; ``image_grid_thw`` and ``video_second_per_grid``
+        also need to reach the Thinker (for the 3D MRoPE math) and
+        get their own parallel edges to ``Thinker``.
+        """
+        schedule = metadata.kwargs["prefill_schedule"]
+        step = metadata.kwargs["prefill_step"]
+        walk_name, tensor_dict = schedule[step]
+
+        if walk_name == "prefill_text":
+            target_node = "Thinker"
+        elif walk_name == "prefill_audio":
+            target_node = "audio_encoder"
+        elif walk_name in ("prefill_vision", "prefill_video"):
+            target_node = "vision_encoder"
+        else:
+            raise ValueError(f"Unrecognized prefill walk: {walk_name!r}")
+
+        edges: list[GraphEdge] = []
+        for input_name, tensor_info in tensor_dict.items():
+            if input_name in ("image_grid_thw", "video_second_per_grid"):
+                # These go to the Thinker, not the encoder — handled below.
+                continue
+            edge = GraphEdge(next_node=target_node, name=input_name)
+            edge.tensor_info = [tensor_info]
+            edges.append(edge)
+
+        if walk_name in ("prefill_vision", "prefill_video"):
+            # Vision encoder needs image_grid_thw, AND the Thinker needs
+            # it for 3D position math. Emit a duplicate edge to each.
+            if "image_grid_thw" in tensor_dict:
+                enc_edge = GraphEdge(next_node="vision_encoder", name="image_grid_thw")
+                enc_edge.tensor_info = [tensor_dict["image_grid_thw"]]
+                edges.append(enc_edge)
+                thinker_edge = GraphEdge(next_node="Thinker", name="image_grid_thw")
+                thinker_edge.tensor_info = [tensor_dict["image_grid_thw"]]
+                edges.append(thinker_edge)
+            if walk_name == "prefill_video" and "video_second_per_grid" in tensor_dict:
+                vspg_edge = GraphEdge(next_node="Thinker", name="video_second_per_grid")
+                vspg_edge.tensor_info = [tensor_dict["video_second_per_grid"]]
+                edges.append(vspg_edge)
+
+        return edges
+
+    # ------------------------------------------------------------------
+    # Forward-pass arg builders — multimodal prefill scheduling (step 5c)
     # ------------------------------------------------------------------
 
     def get_initial_forward_pass_args(
@@ -443,19 +643,49 @@ class MingFlashOmniModel(Model):
     ) -> ForwardPassArgs:
         if partition_name != "Thinker":
             raise ValueError(f"Unknown partition: {partition_name!r}")
+        schedule = self._build_thinker_prefill_schedule(
+            input_modalities, input_signals,
+        )
+        if not schedule:
+            # No modalities provided — fall through to decode immediately.
+            # The conductor will report request_done after the first decode
+            # step returns nothing. Useful for empty-prompt smoke tests.
+            full_metadata = CurrentForwardConductorMetadata(
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk="thinker_decode",
+                is_prefill=False,
+            )
+            return ForwardPassArgs(
+                full_metadata=full_metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
+            )
+
+        first_walk, _ = schedule[0]
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            graph_walk="prefill",
+            graph_walk=first_walk,
             is_prefill=True,
+            kwargs={
+                "prefill_schedule": schedule,
+                "prefill_step": 0,
+            },
         )
-        graph_edge = GraphEdge(next_node="Thinker", name="text_inputs")
-        graph_edge.tensor_info = input_signals.get("text_inputs", [])
+        inputs = self._get_thinker_prefill_inputs(full_metadata, input_signals)
+        unpersist_tensors = sum(
+            (inp.tensor_info for inp in inputs), start=[],
+        )
         return ForwardPassArgs(
             full_metadata=full_metadata,
-            inputs=[graph_edge],
-            unpersist_tensors=list(graph_edge.tensor_info),
-            step_metadata={"is_prefill": True},
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata={
+                "is_prefill": True,
+                "is_last_prefill": len(schedule) == 1,
+            },
         )
 
     def get_partition_forward_pass_args(
@@ -466,22 +696,31 @@ class MingFlashOmniModel(Model):
         new_tokens: dict[str, list[int]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        """Thinker partition: prefill → decode loop until EOS or max tokens.
+        """Thinker state machine: walk schedule → thinker_decode → done.
 
-        Same shape as Orpheus's _get_llm_partition_forward.
+        Each prefill step pops the next walk from
+        ``metadata.kwargs["prefill_schedule"]``. When all prefill steps
+        are done we transition to ``thinker_decode``; when the decode
+        loop unwinds (the loop's max_iters or check_stop fired) we
+        return ``request_done=True``.
+
+        Same shape as ``mminf/model/qwen3_omni/qwen3_omni_model.py:765+``,
+        minus the Talker / Code2Wav partitions.
         """
         if partition_name != "Thinker":
             raise ValueError(f"Unknown partition: {partition_name!r}")
 
-        request_done = False
         if partition_metadata.is_prefill:
-            partition_metadata.is_prefill = False
-            partition_metadata.graph_walk = "decode"
-        elif partition_metadata.graph_walk == "decode":
-            request_done = True
-            partition_metadata.kwargs["decode_finished"] = True
-
-        if request_done:
+            step = partition_metadata.kwargs["prefill_step"] + 1
+            schedule = partition_metadata.kwargs["prefill_schedule"]
+            if step < len(schedule):
+                partition_metadata.kwargs["prefill_step"] = step
+                partition_metadata.graph_walk = schedule[step][0]
+            else:
+                partition_metadata.is_prefill = False
+                partition_metadata.graph_walk = "thinker_decode"
+        elif partition_metadata.graph_walk == "thinker_decode":
+            # Decode loop unwound — Thinker is fully done with this request.
             return ForwardPassArgs(
                 full_metadata=partition_metadata,
                 inputs=[],
@@ -489,13 +728,30 @@ class MingFlashOmniModel(Model):
                 request_done=True,
             )
 
-        graph_edge = GraphEdge(next_node="Thinker", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
+        if partition_metadata.is_prefill:
+            schedule = partition_metadata.kwargs["prefill_schedule"]
+            step = partition_metadata.kwargs["prefill_step"]
+            is_last_prefill = step == len(schedule) - 1
+            inputs = self._get_thinker_prefill_inputs(
+                partition_metadata, persist_signals,
+            )
+        else:
+            is_last_prefill = False
+            edge = GraphEdge(next_node="Thinker", name="text_inputs")
+            edge.tensor_info = persist_signals.get("new_token", [])
+            inputs = [edge]
+
+        unpersist_tensors = sum(
+            (inp.tensor_info for inp in inputs), start=[],
+        )
         return ForwardPassArgs(
             full_metadata=partition_metadata,
-            inputs=[graph_edge],
-            unpersist_tensors=list(graph_edge.tensor_info),
-            step_metadata={"is_prefill": partition_metadata.is_prefill},
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata={
+                "is_prefill": partition_metadata.is_prefill,
+                "is_last_prefill": is_last_prefill,
+            },
         )
 
     # ------------------------------------------------------------------
