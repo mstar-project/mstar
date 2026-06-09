@@ -625,8 +625,67 @@ graph-walk / partition / streaming patterns transfer 1:1.
      / 1 deselected** (deselected is pre-existing cuDNN-broken
      attention forward, unrelated).
 
-   - **6d — TODO** (AudioVAE): port `audio_vae.py`'s Encoder, Decoder,
-     ISTFTHead, ISTFT, StreamingLinearUpsample.
+   - **6d — DONE** (AudioVAE): new `components/audio_vae.py` ports
+     `vllm_omni/.../audio_vae.py` (~392 LOC). Module tree mirrors
+     upstream so the released ckpt's `talker/vae/model.safetensors`
+     keys load 1:1 by state-dict equality once the loader path
+     lands (6f).
+
+     Building blocks:
+     * `_ISTFT` — sliding-window OLA inverse-STFT. Two padding
+       modes: `"center"` wraps `torch.istft` directly; `"same"` is
+       the hand-rolled `F.fold` reconstruction with optional
+       streaming buffers (carries the trailing `win_length - hop`
+       samples + window envelope across chunks).
+     * `_ISTFTHead` — Linear → STFT mag (exp+clip) / phase → `_ISTFT`.
+     * `_StreamingLinearUpsample` — chunked linear upsampler with
+       1-step lookahead so chunked output matches single-shot output
+       at chunk boundaries.
+     * `_Encoder` — waveform → latent params. `get_frames` windows
+       the waveform with stride `hop_size`, `fc1` projects to hidden,
+       Qwen2 backbone runs, then optional `aggregator` (4-layer
+       Qwen2 + `cls_embed`) summarises each patch.
+     * `_Decoder` — latent → waveform. `fc1` to hidden, optional
+       `_StreamingLinearUpsample`, Qwen2 backbone with sliding-window
+       bridge for streaming KV cache, `_ISTFTHead` to audio.
+     * `AudioVAE` — wraps encoder+decoder, exposes `encode_latent`
+       (with an inline `_oobleck_sample()` so we don't depend on the
+       broken-on-this-box `diffusers` package) and `decode`.
+
+     **Defaults fixed**: `AudioVAEConfig.encoder_input_dim` /
+     `encoder_hop_size` were previously 80 / 320 (placeholder from
+     step 6a); updated to 882 / 882 to match the released ckpt
+     (`enc_kwargs: {hop_size: 882, input_dim: 882, latent_dim: 64}`).
+     The existing 6a tests still pass since they explicitly pass
+     overrides through `from_dict`.
+
+     `build_audio_vae(audio_vae_config, dtype, device, attn_implementation=None)`:
+     auto-picks `"sdpa"` on CPU and FA2 when available on CUDA;
+     caller can pin explicitly. Mirrors vllm-omni's runtime choice
+     for the talker LLM (`llm_config._attn_implementation = "sdpa"`).
+
+     18 tests in `test_ming_flash_omni_audio_vae.py` covering:
+     - Oobleck sampler shape + mean-collapse-on-small-scale.
+     - ISTFT padding-mode validation + center / same forward paths.
+     - StreamingLinearUpsample: single-shot path, deferred-first-chunk
+       path, **chunked-vs-single-shot equivalence** (the key
+       correctness property — proves boundary lookahead is wired
+       correctly so chunked streaming doesn't introduce artefacts).
+     - ISTFTHead output shape (audio + x_pred).
+     - Encoder: `get_frames` padding arithmetic, forward without
+       patching, forward with patching (aggregator path collapses
+       to per-patch latents).
+     - Decoder: non-streaming reconstruct shape, patching path
+       routes through the upsampler.
+     - AudioVAE: construction + encode_latent shape (incl. per-clip
+       frame counts) + decode end-to-end.
+     - **Snapshot-gated parity**: built `AudioVAE.state_dict()` keys
+       contain all representative entries present in
+       `talker/vae/model.safetensors` (fc1/fc2/fc3/norm/cls_embed,
+       encoder.encoder, encoder.aggregator, decoder.fc1,
+       decoder.head.out, decoder.head.istft.window, decoder.decoder)
+       and vice versa — proves the eventual loader will be a clean
+       prefix-strip + load_state_dict.
 
    - **6e — TODO** (Talker submodule + graph walks): wire the talker
      into mminf's graph + partition system. Need a streaming topology

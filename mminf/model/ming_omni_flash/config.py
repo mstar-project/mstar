@@ -367,10 +367,14 @@ class AudioVAEConfig:
     init_method: str = "kaiming"
 
     # Encoder / decoder dims pulled out of enc_kwargs / dec_kwargs.
+    # Defaults match the released ckpt's `talker/vae/config.json`:
+    # input_dim=882 (waveform frame size), hop_size=882 (one latent per
+    # 882-sample chunk → 50 latents/sec at 44.1 kHz), latent_dim=64,
+    # output_dim=882 (ISTFTHead hop_length; n_fft = output_dim * 4 = 3528).
     latent_dim: int = 64
-    encoder_input_dim: int = 80    # mel bins (default; overridden below)
-    encoder_hop_size: int = 320    # frames-per-latent (default)
-    decoder_output_dim: int = 882  # STFT bins fed to ISTFTHead
+    encoder_input_dim: int = 882
+    encoder_hop_size: int = 882
+    decoder_output_dim: int = 882
 
     # The full Qwen2-shaped backbones for enc/dec are kept as raw dicts
     # here; the modeling code (step 6d) will lift the relevant fields
