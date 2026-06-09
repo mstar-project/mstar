@@ -910,10 +910,24 @@ graph-walk / partition / streaming patterns transfer 1:1.
    step 9 (ImageGen partition), since today's prefill schedule only
    covers text-out generation.
 
-8. **TTS caption template (optional, talker-only deploy).** Port
-   `prompt_utils.BASE_CAPTION_TEMPLATE` + `create_instruction` so the
-   `ming_flash_omni_tts` deploy variant accepts the same JSON caption shape
-   that vllm-omni speaks.
+8. **TTS caption template — DONE.** `components/prompt_utils.py` ports
+   vllm-omni's `prompt_utils.py` wholesale (self-contained, no torch /
+   model deps):
+   * `create_instruction(user_input)` + `BASE_CAPTION_TEMPLATE` — the
+     JSON caption builder for the `ming_flash_omni_tts` talker-only
+     deploy. Merges only known keys (序号 / 说话人 / 方言 / 风格 / 语速
+     / 基频 / 音量 / 情感 / BGM / IP) into a deep-copied template;
+     `ensure_ascii=False` keeps the Chinese field names readable.
+   * `maybe_expand_image_gen_prompt` + `IMAGE_PATCH_TOKEN` +
+     `DEFAULT_NUM_QUERY_TOKENS=256` — the
+     `<image><imagePatch>*256</image>` query-token expansion the
+     ImageGen path (step 9) needs; landed here so the constants live
+     in one place.
+   10 tests in `test_ming_flash_omni_prompt_utils.py`: query-token
+   expansion (default 256, custom count, no-op on already-expanded /
+   empty / non-string), caption build (defaults, known-key merge,
+   unknown-key ignore, no template mutation across calls, unescaped
+   unicode, shallow BGM merge).
 
 9. **ImageGen partition (deferred).** Separate from the omni pipeline; lives
    under vllm-omni's diffusion tree. Wire as a fourth partition with its own
