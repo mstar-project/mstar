@@ -68,7 +68,8 @@ from mminf.model.ming_omni_flash.submodules import (
     BailingMoeV2ThinkerSubmodule,
     VisionEncoderSubmodule,
 )
-from mminf.streaming.topology import PartitionTopology
+from mminf.streaming.chunk_policy import FixedChunkPolicy
+from mminf.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
 
@@ -331,8 +332,67 @@ class MingFlashOmniModel(Model):
         except Exception as e:
             self._warn_tokenizer_unavailable("processor", e)
 
+        # Talker tokenizer (talker/llm/) — separate from the thinker
+        # tokenizer. The Thinker->Talker bridge (step 6e-3) decodes the
+        # thinker's text output and re-encodes it here. Loaded lazily on
+        # first use via `_get_talker_tokenizer` so thinker-only configs
+        # don't pay for it.
+        self._talker_tokenizer = None
+
         # Lazy submodule cache — populated on first get_submodule call.
         self._submodule_cache: dict[str, object] = {}
+
+    def _get_talker_tokenizer(self):
+        """Load + cache the talker's own Qwen2 tokenizer (talker/llm/).
+
+        The talker re-tokenizes the thinker's detokenized text with this
+        tokenizer (vocab_size 151936, distinct from the thinker's
+        BailingTokenizer). Returns None if the talker subdir / tokenizer
+        is unavailable.
+        """
+        if self._talker_tokenizer is not None:
+            return self._talker_tokenizer
+        talker_dir = Path(self.local_dir) / "talker" / "llm"
+        if not (talker_dir / "tokenizer_config.json").exists():
+            return None
+        try:
+            from transformers import AutoTokenizer
+            self._talker_tokenizer = AutoTokenizer.from_pretrained(
+                str(talker_dir), trust_remote_code=True,
+            )
+        except Exception as e:
+            logger.warning("Talker tokenizer (talker/llm/) failed to load: %s", e)
+            return None
+        return self._talker_tokenizer
+
+    def thinker_text_to_talker_inputs(self, thinker_token_ids) -> "torch.Tensor":
+        """Bridge: thinker output token ids -> talker_text_inputs token ids.
+
+        Ming's thinker->talker handoff passes detokenized TEXT, not
+        hidden states (see vllm-omni pipeline.py `thinker2talker`). We
+        decode the thinker's generated ids with the thinker tokenizer,
+        then re-encode with the talker's own `talker/llm` tokenizer.
+
+        Returns a 1-D long tensor of talker token ids. Raises if either
+        tokenizer is unavailable.
+        """
+        if self.tokenizer is None:
+            raise RuntimeError(
+                "thinker_text_to_talker_inputs: thinker tokenizer not loaded."
+            )
+        talker_tok = self._get_talker_tokenizer()
+        if talker_tok is None:
+            raise RuntimeError(
+                "thinker_text_to_talker_inputs: talker tokenizer (talker/llm/) "
+                "not available — cannot bridge to the Talker partition."
+            )
+        if isinstance(thinker_token_ids, torch.Tensor):
+            ids_list = thinker_token_ids.flatten().tolist()
+        else:
+            ids_list = list(thinker_token_ids)
+        text = self.tokenizer.decode(ids_list, skip_special_tokens=True)
+        talker_ids = talker_tok(text, return_tensors="pt").input_ids[0]
+        return talker_ids
 
     @staticmethod
     def _warn_tokenizer_unavailable(what: str, err: Exception) -> None:
@@ -473,41 +533,89 @@ class MingFlashOmniModel(Model):
         ])
 
         # Thinker decode loop — same shape as step 3f's `decode` walk,
-        # renamed for symmetry with the prefill walks.
+        # renamed for symmetry with the prefill walks. When the talker is
+        # available, each decoded token additionally streams to the Talker
+        # partition as ``thinker_tokens`` (the Talker accumulates the full
+        # text then re-tokenizes + generates audio in one shot — Ming's
+        # bridge passes detokenized text, not hidden states).
+        talker_enabled = self.config.talker is not None
+        decode_outputs = [
+            GraphEdge(
+                next_node=EMIT_TO_CLIENT,
+                name="new_token",
+                output_modality="text",
+            ),
+            GraphEdge(
+                next_node="Thinker",
+                name="text_inputs",
+                output_modality="text",
+            ),
+        ]
+        if talker_enabled:
+            decode_outputs.append(
+                StreamingGraphEdge(
+                    next_node="Talker",
+                    name="thinker_tokens",
+                    target_partition="Talker",
+                )
+            )
         thinker_decode = Loop(
             name="thinker_decode_loop",
             section=GraphNode(
                 name="Thinker",
                 input_names=["text_inputs"],
-                outputs=[
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="new_token",
-                        output_modality="text",
-                    ),
-                    GraphEdge(
-                        next_node="Thinker",
-                        name="text_inputs",
-                        output_modality="text",
-                    ),
-                ],
+                outputs=decode_outputs,
             ),
             max_iters=max_decode,
             outputs=[],
         )
-        return {
+        walks: dict[str, GraphSection] = {
             "prefill_text": prefill_text,
             "prefill_audio": prefill_audio,
             "prefill_vision": prefill_vision,
             "prefill_video": prefill_video,
             "thinker_decode": thinker_decode,
         }
+        if talker_enabled:
+            # Single Talker node: consume the streamed thinker tokens,
+            # run the full AR-decode + VAE-decode internally, emit one
+            # audio chunk to the client.
+            walks["talker"] = GraphNode(
+                name="Talker",
+                input_names=["thinker_tokens"],
+                outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="audio_chunk",
+                        output_modality="audio",
+                    ),
+                ],
+            )
+        return walks
 
     def get_partition_topology(self) -> PartitionTopology:
-        return PartitionTopology(partitions=["Thinker"], connections=[])
+        if self.config.talker is None:
+            return PartitionTopology(partitions=["Thinker"], connections=[])
+        return PartitionTopology(
+            partitions=["Thinker", "Talker"],
+            connections=[
+                Connection(
+                    from_partition="Thinker",
+                    to_partition="Talker",
+                    edge_name="thinker_tokens",
+                    # The talker needs the FULL text before it generates.
+                    # continue_after_done=True keeps the Talker partition
+                    # alive past the Thinker's text-EOS so it can fire its
+                    # single generation once all tokens have arrived.
+                    chunk_policy_factory=lambda: FixedChunkPolicy(
+                        chunk_size=1, continue_after_done=True,
+                    ),
+                ),
+            ],
+        )
 
     def get_partitions(self) -> list[PartitionDefinition]:
-        return [PartitionDefinition(
+        thinker = PartitionDefinition(
             name="Thinker",
             graph_walks={
                 "prefill_text", "prefill_audio",
@@ -516,7 +624,22 @@ class MingFlashOmniModel(Model):
             },
             initial_walk="prefill_text",
             producer_partitions=[],
-        )]
+        )
+        if self.config.talker is None:
+            return [thinker]
+        talker = PartitionDefinition(
+            name="Talker",
+            graph_walks={"talker"},
+            initial_walk=None,
+            producer_partitions=["Thinker"],
+        )
+        return [thinker, talker]
+
+    def get_output_sample_rate(self, modality: str = "audio") -> int:
+        """Talker AudioVAE sample rate (44.1 kHz on the released ckpt)."""
+        if modality == "audio" and self.config.talker is not None:
+            return self.config.talker.vae_sample_rate
+        return super().get_output_sample_rate(modality)
 
     # ------------------------------------------------------------------
     # Prefill scheduling — mirrors qwen3_omni's _build_thinker_prefill_schedule
@@ -649,6 +772,23 @@ class MingFlashOmniModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
+        if partition_name == "Talker":
+            # Talker is a consumer partition: it has no initial inputs of
+            # its own — it self-triggers when the Thinker's streamed
+            # ``thinker_tokens`` arrive. Audio output only.
+            audio_output = "audio" in output_modalities
+            full_metadata = CurrentForwardConductorMetadata(
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk="talker",
+                is_prefill=False,
+            )
+            return ForwardPassArgs(
+                full_metadata=full_metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=not audio_output,
+            )
         if partition_name != "Thinker":
             raise ValueError(f"Unknown partition: {partition_name!r}")
         schedule = self._build_thinker_prefill_schedule(
@@ -712,9 +852,14 @@ class MingFlashOmniModel(Model):
         loop unwinds (the loop's max_iters or check_stop fired) we
         return ``request_done=True``.
 
-        Same shape as ``mminf/model/qwen3_omni/qwen3_omni_model.py:765+``,
-        minus the Talker / Code2Wav partitions.
+        For the Talker partition the state machine is trivial: it runs
+        its single ``talker`` walk (one Talker node consuming the streamed
+        thinker tokens, generating audio internally) and is then done.
+
+        Thinker shape mirrors ``mminf/model/qwen3_omni/qwen3_omni_model.py:765+``.
         """
+        if partition_name == "Talker":
+            return self._get_talker_forward(partition_metadata, incoming_connections)
         if partition_name != "Thinker":
             raise ValueError(f"Unknown partition: {partition_name!r}")
 
@@ -760,6 +905,52 @@ class MingFlashOmniModel(Model):
                 "is_prefill": partition_metadata.is_prefill,
                 "is_last_prefill": is_last_prefill,
             },
+        )
+
+    def _get_talker_forward(
+        self,
+        metadata: CurrentForwardConductorMetadata,
+        incoming_connections: list[StreamingConnectionState] | None,
+    ) -> ForwardPassArgs:
+        """Talker partition state machine — runs once, then done.
+
+        The Talker is a single stateless node: it consumes the full
+        stream of ``thinker_tokens`` (gated by the FixedChunkPolicy with
+        continue_after_done=True so it stays alive past the Thinker's
+        text EOS), re-tokenizes the accumulated text, and generates one
+        audio chunk inside ``TalkerSubmodule.forward``. We fire that walk
+        once the producer (Thinker) is done, then report request_done.
+        """
+        conn = incoming_connections[0] if incoming_connections else None
+        producer_done = conn.producer_done if conn else True
+
+        # Wait until the Thinker has finished emitting all its tokens — the
+        # talker needs the FULL text before it can generate. Until then,
+        # return an empty no-op step (the conductor re-invokes us as more
+        # tokens stream in).
+        if not producer_done:
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+            )
+
+        if metadata.kwargs.get("talker_fired"):
+            # Already generated — the request is complete for this partition.
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
+            )
+
+        metadata.kwargs["talker_fired"] = True
+        metadata.graph_walk = "talker"
+        edge = GraphEdge(next_node="Talker", name="thinker_tokens")
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=[edge],
+            unpersist_tensors=[],
         )
 
     # ------------------------------------------------------------------
@@ -1256,4 +1447,8 @@ class MingFlashOmniModel(Model):
             stop_head=heads["stop_head"],
             audio_vae=audio_vae,
         )
-        return TalkerSubmodule(generator=generator, config=self.config)
+        return TalkerSubmodule(
+            generator=generator,
+            config=self.config,
+            text_bridge=self.thinker_text_to_talker_inputs,
+        )
