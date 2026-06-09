@@ -692,6 +692,48 @@ graph-walk / partition / streaming patterns transfer 1:1.
      for the CFM-step → audio-chunk flow (different shape from
      qwen3_omni's discrete-codec talker).
 
+   - **6f — DONE** (weight loaders): `loader.py` exposes five new
+     entry points on top of the step-4b `_load_prefixed_state_dict`
+     helper. The helper grew two args: `subdir` (relative to
+     `local_dir` — lets us point at `talker/` or `talker/vae/` instead
+     of the snapshot root) and `allow_unexpected` (set of post-rename
+     keys allowed to appear in the ckpt without a target module slot).
+
+     Five loaders:
+     * `load_talker_llm_weights` — strips `model.` from
+       `talker/model.safetensors` for a `transformers.Qwen2Model`.
+     * `load_talker_cfm_weights` — strips `cfm.` for a `CFM(DiT)`.
+       Allows the ckpt's `model.rotary_embed.inv_freq` (we register
+       it as `persistent=False` and recompute locally — deterministic
+       from head_dim + rope_theta).
+     * `load_talker_aggregator_weights` — strips `aggregator.` for
+       an `Aggregator`. Same `rotary_embed.inv_freq` allow.
+     * `load_talker_heads_weights` — loads `stop_head.*` +
+       `spk_head.*` into the dict produced by `build_talker_heads`.
+     * `load_talker_audio_vae_weights` — empty-prefix load from
+       `talker/vae/model.safetensors` (the ckpt's `encoder.*` /
+       `decoder.*` are top-level siblings with no shared prefix —
+       no strip needed).
+
+     7 snapshot-gated tests in `test_ming_flash_omni_talker_loader.py`
+     verify strict load against `/dev/shm/ming-hybrid/talker/`:
+     - Talker LLM: representative key parity + non-zero embed table
+       after load.
+     - CFM: `model.x_embedder.weight` / `model.blocks.0.attn.to_q.weight`
+       / `model.blocks.0.mlp.ff.0.0.weight` / `model.final_layer.linear.weight`.
+     - Aggregator: `x_embedder` / `word_embedder` / `blocks.0.attn.to_q`
+       / `final_layer.linear`.
+     - Heads: `stop_head` + `spk_head` weights both load; non-zero
+       post-load; missing-key guard fires before disk I/O.
+     - AudioVAE: full encoder + decoder + aggregator + ISTFT window
+       keys loaded; CPU end-to-end decode on a real-weights latent
+       produces a finite waveform (catches catastrophic
+       dtype/layout misloads that key-name parity alone wouldn't
+       surface).
+
+     Full Ming step-1..7 + 6a/6b/6c/6d/6f suite: 187 pass / 9 skipped
+     / 0 fail / 1 deselected.
+
 7. **Process_prompt — DONE.** `MingFlashOmniModel.process_prompt` now
    produces the full `NameToTensorList` consumed by step 5c's prefill
    scheduler. Strategy mirrors `qwen3_omni`'s `process_prompt`: apply
