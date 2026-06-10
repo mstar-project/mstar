@@ -26,6 +26,15 @@ Install from source
 This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, ZMQ, …) and installs the two
 console scripts, ``mminf`` and ``mminf-serve``.
 
+.. important::
+
+   ``mminf`` pins **PyTorch 2.9** (``torch==2.9.1`` / ``torchvision==0.24.1`` /
+   ``torchaudio==2.9.1``). The Qwen3-Omni extra depends on ``sgl-kernel``, which is built
+   against torch 2.9 — newer torch will not work. By default pip installs the PyTorch wheel
+   for the *newest* CUDA toolkit (currently CUDA 13), which may not match your machine. If
+   your CUDA version differs, install the matching torch build **before** ``pip install -e .``
+   — see `Matching your CUDA toolkit`_ below.
+
 Optional dependencies
 ---------------------
 
@@ -58,6 +67,11 @@ Model families and some output formats need extra packages, exposed as pip *extr
        from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.
    * - ``.[dev]``
      - ``ruff`` + ``pytest`` for linting and the test suite.
+   * - ``.[all]``
+     - The union of every model extra above — installs the full runtime for all model
+       families in one shot (including ``flash-attn`` and ``sgl-kernel``). Convenient for a
+       machine that serves multiple models; heavier and slower to install than a single
+       family's extra.
 
 Combine extras as needed:
 
@@ -86,6 +100,26 @@ The GPU model families depend on:
 
 These are installed by the extras above. Make sure your installed ``torch`` matches your
 CUDA version *before* installing them.
+
+Matching your CUDA toolkit
+--------------------------
+
+PyPI's default ``torch`` wheel targets the newest CUDA release. To get the build for *your*
+CUDA toolkit, install the pinned torch trio from PyTorch's CUDA-specific index **first**, then
+install ``mminf`` (pip then sees the requirement as already satisfied and won't pull a
+different build):
+
+.. code-block:: bash
+
+   # CUDA 12.8
+   pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+       --index-url https://download.pytorch.org/whl/cu128
+   pip install -e ".[bagel]"      # add the extras you need
+
+Swap ``cu128`` for your toolkit (e.g. ``cu126``, ``cu130``). Check your driver's CUDA version
+with ``nvidia-smi`` and pick the closest build at
+https://pytorch.org/get-started/locally/. Keep all three packages on the same ``2.9`` /
+``0.24`` line — ``torchvision`` and ``torchaudio`` are versioned in lockstep with ``torch``.
 
 Verify the install
 ------------------

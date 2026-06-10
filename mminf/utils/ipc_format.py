@@ -98,6 +98,7 @@ class WorkerMessage:
 class ConductorMessageType(Enum):
     NEW_REQUEST = "new_request"
     WORKER_GRAPHS_DONE = "worker_graphs_done"
+    SETUP_DONE = "setup_done"
 
 
 @dataclass
@@ -124,6 +125,10 @@ class WorkerGraphsDone(MessageBody):
     stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
     output_loop_indices: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
+
+@dataclass
+class SetupDone(MessageBody):
+    worker_id: str
 
 @dataclass
 class ConductorMessage:

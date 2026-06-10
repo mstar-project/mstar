@@ -39,6 +39,7 @@ from mminf.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+from mminf.utils.logging_config import quiet_noisy_loggers
 from mminf.utils.profiler import range_pop, range_push
 from mminf.utils.sampling import SamplingConfig
 
@@ -101,6 +102,7 @@ def _worker_process_target(
         format=f"%(asctime)s %(levelname)s [{worker_id}] %(name)s: %(message)s",
         force=True,
     )
+    quiet_noisy_loggers()
 
     from mminf.worker.worker import Worker
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
@@ -323,6 +325,10 @@ class Conductor:
 
         self._sorted_ranks = sorted(rank_to_worker_graphs.keys())
         self.worker_ids = [f"worker_{rank}" for rank in self._sorted_ranks]
+
+        # Messages that arrive before all workers report SETUP_DONE; replayed
+        # on the first main-loop iteration. See _wait_for_workers_ready.
+        self._startup_message_backlog: list = []
 
         # Per-worker graph units, engine configs
         self._per_worker_graphs: dict[str, list[WorkerGraph]] = {}
@@ -985,8 +991,35 @@ class Conductor:
             )
             self.communicator.send(worker_id, message)
 
+    def _wait_for_workers_ready(self) -> None:
+        """Block until every worker reports ``SETUP_DONE`` (weight load + warmup
+        + CUDA-graph capture), so the main loop opens only once all workers can
+        serve. Any non-``SETUP_DONE`` message that races in is stashed and
+        replayed on the first main-loop iteration so it isn't lost.
+        """
+        pending = set(self.worker_ids)
+        logger.info(
+            "Conductor waiting for %d worker(s) to finish setup", len(pending)
+        )
+        while pending:
+            for message in self.communicator.get_all_new_messages():
+                if message.message_type == ConductorMessageType.SETUP_DONE:
+                    pending.discard(message.body.worker_id)
+                else:
+                    self._startup_message_backlog.append(message)
+            if pending:
+                time.sleep(0.01)
+        logger.info("Conductor: all %d worker(s) ready", len(self.worker_ids))
+
     def run(self):
         from mminf.utils.profiler import range_pop, range_push
+
+        self._wait_for_workers_ready()
+
+        self.communicator.send(
+            "api_server",
+            APIServerMessage(message_type="setup_done")
+        )
 
         while True:
             if self.enable_nvtx:
@@ -995,7 +1028,9 @@ class Conductor:
             try:
                 done_partition_forwards: list[tuple[str, str, bool]] = []
 
-                for message in self.communicator.get_all_new_messages():
+                startup_backlog = self._startup_message_backlog
+                self._startup_message_backlog = []
+                for message in startup_backlog + self.communicator.get_all_new_messages():
                     if message.message_type == ConductorMessageType.NEW_REQUEST:
                         self._ingest_request(message.body)
                     elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:

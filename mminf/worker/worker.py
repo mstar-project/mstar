@@ -32,6 +32,7 @@ from mminf.utils.ipc_format import (
     NewRequest,
     RemoveRequest,
     ScheduleTPNode,
+    SetupDone,
     StopLoops,
     TensorReceived,
     UnpersistTensors,
@@ -1927,6 +1928,18 @@ class Worker:
         # engine's ``warmup``. The follower can't service the message
         # yet, but the leader will sit on the first NCCL collective.
         self.tp_groups.barrier_all()
+
+        # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
+        # the conductor this worker is ready. The conductor blocks its main
+        # loop until every worker reports in, so the API server only advertises
+        # readiness once all workers can actually serve.
+        self.communicator.send(
+            "conductor",
+            ConductorMessage(
+                message_type=ConductorMessageType.SETUP_DONE,
+                body=SetupDone(worker_id=self.worker_id),
+            ),
+        )
 
         # The async worker path needs decode submission to return quickly so
         # the main loop can overlap queue/tensor polling and post-processing

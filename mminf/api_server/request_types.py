@@ -35,8 +35,8 @@ class RequestComplete:
 @dataclass
 class APIServerMessage:
     """Envelope for messages received by the API server."""
-    message_type: str  # "result_tensors" | "request_complete"
-    body: ResultTensors | RequestComplete
+    message_type: str  # "result_tensors" | "request_complete" | "setup_done"
+    body: ResultTensors | RequestComplete | None = None  # None for setup_done message
 
 
 @dataclass

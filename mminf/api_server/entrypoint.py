@@ -24,6 +24,7 @@ from mminf.api_server.data_worker import PreprocessWorker
 from mminf.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mminf.communication.communicator import CommProtocol, ZMQCommunicator
 from mminf.model.registry import HF_MODELS
+from mminf.utils.logging_config import quiet_noisy_loggers
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ def _conductor_process_target(
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
         force=True,
     )
+    quiet_noisy_loggers()
     from mminf.conductor.conductor import Conductor
     from mminf.model.registry import get_model_class
 
@@ -182,11 +184,36 @@ class APIServer:
             ipc_socket_path_prefix=socket_path_prefix,
         )
 
-        # Background thread that drains results from conductor
+        # Background thread that drains results from the conductor. Started by
+        # finalize_setup() once the workers report ready — before that there's
+        # no traffic to drain and the HTTP server isn't up yet.
         self._msg_thread = threading.Thread(
             target=self._process_messages, daemon=True
         )
-        self._msg_thread.start()
+
+    def finalize_setup(self) -> None:
+        """Block until the conductor signals that every worker has finished
+        setup (weight load + warmup + CUDA-graph capture), then start draining
+        results. Called before the HTTP server binds, so ``mminf`` only begins
+        serving once it can actually handle requests.
+        """
+        logger.info(
+            "Waiting for workers to finish setup "
+            "(loading weights, capturing CUDA graphs)..."
+        )
+        while True:
+            for message in self.communicator.get_all_new_messages():
+                if (
+                    isinstance(message, APIServerMessage)
+                    and message.message_type == "setup_done"
+                ):
+                    logger.info("All workers ready")
+                    self._msg_thread.start()
+                    return
+                logger.warning(
+                    "Unexpected message before setup_done: %s", type(message)
+                )
+            time.sleep(0.01)
 
     # ----------------------------------------------------------
     # Submitting a request
@@ -621,6 +648,7 @@ def main(argv: list[str] | None = None):
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s [api_server] %(name)s: %(message)s",
     )
+    quiet_noisy_loggers()
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
@@ -670,6 +698,9 @@ def main(argv: list[str] | None = None):
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
 
     try:
+        # Block until all workers have finished setup, so the server only binds
+        # (and logs "Starting…") once it can actually serve requests.
+        api_server.finalize_setup()
         logger.info("Starting mminf API server on %s:%s", args.host, args.port)
         uvicorn.run(app, host=args.host, port=args.port, access_log=False)
     except KeyboardInterrupt:
