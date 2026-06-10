@@ -18,7 +18,6 @@ import pytest
 from mminf.conductor.request_info import CurrentForwardConductorMetadata
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphNode, Loop
-from mminf.streaming.topology import StreamingGraphEdge
 from mminf.model.ming_omni_flash.config import (
     AudioEncoderConfig,
     AudioVAEConfig,
@@ -30,6 +29,7 @@ from mminf.model.ming_omni_flash.config import (
     VisionEncoderConfig,
 )
 from mminf.model.ming_omni_flash.ming_omni_flash_model import MingFlashOmniModel
+from mminf.streaming.topology import StreamingGraphEdge
 
 
 def _talker_config() -> TalkerConfig:

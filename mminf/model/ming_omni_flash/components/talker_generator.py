@@ -28,7 +28,6 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from mminf.model.ming_omni_flash.components.talker_dit import (
@@ -38,8 +37,8 @@ from mminf.model.ming_omni_flash.components.talker_dit import (
 )
 
 if TYPE_CHECKING:
-    from transformers import Qwen2Config
     from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
+
     from mminf.model.ming_omni_flash.components.audio_vae import AudioVAE
     from mminf.model.ming_omni_flash.config import TalkerConfig
 

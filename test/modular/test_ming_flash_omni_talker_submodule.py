@@ -30,6 +30,7 @@ from mminf.model.ming_omni_flash.components.talker_dit import (
 )
 from mminf.model.ming_omni_flash.components.talker_generator import TalkerGenerator
 from mminf.model.ming_omni_flash.config import (
+    AudioEncoderConfig,
     AudioVAEConfig,
     DiTBlockConfig,
     MingFlashOmniModelConfig,
@@ -37,11 +38,9 @@ from mminf.model.ming_omni_flash.config import (
     TalkerLLMConfig,
     ThinkerLLMConfig,
     VisionEncoderConfig,
-    AudioEncoderConfig,
 )
 from mminf.model.ming_omni_flash.ming_omni_flash_model import MingFlashOmniModel
 from mminf.model.ming_omni_flash.submodules import TalkerSubmodule
-
 
 # ---------------------------------------------------------------------------
 # Snapshot discovery

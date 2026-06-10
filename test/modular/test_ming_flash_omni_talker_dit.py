@@ -26,19 +26,17 @@ from mminf.model.ming_omni_flash.components.talker_dit import (
     DiT,
     DiTTimestepEmbedding,
     RotaryEmbedding,
-    build_talker_cfm,
-    get_epss_timesteps,
-)
-from mminf.model.ming_omni_flash.components.talker_dit import (
+    _apply_rotary_pos_emb,
     _Attention,
     _CondEmbedder,
     _DiTBlock,
     _FeedForward,
     _FinalLayer,
     _RMSNorm,
-    _apply_rotary_pos_emb,
     _rotate_half_interleaved,
     _SinusPositionEmbedding,
+    build_talker_cfm,
+    get_epss_timesteps,
 )
 from mminf.model.ming_omni_flash.config import (
     AudioVAEConfig,
@@ -46,7 +44,6 @@ from mminf.model.ming_omni_flash.config import (
     TalkerConfig,
     TalkerLLMConfig,
 )
-
 
 # ---------------------------------------------------------------------------
 # RotaryEmbedding — match x_transformers' interleaved-pair layout
@@ -449,7 +446,7 @@ def test_attention_no_mask_no_zeroing() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _tiny_aggregator(llm_input_dim: int = 16) -> "Aggregator":
+def _tiny_aggregator(llm_input_dim: int = 16):
     from mminf.model.ming_omni_flash.components.talker_dit import Aggregator
     return Aggregator(
         in_channels=8,

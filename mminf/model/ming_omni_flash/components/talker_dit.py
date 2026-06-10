@@ -25,12 +25,10 @@ runtime dep surface small:
 from __future__ import annotations
 
 import math
-from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-
 
 # ===========================================================================
 # Sinusoidal timestep embedding (port of vllm-omni's DiTTimestepEmbedding)

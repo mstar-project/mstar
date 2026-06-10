@@ -20,19 +20,16 @@ import pytest
 import torch
 
 from mminf.model.ming_omni_flash.components.audio_vae import (
+    _ISTFT,
     AudioVAE,
-    build_audio_vae,
-)
-from mminf.model.ming_omni_flash.components.audio_vae import (
     _Decoder,
     _Encoder,
-    _ISTFT,
     _ISTFTHead,
-    _StreamingLinearUpsample,
     _oobleck_sample,
+    _StreamingLinearUpsample,
+    build_audio_vae,
 )
 from mminf.model.ming_omni_flash.config import AudioVAEConfig
-
 
 # ---------------------------------------------------------------------------
 # Snapshot discovery
@@ -334,7 +331,8 @@ def test_audio_vae_encode_latent_returns_correct_shape() -> None:
     # input_dim=16 → frame_num[0] = ceil(64/16) = 4, frame_num[1] = ceil(48/16) = 3.
     assert frame_num.tolist() == [4, 3]
     # Latent dimensions: (B, T_latents, latent_dim) after transpose.
-    # T_latents = encoder T_frames = ceil((64 + 15) / 16) = 4 (same for both since waveform was padded to max len before encoder)
+    # T_latents = encoder T_frames = ceil((64 + 15) / 16) = 4 (same for both
+    # since the waveform was padded to the max length before the encoder).
     assert latent.shape[0] == 2
     assert latent.shape[2] == 4   # latent_dim
     assert torch.isfinite(latent).all()
@@ -371,6 +369,7 @@ def test_audio_vae_module_keys_match_snapshot_state_dict() -> None:
     aggregator.layers.0.*) — full parameter coverage is the loader's job.
     """
     from safetensors import safe_open
+
     from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig
 
     snap = _find_local_snapshot()

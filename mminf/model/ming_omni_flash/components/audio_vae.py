@@ -43,10 +43,13 @@ Two simplifications vs vllm-omni:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from transformers import Qwen2Config
 from torch import nn
 
 logger = logging.getLogger(__name__)

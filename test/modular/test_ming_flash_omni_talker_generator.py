@@ -8,12 +8,10 @@ configs on CPU; integration with mminf's graph system lands in 6e-2.
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import pytest
 import torch
 
+from mminf.model.ming_omni_flash.components.audio_vae import build_audio_vae
 from mminf.model.ming_omni_flash.components.talker_dit import (
     build_aggregator,
     build_talker_cfm,
@@ -25,14 +23,12 @@ from mminf.model.ming_omni_flash.components.talker_generator import (
     silence_holder,
     trim_trailing_silence,
 )
-from mminf.model.ming_omni_flash.components.audio_vae import build_audio_vae
 from mminf.model.ming_omni_flash.config import (
     AudioVAEConfig,
     DiTBlockConfig,
     TalkerConfig,
     TalkerLLMConfig,
 )
-
 
 # ---------------------------------------------------------------------------
 # Tiny TalkerConfig + Qwen2 backbone for fast CPU tests
