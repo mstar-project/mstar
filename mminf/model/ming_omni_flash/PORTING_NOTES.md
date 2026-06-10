@@ -967,14 +967,52 @@ graph-walk / partition / streaming patterns transfer 1:1.
      snapshot-gated assertions on dit.dim=3840 / vae.latent_channels=16
      / scheduler.shift=3.0 / byt5.sdxl_channels=2560 / connector qwen2).
 
-   - **9b+ — TODO** (modeling + pipeline): port the ZImage DiT
-     (`ming_zimage_transformer.py`), ByT5 mapper + encoder
-     (`byte5_encoder.py`, `t5_block_mapper.py`), condition encoder
-     (`condition_encoder.py`), and the diffusion pipeline
-     (`pipeline_ming_imagegen.py`) + AutoencoderKL decode. Then the
-     ImageGen partition + graph walk + weight loaders. This is a whole
-     diffusion stack (~1.3 KLOC upstream) and a separate deploy from
-     the omni text/audio path.
+   - **9b — DONE** (modeling + pipeline + wiring): the full image-gen
+     stack is ported into `components/` as native pure-torch (+ stock
+     transformers) modules, decoupled from vllm-omni / vllm TP / diffusers
+     internals:
+     * `t5_block_mapper.py` + `byte5_encoder.py` — ByT5 glyph mapper +
+       encoder. Built on **stock HF `T5Block`** (unfused q/k/v/o,
+       wi_0/wi_1/wo) so Ming's `byt5_mapper.pt` loads with a plain `copy_`,
+       no stacked-param remap. 11 mapper tests + 1 snapshot-gated encoder.
+     * `zimage_transformer.py` — ZImage DiT (`ZImageTransformer2DModel`) +
+       Ming's ref-latent subclass (`MingZImageTransformer2DModel`). Drops
+       vllm's TP linears / `CachedTransformer` / fused `Attention` /
+       `RotaryEmbedding` for plain `nn.Linear` +
+       `F.scaled_dot_product_attention`. Unfused param names
+       (`attention.to_q/to_k/to_v`, `feed_forward.w1/w3`) → direct load.
+       The interleaved (is_neox_style=False) RoPE, GLIDE/DiT
+       `timestep_embedding`, and FP32 RMSNorm match the vllm-omni reference
+       (RoPE parity verified maxdiff=0.0). 14 tests on a tiny config.
+       One intentional divergence: vllm-omni computes-but-does-not-apply the
+       attention pad mask; this port applies it (identical for the bsz-1
+       multiple-of-32 t2i path, correct when caption padding is nonzero).
+     * `condition_encoder.py` — Qwen2-connector condition path (proj_in →
+       bidirectional Qwen2 → proj_out → L2-normalize×1000). transformers
+       only (no diffusers). 7 tests with a stub connector.
+     * `imagegen_pipeline.py` — flow-matching + CFG denoise loop
+       (`MingImageDenoiser`, `combine_cfg`, `calculate_shift`) **decoupled
+       from diffusers** (DiT/scheduler/VAE injected), so the guidance math /
+       sign convention / scheduler stepping are unit-tested with stubs.
+       diffusers + transformers loading lives behind the lazy
+       `MingImagePipeline.from_checkpoint` classmethod (diffusers is broken
+       on this box — confirmed — so eager import is avoided). 11 tests.
+     * Wiring (`submodules.py` + `ming_omni_flash_model.py`):
+       `ImageGenSubmodule` (STATELESS consumer) + an `imagegen` graph walk +
+       `ImageGen` partition + `Thinker→ImageGen` streaming connection
+       (`continue_after_done`) + `_create_imagegen_submodule` factory, all
+       guarded on `config.image_gen`. Mirrors the Talker consumer pattern.
+       17 graph/partition/submodule tests.
+
+     **Remaining live-bringup gap (not modeling):** the thinker decode path
+     currently returns logits only — it does not yet *emit* the query-token
+     hidden states as a `thinker_hidden_states` streaming edge, so the
+     Thinker→ImageGen handoff is wired on the consumer side but the producer
+     side needs the thinker submodule to expose hidden states at the
+     `<imagePatch>` positions. End-to-end image output also needs live
+     multi-GPU serve (TP=8) + a working diffusers. The modeling + graph
+     wiring are complete and unit-validated; this producer-side hidden-state
+     emit + live bring-up is the only piece left.
 
 10. **Configs — DONE.** `configs/ming_flash_omni.yaml` rewritten to the
     real registered node names: `vision_encoder` + `audio_encoder` +
