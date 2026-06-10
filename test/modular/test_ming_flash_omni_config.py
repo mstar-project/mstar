@@ -148,6 +148,19 @@ def test_subdir_configs_load_when_present(config: MingFlashOmniModelConfig) -> N
     assert config.image_gen.num_query_tokens == 256  # img_gen_scales=[16] => 16*16
     assert config.image_gen.diffusion_c_input_dim == 2560
     assert config.image_gen.text_encoder_norm is True
+    # Step 9a: typed sub-configs parsed from the imagegen subdir tree.
+    assert config.image_gen.dit.dim == 3840
+    assert config.image_gen.dit.n_layers == 30
+    assert config.image_gen.dit.in_channels == 16
+    assert config.image_gen.dit.axes_dims == (32, 48, 48)
+    assert config.image_gen.vae.latent_channels == 16
+    assert config.image_gen.vae.scaling_factor == pytest.approx(0.3611)
+    assert config.image_gen.scheduler.shift == pytest.approx(3.0)
+    assert config.image_gen.byt5.sdxl_channels == 2560
+    assert config.image_gen.byt5.byt5_name == "google/byt5-small"
+    # Connector is a Qwen2 LLM kept as a raw dict.
+    assert config.image_gen.connector is not None
+    assert config.image_gen.connector.get("model_type") == "qwen2"
 
 
 def test_subdir_configs_absent_returns_none() -> None:
@@ -418,3 +431,131 @@ def test_talker_config_default_factories_yield_real_dataclasses() -> None:
     assert isinstance(t.aggregator, DiTBlockConfig)
     assert isinstance(t.vae, AudioVAEConfig)
     assert t.vae_sample_rate == 44100   # convenience property
+
+
+# ---------------------------------------------------------------------------
+# Step 9a: ImageGen typed sub-configs (pure-Python)
+# ---------------------------------------------------------------------------
+
+
+def test_zimage_dit_config_from_dict_coerces_tuples_and_filters() -> None:
+    from mminf.model.ming_omni_flash.config import ZImageDiTConfig
+    dit = ZImageDiTConfig.from_dict({
+        "dim": 3840, "n_layers": 30, "in_channels": 16,
+        "axes_dims": [32, 48, 48], "axes_lens": [1536, 512, 512],
+        "all_patch_size": [2], "_class_name": "ZImageTransformer2DModel",
+    })
+    assert dit.dim == 3840
+    assert dit.axes_dims == (32, 48, 48)
+    assert dit.axes_lens == (1536, 512, 512)
+    assert dit.all_patch_size == (2,)
+    assert not hasattr(dit, "_class_name")
+
+
+def test_image_vae_config_defaults_and_from_dict() -> None:
+    from mminf.model.ming_omni_flash.config import ImageVAEConfig
+    vae = ImageVAEConfig.from_dict({
+        "latent_channels": 16, "scaling_factor": 0.3611, "shift_factor": 0.1159,
+        "act_fn": "silu", "ignored": 1,
+    })
+    assert vae.latent_channels == 16
+    assert vae.scaling_factor == pytest.approx(0.3611)
+    assert vae.shift_factor == pytest.approx(0.1159)
+    assert not hasattr(vae, "ignored")
+
+
+def test_imagegen_scheduler_config_from_dict() -> None:
+    from mminf.model.ming_omni_flash.config import ImageGenSchedulerConfig
+    s = ImageGenSchedulerConfig.from_dict({
+        "num_train_timesteps": 1000, "shift": 3.0, "use_dynamic_shifting": False,
+        "_class_name": "FlowMatchEulerDiscreteScheduler",
+    })
+    assert s.num_train_timesteps == 1000
+    assert s.shift == pytest.approx(3.0)
+    assert s.use_dynamic_shifting is False
+
+
+def test_byt5_mapper_config_from_nested_json() -> None:
+    from mminf.model.ming_omni_flash.config import ByT5MapperConfig
+    b = ByT5MapperConfig.from_json({
+        "byt5_mapper_type": "T5EncoderBlockByT5Mapper",
+        "byt5_mapper_config": {"num_layers": 4, "sdxl_channels": 2560},
+        "byt5_config": {"byt5_name": "google/byt5-small", "multilingual": True},
+        "byt5_max_length": 256,
+    })
+    assert b.byt5_mapper_type == "T5EncoderBlockByT5Mapper"
+    assert b.mapper_num_layers == 4
+    assert b.sdxl_channels == 2560
+    assert b.byt5_name == "google/byt5-small"
+    assert b.byt5_max_length == 256
+    assert b.multilingual is True
+
+
+def test_imagegen_config_default_factories_yield_typed_subconfigs() -> None:
+    from mminf.model.ming_omni_flash.config import (
+        ByT5MapperConfig,
+        ImageGenConfig,
+        ImageGenSchedulerConfig,
+        ImageVAEConfig,
+        ZImageDiTConfig,
+    )
+    ig = ImageGenConfig()
+    assert isinstance(ig.dit, ZImageDiTConfig)
+    assert isinstance(ig.vae, ImageVAEConfig)
+    assert isinstance(ig.scheduler, ImageGenSchedulerConfig)
+    assert isinstance(ig.byt5, ByT5MapperConfig)
+    assert ig.connector is None  # only populated by from_subdirs
+    assert ig.use_identity_mlp is True
+    assert ig.dit_type == "zimage"
+
+
+def test_imagegen_from_subdirs_returns_none_without_transformer() -> None:
+    """No transformer/ subdir → None (thinker-only / talker-only ckpt)."""
+    from mminf.model.ming_omni_flash.config import ImageGenConfig
+    with tempfile.TemporaryDirectory() as tmp:
+        assert ImageGenConfig.from_subdirs(Path(tmp)) is None
+
+
+def test_imagegen_from_subdirs_parses_synthetic_tree() -> None:
+    """from_subdirs reads each subdir's config into the typed fields."""
+    from mminf.model.ming_omni_flash.config import ImageGenConfig
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "transformer").mkdir()
+        (root / "transformer" / "config.json").write_text(json.dumps({
+            "_class_name": "ZImageTransformer2DModel",
+            "dim": 1024, "n_layers": 4, "in_channels": 16,
+            "axes_dims": [8, 12, 12], "axes_lens": [128, 64, 64],
+        }))
+        (root / "vae").mkdir()
+        (root / "vae" / "config.json").write_text(json.dumps({
+            "latent_channels": 16, "scaling_factor": 0.5, "shift_factor": 0.1,
+        }))
+        (root / "scheduler").mkdir()
+        (root / "scheduler" / "scheduler_config.json").write_text(json.dumps({
+            "num_train_timesteps": 1000, "shift": 2.5,
+        }))
+        (root / "byt5").mkdir()
+        (root / "byt5" / "byt5.json").write_text(json.dumps({
+            "byt5_mapper_config": {"num_layers": 2, "sdxl_channels": 1024},
+            "byt5_config": {"byt5_name": "google/byt5-small"},
+        }))
+        (root / "connector").mkdir()
+        (root / "connector" / "config.json").write_text(json.dumps({
+            "model_type": "qwen2", "hidden_size": 1536,
+        }))
+        (root / "mlp").mkdir()
+        (root / "mlp" / "config.json").write_text(json.dumps({
+            "img_gen_scales": [16], "diffusion_c_input_dim": 2560,
+            "use_identity_mlp": True, "dit_type": "zimage",
+        }))
+
+        ig = ImageGenConfig.from_subdirs(root)
+        assert ig is not None
+        assert ig.dit.dim == 1024
+        assert ig.dit.axes_dims == (8, 12, 12)
+        assert ig.vae.scaling_factor == pytest.approx(0.5)
+        assert ig.scheduler.shift == pytest.approx(2.5)
+        assert ig.byt5.mapper_num_layers == 2
+        assert ig.connector["hidden_size"] == 1536
+        assert ig.num_query_tokens == 256

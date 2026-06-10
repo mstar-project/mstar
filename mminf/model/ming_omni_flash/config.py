@@ -505,19 +505,139 @@ class TalkerConfig:
 
 
 # ---------------------------------------------------------------------------
-# Image generation (SKELETON — step 9 will fill in)
+# Image generation (step 9a — typed sub-configs)
 # ---------------------------------------------------------------------------
+#
+# The released ckpt's imagegen components live in sibling subdirs:
+#   transformer/  — ZImageTransformer2DModel (the diffusion DiT)
+#   vae/          — AutoencoderKL (16-channel latent, scaling/shift)
+#   scheduler/    — FlowMatchEulerDiscreteScheduler
+#   connector/    — Qwen2ForCausalLM (caption-feature connector)
+#   byt5/         — ByT5 glyph encoder + T5-block mapper (text rendering)
+#   mlp/          — projector knobs (img_gen_scales, diffusion_c_input_dim)
+
+
+@dataclass
+class ZImageDiTConfig:
+    """ZImageTransformer2DModel (the image-gen diffusion backbone).
+
+    Fields mirror the released ``transformer/config.json`` (a diffusers
+    config with ``_class_name="ZImageTransformer2DModel"``). The DiT is a
+    flow-matching transformer with 3D axial RoPE (``axes_dims`` /
+    ``axes_lens``) operating on 16-channel VAE latents.
+    """
+
+    dim: int = 3840
+    n_layers: int = 30
+    n_refiner_layers: int = 2
+    n_heads: int = 30
+    n_kv_heads: int = 30
+    in_channels: int = 16
+    cap_feat_dim: int = 2560
+    siglip_feat_dim: int | None = None
+    norm_eps: float = 1e-5
+    qk_norm: bool = True
+    rope_theta: float = 256.0
+    t_scale: float = 1000.0
+    axes_dims: tuple[int, ...] = (32, 48, 48)
+    axes_lens: tuple[int, ...] = (1536, 512, 512)
+    all_patch_size: tuple[int, ...] = (2,)
+    all_f_patch_size: tuple[int, ...] = (1,)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ZImageDiTConfig:
+        fnames = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in d.items() if k in fnames}
+        for tup_key in ("axes_dims", "axes_lens", "all_patch_size", "all_f_patch_size"):
+            if tup_key in filtered and isinstance(filtered[tup_key], list):
+                filtered[tup_key] = tuple(filtered[tup_key])
+        return cls(**filtered)
+
+
+@dataclass
+class ImageVAEConfig:
+    """AutoencoderKL for image-gen (vae/config.json).
+
+    16-channel latent space with diffusers-style ``scaling_factor`` /
+    ``shift_factor`` applied to latents before / after the DiT.
+    """
+
+    in_channels: int = 3
+    out_channels: int = 3
+    latent_channels: int = 16
+    layers_per_block: int = 2
+    norm_num_groups: int = 32
+    sample_size: int = 1024
+    scaling_factor: float = 0.3611
+    shift_factor: float = 0.1159
+    force_upcast: bool = True
+    act_fn: str = "silu"
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ImageVAEConfig:
+        fnames = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in fnames})
+
+
+@dataclass
+class ImageGenSchedulerConfig:
+    """FlowMatchEulerDiscreteScheduler (scheduler/scheduler_config.json)."""
+
+    num_train_timesteps: int = 1000
+    shift: float = 3.0
+    use_dynamic_shifting: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ImageGenSchedulerConfig:
+        fnames = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in fnames})
+
+
+@dataclass
+class ByT5MapperConfig:
+    """ByT5 glyph encoder + T5-block mapper (byt5/byt5.json).
+
+    Drives the text-rendering pathway: a ByT5-small encoder feeds a
+    ``T5EncoderBlockByT5Mapper`` that projects glyph features into the
+    DiT's caption-feature space (``sdxl_channels``). The font / color
+    special-token annotation files live alongside in ``byt5/``.
+    """
+
+    byt5_mapper_type: str = "T5EncoderBlockByT5Mapper"
+    mapper_num_layers: int = 4
+    sdxl_channels: int = 2560
+    byt5_name: str = "google/byt5-small"
+    byt5_max_length: int = 256
+    multilingual: bool = True
+    special_token: bool = True
+    color_special_token: bool = True
+    font_special_token: bool = True
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> ByT5MapperConfig:
+        mapper = d.get("byt5_mapper_config", {}) or {}
+        byt5 = d.get("byt5_config", {}) or {}
+        return cls(
+            byt5_mapper_type=str(d.get("byt5_mapper_type", "T5EncoderBlockByT5Mapper")),
+            mapper_num_layers=int(mapper.get("num_layers", 4)),
+            sdxl_channels=int(mapper.get("sdxl_channels", 2560)),
+            byt5_name=str(byt5.get("byt5_name", "google/byt5-small")),
+            byt5_max_length=int(d.get("byt5_max_length", 256)),
+            multilingual=bool(byt5.get("multilingual", True)),
+            special_token=bool(byt5.get("special_token", True)),
+            color_special_token=bool(byt5.get("color_special_token", True)),
+            font_special_token=bool(byt5.get("font_special_token", True)),
+        )
+
 
 @dataclass
 class ImageGenConfig:
     """Ming-flash-omni-2.0 image-generation pipeline (ZImage DiT + ByT5).
 
-    SKELETON. On the released ckpt the imagegen components live in sibling
-    subdirs: ``transformer/`` (DiT), ``vae/`` (AutoencoderKL),
-    ``scheduler/`` (FlowMatchEulerDiscreteScheduler), ``byt5/`` (text
-    encoder), ``connector/`` (Qwen2-based connector), ``mlp/`` (projector
-    with ``img_gen_scales``, ``diffusion_c_input_dim``). Exhaustive porting
-    happens at step 9.
+    Typed sub-config tree parsed from the released ckpt's imagegen
+    subdirs. The DiT / VAE / scheduler / byt5 dataclasses carry the dims
+    the modeling code (step 9b+) reads; the connector is a Qwen2 backbone
+    kept as a raw dict (built via the talker's Qwen2 path when wired).
     """
 
     # Subfolder names (mirror upstream MingImageGenConfig)
@@ -532,12 +652,24 @@ class ImageGenConfig:
     img_gen_scales: list[int] = field(default_factory=lambda: [16])
     diffusion_c_input_dim: int = 2560
     text_encoder_norm: bool = True
+    use_identity_mlp: bool = True
+    dit_type: str = "zimage"
 
     # Defaults for image-gen sampling (match upstream MingImageGenConfig)
     num_inference_steps: int = 30
     guidance_scale: float = 2.0
     default_height: int = 1024
     default_width: int = 1024
+
+    # Typed sub-configs (populated by from_subdirs when the subdir exists).
+    dit: ZImageDiTConfig = field(default_factory=ZImageDiTConfig)
+    vae: ImageVAEConfig = field(default_factory=ImageVAEConfig)
+    scheduler: ImageGenSchedulerConfig = field(default_factory=ImageGenSchedulerConfig)
+    byt5: ByT5MapperConfig = field(default_factory=ByT5MapperConfig)
+    # The connector is a Qwen2 LLM (1536-dim, 28L); kept as a raw dict
+    # because it's built via the shared Qwen2 path at model-construction
+    # time, not read field-by-field here.
+    connector: dict[str, Any] | None = None
 
     @property
     def num_query_tokens(self) -> int:
@@ -573,6 +705,39 @@ class ImageGenConfig:
                 instance.diffusion_c_input_dim = int(mlp_raw["diffusion_c_input_dim"])
             if "text_encoder_norm" in mlp_raw:
                 instance.text_encoder_norm = bool(mlp_raw["text_encoder_norm"])
+            if "use_identity_mlp" in mlp_raw:
+                instance.use_identity_mlp = bool(mlp_raw["use_identity_mlp"])
+            if "dit_type" in mlp_raw:
+                instance.dit_type = str(mlp_raw["dit_type"])
+
+        # transformer/ (DiT) — the load gate, always present here.
+        dit_path = local_dir / instance.transformer_subfolder / "config.json"
+        with open(dit_path) as f:
+            instance.dit = ZImageDiTConfig.from_dict(json.load(f))
+
+        # vae/
+        vae_path = local_dir / instance.vae_subfolder / "config.json"
+        if vae_path.exists():
+            with open(vae_path) as f:
+                instance.vae = ImageVAEConfig.from_dict(json.load(f))
+
+        # scheduler/
+        sched_path = local_dir / instance.scheduler_subfolder / "scheduler_config.json"
+        if sched_path.exists():
+            with open(sched_path) as f:
+                instance.scheduler = ImageGenSchedulerConfig.from_dict(json.load(f))
+
+        # byt5/byt5.json
+        byt5_path = local_dir / instance.byt5_subfolder / "byt5.json"
+        if byt5_path.exists():
+            with open(byt5_path) as f:
+                instance.byt5 = ByT5MapperConfig.from_json(json.load(f))
+
+        # connector/ (Qwen2) — keep raw.
+        conn_path = local_dir / instance.connector_subfolder / "config.json"
+        if conn_path.exists():
+            with open(conn_path) as f:
+                instance.connector = json.load(f)
 
         return instance
 

@@ -929,9 +929,40 @@ graph-walk / partition / streaming patterns transfer 1:1.
    unknown-key ignore, no template mutation across calls, unescaped
    unicode, shallow BGM merge).
 
-9. **ImageGen partition (deferred).** Separate from the omni pipeline; lives
-   under vllm-omni's diffusion tree. Wire as a fourth partition with its own
-   graph walk once #1–8 are landed. Needs `FlowEngine`-style integration.
+9. **ImageGen partition.** Separate from the omni pipeline; lives under
+   vllm-omni's diffusion tree (`diffusion/models/ming_flash_omni/`,
+   ~1,315 LOC). Wire as a fourth partition with its own graph walk.
+   Needs `FlowEngine`-style integration. Multi-commit step.
+
+   - **9a — DONE** (config port): `ImageGenConfig` fleshed out with
+     typed sub-config dataclasses parsed from the imagegen subdir tree:
+     * `ZImageDiTConfig` (transformer/config.json) — the diffusion DiT
+       (dim=3840, 30 layers + 2 refiner, 16-channel latents, 3D axial
+       RoPE via axes_dims=(32,48,48) / axes_lens=(1536,512,512)).
+     * `ImageVAEConfig` (vae/config.json) — AutoencoderKL, 16-channel
+       latent, scaling_factor=0.3611 / shift_factor=0.1159.
+     * `ImageGenSchedulerConfig` (scheduler/) —
+       FlowMatchEulerDiscreteScheduler (shift=3.0).
+     * `ByT5MapperConfig` (byt5/byt5.json) — ByT5-small glyph encoder +
+       T5EncoderBlockByT5Mapper (4 layers → sdxl_channels=2560) for the
+       text-rendering pathway.
+     * `connector` — Qwen2 LLM (1536-dim, 28L) kept as a raw dict
+       (built via the shared Qwen2 path at construction time).
+     `from_subdirs` reads each subdir into the typed fields; the
+     `mlp/config.json` knobs (img_gen_scales, diffusion_c_input_dim,
+     use_identity_mlp, dit_type) stay at the top level.
+     13 tests (7 new pure-Python + 6 existing, incl. updated
+     snapshot-gated assertions on dit.dim=3840 / vae.latent_channels=16
+     / scheduler.shift=3.0 / byt5.sdxl_channels=2560 / connector qwen2).
+
+   - **9b+ — TODO** (modeling + pipeline): port the ZImage DiT
+     (`ming_zimage_transformer.py`), ByT5 mapper + encoder
+     (`byte5_encoder.py`, `t5_block_mapper.py`), condition encoder
+     (`condition_encoder.py`), and the diffusion pipeline
+     (`pipeline_ming_imagegen.py`) + AutoencoderKL decode. Then the
+     ImageGen partition + graph walk + weight loaders. This is a whole
+     diffusion stack (~1.3 KLOC upstream) and a separate deploy from
+     the omni text/audio path.
 
 10. **Configs — DONE.** `configs/ming_flash_omni.yaml` rewritten to the
     real registered node names: `vision_encoder` + `audio_encoder` +
