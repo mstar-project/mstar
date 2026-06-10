@@ -253,14 +253,24 @@ class Model(ABC):
         if node_groups is None:
             raise KeyError("Config must define `node_groups`.")
 
+        # Nodes this deploy actually provides. A graph walk referencing a
+        # node absent from node_groups (e.g. the encoder / talker walks in
+        # a thinker-only deploy) is skipped rather than KeyError'ing during
+        # worker-graph division — that deploy simply can't serve the walk.
+        available_nodes: set[str] = set()
+        for group in node_groups:
+            available_nodes.update(group["node_names"])
+
         # TODO: merge identical worker graphs from different graph walks
-        return sum(
-            [
+        worker_graphs: list[WorkerGraph] = []
+        for graph_walk, graph in self.get_graph_walk_graphs().items():
+            required = set(graph.get_nodes().keys())
+            if not required <= available_nodes:
+                continue
+            worker_graphs.extend(
                 self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups)
-                for graph_walk, graph in self.get_graph_walk_graphs().items()
-            ],
-            start=[],
-        )
+            )
+        return worker_graphs
     
     def get_sharding_config(self, config_path: str) -> ShardingConfig:
         with open(config_path, "r") as f:
