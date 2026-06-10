@@ -63,10 +63,16 @@ class _StubTokenizer:
     eos_token = "<eos>"
     eos_token_id = 0
 
+    def __init__(self) -> None:
+        # Record the content passed to apply_chat_template so tests can
+        # assert on prompt expansion (image-gen query-token block).
+        self.last_content: str | None = None
+
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
         # Emit a deterministic synthetic string; tokenize=False means
         # process_prompt will re-tokenize via __call__.
         assert tokenize is False
+        self.last_content = messages[0]["content"]
         return "<|USER|>" + messages[0]["content"] + "<|ASSISTANT|>"
 
     def __call__(self, text, return_tensors="pt"):
@@ -131,6 +137,18 @@ def _bare_model_with_stubs() -> MingFlashOmniModel:
     inst.tokenizer = _StubTokenizer()
     inst._processor = _StubProcessor()
     inst._submodule_cache = {}
+    return inst
+
+
+def _model_with_imagegen(scales: list[int] | None = None) -> MingFlashOmniModel:
+    """Bare model whose config carries an ImageGenConfig (image output path)."""
+    from mminf.model.ming_omni_flash.config import ImageGenConfig
+
+    inst = _bare_model_with_stubs()
+    image_gen = ImageGenConfig()
+    if scales is not None:
+        image_gen.img_gen_scales = scales
+    inst.config.image_gen = image_gen
     return inst
 
 
@@ -416,3 +434,75 @@ def test_process_prompt_image_path_with_real_image_processor() -> None:
     # Grid should be (1, h, w) where h*16 >= image height (after resizing).
     grid = out["image_grid_thw"][0]
     assert grid.shape == (3,) and int(grid[0].item()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Image-generation prompt path (step 9b-pre): when output_modalities asks for
+# an image AND the deploy ships an ImageGenConfig, process_prompt appends the
+# <image><imagePatch>*N</image> query-token block before tokenizing.
+# ---------------------------------------------------------------------------
+
+
+def test_image_output_appends_query_token_block() -> None:
+    m = _model_with_imagegen()  # default img_gen_scales=[16] -> 256 tokens
+    out = m.process_prompt(
+        prompt="draw a cat",
+        input_modalities=["text"],
+        output_modalities=["image"],
+        tensors=None,
+    )
+    content = m.tokenizer.last_content
+    assert content is not None
+    assert content.startswith("draw a cat")
+    assert "<image>" in content and "</image>" in content
+    assert content.count("<imagePatch>") == 256
+    assert len(out["text_inputs"]) == 1
+
+
+def test_image_output_respects_img_gen_scales() -> None:
+    m = _model_with_imagegen(scales=[8])  # 8*8 = 64 query tokens
+    m.process_prompt(
+        prompt="draw a dog",
+        input_modalities=["text"],
+        output_modalities=["image"],
+        tensors=None,
+    )
+    assert m.tokenizer.last_content.count("<imagePatch>") == 64
+
+
+def test_text_output_does_not_append_query_block_even_with_imagegen() -> None:
+    """ImageGenConfig present but caller wants text -> no expansion."""
+    m = _model_with_imagegen()
+    m.process_prompt(
+        prompt="describe a cat",
+        input_modalities=["text"],
+        output_modalities=["text"],
+        tensors=None,
+    )
+    assert "<imagePatch>" not in m.tokenizer.last_content
+
+
+def test_image_output_without_imagegen_config_is_noop() -> None:
+    """Thinker-only deploy (no ImageGenConfig) ignores image output_modalities."""
+    m = _bare_model_with_stubs()  # config.image_gen is None
+    m.process_prompt(
+        prompt="draw a cat",
+        input_modalities=["text"],
+        output_modalities=["image"],
+        tensors=None,
+    )
+    assert "<imagePatch>" not in m.tokenizer.last_content
+
+
+def test_image_output_no_double_expansion() -> None:
+    """A prompt that already carries a patch block is left unchanged."""
+    m = _model_with_imagegen()
+    pre = "draw a cat<image>" + ("<imagePatch>" * 256) + "</image>"
+    m.process_prompt(
+        prompt=pre,
+        input_modalities=["text"],
+        output_modalities=["image"],
+        tensors=None,
+    )
+    # maybe_expand_image_gen_prompt is a no-op when a block already exists.
+    assert m.tokenizer.last_content.count("<imagePatch>") == 256

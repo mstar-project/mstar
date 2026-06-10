@@ -929,6 +929,18 @@ graph-walk / partition / streaming patterns transfer 1:1.
    unknown-key ignore, no template mutation across calls, unescaped
    unicode, shallow BGM merge).
 
+   **8b — DONE (image-gen prompt wiring):** `process_prompt` now calls
+   `maybe_expand_image_gen_prompt` when `output_modalities` contains
+   `"image"` AND the deploy ships an `ImageGenConfig` (thinker-only
+   deploys leave the prompt untouched). The expansion count comes from
+   `config.image_gen.num_query_tokens` (= sum of img_gen_scales², 256 by
+   default), so it tracks the checkpoint rather than the hard-coded
+   constant. This is the thinker-side half of the step-9 handoff; the DiT
+   that consumes the query embeddings is still 9b. 5 tests in
+   `test_ming_flash_omni_process_prompt.py`: block appended on image
+   output, count tracks img_gen_scales, no expansion on text output,
+   no-op without ImageGenConfig, no double-expansion.
+
 9. **ImageGen partition.** Separate from the omni pipeline; lives under
    vllm-omni's diffusion tree (`diffusion/models/ming_flash_omni/`,
    ~1,315 LOC). Wire as a fourth partition with its own graph walk.
