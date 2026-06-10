@@ -447,6 +447,14 @@ class MingFlashOmniModel(Model):
         # STATELESS node suffices. Thinker-only configs leave this off.
         if self.config.talker is not None:
             types["Talker"] = EngineType.STATELESS
+        # Step 9b: register ImageGen as a stateless diffusion node when the
+        # snapshot ships an imagegen tree (transformer/ + vae/ + connector/).
+        # Its full denoise loop + VAE decode run internally (the step count is
+        # scheduler-determined, not a conductor decode loop), so a single
+        # STATELESS node suffices. Thinker-only / talker-only configs leave it
+        # off.
+        if self.config.image_gen is not None:
+            types["ImageGen"] = EngineType.STATELESS
         return types
 
     # ------------------------------------------------------------------
@@ -591,14 +599,32 @@ class MingFlashOmniModel(Model):
                     ),
                 ],
             )
+        if self.config.image_gen is not None:
+            # Single ImageGen node: consume the thinker hidden states at the
+            # <imagePatch> query-token positions (streamed from the Thinker as
+            # ``thinker_hidden_states``), run the full diffusion denoise + VAE
+            # decode internally, emit one image to the client. Like the Talker,
+            # the per-request work is one shot (scheduler-determined step
+            # count), so no conductor decode loop is needed.
+            walks["imagegen"] = GraphNode(
+                name="ImageGen",
+                input_names=["thinker_hidden_states"],
+                outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="image",
+                        output_modality="image",
+                    ),
+                ],
+            )
         return walks
 
     def get_partition_topology(self) -> PartitionTopology:
-        if self.config.talker is None:
-            return PartitionTopology(partitions=["Thinker"], connections=[])
-        return PartitionTopology(
-            partitions=["Thinker", "Talker"],
-            connections=[
+        partitions = ["Thinker"]
+        connections = []
+        if self.config.talker is not None:
+            partitions.append("Talker")
+            connections.append(
                 Connection(
                     from_partition="Thinker",
                     to_partition="Talker",
@@ -610,9 +636,26 @@ class MingFlashOmniModel(Model):
                     chunk_policy_factory=lambda: FixedChunkPolicy(
                         chunk_size=1, continue_after_done=True,
                     ),
-                ),
-            ],
-        )
+                )
+            )
+        if self.config.image_gen is not None:
+            partitions.append("ImageGen")
+            connections.append(
+                Connection(
+                    from_partition="Thinker",
+                    to_partition="ImageGen",
+                    edge_name="thinker_hidden_states",
+                    # The imagegen node fires once, after the thinker has
+                    # produced the query-token hidden states. continue_after_done
+                    # keeps the partition alive until that single handoff lands.
+                    chunk_policy_factory=lambda: FixedChunkPolicy(
+                        chunk_size=1, continue_after_done=True,
+                    ),
+                )
+            )
+        if not connections:
+            return PartitionTopology(partitions=["Thinker"], connections=[])
+        return PartitionTopology(partitions=partitions, connections=connections)
 
     def get_partitions(self) -> list[PartitionDefinition]:
         thinker = PartitionDefinition(
@@ -625,15 +668,26 @@ class MingFlashOmniModel(Model):
             initial_walk="prefill_text",
             producer_partitions=[],
         )
-        if self.config.talker is None:
-            return [thinker]
-        talker = PartitionDefinition(
-            name="Talker",
-            graph_walks={"talker"},
-            initial_walk=None,
-            producer_partitions=["Thinker"],
-        )
-        return [thinker, talker]
+        partitions = [thinker]
+        if self.config.talker is not None:
+            partitions.append(
+                PartitionDefinition(
+                    name="Talker",
+                    graph_walks={"talker"},
+                    initial_walk=None,
+                    producer_partitions=["Thinker"],
+                )
+            )
+        if self.config.image_gen is not None:
+            partitions.append(
+                PartitionDefinition(
+                    name="ImageGen",
+                    graph_walks={"imagegen"},
+                    initial_walk=None,
+                    producer_partitions=["Thinker"],
+                )
+            )
+        return partitions
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         """Talker AudioVAE sample rate (44.1 kHz on the released ckpt)."""
@@ -1234,11 +1288,15 @@ class MingFlashOmniModel(Model):
             submodule = self._create_talker_submodule(device)
             self._submodule_cache[node_name] = submodule
             return submodule
+        if node_name == "ImageGen":
+            submodule = self._create_imagegen_submodule(device)
+            self._submodule_cache[node_name] = submodule
+            return submodule
         if node_name != "Thinker":
             raise ValueError(
                 f"Unknown node: {node_name!r}. Registers "
-                f"'Thinker', 'vision_encoder', 'audio_encoder', 'Talker'; "
-                f"ImageGen follows in step 9."
+                f"'Thinker', 'vision_encoder', 'audio_encoder', 'Talker', "
+                f"'ImageGen'."
             )
 
         # Build LingMoeModel on the meta device first so the constructor's
@@ -1466,3 +1524,33 @@ class MingFlashOmniModel(Model):
             config=self.config,
             text_bridge=self.thinker_text_to_talker_inputs,
         )
+
+    def _create_imagegen_submodule(self, device: str):
+        """Build the imagegen diffusion stack + load weights, wrap in a submodule.
+
+        Assembles the ZImage DiT + VAE + scheduler + Qwen2 condition encoder
+        (+ optional ByT5) via :meth:`MingImagePipeline.from_checkpoint`, then
+        wraps it in an :class:`ImageGenSubmodule`. The imagegen stack colocates
+        on a single rank (no TP) — bf16 to match the released ckpt dtype.
+
+        ``from_checkpoint`` lazily imports diffusers (for the VAE + scheduler),
+        so this factory only runs on a box where diffusers is healthy and the
+        snapshot ships the imagegen tree.
+        """
+        if self.config.image_gen is None:
+            raise RuntimeError(
+                "MingFlashOmniModel: 'ImageGen' node requested but the snapshot "
+                "has no imagegen tree (no transformer/ + vae/ + connector/)."
+            )
+        from mminf.model.ming_omni_flash.components.imagegen_pipeline import (
+            MingImagePipeline,
+        )
+        from mminf.model.ming_omni_flash.submodules import ImageGenSubmodule
+
+        pipeline = MingImagePipeline.from_checkpoint(
+            self.local_dir,
+            self.config.image_gen,
+            device=device,
+            dtype=self.get_autocast_dtype(),
+        )
+        return ImageGenSubmodule(pipeline=pipeline, config=self.config)

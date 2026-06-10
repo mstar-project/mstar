@@ -833,3 +833,107 @@ class TalkerSubmodule(NodeSubmodule):
             waveform = self.generator.decode_to_waveform(latents, stream_decode=True)
             waveform = self.generator.trim_trailing_silence(waveform)
         return {"audio_chunk": [waveform]}
+
+
+# ===================================================================
+# 5. ImageGenSubmodule (stateless diffusion — thinker hidden -> image)
+# ===================================================================
+
+
+class ImageGenSubmodule(NodeSubmodule):
+    """Stateless image-generation node: thinker hidden states -> RGB image.
+
+    Ming's thinker->imagegen bridge passes the thinker's final hidden states
+    sliced at the learnable ``<imagePatch>`` query-token positions (the block
+    appended by ``maybe_expand_image_gen_prompt`` in ``process_prompt``, step
+    8b). The condition encoder turns those into the DiT's ``cap_feats``, and the
+    diffusion pipeline runs the full flow-matching denoise + VAE decode in one
+    ``forward`` call — like the Talker, the step count is internal
+    (scheduler-determined), not a conductor decode loop. So a single STATELESS
+    node with one ``EMIT_TO_CLIENT`` image edge suffices.
+
+    The whole stack (condition encoder + DiT + VAE + optional ByT5) is owned by
+    a :class:`MingImagePipeline`; this submodule only marshals inputs and calls
+    ``pipeline.generate``.
+    """
+
+    def __init__(
+        self,
+        pipeline: "Any",  # MingImagePipeline (avoid import cycle at module load)
+        config: MingFlashOmniModelConfig,
+        default_params: "Any" = None,  # MingImageGenSamplingParams
+    ) -> None:
+        super().__init__()
+        self.pipeline = pipeline
+        self.config = config
+        if default_params is None:
+            from mminf.model.ming_omni_flash.components.imagegen_pipeline import (
+                MingImageGenSamplingParams,
+            )
+
+            ig = config.image_gen
+            default_params = MingImageGenSamplingParams(
+                height=ig.default_height if ig is not None else 1024,
+                width=ig.default_width if ig is not None else 1024,
+                num_inference_steps=ig.num_inference_steps if ig is not None else 50,
+                guidance_scale=ig.guidance_scale if ig is not None else 2.0,
+            )
+        self.default_params = default_params
+
+    def get_stateless_flavor(self) -> str:
+        # The DiT + VAE denoise loop is numerically sensitive (flow-matching
+        # ODE); mirror the talker/audio_codec flavor (no torch.compile, no
+        # autocast surprises).
+        return "audio_codec"
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs,
+    ) -> NodeInputs:
+        """Pull the thinker hidden states at the query-token positions.
+
+        Accepts either ``thinker_hidden_states`` (already sliced [N, H] or
+        [1, N, H] by the thinker->imagegen bridge) or, in the unit-test path,
+        a pre-built tensor. An optional ``negative_thinker_hidden_states``
+        enables real (non-zero) CFG negatives.
+        """
+        if "thinker_hidden_states" in inputs and inputs["thinker_hidden_states"]:
+            hidden = inputs["thinker_hidden_states"][0]
+        else:
+            raise ValueError(
+                "ImageGenSubmodule: missing 'thinker_hidden_states'. The "
+                "Thinker->ImageGen bridge must supply the query-token hidden "
+                "states."
+            )
+        negative = inputs.get("negative_thinker_hidden_states", [None])[0]
+        return NodeInputs(
+            tensor_inputs={
+                "thinker_hidden_states": hidden,
+                "negative_thinker_hidden_states": negative,
+            }
+        )
+
+    def forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        thinker_hidden_states: torch.Tensor,
+        negative_thinker_hidden_states: torch.Tensor | None = None,
+        **kwargs,
+    ) -> NameToTensorList:
+        """Run condition-encode -> denoise -> VAE decode, emit one image.
+
+        Returns ``{"image": [img]}`` where ``img`` is a ``[B, 3, H, W]`` tensor
+        in ``[-1, 1]`` (Z-Image VAE convention); the diffusion output adapter
+        converts it to PIL/base64 downstream.
+        """
+        with torch.no_grad():
+            image = self.pipeline.generate(
+                thinker_hidden_states,
+                self.default_params,
+                negative_hidden=negative_thinker_hidden_states,
+            )
+        return {"image": [image]}
