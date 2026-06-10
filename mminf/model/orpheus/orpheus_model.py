@@ -142,11 +142,6 @@ class OrpheusModel(Model):
                         name="new_token",
                         target_partition="SNAC",
                     ),
-                    # GraphEdge(
-                    #     next_node=EMPTY_DESTINATION,
-                    #     name="new_token",
-                    #     conductor_new_token=True,
-                    # ),
                 ],
             ),
             max_iters=self.get_max_output_tokens(),
@@ -212,12 +207,11 @@ class OrpheusModel(Model):
         partition_name: str,
         partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        new_tokens: dict[str, list[int]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
         if partition_name == "LLM":
             return self._get_llm_partition_forward(
-                partition_metadata, persist_signals, new_tokens,
+                partition_metadata, persist_signals,
             )
         elif partition_name == "SNAC":
             # Extract streaming state from the incoming connection
@@ -234,7 +228,6 @@ class OrpheusModel(Model):
         self,
         metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        new_tokens: dict[str, list[int]],
     ) -> ForwardPassArgs:
         """LLM partition: prefill -> decode loop until EOS."""
         request_done = False

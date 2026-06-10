@@ -555,7 +555,6 @@ class Pi05Model(Model):
         partition_name: str,
         partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        new_tokens: dict[str, list[int]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
         metadata = partition_metadata

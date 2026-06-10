@@ -1035,7 +1035,6 @@ class BagelModel(Model):
         partition_name: str,
         partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        new_tokens: dict[str, list[int]],
         incoming_connections=None,
     ) -> ForwardPassArgs:
         """Advance graph walk transitions. Schedule-driven, no BOI detection.

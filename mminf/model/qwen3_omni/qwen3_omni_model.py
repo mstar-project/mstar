@@ -29,7 +29,6 @@ Text-only mode:
 """
 
 import logging
-from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -747,16 +746,15 @@ class Qwen3OmniModel(Model):
         partition_name: str,
         partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        new_tokens: dict[str, list[int]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
         if partition_name == "Thinker":
             return self._get_thinker_forward(
-                partition_metadata, persist_signals, new_tokens,
+                partition_metadata, persist_signals,
             )
         elif partition_name == "Talker":
             return self._get_talker_forward(
-                partition_metadata, persist_signals, new_tokens,
+                partition_metadata, persist_signals,
                 incoming_connections,
             )
         elif partition_name == "Code2Wav":
@@ -772,7 +770,6 @@ class Qwen3OmniModel(Model):
         self,
         metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        new_tokens: dict[str, list[int]],
     ) -> ForwardPassArgs:
         """Thinker partition state machine.
 
@@ -850,7 +847,6 @@ class Qwen3OmniModel(Model):
         self,
         metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
-        new_tokens: dict[str, list[int]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
         """Talker partition state machine.
@@ -1333,7 +1329,6 @@ class Qwen3OmniModel(Model):
         from mminf.model.loader import load_hf_weights
         from mminf.model.loader.iterators import iter_safetensors_shards
         from mminf.model.qwen3_omni.components.talker import (
-            Qwen3OmniCodePredictor,
             Qwen3OmniTalkerModel,
         )
 

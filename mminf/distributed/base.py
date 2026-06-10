@@ -1,6 +1,6 @@
 from collections import defaultdict
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from mminf.graph.base import GraphEdge, NodeAndGraphWalk
 

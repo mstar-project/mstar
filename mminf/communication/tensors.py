@@ -1,7 +1,6 @@
 import logging
 import os
 import platform
-import struct
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext as _nullcontext

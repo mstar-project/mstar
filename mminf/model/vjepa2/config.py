@@ -74,7 +74,7 @@ class VJepa2Config:
     predictor_kind: str = "masked"
     ac_predictor: VJepa2ACPredictorConfig | None = None
 
-    # Rollout (Phase 2).  ``max_rollout_horizon`` caps the Loop's
+    # Rollout.  ``max_rollout_horizon`` caps the Loop's
     # ``max_iters`` at graph-build time; per-request ``rollout_horizon`` is
     # enforced by early-exit (``check_stop``) from inside the
     # rollout submodule.
@@ -86,7 +86,7 @@ class VJepa2Config:
     rollout_frames_per_second: int = 4
     rollout_anticipation_seconds: float = 1.0
 
-    # MPC (Phase 3.B).  Cost function used by VJepa2MPCScorerSubmodule to
+    # MPC.  Cost function used by VJepa2MPCScorerSubmodule to
     # score K candidate predicted latents against the goal latent.  "l1"
     # matches upstream vjepa2/notebooks/utils/mpc_utils.py::l1 (the CEM
     # objective).  Fixed at deploy time rather than per-request so that

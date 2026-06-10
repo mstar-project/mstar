@@ -31,7 +31,6 @@ def test_orpheus_prefill_transitions_to_decode():
         partition_name="LLM",
         partition_metadata=metadata,
         persist_signals={"new_token": []},
-        new_tokens={},
     )
 
     assert result.full_metadata.graph_walk == "decode"
@@ -57,7 +56,6 @@ def test_orpheus_decode_eos_marks_done():
         partition_name="LLM",
         partition_metadata=metadata,
         persist_signals={},
-        new_tokens={"new_token": [model.config.stop_token_id]},
     )
 
     assert result.request_done is True

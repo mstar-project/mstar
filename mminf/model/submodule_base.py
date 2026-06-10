@@ -13,7 +13,7 @@ from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.engine.base import NodeBatch
 from mminf.engine.cache_manager import BatchedCacheManager
 from mminf.engine.kv_store import PositionInfo
-from mminf.utils.sampling import BaseSampler, CudaGraphableSampler, SeenTokenMask
+from mminf.utils.sampling import BaseSampler, SeenTokenMask
 
 if TYPE_CHECKING:
     from mminf.engine.cuda_graph_config import CudaGraphConfig
@@ -156,9 +156,8 @@ class ModelInputsFromEngine:
 
 
 class NodeSubmodule(torch.nn.Module):
-    """
-    TODO
-    """
+    """Base class for a model's compute units: defines the prepare_inputs →
+    preprocess → forward(_batched) contract the engines drive."""
 
     def get_device(self):
         return next(self.parameters()).device
@@ -207,9 +206,8 @@ class NodeSubmodule(torch.nn.Module):
         engine_inputs: ModelInputsFromEngine,
         **kwargs, # coming from preprocess output
     )  -> dict[str, NameToTensorList]: # request_id to tensors
-        """
-        TODO comment
-        """
+        """Batched form of ``forward``: maps a multi-request batch to
+        per-request outputs. Override when ``can_batch`` returns True."""
         raise NotImplementedError(
             f"Batching not implemented for submodule {self.__class__.__name__}"
             " - override forward_batched to implement, or ensure can_batch returns False"

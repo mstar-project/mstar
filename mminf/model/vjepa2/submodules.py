@@ -88,7 +88,7 @@ def _shape_key(tensor: torch.Tensor | None) -> tuple | None:
 class VJepa2EncoderSubmodule(NodeSubmodule):
     """ViT 3D-patch video encoder.
 
-    Supports cross-request batching (Phase 3): requests with identical
+    Supports cross-request batching: requests with identical
     ``video_frames`` shapes are stacked on dim 0 and run in a single
     encoder forward.  Shape-heterogeneous batches fall through to the
     engine's sequential path (one forward per request).
@@ -109,7 +109,7 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
         batch: NodeBatch,
         model_inputs: list[NodeInputs],
     ):
-        # Route B=1 through the sequential ``forward`` (proven Phase 2 path).
+        # Route B=1 through the sequential ``forward`` (proven sequential path).
         # ``forward_batched`` is a distinct torch.compile cache from ``forward``
         # and — empirically on vjepa2-ac-vitg — compiles a much slower kernel
         # than ``forward`` when both are traced with the same [1, ...] shape.
@@ -145,7 +145,7 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
     ) -> dict[str, torch.Tensor]:
         # Handles both sequential (len == 1) and batched (len > 1) — the
         # single-request case yields a [1, T, C, H, W] tensor, identical to
-        # Phase 1 behaviour.
+        # the original sequential path.
         stacked = torch.cat(
             [inp.tensor_inputs["video_frames"] for inp in inputs],
             dim=0,
@@ -405,7 +405,7 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
 
 
 class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
-    """Masked-predictor rollout submodule — Phase 2 autoregressive anticipation.
+    """Masked-predictor rollout submodule — autoregressive anticipation.
 
     Parity target: upstream
     ``vjepa2/evals/action_anticipation_frozen/modelcustom/vit_encoder_predictor_concat_ar.py``
@@ -433,9 +433,9 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
     ``VJepa2PredictorSubmodule`` — weights are loaded once and shared.  Only
     the preprocess/forward rollout-awareness differs.
 
-    Shares Phase 1's single-request sequential path (``can_batch=False``
-    inherited from ``NodeSubmodule``).  Same Phase-3 batching story as the
-    encoder — enabling it requires the engine fix documented in the plan.
+    Uses the single-request sequential path (``can_batch=False`` inherited
+    from ``NodeSubmodule``).  Same cross-request batching story as the
+    encoder — enabling it requires an engine fix.
     """
 
     def __init__(
@@ -870,7 +870,7 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
 
 
 class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
-    """Action-conditioned autoregressive rollout — Phase 3.D.
+    """Action-conditioned autoregressive rollout.
 
     Optionally uses a PiecewiseCudaGraphRunner to accelerate the inner block
     loop. Set via set_piecewise_runner() after construction (typically done by
@@ -881,8 +881,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     (``T: 1 → rollout+1``) from a single-tubelet initial encoding.  Our
     encoder's natural output is ``T=grid_depth`` (a full 64-frame clip), so
     growing-context would immediately hit the AC predictor's pre-built
-    causal attn-mask cap.  See the plan's P3.D "Sliding-window vs upstream
-    growing-context" section for the full rationale.
+    causal attn-mask cap, so we slide a fixed-size window instead.
 
     Per iter ``k``:
       * Slice actions/states: ``actions_k = actions[:, k : k + T_ctx]``
@@ -1251,7 +1250,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 
 
 # ---------------------------------------------------------------------------
-# P3.B — MPC submodules (intra-request K-way candidate evaluation)
+# MPC submodules (intra-request K-way candidate evaluation)
 #
 # The AC predictor's ``forward(encoder_hidden, actions, states)`` is already
 # batch-dim aware (upstream ``mpc_utils.cem`` uses exactly this pattern via
@@ -1267,7 +1266,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 # is meaningless here — the K-way batch dim is already saturating the
 # predictor.  If a future deployment needs cross-request batching of MPC
 # requests too (K1 rids × K2 candidates), the natural path is the same
-# engine batching that P3.A introduced for the single-candidate predictor.
+# engine batching used for the single-candidate predictor.
 # ---------------------------------------------------------------------------
 
 

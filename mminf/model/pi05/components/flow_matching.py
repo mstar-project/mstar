@@ -1,6 +1,5 @@
 """Flow-matching utilities for Pi0.5: timestep embedding, Euler step, state discretization."""
 
-import math
 
 import torch
 

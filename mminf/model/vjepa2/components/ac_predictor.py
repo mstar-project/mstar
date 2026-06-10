@@ -19,7 +19,6 @@ Key differences from the masked predictor:
 
 from __future__ import annotations
 
-import math
 
 from mminf.engine.cache_manager import BatchedCacheManager
 import torch

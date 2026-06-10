@@ -21,3 +21,6 @@ output_edit.png
 mminf-benchmark-cache/
 output.wav
 .bench_outs/
+
+# internal design docs (not for public release)
+mminf/worker/ASYNC_REDESIGN.md

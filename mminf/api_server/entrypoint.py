@@ -8,8 +8,6 @@ import logging
 import multiprocessing as mp
 import os
 import signal
-import socket
-import subprocess
 import threading
 import time
 import uuid

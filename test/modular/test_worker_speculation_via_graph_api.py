@@ -19,7 +19,6 @@ that ``Worker._try_speculate_next`` relies on:
 """
 from copy import deepcopy
 
-import pytest
 
 from mminf.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mminf.graph.graph_io import WorkerGraphIO

@@ -1142,8 +1142,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # Pick layer-0 for text positions and layer-N for multimodal,
             # drop positions the Talker won't consume (system prompt /
             # previous-assistant), and emit a 1D multimodal mask aligned to
-            # the kept tokens. This used to happen inside the Talker, which
-            # forced the Thinker to ship both hidden states for every token.
+            # the kept tokens. Doing this here (not in the Talker) avoids
+            # shipping both hidden states for every token.
             ts_list = outputs.get("thinker_states")
             mask_list = outputs.get("thinker_mask")
             if ts_list and mask_list:

@@ -800,7 +800,6 @@ class Conductor:
 
             if body.new_tokens:
                 for name, tokens in body.new_tokens.items():
-                    pstate.new_tokens.setdefault(name, []).extend(tokens)
                     pstate.num_output_tokens += len(tokens)
                     for conn in request_data.streaming_connections.values():
                         if conn.from_partition == partition_name and conn.edge_name == name:
@@ -861,7 +860,6 @@ class Conductor:
             partition_name=partition_name,
             partition_metadata=pstate.metadata,
             persist_signals=request_data.persist_signals,
-            new_tokens=pstate.new_tokens,
             incoming_connections=incoming_connections,
         )
         pstate.metadata = fwd_args.full_metadata
@@ -897,7 +895,6 @@ class Conductor:
         self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
 
         # Reset partition forward pass state
-        pstate.new_tokens = {}
         pstate.completed_worker_graph_ids = set()
         pstate.current_worker_graph_ids = set()
         pstate.wg_rank_completions = {}

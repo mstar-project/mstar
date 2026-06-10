@@ -394,7 +394,7 @@ class WorkerGraphsManager:
         streaming_edges = [edge for edge in outputs if edge.is_streaming]
         non_streaming_outputs = [edge for edge in outputs if not edge.is_streaming]
 
-        # (1) find back_to_conductor flags
+        # (1) find persist (to-conductor) and new-token-output edges
         to_conductor = [edge for edge in non_streaming_outputs if edge.persist]
         new_token_outputs = [edge for edge in non_streaming_outputs if edge.conductor_new_token]
 
@@ -453,9 +453,9 @@ class WorkerGraphsManager:
         # (3) get mapping of worker to external outputs
         # Skip edges whose next_node is a special destination (e.g.,
         # EMIT_TO_CLIENT is a virtual destination, not a real node on any worker).
-        # Note: back_to_conductor edges may ALSO route to a worker
-        # (e.g., concat_text outputs text_emb -> LLM with back_to_conductor=True),
-        # so we do NOT filter on back_to_conductor here.
+        # Note: persist edges may ALSO route to a worker
+        # (e.g., concat_text outputs text_emb -> LLM with persist=True),
+        # so we do NOT filter on persist here.
         emit_to_client: list[GraphEdge] = []
         for edge in external_outputs:
             node_graph_walk = NodeAndGraphWalk(

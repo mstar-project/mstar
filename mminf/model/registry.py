@@ -27,7 +27,7 @@ HF_MODELS: dict[str, dict] = {
     # config.json.
     "vjepa2": {"model_path_hf": "facebook/vjepa2-vitl-fpc64-256"},
     # V-JEPA 2-AC (encoder + action-conditioned predictor).  HF doesn't host
-    # an AC checkpoint as of 2026-04; weights come from the public S3 mirror
+    # an AC checkpoint; weights come from the public S3 mirror
     # ``https://dl.fbaipublicfiles.com/vjepa2/vjepa2-ac-vitg.pt`` via
     # ``download_vjepa2_ac_upstream_pt`` — the ``model_path_hf`` string is
     # kept as a logical identifier but isn't resolved against HuggingFace.

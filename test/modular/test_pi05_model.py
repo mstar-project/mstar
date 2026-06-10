@@ -174,7 +174,6 @@ def test_pi05_prefill_transitions_to_action_gen():
         partition_name="default",
         partition_metadata=metadata,
         persist_signals={},
-        new_tokens={},
     )
     assert result.full_metadata.graph_walk == Pi05Model.ACTION_GEN_WALK
     assert result.full_metadata.is_prefill is False
@@ -195,7 +194,6 @@ def test_pi05_action_gen_marks_request_done():
         partition_name="default",
         partition_metadata=metadata,
         persist_signals={},
-        new_tokens={},
     )
     assert result.request_done is True
 

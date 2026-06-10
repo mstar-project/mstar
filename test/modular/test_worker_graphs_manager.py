@@ -7,13 +7,11 @@ Covers:
 - ``process_new_inputs`` returns leftover edges that no wg claimed
 - ``stop_loops`` returns the loop-back ``set[(name, dest)]``
 """
-from dataclasses import dataclass, field
 
 import pytest
 
 from mminf.conductor.request_info import (
     CurrentForwardPassInfo,
-    PartitionDefinition,
 )
 from mminf.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mminf.model.base import WorkerGraph

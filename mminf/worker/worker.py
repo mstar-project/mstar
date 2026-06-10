@@ -1,4 +1,3 @@
-from copy import deepcopy
 import logging
 import os
 import sys
@@ -1738,7 +1737,6 @@ class Worker:
             if req_info is not None:
                 req_info.per_partition_info[batch_N.partition].stream_partition_done = True
 
-        # TODO: wire up the new token path (currently unused for any of the models)
         for rid, routing in routing_per_request.items():
             self._send_outputs(
                 rid, routing,

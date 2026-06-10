@@ -27,7 +27,7 @@ class PageAllocator:
 
     Thread-safe: a ``threading.Lock`` makes the qsize-then-get sequence in
     ``allocate``/``try_allocate`` atomic against concurrent ``free`` calls.
-    Required by the Phase 3 spec/pre-plan path, where the plan thread runs
+    Required by the pre-plan path, where the plan thread runs
     ``try_allocate`` while the GPU thread runs ``free`` from
     ``reset_label`` — the unlocked qsize/get pair could false-negative
     (return None when pages are about to be freed) or partially fill the

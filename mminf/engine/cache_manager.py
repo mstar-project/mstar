@@ -107,7 +107,7 @@ class BatchedCacheManager:
             kv_cache_config.max_seq_len, dtype=torch.long, device=device
         )
 
-        # Phase 3: labels the Worker's plan_executor has pre-planned for the
+        # Labels the Worker's plan_executor has pre-planned for the
         # next batch. Each entry causes the matching plan_attention(label=L)
         # call to short-circuit — the captured graph's preprocess skips the
         # heavy FlashInfer wrapper.plan() (GIL-contended with main thread's
@@ -200,7 +200,7 @@ class BatchedCacheManager:
                 assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
                 effective_label = next(iter(self.active_labels.values()))
             if effective_label in self._pre_planned_labels:
-                # Phase 3 fast path: plan was pre-computed by Worker.plan_executor
+                # Fast path: plan was pre-computed by Worker.plan_executor
                 # against the same persistent wrapper. The wrapper's static
                 # buffers and FlashInfer scheduling state are already correct
                 # for this iter's seq_lens. We only need to record ps.seq_lens

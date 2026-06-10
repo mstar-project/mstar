@@ -6,7 +6,6 @@ import torch
 
 from mminf.conductor.request_info import CurrentForwardPassInfo
 from mminf.distributed.communication import TPCommGroup, WorkerTPGroups
-from mminf.distributed.utils import divide
 from mminf.engine.base import (
     BaseEngine,
     EngineCapabilities,
@@ -553,7 +552,6 @@ class KVCacheEngine(BaseEngine):
             for rid in batch.request_ids
         )
         bs = len(batch.request_ids)
-        #TODO: Remove in production
         num_tokens = sum(inp.input_seq_len for inp in inputs)
 
         if not submodule.can_use_cuda_graphs(batch, inputs):
@@ -946,7 +944,7 @@ class KVCacheEngine(BaseEngine):
         """Allocate the next double-buffer slot for this batch and stash it
         on ``batch.metadata['cuda_graph_slot']``.
 
-        Phase 3: Worker's main thread calls this on the speculative path
+        Worker's main thread calls this on the speculative path
         BEFORE submitting both pre-plan and replay so they target the same
         slot (and the OPPOSITE slot from the in-flight replay). Returns the
         slot index, or ``None`` if no captured graph matches (eager path).
@@ -997,7 +995,7 @@ class KVCacheEngine(BaseEngine):
         batch: NodeBatch,
         prev_completion_event: "torch.cuda.Event | None" = None,
     ) -> bool:
-        """Phase 3: pre-plan FlashInfer attention for a batch on the
+        """Pre-plan FlashInfer attention for a batch on the
         Worker.plan_executor thread, so the GPU thread's preprocess can skip
         the GIL-contended plan() call.
 

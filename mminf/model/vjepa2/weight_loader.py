@@ -235,7 +235,7 @@ def download_vjepa2_ac_upstream_pt(
 ) -> Path:
     """Fetch the upstream V-JEPA 2-AC ``.pt`` from the public S3 mirror.
 
-    As of Apr 2026 the HuggingFace V-JEPA 2 collection does NOT include an
+    The HuggingFace V-JEPA 2 collection does not include an
     AC-variant repo (only the base + SSv2 / Diving-48 classification
     checkpoints for vitl/h/g are published there).  So we go straight to
     :data:`VJEPA2_AC_VITG_S3_URL` — the public

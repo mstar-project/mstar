@@ -1,6 +1,6 @@
 """CUDA Graph capture and replay for AR decode and EncDec engines.
 
-Option A keying: separate CUDA graph captures per (graph_walk, requires_cfg, batch_size).
+Separate CUDA graph captures keyed by (graph_walk, requires_cfg, batch_size).
 - decode + no_cfg: 1 LLM forward pass (main label only)
 - decode + cfg: 2 LLM forward passes (main + cfg_img)
 
@@ -53,7 +53,7 @@ class DummyCaptureInput:
 class CudaGraphSlot:
     """One captured graph + its private FlashInfer wrappers.
 
-    Phase 3 double-buffer: each (graph_walk, requires_cfg, bs, num_tokens)
+    Double-buffer: each (graph_walk, requires_cfg, bs, num_tokens)
     key holds two of these in ``CudaGraphData.slots``. Replay alternates
     between slots so plan(N+1) on the inactive slot's wrapper can run
     concurrently with replay(N) on the active slot.
@@ -121,7 +121,7 @@ class _SlotCaptureSpec:
 class CudaGraphRunner:
     """Captures and replays CUDA graphs for AR decode batches.
 
-    Option A: separate graphs per (graph_walk, requires_cfg, batch_size).
+    Separate graphs per (graph_walk, requires_cfg, batch_size).
 
     Warmup flow:
     1. For each config (decode+no_cfg, decode+cfg):
@@ -142,7 +142,7 @@ class CudaGraphRunner:
     """
 
     CAPTURE_BATCH_SIZES = DEFAULT_AR_CAPTURE_BATCH_SIZES
-    # Phase 3 double-buffer: capture two graphs + two FlashInfer wrapper sets
+    # Double-buffer: capture two graphs + two FlashInfer wrapper sets
     # per (graph_walk, requires_cfg, bs, num_tokens) key. Replay alternates so
     # plan(N+1) on the inactive slot can run concurrent with replay(N) on the
     # active slot. Override via MMINF_NUM_SLOTS=1 to disable double-buffer
@@ -200,11 +200,11 @@ class CudaGraphRunner:
         # Sum of bytes that WOULD have been allocated by per-capture clones
         # (one full tensor per call) — incremented on every _intern_static_buffer
         # call. Compared against the actual shared-buffer footprint at the end
-        # of warmup_and_capture to surface the Step 5 savings deterministically
+        # of warmup_and_capture to surface the shared-buffer savings deterministically
         # (the actual torch.cuda.memory_allocated delta also covers KV cache /
         # model weights / FlashInfer workspaces, so it's noisier).
         self._capture_clone_bytes_naive = 0
-        # Phase 3 plan-overlap stream. Lazily created the first time pre_plan
+        # Plan-overlap stream. Lazily created the first time pre_plan
         # is called from Worker.plan_executor.
         self._plan_stream: "torch.cuda.Stream | None" = None
 
@@ -496,7 +496,7 @@ class CudaGraphRunner:
     ) -> None:
         """Register a populated CudaGraphData under all replay graph walks.
 
-        Phase 3 double-buffer: ``slots`` is the list of all NUM_SLOTS slots,
+        Double-buffer: ``slots`` is the list of all NUM_SLOTS slots,
         each with its own captured graph + persistent wrappers. Replay picks
         the active slot via ``CudaGraphData.next_slot``; pre-plan targets
         the slot the next replay will use.
@@ -980,7 +980,7 @@ class CudaGraphRunner:
         ``_pre_planned_labels`` set and stashes a plan_done_event so the
         captured graph's replay can wait on it before reading the wrappers.
 
-        Phase 3 double-buffer: the slot here is the OTHER slot from the one
+        Double-buffer: the slot here is the OTHER slot from the one
         currently being replayed — main thread reserves it via
         ``reserve_slot`` before dispatching pre-plan, so plan(N+1) writes
         slot[(s+1)%2]'s wrapper buffers while replay(N) on slot[s] continues
@@ -1221,7 +1221,7 @@ class CudaGraphRunner:
         and RoPE on the static cache manager) and copies the resulting packed tensors
         into the static buffers before replay.
 
-        Phase 3: ``slot_data`` is the chosen double-buffer slot (graph + persistent
+        ``slot_data`` is the chosen double-buffer slot (graph + persistent
         wrappers + cache_manager). Same logic as before — we just look up the
         slot's graph/cm instead of reading flat fields off ``graph_data``.
         """
@@ -1336,7 +1336,7 @@ class CudaGraphRunner:
                 mark("gpu_thread.preprocess_end")
 
             # --- Step 4: Replay ---
-            # Phase 3: if pre-plan was applied for this iter, the wrapper's
+            # If pre-plan was applied for this iter, the wrapper's
             # static buffers were written on a side stream. Make the default
             # stream wait on plan_done_event before replay reads them.
             plan_done_event = getattr(static_cm, "_plan_done_event", None)
@@ -1378,7 +1378,7 @@ class CudaGraphRunner:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
-            # Phase 3: signal that alloc_manager state for batch_N is now
+            # Signal that alloc_manager state for batch_N is now
             # post-advance. plan_executor's pre_plan(batch_(N+1)) waits on this
             # event instead of prev_future, so plan() starts ~tens of µs into
             # replay(N) (overlapping with replay(N)'s remaining GPU work) rather
@@ -1441,7 +1441,7 @@ class CudaGraphRunner:
         contents; non-attention compute over them is wasted work, not a correctness
         issue. State swap / advance_seq_lens / output remap mirror _run_basic_matched.
 
-        Phase 3: ``slot_data`` selects one of the captured double-buffer slots.
+        ``slot_data`` selects one of the captured double-buffer slots.
         Prefill paths don't speculate or pre-plan today, so slot alternation
         for these is just round-robin — perf-neutral but consistent with the
         decode path's bookkeeping.
@@ -1936,7 +1936,6 @@ class StatelessCudaGraphRunner:
         device: torch.device,
         tp_group=None,
     ):
-        from mminf.distributed.communication import TPCommGroup
 
         self.submodule_name = submodule_name
         self.submodule = submodule

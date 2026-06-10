@@ -57,8 +57,8 @@ class GraphEdge:
     tensor_info: list[TensorPointerInfo] = field(default_factory=list)
 
     # Flags
-    persist: bool = field(default=False)  # previously back_to_conductor
-    conductor_new_token: bool = field(default=False)  # legacy; not yet wired in new system
+    persist: bool = field(default=False)  # kept at the conductor across forward passes
+    conductor_new_token: bool = field(default=False)  # counted by the conductor toward the output-token total
     is_streaming: bool = field(default=False)  # streaming edge: tokens accumulate at destination buffer
     # only for EMIT_TO_CLIENT
     output_modality: str = field(default="")  # text | image | video | audio

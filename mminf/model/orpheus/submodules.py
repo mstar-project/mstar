@@ -13,7 +13,7 @@ from mminf.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mminf.engine.kv_store import PositionInfo
 from mminf.model.orpheus.config import OrpheusModelConfig
 from mminf.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mminf.utils.sampling import CudaGraphableSampler, Sampler, SeenTokenMask
+from mminf.utils.sampling import Sampler
 
 logger = logging.getLogger(__name__)
 

@@ -76,8 +76,7 @@ class CurrentForwardPassInfo:
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")
 
-    # NOTE: removing the dynamic_loop_stop_signals field, as the functionality has been moved
-    # to the specific check_stop function on the submodule
+    # Per-loop stop indices; stop decisions come from each submodule's check_stop.
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
     dynamic_loop_iter_counts: dict[str, int] = field(default_factory=dict)
 
@@ -121,7 +120,6 @@ class PartitionState:
     fwd_pass_number: int = 0
     random_seed: int = 0
     is_done: bool = False
-    new_tokens: dict[str, list[int]] = field(default_factory=dict)
     completed_worker_graph_ids: set[str] = field(default_factory=set)
     current_worker_graph_ids: set[str] = field(default_factory=set)
     # wg_id -> count of distinct TP ranks that have reported completion
