@@ -430,3 +430,106 @@ def test_state_machine_advances_schedule_then_decodes_then_finishes() -> None:
         new_tokens={},
     )
     assert args4.request_done is True
+
+
+# ---------------------------------------------------------------------------
+# get_worker_graphs partial-deploy skipping (regression for the live
+# bring-up KeyError: 'audio_encoder' — see model/base.py fix c06c99a)
+# ---------------------------------------------------------------------------
+
+
+def _talker_enabled_model() -> MingFlashOmniModel:
+    """Bare model whose config DOES declare a talker (so the talker walk exists)."""
+    from mminf.model.ming_omni_flash.config import (
+        AudioVAEConfig,
+        DiTBlockConfig,
+        TalkerConfig,
+        TalkerLLMConfig,
+    )
+    inst = MingFlashOmniModel.__new__(MingFlashOmniModel)
+    inst.config = MingFlashOmniModelConfig(
+        local_dir="",
+        mlp_depth=2,
+        thinker_llm=ThinkerLLMConfig(),
+        vision=VisionEncoderConfig(),
+        audio_encoder=AudioEncoderConfig(),
+        talker=TalkerConfig(
+            llm=TalkerLLMConfig(), flowmodel=DiTBlockConfig(),
+            aggregator=DiTBlockConfig(), vae=AudioVAEConfig(),
+        ),
+    )
+    inst._submodule_cache = {}
+    return inst
+
+
+def _write_yaml(tmp_path, node_groups: list[dict]) -> str:
+    import json
+    p = tmp_path / "cfg.yaml"
+    # node_groups is JSON-compatible; YAML is a JSON superset so json.dumps
+    # is a valid (if ugly) serialization the yaml loader accepts.
+    p.write_text("model: ming_flash_omni\nmax_seq_len: 4096\n"
+                 "node_groups: " + json.dumps(node_groups) + "\n")
+    return str(p)
+
+
+def _worker_graph_node_names(worker_graphs) -> set[str]:
+    """Collect the real GraphNode names across a list of WorkerGraphs.
+
+    A worker graph's ``section`` may be a Loop wrapper (e.g.
+    ``thinker_decode_loop``) rather than a GraphNode, so reach the actual
+    nodes via ``get_nodes()`` instead of reading ``section.name``.
+    """
+    names: set[str] = set()
+    for wg in worker_graphs:
+        names |= set(wg.section.get_nodes().keys())
+    return names
+
+
+def test_get_worker_graphs_thinker_only_skips_encoder_and_talker_walks(tmp_path) -> None:
+    """Regression: a thinker-only node_groups must NOT KeyError on the
+    encoder/talker walks — they're skipped because their nodes are absent.
+
+    This is exactly the live-bring-up crash that motivated the
+    model/base.py fix (KeyError: 'audio_encoder' during
+    _divide_into_worker_graphs of the prefill_audio walk).
+    """
+    model = _talker_enabled_model()  # all walks (incl. talker) are emitted
+    cfg = _write_yaml(tmp_path, [
+        {"node_names": ["Thinker"], "ranks": [0, 1, 2, 3], "tp_size": 4},
+    ])
+    # Must not raise.
+    wgs = model.get_worker_graphs(cfg)
+    node_names = _worker_graph_node_names(wgs)
+    # Only the Thinker is ever a worker-graph node; encoder/talker nodes
+    # never appear because their walks were skipped.
+    assert node_names == {"Thinker"}
+    assert "audio_encoder" not in node_names
+    assert "vision_encoder" not in node_names
+    assert "Talker" not in node_names
+
+
+def test_get_worker_graphs_full_omni_includes_all_nodes(tmp_path) -> None:
+    """With encoders + Talker declared, their walks divide cleanly."""
+    model = _talker_enabled_model()
+    cfg = _write_yaml(tmp_path, [
+        {"node_names": ["vision_encoder", "audio_encoder", "Talker"], "ranks": [0]},
+        {"node_names": ["Thinker"], "ranks": [0, 1, 2, 3], "tp_size": 4},
+    ])
+    wgs = model.get_worker_graphs(cfg)
+    node_names = _worker_graph_node_names(wgs)
+    # All node types now present across the divided worker graphs.
+    assert "Thinker" in node_names
+    assert "vision_encoder" in node_names
+    assert "audio_encoder" in node_names
+    assert "Talker" in node_names
+
+
+def test_get_worker_graphs_thinker_only_no_talker_config(tmp_path) -> None:
+    """A model whose config has no talker emits no talker walk at all, and a
+    thinker-only deploy still divides without error."""
+    model = _bare_model()  # talker=None → no talker walk emitted
+    cfg = _write_yaml(tmp_path, [
+        {"node_names": ["Thinker"], "ranks": [0, 1, 2, 3], "tp_size": 4},
+    ])
+    wgs = model.get_worker_graphs(cfg)
+    assert _worker_graph_node_names(wgs) == {"Thinker"}
