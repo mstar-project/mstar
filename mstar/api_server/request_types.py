@@ -49,3 +49,8 @@ class PreprocessInput:
     input_modalities: list[str]
     output_modalities: list[str]
     model_kwargs: dict
+
+    # In-memory uploads for the "numpy" modality (.npy): the bytes are NOT
+    # written to disk (unlike images/audio/video), so the data worker np.loads
+    # them directly. Each entry is one .npy blob (e.g. one camera frame).
+    numpy_bytes: list[bytes] | None = None

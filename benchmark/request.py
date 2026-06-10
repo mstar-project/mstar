@@ -17,31 +17,6 @@ import numpy as np
 from benchmark.base import Bagel, Model, Orpheus, RequestType, Status
 from benchmark.utils import _write_wav
 
-# Optional: send images as a raw uint8 CxHxW .npy instead of PNG (MMINF_BENCH_RAW=1).
-# PNG decode in the data worker is ~2ms/image (zlib inflate + unfiltering),
-# independent of resolution; a raw array is np.load'd for ~0. Lossless — the
-# bytes are the decoded pixels (bit-identical to the server's torchvision
-# decode), self-described by the .npy header. Trades a larger upload (~173KB vs
-# ~95KB PNG) for ~zero server-side decode. The server's load_image sniffs the
-# .npy magic bytes, so only the client bytes change.
-_BENCH_RAW = os.environ.get("MMINF_BENCH_RAW", "") not in ("", "0", "false")
-
-
-def _maybe_raw(data: bytes) -> bytes:
-    """Re-encode PNG/JPEG bytes as a raw CxHxW uint8 .npy when MMINF_BENCH_RAW set."""
-    if not _BENCH_RAW:
-        return data
-    import numpy as np
-    import torch
-    import torchvision
-
-    chw = torchvision.io.decode_image(
-        torch.frombuffer(bytearray(data), dtype=torch.uint8)
-    ).numpy()  # CxHxW uint8 — matches the server's decode exactly
-    buf = io.BytesIO()
-    np.save(buf, chw)
-    return buf.getvalue()
-
 
 @dataclass
 class LatencyStats:
@@ -629,6 +604,11 @@ class RequestInput:
     # All paths are uploaded as separate "files" form fields alongside image_path.
     extra_image_paths: list[str] = field(default_factory=list)
 
+    # Pre-decoded ".npy" uploads (the "numpy" modality): paths to raw uint8
+    # arrays the server np.loads in memory (no disk, no decode). Used by pi0.5
+    # (resized 224x224 camera frames); each path is one camera.
+    _numpy_paths: list[str] = field(default_factory=list)
+
     # Per-request model_kwargs merged into the JSON payload at send time.
     # Use this for robotics-specific fields: robot_state, actions, states,
     # rollout_horizon, etc.
@@ -645,10 +625,11 @@ class RequestInput:
     _audio_b64: Optional[str] = field(default=None, repr=False)
     _video_b64: Optional[str] = field(default=None, repr=False)
     _extra_image_bytes: list[bytes] = field(default_factory=list, repr=False)
+    _numpy_bytes: list[bytes] = field(default_factory=list, repr=False)
 
     def __post_init__(self):
         if self.image_path and self._image_bytes is None:
-            self._image_bytes = _maybe_raw(Path(self.image_path).read_bytes())
+            self._image_bytes = Path(self.image_path).read_bytes()
             self._image_b64 = base64.b64encode(self._image_bytes).decode()
         if self.audio_path and self._audio_bytes is None:
             self._audio_bytes = Path(self.audio_path).read_bytes()
@@ -657,7 +638,9 @@ class RequestInput:
             self._video_bytes = Path(self.video_path).read_bytes()
             self._video_b64 = base64.b64encode(self._video_bytes).decode()
         if self.extra_image_paths and not self._extra_image_bytes:
-            self._extra_image_bytes = [_maybe_raw(Path(p).read_bytes()) for p in self.extra_image_paths]
+            self._extra_image_bytes = [Path(p).read_bytes() for p in self.extra_image_paths]
+        if self._numpy_paths and not self._numpy_bytes:
+            self._numpy_bytes = [Path(p).read_bytes() for p in self._numpy_paths]
 
     def get_all_filepaths(self) -> dict[str, str]:
         res = {}
@@ -764,7 +747,16 @@ class OurSystem(InferenceSystem):
                     "files",
                     content,
                     filename=os.path.basename(path),
-                    content_type="image/png",
+                    content_type="application/octet-stream",
+                )
+            # Pre-decoded ".npy" uploads (numpy modality): the server keeps these
+            # in memory and np.loads them — no disk, no decode (pi0.5 cameras).
+            for path, content in zip(req_input._numpy_paths, req_input._numpy_bytes):
+                form.add_field(
+                    "files",
+                    content,
+                    filename=os.path.basename(path),
+                    content_type="application/octet-stream",
                 )
 
             metrics.start_time = time.monotonic()

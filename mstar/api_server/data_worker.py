@@ -223,6 +223,20 @@ class PreprocessWorkerThread:
                         tensors[key].append(out.data)
                         input_metadata[key].append(out.metadata)
 
+        # ".npy" uploads (modality "numpy") are kept in memory and np.load'd
+        # here as "raw_inputs"; the model maps them in process_prompt.
+        if input.numpy_bytes:
+            import io as _io
+
+            import numpy as np
+
+            tensors["raw_inputs"] = []
+            input_metadata["raw_inputs"] = []
+            for blob in input.numpy_bytes:
+                tensors["raw_inputs"].append(
+                    torch.from_numpy(np.load(_io.BytesIO(blob))).to(self.device)
+                )
+                input_metadata["raw_inputs"].append({})
 
         _t_load = time.perf_counter()  # media decode (load_image/audio/video) done
 

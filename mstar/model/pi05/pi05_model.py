@@ -457,6 +457,15 @@ class Pi05Model(Model):
         here so the resulting ``text_inputs`` stream matches the production
         format.
         """
+        # A "numpy" upload arrives as "raw_inputs"; Pi0.5 treats it as the image.
+        tensors = kwargs.get("tensors")
+        if tensors is not None and "raw_inputs" in tensors:
+            assert "image_inputs" not in tensors, "got both raw_inputs and image_inputs"
+            tensors["image_inputs"] = tensors.pop("raw_inputs")
+            input_metadata = kwargs.get("input_metadata")
+            if input_metadata is not None and "raw_inputs" in input_metadata:
+                input_metadata["image_inputs"] = input_metadata.pop("raw_inputs")
+
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             if prompt is not None:

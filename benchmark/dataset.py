@@ -607,6 +607,39 @@ def _decode_frames_to_png_and_video(
         VideoEncoder(frames=tensors, frame_rate=fps).to_file(mp4_path)
 
 
+def _resize_with_pad(chw, size: int):
+    """Aspect-preserving letterbox of a (C, H, W) uint8 tensor to size x size.
+
+    Scales the longer side to ``size`` and pads the shorter with black (0).
+    Mirrors the server's ``Pi05ViTEncoderSubmodule._prepare_one`` geometry, so
+    sending the pre-resized frame produces the same model input as decoding at
+    native resolution and resizing on the worker.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    _, h, w = chw.shape
+    if (h, w) == (size, size):
+        return chw
+    ratio = max(w / size, h / size)
+    rh, rw = int(h / ratio), int(w / ratio)
+    x = F.interpolate(chw[None].float(), size=(rh, rw), mode="bilinear", align_corners=False)
+    ph0, remh = divmod(size - rh, 2)
+    pw0, remw = divmod(size - rw, 2)
+    x = F.pad(x, (pw0, pw0 + remw, ph0, ph0 + remh), value=0.0)
+    return x[0].round().clamp(0, 255).to(torch.uint8)
+
+
+def _decode_frame_to_npy(video_path: str, frame_index: int, npy_path: str, size: int) -> None:
+    """Decode one frame, letterbox-resize to ``size`` x ``size``, save as a
+    (C, H, W) uint8 ``.npy`` (the "numpy" upload the server np.loads in memory)."""
+    import numpy as np
+    from torchcodec.decoders import VideoDecoder
+
+    frame = VideoDecoder(video_path).get_frames_at(indices=[frame_index]).data[0]  # (C,H,W) uint8
+    np.save(npy_path, _resize_with_pad(frame, size).numpy())
+
+
 class DROIDDataset(BaseDataset):
     """DROID robotics dataset for evaluating pi0.5 and V-JEPA 2-AC.
 
@@ -631,6 +664,9 @@ class DROIDDataset(BaseDataset):
     """
 
     HF_REPO = "lerobot/droid_100"
+    # pi05 camera frames are letterboxed to this size client-side (matches the
+    # server's vit_image_size) so both mminf and openpi get identical input.
+    IMAGE_SIZE = 224
 
     def __init__(
         self,
@@ -792,22 +828,21 @@ class DROIDDataset(BaseDataset):
         local_indices = self._local_frame_indices(frames)
         first_local   = local_indices[0]
 
-        image_paths: list[str] = []
+        # Decode + letterbox-resize each camera frame to 224x224 uint8 and save
+        # as a ".npy" (the "numpy" modality). Sending pre-resized arrays lets the
+        # server skip both image decode and the resize, and lets us hand mminf
+        # and openpi identical input.
+        npy_paths: list[str] = []
         for cam_key in camera_keys[:3]:
             chunk_video = download_fn(self._chunk_video_path(ep_id, cam_key, chunks_size))
-            png_path    = os.path.join(self.local_file_dir, f"ep{ep_id}_cam{len(image_paths)}.png")
-            _decode_frames_to_png_and_video(
-                video_path=chunk_video,
-                frame_indices=[first_local],
-                png_path=png_path,
-                mp4_path=None
-            )
-            image_paths.append(png_path)
+            npy_path = os.path.join(self.local_file_dir, f"ep{ep_id}_cam{len(npy_paths)}.npy")
+            _decode_frame_to_npy(chunk_video, first_local, npy_path, self.IMAGE_SIZE)
+            npy_paths.append(npy_path)
 
-        if not image_paths:
+        if not npy_paths:
             raise ValueError("no camera videos found")
-        while len(image_paths) < 3:
-            image_paths.append(image_paths[0])
+        while len(npy_paths) < 3:
+            npy_paths.append(npy_paths[0])
 
         state = _to_float_list(
             frames[0].get(state_col) if state_col else None, self.action_dim
@@ -815,10 +850,8 @@ class DROIDDataset(BaseDataset):
         return RequestInput(
             req_type=RequestType.VLA,
             prompt=language or "manipulate the object",
-            image_path=image_paths[0],
-            # openpi droid policy only uses the first extra image path! So, to be consistent
-            # we emit the remainder entirely from bechmarking
-            extra_image_paths=image_paths[1:2],
+            # openpi droid policy only uses the first extra image, so send 2 cameras.
+            _numpy_paths=npy_paths[:2],
             model_kwargs={"robot_state": state},
         )
 
@@ -877,13 +910,13 @@ class DROIDDataset(BaseDataset):
         """Manifest filename keyed by the params that change the built items."""
         return os.path.join(
             self.local_file_dir,
-            f"manifest_pi05_nvf{self.num_video_frames}_ad{self.action_dim}.json",
+            f"manifest_pi05_npy{self.IMAGE_SIZE}_nvf{self.num_video_frames}_ad{self.action_dim}.json",
         )
 
     def _load_manifest(self) -> list[RequestInput] | None:
         """Return cached pi05 RequestInputs, or None to force a rebuild.
 
-        Returns None if the manifest is absent, unreadable, or references a PNG
+        Returns None if the manifest is absent, unreadable, or references a .npy
         that no longer exists on disk.
         """
         import json as _json
@@ -896,18 +929,16 @@ class DROIDDataset(BaseDataset):
                 data = _json.load(f)
             items: list[RequestInput] = []
             for entry in data["items"]:
-                img = os.path.join(self.local_file_dir, entry["image_path"])
-                extra = [os.path.join(self.local_file_dir, p)
-                         for p in entry.get("extra_image_paths", [])]
-                for p in (img, *extra):
+                npy_paths = [os.path.join(self.local_file_dir, p)
+                             for p in entry.get("numpy_paths", [])]
+                for p in npy_paths:
                     if not os.path.exists(p):
                         print(f"  [cache] missing {p}; rebuilding")
                         return None
                 items.append(RequestInput(
                     req_type=RequestType.VLA,
                     prompt=entry["prompt"],
-                    image_path=img,
-                    extra_image_paths=extra,
+                    _numpy_paths=npy_paths,
                     model_kwargs=entry.get("model_kwargs", {}),
                 ))
             return items or None
@@ -918,7 +949,7 @@ class DROIDDataset(BaseDataset):
     def _save_manifest(self, items: list[RequestInput]) -> None:
         """Persist built pi05 items so the next run can skip parquet + decode.
 
-        PNG paths are stored as basenames (relative to local_file_dir) and the
+        .npy paths are stored as basenames (relative to local_file_dir) and the
         write is atomic (tmp + os.replace) so an interrupted run never leaves a
         half-written manifest that would later be reused.
         """
@@ -926,12 +957,11 @@ class DROIDDataset(BaseDataset):
 
         entries = [{
             "prompt": it.prompt,
-            "image_path": os.path.basename(it.image_path),
-            "extra_image_paths": [os.path.basename(p) for p in it.extra_image_paths],
+            "numpy_paths": [os.path.basename(p) for p in it._numpy_paths],
             "model_kwargs": it.model_kwargs,
         } for it in items]
         payload = {
-            "version": 1,
+            "version": 2,
             "task": "pi05",
             "num_video_frames": self.num_video_frames,
             "action_dim": self.action_dim,

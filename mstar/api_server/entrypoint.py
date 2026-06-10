@@ -46,6 +46,7 @@ for _mod, _exts in {
     "image": (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif"),
     "audio": (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"),
     "video": (".mp4", ".avi", ".mov", ".mkv", ".webm"),
+    "numpy": (".npy",)
 }.items():
     for _ext in _exts:
         _EXT_TO_MODALITY[_ext] = _mod
@@ -234,6 +235,7 @@ class APIServer:
         *,
         text: str | None = None,
         file_paths: dict[str, list[str]] | None = None,
+        numpy_bytes: list[bytes] | None = None,
         input_modalities: list[str],
         output_modalities: list[str],
         model_kwargs: dict | None = None,
@@ -271,6 +273,7 @@ class APIServer:
             request_id=request_id,
             text=text,
             file_paths=file_paths,
+            numpy_bytes=numpy_bytes,
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             model_kwargs=model_kwargs
@@ -555,7 +558,11 @@ async def generate(
     out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
 
     # --- save uploaded files, grouped by modality ----------------
+    # The "numpy" modality (.npy) is kept in memory and np.load'd by the data
+    # worker; image/audio/video are written to disk so their decoders work from
+    # a file (PNG/mp4 decode prefers a path).
     file_paths: dict[str, list[str]] = {}
+    numpy_bytes: list[bytes] = []
     if files:
         for f in files:
             modality = _detect_modality(f.filename or "")
@@ -564,9 +571,12 @@ async def generate(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
                 )
+            content = await f.read()
+            if modality == "numpy":
+                numpy_bytes.append(content)
+                continue
             save_name = f"{uuid.uuid4()}_{f.filename}"
             save_path = api_server.upload_dir / save_name
-            content = await f.read()
             await run_in_threadpool(save_path.write_bytes, content)
             file_paths.setdefault(modality, []).append(str(save_path))
 
@@ -586,6 +596,7 @@ async def generate(
         request_id = api_server.submit_request(
             text=text,
             file_paths=file_paths or None,
+            numpy_bytes=numpy_bytes or None,
             input_modalities=in_mods,
             output_modalities=out_mods,
             model_kwargs=parsed_kwargs,

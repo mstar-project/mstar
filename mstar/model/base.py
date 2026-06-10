@@ -5,7 +5,6 @@ from uuid import uuid4
 
 import torch
 import yaml
-import numpy as np
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
@@ -378,8 +377,6 @@ class Model(ABC):
         pass
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
-        import io
-
         import torchvision
 
         # Read the file once, then dispatch on content: a raw uint8 CxHxW array
@@ -388,12 +385,9 @@ class Model(ABC):
         # Sniffing the magic (not the extension) keeps the upload filename free.
         with open(filepath, "rb") as f:
             raw = f.read()
-        if raw[:6] == b"\x93NUMPY":
-            img = torch.from_numpy(np.load(io.BytesIO(raw))).to(device)  # uint8 CxHxW
-        else:
-            img = torchvision.io.decode_image(
-                torch.frombuffer(bytearray(raw), dtype=torch.uint8)
-            ).to(device)  # uint8 CxHxW
+        img = torchvision.io.decode_image(
+            torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+        ).to(device)  # uint8 CxHxW
         img = img.float() / 255.0
 
         return TensorAndMetadata(img)
