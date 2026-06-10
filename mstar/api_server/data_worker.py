@@ -1,6 +1,7 @@
 
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -29,6 +30,17 @@ from mstar.utils.ipc_format import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Lightweight, env-gated timing prints (MMINF_TIMING=1). perf_counter is
+# process-wide monotonic, so timestamps stamped in the API-server handler
+# thread and read in this data-worker thread are directly comparable — that's
+# how queue-wait (polling) latency is separated from actual work below.
+_TIMING = os.environ.get("MMINF_TIMING", "") not in ("", "0", "false")
+
+
+def _tlog(msg: str) -> None:
+    if _TIMING:
+        print(f"[DW-TIMING] {msg}", flush=True)
 
 
 def _preprocess_loop(**kwargs):
@@ -75,6 +87,7 @@ class PreprocessWorker:
         self.thread.start()
 
     def new_request(self, input: PreprocessInput):
+        input._t_enqueue = time.perf_counter()  # for queue-wait timing
         self.output_loop_idxs[input.request_id] = {}
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
@@ -157,6 +170,7 @@ class PreprocessWorkerThread:
         self.model = model
 
         self.tensor_uuid_to_metadata_per_request = {}
+        self._t_read_start: dict[str, float] = {}  # request_id -> read-start time
 
         self.communicator = ZMQCommunicator(
             my_id="api_server_preprocess_worker",
@@ -176,6 +190,8 @@ class PreprocessWorkerThread:
     def _process_input(
         self, input: PreprocessInput
     ):
+        _t0 = time.perf_counter()
+        _enq = getattr(input, "_t_enqueue", None)
         tensors: NameToTensorList = {}
         input_metadata = {}
 
@@ -208,6 +224,8 @@ class PreprocessWorkerThread:
                         input_metadata[key].append(out.metadata)
 
 
+        _t_load = time.perf_counter()  # media decode (load_image/audio/video) done
+
         # Then, tokenize the prompt and let the model augment/transform the
         # tensors dict (e.g., Qwen3-Omni needs to compute pixel_values,
         # image_grid_thw, audio_features, audio_seqlens from the raw tensors
@@ -231,6 +249,8 @@ class PreprocessWorkerThread:
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
 
+        _t_prompt = time.perf_counter()  # tokenization / process_prompt done
+
         initial_signals = self.tensor_manager.store_and_return_tensor_info(
             request_id=input.request_id,
             tensors=tensors # dict(modality_input: list[tensors])
@@ -248,6 +268,8 @@ class PreprocessWorkerThread:
                 input.request_id, uuid, persist=True
             )
 
+        _t_store = time.perf_counter()  # tensor store/register/persist done
+
         msg = ConductorMessage(
             message_type=ConductorMessageType.NEW_REQUEST,
             body=NewRequestConductor(
@@ -260,10 +282,26 @@ class PreprocessWorkerThread:
             ),
         )
         self.communicator.send("conductor", msg)
+        if _TIMING:
+            _t_send = time.perf_counter()
+            _qwait = (_t0 - _enq) * 1e3 if _enq is not None else -1.0
+            _imgs = tensors.get("image_inputs") or []
+            _img_shape = tuple(_imgs[0].shape) if _imgs else None
+            _tlog(
+                f"{input.request_id[:8]} INPUT  "
+                f"img={_img_shape}x{len(_imgs)} "  # decoded shape x count (decode cost driver)
+                f"qwait={_qwait:.2f} "  # enqueue->dequeue (polling)
+                f"load={(_t_load - _t0) * 1e3:.2f} "  # media decode
+                f"prompt={(_t_prompt - _t_load) * 1e3:.2f} "  # tokenize
+                f"store={(_t_store - _t_prompt) * 1e3:.2f} "  # tensor store/register
+                f"send={(_t_send - _t_store) * 1e3:.2f} "  # zmq send to conductor
+                f"total={(_t_send - _t0) * 1e3:.2f}ms"
+            )
 
     def _read_result_tensor(
         self, result: ResultTensors
     ):
+        self._t_read_start[result.request_id] = time.perf_counter()
         result.graph_edge.name = f"{result.modality}_output"
         self.tensor_manager.start_read_tensors(
             request_id=result.request_id,
@@ -279,18 +317,31 @@ class PreprocessWorkerThread:
         did_work = False
         for request_id, graph_edges in self.tensor_manager.get_ready_tensors().items():
             did_work = True
+            _t_ready = time.perf_counter()  # tensor became ready (RDMA read done)
+            _read_start = self._t_read_start.pop(request_id, None)
             for graph_edge in graph_edges:
                 modality = graph_edge.name.replace("_output", "")
 
                 for tensor_info in graph_edge.tensor_info:
                     logger.debug("Reading in OUTPUT tensor %s with uuid %s", graph_edge.name, tensor_info.uuid)
+                    _t_a = time.perf_counter()
                     tensor = self.tensor_manager.get_tensor(
                         request_id=request_id,
                         uuid=tensor_info.uuid
                     )
+                    _t_get = time.perf_counter()
                     postprocessed = self.model.postprocess(
                         tensor, modality
                     )
+                    _t_post = time.perf_counter()
+                    if _TIMING:
+                        _rw = (_t_ready - _read_start) * 1e3 if _read_start else -1.0
+                        _tlog(
+                            f"{request_id[:8]} OUTPUT "
+                            f"read_wait={_rw:.2f} "  # start_read -> ready (RDMA + polling)
+                            f"get={(_t_get - _t_a) * 1e3:.2f} "  # fetch tensor handle
+                            f"post={(_t_post - _t_get) * 1e3:.2f}ms"  # model.postprocess
+                        )
 
                     chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
                         tensor_info.uuid] or {}
@@ -302,12 +353,14 @@ class PreprocessWorkerThread:
                             "sample_rate": self.model.get_output_sample_rate("audio"),
                         }
 
-                    self.out_queue.put(ResultChunk(
+                    _chunk = ResultChunk(
                         request_id=request_id,
                         modality=modality,
                         data=postprocessed,
                         metadata=chunk_metadata,
-                    ))
+                    )
+                    _chunk._t_outqueue = time.perf_counter()
+                    self.out_queue.put(_chunk)
                     del self.tensor_uuid_to_metadata_per_request[request_id][
                         tensor_info.uuid]
                     self.tensor_manager.dereference(

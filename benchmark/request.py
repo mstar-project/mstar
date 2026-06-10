@@ -17,6 +17,31 @@ import numpy as np
 from benchmark.base import Bagel, Model, Orpheus, RequestType, Status
 from benchmark.utils import _write_wav
 
+# Optional: send images as a raw uint8 CxHxW .npy instead of PNG (MMINF_BENCH_RAW=1).
+# PNG decode in the data worker is ~2ms/image (zlib inflate + unfiltering),
+# independent of resolution; a raw array is np.load'd for ~0. Lossless — the
+# bytes are the decoded pixels (bit-identical to the server's torchvision
+# decode), self-described by the .npy header. Trades a larger upload (~173KB vs
+# ~95KB PNG) for ~zero server-side decode. The server's load_image sniffs the
+# .npy magic bytes, so only the client bytes change.
+_BENCH_RAW = os.environ.get("MMINF_BENCH_RAW", "") not in ("", "0", "false")
+
+
+def _maybe_raw(data: bytes) -> bytes:
+    """Re-encode PNG/JPEG bytes as a raw CxHxW uint8 .npy when MMINF_BENCH_RAW set."""
+    if not _BENCH_RAW:
+        return data
+    import numpy as np
+    import torch
+    import torchvision
+
+    chw = torchvision.io.decode_image(
+        torch.frombuffer(bytearray(data), dtype=torch.uint8)
+    ).numpy()  # CxHxW uint8 — matches the server's decode exactly
+    buf = io.BytesIO()
+    np.save(buf, chw)
+    return buf.getvalue()
+
 
 @dataclass
 class LatencyStats:
@@ -623,7 +648,7 @@ class RequestInput:
 
     def __post_init__(self):
         if self.image_path and self._image_bytes is None:
-            self._image_bytes = Path(self.image_path).read_bytes()
+            self._image_bytes = _maybe_raw(Path(self.image_path).read_bytes())
             self._image_b64 = base64.b64encode(self._image_bytes).decode()
         if self.audio_path and self._audio_bytes is None:
             self._audio_bytes = Path(self.audio_path).read_bytes()
@@ -632,7 +657,7 @@ class RequestInput:
             self._video_bytes = Path(self.video_path).read_bytes()
             self._video_b64 = base64.b64encode(self._video_bytes).decode()
         if self.extra_image_paths and not self._extra_image_bytes:
-            self._extra_image_bytes = [Path(p).read_bytes() for p in self.extra_image_paths]
+            self._extra_image_bytes = [_maybe_raw(Path(p).read_bytes()) for p in self.extra_image_paths]
 
     def get_all_filepaths(self) -> dict[str, str]:
         res = {}
