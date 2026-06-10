@@ -146,7 +146,8 @@ class LingMoeModel(nn.Module):
         position_ids: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
         audio_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_hidden_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the full thinker forward.
 
         Args:
@@ -165,9 +166,18 @@ class LingMoeModel(nn.Module):
             image_mask, audio_mask: per-token modality masks for
                 :class:`LingMoeBlock`. ``None`` ⇒ all text routing.
 
+            return_hidden_states: when True, also return the post-norm
+                hidden states ``(T, hidden_size)`` as a second tuple element.
+                The image-gen path (step 9b) needs these at the
+                ``<imagePatch>`` query-token positions to condition the DiT —
+                ``lm_head`` logits are irrelevant there.
+
         Returns:
-            ``(T, vocab_size)`` logits. The caller (the submodule)
-            slices the last position for next-token sampling.
+            ``(T, vocab_size)`` logits by default. The caller (the submodule)
+            slices the last position for next-token sampling. When
+            ``return_hidden_states`` is True, returns
+            ``(logits, hidden_states)`` where ``hidden_states`` is the
+            post-norm ``(T, hidden_size)`` tensor.
         """
         if (input_ids is None) == (input_embeds is None):
             raise ValueError(
@@ -199,4 +209,7 @@ class LingMoeModel(nn.Module):
             )
 
         h = self.norm(h)
-        return self.lm_head(h)
+        logits = self.lm_head(h)
+        if return_hidden_states:
+            return logits, h
+        return logits

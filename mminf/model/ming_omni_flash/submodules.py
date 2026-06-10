@@ -373,6 +373,58 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         return self._audio_start_embed, self._audio_end_embed
 
     # ------------------------------------------------------------------
+    # Image-gen producer-side hidden-state extraction (step 9b)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def extract_image_gen_hidden_states(
+        hidden_states: torch.Tensor,
+        token_ids: torch.Tensor,
+        image_patch_token: int,
+    ) -> torch.Tensor:
+        """Slice the post-norm hidden states at the ``<imagePatch>`` positions.
+
+        For an image-generation request the prompt carries an
+        ``<image><imagePatch>*N</image>`` block (appended by
+        :func:`maybe_expand_image_gen_prompt`, step 8b). The DiT condition
+        encoder (step 9b) consumes the thinker's hidden states *at those N
+        query-token positions* — not the sampled token. This helper pulls them
+        out so the Thinker→ImageGen streaming edge can carry
+        ``thinker_hidden_states``.
+
+        Args:
+            hidden_states: ``(T, H)`` post-norm thinker hidden states (from
+                ``LingMoeModel.forward(..., return_hidden_states=True)``).
+            token_ids: ``(T,)`` the input token ids for the same forward pass
+                (used to locate the patch positions).
+            image_patch_token: the ``<imagePatch>`` token id
+                (``config.thinker_llm.image_patch_token``, 157157 on the
+                released ckpt).
+
+        Returns:
+            ``(N, H)`` hidden states at the patch positions, in order.
+
+        Raises:
+            ValueError: if shapes disagree or no patch tokens are present.
+        """
+        if hidden_states.dim() != 2:
+            raise ValueError(f"expected (T, H) hidden_states, got {tuple(hidden_states.shape)}")
+        if token_ids.dim() != 1:
+            token_ids = token_ids.reshape(-1)
+        if token_ids.shape[0] != hidden_states.shape[0]:
+            raise ValueError(
+                f"token_ids length {token_ids.shape[0]} != hidden_states T "
+                f"{hidden_states.shape[0]}"
+            )
+        mask = token_ids.to(hidden_states.device) == int(image_patch_token)
+        if not bool(mask.any()):
+            raise ValueError(
+                f"no <imagePatch> token ({image_patch_token}) found in token_ids; "
+                "process_prompt must append the query-token block for image output."
+            )
+        return hidden_states[mask]
+
+    # ------------------------------------------------------------------
     # ARNodeSubmodule contract
     # ------------------------------------------------------------------
 
