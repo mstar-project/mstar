@@ -58,7 +58,7 @@ from mminf.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mminf.graph.special_destinations import EMIT_TO_CLIENT
 from mminf.model.base import ForwardPassArgs, Model
 from mminf.model.ming_omni_flash.components.model import LingMoeModel
 from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig
@@ -1029,7 +1029,21 @@ class MingFlashOmniModel(Model):
         # turns since the chat template emits role markers + an
         # assistant-prompt suffix the model needs to start decoding).
         if prompt is not None:
-            messages = [{"role": "user", "content": prompt}]
+            # Image-generation requests append the learnable query-token
+            # block (<image><imagePatch>*N</image>) to the prompt — the
+            # thinker substitutes its image-gen query embeddings at those
+            # positions during forward (step 9). Only when the deploy
+            # actually ships an imagegen sub-config and the caller asked
+            # for an image output.
+            prompt_for_template = prompt
+            if "image" in output_modalities and self.config.image_gen is not None:
+                from mminf.model.ming_omni_flash.components.prompt_utils import (
+                    maybe_expand_image_gen_prompt,
+                )
+                prompt_for_template = maybe_expand_image_gen_prompt(
+                    prompt, num_query_tokens=self.config.image_gen.num_query_tokens,
+                )
+            messages = [{"role": "user", "content": prompt_for_template}]
             text = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
             )
