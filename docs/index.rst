@@ -1,5 +1,5 @@
-mminf Documentation
-===================
+M* Documentation
+================
 
 ``mminf`` is the package behind **M\*** ("M-star"), a **disaggregated, any-to-any
 multimodal inference engine**. It serves models built from structurally distinct
@@ -9,8 +9,8 @@ and the task.
 
 The core abstraction is the *graph walk*: each model declares its computation as a
 dataflow graph of components, and every request is a walk over that graph. A request flows
-``HTTP / SDK → API server → conductor → workers → streamed results``; the conductor walks
-the model's graph to coordinate multi-engine pipelines across one or more GPUs. Logical
+``HTTP / SDK → API server → conductor → workers → streamed results``; the conductor schedules
+the model's graph walks to coordinate multi-engine pipelines across one or more GPUs. Logical
 graph structure is decoupled from physical placement, so the *same* model runs single-GPU
 or fully disaggregated by changing only a YAML config.
 

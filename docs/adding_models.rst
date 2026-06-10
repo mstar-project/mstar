@@ -161,8 +161,9 @@ Step 3 — Declare the computation graph
 - ``GraphEdge(next_node, name, ...)`` — routes an output tensor named ``name`` to
   ``next_node``. Flags: ``persist=True`` keeps the tensor available for later steps/walks
   (this is how a generated token is carried from ``prefill`` into the ``decode`` loop),
-  and ``output_modality="audio"`` (with ``next_node=EMIT_TO_CLIENT``) streams it to the
-  client. Special destinations live in ``mminf/graph/special_destinations.py``
+  and ``output_modality`` — one of ``"text"``, ``"image"``, ``"audio"``, ``"video"``,
+  ``"action"`` — with ``next_node=EMIT_TO_CLIENT`` streams the tensor to the client.
+  Special destinations live in ``mminf/graph/special_destinations.py``
   (``EMIT_TO_CLIENT``, ``EMPTY_DESTINATION``). A ``decode`` loop stops when a submodule's
   ``check_stop`` registers a stop signal against the ``Loop`` (e.g. on EOS) — see Step 4 —
   not through any edge flag.
@@ -241,9 +242,12 @@ contract:
    Runs off the GPU thread and *may* read tensor values. Return the names of the
    ``Loop`` s to stop (e.g. when you see the EOS token). This is how decode terminates.
 
+``cleanup_request(self, request_id)`` (optional)
+   Free any submodule-internal per-request state when a request finishes — buffers,
+   per-request caches, counters. See Qwen3-Omni's ``Code2WavSubmodule`` for an example.
+
 The two batching/CUDA-graph knobs — ``can_batch`` / ``forward_batched`` and
-``get_cuda_graph_configs`` — are important enough to get their own step below;
-``cleanup_request`` (free per-request state on completion) is the one minor leftover.
+``get_cuda_graph_configs`` — are important enough to get their own step below.
 
 Loading weights
 ~~~~~~~~~~~~~~~
@@ -426,10 +430,16 @@ Tensor parallelism (sharding)
 
 A node can be sharded across several GPUs by adding ``tp_size`` to its ``node_groups``
 entry and listing ``tp_size`` ranks. The runtime splits the group's ranks into
-TP groups of that size and builds one ``comm_group`` per shard; the weight loaders
-(see `Loading weights`_) slice each sharded parameter automatically, so **no model code
-changes** are needed to go from single-GPU to tensor-parallel — only the YAML and a small
-sharding declaration. For example, running the Orpheus LLM tensor-parallel across two
+TP groups of that size and builds one ``comm_group`` per shard. For a node to actually
+shard (rather than be replicated), its components must be built from the tensor-parallel
+modules in ``mminf/model/components/distributed`` — ``ParallelAttention``,
+``ParallelGatedMLP``, ``ColumnParallelLinear`` / ``RowParallelLinear``,
+``VocabParallelEmbedding``, and friends — whose ``weight_loader`` s (see `Loading
+weights`_) slice each sharded parameter automatically. A node whose components do *not*
+use those modules is simply **replicated** on every rank (e.g. a tensor-parallel
+Qwen3-Omni Talker leaves its code predictor replicated). Once a component is built this
+way, going from single-GPU to tensor-parallel needs only the YAML and a small sharding
+declaration — no further model-code changes. For example, running the Orpheus LLM tensor-parallel across two
 GPUs (``configs/orpheus_tp2.yaml``):
 
 .. code-block:: yaml

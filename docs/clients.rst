@@ -184,9 +184,12 @@ Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``) return ``
 
 Per-model notes:
 
-- **BAGEL** — chat is text-only; per-request ``temperature`` / ``top_p`` are not honored
-  (sampling is read from the model config), but ``max_output_tokens`` and ``seed`` are.
-- **Qwen3-Omni** — text sampling uses ``thinker_*`` keys and speech uses ``talker_*``;
-  request audio output by including ``"audio"`` in ``modalities``. Non-OpenAI knobs (e.g.
-  ``talker_top_k``) go through ``extra_body``.
-- **Orpheus** — honors ``temperature`` / ``top_p`` / ``seed`` and ``voice``.
+- **BAGEL** — chat returns text only; use ``/v1/images/generations`` and
+  ``/v1/images/edits`` for image output.
+- **Qwen3-Omni** — text sampling uses ``thinker_*`` keys and speech uses ``talker_*``; set
+  the speaker with ``voice`` (default ``Ethan``) and request audio output by including
+  ``"audio"`` in ``modalities``. Non-OpenAI knobs (e.g. ``talker_top_k``) go through
+  ``extra_body``.
+- **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
+  ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list
+  in the Orpheus config).

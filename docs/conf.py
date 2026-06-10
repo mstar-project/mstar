@@ -15,8 +15,8 @@ except Exception:  # noqa: BLE001
     except Exception:  # noqa: BLE001
         package_version = "0.0.0"
 
-project = "mminf"
-author = "mminf Team"
+project = "M*"
+author = "M* Team"
 current_year = datetime.now().year
 copyright = f"2025-{current_year}, {author}"
 version = package_version
