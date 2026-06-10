@@ -1513,8 +1513,11 @@ class TalkerSubmodule(ARNodeSubmodule):
             last_hidden = hidden
         logits = self.model.codec_head(last_hidden)
         logits = logits.masked_fill(suppress_mask.unsqueeze(0), float("-inf"))
+        # Apply the repetition penalty to the Talker's layer-0 codes (the code
+        # predictor depth loop below uses sample_with_config and stays penalty-free
+        # for now). The penalty is baked into the captured graph.
         layer0_codes = injected_sampler.sample(
-            request_ids, logits
+            request_ids, logits, apply_penalty=True
         )
 
         # code predictor section

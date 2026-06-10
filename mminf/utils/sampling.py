@@ -15,15 +15,15 @@ Usage:
     tokens = sample_tokens(logits, temperature=0.7, top_p=0.9)
 """
 
-from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, field
 import logging
-from typing import Any, Callable
+from abc import ABC, abstractmethod
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 import torch
 import triton
 import triton.language as tl
-
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +181,15 @@ def fused_temperature_softmax(
     mask_stride_v = seen_mask.stride(1) if apply_penalty else 0
     grid = (B,)
     with torch.cuda.device(logits.device):
-        # BLOCK_SIZE is picked by @triton.autotune (not passed here).
+        # BLOCK_SIZE is picked by @triton.autotune (not passed here). The first
+        # launch for a given key benchmarks every config (do_bench), which can
+        # leave probs in a state not ordered on the current stream relative to
+        # the downstream FlashInfer read -> garbage. We can't gate the sync on
+        # autotune alone (that wasn't enough on its own); pairing it with the
+        # device context above is what fixes it. Detect the autotune call by the
+        # config cache growing, and sync only then -- steady state stays sync-free.
+        cache = getattr(_fused_sampling_prep_kernel, "cache", None)
+        cache_size_before = len(cache) if cache is not None else 0
         _fused_sampling_prep_kernel[grid](
             logits, temperature, pen_ptr, mask_ptr, probs,
             V,
@@ -191,11 +199,17 @@ def fused_temperature_softmax(
             APPLY_PENALTY=apply_penalty,
             INCLUDE_GREEDY=include_greedy,
         )
+        if cache is not None and len(cache) > cache_size_before:
+            torch.cuda.current_stream().synchronize()
     return probs
 
 
 @dataclass
 class SamplingConfig:
+    # Sizes the per-request seen-token mask for the repetition penalty. When set,
+    # it MUST equal the model's logit width (lm_head/codec_head output dim): the
+    # mask is indexed as ``[B, vocab_size]`` against ``logits[B, V]``, and on the
+    # CUDA-graph path it also gates allocation of the in-graph penalty buffers.
     vocab_size: int | None = None
     temperature: float = 0.6
     top_k: int = 0
@@ -229,7 +243,7 @@ class BaseSampler(ABC):
 
     @abstractmethod
     def sample(
-        self, request_ids: list[str], logits: torch.Tensor
+        self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         pass
 
@@ -272,7 +286,10 @@ class SeenTokenMask:
                 "the SamplingConfig has not yet been registered with the Sampler.s"
             )
             return
-        self._seen_token_mask[tokens] = True
+        idx = torch.as_tensor(
+            tokens, dtype=torch.long, device=self._seen_token_mask.device,
+        ).reshape(-1)
+        self._seen_token_mask.scatter_(0, idx, True)
 
 
 @dataclass
@@ -281,7 +298,11 @@ class Sampler(BaseSampler):
     device: torch.device
     _sampling_config: dict[str, SamplingConfig] = field(default_factory=dict)
     _seen_token_mask: dict[str, SeenTokenMask]= field(default_factory=dict)
-    _autotune_sync_budget_remaining: int = 64
+    # Per-request RNG offset, advanced once per sampled step. Paired with the
+    # request's fixed seed, this steps the philox stream so deterministic
+    # (seeded) sampling draws a fresh number each step — otherwise identical
+    # (seed, offset=0) draws repeat forever and stable logits never reach EOS.
+    _step_offset: dict[str, int] = field(default_factory=dict)
     tp_group: "TPCommGroup | None" = None  # noqa: F821
 
     def add_request(self, request_id: str):
@@ -291,8 +312,9 @@ class Sampler(BaseSampler):
             vocab_size=None,
             device=self.device
         )
+        self._step_offset[request_id] = 0
         # lazy init _seen_token_mask, taking vocab size from logits or cfg
-    
+
     def get_token_mask(self, request_id: str):
         return self._seen_token_mask[request_id]
 
@@ -301,6 +323,7 @@ class Sampler(BaseSampler):
             del self._sampling_config[request_id]
         if request_id in self._seen_token_mask:
             del self._seen_token_mask[request_id]
+        self._step_offset.pop(request_id, None)
 
     def set_config(self, request_id: str, **kwargs):
         old_vocab_size = self._sampling_config[request_id].vocab_size
@@ -319,7 +342,7 @@ class Sampler(BaseSampler):
             )
 
     def sample(
-        self, request_ids: list[str], logits: torch.Tensor
+        self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         """Return the sampled tokens as a single [B] int tensor.
 
@@ -334,7 +357,10 @@ class Sampler(BaseSampler):
         top_p = torch.tensor([c.top_p for c in configs], device=logits.device)
         r_pen = torch.tensor([c.repetition_penalty for c in configs], device=logits.device)
         seed = torch.tensor([c.seed for c in configs], device=logits.device, dtype=torch.long)
-        rand_offset = torch.zeros_like(seed)
+        rand_offset = torch.tensor(
+            [self._step_offset.get(rid, 0) for rid in request_ids],
+            device=logits.device, dtype=torch.long,
+        )
     
         any_rep_pen = any(c.repetition_penalty != 1.0 for c in configs)
         any_greedy = any(c.temperature == 0 for c in configs)
@@ -342,7 +368,7 @@ class Sampler(BaseSampler):
         all_top_k_zero = all(c.top_k == 0 for c in configs)
 
         for rid in request_ids:
-            if self._sampling_config[rid].vocab_size is None:
+            if self._seen_token_mask[rid]._seen_token_mask is None:
                 self._seen_token_mask[rid] = SeenTokenMask.new(
                     rid, vocab_size=logits.shape[1],
                     device=self.device
@@ -366,7 +392,6 @@ class Sampler(BaseSampler):
             all_top_k_zero=all_top_k_zero,
             seed=seed,
             rand_offset=rand_offset,
-            cuda_sync_function=self._sync,
         )
 
         # TODO: make this scatter async. Currently runs 2 kernels per rid
@@ -386,13 +411,11 @@ class Sampler(BaseSampler):
             for i, rid in enumerate(request_ids):
                 self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
 
-        return tokens
+        # Advance the per-request RNG offset so the next step draws fresh.
+        for rid in request_ids:
+            self._step_offset[rid] = self._step_offset.get(rid, 0) + 1
 
-    def _sync(self) -> None:
-        # Sync between Triton's fused_temperature_softmax (writes probs)
-        # and FlashInfer's sampling kernel (reads probs). They live on
-        # different CUDA streams in some configurations.
-        torch.cuda.current_stream().synchronize()
+        return tokens
 
 
 @torch.compiler.disable
@@ -408,7 +431,6 @@ def sample_tokens(
     all_top_k_zero: bool | None = None,
     seed: torch.Tensor | None = None,
     rand_offset: torch.Tensor | None = None,
-    cuda_sync_function: Callable[[], None] | None = None,
 ) -> torch.Tensor:
     """Sample tokens from logits with temperature, top-k, top-p, and repetition penalty.
 
@@ -442,37 +464,42 @@ def sample_tokens(
 
     import flashinfer
 
-    # Fast path: top_k is disabled for every request in the batch. One Triton
-    # kernel fuses (optional rep-penalty) + (temperature-scaled softmax) +
-    # (argmax → one-hot for greedy rows). FlashInfer's sample-from-probs then
-    # deterministically picks argmax on one-hot rows, matching greedy semantics.
-    if all_top_k_zero is True:
+    # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
+    # (reads probs) to the same device/stream so the write-before-read is
+    # ordered without an explicit sync. Otherwise FlashInfer runs on the
+    # worker's current-device stream while probs lives off-device (e.g. BAGEL
+    # LLM on rank 1) — a cross-stream race that yields garbage.
+    with torch.cuda.device(logits.device):
+        # Fast path: top_k is disabled for every request in the batch. One Triton
+        # kernel fuses (optional rep-penalty) + (temperature-scaled softmax) +
+        # (argmax → one-hot for greedy rows). FlashInfer's sample-from-probs then
+        # deterministically picks argmax on one-hot rows, matching greedy semantics.
+        if all_top_k_zero is True:
+            probs = fused_temperature_softmax(
+                logits, temperature,
+                penalty=repetition_penalty if seen_token_mask is not None else None,
+                seen_mask=seen_token_mask,
+                include_greedy=run_greedy,
+            )
+            result = flashinfer.sampling.top_p_sampling_from_probs(
+                probs, top_p,
+                deterministic=True,
+                seed=seed, offset=rand_offset,
+            )
+            return result[0] if isinstance(result, tuple) else result
+
         probs = fused_temperature_softmax(
             logits, temperature,
             penalty=repetition_penalty if seen_token_mask is not None else None,
             seen_mask=seen_token_mask,
             include_greedy=run_greedy,
         )
-
-        if cuda_sync_function is not None:
-            cuda_sync_function()
-        result = flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
+        result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, top_p,
+            deterministic=True,
+            seed=seed, offset=rand_offset
+        )
         return result[0] if isinstance(result, tuple) else result
-    
-    probs = fused_temperature_softmax(
-        logits, temperature,
-        penalty=repetition_penalty if seen_token_mask is not None else None,
-        seen_mask=seen_token_mask,
-        include_greedy=run_greedy,
-    )
-    if cuda_sync_function is not None:
-        cuda_sync_function()
-    result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-        probs, top_k, top_p,
-        deterministic=True,
-        seed=seed, offset=rand_offset
-    )
-    return result[0] if isinstance(result, tuple) else result
 
 
 def _to_tensor(
@@ -494,9 +521,9 @@ def _to_tensor(
 # Reads top_k / top_p / temperature from preallocated device tensors so the
 # call can sit inside a CUDA graph capture region without allocating, syncing,
 # or branching on CPU-side values. The full ``Sampler`` class is *not* graph
-# capturable (repetition-penalty state, ``@torch.compiler.disable``, the CPU
-# stream sync inside ``sample_tokens``), so the unrolled MTP loop uses this
-# narrower path. ``deterministic=True`` disables the CPU-RNG-seeded path that
+# capturable (repetition-penalty state, ``@torch.compiler.disable``, the
+# device-context switch inside ``sample_tokens``), so the unrolled MTP loop uses
+# this narrower path. ``deterministic=True`` disables the CPU-RNG-seeded path that
 # FlashInfer would otherwise take.
 
 def sample_cuda_graphable_gpu(
@@ -506,20 +533,33 @@ def sample_cuda_graphable_gpu(
     top_p: torch.Tensor,
     seed: torch.Tensor,
     offset: torch.Tensor,
+    apply_penalty: bool = False,
+    rep_penalty: torch.Tensor | None = None,
+    seen_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
-    Uses ``flashinfer.sampling.top_k_top_p_sampling_from_logits`` with
-    ``deterministic=True`` -- the graph-safe variant that avoids CPU-seeded
-    RNG paths (those require a CPU sync to pull a random offset). Callers
-    encode greedy requests as ``(temperature=1.0, top_k=1)`` so this
-    function never needs to branch on CPU values.
+    Routes through the fused Triton prep kernel (``fused_temperature_softmax``)
+    so the CUDA-graph path can apply the same vLLM-style repetition penalty as
+    the regular ``Sampler``, then samples with
+    ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` (``deterministic=True``
+    — the graph-safe variant that avoids CPU-seeded RNG paths). Greedy requests
+    are encoded as ``(temperature=1.0, top_k=1)`` so ``from_probs`` returns the
+    argmax and this function never branches on CPU values (``include_greedy`` is
+    therefore left off).
+
+    The autotune sync inside ``fused_temperature_softmax`` only fires the first
+    time a kernel key is seen, which happens during eager warmup — by capture
+    time the config is cached, so the captured launch is sync-free.
 
     Args:
         logits: ``[batch_size, vocab_size]`` raw logits from the codebook head.
         temperature: ``[batch_size]`` float tensor.
         top_k: ``[batch_size]`` int32 tensor. Use ``vocab_size`` to disable.
         top_p: ``[batch_size]`` float tensor. Use ``1.0`` to disable.
+        apply_penalty: when True, ``rep_penalty`` + ``seen_tokens`` are applied.
+        rep_penalty: ``[batch_size]`` float tensor (1.0 = disabled per row).
+        seen_tokens: ``[batch_size, vocab_size]`` bool mask of seen tokens.
 
     Returns:
         ``[batch_size]`` int64 sampled token IDs. FlashInfer's default
@@ -528,11 +568,16 @@ def sample_cuda_graphable_gpu(
     """
     import flashinfer
 
-    scaled = logits / temperature.unsqueeze(-1).to(logits.dtype)
+    probs = fused_temperature_softmax(
+        logits, temperature,
+        penalty=rep_penalty if apply_penalty else None,
+        seen_mask=seen_tokens if apply_penalty else None,
+        include_greedy=False,
+    )
     top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-    samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-        scaled, top_k, top_p, deterministic=True,
-        seed=seed, offset=offset
+    samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        probs, top_k, top_p, deterministic=True,
+        seed=seed, offset=offset,
     )
     return samples.to(torch.int64)
 
@@ -544,18 +589,41 @@ class CudaGraphableSampler(BaseSampler):
     top_p_buf: torch.Tensor
     seed_buf: torch.Tensor
     offset_buf: torch.Tensor
+    # Repetition-penalty state for the CUDA-graph path. ``None`` for submodules
+    # that don't opt into seen-token tracking (then ``apply_penalty`` is a no-op).
+    rep_penalty_buf: torch.Tensor | None = None
+    seen_tokens_buf: torch.Tensor | None = None  # [bs, V] bool
     tp_group: "TPCommGroup | None" = None  # noqa: F821
 
+    # Set during graph capture, and used by the cuda graph runner to determine
+    # whether requests' seen token buffers should be synced post-replay
+    applied_penalty_in_graph: bool = False
+
     @torch.compiler.disable
-    def sample(self, request_ids: list[str], logits: torch.Tensor):
+    def sample(
+        self, request_ids: list[str], logits: torch.Tensor,
+        apply_penalty: bool = False,
+    ):
         codes = sample_cuda_graphable_gpu(
             logits, self.temperature_buf,
             self.top_k_buf, self.top_p_buf,
-            self.seed_buf, self.offset_buf
+            self.seed_buf, self.offset_buf,
+            apply_penalty=apply_penalty,
+            rep_penalty=self.rep_penalty_buf,
+            seen_tokens=self.seen_tokens_buf,
         )
         self.offset_buf += 1
-        return self._broadcast_tokens(codes)
-    
+        codes = self._broadcast_tokens(codes)
+        if apply_penalty and self.seen_tokens_buf is not None:
+            self.applied_penalty_in_graph = True
+            # Record the (broadcast, TP-agreed) token in the seen-token buffer so
+            # the next step penalises it. ``scatter_`` with a scalar value is
+            # CUDA-graph capturable; advanced-index assignment
+            # (``buf[rows, codes] = True``) is not — it trips "operation not
+            # permitted when stream is capturing".
+            self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
+        return codes
+
     @torch.compiler.disable
     def sample_with_config(
         self, logits: torch.Tensor,
@@ -581,36 +649,128 @@ class CudaGraphableSampler(BaseSampler):
         # agreement. Mirrors ``CudaGraphableSampler.sample``.
         return self._broadcast_tokens(tokens)
 
+    @torch.compiler.disable
+    def sync_seen_token_masks(
+        self, seen_masks: "Iterable[SeenTokenMask]",
+    ) -> None:
+        """Copy the in-graph seen-token rows back into canonical ``SeenTokenMask``s.
+
+        Called eagerly after graph replay (the captured ``sample`` scattered the
+        newly sampled token into ``seen_tokens_buf``). ``seen_masks`` are in
+        request order; padding rows beyond ``len(seen_masks)`` are ignored, and
+        not-yet-sized masks (``_seen_token_mask is None``) are skipped.
+        """
+        if self.seen_tokens_buf is None:
+            return
+        for i, m in enumerate(seen_masks):
+            mask = m._seen_token_mask
+            if mask is not None:
+                mask.copy_(self.seen_tokens_buf[i])
+
+
+@dataclass
+class Buffer:
+    """Three-tier storage for one per-request scalar sampling parameter.
+
+    - ``buf``     ``[max_bs]``   per-step tensor, sliced to ``padded_bs`` and read
+      by ``CudaGraphableSampler`` (its address must stay stable across replays).
+    - ``master``  ``[capacity]`` slot-indexed cache, one row per active request.
+    - ``row_cpu`` ``[1]`` pinned staging for a single async H2D master-row write.
+    """
+    buf: torch.Tensor
+    master: torch.Tensor
+    row_cpu: torch.Tensor
+    default: float
+    dtype: torch.dtype
+
+    @classmethod
+    def allocate(
+        cls, max_bs: int, capacity: int, device: torch.device,
+        dtype: torch.dtype, default: float, pinned: bool,
+    ) -> "Buffer":
+        return cls(
+            buf=torch.full((max_bs,), default, dtype=dtype, device=device),
+            master=torch.full((capacity,), default, dtype=dtype, device=device),
+            row_cpu=torch.zeros(1, dtype=dtype, pin_memory=pinned),
+            default=default,
+            dtype=dtype,
+        )
+
+    def write_master_row(self, slot: int, value) -> None:
+        self.row_cpu[0] = value
+        self.master[slot:slot + 1].copy_(self.row_cpu, non_blocking=True)
+
+    def grow_master(self, new_capacity: int) -> None:
+        new = torch.full(
+            (new_capacity,), self.default, dtype=self.dtype, device=self.master.device,
+        )
+        new[: self.master.shape[0]].copy_(self.master)
+        self.master = new
+
+    def gather(self, idx_view: torch.Tensor, padded_bs: int) -> None:
+        torch.index_select(self.master, 0, idx_view, out=self.buf[:padded_bs])
+
+
+@dataclass
+class MaskBuffer:
+    """Three-tier storage for the per-request seen-token mask ``[*, V]`` (bool).
+
+    Mirrors ``Buffer`` but 2-D and sourced from on-device ``SeenTokenMask``
+    tensors, so the master-row write is a GPU->GPU copy (no pinned staging).
+    """
+    buf: torch.Tensor       # [max_bs, V] bool
+    master: torch.Tensor    # [capacity, V] bool
+    vocab_size: int
+
+    @classmethod
+    def allocate(
+        cls, max_bs: int, capacity: int, vocab_size: int, device: torch.device,
+    ) -> "MaskBuffer":
+        return cls(
+            buf=torch.zeros(max_bs, vocab_size, dtype=torch.bool, device=device),
+            master=torch.zeros(capacity, vocab_size, dtype=torch.bool, device=device),
+            vocab_size=vocab_size,
+        )
+
+    def write_master_row(self, slot: int, mask: torch.Tensor) -> None:
+        # ``mask`` is the [V] bool tensor owned by a SeenTokenMask (on device).
+        self.master[slot].copy_(mask)
+
+    def clear_master_row(self, slot: int) -> None:
+        self.master[slot].zero_()
+
+    def grow_master(self, new_capacity: int) -> None:
+        new = torch.zeros(
+            new_capacity, self.vocab_size, dtype=torch.bool, device=self.master.device,
+        )
+        new[: self.master.shape[0]].copy_(self.master)
+        self.master = new
+
+    def gather(self, idx_view: torch.Tensor, padded_bs: int) -> None:
+        torch.index_select(self.master, 0, idx_view, out=self.buf[:padded_bs])
+
 
 @dataclass
 class SamplerBuffers:
-    """Pre-allocated static buffers for graph-safe MTP sampling.
+    """Pre-allocated static buffers for graph-safe sampling.
 
-    Owns two tiers of GPU state:
+    Each per-request scalar parameter (temperature, top_k, top_p, seed,
+    repetition_penalty) is a ``Buffer`` owning a per-step slice, a slot-indexed
+    master cache, and pinned row staging. ``offset_buf`` is special-cased (no
+    master; it accumulates in-graph via ``offset_buf += 1``). The optional
+    ``seen_tokens`` ``MaskBuffer`` (allocated only when ``vocab_size`` is given)
+    carries the per-request repetition-penalty mask for the CUDA-graph path.
 
-    1. **Per-step buffers** (``temperature_buf``, ``top_k_buf``, ``top_p_buf``,
-       ``seed_buf``, ``offset_buf``) — sized ``[max_batch_size]``, sliced to
-       ``padded_bs`` on each call and consumed by ``CudaGraphableSampler``.
-    2. **Master buffers** (``_master_temperature``, ``_master_top_k``,
-       ``_master_top_p``) — sized ``[max_batch_size]`` and indexed by a stable
-       per-request slot. Each active request occupies one slot.
-
-    The per-step path (``gather_for_request_ids``) builds a small slot-index
-    tensor on a pinned CPU buffer, async-copies it to GPU, and runs three
-    ``torch.index_select`` calls into the per-step buffers. This replaces the
-    old per-step Python loop that issued ``temps[i] = float(...)``-style
-    item-assignments (one tiny H2D + kernel launch per element), which
-    competed with the async-engine pipeline for host-side throughput.
-
-    Seeds are kept GPU-local: ``seed_buf`` is refilled per step via
-    ``torch.randint`` on device, preserving step-to-step randomization
-    without any CPU sync.
+    ``gather_for_request_ids`` builds a pinned slot-index tensor, async-copies it
+    to GPU, and ``index_select``s each master into the per-step buffers — one
+    cheap gather per buffer instead of the old per-element item-assignments.
     """
     max_batch_size: int
-    temperature_buf: torch.Tensor   # [max_bs], float32
-    top_k_buf: torch.Tensor         # [max_bs], int32
-    top_p_buf: torch.Tensor         # [max_bs], float32
-    seed_buf: torch.Tensor          # [max_bs], int64
+    temperature: Buffer
+    top_k: Buffer
+    top_p: Buffer
+    seed: Buffer
+    rep_penalty: Buffer
     offset_buf: torch.Tensor        # [max_bs], int64
     # TP communicator for the submodule that owns these buffers. Passed
     # through ``slice_for_bs`` into every per-step ``CudaGraphableSampler``
@@ -621,35 +781,31 @@ class SamplerBuffers:
     # garbled audio for Talker, premature EOS for Thinker. Defaults to
     # ``None`` for non-TP submodules (trivial broadcast is a cheap no-op).
     tp_group: "TPCommGroup | None" = None  # noqa: F821
-    # Master cache: one row per active request, indexed by slot. Grown
-    # dynamically (doubling) when more than ``max_batch_size`` requests are
-    # in-flight simultaneously — the master is decoupled from the per-step
-    # buffer size so registered-but-not-batched requests don't constrain the
-    # cuda-graph capture batch sizes.
-    _master_temperature: torch.Tensor = field(default=None, repr=False)
-    _master_top_k: torch.Tensor = field(default=None, repr=False)
-    _master_top_p: torch.Tensor = field(default=None, repr=False)
-    _master_seed: torch.Tensor = field(default=None, repr=False)
+    # Per-request seen-token mask buffer for the repetition penalty. Present
+    # only for submodules that opt in by declaring a vocab size (e.g. the
+    # Qwen3-Omni Talker). ``None`` => the CUDA-graph path applies no penalty.
+    seen_tokens: "MaskBuffer | None" = None
+    # Master cache capacity (grown by doubling when more requests are
+    # concurrently registered than the per-step buffer holds).
     _master_capacity: int = field(default=0, repr=False)
     # Per-step slot-index staging. ``_slot_idx_cpu`` is pinned so the H2D
     # copy can be issued non-blocking; ``_slot_idx_gpu`` is the device-side
     # index tensor that ``index_select`` reads from.
     _slot_idx_cpu: torch.Tensor = field(default=None, repr=False)
     _slot_idx_gpu: torch.Tensor = field(default=None, repr=False)
-    # Single-row pinned staging used by ``register_request`` /
-    # ``update_request_config`` to push (temperature, top_k, top_p) for one
-    # slot via a single async H2D per buffer (rather than 3 elementwise
-    # item-assignments on the GPU master buffers).
-    _row_temp_cpu: torch.Tensor = field(default=None, repr=False)
-    _row_top_k_cpu: torch.Tensor = field(default=None, repr=False)
-    _row_top_p_cpu: torch.Tensor = field(default=None, repr=False)
-    _row_seed_cpu: torch.Tensor = field(default=None, repr=False)
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
     _free_slots: list[int] = field(default_factory=list, repr=False)
     # Last-known config per rid — change-detect for ``update_request_config``
-    # so steady-state per-step calls do zero GPU work.
+    # so steady-state per-step calls do zero GPU work (for the scalar rows).
     _cached_config: dict[str, SamplingConfig] = field(default_factory=dict, repr=False)
+
+    @property
+    def tracks_seen_tokens(self) -> bool:
+        return self.seen_tokens is not None
+
+    def _scalar_buffers(self) -> list[Buffer]:
+        return [self.temperature, self.top_k, self.top_p, self.seed, self.rep_penalty]
 
     @classmethod
     def allocate(
@@ -657,52 +813,39 @@ class SamplerBuffers:
         max_batch_size: int,
         device: torch.device,
         tp_group: "TPCommGroup | None" = None,  # noqa: F821
+        vocab_size: int | None = None,
     ) -> "SamplerBuffers":
-        """Allocate zero-initialised sampling buffers for ``max_batch_size``.
+        """Allocate sampling buffers for ``max_batch_size``.
+
+        ``vocab_size`` (when not None) enables the seen-token mask buffer for the
+        repetition penalty. The master rows default to a ``SamplingConfig()`` row
+        (temp=1, top_k=0, top_p=1, rep_penalty=1) — what an unregistered slot
+        would surface if accidentally indexed.
         """
-        temperature_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
-        top_k_buf = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
-        top_p_buf = torch.ones(max_batch_size, dtype=torch.float32, device=device)
-        seed_buf = torch.zeros(max_batch_size, dtype=torch.long, device=device)
-        offset_buf = torch.zeros(max_batch_size, dtype=torch.long, device=device)
-
-        # Master cache initialised to the same defaults as a SamplingConfig()
-        # row would produce (temp=1, top_k=0, top_p=1) — these defaults are
-        # what an unregistered slot would surface if accidentally indexed.
-        master_temperature = torch.ones(max_batch_size, dtype=torch.float32, device=device)
-        master_top_k = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
-        master_top_p = torch.ones(max_batch_size, dtype=torch.float32, device=device)
-        master_seed = torch.zeros(max_batch_size, dtype=torch.long, device=device)
-
-        # Pinned CPU staging — small, allocated once, reused every step.
         pinned = torch.cuda.is_available() and device.type == "cuda"
-        slot_idx_cpu = torch.zeros(max_batch_size, dtype=torch.long, pin_memory=pinned)
-        slot_idx_gpu = torch.zeros(max_batch_size, dtype=torch.long, device=device)
-        row_temp_cpu = torch.zeros(1, dtype=torch.float32, pin_memory=pinned)
-        row_top_k_cpu = torch.zeros(1, dtype=torch.int32, pin_memory=pinned)
-        row_top_p_cpu = torch.zeros(1, dtype=torch.float32, pin_memory=pinned)
-        row_seed_cpu = torch.zeros(1, dtype=torch.long, pin_memory=pinned)
+        cap = max_batch_size
 
+        def mk(dtype: torch.dtype, default: float) -> Buffer:
+            return Buffer.allocate(max_batch_size, cap, device, dtype, default, pinned)
+
+        seen_tokens = (
+            MaskBuffer.allocate(max_batch_size, cap, vocab_size, device)
+            if vocab_size is not None else None
+        )
         return cls(
             max_batch_size=max_batch_size,
-            temperature_buf=temperature_buf,
-            top_k_buf=top_k_buf,
-            top_p_buf=top_p_buf,
-            seed_buf=seed_buf,
-            offset_buf=offset_buf,
+            temperature=mk(torch.float32, 1.0),
+            top_k=mk(torch.int32, 0),
+            top_p=mk(torch.float32, 1.0),
+            seed=mk(torch.long, 0),
+            rep_penalty=mk(torch.float32, 1.0),
+            offset_buf=torch.zeros(max_batch_size, dtype=torch.long, device=device),
             tp_group=tp_group,
-            _master_temperature=master_temperature,
-            _master_top_k=master_top_k,
-            _master_top_p=master_top_p,
-            _master_seed=master_seed,
-            _master_capacity=max_batch_size,
-            _slot_idx_cpu=slot_idx_cpu,
-            _slot_idx_gpu=slot_idx_gpu,
-            _row_temp_cpu=row_temp_cpu,
-            _row_top_k_cpu=row_top_k_cpu,
-            _row_top_p_cpu=row_top_p_cpu,
-            _row_seed_cpu=row_seed_cpu,
-            _free_slots=list(range(max_batch_size)),
+            seen_tokens=seen_tokens,
+            _master_capacity=cap,
+            _slot_idx_cpu=torch.zeros(max_batch_size, dtype=torch.long, pin_memory=pinned),
+            _slot_idx_gpu=torch.zeros(max_batch_size, dtype=torch.long, device=device),
+            _free_slots=list(range(cap)),
         )
 
     def slice_for_bs(self, bs: int) -> dict[str, Any]:
@@ -710,11 +853,13 @@ class SamplerBuffers:
         the owning submodule's ``tp_group`` so the constructed sampler
         broadcasts across TP ranks."""
         return {
-            "temperature_buf": self.temperature_buf[:bs],
-            "top_k_buf": self.top_k_buf[:bs],
-            "top_p_buf": self.top_p_buf[:bs],
-            "seed_buf": self.seed_buf[:bs],
+            "temperature_buf": self.temperature.buf[:bs],
+            "top_k_buf": self.top_k.buf[:bs],
+            "top_p_buf": self.top_p.buf[:bs],
+            "seed_buf": self.seed.buf[:bs],
             "offset_buf": self.offset_buf[:bs],
+            "rep_penalty_buf": self.rep_penalty.buf[:bs],
+            "seen_tokens_buf": self.seen_tokens.buf[:bs] if self.seen_tokens is not None else None,
             "tp_group": self.tp_group,
         }
 
@@ -723,52 +868,37 @@ class SamplerBuffers:
     # ------------------------------------------------------------------
 
     def _write_master_row(self, slot: int, cfg: SamplingConfig) -> None:
-        """Push one config row into the master GPU buffers via pinned H2D.
+        """Push one config row into each scalar master buffer via pinned H2D.
 
-        Three async non-blocking copies, one per master tensor. Cheap; only
-        runs on register or actual config change (change-detection lives in
+        Cheap async copies; only runs on register or actual config change
+        (change-detection lives in ``update_request_config``). The seen-token
+        mask is NOT written here (it changes every step — see
         ``update_request_config``).
         """
-        s = cfg.seed
         if cfg.temperature > 0:
             t = float(cfg.temperature)
             k = int(cfg.top_k)
             p = float(cfg.top_p) if cfg.top_p else 1.0
         else:
-            # Greedy: kernel takes the one-hot/argmax branch regardless of
-            # top_k/top_p, so park them at the disabled defaults.
+            # Greedy: encoded as (temp=1, top_k=1) so from_probs returns argmax.
             t, k, p = 1.0, 1, 1.0
-
-        self._row_temp_cpu[0] = t
-        self._row_top_k_cpu[0] = k
-        self._row_top_p_cpu[0] = p
-        self._row_seed_cpu[0] = s
-        self._master_temperature[slot:slot + 1].copy_(self._row_temp_cpu, non_blocking=True)
-        self._master_top_k[slot:slot + 1].copy_(self._row_top_k_cpu, non_blocking=True)
-        self._master_top_p[slot:slot + 1].copy_(self._row_top_p_cpu, non_blocking=True)
-        self._row_seed_cpu[slot:slot + 1].copy_(self._row_seed_cpu, non_blocking=True)
+        self.temperature.write_master_row(slot, t)
+        self.top_k.write_master_row(slot, k)
+        self.top_p.write_master_row(slot, p)
+        self.seed.write_master_row(slot, cfg.seed)
+        self.rep_penalty.write_master_row(slot, float(cfg.repetition_penalty))
 
     def _grow_master(self, new_capacity: int) -> None:
         """Double-and-copy the master buffers up to at least ``new_capacity``.
 
-        Triggered when the number of concurrently-registered requests exceeds
-        the current master capacity. Per-step buffers (sized to the cuda-graph
-        max_bs) are NOT resized — the gather only reads ``padded_bs`` rows
-        from master, which always fits within the per-step buffer.
+        Triggered when concurrently-registered requests exceed the current
+        master capacity. Per-step buffers (sized to the cuda-graph max_bs) are
+        NOT resized — the gather only reads ``padded_bs`` rows from master.
         """
-        device = self._master_temperature.device
-        new_temp = torch.ones(new_capacity, dtype=torch.float32, device=device)
-        new_top_k = torch.zeros(new_capacity, dtype=torch.int32, device=device)
-        new_top_p = torch.ones(new_capacity, dtype=torch.float32, device=device)
-        new_seed = torch.zeros(new_capacity, dtype=torch.long, device=device)
-        new_temp[: self._master_capacity].copy_(self._master_temperature)
-        new_top_k[: self._master_capacity].copy_(self._master_top_k)
-        new_top_p[: self._master_capacity].copy_(self._master_top_p)
-        new_seed[: self._master_capacity].copy_(self._master_seed)
-        self._master_temperature = new_temp
-        self._master_top_k = new_top_k
-        self._master_top_p = new_top_p
-        self._master_seed = new_seed
+        for buf in self._scalar_buffers():
+            buf.grow_master(new_capacity)
+        if self.seen_tokens is not None:
+            self.seen_tokens.grow_master(new_capacity)
         self._free_slots.extend(range(self._master_capacity, new_capacity))
         self._master_capacity = new_capacity
 
@@ -788,6 +918,11 @@ class SamplerBuffers:
         cfg = sampling_config if sampling_config is not None else SamplingConfig()
         self._cached_config[rid] = cfg
         self._write_master_row(slot, cfg)
+        # Clear any stale seen-token history from a previously-freed slot. The
+        # first per-step ``update_request_config`` overwrites it with the live
+        # mask before the slot is gathered, but clearing is cheap insurance.
+        if self.seen_tokens is not None:
+            self.seen_tokens.clear_master_row(slot)
 
     def unregister_request(self, rid: str) -> None:
         """Free the slot owned by ``rid`` (no GPU writes)."""
@@ -802,10 +937,10 @@ class SamplerBuffers:
     ) -> None:
         """Update the master row for ``rid`` only when its config changed.
 
-        AR engine calls this every step (mirroring the existing
-        ``Sampler.set_config`` per-step pattern). Steady-state requests have
-        identical configs across steps, so the change-check skips the H2D
-        path entirely.
+        AR engine calls this every step (mirroring ``Sampler.set_config``).
+        Steady-state requests have identical configs across steps, so the
+        change-check skips the H2D path entirely. The seen-token mask is staged
+        separately (see ``stage_seen_token_masks``) because it grows every step.
         """
         slot = self._rid_to_slot.get(rid)
         if slot is None:
@@ -819,12 +954,32 @@ class SamplerBuffers:
         self._cached_config[rid] = sampling_config
         self._write_master_row(slot, sampling_config)
 
+    def stage_seen_token_masks(
+        self, request_ids: list[str], seen_masks: "Iterable[SeenTokenMask]",
+    ) -> None:
+        """Copy each request's current seen-token mask into its master row.
+
+        Called every step (before ``gather_for_request_ids``) for submodules that
+        sample with a penalty in-graph, so the gathered per-step buffer reflects
+        the live prompt + generated tokens. No-op when seen-token tracking is off.
+        """
+        if self.seen_tokens is None:
+            return
+        for rid, m in zip(request_ids, seen_masks, strict=False):
+            slot = self._rid_to_slot.get(rid)
+            if slot is None:
+                continue
+            mask = m._seen_token_mask
+            if mask is not None:
+                self.seen_tokens.write_master_row(slot, mask)
+
     # ------------------------------------------------------------------
     # Per-step gather: pinned-H2D slot-index → index_select into per-step bufs
     # ------------------------------------------------------------------
 
     def gather_for_request_ids(
         self, request_ids: list[str], padded_bs: int,
+        gather_seen_tokens: bool = True,
     ) -> "CudaGraphableSampler":
         """Materialise the per-step sampling tensors for ``request_ids``.
 
@@ -839,8 +994,8 @@ class SamplerBuffers:
         )
 
         # CPU-only fill of the pinned slot-index buffer. Unregistered rids
-        # fall back to slot 0 (matches the old code's defaults — temp=1,
-        # top_k=0, top_p=1 — for any rid the AR engine forgot to register).
+        # fall back to slot 0 (matches the defaults — temp=1, top_k=0, top_p=1,
+        # rep_penalty=1 — for any rid the AR engine forgot to register).
         for i, rid in enumerate(request_ids):
             self._slot_idx_cpu[i] = self._rid_to_slot.get(rid, 0)
         for i in range(len(request_ids), padded_bs):
@@ -850,21 +1005,15 @@ class SamplerBuffers:
         idx_view = self._slot_idx_gpu[:padded_bs]
         idx_view.copy_(self._slot_idx_cpu[:padded_bs], non_blocking=True)
 
-        # Three GPU index_select kernels, writing directly into the
+        # One index_select per buffer, writing directly into the
         # cuda-graph-friendly per-step buffers.
-        torch.index_select(
-            self._master_temperature, 0, idx_view,
-            out=self.temperature_buf[:padded_bs],
-        )
-        torch.index_select(
-            self._master_top_k, 0, idx_view, out=self.top_k_buf[:padded_bs],
-        )
-        torch.index_select(
-            self._master_top_p, 0, idx_view, out=self.top_p_buf[:padded_bs],
-        )
-        torch.index_select(
-            self._master_seed, 0, idx_view, out=self.seed_buf[:padded_bs],
-        )
+        for buf in self._scalar_buffers():
+            buf.gather(idx_view, padded_bs)
+        # The seen-token mask is large ([bs, V] bool); only gather it when the
+        # caller's graph actually applies the penalty in-graph (the Talker), so
+        # non-penalty graphs that happen to allocate the buffer don't pay for it.
+        if self.seen_tokens is not None and gather_seen_tokens:
+            self.seen_tokens.gather(idx_view, padded_bs)
 
         # offset_buf is NOT reset here. With per-request fixed seed and
         # ``deterministic=True`` sampling, resetting offset every call
