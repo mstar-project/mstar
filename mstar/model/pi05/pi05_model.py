@@ -51,7 +51,7 @@ from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import SIGLIP_STACKED_PARAMS, Pi05SiglipEncoder
 from mstar.model.pi05.components.tokenization import Pi05Tokenizer
 from mstar.model.pi05.config import Pi05Config, load_pi05_config
-from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05ActionExpertSubmodule, Pi05PaligemmaSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -122,8 +122,6 @@ def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
 
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
-
-    PREFILL_WALK = "prefill"
     ACTION_GEN_WALK = "action_gen"
 
     def __init__(
@@ -387,54 +385,50 @@ class Pi05Model(Model):
             head_dim=self.config.head_dim,
             max_seq_len=self.config.max_position_embeddings,
             num_qo_heads=self.config.num_qo_heads,
+            nodes=["paligemma_LLM", "action_expert_LLM"]
         )]
 
     def get_node_engine_types(self) -> dict[str, EngineType]:
         return {
             "vit_encoder": EngineType.STATELESS,
-            "LLM": EngineType.KV_CACHE,
+            "paligemma_LLM": EngineType.KV_CACHE,
+            "action_expert_LLM": EngineType.KV_CACHE,
         }
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # Pi0.5 encodes the robot state as a decimal-string suffix on the
-        # language prompt (e.g. "Task: pick up the block, State: 12 87 ...;
-        # \nAction: ") and tokenizes the whole thing with the PaliGemma
-        # tokenizer. So the model only ever sees a single "text_inputs"
-        # stream — there are no separate state-bin tokens. This matches
-        # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
-        prefill = Sequential(
-            [
-                GraphNode(
-                    name="vit_encoder",
-                    input_names=["image_inputs"],
-                    outputs=[GraphEdge(next_node="LLM", name="img_emb")],
-                ),
-                GraphNode(
-                    name="LLM",
-                    input_names=["img_emb", "text_inputs"],
-                    outputs=[],
-                ),
-            ]
-        )
-
         # NOTE: the full action generation flow loop is extremely short (total < 50ms), so
         # we opt to have it as one node to reduce cuda graph startup, flashinfer planning,
         # etc. overhead. Cache planning only needs to happen at the beginning of the flow
         # loop, so this collapsed loop is valid.
-        action_gen = GraphNode(
-            name="LLM",
-            input_names=["noisy_actions"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="actions",
-                    output_modality="action",
+        action_gen = Sequential(
+            [
+                GraphNode(
+                    name="vit_encoder",
+                    input_names=["image_inputs"],
+                    outputs=[GraphEdge(next_node="paligemma_LLM", name="img_emb")],
+                ),
+                GraphNode(
+                    name="paligemma_LLM",
+                    input_names=["img_emb", "text_inputs"],
+                    outputs=[
+                        GraphEdge(next_node="action_expert_LLM", name="action_expert_trigger")
+                    ],
+                ),
+                GraphNode(
+                    name="action_expert_LLM",
+                    input_names=["action_expert_trigger"],
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="actions",
+                            output_modality="action",
+                        )
+                    ],
                 )
-            ],
+            ]
         )
 
         return {
-            self.PREFILL_WALK: prefill,
             self.ACTION_GEN_WALK: action_gen,
         }
 
@@ -513,7 +507,7 @@ class Pi05Model(Model):
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            graph_walk=self.PREFILL_WALK,
+            graph_walk=self.ACTION_GEN_WALK,
             is_prefill=True,
             kwargs={},
         )
@@ -524,7 +518,7 @@ class Pi05Model(Model):
             edge.tensor_info = input_signals["image_inputs"]
             inputs.append(edge)
         if "text_inputs" in input_signals:
-            edge = GraphEdge(next_node="LLM", name="text_inputs")
+            edge = GraphEdge(next_node="paligemma_LLM", name="text_inputs")
             edge.tensor_info = input_signals["text_inputs"]
             inputs.append(edge)
 
@@ -533,7 +527,6 @@ class Pi05Model(Model):
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
         )
 
     def get_partition_forward_pass_args(
@@ -543,29 +536,12 @@ class Pi05Model(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        if metadata.graph_walk == self.PREFILL_WALK:
-            metadata.is_prefill = False
-            metadata.graph_walk = self.ACTION_GEN_WALK
-            # Inputs for the first action_gen iteration are sampled inside the
-            # LLM submodule's preprocess (Gaussian noise + timestep_index=0).
-            inputs = [
-                GraphEdge(next_node="LLM", name="noisy_actions"),
-                GraphEdge(next_node="LLM", name="timestep_index"),
-            ]
-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+        # only one graph walk, so we're done
         return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-            request_done=request_done,
+            full_metadata=partition_metadata,
+            inputs=[],
+            unpersist_tensors=[],
+            request_done=True,
         )
 
     # ------------------------------------------------------------------
@@ -591,11 +567,16 @@ class Pi05Model(Model):
             return Pi05ViTEncoderSubmodule(
                 encoder=self.siglip, config=self.config
             )
-        if node_name == "LLM":
+        if node_name == "paligemma_LLM":
             self._init_llm_components(device)
-            return Pi05LLMSubmodule(
+            return Pi05PaligemmaSubmodule(
                 embed_tokens=self.embed_tokens,
                 paligemma=self.paligemma,
+                config=self.config,
+            )
+        if node_name == "action_expert_LLM":
+            self._init_llm_components(device)
+            return Pi05ActionExpertSubmodule(
                 action_expert=self.action_expert,
                 action_in_proj=self.action_in_proj,
                 action_out_proj=self.action_out_proj,

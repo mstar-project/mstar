@@ -604,6 +604,10 @@ class PagedAllocationManager:
             }
 
     def remove_request(self, request_id: str):
+        if request_id not in self.request_states:
+            # This request has already been removed; e.g., if we have colocated
+            # nodes sharing a KV cache
+            return
         for label in self.request_states[request_id]:
             self.wait_for_retrieves(request_id, label)
         with self._lock:

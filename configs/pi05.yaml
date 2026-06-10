@@ -8,6 +8,7 @@ node_groups:
       - 0
 
   - node_names:
-      - LLM
+      - paligemma_LLM
+      - action_expert_LLM
     ranks:
       - 0

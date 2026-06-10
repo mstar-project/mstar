@@ -1511,8 +1511,8 @@ class Worker:
             rid_outputs = output_N.per_request_output_tensors.get(rid, {})
             ok = True
             for input_name, _ in speculation.consumed_edges:
-                tensors = rid_outputs.get(input_name, [])
-                if not tensors:
+                tensors = rid_outputs.get(input_name, None)
+                if tensors is None:
                     ok = False
                     break
                 speculation.node_batch.per_request_input_tensors[rid][input_name] \
