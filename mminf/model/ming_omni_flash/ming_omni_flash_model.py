@@ -58,7 +58,7 @@ from mminf.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mminf.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mminf.graph.special_destinations import EMIT_TO_CLIENT
 from mminf.model.base import ForwardPassArgs, Model
 from mminf.model.ming_omni_flash.components.model import LingMoeModel
 from mminf.model.ming_omni_flash.config import MingFlashOmniModelConfig

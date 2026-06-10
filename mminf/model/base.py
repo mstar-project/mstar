@@ -271,11 +271,11 @@ class Model(ABC):
                 self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups)
             )
         return worker_graphs
-    
+
     def get_sharding_config(self, config_path: str) -> ShardingConfig:
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
-        
+
         sharding_config = self.get_default_sharding_config()
 
         # Derive sharding groups from node_groups with tp_size > 1. The

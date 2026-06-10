@@ -18,7 +18,6 @@ from mminf.model.ming_omni_flash.components.positions import (
     vision_span_max_position,
 )
 
-
 # ---------------------------------------------------------------------------
 # get_rope_index_text
 # ---------------------------------------------------------------------------

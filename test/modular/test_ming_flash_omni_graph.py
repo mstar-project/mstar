@@ -19,8 +19,7 @@ from typing import Any
 import pytest
 
 from mminf.conductor.request_info import CurrentForwardConductorMetadata
-from mminf.engine.base import EngineType
-from mminf.graph.base import GraphEdge, GraphNode, Loop, Sequential
+from mminf.graph.base import GraphNode, Loop, Sequential
 from mminf.graph.special_destinations import EMIT_TO_CLIENT
 from mminf.model.ming_omni_flash.config import (
     AudioEncoderConfig,
@@ -29,7 +28,6 @@ from mminf.model.ming_omni_flash.config import (
     VisionEncoderConfig,
 )
 from mminf.model.ming_omni_flash.ming_omni_flash_model import MingFlashOmniModel
-
 
 # ---------------------------------------------------------------------------
 # Tiny model instance (no weights, no tokenizer)

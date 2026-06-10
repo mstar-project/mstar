@@ -24,7 +24,6 @@ from mminf.model.ming_omni_flash.components.projectors import (
     MingVisionProjector,
 )
 
-
 # ---------------------------------------------------------------------------
 # Snapshot / Ming source discovery (mirrors test_ming_flash_omni_config.py)
 # ---------------------------------------------------------------------------
@@ -491,7 +490,10 @@ def test_load_audio_encoder_weights_from_snapshot() -> None:
     assert enc.positional_embedding.shape == (15000, cfg.audio_encoder.d_model)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA + Ming source modules to instantiate vision encoder")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="needs CUDA + Ming source modules to instantiate vision encoder",
+)
 def test_load_vision_encoder_weights_from_snapshot(staged_snapshot: tuple[str, str]) -> None:
     """``vision.*`` keys load cleanly into the Ming Qwen3MoeVisionTransformer.
 

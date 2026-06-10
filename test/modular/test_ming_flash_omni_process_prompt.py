@@ -30,7 +30,6 @@ from mminf.model.ming_omni_flash.config import (
 )
 from mminf.model.ming_omni_flash.ming_omni_flash_model import MingFlashOmniModel
 
-
 # ---------------------------------------------------------------------------
 # Snapshot discovery (mirrors test_ming_flash_omni_encoders.py)
 # ---------------------------------------------------------------------------
