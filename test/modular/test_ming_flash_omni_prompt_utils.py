@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from mminf.model.ming_omni_flash.components.prompt_utils import (
     BASE_CAPTION_TEMPLATE,
     DEFAULT_NUM_QUERY_TOKENS,
@@ -13,7 +11,6 @@ from mminf.model.ming_omni_flash.components.prompt_utils import (
     create_instruction,
     maybe_expand_image_gen_prompt,
 )
-
 
 # ---------------------------------------------------------------------------
 # Image-gen query-token expansion
