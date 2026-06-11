@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Docs & quickstart
+    url: https://mstar-project.github.io/mstar/
+    about: Many questions are answered in the docs — worth a look first.

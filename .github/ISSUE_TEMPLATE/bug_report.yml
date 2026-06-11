@@ -1,0 +1,21 @@
+name: Bug report
+description: Report a problem with M*
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Steps, a minimal command/config, or a short code snippet.
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: M* version or commit, OS, Python, GPU(s) + CUDA, and the model/config involved.

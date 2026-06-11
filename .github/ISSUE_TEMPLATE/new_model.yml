@@ -1,0 +1,26 @@
+name: New model request
+description: Request support for a model
+labels: ["new model"]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Name of the model.
+    validations:
+      required: true
+  - type: input
+    id: link
+    attributes:
+      label: Weights / paper link
+      description: Hugging Face URL, repository, or paper.
+  - type: input
+    id: closest
+    attributes:
+      label: Closest model M* already supports
+      description: e.g. BAGEL, Qwen3-Omni, Orpheus, Pi0.5, V-JEPA 2 — if any.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?
+      description: Use case, modality (image / audio / video / action / world), priority. (optional)

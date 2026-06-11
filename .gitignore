@@ -24,3 +24,7 @@ output.wav
 
 # internal design docs (not for public release)
 mstar/worker/ASYNC_REDESIGN.md
+
+# local AI-assistant context (kept local, not published — cf. vllm-omni)
+CLAUDE.md
+AGENTS.md
