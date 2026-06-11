@@ -58,8 +58,10 @@ bagel = [
 ]
 
 qwen3_omni = [
+    # NOTE: flash-attn is required by Qwen3-Omni but is NOT listed here — its
+    # prebuilt wheels aren't on PyPI, so a plain install compiles from source
+    # (and fails on CUDA 13). Install it separately; see docs/installation.rst.
     "einops",
-    "flash-attn",
     "flashinfer-python",
     "huggingface-hub",
     "mooncake-transfer-engine",
@@ -122,9 +124,10 @@ all = [
     "transformers",
     "safetensors",
     "triton",
-    "flash-attn",
     "qwen-omni-utils",
     "sgl-kernel",
+    # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
+    # separately, see docs/installation.rst.
 ]
 
 [tool.setuptools.packages.find]
