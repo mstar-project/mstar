@@ -12,14 +12,17 @@
   <a href="#quickstart"><b>Quickstart</b></a> &nbsp;·&nbsp;
   <a href="#supported-models"><b>Models</b></a> &nbsp;·&nbsp;
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;·&nbsp;
-  <a href="#performance"><b>Performance</b></a> &nbsp;·&nbsp;
-  <a href="#citation"><b>Paper</b></a>
+  <a href="https://mstar-project.github.io/docs/"><b>Docs</b></a> &nbsp;·&nbsp;
+  <a href="https://mstar-project.github.io/"><b>Blog</b></a> &nbsp;·&nbsp;
+  <a href="https://mstar-project.github.io/mstar.pdf"><b>Paper</b></a>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-7b61ff.svg" alt="License: Apache 2.0"></a>
   <img src="https://img.shields.io/badge/python-3.12-22d3ee.svg" alt="Python 3.12">
   <img src="https://img.shields.io/badge/modalities-text_image_audio_video_action-6a8cff.svg" alt="Modalities">
+  <a href="https://mstar-project.github.io/docs/"><img src="https://img.shields.io/badge/docs-online-3b82f6.svg" alt="Docs"></a>
+  <a href="https://mstar-project.github.io/mstar.pdf"><img src="https://img.shields.io/badge/paper-PDF-b31b1b.svg" alt="Paper (PDF)"></a>
 </p>
 
 ---
@@ -110,16 +113,19 @@ and schedules it; **Workers** each own a subgraph on their GPU and stream tensor
 another. Logical graph structure is decoupled from physical placement, so the same model runs
 single-GPU or fully disaggregated by changing only the YAML `node_groups`. Four composable
 primitives — `Sequential`, `Parallel`, `Loop`, and a cross-partition
-`StreamingGraphEdge` — express every model family above. See the [paper](#citation) for the full design.
+`StreamingGraphEdge` — express every model family above. See the [paper](https://mstar-project.github.io/mstar.pdf) for the full design.
 
 ## Performance
 
-- **~30% lower** end-to-end latency than vLLM-Omni on BAGEL text-to-image (**~50% lower** on image editing, with CFG parallelism).
-- **Lower real-time factor and up to ~15% higher throughput** than vLLM-Omni on Qwen3-Omni text-to-speech at larger batch sizes.
-- **On par with VoxServe**, a speech-specialized engine, on Orpheus TTS.
-- **Up to 12.5×** faster than the V-JEPA 2-AC rollout baseline for robotic planning.
+Across every model we benchmark, M\* matches or beats the system specialized for that family — unified
+models (BAGEL), omni and speech models (Qwen3-Omni, Orpheus), and world models (V-JEPA 2) — by executing
+only the components each request needs and giving each its own fast path: paged attention and continuous
+batching for autoregressive backbones, classifier-free-guidance parallelism for diffusion, chunk streaming
+for audio codecs, and persistent-cache loops for world-model rollouts.
 
-Full methodology and numbers are in the [paper](#citation).
+Benchmark numbers shift as systems evolve — ours and everyone else's — so rather than freeze figures here
+that go stale, we keep the current results and full methodology in the
+[blog post](https://mstar-project.github.io/) and the [paper](https://mstar-project.github.io/mstar.pdf).
 
 ## Citation
 
@@ -127,11 +133,12 @@ If you use M\* in your research, please cite:
 
 ```bibtex
 @article{mstar2026,
-  title  = {M*: A Universal Serving System for Composite Multimodal Models},
+  title  = {M*: A Modular, Extensible, Serving System for Multimodal Models},
   author = {Jha, Atindra and Sagan, Naomi and Kamahori, Keisuke and Sivgin, Irmak and
             Sanda, Rohan and Gao, Steven and Horowitz, Mark and Zettlemoyer, Luke and
-            Hsu, Olivia and Leskovec, Jure and Wang, Stephanie and Kasikci, Baris},
-  year   = {2026}
+            Hsu, Olivia and Leskovec, Jure and Kasikci, Baris and Wang, Stephanie},
+  year   = {2026},
+  note   = {Preprint}
 }
 ```
 
