@@ -16,7 +16,7 @@ Env requirement
 This script must run inside the **openpi** conda env (or any env with
 ``openpi`` installed via ``uv pip install -e .``). openpi pins
 ``torch==2.7.1`` and ``transformers==4.53.2`` with vendored patches, which
-will conflict with our mminf environment — keep them separate.
+will conflict with our mstar environment — keep them separate.
 
     conda activate openpi
     python benchmark/openpi_pi05.py --num-requests 5 --output-dir /tmp/openpi_pi05
@@ -119,7 +119,7 @@ def _check_env_or_exit():
             "    GIT_LFS_SKIP_SMUDGE=1 uv sync\n"
             "    GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .\n\n"
             "Note: openpi pins torch==2.7.1 and transformers==4.53.2 with vendored\n"
-            "patches, so it must live in its own env separate from mminf.\n"
+            "patches, so it must live in its own env separate from mstar.\n"
         )
 
 
@@ -180,7 +180,7 @@ def parse_args() -> argparse.Namespace:
                    help=f"GCS / local path to checkpoint (default: {DEFAULT_CHECKPOINT}).")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--output-dir", default="/tmp/openpi_pi05")
-    p.add_argument("--local-cache", default="./mminf-benchmark-cache/",
+    p.add_argument("--local-cache", default="./mstar-benchmark-cache/",
                    help="Same default as runner.py so DROIDDataset reuses extracted videos.")
     p.add_argument("--hf-cache", default=None,
                    help="HuggingFace cache directory for lerobot/droid_100.")
