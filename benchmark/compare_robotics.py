@@ -14,17 +14,17 @@ Usage
 -----
     # Two-system pi0.5 comparison (our system vs openpi)
     python benchmark/compare_robotics.py \
-        --label-a "mminf"  --json-a results/mminf_pi05/results.json \
+        --label-a "mstar"  --json-a results/mstar_pi05/results.json \
         --label-b "openpi" --json-b results/openpi_pi05/results.json
 
     # Two-system vjepa2-ac comparison (our system vs HF)
     python benchmark/compare_robotics.py \
-        --label-a "mminf" --json-a results/mminf_vjepa2/results.json \
+        --label-a "mstar" --json-a results/mstar_vjepa2/results.json \
         --label-b "hf"    --json-b results/hf_vjepa2/results.json
 
     # Three-way (e.g. our system vs HF vs openpi for a paper figure)
     python benchmark/compare_robotics.py \
-        --label-a "mminf"  --json-a results/mminf/results.json \
+        --label-a "mstar"  --json-a results/mstar/results.json \
         --label-b "hf"     --json-b results/hf/results.json \
         --label-c "openpi" --json-c results/openpi/results.json
 """
@@ -82,7 +82,7 @@ def _row(metric_label: str, fmt: str, values: list[float | int | None]) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Side-by-side robotics benchmark comparison")
-    p.add_argument("--label-a", required=True, help="Label for the first system (e.g. 'mminf')")
+    p.add_argument("--label-a", required=True, help="Label for the first system (e.g. 'mstar')")
     p.add_argument("--json-a", required=True, help="Path to results.json for system A")
     p.add_argument("--label-b", required=True, help="Label for the second system")
     p.add_argument("--json-b", required=True, help="Path to results.json for system B")
