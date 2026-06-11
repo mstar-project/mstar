@@ -599,7 +599,7 @@ match <strong>your installed torch’s</strong> CUDA, not your system toolkit. C
 </div>
 <p>Then install the matching wheel by <strong>direct URL</strong> (don’t use <code class="docutils literal notranslate"><span class="pre">--find-links</span></code> — uv sorts the
 <code class="docutils literal notranslate"><span class="pre">+cu13…</span></code> local version above <code class="docutils literal notranslate"><span class="pre">+cu12…</span></code> and will grab cu13 even on a CUDA 12 box):</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># torch built for CUDA 12.x (cu12 — the default / most common)</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># torch built for CUDA 12.x (cu12)</span>
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span><span class="s2">&quot;https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl&quot;</span>
 
