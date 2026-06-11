@@ -1,11 +1,11 @@
 """Text-to-speech via the Python SDK.
 
-Start a server first, e.g.:  mminf serve orpheus
+Start a server first, e.g.:  mstar serve orpheus
 """
 
-from mminf import MMInfClient
+from mstar import MStarClient
 
-client = MMInfClient("http://localhost:8000")
+client = MStarClient("http://localhost:8000")
 
 audio = client.tts("Hello from M star!", voice="tara")
 audio.to_wav("out.wav")
