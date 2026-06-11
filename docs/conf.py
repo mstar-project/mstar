@@ -73,7 +73,7 @@ intersphinx_mapping = {
 }
 
 html_theme_options = {
-    "repository_url": "https://github.com/merceod/multimodal_inference",
+    "repository_url": "https://github.com/mstar-project/mstar",
     "repository_branch": "main",
     "path_to_docs": "docs",
     "show_navbar_depth": 2,

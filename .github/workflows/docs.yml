@@ -1,0 +1,57 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mstar/**"
+      - "pyproject.toml"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Builds the Sphinx site and publishes the HTML into the org Pages repo
+# (mstar-project/mstar-project.github.io) under /docs/, leaving the blog and
+# landing page at the Pages repo root untouched (keep_files: true).
+#
+# Requires a secret PAGES_DEPLOY_KEY: an SSH private key whose matching public
+# key is registered as a write-enabled Deploy Key on the Pages repo.
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch: the API autosummary imports the package, and conf.py
+          # deliberately does not mock torch (PEP 604 annotations break under mocks).
+          pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+            --index-url https://download.pytorch.org/whl/cpu
+          # Base install only; GPU-only model extras (flashinfer, transformers, ...)
+          # are not needed for the narrative docs. Modules that import them at module
+          # scope yield autosummary stub pages, which is acceptable for the first site.
+          pip install -e .
+          pip install -r docs/requirements.txt
+
+      - name: Build HTML
+        run: sphinx-build -b html docs docs/_build/html
+
+      - name: Publish to Pages repo
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          deploy_key: ${{ secrets.PAGES_DEPLOY_KEY }}
+          external_repository: mstar-project/mstar-project.github.io
+          publish_branch: main
+          publish_dir: ./docs/_build/html
+          destination_dir: docs
+          keep_files: true
+          enable_jekyll: false
+          commit_message: "docs: publish ${{ github.sha }}"

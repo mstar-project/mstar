@@ -20,8 +20,8 @@ Install from source
 
 .. code-block:: bash
 
-   git clone https://github.com/merceod/multimodal_inference.git
-   cd multimodal_inference
+   git clone https://github.com/mstar-project/mstar.git
+   cd mstar
 
    # Create and activate a Python 3.12 virtualenv (--seed adds pip to it)
    uv venv --python 3.12 --seed
