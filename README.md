@@ -59,7 +59,7 @@ mstar serve bagel          # one command — launch a server (default: http://lo
 
 To enable flash-attn support (required for Qwen3-Omni, recommended for BAGEL),
 ```bash
-# torch built for CUDA 12.x (cu12 — the default / most common)
+# torch built for CUDA 12.x (cu12)
 uv pip install \
   "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
@@ -97,6 +97,8 @@ client.images.generate(model="bagel", prompt="a cat")                   # image 
 
 Runnable scripts and `curl` examples live in [`examples/`](examples/). Power users can launch any
 deployment with an explicit config: `mstar-serve --config configs/<model>.yaml`.
+
+_Note_: The **first request(s) on a fresh environment can be slow** — often tens of seconds to a few minutes. mstar ``torch.compile``s the model on first use, and that compilation happens lazily on the first request that exercises each path.
 
 ## Supported models
 

@@ -149,7 +149,7 @@ Then install the matching wheel by **direct URL** (don't use ``--find-links`` â€
 
 .. code-block:: bash
 
-   # torch built for CUDA 12.x (cu12 â€” the default / most common)
+   # torch built for CUDA 12.x (cu12)
    uv pip install \
      "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
