@@ -418,6 +418,35 @@ class Sampler(BaseSampler):
         return tokens
 
 
+def _flashinfer_rng_scalars(
+    seed: torch.Tensor | int | None,
+    rand_offset: torch.Tensor | int | None,
+) -> tuple[int, int]:
+    """Coerce per-request seed/offset to scalar Python ints for flashinfer.
+
+    The installed flashinfer (0.6.2) sampler FFI takes scalar ``int`` seed and
+    offset; newer builds (>=0.6.6) take per-request tensors. mstar's sampler
+    constructs them as ``[batch]`` tensors (the 0.6.6 form), which crashes the
+    0.6.2 kernel with "Mismatched type on argument #7 ... Expected int but got
+    ffi.Tensor". We collapse to a single scalar here.
+
+    Correctness note: a scalar applies one (seed, offset) to the whole batch
+    rather than per-row. Greedy decode (temperature=0) ignores RNG entirely, so
+    this is exact for the greedy path; for stochastic sampling it only affects
+    cross-row RNG independence (reproducibility), not the sampling distribution.
+    The ``.item()`` is a host sync, but this fn is already ``@torch.compiler.
+    disable`` and runs once per decode step.
+    """
+    def _scalar(v, default=0):
+        if v is None:
+            return default
+        if isinstance(v, torch.Tensor):
+            return int(v.reshape(-1)[0].item()) if v.numel() else default
+        return int(v)
+
+    return _scalar(seed), _scalar(rand_offset)
+
+
 @torch.compiler.disable
 def sample_tokens(
     logits: torch.Tensor,
@@ -464,6 +493,10 @@ def sample_tokens(
 
     import flashinfer
 
+    # Coerce per-request seed/offset tensors to scalar ints for the installed
+    # flashinfer sampler FFI (0.6.2). See _flashinfer_rng_scalars.
+    fi_seed, fi_offset = _flashinfer_rng_scalars(seed, rand_offset)
+
     # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
     # (reads probs) to the same device/stream so the write-before-read is
     # ordered without an explicit sync. Otherwise FlashInfer runs on the
@@ -484,7 +517,7 @@ def sample_tokens(
             result = flashinfer.sampling.top_p_sampling_from_probs(
                 probs, top_p,
                 deterministic=True,
-                seed=seed, offset=rand_offset,
+                seed=fi_seed, offset=fi_offset,
             )
             return result[0] if isinstance(result, tuple) else result
 
@@ -497,7 +530,7 @@ def sample_tokens(
         result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
             probs, top_k, top_p,
             deterministic=True,
-            seed=seed, offset=rand_offset
+            seed=fi_seed, offset=fi_offset,
         )
         return result[0] if isinstance(result, tuple) else result
 
