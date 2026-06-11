@@ -13,7 +13,7 @@ predictor); it has no ``VisionTransformerPredictorAC`` class, no
 actions/states inputs, and no AC checkpoint on Hub. The upstream repo at
 ``facebookresearch/vjepa2`` ships the AC predictor (``src/models/
 ac_predictor.py``), the bundled encoder+predictor checkpoint
-(``vjepa2-ac-vitg.pt`` on FAIR S3 — the same ``.pt`` mminf loads), and a
+(``vjepa2-ac-vitg.pt`` on FAIR S3 — the same ``.pt`` mstar loads), and a
 canonical AC rollout pattern in ``notebooks/energy_landscape_example.ipynb``
 Cell 5 / Cell 6.
 
@@ -33,7 +33,7 @@ JSON serialization, env-check, video decode wrapper).
 Env requirement
 ---------------
 This script requires the dedicated ``vjepa2_repo`` conda env (separate
-from mminf — torch and torchcodec versions diverge). See the
+from mstar — torch and torchcodec versions diverge). See the
 implementation plan at ``vjepa2_ac_bench_implementation_plan.md`` for the
 full env setup. Quick start:
 
@@ -224,7 +224,7 @@ def parse_args() -> argparse.Namespace:
                    help="Inference dtype. Upstream notebook defaults to fp32; "
                         "we default to bf16 to match deployment.")
     p.add_argument("--output-dir", default="/tmp/vjepa2_repo_ac")
-    p.add_argument("--local-cache", default="./mminf-benchmark-cache/",
+    p.add_argument("--local-cache", default="./mstar-benchmark-cache/",
                    help="Same default as runner.py so DROIDDataset reuses extracted clips.")
     p.add_argument("--hf-cache", default=None,
                    help="HuggingFace cache directory for lerobot/droid_100.")
@@ -383,7 +383,7 @@ def main() -> None:
         # only consumes the first ``rollout_horizon`` of them (Cell 5's
         # forward_actions starts with a single initial action and appends
         # one per iteration). Excess entries are intentionally unused —
-        # mminf may consume the full sequence on its side.
+        # mstar may consume the full sequence on its side.
         if actions_t.size(1) < args.rollout_horizon:
             raise RuntimeError(
                 f"req has only {actions_t.size(1)} actions; need >= "
