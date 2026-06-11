@@ -904,7 +904,6 @@ class KVCacheEngine(BaseEngine):
             ).items():
                 if needed_labels is not None and label not in needed_labels:
                     continue
-                print("ASYNC RETRIEVE HAPPENING")
                 cache_mgmt.alloc_manager.start_async_retrieve(
                     request_id, label, seq_info
                 )

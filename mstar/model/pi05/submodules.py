@@ -571,10 +571,6 @@ class Pi05ActionExpertSubmodule(ARNodeSubmodule):
             )
         return self._time_emb_buffer[:bs]
 
-    def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
-        emb = self.embed_tokens(ids)
-        return emb * self._text_embed_scale
-
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:

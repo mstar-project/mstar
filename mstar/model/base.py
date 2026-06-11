@@ -379,10 +379,6 @@ class Model(ABC):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         import torchvision
 
-        # Read the file once, then dispatch on content: a raw uint8 CxHxW array
-        # uploaded as .npy (np.save magic = b"\x93NUMPY") skips PNG/JPEG decode
-        # entirely (np.load is ~a memcpy); anything else goes through torchvision.
-        # Sniffing the magic (not the extension) keeps the upload filename free.
         with open(filepath, "rb") as f:
             raw = f.read()
         img = torchvision.io.decode_image(
