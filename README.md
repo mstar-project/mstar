@@ -51,8 +51,21 @@ LLM serving stacks assume inference is a single autoregressive loop. Composite m
 ## Quickstart
 
 ```bash
-pip install -e .            # install M*
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+uv pip install -e --torch-backend=auto .[all]      # install M*
 mstar serve bagel          # one command — launch a server (default: http://localhost:8000)
+```
+
+To enable flash-attn support (required for Qwen3-Omni, recommended for BAGEL),
+```bash
+# torch built for CUDA 12.x (cu12 — the default / most common)
+uv pip install \
+  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+
+# torch built for CUDA 13.x (cu13)
+uv pip install \
+  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ```
 
 Other models: `mstar serve qwen3_omni` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
