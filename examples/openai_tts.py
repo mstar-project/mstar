@@ -1,7 +1,7 @@
-"""Text-to-speech via the official OpenAI SDK, pointed at an mminf server.
+"""Text-to-speech via the official OpenAI SDK, pointed at an mstar server.
 
     pip install openai
-    mminf serve orpheus
+    mstar serve orpheus
 """
 
 from openai import OpenAI
