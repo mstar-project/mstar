@@ -127,6 +127,13 @@ Benchmark numbers shift as systems evolve — ours and everyone else's — so ra
 that go stale, we keep the current results and full methodology in the
 [blog post](https://mstar-project.github.io/) and the [paper](https://mstar-project.github.io/mstar.pdf).
 
+## Contributing
+
+Issues and pull requests are welcome. Found a bug, or want a model or feature supported?
+**[Open an issue](https://github.com/mstar-project/mstar/issues).** To add a model yourself,
+follow the [Adding a New Model](https://mstar-project.github.io/mstar/adding_models.html) guide.
+PRs to `main` go through review and CI (`ruff`).
+
 ## Citation
 
 If you use M\* in your research, please cite:
