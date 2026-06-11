@@ -1327,17 +1327,54 @@ class MingFlashOmniModel(Model):
             result["audio_seqlens"].append(length.to(torch.long))
 
     def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        if modality != "text":
+        """Encode a finished output tensor to bytes for the client.
+
+        * ``text``  — utf-8 of the detokenized ids.
+        * ``audio`` — raw little-endian float32 PCM (Talker AudioVAE waveform);
+          the sample rate is exposed via :meth:`get_output_sample_rate`.
+          Mirrors qwen3_omni's ``output.cpu().numpy().tobytes()`` convention.
+        * ``image`` — PNG bytes of the ImageGen RGB output. The pipeline emits a
+          ``[B, 3, H, W]`` (or ``[3, H, W]``) tensor in ``[-1, 1]`` (Z-Image VAE
+          convention); we map to uint8 [0, 255] and PNG-encode the first image.
+        """
+        if output is None or output.numel() == 0:
+            return b""
+        if modality == "text":
+            if self.tokenizer is None:
+                return b""
+            text = self.tokenizer.decode(output.tolist(), skip_special_tokens=True)
+            return text.encode("utf-8")
+        if modality == "audio":
+            return output.detach().to("cpu", dtype=torch.float32).numpy().tobytes()
+        if modality == "image":
+            return self._encode_image_png(output)
+        raise ValueError(
+            f"Unsupported modality for Ming-flash-omni-2.0: {modality!r}. "
+            f"Supported: text, audio, image."
+        )
+
+    @staticmethod
+    def _encode_image_png(output: torch.Tensor) -> bytes:
+        """PNG-encode a [-1, 1] RGB tensor ([B,3,H,W] or [3,H,W]) → bytes."""
+        import io
+
+        from PIL import Image
+
+        img = output.detach().to("cpu", dtype=torch.float32)
+        if img.dim() == 4:
+            img = img[0]  # first image of the batch
+        if img.dim() != 3 or img.shape[0] not in (1, 3):
             raise ValueError(
-                f"Unsupported modality for Ming-flash-omni-2.0 step 3d: "
-                f"{modality!r}. Audio/image lands in step 4+."
+                f"ImageGen postprocess expected [3,H,W] (or [B,3,H,W]); got {tuple(output.shape)}"
             )
-        if self.tokenizer is None:
-            return b""
-        if output.numel() == 0:
-            return b""
-        text = self.tokenizer.decode(output.tolist(), skip_special_tokens=True)
-        return text.encode("utf-8")
+        # [-1, 1] → [0, 255] uint8, CHW → HWC.
+        img = ((img.clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8)
+        arr = img.permute(1, 2, 0).numpy()
+        if arr.shape[2] == 1:
+            arr = arr.repeat(3, axis=2)
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG")
+        return buf.getvalue()
 
     # ------------------------------------------------------------------
     # Submodule construction
