@@ -18,9 +18,9 @@ traces/
 # output filenames
 output.png
 output_edit.png
-mminf-benchmark-cache/
+mstar-benchmark-cache/
 output.wav
 .bench_outs/
 
 # internal design docs (not for public release)
-mminf/worker/ASYNC_REDESIGN.md
+mstar/worker/ASYNC_REDESIGN.md
