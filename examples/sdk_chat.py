@@ -1,12 +1,12 @@
-"""Chat with a running mminf server via the Python SDK.
+"""Chat with a running mstar server via the Python SDK.
 
-Start a server first, e.g.:  mminf serve bagel
+Start a server first, e.g.:  mstar serve bagel
 """
 
-from mminf import MMInfClient
-from mminf.client import TextChunk
+from mstar import MStarClient
+from mstar.client import TextChunk
 
-client = MMInfClient("http://localhost:8000")
+client = MStarClient("http://localhost:8000")
 
 # Non-streaming
 print(client.chat("What is the capital of France?").text)
