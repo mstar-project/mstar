@@ -753,7 +753,7 @@ class OurSystem(InferenceSystem):
                 )
             # Pre-decoded ".npy" uploads (numpy modality): the server keeps these
             # in memory and np.loads them — no disk, no decode (pi0.5 cameras).
-            for path, content in zip(req_input._numpy_paths, req_input._numpy_bytes):
+            for path, content in zip(req_input._numpy_paths, req_input._numpy_bytes, strict=True):
                 form.add_field(
                     "files",
                     content,
