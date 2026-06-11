@@ -20,6 +20,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from mstar.api_server._timing import TIMING_ENABLED as _TIMING
+from mstar.api_server._timing import make_tlog
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
@@ -28,17 +30,15 @@ from mstar.utils.logging_config import quiet_noisy_loggers
 
 logger = logging.getLogger(__name__)
 
-# Env-gated timing prints (MSTAR_TIMING=1); pairs with the [DW-TIMING] prints
-# in data_worker.py to split HTTP/handler overhead from data-worker work.
-_TIMING = os.environ.get("MSTAR_TIMING", "") not in ("", "0", "false")
+# See mstar.api_server._timing; env-gated [API-TIMING] prints (MSTAR_TIMING=1)
+# that pair with the [DW-TIMING] prints to split HTTP/handler overhead from
+# data-worker work.
+_tlog = make_tlog("API-TIMING")
 
 
-def _tlog(msg: str) -> None:
-    if _TIMING:
-        print(f"[API-TIMING] {msg}", flush=True)
-
-
-SUPPORTED_MODALITIES = frozenset({"text", "image", "audio", "video", "action", "scalar", "tensor"})
+SUPPORTED_MODALITIES = frozenset(
+    {"text", "image", "audio", "video", "action", "scalar", "tensor", "numpy"}
+)
 
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
@@ -586,6 +586,10 @@ async def generate(
     else:
         in_mods: list[str] = []
         in_mods.extend(file_paths.keys())
+        # ".npy" uploads bypass file_paths (kept in memory as numpy_bytes), so
+        # add their "numpy" modality explicitly or auto-detect would drop it.
+        if numpy_bytes:
+            in_mods.append("numpy")
         if text:
             in_mods.append("text")
 

@@ -1,6 +1,6 @@
-1. Make a python3.12 environment 
-2. Clone the `openpi` reop
-3. Run the following in your ennvironment:
+1. Make a python3.12 environment
+2. Clone the `openpi` repo
+3. Run the following in your environment:
 ```
 git submodule update --init --recursive
 GIT_LFS_SKIP_SMUDGE=1 uv sync

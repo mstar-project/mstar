@@ -1,11 +1,12 @@
 
 
+import io
 import logging
-import os
 import queue
 import threading
 import time
 
+import numpy as np
 import torch
 
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -16,6 +17,8 @@ try:
 except (ImportError, RuntimeError, OSError):
     VideoDecoder = None
 
+from mstar.api_server._timing import TIMING_ENABLED as _TIMING
+from mstar.api_server._timing import make_tlog
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
@@ -31,16 +34,9 @@ from mstar.utils.ipc_format import (
 
 logger = logging.getLogger(__name__)
 
-# Lightweight, env-gated timing prints (MSTAR_TIMING=1). perf_counter is
-# process-wide monotonic, so timestamps stamped in the API-server handler
-# thread and read in this data-worker thread are directly comparable — that's
-# how queue-wait (polling) latency is separated from actual work below.
-_TIMING = os.environ.get("MSTAR_TIMING", "") not in ("", "0", "false")
-
-
-def _tlog(msg: str) -> None:
-    if _TIMING:
-        print(f"[DW-TIMING] {msg}", flush=True)
+# See mstar.api_server._timing; env-gated [DW-TIMING] prints (MSTAR_TIMING=1)
+# that pair with the [API-TIMING] prints to split queue-wait from actual work.
+_tlog = make_tlog("DW-TIMING")
 
 
 def _preprocess_loop(**kwargs):
@@ -226,15 +222,11 @@ class PreprocessWorkerThread:
         # ".npy" uploads (modality "numpy") are kept in memory and np.load'd
         # here as "raw_inputs"; the model maps them in process_prompt.
         if input.numpy_bytes:
-            import io as _io
-
-            import numpy as np
-
             tensors["raw_inputs"] = []
             input_metadata["raw_inputs"] = []
             for blob in input.numpy_bytes:
                 tensors["raw_inputs"].append(
-                    torch.from_numpy(np.load(_io.BytesIO(blob))).to(self.device)
+                    torch.from_numpy(np.load(io.BytesIO(blob))).to(self.device)
                 )
                 input_metadata["raw_inputs"].append({})
 

@@ -1,12 +1,11 @@
 """NodeSubmodule wrappers for the Pi0.5 model nodes.
 
-Two submodules:
-  Pi05ViTEncoderSubmodule -- SigLIP vision encoder for camera images.
-  Pi05LLMSubmodule        -- combined PaliGemma + action expert. Dispatches by
-                             graph_walk between prefill (PaliGemma writes the
-                             prefix KV cache) and action_gen (action expert
-                             reads the frozen prefix KV cache and runs one
-                             Euler flow-matching step).
+Three submodules:
+  Pi05ViTEncoderSubmodule    -- SigLIP vision encoder for camera images.
+  Pi05PaligemmaSubmodule     -- PaliGemma prefix expert; prefills and writes the
+                                prefix KV cache.
+  Pi05ActionExpertSubmodule  -- action expert; reads the frozen prefix KV cache
+                                and runs the Euler flow-matching denoising loop.
 """
 
 import logging
@@ -580,7 +579,7 @@ class Pi05ActionExpertSubmodule(ARNodeSubmodule):
         # are read directly from self.config — same source as the nn.Linear
         # weight shapes — so they're guaranteed consistent.
         logger.info(
-            "Pi05LLMSubmodule.get_cuda_graph_configs: capturing 'action_gen' "
+            "Pi05ActionExpertSubmodule.get_cuda_graph_configs: capturing 'action_gen' "
             "graph with input_seq_len=%d, noisy_actions=(%d, %d), batch_sizes=[1,2,4] "
             "(num_flow_steps=%d denoising iters runs INSIDE this captured graph; "
             "denoising count is independent of horizon)",
@@ -762,8 +761,9 @@ class Pi05ActionExpertSubmodule(ARNodeSubmodule):
 
         ``noisy_actions`` and ``timestep_index`` arrive as single-element
         lists from preprocess (to keep the data structure uniform with the
-        batched path). We unpack the first element, run one Euler step, and
-        return the loop-back edges.
+        batched path). We unpack the first element, run the full
+        ``num_flow_steps`` Euler denoising loop, and return the denoised action
+        tensor.
         """
         # Unpack from list form (preprocess always returns lists now).
         if isinstance(noisy_actions, list):
