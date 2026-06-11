@@ -10,6 +10,7 @@ checkpoint load, no diffusers.
 
 from __future__ import annotations
 
+from mminf.conductor.request_info import CurrentForwardConductorMetadata
 from mminf.engine.base import EngineType
 from mminf.graph.base import GraphNode
 from mminf.model.ming_omni_flash.config import (
@@ -125,3 +126,89 @@ def test_get_submodule_unknown_node_lists_imagegen() -> None:
     model = _model(with_imagegen=True)
     with pytest.raises(ValueError, match="ImageGen"):
         model.get_submodule("NotARealNode")
+
+
+# ---------------------------------------------------------------------------
+# ImageGen partition state machine (consumer side)
+# ---------------------------------------------------------------------------
+
+
+class _Conn:
+    """Stub StreamingConnectionState."""
+
+    def __init__(self, producer_done: bool) -> None:
+        self.producer_done = producer_done
+        self.token_count = 0
+        self.consumed_count = 0
+
+
+def test_imagegen_initial_args_image_output_keeps_partition_alive() -> None:
+    model = _model(with_imagegen=True)
+    args = model.get_initial_forward_pass_args(
+        partition_name="ImageGen",
+        input_modalities=["text"],
+        output_modalities=["image"],
+        input_signals={},
+    )
+    assert args.full_metadata.graph_walk == "imagegen"
+    assert args.request_done is False
+
+
+def test_imagegen_initial_args_no_image_output_done_immediately() -> None:
+    model = _model(with_imagegen=True)
+    args = model.get_initial_forward_pass_args(
+        partition_name="ImageGen",
+        input_modalities=["text"],
+        output_modalities=["text"],  # no image requested
+        input_signals={},
+    )
+    assert args.request_done is True
+
+
+def test_imagegen_forward_waits_for_producer_done() -> None:
+    model = _model(with_imagegen=True)
+    meta = CurrentForwardConductorMetadata(
+        input_modalities=["text"],
+        output_modalities=["image"],
+        graph_walk="imagegen",
+        is_prefill=False,
+    )
+    args = model.get_partition_forward_pass_args(
+        partition_name="ImageGen",
+        partition_metadata=meta,
+        persist_signals={},
+        new_tokens={},
+        incoming_connections=[_Conn(producer_done=False)],
+    )
+    assert args.request_done is False
+    assert args.inputs == []
+
+
+def test_imagegen_forward_fires_once_then_done() -> None:
+    model = _model(with_imagegen=True)
+    meta = CurrentForwardConductorMetadata(
+        input_modalities=["text"],
+        output_modalities=["image"],
+        graph_walk="imagegen",
+        is_prefill=False,
+    )
+    args1 = model.get_partition_forward_pass_args(
+        partition_name="ImageGen",
+        partition_metadata=meta,
+        persist_signals={},
+        new_tokens={},
+        incoming_connections=[_Conn(producer_done=True)],
+    )
+    assert args1.full_metadata.graph_walk == "imagegen"
+    assert len(args1.inputs) == 1
+    assert args1.inputs[0].name == "thinker_hidden_states"
+    assert args1.request_done is False
+    # Next invocation → already fired → done.
+    args2 = model.get_partition_forward_pass_args(
+        partition_name="ImageGen",
+        partition_metadata=args1.full_metadata,
+        persist_signals={},
+        new_tokens={},
+        incoming_connections=[_Conn(producer_done=True)],
+    )
+    assert args2.request_done is True

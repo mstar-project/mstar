@@ -650,6 +650,19 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         cache_handle = engine_inputs.cache_manager
         request_info = engine_inputs.single_request_info
 
+        # Image-gen prefill carries an <imagePatch> query-token block; when
+        # those token ids are present we additionally capture the post-norm
+        # hidden states at those positions and stream them to the ImageGen
+        # partition. Only meaningful on the text-input path (the block lives
+        # in the tokenized prompt); embeds-path multimodal prefills don't
+        # carry it.
+        want_image_gen = (
+            self.config is not None
+            and self.config.image_gen is not None
+            and text_inputs is not None
+            and bool((text_inputs == self.config.thinker_llm.image_patch_token).any())
+        )
+
         if input_embeds is not None:
             if position_ids is None:
                 raise ValueError(
@@ -657,7 +670,7 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
                     "provided but position_ids is None. prepare_inputs "
                     "must emit custom_pos_ids alongside embeds."
                 )
-            logits = self.model(
+            model_out = self.model(
                 cache_handle,
                 input_embeds=input_embeds,
                 position_ids=position_ids,
@@ -686,11 +699,17 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
                 start_pos, start_pos + num_tokens,
                 dtype=torch.long, device=text_inputs.device,
             )
-            logits = self.model(
+            model_out = self.model(
                 cache_handle,
                 input_ids=text_inputs,
                 position_ids=position_ids_1d,
+                return_hidden_states=want_image_gen,
             )
+
+        if want_image_gen:
+            logits, hidden_states = model_out
+        else:
+            logits = model_out
 
         # Advance the cache's sequence lengths so the next decode step
         # knows where to read/write. This is the standard post-forward
@@ -699,7 +718,13 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
 
         # Sample only the last position's logits (next-token sampling).
         last_logits = logits[-1:, :]
-        return {"logits": [last_logits]}
+        outputs: NameToTensorList = {"logits": [last_logits]}
+        if want_image_gen:
+            patch_hidden = self.extract_image_gen_hidden_states(
+                hidden_states, text_inputs, self.config.thinker_llm.image_patch_token,
+            )
+            outputs["thinker_hidden_states"] = [patch_hidden]
+        return outputs
 
     def postprocess(
         self,
