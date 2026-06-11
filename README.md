@@ -53,7 +53,7 @@ LLM serving stacks assume inference is a single autoregressive loop. Composite m
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
-uv pip install -e --torch-backend=auto .[all]      # install M*
+uv pip install --torch-backend=auto -e .[all]      # install M*
 mstar serve bagel          # one command — launch a server (default: http://localhost:8000)
 ```
 
