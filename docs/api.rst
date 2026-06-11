@@ -2,7 +2,7 @@ API Reference
 =============
 
 This reference is generated automatically from the docstrings in each module. It mirrors
-the package layout under ``mminf/``; expand a subpackage to drill down to individual
+the package layout under ``mstar/``; expand a subpackage to drill down to individual
 modules, classes, and functions.
 
 .. note::
@@ -16,12 +16,12 @@ modules, classes, and functions.
    :toctree: _autosummary
    :recursive:
 
-   mminf.api_server
-   mminf.communication
-   mminf.conductor
-   mminf.engine
-   mminf.graph
-   mminf.model
-   mminf.streaming
-   mminf.utils
-   mminf.worker
+   mstar.api_server
+   mstar.communication
+   mstar.conductor
+   mstar.engine
+   mstar.graph
+   mstar.model
+   mstar.streaming
+   mstar.utils
+   mstar.worker
