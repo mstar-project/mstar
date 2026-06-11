@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`mminf` is a disaggregated multimodal inference engine. It serves multimodal models (vision, audio, text, actions) over HTTP via a graph-based execution system where logical computation nodes are decoupled from physical GPU workers.
+`mstar` is a disaggregated multimodal inference engine. It serves multimodal models (vision, audio, text, actions) over HTTP via a graph-based execution system where logical computation nodes are decoupled from physical GPU workers.
 
 ## Common Commands
 
@@ -28,7 +28,7 @@ pytest test/modular/test_phase1.py::TestPageAllocator::test_allocate_and_free
 pytest test/integration/
 
 # Start the server
-mminf-serve --config configs/<model>.yaml --host 0.0.0.0 --port 8000
+mstar-serve --config configs/<model>.yaml --host 0.0.0.0 --port 8000
 ```
 
 ## Architecture
@@ -37,14 +37,14 @@ mminf-serve --config configs/<model>.yaml --host 0.0.0.0 --port 8000
 
 ### Key components
 
-- **API Server** (`mminf/api_server/`): FastAPI endpoint handling tokenization, media loading, and result collection. Entry point is `entrypoint.py`. Accepts `POST /generate`.
-- **Conductor** (`mminf/conductor/`): Central coordinator that manages request lifecycle, selects workers, routes inputs, and detects completion.
-- **Workers** (`mminf/worker/`): One process per GPU. Each has an engine manager, micro-scheduler (continuous batching), and KV cache manager. Workers route tensors directly to downstream workers.
-- **Engines** (`mminf/engine/`): Execution backends — `AREngine` (autoregressive), `FlowEngine` (diffusion/ODE), `EncoderDecoderEngine` (vision/audio encoding), `AudioCodecEngine`.
-- **Models** (`mminf/model/`): Each model inherits from `Model` (base.py) and defines its computation graph, forward pass orchestration, tokenization, and engine types. Registered via `registry.py`.
-- **Graph** (`mminf/graph/`): Computation graph primitives — `GraphNode`, `Sequential`, `Parallel`, `Loop`, `GraphEdge`. Models declare graph walks that the conductor executes.
-- **Communication** (`mminf/communication/`): ZMQ-based IPC/TCP for inter-process messaging. Tensor transport via RDMA or TCP.
-- **Streaming** (`mminf/streaming/`): Handles streaming output with configurable chunking policies.
+- **API Server** (`mstar/api_server/`): FastAPI endpoint handling tokenization, media loading, and result collection. Entry point is `entrypoint.py`. Accepts `POST /generate`.
+- **Conductor** (`mstar/conductor/`): Central coordinator that manages request lifecycle, selects workers, routes inputs, and detects completion.
+- **Workers** (`mstar/worker/`): One process per GPU. Each has an engine manager, micro-scheduler (continuous batching), and KV cache manager. Workers route tensors directly to downstream workers.
+- **Engines** (`mstar/engine/`): Execution backends — `AREngine` (autoregressive), `FlowEngine` (diffusion/ODE), `EncoderDecoderEngine` (vision/audio encoding), `AudioCodecEngine`.
+- **Models** (`mstar/model/`): Each model inherits from `Model` (base.py) and defines its computation graph, forward pass orchestration, tokenization, and engine types. Registered via `registry.py`.
+- **Graph** (`mstar/graph/`): Computation graph primitives — `GraphNode`, `Sequential`, `Parallel`, `Loop`, `GraphEdge`. Models declare graph walks that the conductor executes.
+- **Communication** (`mstar/communication/`): ZMQ-based IPC/TCP for inter-process messaging. Tensor transport via RDMA or TCP.
+- **Streaming** (`mstar/streaming/`): Handles streaming output with configurable chunking policies.
 
 ### Core design principles
 
