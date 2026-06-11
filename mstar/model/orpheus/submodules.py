@@ -6,10 +6,10 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.kv_cache_engine import BatchedCacheManager
 from mstar.engine.base import NodeBatch
 from mstar.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
 from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
+from mstar.engine.kv_cache_engine import BatchedCacheManager
 from mstar.engine.kv_store import PositionInfo
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule

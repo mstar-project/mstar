@@ -11,8 +11,10 @@ Usage:
 """
 
 from __future__ import annotations
-import sys
+
 import os
+import sys
+
 import numpy as np
 
 
@@ -80,7 +82,7 @@ def report(path: str, r: dict) -> None:
     if issues:
         print(f"  WARNINGS: {'; '.join(issues)}")
     else:
-        print(f"  PASS — actions look plausible")
+        print("  PASS — actions look plausible")
 
 
 def plot_one(path: str, r: dict, out_dir: str) -> None:
@@ -107,7 +109,7 @@ def plot_one(path: str, r: dict, out_dir: str) -> None:
         axes = [axes]
 
     t = np.arange(T)
-    for ax, dim in zip(axes, active):
+    for ax, dim in zip(axes, active, strict=False):
         ax.plot(t, arr[:, dim], linewidth=1.2)
         ax.set_ylabel(f"dim {dim}", fontsize=8)
         ax.axhline(0, color="gray", linewidth=0.5, linestyle="--")

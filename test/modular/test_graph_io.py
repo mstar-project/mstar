@@ -3,7 +3,6 @@
 Each test pins down a specific behavior that the prior implementation got
 wrong; if any of these regress, the underlying bugs have re-surfaced.
 """
-import pytest
 
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.graph_io import WorkerGraphIO

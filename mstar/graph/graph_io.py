@@ -47,15 +47,15 @@ class WorkerGraphIO:
     @property
     def ready_node_names(self):
         return self.wg_state_registry.ready_names
-    
+
     @property
     def ready_for_streaming(self):
         return self.wg_state_registry.ready_for_streaming
-    
+
     def get_node(self, name: str):
         assert name in self.nodes
         return self.nodes[name]
-    
+
     def ingest_input(
         self, graph_edge: GraphEdge, can_buffer: bool=True
     ) -> bool:
@@ -72,7 +72,7 @@ class WorkerGraphIO:
         return self.nodes[graph_edge.next_node].ingest_input(
             graph_edge, can_buffer
         )
-    
+
     def mark_node_complete(
         self, node_name: str
     ) -> NodeCompletionOutput:
@@ -92,7 +92,7 @@ class WorkerGraphIO:
         if self.wg_state_registry.is_done and not prev_done_val:
             self.num_times_run += 1
         return completion
-    
+
     def ingest_for_speculation(
         self, edges: list[GraphEdge], source_node: str
     ) -> list[SpeculativeNodeInfo]:
@@ -162,7 +162,7 @@ class WorkerGraphIO:
         """
         if loop_name in self.loops:
             self.loops[loop_name].register_finished()
-    
+
     def clear(self):
         self.wg_state_registry.clear()
 
@@ -175,12 +175,12 @@ class WorkerGraphIO:
             node.register_communication_info(
                 communication_manager, request_id
             )
-    
+
     def get_loop_indices(self):
         return {
             name: loop.curr_iter for name, loop in self.loops.items()
         }
-    
+
     def get_nested_loop_idxs(
         self, target_loop_name: str
     ):
@@ -197,7 +197,7 @@ class WorkerGraphIO:
             loop_indices=self.get_loop_indices(),
             wg_fwd_pass_idx=self.num_times_run
         )
-    
+
     def get_nested_loop_idxs_for_node(
         self, node_name: str
     ):

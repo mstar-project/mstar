@@ -206,7 +206,7 @@ class FlashInferPrefillWrapper:
         # even if we're not in a cuda graph
         if not self.use_cuda_graph:
             self._qo_indptr_buf = qo_indptr
-    
+
         # Compute per-token page and offset for vectorized KV writes
         n_req = qo_indptr.shape[0] - 1
         starts = qo_indptr[:-1].to(torch.int32)

@@ -7,8 +7,8 @@ import logging
 
 import numpy as np
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 from transformers.activations import ACT2FN
 
 from mstar.model.qwen3_omni.config import Code2WavConfig
@@ -340,7 +340,8 @@ class SnakeBeta(nn.Module):
         - alpha - trainable parameter that controls frequency
         - beta - trainable parameter that controls magnitude
     References:
-        - This activation function is a modified version based on this paper by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
+        - This activation function is a modified version based on this paper by
+        Liu Ziyin, Tilman Hartwig, Masahito Ueda:
         https://huggingface.co/papers/2006.08195
     """
 
@@ -455,7 +456,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             Qwen3OmniMoeCausalConvNet(output_dim, 1, 7),
         ]
         self.decoder = nn.ModuleList(decoder)
-    
+
     def consolidate(self):
         self.pre_transformer.consolidate()
         # Pre-fold SnakeBeta exp(alpha) / 1/(exp(beta)+eps) on every instance
@@ -487,7 +488,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         for block in self.decoder:
             wav = block(wav)
         return wav.clamp(min=-1, max=1)
-    
+
     def chunked_decode_streaming(
         self,
         codes: torch.Tensor,

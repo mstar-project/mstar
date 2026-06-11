@@ -103,11 +103,11 @@ def load_lerobot(device):
 # ----------------------------------------------------------------------------
 
 def load_mstar(ref_model, ref_config, device):
+    from mstar.model.pi05.weight_loader import load_lerobot_pi05_into_model
     from safetensors.torch import load_file
 
     from mstar.model.pi05.config import Pi05Config
     from mstar.model.pi05.pi05_model import Pi05Model
-    from mstar.model.pi05.weight_loader import load_lerobot_pi05_into_model
 
     cache_root = os.environ.get(
         "HF_HUB_CACHE",

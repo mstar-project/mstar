@@ -145,7 +145,7 @@ class ModelInputsFromEngine:
         """
         assert len(self.per_request_info) == 1
         return self.per_request_info[self.request_ids[0]]
-    
+
     @property
     @torch.compiler.disable
     def first_request_info(self):
@@ -219,7 +219,7 @@ class NodeSubmodule(torch.nn.Module):
         model_inputs: list[NodeInputs],
     ):
         return False # batching disabled by default
-    
+
     def max_batch_size(self, graph_walk: str):
         return None
 

@@ -1,6 +1,6 @@
-from collections import deque
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 
@@ -124,12 +124,12 @@ class MicroScheduler:
         deadline = time.monotonic() + self.HOLD_BACKOFF_SECONDS
         for rid in request_ids:
             self.held_until[rid] = deadline
-    
+
     def register_tp_follow(
         self, message: ScheduleTPNode
     ):
         self.tp_batches_pending_schedule.append(message)
-    
+
     def _try_schedule_tp_follow(
         self, worker_graphs_manager: WorkerGraphsManager,
     ) -> ScheduledBatch | None:
@@ -158,7 +158,7 @@ class MicroScheduler:
             engine = self.engine_manager.get_engine(first_tp_node.node_name)
             if not engine.check_ready(first_tp_node.node_name, rid, fwd_info):
                 return
-        
+
         node_objects = {}
         request_to_worker_graph = {}
 

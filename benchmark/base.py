@@ -138,7 +138,7 @@ class Bagel(Model):
 
     def get_supported_modalities(self):
         return {RequestType.T2T, RequestType.T2I, RequestType.I2I, RequestType.I2T}
-    
+
     def get_openai_system_message(self) -> Optional[dict]:
         return {
             "role": "system",

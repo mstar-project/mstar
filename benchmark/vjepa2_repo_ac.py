@@ -153,8 +153,8 @@ def _check_env_or_exit(repo_path: str) -> None:
     try:
         import torch  # noqa: F401
         from app.vjepa_droid.transforms import make_transforms  # noqa: F401
-        from src.models.ac_predictor import VisionTransformerPredictorAC  # noqa: F401
         from notebooks.utils.mpc_utils import compute_new_pose  # noqa: F401
+        from src.models.ac_predictor import VisionTransformerPredictorAC  # noqa: F401
     except ImportError as e:
         sys.exit(
             f"\n[ERROR] vjepa2 upstream imports failed ({e}).\n\n"
@@ -265,6 +265,7 @@ def main() -> None:
     import torch.nn.functional as F
     from app.vjepa_droid.transforms import make_transforms
     from notebooks.utils.mpc_utils import compute_new_pose
+
     from benchmark.dataset import DROIDDataset
 
     print("=== upstream vjepa2 AC baseline ===")

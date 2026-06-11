@@ -67,9 +67,9 @@ from mstar.model.bagel.submodules import (
     ViTEncoderSubmodule,
 )
 from mstar.model.base import DECODE, ForwardPassArgs, Model
+from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
@@ -510,7 +510,7 @@ class BagelModel(Model):
                     segments.insert(0, self.BOS_EOS_TEMPL.format(prompt=GEN_THINK_SYSTEM_PROMPT))
             result["text_inputs"] = [self._encode_text(seg) for seg in segments]
 
-        # Image edit path: both input and output include "image". 
+        # Image edit path: both input and output include "image".
         # request specifies a target width and/or height, resize the input
         # images to be the largest that fits within that box (preserving
         # aspect ratio) so the edited output matches the requested size.
@@ -523,12 +523,12 @@ class BagelModel(Model):
             and tensors.get("image_inputs")
         ):
             result["image_inputs"] = [
-                self._resize_to_fit(img, max_width, max_height) 
+                self._resize_to_fit(img, max_width, max_height)
                 for img in tensors["image_inputs"]
             ]
 
         return result
-    
+
     @staticmethod
     def _resize_to_fit(
         image: torch.Tensor,
@@ -820,7 +820,7 @@ class BagelModel(Model):
         images = input_signals.get("image_inputs", [])
 
         # 1. System prompt
-        
+
         if len(texts) == 2:
             # the first text block is the system prompt and should come at the very beginning
             # (in both thinking and non-thinking mode)
@@ -986,7 +986,7 @@ class BagelModel(Model):
             for key in overridable_keys:
                 if key in model_kwargs:
                     params[key] = model_kwargs[key]
-        
+
         if "image" in output_modalities and input_signals.get("image_inputs"):
             image = input_signals["image_inputs"][0]
             params["height"] = image.dims[1]
@@ -1062,7 +1062,7 @@ class BagelModel(Model):
             metadata.kwargs.get("think_mode", False) or metadata.kwargs["target_output"] != "image"
         )
         sample_prefill_token = False
-    
+
         if metadata.is_prefill:
             step = metadata.kwargs["prefill_step"] + 1
             schedule = metadata.kwargs["prefill_schedule"]

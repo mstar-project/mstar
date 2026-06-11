@@ -82,7 +82,7 @@ class KVCacheConfig:
     def __post_init__(self):
         if self.num_qo_heads is None:
             self.num_qo_heads = self.num_kv_heads
-        
+
         self._sharded = False
         self.original_num_kv_heads = self.num_kv_heads
         self.original_num_qo_heads =  self.num_qo_heads
@@ -91,7 +91,7 @@ class KVCacheConfig:
         if self.nodes is None:
             return "ALL_NODES"
         return "///".join(self.nodes)
-    
+
     def shard(self, tp_size: int):
         if tp_size >= self.original_num_kv_heads:
             self.num_kv_heads = 1

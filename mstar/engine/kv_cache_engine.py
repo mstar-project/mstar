@@ -234,7 +234,9 @@ class KVCacheEngine(BaseEngine):
     def warmup(self) -> None:
         """Compile submodules and capture CUDA graphs."""
         from mstar.engine.cuda_graph_runner import (
-            CudaGraphRunner, PiecewiseCudaGraphRunner, DEFAULT_AR_CAPTURE_BATCH_SIZES,
+            DEFAULT_AR_CAPTURE_BATCH_SIZES,
+            CudaGraphRunner,
+            PiecewiseCudaGraphRunner,
         )
 
         for node_name, submodule_mgmt in self.submodule_management.items():
@@ -348,7 +350,7 @@ class KVCacheEngine(BaseEngine):
         submod_mg = self.submodule_management[node_name]
         if submod_mg.cuda_graph_runner is None:
             return submod_max_bs
-        
+
         runner = submod_mg.cuda_graph_runner
         configs = [
             cfg for cfg in runner.capture_configs \

@@ -19,12 +19,11 @@ Key differences from the masked predictor:
 
 from __future__ import annotations
 
-
-from mstar.engine.cache_manager import BatchedCacheManager
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.vjepa2.components.rope_utils import rotate_queries_or_keys, rotate_queries_or_keys_BNHD
 from mstar.model.vjepa2.config import VJepa2ACPredictorConfig
 

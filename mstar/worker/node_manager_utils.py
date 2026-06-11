@@ -72,7 +72,7 @@ class WorkerGraphQueues:
             if not queue.ingest_input(inp, can_buffer):
                 not_ingested.append(inp)
         return not_ingested
-    
+
     def process_new_streaming_inputs(
         self, request_id: str, inputs: list[GraphEdge],
         can_buffer: bool=True
@@ -117,7 +117,7 @@ class WorkerGraphQueues:
             request_id: q.ready_node_names \
                 for (request_id, q) in self.per_request_queues.items()
         }
-    
+
     def get_ready_for_streaming(self, request_id: str):
         assert request_id in self.per_request_queues, \
             f"Tried to check ready for streaming for unknown request ID {request_id}"
@@ -330,7 +330,7 @@ class WorkerGraphsManager:
                     request_id, inputs, can_buffer=can_buffer
                 )
         return inputs
-    
+
     def process_new_streaming_inputs(
         self,
         request_id: str,
@@ -368,14 +368,14 @@ class WorkerGraphsManager:
         and ``filtered_signals`` (loop-back (name, dest) pairs to drop).
         """
         return self.queues[worker_graph_id].mark_node_complete(request_id, node_name)
-    
+
     def register_output_loop_indices(
         self, request_id: str,
         loop_indices: NestedLoopIndices,
         output_name: str
     ):
         self.per_request_info[request_id].output_loop_indices[output_name] = loop_indices
-    
+
     def get_output_loop_indices(self, request_id: str):
         return self.per_request_info[request_id].output_loop_indices
 
@@ -570,7 +570,7 @@ class WorkerGraphsManager:
                             target_loop_name=name,
                         )
         return stopped_loop_back_signals
-    
+
     def get_nested_loop_idxs_for_node(
         self, request_id: str, partition: str, node_name: str
     ) -> NestedLoopIndices:

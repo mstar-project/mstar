@@ -66,15 +66,15 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
-    from mstar.conductor.conductor import Conductor
-    from mstar.model.registry import get_model_class
-
     # Read yaml early to extract optional `model_kwargs:` section for the model
     # constructor. Lets a yaml override init-time model parameters (e.g.
     # Pi05's action_horizon for the DROID benchmark variant) without code
     # changes per model. Backward compatible: missing section → empty dict,
     # so existing configs see identical behavior.
     import yaml as _yaml
+
+    from mstar.conductor.conductor import Conductor
+    from mstar.model.registry import get_model_class
     with open(config_path, "r") as _f:
         _yaml_cfg = _yaml.safe_load(_f) or {}
     yaml_model_kwargs = _yaml_cfg.get("model_kwargs", {}) or {}

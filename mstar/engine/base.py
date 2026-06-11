@@ -131,7 +131,7 @@ class BaseEngine(ABC):
 
     def has_autocast(self):
         return True
-    
+
     def get_max_batch_size(self, node_name: str, graph_walk: str):
         return None
 

@@ -606,7 +606,7 @@ class Worker:
 
             stream_buf.put(info.uuid, tensor.clone())
             self.tensor_manager.dereference(request_id, info.uuid)
-    
+
     def _pop_streaming_edge(
         self, sbuf: StreamBuffer, edge_name: str, request_id: str
     ) -> GraphEdge | None:
@@ -659,7 +659,7 @@ class Worker:
             if edge is not None:
                 result.append(edge)
         return result
-    
+
     def _return_speculative_streaming_edge(
         self, request_id: str, edge: GraphEdge
     ):
@@ -706,7 +706,7 @@ class Worker:
                 range_push("check_ready-tensors.route_streaming")
             for edge in streaming:
                 self._route_streaming_tensor(request_id, edge)
-            
+
             if self.enable_nvtx:
                 range_pop(synchronize=False)
                 range_push("process_new_inputs.process_inputs")
@@ -832,7 +832,7 @@ class Worker:
             per_request_info=per_request_info,
             final_stream_rids=final_stream_rids,
         )
-    
+
     def maybe_send_zmq_to_tp_followers(
         self, node_batch: NodeBatch
     ):
@@ -1298,7 +1298,7 @@ class Worker:
         batch_N = pending.batch
         partition_N = pending.partition
         graph_walk = pending.graph_walk
-        
+
         # sample node and RID to see which node we will be speculating
         # (TODO: refine this to be, e.g., a majority vote)
         rid, sample_node = next(iter(batch_N.node_objects.items()))
@@ -1330,7 +1330,7 @@ class Worker:
 
         if not ready_for_spec:
             return # no nodes can be speculated
-        
+
         # TODO: use the microscheduler to break ties when ready_for_spec
         # contains multiple ready nodes
         spec_node_info = ready_for_spec[0]
@@ -1499,7 +1499,7 @@ class Worker:
             loop_name=spec_node_info.loop_name,
             consumed_streaming_edges=consumed_streaming_edges
         )
-    
+
     def _thread_outputs_to_speculative(
         self, speculation: Speculation, output_N: NodeOutput
     ):
@@ -1578,7 +1578,7 @@ class Worker:
                 batch_N.batch.request_to_worker_graph.pop(stopped_rid)
                 batch_N.node_batch.per_request_info.pop(stopped_rid)
         batch_N.node_batch.request_ids = list(valid_rids)
-        
+
         # pending stops are only needed for one iteration, so can be cleared now
         self._pending_loop_stops.clear()
 
@@ -1596,11 +1596,11 @@ class Worker:
         t = _time.monotonic()
         for rid in batch_N.node_batch.request_ids:
             self._last_active[(rid, batch_N.node_name)] = t
-        
+
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.synchronize_completion_event", synchronize=False)
-        
+
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
         if torch.cuda.is_available() and batch_N.batch.node_objects:
@@ -1612,17 +1612,17 @@ class Worker:
                     range_pop(synchronize=False)
             else:
                 torch.cuda.default_stream().synchronize()
-        
+
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.check_stop", synchronize=False)
-        
+
         for rid, req_info in batch_N.node_batch.per_request_info.items():
             new_iters = self.worker_graphs_manager.get_dynamic_loop_iters(
                 rid, partition=batch_N.partition,
             )
             req_info.dynamic_loop_iter_counts.update(new_iters)
-        
+
         # Check for stops
         engine = self.engine_manager.get_engine(batch_N.node_name)
         cpu_output = self._prematerialize_for_check_stop(output)
@@ -1670,7 +1670,7 @@ class Worker:
                         )
                     )
                 )
-        
+
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.route_outputs", synchronize=False)
@@ -1720,12 +1720,12 @@ class Worker:
                 self.tensor_manager.set_output_ref_counts(
                     rid, per_request_uuids[rid], routed_edges
                 )
-        
+
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
         self._register_outputs(batch_N.batch, routing_per_request)
-        
+
         # send outputs
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -2061,7 +2061,7 @@ class Worker:
                 # non-speculative path below (drain, then schedule).
                 speculation = None
                 yield_away_from_target = None
-    
+
                 if pending is not None and self._can_speculate(pending.batch):
                     # Fairness check (peek-based, replaces the old iter-
                     # counter cap): only break the spec chain when there's
@@ -2112,7 +2112,7 @@ class Worker:
                                 is_same_node=False,
                                 is_yield_away=True
                             )
-                            
+
                             # send messages to follower ranks if relevant
                             self.maybe_send_zmq_to_tp_followers(node_batch)
                     if speculation is not None:
@@ -2163,7 +2163,7 @@ class Worker:
                         _phase_record("await_gpu", _time.perf_counter() - _t0)
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
-                    
+
                     # set node._speculatively_scheduled to false, since
                     # the node has just completed
                     for node in pending.batch.node_objects.values():
@@ -2213,7 +2213,7 @@ class Worker:
                         for node in spec_batch.node_objects.values():
                             # this does not include the dropped rids
                             node._speculatively_scheduled = True
-                        
+
                         if spec_batch.node_objects:
                             if self.enable_nvtx:
                                 range_push("worker.submit_spec", synchronize=False)

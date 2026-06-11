@@ -166,6 +166,12 @@ ignore = [
     "PLW2901", # Loop variable overwritten by assignment target
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# Intentional star-import re-export of the graph base API.
+"mstar/graph/graph_io.py" = ["F403", "F405"]
+# Imports are deliberately placed after a module-level pytest.skip().
+"test/modular/test_phase1.py" = ["E402"]
+
 [tool.ruff.format]
 quote-style = "double"
 line-ending = "auto"

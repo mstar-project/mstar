@@ -681,10 +681,10 @@ def test_pi05_model_loaded_via_remapper_matches_lerobot():
     import os
 
     from lerobot.policies.pi05 import PI05Policy
+    from mstar.model.pi05.weight_loader import load_lerobot_pi05_into_model
     from safetensors.torch import load_file
 
     from mstar.model.pi05.pi05_model import Pi05Model
-    from mstar.model.pi05.weight_loader import load_lerobot_pi05_into_model
 
     device = torch.device("cuda")
     dtype = torch.float32
@@ -925,14 +925,14 @@ def test_pi05_areengine_load_model_with_real_weights():
     paged KV cache has the correct dimensions for Pi0.5.
     """
     from lerobot.policies.pi05 import PI05Policy
+    from mstar.model.pi05.weight_loader import load_lerobot_pi05_into_model
     from safetensors.torch import load_file
 
-    from mstar.engine.kv_cache_engine import KVCacheEngine
     from mstar.engine.base import EngineType
+    from mstar.engine.kv_cache_engine import KVCacheEngine
     from mstar.engine.kv_store import TransferEngineInfo
     from mstar.model.pi05.config import Pi05Config
     from mstar.model.pi05.pi05_model import Pi05Model
-    from mstar.model.pi05.weight_loader import load_lerobot_pi05_into_model
 
     device = torch.device("cuda")
 

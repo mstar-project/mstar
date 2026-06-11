@@ -202,7 +202,7 @@ def main():
     from openpi.shared import download
     from openpi.training import config as _config
 
-    print(f"=== openpi pi0.5 baseline ===")
+    print("=== openpi pi0.5 baseline ===")
     print(f"  config       : {args.config}")
     print(f"  checkpoint   : {args.checkpoint}")
     print(f"  device       : {args.device}")
@@ -212,13 +212,13 @@ def main():
     # ------------------------------------------------------------------
     # Load policy
     # ------------------------------------------------------------------
-    print(f"\nDownloading checkpoint (cached at ~/.cache/openpi)...")
+    print("\nDownloading checkpoint (cached at ~/.cache/openpi)...")
     t0 = time.perf_counter()
     config = _config.get_config(args.config)
     ckpt_dir = download.maybe_download(args.checkpoint)
     print(f"  ckpt at {ckpt_dir} ({time.perf_counter() - t0:.1f}s)")
 
-    print(f"\nCreating policy...")
+    print("\nCreating policy...")
     t0 = time.perf_counter()
     policy = policy_config.create_trained_policy(
         config, ckpt_dir, pytorch_device=args.device

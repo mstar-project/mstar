@@ -26,7 +26,7 @@ def sincos_timestep_embedding(
         raise ValueError(f"sincos embedding requires even dim, got {dim}")
     if t.dim() == 0:
         t = t[None]
-    
+
     period = min_period * torch.pow(max_period / min_period, fraction)
     omega = (2.0 * torch.pi / period).to(t.dtype)
 

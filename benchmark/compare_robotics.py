@@ -33,9 +33,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
-from pathlib import Path
-
 
 METRIC_ORDER = [
     ("JCT mean (ms)",     "jct_mean_ms",        "{:.1f}"),
@@ -133,7 +130,7 @@ def main():
         raw = [data.get(key, None) for _, data in systems]
         # Skip the row if every system is missing or zero for this metric
         # (e.g. actions_per_sec is only meaningful for pi0.5 results).
-        if all(v is None or v == 0 or v == 0.0 for v in raw):
+        if all(v is None or v in (0, 0.0) for v in raw):
             continue
 
         cells = _row(label, fmt, raw)

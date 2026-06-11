@@ -11,7 +11,6 @@ import pytest
 from mstar.distributed.base import ShardDestination, ShardingConfig, ShardingGroup
 from mstar.graph.base import NodeAndGraphWalk
 
-
 # ---------------------------------------------------------------------------
 # ShardingGroup
 # ---------------------------------------------------------------------------

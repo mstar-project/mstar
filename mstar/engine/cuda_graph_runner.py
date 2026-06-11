@@ -35,7 +35,7 @@ from mstar.engine.cuda_graph_config import (
 from mstar.engine.kv_store import KVCacheConfig, PagedAllocationManager
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
 from mstar.utils.profiler import mark, range_pop, range_push
-from mstar.utils.sampling import SamplerBuffers, Sampler, SamplingConfig, make_sampler_from_buffers
+from mstar.utils.sampling import Sampler, SamplerBuffers, SamplingConfig, make_sampler_from_buffers
 
 logger = logging.getLogger(__name__)
 
@@ -594,7 +594,7 @@ class CudaGraphRunner:
                     cache_manager=spec.cache_manager,
                 )
                 captured_slots.append(slot)
-                
+
                 applied_penalty_in_graph = applied_penalty_in_graph or \
                     spec.engine_inputs.sampler.applied_penalty_in_graph
 
@@ -1357,7 +1357,7 @@ class CudaGraphRunner:
                 range_pop(synchronize=False)
                 range_pop(synchronize=False)
                 mark("gpu_thread.cuda_graph_end")
-            
+
 
             if graph_data.applied_penalty_in_graph:
                 engine_inputs.sampler.sync_seen_token_masks(
@@ -1574,7 +1574,7 @@ class CudaGraphRunner:
                 range_pop(synchronize=False)
                 range_pop(synchronize=False)
                 mark("gpu_thread.cuda_graph_end")
-            
+
             if graph_data.applied_penalty_in_graph:
                 engine_inputs.sampler.sync_seen_token_masks(
                     [self.sampler._seen_token_mask[rid] for rid in request_ids]

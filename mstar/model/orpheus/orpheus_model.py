@@ -28,8 +28,8 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
-from mstar.engine.kv_cache_engine import KVCacheConfig
 from mstar.engine.base import EngineType
+from mstar.engine.kv_cache_engine import KVCacheConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model

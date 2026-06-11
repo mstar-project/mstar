@@ -74,11 +74,11 @@ class ZMQCommunicator(BaseCommunicator):
         self.poller = zmq.Poller()
         self.poller.register(self.pull_socket, zmq.POLLIN)
         self.event = None
-    
+
     def register_event_for_poll(self, event: EventWakeup):
         self.poller.register(event.fd,  zmq.POLLIN)
         self.event = event
-    
+
     def wait_for_work(self, timeout_ms=50):
         events = dict(self.poller.poll(timeout=timeout_ms))
         if self.event.fd in events:

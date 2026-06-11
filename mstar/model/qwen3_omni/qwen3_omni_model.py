@@ -44,7 +44,7 @@ from mstar.engine.base import EngineType
 from mstar.engine.kv_store import KVCacheConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, MAX_OUTPUT_TOKENS, Model, TensorAndMetadata
+from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import Operation, WeightConverter
@@ -179,7 +179,7 @@ class Qwen3OmniModel(Model):
             "Talker": EngineType.KV_CACHE,
             "Code2Wav": EngineType.STATELESS,
         }
-    
+
     def get_max_talker_output_tokens(self, **model_kwargs):
         return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
 
@@ -1317,7 +1317,7 @@ class Qwen3OmniModel(Model):
             name_remapper=self._thinker_remap,
         )
         thinker_model.eval()
-        
+
 
         from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
         return ThinkerSubmodule(
@@ -1361,7 +1361,7 @@ class Qwen3OmniModel(Model):
                 code_pred_weights.append((k.removeprefix(_CP_PREFIX), v))
             else:
                 talker_weights.append((k.removeprefix(_TALKER_PREFIX), v))
-        for k, v in iter_safetensors_shards(
+        for _k, v in iter_safetensors_shards(
             self.local_dir, device=device, prefix="thinker.model.embed_tokens"
         ):
             initialized_thinker_embed_tokens = True
@@ -1404,8 +1404,8 @@ class Qwen3OmniModel(Model):
     def _create_code2wav_submodule(self, device: str) -> NodeSubmodule:
         # Code2Wav is the vocoder that converts codec tokens to audio waveform.
         # The actual model class will be defined in components.
-        from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
         from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
+        from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         # The vocoder is dominated by Conv1d/ConvTranspose1d at small channel
         # counts where cuDNN's default heuristic picks a sub-optimal algo.

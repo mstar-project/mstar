@@ -30,9 +30,8 @@ from typing import List, Optional
 
 import aiohttp
 import numpy as np
-from PIL import Image
-
 from _env import get_server_url
+from PIL import Image
 
 # ── constants matching Pi0.5 defaults ────────────────────────────────────────
 ACTION_HORIZON = 50
@@ -236,7 +235,10 @@ def print_summary(all_results: dict[int, List[RequestResult]], pool_size: int) -
     print(f"\n{'═'*72}")
     print("  BENCHMARK SUMMARY")
     print(f"{'═'*72}")
-    header = f"{'Batch':>6}  {'OK':>4}  {'Fail':>4}  {'min':>7}  {'p50':>7}  {'p95':>7}  {'p99':>7}  {'max':>7}  {'req/s':>7}"
+    header = (
+        f"{'Batch':>6}  {'OK':>4}  {'Fail':>4}  {'min':>7}  {'p50':>7}  "
+        f"{'p95':>7}  {'p99':>7}  {'max':>7}  {'req/s':>7}"
+    )
     print(header)
     print(f"{'─'*72}")
     for bs in sorted(all_results.keys()):

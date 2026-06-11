@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
+import numpy as np
 
 from benchmark.base import Bagel, Model, Orpheus, RequestType, Status
 from benchmark.utils import _write_wav
@@ -733,7 +734,7 @@ class OurSystem(InferenceSystem):
                     content_type="application/octet-stream",
                 )
             # Extra images (e.g. wrist cameras for pi0.5)
-            for path, content in zip(req_input.extra_image_paths, req_input._extra_image_bytes):
+            for path, content in zip(req_input.extra_image_paths, req_input._extra_image_bytes, strict=False):
                 form.add_field(
                     "files",
                     content,
@@ -1338,7 +1339,10 @@ class SGLangOmni(InferenceSystem):
             if sys_msg_obj is not None:
                 sc = sys_msg_obj.get("content")
                 if isinstance(sc, list):
-                    sys_text = next((p.get("text") for p in sc if isinstance(p, dict) and p.get("type") == "text"), None)
+                    sys_text = next(
+                        (p.get("text") for p in sc if isinstance(p, dict) and p.get("type") == "text"),
+                        None,
+                    )
                 elif isinstance(sc, str):
                     sys_text = sc
             user_msg = {"role": "user", "content": req_input.prompt}
@@ -1491,7 +1495,7 @@ class OursOpenAI(VLLMOmni):
             model=model,
             additional_model_kwargs=additional_model_kwargs,
         )
-    
+
     async def _send_request_bagel_images(
         self,
         session: aiohttp.ClientSession,

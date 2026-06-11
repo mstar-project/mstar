@@ -22,7 +22,6 @@ from mstar.communication.tensors import (
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -101,7 +100,7 @@ def _send(
     """
     edge = GraphEdge(
         next_node=dest_node, name=signal,
-        _total_fanin=fanin, 
+        _total_fanin=fanin,
         _shard_dim=shard_dim
     )
     manager.store_and_populate_graph_edges(

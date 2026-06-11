@@ -304,7 +304,7 @@ class BufferedShards:
 
     def is_done(self):
         return len(self.shards) >= self.total_fanin
-    
+
     def consolidate(self) -> list[torch.Tensor]:
         assert self.is_done(), \
             "Can't consolidate shards until all fanin contributions are received"
@@ -520,7 +520,7 @@ class TensorCommunicationManager(ABC):
         syncs to 1 when registering many uuids in a row.
         """
         ...
-    
+
     def _slice_existing_tensor(
         self, request_id: str, name: str, next_node: str,
         graph_walk: str | None, info: TensorPointerInfo
@@ -675,7 +675,7 @@ class TensorCommunicationManager(ABC):
                 else:
                     final_ready.setdefault(req_id, []).append(edge)
         return final_ready
-    
+
     def register_request(
         self, request_id: str, sharding_config: ShardingConfig
     ):

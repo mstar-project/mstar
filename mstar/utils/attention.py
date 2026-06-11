@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_N": 16},  num_warps=4,  num_stages=2),
@@ -421,7 +422,8 @@ def sliding_window_attn(q, k, v, window, scale=None):
         scale = D ** -0.5
 
     out = torch.empty_like(q)
-    grid = lambda meta: (triton.cdiv(S, meta["BLOCK_M"]), B * H_q)
+    def grid(meta):
+        return (triton.cdiv(S, meta["BLOCK_M"]), B * H_q)
     _swa_attn_kernel[grid](
         q, k, v, out,
         scale,

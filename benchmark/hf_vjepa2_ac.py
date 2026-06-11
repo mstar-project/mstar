@@ -181,7 +181,7 @@ def main():
             "  pip install -U transformers torch torchcodec\n"
         )
 
-    print(f"=== HF V-JEPA 2 baseline ===")
+    print("=== HF V-JEPA 2 baseline ===")
     print(f"  model_id    : {args.hf_model}")
     print(f"  device      : {args.device}")
     print(f"  dtype       : {args.dtype}")
@@ -224,7 +224,7 @@ def main():
     # ------------------------------------------------------------------
     if args.num_warmup > 0:
         print(f"\nWarmup ({args.num_warmup} requests)...")
-        for w in range(args.num_warmup):
+        for _ in range(args.num_warmup):
             _run_one(model, processor, requests[0].video_path, args.device, dtype)
         if torch.cuda.is_available():
             torch.cuda.synchronize()

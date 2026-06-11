@@ -19,7 +19,6 @@ that ``Worker._try_speculate_next`` relies on:
 """
 from copy import deepcopy
 
-
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.graph_io import WorkerGraphIO
 

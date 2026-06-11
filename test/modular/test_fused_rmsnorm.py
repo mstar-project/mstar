@@ -3,11 +3,10 @@ Test fused_qk_norm_rope against flashinfer's rmsnorm + rope.
 
 Run: python test_fused_qk_norm_rope.py
 """
-import torch
 import flashinfer
+import torch
 
 from mstar.utils.attention import fused_qk_norm_rope
-
 
 
 def torch_reference(x, w_norm, pos, eps, rope_theta, rope_style="split_half"):

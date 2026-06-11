@@ -270,7 +270,7 @@ class ImageTransform:
         return img
 
 
-def vllm_vit_resize(image: torch.Tensor, size: int) -> torch.Tensor:  
+def vllm_vit_resize(image: torch.Tensor, size: int) -> torch.Tensor:
     """vllm-omni's SigLIP ViT preprocessing: resize to a fixed ``size``x``size``
     square, discarding aspect ratio. Mirrors HF ``SiglipImageProcessor`` with
     ``size={"height": size, "width": size}`` (BICUBIC, antialias), which is what

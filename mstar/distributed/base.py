@@ -1,5 +1,5 @@
-from collections import defaultdict
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk
@@ -28,7 +28,7 @@ class ShardingGroup:
         }
         if my_tp_rank is not None:
             self._tp_rank = my_tp_rank
-    
+
     def clone_empty(self):
         return ShardingGroup(
             nodes=self.nodes,
@@ -50,7 +50,7 @@ class ShardDestination:
     tp_rank: int
     start_idxs: list[int] | None = None
     end_idxs: list[int] | None = None
-    
+
 
 @dataclass
 class ShardingConfig:
@@ -64,18 +64,18 @@ class ShardingConfig:
             tp_enabled_nodes=self.tp_enabled_nodes,
             shard_dim=self.shard_dim
         )
-    
+
     def get_sharding_group(
         self, node: str, graph_walk: str,
     ):
         return self.group_mapping.get(NodeAndGraphWalk(node, graph_walk))
-    
+
     def __post_init__(self):
         self.group_mapping: dict[NodeAndGraphWalk, ShardingGroup] = {}
         self.node_to_worker: dict[NodeAndGraphWalk, list[str]] = {}
         self.tp_enabled_nodes = set(self.tp_enabled_nodes)
         self._setup_done = False
-    
+
     def assert_stream_consumer_compatibility(self, streaming_consumers: set[str]):
         """
         Asserts that stream consumers do not have graph-walk specific worker
@@ -136,12 +136,11 @@ class ShardingConfig:
                 num_walk_combos[node] += 1
                 node_and_workers_to_gws[(node, workers)] = [gw]
 
-        for node, workers in node_and_workers_to_gws:
-            gws = node_and_workers_to_gws[(node, workers)]
+        for (node, workers), gws in node_and_workers_to_gws.items():
             singleton = ShardingGroup(
                 nodes=[node], tp_size=1, graph_walks=gws,
             )
-                
+
             singleton.register_workers(
                 list(workers), my_tp_rank=0
             )
@@ -183,7 +182,7 @@ class ShardingConfig:
             source_worker = source_group._workers[source_tp_rank]
             source_worker_set = source_group._workers_set
             source_tp_size = source_group.tp_size
-        
+
         if dest_group is None:
             dest_worker_set = {""}
             dest_worker_to_tp_rank = {"": 0}
@@ -237,17 +236,17 @@ class ShardingConfig:
                     full_tensor=False,
                     start_idxs=[
                         max(src_s, dest_s)
-                        for (src_s, dest_s) in zip(source_shard_starts, dest_shard_starts)
+                        for (src_s, dest_s) in zip(source_shard_starts, dest_shard_starts, strict=False)
                     ],
                     end_idxs=[
                         min(src_e, dest_e)
-                        for (src_e, dest_e) in zip(source_shard_ends, dest_shard_ends)
+                        for (src_e, dest_e) in zip(source_shard_ends, dest_shard_ends, strict=False)
                     ],
                     tp_rank=dest_worker_to_tp_rank.get(worker, 0)
                 ))
 
         return fanout
-    
+
     def fanout_graph_edges(
         self, graph_edge: GraphEdge,
         source_node: str,
@@ -311,7 +310,7 @@ class ShardingConfig:
                     new_edge.tensor_info.append(new_info)
             result[item.worker] = new_edge
         return result
-    
+
     def compute_fanin(
         self, signal: str, source_tp_size: int,
         dest_node: str, dest_graph_walk: str,

@@ -155,11 +155,11 @@ class ReadySignals:
     def __post_init__(self):
         self._tensor_manager = None
         self._request_id = None
-    
+
     def register_communication_info(self, communication_manager, request_id: str):
         self._tensor_manager = communication_manager
         self._request_id =  request_id
-    
+
     def update(self, edge: GraphEdge):
         assert edge.name in self.input_names, \
             f"Node {self.node_name} does not take input named {edge.name}"
@@ -176,7 +176,7 @@ class ReadySignals:
             self.is_ready_for_streaming or (
             self.input_names.issuperset(self.ready_names.union(self.streaming_inputs))
         )
-    
+
     def clear(self):
         if self._tensor_manager is not None:
             for edge in self.ready_inputs.values():
@@ -253,7 +253,7 @@ class GraphNode(GraphSection):
         )
         self._tensor_manager = None
         self._request_id = None
-    
+
     def register_communication_info(self, communication_manager, request_id: str):
         self.ready_signals.register_communication_info(
             communication_manager, request_id
@@ -277,7 +277,7 @@ class GraphNode(GraphSection):
         """Try to ingest an arriving edge.
 
         Returns True on success, False when the edge is rejected; e.g., this
-        is a streaming edge that we are not redy for and needs to get re-queued 
+        is a streaming edge that we are not redy for and needs to get re-queued
         """
         if edge.next_node != self.name:
             return False
@@ -308,7 +308,7 @@ class GraphNode(GraphSection):
             ext_outputs=[out for out in self.outputs if out.next_node != self.name],
             loop_back=loop_back
         )
-    
+
     def is_ready_for_speculation(
         self, check_next_iter: bool=False,
         allow_streaming: bool=True
@@ -323,20 +323,20 @@ class GraphNode(GraphSection):
         return needed_inputs.issubset(
             self.ready_signals.ready_names | self.speculative_signals.ready_names
         )
-    
+
     def get_nodes(self):
         return {self.name: self}
-    
+
     def get_loops(self):
         return {}
-    
+
     def reset_for_outer_iter(self):
         self.ready_signals.clear()
         # promote next-iter inputs to current; reuse the now-empty object as the new next-iter buffer
         self.ready_signals, self.ready_next_iter = (
             self.ready_next_iter, self.ready_signals
         )
-    
+
     def clear(self):
         self.ready_signals.clear()
         self.ready_next_iter.clear()
@@ -359,7 +359,7 @@ class Sequential(GraphSection):
         for sec in self.sections:
             nodes.update(sec.get_nodes())
         return nodes
-    
+
     def get_loops(self):
         loops = {}
         for sec in self.sections:
@@ -413,7 +413,7 @@ class Parallel(GraphSection):
         for sec in self.sections:
             nodes.update(sec.get_nodes())
         return nodes
-    
+
     def get_loops(self):
         loops = {}
         for sec in self.sections:
@@ -474,25 +474,25 @@ class Loop(GraphSection):
 
     def get_nodes(self):
         return self.section.get_nodes()
-    
+
     def register_finished(self):
         self._finish_signal = True
-    
+
     def get_loops(self):
         loops = self.section.get_loops()
         loops[self.name] = self
         return loops
-    
+
     def get_inputs_outputs(self):
         inp_out = self.section.get_inputs_outputs()
         inp_out.ext_outputs = self.outputs + self.accumulated_outputs
         return inp_out
-    
+
     def _advance_one_iter(self):
         self.curr_iter += 1
         self.inner_registry.reset_for_iter()
         self._uncache_outputs()
-    
+
     def ingest_external_input(self, graph_edge: GraphEdge):
         # track one copy of each external input for re-injection on the next iteration
         if (graph_edge.name, graph_edge.next_node) in self._external_inputs \
@@ -501,7 +501,7 @@ class Loop(GraphSection):
             self._ingested_external_input_names.add(graph_edge.name)
             graph_edge._persist_for_loop = True
         self._managing_registry.register_ingested_input(graph_edge)
-    
+
     def complete_iter(self):
         """Called when every entity in the loop's section has finished for this iteration.
 
@@ -523,7 +523,7 @@ class Loop(GraphSection):
                 edge.tensor_info = self._cached_outputs.get(edge.name, [])
             for edge in self.accumulated_outputs:
                 edge.tensor_info = self._accumulated_cache.get(edge.name, [])
-            
+
             # Don't dereference, becaue the tensors will be used downstream
             self._cached_outputs.clear()
             self._accumulated_cache.clear()
@@ -536,11 +536,11 @@ class Loop(GraphSection):
             return NodeCompletionOutput(
                 output_edges=self._ingested_external_inputs
             )
-    
+
     def register_communication_info(self, communication_manager, request_id: str):
         self._tensor_manager = communication_manager
         self._request_id = request_id
-    
+
     def maybe_cache_output(self, edges: list[GraphEdge]):
         """Snapshot tensor_info for any edge that matches a declared loop output.
 
@@ -568,7 +568,7 @@ class Loop(GraphSection):
                     for info in edge.tensor_info:
                         self._tensor_manager.increment_ref(self._request_id, info.uuid)
 
-    
+
     def __post_init__(self):
         # Will be set later
         self._tensor_manager = None
@@ -595,21 +595,21 @@ class Loop(GraphSection):
                 f"overlap: {sorted(_overlap)}"
             )
         self.inner_registry = LoopStateRegistry(self)
-    
+
     def _reset_metadata(self):
         self._ingested_external_inputs.clear()
         self._ingested_external_input_names.clear()
         self.curr_iter = 0
         self._finish_signal = False
         self.is_done = False
-    
+
     def _uncache_outputs(self):
         if self._tensor_manager is not None and self._request_id is not None:
             for tensor_infos in self._cached_outputs.values():
                 for info in tensor_infos:
                     self._tensor_manager.dereference(self._request_id, info.uuid)
         self._cached_outputs.clear()
-    
+
     def _uncache_accumulated_outputs(self):
         if self._tensor_manager is not None and self._request_id is not None:
             for tensor_infos in self._accumulated_cache.values():
@@ -620,7 +620,7 @@ class Loop(GraphSection):
     def reset_for_outer_iter(self):
         self.inner_registry.reset_for_iter()
         self._reset_metadata()
-    
+
     def clear(self):
         self.inner_registry.clear()
         self._reset_metadata()
@@ -647,7 +647,7 @@ class GraphStateRegistry(ABC):
         self.is_done = False
         self._num_completed_entities = 0
         self._num_managed_entities = len(self.managed_entities)
-    
+
     def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
         """Record that an entity has finished; no-ops if already done (safeguard only)."""
         if not self.is_done and entity_name in self.managed_entities:
@@ -656,11 +656,11 @@ class GraphStateRegistry(ABC):
         return NodeCompletionOutput(
             output_edges=self.managed_entities[entity_name].outputs
         )
-    
+
     @abstractmethod
     def register_ingested_input(self, graph_edge: GraphEdge):
         pass
-    
+
     def reset_for_iter(self):
         self.is_done = False
         self._num_completed_entities = 0
@@ -680,7 +680,7 @@ class LoopStateRegistry(GraphStateRegistry):
     ):
         super().__init__(loop.section)
         self.loop = loop
-    
+
     def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
         output = super().mark_entity_complete(entity_name)
         self.loop.maybe_cache_output(self.managed_entities[entity_name].outputs)
@@ -696,7 +696,7 @@ class LoopStateRegistry(GraphStateRegistry):
             ]
             output.output_edges.extend(loop_out.output_edges)
         return output
-    
+
     def register_ingested_input(self, graph_edge: GraphEdge):
         self.loop.ingest_external_input(graph_edge)
 

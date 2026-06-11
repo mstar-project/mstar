@@ -590,9 +590,8 @@ def _decode_frames_to_png_and_video(
     If ``mp4_path`` is given, saves ALL decoded frames as a new mp4.
     ``frame_indices`` are local positions within the chunk file (0-based).
     """
-    import torch
-    from torchcodec.decoders import VideoDecoder
     from PIL import Image as PILImage
+    from torchcodec.decoders import VideoDecoder
 
     dec = VideoDecoder(video_path)
     batch = dec.get_frames_at(indices=frame_indices)
@@ -646,6 +645,7 @@ class DROIDDataset(BaseDataset):
         assert task in ("pi05", "vjepa2_ac"), \
             f"task must be 'pi05' or 'vjepa2_ac', got {task!r}"
         import json as _json
+
         from datasets import load_dataset
         from huggingface_hub import hf_hub_download
 
@@ -693,7 +693,7 @@ class DROIDDataset(BaseDataset):
             import pandas as _pd
             tasks_df = _pd.read_parquet(_dl("meta/tasks.parquet"))
             tasks = dict(zip(tasks_df["task_index"].astype(int),
-                             tasks_df["task"].astype(str)))
+                             tasks_df["task"].astype(str), strict=False))
             print(f"  tasks loaded: {len(tasks)}")
         except Exception as e:
             print(f"  [warn] could not load tasks.parquet: {e}")
@@ -721,8 +721,8 @@ class DROIDDataset(BaseDataset):
             ep_id = int(row[ep_col]) if ep_col else 0
             episodes.setdefault(ep_id, []).append(row)
         if frame_col:
-            for ep_id in episodes:
-                episodes[ep_id].sort(key=lambda r: int(r[frame_col]))
+            for frames in episodes.values():
+                frames.sort(key=lambda r: int(r[frame_col]))
 
         ep_ids = sorted(episodes.keys())[:num_requests]
         print(f"  using {len(ep_ids)} of {len(episodes)} episodes")

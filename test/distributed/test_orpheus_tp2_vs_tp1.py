@@ -52,7 +52,6 @@ import requests
 sys.path.insert(0, str(Path(__file__).parent.parent / "orpheus"))
 from _env import get_server_url  # noqa: E402
 
-
 # Fix everything so the only source of cross-run variation is FP
 # non-determinism inside the NCCL collectives.
 PROMPT_TEXT = "The capital of France is Paris."

@@ -14,19 +14,22 @@ pytest.skip(
 
 import sys  # noqa: E402
 
+import torch
+
 sys.path.insert(0, ".")
 
-from mstar.engine.kv_cache_engine import KVCacheEngine  # noqa: E402
+from mstar.graph.request_queues import PerRequestNodeQueues
+from mstar.model.dummy_model import DummyModel
+
 from mstar.engine.base import EngineType, NodeBatch, NodeOutput
+from mstar.engine.kv_cache_engine import KVCacheEngine  # noqa: E402
 from mstar.engine.kv_store import PageAllocator
 from mstar.engine.stateless_engine import (
     StatelessEngine,
     make_enc_dec_config,
 )
 from mstar.graph.base import GraphEdge
-from mstar.graph.request_queues import PerRequestNodeQueues
 from mstar.model.base import WorkerGraph
-from mstar.model.dummy_model import DummyModel
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.node_manager_utils import (

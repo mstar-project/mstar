@@ -220,7 +220,7 @@ class SamplingConfig:
 
     def set_seed(self, seed: int):
         self._seed = seed
-    
+
     @property
     def seed(self):
         return self._seed
@@ -275,13 +275,13 @@ class SeenTokenMask:
             _seen_token_mask=torch.zeros(
                 vocab_size, dtype=torch.bool, device=device
             ) if vocab_size is not None else None,
-            
+
         )
 
     def add_tokens(self, tokens: torch.Tensor | int):
         if self._seen_token_mask is None:
             logger.warning(
-                f"Calling add_tokens on an uninitialized SeenTokenMask, i.e., "
+                "Calling add_tokens on an uninitialized SeenTokenMask, i.e., "
                 "one where the vocab_size was provided in the SamplingConfig or "
                 "the SamplingConfig has not yet been registered with the Sampler.s"
             )
@@ -361,7 +361,7 @@ class Sampler(BaseSampler):
             [self._step_offset.get(rid, 0) for rid in request_ids],
             device=logits.device, dtype=torch.long,
         )
-    
+
         any_rep_pen = any(c.repetition_penalty != 1.0 for c in configs)
         any_greedy = any(c.temperature == 0 for c in configs)
         any_top_k_zero = any(c.top_k == 0 for c in configs)
@@ -373,7 +373,7 @@ class Sampler(BaseSampler):
                     rid, vocab_size=logits.shape[1],
                     device=self.device
                 )
-    
+
         seen_mask = None
         if any_rep_pen:
             seen_mask = torch.stack(

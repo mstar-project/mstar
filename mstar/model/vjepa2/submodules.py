@@ -372,7 +372,7 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
         }
         has_context_mask = "context_mask" in inputs[0].tensor_inputs
         has_target_mask = "target_mask" in inputs[0].tensor_inputs
-        
+
         if has_context_mask:
             out["context_mask"] = torch.cat([
                 inp.tensor_inputs["context_mask"] for inp in inputs
@@ -526,7 +526,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         #     "pos_buf_shapes": {"position_mask": (n_seq,)},
         #     "cache_labels": ["main"],
         # }
-        
+
         """Masked predictor rollout does not use piecewise CUDA graphs.
 
         The non-AC predictor attends over n_ctxt + n_pred ≈ 8448 tokens using
@@ -701,7 +701,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
             "encoder_hidden": [next_encoder_hidden],
             "predicted_hidden": [predicted],
         }
-        
+
 
     def forward_batched(
         self,
@@ -746,7 +746,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
             }
             for i, rid in enumerate(request_ids)
         }
-    
+
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
@@ -1065,13 +1065,13 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         **kwargs
     ) -> ARNodeInputs:
         iter_idx = fwd_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
-        
+
         encoder_hidden = _ensure_lead_batch_dim(inputs["encoder_hidden"][0], 3)
 
         tensor_inputs = {}
         tensor_inputs["actions"] = _ensure_lead_batch_dim(inputs["actions"][0], 3)[:, iter_idx:iter_idx+1]
         tensor_inputs["states"] = _ensure_lead_batch_dim(inputs["states"][0], 3)[:, iter_idx:iter_idx+1]
-        
+
         if "extrinsics" in inputs:
             tensor_inputs["extrinsics"] = _ensure_lead_batch_dim(inputs["extrinsics"][0], 3)[:, iter_idx:iter_idx+1]
 
@@ -1104,7 +1104,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 inp.tensor_inputs["extrinsics"] for inp in inputs
             ], dim=0)
             per_req_seq_len += 1
-        
+
         # plan attention
         engine_inputs.cache_manager.plan_attention(
             seq_lens=[per_req_seq_len] * len(inputs),
@@ -1216,7 +1216,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             "predicted_hidden": [new_tg],
         }
         return out
-    
+
 
     def forward_batched(
         self,
@@ -1235,7 +1235,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 f"encoder_hidden batch dim {encoder_hidden.size(0)} does not "
                 f"match request count {len(request_ids)}."
             )
-        
+
         # Now, can_batch ensures that all requests in a batch have the same loop index
         # TODO: this no longer needs to be the case.
         iter_idx = engine_inputs.first_request_info.dynamic_loop_iter_counts.get(
@@ -1260,7 +1260,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 } for i, rid in enumerate(request_ids)
         }
         return per_rid
-    
+
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,

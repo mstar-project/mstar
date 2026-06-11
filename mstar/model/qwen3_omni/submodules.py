@@ -38,7 +38,6 @@ from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.sampling import CudaGraphableSampler, SeenTokenMask
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -1239,7 +1238,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         # the text conditioning for this request. We use this flag to
         # inject tts_eos_embed for ONE step before falling back to pad.
         self._eos_embed_sent: set[str] = set()
-    
+
         # TODO: this is hacky; when we have time, refactor it to make this
         # come from the engine
         self._cp_kv_cache: torch.Tensor | None = None
@@ -1255,7 +1254,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 device=self.get_device(),
             )
         return self._cp_kv_cache
-    
+
     def init_tts_embeds(self, thinker_embed_tokens: nn.Embedding) -> None:
         """Pre-compute TTS pad/bos/eos hidden states using the Thinker's
         embedding table + Talker text_projection
@@ -1347,7 +1346,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             bos_text,     # bos       (1 token)
             self.model.text_projection(thinker_hidden), #  (1 token)
         ], dim=0)  # (9, talker_hidden)
-    
+
     def _get_last_prefill_codec_hidden(
         self, speaker: str
     ):
@@ -1550,7 +1549,7 @@ class TalkerSubmodule(ARNodeSubmodule):
 
             # TODO: allow setting the code predictor temperature
             tokens = injected_sampler.sample_with_config(
-                logits=logits, temperature=1.0, 
+                logits=logits, temperature=1.0,
                 top_k=50, top_p=0.8
             )
             all_codes[:, group_idx] = tokens
@@ -1689,7 +1688,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= max_tokens):
             return {"talker_decode_loop"}
         return set()
-    
+
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
         self._eos_embed_sent.discard(request_id)
@@ -1698,7 +1697,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         return batch.graph_walk in [
             "talker_decode", "talker_last_prefill"
         ] and len(model_inputs) <= self.MAX_BATCH_SIZE
-    
+
     def max_batch_size(self, graph_walk):
         return self.MAX_BATCH_SIZE
 
@@ -1846,7 +1845,7 @@ class Code2WavSubmodule(NodeSubmodule):
     def cleanup_request(self, request_id):
         self._first_chunk_emitted.discard(request_id)
         self._latest_seq_len.pop(request_id, None)
-    
+
     def get_cuda_graph_configs(self, device, tp_world_size: int = 1):
         num_quantizers = self.config.code2wav.num_quantizers
         return [
@@ -1893,7 +1892,7 @@ class Code2WavSubmodule(NodeSubmodule):
         # Select first num_quantizers codebook layers
         if codec_tokens.shape[-1] > num_quantizers:
             codec_tokens = codec_tokens[..., :num_quantizers]
-        
+
         # pad sequence to full_seqlen for batching
         orig_seq_len = codec_tokens.shape[0]
         pad_len = self.full_seqlen - codec_tokens.shape[0]
@@ -2001,13 +2000,13 @@ class Code2WavSubmodule(NodeSubmodule):
             inputs.tensor_inputs["codec_tokens"].numel() \
                 for inputs in model_inputs
         }) == 1
-    
+
     def can_use_cuda_graphs(self, batch, model_inputs: list[NodeInputs]):
         res = super().can_use_cuda_graphs(batch, model_inputs) \
             and self.can_batch(batch, model_inputs) \
                 and model_inputs[0].tensor_inputs["codec_tokens"].shape[1] == self.full_seqlen
-        return res            
-    
+        return res
+
     def postprocess(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
@@ -2016,7 +2015,7 @@ class Code2WavSubmodule(NodeSubmodule):
     ):
         if "audio_chunk" not in outputs:
             return
-        
+
         orig_seq_len = self._latest_seq_len[request_id]
         cfg_ctx = self.config.code2wav.codec_left_context_frames
         left_context_size = 0 if request_id not in self._first_chunk_emitted else cfg_ctx

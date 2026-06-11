@@ -17,8 +17,8 @@ Weight layout per layer (matches HF checkpoint keys):
 from __future__ import annotations
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 from mstar.model.vjepa2.components.rope_utils import rotate_queries_or_keys
 from mstar.model.vjepa2.config import VJepa2Config
@@ -55,7 +55,7 @@ def _sdpa_attention(
     value: torch.Tensor,
 ) -> torch.Tensor:
     # query/key/value: [B, H, N, D]
-    
+
     # # Option 1:
     # attn_output = F.scaled_dot_product_attention(
     #     query.float(), # force all operations to be in float32 precision

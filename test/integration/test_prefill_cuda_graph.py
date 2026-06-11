@@ -38,8 +38,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mstar.engine.kv_cache_engine import KVCacheEngine  # noqa: E402
 from mstar.engine.cuda_graph_runner import CudaGraphKey, CudaGraphRunner  # noqa: E402
+from mstar.engine.kv_cache_engine import KVCacheEngine  # noqa: E402
 from mstar.engine.kv_store import TransferEngineInfo  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
 

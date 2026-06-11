@@ -49,7 +49,7 @@ class TPCommGroup:
             + input_size[dim + 1 :]
         )
         return output_tensor
-    
+
     def barrier(self):
         if self.world_size == 1:
             return
@@ -60,7 +60,7 @@ class TPCommGroup:
             return input_
         dist.all_reduce(input_, group=self.device_group)
         return input_
-    
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
@@ -93,7 +93,7 @@ class TPCommGroup:
 
         # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
-    
+
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast a tensor from source rank to all ranks."""
         if self.world_size == 1:
@@ -126,7 +126,7 @@ class WorkerTPGroups:
             )
         if node not in self.node_to_group:
             self.node_to_group[node] = comm_group
-    
+
     def init_dist(
         self, init_method="tcp://127.0.0.1:29500",
     ):
@@ -170,7 +170,7 @@ class WorkerTPGroups:
                 continue
             comm_group.device_group = rank_tuple_to_pg[tuple(comm_group.group_members)]
             comm_group.initialized = True
-    
+
     def get_tp_config_for_node(self, node: str) -> TPCommGroup:
         if node not in self.node_to_group:
             self.node_to_group[node] = TPCommGroup.trivial()
@@ -231,4 +231,4 @@ class GlobalTPConfig:
                         self.per_worker_config[worker_ids[rank]].add(
                             node,  self.comm_groups[key]
                         )
-        
+

@@ -57,7 +57,7 @@ def iter_safetensors_shards(
     if index_path.exists():
         with open(index_path) as f:
             index = json.load(f)
-        
+
         if prefix is not None or keys is not None:
             relevant_keys = [
                 key for key in index["weight_map"]
@@ -69,7 +69,7 @@ def iter_safetensors_shards(
             ]))
         else:
             shard_files = sorted(set(index["weight_map"].values()))
-        
+
         for shard_file in shard_files:
             yield from iter_safetensors_file(
                 repo_dir / shard_file, device=device,

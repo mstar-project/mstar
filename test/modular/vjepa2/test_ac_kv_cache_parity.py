@@ -15,13 +15,11 @@ or GPU required.
 
 from __future__ import annotations
 
-
 import torch
 import torch.nn.functional as F
 
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.config import VJepa2ACPredictorConfig
-
 
 # ---------------------------------------------------------------------------
 # Fake cache manager
@@ -82,7 +80,7 @@ class FakeCacheManager:
         v_splits = torch.split(v, seq_lens)
 
         outputs: list[torch.Tensor] = []
-        for i, (q_i, k_i, v_i) in enumerate(zip(q_splits, k_splits, v_splits)):
+        for i, (q_i, k_i, v_i) in enumerate(zip(q_splits, k_splits, v_splits, strict=False)):
             req_kvs[i][0].append(k_i)
             req_kvs[i][1].append(v_i)
 

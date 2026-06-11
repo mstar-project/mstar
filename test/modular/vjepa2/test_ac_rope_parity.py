@@ -1,5 +1,6 @@
 import torch
 
+
 def rotate_queries_or_keys(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     """Apply rotary embeddings along the last ``D`` dims of ``x``.
 
@@ -59,7 +60,7 @@ class DummyAttention:
         self.grid_size = 16
 
         self.qkv = torch.nn.Linear(128, 3 * self.num_heads * self.head_dim).to(device)
-        
+
         # random initialization for testing
         torch.nn.init.normal_(self.qkv.weight)
 
@@ -71,7 +72,7 @@ class DummyAttention:
         height_ids = rem // w
         width_ids = rem - w * height_ids
         return 1.0 * frame_ids, 1.0 * height_ids, 1.0 * width_ids
-    
+
     def forward_cached(
         self,
         x: torch.Tensor,          # [B, L, C]
@@ -198,11 +199,12 @@ class DummyAttention:
         b, n, c = x.size()
 
         # Position ids for the spatial part of each frame
-        # We will only do this kv cache fwd function if we are running one block at a time (that's what matches the forward call)
-        # we would need the attention mask if we did more blocks, and that is not supported.
+        # We will only do this kv cache fwd function if we are running one block at a time
+        # (that's what matches the forward call). We would need the attention mask if we did
+        # more blocks, and that is not supported.
         spatial_ids = torch.arange(t_0 * h * w, (t_0 + 1) * h * w, device=x.device)
         d_pos, h_pos, w_pos = self._separate_positions(spatial_ids, h, w)
-        
+
         # Upstream snaps to the RoPE grid in case inference H/W differ
         # from training; these are no-ops when grid_size matches.
         h_pos = h_pos * (self.grid_size / h)
@@ -269,7 +271,7 @@ class DummyAttention:
         # qkv shape should be: B, num_heads, block_size, head_dim
         def _fix_shapes_for_attn(x):
             return x.transpose(1,2).flatten(0,1) # B*block_size, num_heads, head_dim
-        
+
         return _fix_shapes_for_attn(q), \
             _fix_shapes_for_attn(k), \
             _fix_shapes_for_attn(v)

@@ -20,7 +20,6 @@ from mstar.worker.node_manager_utils import (
     WorkerGraphsManager,
 )
 
-
 # --- minimal stubs for tensor manager + fwd info -----------------------------
 
 class StubTensorManager:

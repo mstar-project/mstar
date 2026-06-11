@@ -211,7 +211,7 @@ class Conductor:
         self.worker_graphs = {
             worker_graph.worker_graph_id: worker_graph
             for worker_graph in model.get_worker_graphs(model_config_file)
-        }        
+        }
 
         # (1) Set up worker graph TP ranks
         # (2) Assert that streaming consumers don't have graph-walk-specific sharding config
@@ -360,7 +360,7 @@ class Conductor:
                 if group_key in self.worker_tp_group_to_tp_rank.get(i, {}):
                     group._tp_rank = self.worker_tp_group_to_tp_rank[i][group_key]
             self.per_worker_sharding_config[worker_id] = sharding_cfg
-        
+
         self.tp_config = GlobalTPConfig(
             worker_graphs=self.worker_graphs,
             worker_ids=self.worker_ids,

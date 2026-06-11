@@ -38,7 +38,7 @@ class NestedLoopIndices:
             if our_idx < their_idx:
                 return False
         return False
-    
+
     def max(self, other: "NestedLoopIndices | None") -> "NestedLoopIndices":
         if other is None:
             return self

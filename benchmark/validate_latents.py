@@ -7,8 +7,10 @@ Usage:
 """
 
 from __future__ import annotations
-import sys
+
 import os
+import sys
+
 import numpy as np
 
 
@@ -66,7 +68,7 @@ def report(path: str, r: dict) -> None:
     if issues:
         print(f"  WARNINGS: {'; '.join(issues)}")
     else:
-        print(f"  PASS — latents look plausible")
+        print("  PASS — latents look plausible")
 
 
 def main():
