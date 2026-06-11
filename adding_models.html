@@ -1,0 +1,1263 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Adding a New Model &#8212; M* v0.1.0 Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/sphinx-book-theme.css?v=3c74b3bc" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="_static/documentation_options.js?v=a1637f0b"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=ccdb6887"></script>
+    <script src="_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'adding_models';</script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="prev" title="mstar.worker" href="_autosummary/mstar.worker.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.1.0" />
+    <meta name="docbuild:last-update" content="Jun 11, 2026"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">M* v0.1.0 Documentation</p>
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="serving.html">Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="clients.html">Using a Server</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="architecture.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="models.html">Supported Models</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="_autosummary/mstar.engine.html">mstar.engine</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.base.html">mstar.graph.base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.loop_indices.html">mstar.graph.loop_indices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.special_destinations.html">mstar.graph.special_destinations</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.topology.html">mstar.streaming.topology</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Adding a New Model</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/adding_models.rst?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2Fadding_models.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="_sources/adding_models.rst" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.rst</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Adding a New Model</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mental-model">Mental model</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-you-will-create">What you will create</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-register-the-model">Step 1 — Register the model</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-implement-the-model-class">Step 2 — Implement the <code class="docutils literal notranslate"><span class="pre">Model</span></code> class</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-declare-the-computation-graph">Step 3 — Declare the computation graph</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-4-implement-the-submodules">Step 4 — Implement the submodules</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#loading-weights">Loading weights</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-5-continuous-batching-and-cuda-graphs">Step 5 — Continuous batching and CUDA graphs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-6-choose-engine-types">Step 6 — Choose engine types</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-7-write-a-config-yaml">Step 7 — Write a config YAML</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallelism-sharding">Tensor parallelism (sharding)</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-orpheus">Worked example: Orpheus</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-bagel">Worked example: BAGEL</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-async-partitions-and-streaming">Advanced: async partitions and streaming</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checklist">Checklist</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing">Testing</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="adding-a-new-model">
+<h1>Adding a New Model<a class="headerlink" href="#adding-a-new-model" title="Link to this heading">#</a></h1>
+<p>This page walks through everything you need to implement to add support for a new model
+in <code class="docutils literal notranslate"><span class="pre">mstar</span></code>. By the end you will have a model that the conductor can schedule, that
+workers can execute on GPU, and that you can launch with <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>.</p>
+<section id="mental-model">
+<h2>Mental model<a class="headerlink" href="#mental-model" title="Link to this heading">#</a></h2>
+<p>A model in <code class="docutils literal notranslate"><span class="pre">mstar</span></code> is split into a handful of well-defined responsibilities:</p>
+<ul class="simple">
+<li><p><strong>The</strong> <code class="docutils literal notranslate"><span class="pre">Model</span></code> <strong>class</strong> (<code class="docutils literal notranslate"><span class="pre">mstar/model/base.py</span></code>) is the contract the rest of the
+system talks to. It tokenizes prompts, declares the computation graph, says which
+engine runs each node, builds forward-pass arguments, and post-processes outputs. It
+contains <em>no</em> GPU compute.</p></li>
+<li><p><strong>Submodules</strong> (<code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/model/submodule_base.py</span></code>) are the
+<code class="docutils literal notranslate"><span class="pre">torch.nn.Module</span></code> s that <em>do</em> the compute. Each graph node maps to one submodule.</p></li>
+<li><p><strong>Engines</strong> (<code class="docutils literal notranslate"><span class="pre">mstar/engine/</span></code>) wrap submodules with execution machinery (KV cache,
+FlashInfer, CUDA graphs, batching). You pick an engine <em>type</em> per node; you rarely
+write a new engine.</p></li>
+<li><p><strong>The graph</strong> (<code class="docutils literal notranslate"><span class="pre">mstar/graph/base.py</span></code>) is how a model declares <em>what runs in what
+order</em>: nodes, edges between them, and loops. Conceptually all of a model’s work is
+one large computation graph, and each named “graph walk” (e.g. <code class="docutils literal notranslate"><span class="pre">prefill</span></code>,
+<code class="docutils literal notranslate"><span class="pre">decode</span></code>) is a <em>path</em> through it. For implementation purposes, though, you declare
+each walk as its own standalone graph; nodes that appear in several walks (e.g. the
+<code class="docutils literal notranslate"><span class="pre">LLM</span></code>) are simply referenced by name in each, and the engine/submodule behind that
+name — and its KV cache — is shared across them.</p></li>
+<li><p><strong>The config YAML</strong> (<code class="docutils literal notranslate"><span class="pre">configs/</span></code>) maps graph nodes to physical GPU ranks via
+<code class="docutils literal notranslate"><span class="pre">node_groups</span></code>. This is where disaggregation happens — the same model code runs
+single-GPU or sharded across many depending only on the config.</p></li>
+</ul>
+<p>A note on vocabulary used throughout this page: a <strong>tensor bundle</strong> routed between nodes
+is a <code class="docutils literal notranslate"><span class="pre">NameToTensorList</span></code> — i.e. <code class="docutils literal notranslate"><span class="pre">dict[str,</span> <span class="pre">list[torch.Tensor]]</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar/communication/tensors.py</span></code>), mapping an edge name to a (usually length-1) list
+of tensors.</p>
+<p>The flow at request time. This is the <strong>conductor/model-level</strong> flow, at the granularity
+of a <em>graph walk</em>: the conductor is notified when a walk completes and only then asks the
+model what to do next, so everything happening <em>within</em> a walk (the per-node execution
+described in later steps) is abstracted away here:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>process_prompt()              # text/media -&gt; initial tensors
+     │
+     ▼
+get_initial_forward_pass_args()   # seed the first graph walk (e.g. prefill)
+     │
+     ▼   (conductor walks the graph, running nodes via engines)
+get_partition_forward_pass_args() # asked after each graph walk completes:
+                                  #   what&#39;s next? done?
+     │
+     ▼
+postprocess()                 # model output tensor -&gt; bytes for the client
+</pre></div>
+</div>
+</section>
+<section id="what-you-will-create">
+<h2>What you will create<a class="headerlink" href="#what-you-will-create" title="Link to this heading">#</a></h2>
+<p>A typical model lives in its own package under <code class="docutils literal notranslate"><span class="pre">mstar/model/&lt;your_model&gt;/</span></code>:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>mstar/model/&lt;your_model&gt;/
+├── __init__.py
+├── config.py            # a @dataclass with architecture + generation params
+├── &lt;your_model&gt;_model.py # the Model subclass (the contract)
+├── submodules.py        # NodeSubmodule subclasses (the compute wrappers)
+└── components/          # the actual nn.Modules (attention, decoder, etc.)
+</pre></div>
+</div>
+<p>Plus two things outside that package:</p>
+<ul class="simple">
+<li><p>an entry in <code class="docutils literal notranslate"><span class="pre">mstar/model/registry.py</span></code> so the model is discoverable, and</p></li>
+<li><p>a config YAML in <code class="docutils literal notranslate"><span class="pre">configs/</span></code> mapping nodes to ranks.</p></li>
+</ul>
+</section>
+<section id="step-1-register-the-model">
+<h2>Step 1 — Register the model<a class="headerlink" href="#step-1-register-the-model" title="Link to this heading">#</a></h2>
+<p>Open <code class="docutils literal notranslate"><span class="pre">mstar/model/registry.py</span></code> and add your class to <code class="docutils literal notranslate"><span class="pre">MODEL_REGISTRY</span></code> (and, if it
+loads weights from Hugging Face, to <code class="docutils literal notranslate"><span class="pre">HF_MODELS</span></code>). The dict key is the string you put
+under <code class="docutils literal notranslate"><span class="pre">model:</span></code> in a config YAML.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.your_model.your_model_model</span><span class="w"> </span><span class="kn">import</span> <span class="n">YourModel</span>
+
+<span class="n">MODEL_REGISTRY</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">type</span><span class="p">[</span><span class="n">Model</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="c1"># ...</span>
+    <span class="s2">&quot;your_model&quot;</span><span class="p">:</span> <span class="n">YourModel</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="n">HF_MODELS</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="c1"># ...</span>
+    <span class="s2">&quot;your_model&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;model_path_hf&quot;</span><span class="p">:</span> <span class="s2">&quot;org/your-model-id&quot;</span><span class="p">},</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>That is the only wiring step — there is no plugin scan; the registry import is the
+single source of truth.</p>
+</section>
+<section id="step-2-implement-the-model-class">
+<h2>Step 2 — Implement the <code class="docutils literal notranslate"><span class="pre">Model</span></code> class<a class="headerlink" href="#step-2-implement-the-model-class" title="Link to this heading">#</a></h2>
+<p>Subclass <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.base.Model</span></code> and implement its abstract methods. The
+constructor receives <code class="docutils literal notranslate"><span class="pre">model_path_hf</span></code> (from <code class="docutils literal notranslate"><span class="pre">HF_MODELS</span></code>) plus any <code class="docutils literal notranslate"><span class="pre">**kwargs</span></code>; it
+typically loads the tokenizer and stores a config dataclass. Defer heavy weight loading
+to <code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> so the conductor process never allocates GPU memory.</p>
+<p>The abstract methods you <strong>must</strong> implement:</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">get_kv_cache_config(self)</span> <span class="pre">-&gt;</span> <span class="pre">list[KVCacheConfig]</span></code></dt><dd><p>Per-node KV cache configs for autoregressive nodes (<code class="docutils literal notranslate"><span class="pre">num_layers</span></code>,
+<code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code>, <code class="docutils literal notranslate"><span class="pre">head_dim</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>). Return a single
+config if all AR nodes share one. Models with no AR node may return an empty list.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">get_node_engine_types(self)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">EngineType]</span></code></dt><dd><p>Maps each graph-node name to an <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.engine.base.EngineType</span></code>
+(<code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code> or <code class="docutils literal notranslate"><span class="pre">STATELESS</span></code>). See <a class="reference internal" href="#step-6-choose-engine-types">Step 6 — Choose engine types</a> below.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">get_graph_walk_graphs(self)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">GraphSection]</span></code></dt><dd><p>The heart of the model: returns <code class="docutils literal notranslate"><span class="pre">{walk_name:</span> <span class="pre">graph}</span></code>. See
+<a class="reference internal" href="#step-3-declare-the-computation-graph">Step 3 — Declare the computation graph</a>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">process_prompt(self,</span> <span class="pre">prompt,</span> <span class="pre">input_modalities,</span> <span class="pre">output_modalities,</span> <span class="pre">tensors=None,</span> <span class="pre">**kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">NameToTensorList</span></code></dt><dd><p>Tokenize the prompt and produce the initial request tensors (e.g.
+<code class="docutils literal notranslate"><span class="pre">{&quot;text_inputs&quot;:</span> <span class="pre">[token_ids]}</span></code>). It runs in the API-server data worker <em>after</em>
+raw media tensors have been loaded, so it may read <code class="docutils literal notranslate"><span class="pre">tensors</span></code> (e.g.
+<code class="docutils literal notranslate"><span class="pre">image_inputs</span></code> / <code class="docutils literal notranslate"><span class="pre">audio_inputs</span></code> / <code class="docutils literal notranslate"><span class="pre">video_inputs</span></code>) to compute derived tensors
+such as <code class="docutils literal notranslate"><span class="pre">pixel_values</span></code>. The returned dict is merged into the request’s tensors.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">get_initial_forward_pass_args(self,</span> <span class="pre">partition_name,</span> <span class="pre">input_modalities,</span> <span class="pre">output_modalities,</span> <span class="pre">input_signals,</span> <span class="pre">model_kwargs=None)</span> <span class="pre">-&gt;</span> <span class="pre">ForwardPassArgs</span></code></dt><dd><p>Build the first <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.base.ForwardPassArgs</span></code> for a partition — which
+graph walk to start on and which input edges feed it.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">get_partition_forward_pass_args(self,</span> <span class="pre">partition_name,</span> <span class="pre">partition_metadata,</span> <span class="pre">persist_signals,</span> <span class="pre">incoming_connections=None)</span> <span class="pre">-&gt;</span> <span class="pre">ForwardPassArgs</span></code></dt><dd><p>Called by the conductor after each graph walk completes to decide the <em>next</em> walk, its
+inputs, and whether the request is done (<code class="docutils literal notranslate"><span class="pre">request_done=True</span></code>). For a simple
+prefill→decode model this flips <code class="docutils literal notranslate"><span class="pre">is_prefill</span></code> once and then loops decode until EOS.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">postprocess(self,</span> <span class="pre">output,</span> <span class="pre">modality)</span> <span class="pre">-&gt;</span> <span class="pre">bytes</span></code></dt><dd><p>Encode a finished output tensor to bytes for the client (<code class="docutils literal notranslate"><span class="pre">utf-8</span></code> for text, PNG for
+images, raw PCM for audio, …).</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">get_submodule(self,</span> <span class="pre">node_name,</span> <span class="pre">device=&quot;cpu&quot;,</span> <span class="pre">tp_group=None)</span> <span class="pre">-&gt;</span> <span class="pre">NodeSubmodule</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Lazily build and return the <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> for <code class="docutils literal notranslate"><span class="pre">node_name</span></code> (load weights here,
+on <code class="docutils literal notranslate"><span class="pre">device</span></code>; <code class="docutils literal notranslate"><span class="pre">tp_group</span></code> is the node’s tensor-parallel communicator when sharded —
+forward it to parallel-linear constructors, see <a class="reference internal" href="#tensor-parallelism"><span class="std std-ref">Step 7</span></a>).
+Cache the result. Return <code class="docutils literal notranslate"><span class="pre">None</span></code> for dummy mode. See
+<a class="reference internal" href="#step-4-implement-the-submodules">Step 4 — Implement the submodules</a>.</p>
+</dd>
+</dl>
+<p>Useful overridable defaults (not abstract): <code class="docutils literal notranslate"><span class="pre">get_sampling_config</span></code> (temperature/top-p
+per node), <code class="docutils literal notranslate"><span class="pre">get_max_output_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">get_autocast_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">load_image</span></code> /
+<code class="docutils literal notranslate"><span class="pre">load_audio</span></code> / <code class="docutils literal notranslate"><span class="pre">load_video</span></code>, and the partition API below.</p>
+</section>
+<section id="step-3-declare-the-computation-graph">
+<h2>Step 3 — Declare the computation graph<a class="headerlink" href="#step-3-declare-the-computation-graph" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">get_graph_walk_graphs</span></code> returns one graph per <em>walk</em>. The primitives
+(<code class="docutils literal notranslate"><span class="pre">mstar/graph/base.py</span></code>):</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">GraphNode(name,</span> <span class="pre">input_names,</span> <span class="pre">outputs)</span></code> — one unit of compute. <code class="docutils literal notranslate"><span class="pre">name</span></code> must match a
+key in <code class="docutils literal notranslate"><span class="pre">get_node_engine_types</span></code>. <code class="docutils literal notranslate"><span class="pre">input_names</span></code> are the tensor names that must be
+present before the node can run; <code class="docutils literal notranslate"><span class="pre">outputs</span></code> is a list of <code class="docutils literal notranslate"><span class="pre">GraphEdge</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">GraphEdge(next_node,</span> <span class="pre">name,</span> <span class="pre">...)</span></code> — routes an output tensor named <code class="docutils literal notranslate"><span class="pre">name</span></code> to
+<code class="docutils literal notranslate"><span class="pre">next_node</span></code>. Flags: <code class="docutils literal notranslate"><span class="pre">persist=True</span></code> keeps the tensor available for later steps/walks
+(this is how a generated token is carried from <code class="docutils literal notranslate"><span class="pre">prefill</span></code> into the <code class="docutils literal notranslate"><span class="pre">decode</span></code> loop),
+and <code class="docutils literal notranslate"><span class="pre">output_modality</span></code> — one of <code class="docutils literal notranslate"><span class="pre">&quot;text&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;image&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;audio&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;video&quot;</span></code>,
+<code class="docutils literal notranslate"><span class="pre">&quot;action&quot;</span></code> — with <code class="docutils literal notranslate"><span class="pre">next_node=EMIT_TO_CLIENT</span></code> streams the tensor to the client.
+Special destinations live in <code class="docutils literal notranslate"><span class="pre">mstar/graph/special_destinations.py</span></code>
+(<code class="docutils literal notranslate"><span class="pre">EMIT_TO_CLIENT</span></code>, <code class="docutils literal notranslate"><span class="pre">EMPTY_DESTINATION</span></code>). A <code class="docutils literal notranslate"><span class="pre">decode</span></code> loop stops when a submodule’s
+<code class="docutils literal notranslate"><span class="pre">check_stop</span></code> registers a stop signal against the <code class="docutils literal notranslate"><span class="pre">Loop</span></code> (e.g. on EOS) — see Step 4 —
+not through any edge flag.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Sequential([...])</span></code> / <code class="docutils literal notranslate"><span class="pre">Parallel([...])</span></code> — compose subgraphs in order or
+concurrently.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Loop(name,</span> <span class="pre">section,</span> <span class="pre">max_iters,</span> <span class="pre">outputs)</span></code> — an iterating subgraph whose body feeds
+its own outputs back as the next iteration’s inputs. It runs up to <code class="docutils literal notranslate"><span class="pre">max_iters</span></code> but
+can also stop early: give it a <code class="docutils literal notranslate"><span class="pre">name</span></code> so a submodule’s <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> can register a
+stop signal against that loop (e.g. on EOS). This is the usual <code class="docutils literal notranslate"><span class="pre">decode</span></code> loop.</p></li>
+</ul>
+<p>A minimal text generator has two walks — a one-shot <code class="docutils literal notranslate"><span class="pre">prefill</span></code> node and a <code class="docutils literal notranslate"><span class="pre">decode</span></code>
+<code class="docutils literal notranslate"><span class="pre">Loop</span></code> whose body feeds its own output back as the next input:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_graph_walk_graphs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">]:</span>
+    <span class="n">prefill</span> <span class="o">=</span> <span class="n">GraphNode</span><span class="p">(</span>
+        <span class="n">name</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span>
+        <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text_inputs&quot;</span><span class="p">],</span>
+        <span class="c1"># the generated token persists so the decode loop can pick it up</span>
+        <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMPTY_DESTINATION</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;new_token&quot;</span><span class="p">,</span>
+                           <span class="n">persist</span><span class="o">=</span><span class="kc">True</span><span class="p">)],</span>
+    <span class="p">)</span>
+    <span class="n">decode</span> <span class="o">=</span> <span class="n">Loop</span><span class="p">(</span>
+        <span class="n">name</span><span class="o">=</span><span class="s2">&quot;decode_loop&quot;</span><span class="p">,</span>
+        <span class="n">section</span><span class="o">=</span><span class="n">GraphNode</span><span class="p">(</span>
+            <span class="n">name</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span>
+            <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text_inputs&quot;</span><span class="p">],</span>
+            <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;text_inputs&quot;</span><span class="p">)],</span>  <span class="c1"># loop-back</span>
+        <span class="p">),</span>
+        <span class="n">max_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">get_max_output_tokens</span><span class="p">(),</span>
+        <span class="n">outputs</span><span class="o">=</span><span class="p">[],</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="n">prefill</span><span class="o">=</span><span class="n">prefill</span><span class="p">,</span> <span class="n">decode</span><span class="o">=</span><span class="n">decode</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="step-4-implement-the-submodules">
+<h2>Step 4 — Implement the submodules<a class="headerlink" href="#step-4-implement-the-submodules" title="Link to this heading">#</a></h2>
+<p>Each node name maps to a <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.submodule_base.NodeSubmodule</span></code> (a
+<code class="docutils literal notranslate"><span class="pre">torch.nn.Module</span></code>). Autoregressive nodes use the <code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code> subclass. The
+contract:</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">prepare_inputs(self,</span> <span class="pre">graph_walk,</span> <span class="pre">fwd_info,</span> <span class="pre">inputs,</span> <span class="pre">**kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">NodeInputs</span></code></dt><dd><p>Convert the routed <code class="docutils literal notranslate"><span class="pre">NameToTensorList</span></code> into a typed <code class="docutils literal notranslate"><span class="pre">NodeInputs</span></code> (or
+<code class="docutils literal notranslate"><span class="pre">ARNodeInputs</span></code> with <code class="docutils literal notranslate"><span class="pre">input_ids</span></code> / <code class="docutils literal notranslate"><span class="pre">input_embeds</span></code> / <code class="docutils literal notranslate"><span class="pre">input_seq_len</span></code>). Runs once
+per request and should do only <strong>cheap, host-side (“CPU-ish”) work</strong> — shape/length
+bookkeeping, building position metadata, slicing token id lists. Do not launch the
+heavy GPU compute here (that is <code class="docutils literal notranslate"><span class="pre">forward</span></code>); the engine may call this off the GPU
+thread and well ahead of execution.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">preprocess(self,</span> <span class="pre">graph_walk,</span> <span class="pre">engine_inputs,</span> <span class="pre">inputs)</span> <span class="pre">-&gt;</span> <span class="pre">dict</span></code></dt><dd><p>Collate a list of <code class="docutils literal notranslate"><span class="pre">NodeInputs</span></code> into the kwargs your <code class="docutils literal notranslate"><span class="pre">forward</span></code> expects. The base
+default handles batch size 1 but can be overridden to support batching.
+<code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code> makes this method abstract, as autoregressive submodules typically
+support continuous batching (though you can choose to disable batching for a node or
+for specific graph walk(s) if needed — see <a class="reference internal" href="#step-5"><span class="std std-ref">Step 5</span></a>).</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">forward(self,</span> <span class="pre">graph_walk,</span> <span class="pre">engine_inputs,</span> <span class="pre">**kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">NameToTensorList</span></code></dt><dd><p>The pure tensor → tensor computation. Keys in the returned dict are the edge
+<code class="docutils literal notranslate"><span class="pre">name</span></code> s the graph routes downstream. <code class="docutils literal notranslate"><span class="pre">forward</span></code> <strong>is wrapped with</strong> <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>
+<strong>automatically</strong> (and CUDA-graph captured when you declare configs — see
+<a class="reference internal" href="#step-5"><span class="std std-ref">Step 5</span></a>); for autoregressive (<code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code>) nodes <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> is
+compiled too, while the stateless engine leaves <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> eager. Keep the
+compiled paths compile-friendly; any helper that must <em>not</em> be traced (data-dependent
+Python control flow, host syncs) has to be excluded explicitly, e.g. with
+<code class="docutils literal notranslate"><span class="pre">&#64;torch.compiler.disable</span></code>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">postprocess(...)</span></code> (optional)</dt><dd><p>Metadata-only fixups that run on the GPU thread — must <strong>not</strong> read tensor values (no
+<code class="docutils literal notranslate"><span class="pre">.item()</span></code>/<code class="docutils literal notranslate"><span class="pre">.cpu()</span></code>/<code class="docutils literal notranslate"><span class="pre">.tolist()</span></code>). This is a <strong>performance</strong>, not a correctness,
+constraint: reading a value here forces a host sync that stalls the GPU thread and
+forfeits the worker’s async-scheduling overlap. Use it only to rebind output names for
+routing. Value-dependent decisions belong in <code class="docutils literal notranslate"><span class="pre">check_stop</span></code>.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">check_stop(...)</span> <span class="pre">-&gt;</span> <span class="pre">set[str]</span></code> (optional)</dt><dd><p>Runs off the GPU thread and <em>may</em> read tensor values. Return the names of the
+<code class="docutils literal notranslate"><span class="pre">Loop</span></code> s to stop (e.g. when you see the EOS token). This is how decode terminates.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cleanup_request(self,</span> <span class="pre">request_id)</span></code> (optional)</dt><dd><p>Free any submodule-internal per-request state when a request finishes — buffers,
+per-request caches, counters. See Qwen3-Omni’s <code class="docutils literal notranslate"><span class="pre">Code2WavSubmodule</span></code> for an example.</p>
+</dd>
+</dl>
+<p>The two batching/CUDA-graph knobs — <code class="docutils literal notranslate"><span class="pre">can_batch</span></code> / <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> and
+<code class="docutils literal notranslate"><span class="pre">get_cuda_graph_configs</span></code> — are important enough to get their own step below.</p>
+<section id="loading-weights">
+<h3>Loading weights<a class="headerlink" href="#loading-weights" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> is where a node’s parameters are actually loaded. Weight loading is
+standardized through <code class="docutils literal notranslate"><span class="pre">mstar/model/loader/</span></code> — using it (rather than an ad-hoc
+<code class="docutils literal notranslate"><span class="pre">load_state_dict</span></code>) is what lets the <em>same</em> code load both a single-GPU checkpoint and a
+tensor-parallel shard (see <a class="reference internal" href="#tensor-parallelism"><span class="std std-ref">Step 7</span></a>). There are three layers:</p>
+<ol class="arabic simple">
+<li><p>In <code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> you build the <code class="docutils literal notranslate"><span class="pre">nn.Module</span></code> on the <code class="docutils literal notranslate"><span class="pre">meta</span></code> device, materialize it
+with <code class="docutils literal notranslate"><span class="pre">to_empty(device=...)</span></code>, then call the top-level driver
+<code class="docutils literal notranslate"><span class="pre">load_weights(module,</span> <span class="pre">source,</span> <span class="pre">device=...)</span></code> from <code class="docutils literal notranslate"><span class="pre">mstar.model.loader</span></code>. The driver
+picks the right safetensors iterator (single file <em>or</em> a sharded HF directory) and
+calls <code class="docutils literal notranslate"><span class="pre">module.load_weights(weights)</span></code>.</p></li>
+<li><p>Your module implements <code class="docutils literal notranslate"><span class="pre">load_weights(self,</span> <span class="pre">weights)</span></code> and delegates to
+<code class="docutils literal notranslate"><span class="pre">load_hf_weights(self,</span> <span class="pre">weights,</span> <span class="pre">stacked_params=...,</span> <span class="pre">name_remapper=...)</span></code>, which streams
+the <code class="docutils literal notranslate"><span class="pre">(name,</span> <span class="pre">tensor)</span></code> pairs and dispatches each to the matching parameter’s
+<code class="docutils literal notranslate"><span class="pre">weight_loader</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">stacked_params</span></code> (a list of <code class="docutils literal notranslate"><span class="pre">StackedParamRule</span></code>) route several checkpoint keys into
+one fused parameter — e.g. HF <code class="docutils literal notranslate"><span class="pre">q_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">k_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">v_proj</span></code> into a single
+<code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code> (<code class="docutils literal notranslate"><span class="pre">LLAMA_STACKED_PARAMS</span></code> is the ready-made Llama set). <code class="docutils literal notranslate"><span class="pre">name_remapper</span></code>
+rewrites or drops checkpoint keys that don’t line up with your parameter paths.</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># in the Model: build on meta, materialize, hand off to the driver</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_create_llm_submodule</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.loader</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_weights</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;meta&quot;</span><span class="p">):</span>
+        <span class="n">language_model</span> <span class="o">=</span> <span class="n">OrpheusForCausalLM</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">comm_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">)</span>
+    <span class="n">language_model</span><span class="o">.</span><span class="n">to_empty</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">load_weights</span><span class="p">(</span><span class="n">language_model</span><span class="p">,</span> <span class="n">local_dir</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>  <span class="c1"># → module.load_weights(...)</span>
+    <span class="o">...</span>
+
+<span class="c1"># in the nn.Module: declare the fused-shard routing and delegate</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">load_weights</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">weights</span><span class="p">):</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.loader</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLAMA_STACKED_PARAMS</span><span class="p">,</span> <span class="n">load_hf_weights</span>
+    <span class="k">return</span> <span class="n">load_hf_weights</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">stacked_params</span><span class="o">=</span><span class="n">LLAMA_STACKED_PARAMS</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Each parameter’s <code class="docutils literal notranslate"><span class="pre">weight_loader</span></code> is also where tensor-parallel sharding happens: when the
+module is built with a <code class="docutils literal notranslate"><span class="pre">comm_group</span></code> (<code class="docutils literal notranslate"><span class="pre">tp_world_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>), the loader slices the
+incoming tensor along that parameter’s shard dim before copying it in. That is why one
+<code class="docutils literal notranslate"><span class="pre">load_weights</span></code> path serves both single-GPU and tensor-parallel runs without change.</p>
+</section>
+</section>
+<section id="step-5-continuous-batching-and-cuda-graphs">
+<span id="step-5"></span><h2>Step 5 — Continuous batching and CUDA graphs<a class="headerlink" href="#step-5-continuous-batching-and-cuda-graphs" title="Link to this heading">#</a></h2>
+<p>Continuous batching and CUDA graphs are the two fundamental throughput optimizations a
+submodule opts into. They are optional, but for any autoregressive node you almost
+certainly want both, and getting their contracts right is the subtlest part of writing a
+submodule — hence this dedicated step.</p>
+<p><strong>Continuous batching.</strong> The worker’s micro-scheduler groups compatible in-flight
+requests into one GPU call. A submodule controls this with three methods:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">can_batch(self,</span> <span class="pre">batch,</span> <span class="pre">model_inputs)</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code> — may these requests share a forward
+pass? Returns <code class="docutils literal notranslate"><span class="pre">False</span></code> by default (batching off). Override to admit batches (e.g. same
+graph walk, compatible shapes).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">forward_batched(self,</span> <span class="pre">graph_walk,</span> <span class="pre">engine_inputs,</span> <span class="pre">**kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">NameToTensorList]</span></code>
+— the batched compute, returning per-request (<code class="docutils literal notranslate"><span class="pre">request_id</span></code> → tensors) outputs. You
+implement this <em>instead of</em> relying on the single-request <code class="docutils literal notranslate"><span class="pre">forward</span></code> when batched.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">max_batch_size(self,</span> <span class="pre">graph_walk)</span></code> — optional cap.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code> makes <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> abstract precisely because AR nodes are expected
+to collate a batch; you can still disable batching for a specific node or walk by having
+<code class="docutils literal notranslate"><span class="pre">can_batch</span></code> return <code class="docutils literal notranslate"><span class="pre">False</span></code> there.</p>
+<p><strong>CUDA graphs.</strong> A submodule declares its capturable shapes from
+<code class="docutils literal notranslate"><span class="pre">get_cuda_graph_configs(self,</span> <span class="pre">device,</span> <span class="pre">tp_world_size=1)</span> <span class="pre">-&gt;</span> <span class="pre">list[CudaGraphConfig]</span></code> (empty
+by default → eager). The capture runs <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> first (the per-config <code class="docutils literal notranslate"><span class="pre">compile</span></code>
+flag, default <code class="docutils literal notranslate"><span class="pre">True</span></code>), then records a CUDA graph it can replay. Two config types live
+in <code class="docutils literal notranslate"><span class="pre">mstar/engine/cuda_graph_config.py</span></code>, and they differ in <em>which</em> stage of the
+submodule pipeline they freeze:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 26.0%" />
+<col style="width: 74.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Config type</p></th>
+<th class="head"><p>When to use / what it captures</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">BasicBatchedCudaGraphConfig</span></code></p></td>
+<td><p><strong>Decode-style</strong> forward passes, where every request in the batch has the <em>same</em>
+(typically single-token) length. You pass <code class="docutils literal notranslate"><span class="pre">single_request_inputs</span></code> (a one-request
+<code class="docutils literal notranslate"><span class="pre">ARNodeInputs</span></code>); the runner replicates it to size each captured batch. This config
+fixes the output of <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>, and <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> is invoked on <strong>both</strong>
+capture and replay.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">FlashInferPackedCudaGraphConfig</span></code></p></td>
+<td><p><strong>Prefill-style</strong> AR forward passes that operate on <strong>packed / ragged</strong> sequences.
+You pass <code class="docutils literal notranslate"><span class="pre">packed_seq_len_to_inputs</span></code> (a bucket → preprocess-output mapping), so this
+config fixes the output of <code class="docutils literal notranslate"><span class="pre">preprocess</span></code>. The CUDA-graph runner <em>plans</em> FlashInfer
+attention at <strong>capture</strong> time; on <strong>replay</strong> the submodule’s <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> performs
+the per-step attention planning into the captured buffers.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Both share the base <code class="docutils literal notranslate"><span class="pre">CudaGraphConfig</span></code> fields: <code class="docutils literal notranslate"><span class="pre">capture_graph_walk</span></code> (the walk captured),
+<code class="docutils literal notranslate"><span class="pre">replay_graph_walks</span></code> (walks allowed to replay this capture — lets one capture serve
+aliased walks, e.g. <code class="docutils literal notranslate"><span class="pre">prefill_audio</span></code> reusing <code class="docutils literal notranslate"><span class="pre">prefill_text</span></code>), <code class="docutils literal notranslate"><span class="pre">capture_batch_sizes</span></code>
+(which batch sizes to record), <code class="docutils literal notranslate"><span class="pre">labels</span></code> (which KV-cache labels are live, e.g.
+<code class="docutils literal notranslate"><span class="pre">[&quot;main&quot;]</span></code> or <code class="docutils literal notranslate"><span class="pre">[&quot;main&quot;,</span> <span class="pre">&quot;cfg_img&quot;]</span></code>), and <code class="docutils literal notranslate"><span class="pre">requires_cfg</span></code>.</p>
+<p>A concrete example — Orpheus’s LLM submodule captures a basic-batched <code class="docutils literal notranslate"><span class="pre">decode</span></code> graph and
+a packed <code class="docutils literal notranslate"><span class="pre">prefill</span></code> graph:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_cuda_graph_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+    <span class="n">prefill_packed</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="n">n</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_prefill_packed</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">PREFILL_TOKEN_BUCKETS</span>
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="p">[</span>
+        <span class="n">BasicBatchedCudaGraphConfig</span><span class="p">(</span>
+            <span class="n">capture_graph_walk</span><span class="o">=</span><span class="s2">&quot;decode&quot;</span><span class="p">,</span>
+            <span class="n">single_request_inputs</span><span class="o">=</span><span class="n">ARNodeInputs</span><span class="p">(</span>
+                <span class="n">input_ids</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+                <span class="n">input_seq_len</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+            <span class="p">),</span>
+        <span class="p">),</span>
+        <span class="n">FlashInferPackedCudaGraphConfig</span><span class="p">(</span>
+            <span class="n">capture_graph_walk</span><span class="o">=</span><span class="s2">&quot;prefill&quot;</span><span class="p">,</span>
+            <span class="n">replay_graph_walks</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;prefill&quot;</span><span class="p">],</span>
+            <span class="n">packed_seq_len_to_inputs</span><span class="o">=</span><span class="n">prefill_packed</span><span class="p">,</span>
+            <span class="n">causal_attention</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">capture_batch_sizes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">PREFILL_CAPTURE_BATCH_SIZES</span><span class="p">,</span>
+        <span class="p">),</span>
+    <span class="p">]</span>
+</pre></div>
+</div>
+</section>
+<section id="step-6-choose-engine-types">
+<h2>Step 6 — Choose engine types<a class="headerlink" href="#step-6-choose-engine-types" title="Link to this heading">#</a></h2>
+<p>You almost never write an engine; you assign one of the two
+<code class="xref py py-class docutils literal notranslate"><span class="pre">EngineType</span></code> values per node in <code class="docutils literal notranslate"><span class="pre">get_node_engine_types</span></code>.
+The engine type — not the submodule — decides whether the node gets a managed KV cache:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 27.8%" />
+<col style="width: 72.2%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">EngineType</span></code></p></th>
+<th class="head"><p>Use for</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code></p></td>
+<td><p>Any node that needs a persistent, paged KV cache across forward passes —
+autoregressive LLMs (text decode) and LLM-as-denoiser flow loops alike. Runs on
+<code class="xref py py-class docutils literal notranslate"><span class="pre">KVCacheEngine</span></code>; pairs with an
+<code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code> and an entry in <code class="docutils literal notranslate"><span class="pre">get_kv_cache_config</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">STATELESS</span></code></p></td>
+<td><p>Every node <em>without</em> cross-step KV state — ViT / VAE / audio encoders and
+decoders, embedding and projection stages, flow-matching combine steps, codec
+(waveform) decoders. Runs on
+<code class="xref py py-class docutils literal notranslate"><span class="pre">StatelessEngine</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>A model’s job is just to label each node; the worker instantiates the right engine and
+gives <code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code> nodes their cache from <code class="docutils literal notranslate"><span class="pre">get_kv_cache_config</span></code>.</p>
+</section>
+<section id="step-7-write-a-config-yaml">
+<h2>Step 7 — Write a config YAML<a class="headerlink" href="#step-7-write-a-config-yaml" title="Link to this heading">#</a></h2>
+<p>A config maps nodes to GPU ranks. The key under <code class="docutils literal notranslate"><span class="pre">model:</span></code> is your registry key; each
+<code class="docutils literal notranslate"><span class="pre">node_groups</span></code> entry assigns one or more <code class="docutils literal notranslate"><span class="pre">node_names</span></code> to <code class="docutils literal notranslate"><span class="pre">ranks</span></code>, optionally scoped
+to specific <code class="docutils literal notranslate"><span class="pre">graph_walks</span></code> (this is how prefill/decode disaggregation is expressed).</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;your_model&quot;</span>
+<span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
+<span class="nt">node_groups</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;LLM&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]</span>
+</pre></div>
+</div>
+<p>Run it with:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mstar-serve<span class="w"> </span>--config<span class="w"> </span>configs/your_model.yaml<span class="w"> </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<section id="tensor-parallelism-sharding">
+<span id="tensor-parallelism"></span><h3>Tensor parallelism (sharding)<a class="headerlink" href="#tensor-parallelism-sharding" title="Link to this heading">#</a></h3>
+<p>A node can be sharded across several GPUs by adding <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> to its <code class="docutils literal notranslate"><span class="pre">node_groups</span></code>
+entry and listing <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> ranks. The runtime splits the group’s ranks into
+TP groups of that size and builds one <code class="docutils literal notranslate"><span class="pre">comm_group</span></code> per shard. For a node to actually
+shard (rather than be replicated), its components must be built from the tensor-parallel
+modules in <code class="docutils literal notranslate"><span class="pre">mstar/model/components/distributed</span></code> — <code class="docutils literal notranslate"><span class="pre">ParallelAttention</span></code>,
+<code class="docutils literal notranslate"><span class="pre">ParallelGatedMLP</span></code>, <code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code> / <code class="docutils literal notranslate"><span class="pre">RowParallelLinear</span></code>,
+<code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code>, and friends — whose <code class="docutils literal notranslate"><span class="pre">weight_loader</span></code> s (see <a class="reference internal" href="#loading-weights">Loading
+weights</a>) slice each sharded parameter automatically. A node whose components do <em>not</em>
+use those modules is simply <strong>replicated</strong> on every rank (e.g. a tensor-parallel
+Qwen3-Omni Talker leaves its code predictor replicated). Once a component is built this
+way, going from single-GPU to tensor-parallel needs only the YAML and a small sharding
+declaration — no further model-code changes. For example, running the Orpheus LLM tensor-parallel across two
+GPUs (<code class="docutils literal notranslate"><span class="pre">configs/orpheus_tp2.yaml</span></code>):</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;orpheus&quot;</span>
+<span class="nt">node_groups</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">tp_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="w">    </span><span class="nt">graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">prefill</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">decode</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">snac_decoder</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">snac_chunk</span><span class="p p-Indicator">]</span>
+</pre></div>
+</div>
+<p>For a node to be eligible for <code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> it must be declared TP-enabled by the model.
+Override <code class="docutils literal notranslate"><span class="pre">get_default_sharding_config</span></code> to return a <code class="docutils literal notranslate"><span class="pre">ShardingConfig</span></code> naming the
+shardable nodes (and any non-default shard dimensions):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_default_sharding_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ShardingConfig</span>
+    <span class="k">return</span> <span class="n">ShardingConfig</span><span class="p">(</span><span class="n">groups</span><span class="o">=</span><span class="p">[],</span> <span class="n">tp_enabled_nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;LLM&quot;</span><span class="p">},</span> <span class="n">shard_dim</span><span class="o">=</span><span class="p">{})</span>
+</pre></div>
+</div>
+<p>Two pieces split work across the TP group, and it helps to keep them separate:</p>
+<ul class="simple">
+<li><p><strong>Weights</strong> are sharded inside the components, by each parameter’s <code class="docutils literal notranslate"><span class="pre">weight_loader</span></code>
+(column/row-parallel linear layers built with the <code class="docutils literal notranslate"><span class="pre">comm_group</span></code>). This is automatic
+once the module is constructed tensor-parallel — nothing extra in the config.</p></li>
+<li><p><strong>Activations</strong> crossing a node boundary are handled by <code class="docutils literal notranslate"><span class="pre">shard_dim</span></code> in the
+<code class="docutils literal notranslate"><span class="pre">ShardingConfig</span></code> — a map from an inter-node <em>edge/signal name</em> to the dimension along
+which that tensor is split across the group (absent or <code class="docutils literal notranslate"><span class="pre">None</span></code> ⇒ the tensor is
+replicated to every rank). You only need entries here for edges whose producer and
+consumer keep the data sharded; the common case (replicated activations) needs nothing.
+<code class="docutils literal notranslate"><span class="pre">shard_dim</span></code> can also be supplied per-run under a <code class="docutils literal notranslate"><span class="pre">sharding_config</span></code> block in the YAML.</p></li>
+</ul>
+<p>A node group whose <code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> names a node <em>not</em> in <code class="docutils literal notranslate"><span class="pre">tp_enabled_nodes</span></code> is rejected
+at load time. See <code class="docutils literal notranslate"><span class="pre">configs/qwen3omni_thinker_tp2.yaml</span></code> for a multi-node-type example.</p>
+</section>
+</section>
+<section id="worked-example-orpheus">
+<h2>Worked example: Orpheus<a class="headerlink" href="#worked-example-orpheus" title="Link to this heading">#</a></h2>
+<p>Orpheus (<code class="docutils literal notranslate"><span class="pre">mstar/model/orpheus/</span></code>) is a compact, complete reference. It is a TTS model:
+a Llama 3.2 3B LLM emits audio tokens, and a SNAC decoder turns them into 24 kHz PCM.</p>
+<p>Two nodes, two engines — the LLM needs a KV cache, the SNAC decoder doesn’t:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_node_engine_types</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">EngineType</span><span class="p">]:</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;LLM&quot;</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>
+        <span class="s2">&quot;snac_decoder&quot;</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>
+    <span class="p">}</span>
+</pre></div>
+</div>
+<p>Three graph walks — <code class="docutils literal notranslate"><span class="pre">prefill</span></code> and a <code class="docutils literal notranslate"><span class="pre">decode</span></code> <code class="docutils literal notranslate"><span class="pre">Loop</span></code> on the LLM, plus a
+<code class="docutils literal notranslate"><span class="pre">snac_chunk</span></code> node that emits audio to the client:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">snac_chunk</span> <span class="o">=</span> <span class="n">GraphNode</span><span class="p">(</span>
+    <span class="n">name</span><span class="o">=</span><span class="s2">&quot;snac_decoder&quot;</span><span class="p">,</span>
+    <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;new_token&quot;</span><span class="p">],</span>
+    <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;audio_chunk&quot;</span><span class="p">,</span>
+                       <span class="n">output_modality</span><span class="o">=</span><span class="s2">&quot;audio&quot;</span><span class="p">)],</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> formats <code class="docutils literal notranslate"><span class="pre">&quot;{voice}:</span> <span class="pre">{text}&quot;</span></code>, tokenizes, and wraps the ids in the
+model’s special start/end tokens, returning <code class="docutils literal notranslate"><span class="pre">{&quot;text_inputs&quot;:</span> <span class="pre">[ids]}</span></code>.
+<code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> lazily builds either the Llama LLM submodule (an <code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code>)
+or the SNAC decoder submodule and caches it. <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> returns the audio tensor’s
+raw bytes for the <code class="docutils literal notranslate"><span class="pre">audio</span></code> modality.</p>
+<p>Orpheus also demonstrates the <strong>async partition</strong> API (next section): the LLM and SNAC
+run as two partitions connected by a streaming edge, so audio is decoded in a sliding
+window <em>while</em> the LLM is still generating.</p>
+</section>
+<section id="worked-example-bagel">
+<h2>Worked example: BAGEL<a class="headerlink" href="#worked-example-bagel" title="Link to this heading">#</a></h2>
+<p>Orpheus is a single pipeline. BAGEL (<code class="docutils literal notranslate"><span class="pre">mstar/model/bagel/</span></code>) is the opposite end of the
+spectrum and a better illustration of <em>why</em> the graph abstraction exists: it is a
+<strong>unified</strong> model that does both image <em>understanding</em> (image → text) and image
+<em>generation</em> (text → image) with the <strong>same</strong> Qwen2 LLM, which also serves as the
+denoiser for rectified-flow image generation. Walking through the same steps shows how
+the pieces scale up.</p>
+<p><strong>Step 1 — Register.</strong> Already done in <code class="docutils literal notranslate"><span class="pre">registry.py</span></code>: <code class="docutils literal notranslate"><span class="pre">&quot;bagel&quot;:</span> <span class="pre">BagelModel</span></code> plus an
+<code class="docutils literal notranslate"><span class="pre">HF_MODELS</span></code> entry pointing at <code class="docutils literal notranslate"><span class="pre">ByteDance-Seed/BAGEL-7B-MoT</span></code>.</p>
+<p><strong>Step 2/6 — Nodes and engine types.</strong> Only the LLM nodes carry a KV cache; everything
+else is stateless. The core of the model is four nodes — a ViT encoder, a VAE encoder, the
+LLM, and a VAE decoder — plus a few extra nodes for the CFG-parallel image-generation path
+described below (<code class="docutils literal notranslate"><span class="pre">init_latents</span></code>, the per-branch <code class="docutils literal notranslate"><span class="pre">LLM_cfg_*</span></code> nodes, and <code class="docutils literal notranslate"><span class="pre">combine_cfg</span></code>).
+All are declared up front:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_node_engine_types</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">EngineType</span><span class="p">]:</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;vit_encoder&quot;</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># SigLIP2 ViT (understanding)</span>
+        <span class="s2">&quot;vae_encoder&quot;</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># FLUX VAE encode (editing/gen)</span>
+        <span class="s2">&quot;init_latents&quot;</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># seed the image-gen latents</span>
+        <span class="s2">&quot;LLM&quot;</span><span class="p">:</span>          <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>    <span class="c1"># Qwen2: embed + transformer + lm_head + CFG</span>
+        <span class="s2">&quot;LLM_cfg_text&quot;</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>    <span class="c1"># CFG-parallel branch (text-only cond)</span>
+        <span class="s2">&quot;LLM_cfg_img&quot;</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>    <span class="c1"># CFG-parallel branch (image cond)</span>
+        <span class="s2">&quot;combine_cfg&quot;</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># CFG combine + Euler step</span>
+        <span class="s2">&quot;vae_decoder&quot;</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># FLUX VAE decode → pixels</span>
+    <span class="p">}</span>
+</pre></div>
+</div>
+<p>The CFG nodes are always <em>declared</em> here, but they are only <em>used</em> when the config opts
+into CFG-parallel mode (covered under Step 7); a single-GPU config simply never routes to
+them.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">LLM</span></code> is intentionally a <strong>“fat” node</strong>: it absorbs text embedding, the lm_head,
+and the flow projection, because those always live on the same GPU and splitting them
+into separate graph nodes would only add IPC overhead. This is a recurring modeling
+choice — <em>make a node as coarse as the colocation boundary allows.</em></p>
+<p><strong>Step 3 — Graph walks.</strong> Because understanding and generation are different pipelines,
+BAGEL returns <em>five</em> walks from <code class="docutils literal notranslate"><span class="pre">get_graph_walk_graphs</span></code> instead of two:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 25.0%" />
+<col style="width: 75.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Graph walk</p></th>
+<th class="head"><p>What it does</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prefill_text</span></code></p></td>
+<td><p>Embed text tokens and prefill the LLM (causal).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">prefill_vit</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">vit_encoder</span></code> → LLM: encode an input image for <em>understanding</em> (bidirectional).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">prefill_vae</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">vae_encoder</span></code> → LLM: VAE-encode an image for <em>editing / generation</em>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">decode</span></code></p></td>
+<td><p>Autoregressive text generation (a <code class="docutils literal notranslate"><span class="pre">Loop</span></code>, exactly like Orpheus).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">image_gen</span></code></p></td>
+<td><p>The flow-matching denoising <code class="docutils literal notranslate"><span class="pre">Loop</span></code> (LLM does CFG + one Euler step per iter),
+then <code class="docutils literal notranslate"><span class="pre">vae_decoder</span></code> turns the final latents into pixels.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The encoder walks are two-node <code class="docutils literal notranslate"><span class="pre">Sequential</span></code> chains, and <code class="docutils literal notranslate"><span class="pre">image_gen</span></code> is a <code class="docutils literal notranslate"><span class="pre">Loop</span></code>
+followed by the decoder — note how the loop body loops <code class="docutils literal notranslate"><span class="pre">latents</span></code> and <code class="docutils literal notranslate"><span class="pre">time_index</span></code>
+back to itself, and the loop’s <code class="docutils literal notranslate"><span class="pre">outputs</span></code> hand the final latents to <code class="docutils literal notranslate"><span class="pre">vae_decoder</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">prefill_vit</span> <span class="o">=</span> <span class="n">Sequential</span><span class="p">([</span>
+    <span class="n">GraphNode</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">&quot;vit_encoder&quot;</span><span class="p">,</span> <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image_inputs&quot;</span><span class="p">],</span>
+              <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;img_emb&quot;</span><span class="p">)]),</span>
+    <span class="n">GraphNode</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span> <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;img_emb&quot;</span><span class="p">],</span>
+              <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;new_token&quot;</span><span class="p">,</span>
+                                 <span class="n">output_modality</span><span class="o">=</span><span class="s2">&quot;text&quot;</span><span class="p">,</span> <span class="n">persist</span><span class="o">=</span><span class="kc">True</span><span class="p">)]),</span>
+<span class="p">])</span>
+
+<span class="n">image_gen</span> <span class="o">=</span> <span class="n">Sequential</span><span class="p">([</span>
+    <span class="n">Loop</span><span class="p">(</span>
+        <span class="n">section</span><span class="o">=</span><span class="n">GraphNode</span><span class="p">(</span>
+            <span class="n">name</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span>
+            <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;latents&quot;</span><span class="p">,</span> <span class="s2">&quot;time_index&quot;</span><span class="p">],</span>
+            <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;latents&quot;</span><span class="p">),</span>
+                     <span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;time_index&quot;</span><span class="p">)],</span>
+        <span class="p">),</span>
+        <span class="n">max_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_timesteps</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span>   <span class="c1"># one Euler step per interval</span>
+        <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">&quot;vae_decoder&quot;</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;latents&quot;</span><span class="p">)],</span>
+    <span class="p">),</span>
+    <span class="n">GraphNode</span><span class="p">(</span>
+        <span class="n">name</span><span class="o">=</span><span class="s2">&quot;vae_decoder&quot;</span><span class="p">,</span>
+        <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;latents&quot;</span><span class="p">],</span>
+        <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;image_output&quot;</span><span class="p">,</span>
+                           <span class="n">output_modality</span><span class="o">=</span><span class="s2">&quot;image&quot;</span><span class="p">)],</span>
+    <span class="p">),</span>
+<span class="p">])</span>
+</pre></div>
+</div>
+<p><strong>Declared outputs are conditional.</strong> A node’s <code class="docutils literal notranslate"><span class="pre">outputs</span></code> list is the set of edges it
+<em>can</em> emit; what it actually emits on a given step is limited to whatever its submodule produces.
+<code class="docutils literal notranslate"><span class="pre">new_token</span></code> above is the clearest case — the LLM samples a token only when the request
+needs text out (the understanding path, and every <code class="docutils literal notranslate"><span class="pre">decode</span></code> step). On the
+image-generation / editing path the same node still runs and writes the KV cache but
+samples no token, so <code class="docutils literal notranslate"><span class="pre">new_token</span></code> is not produced. It is in the graph because understanding
+requests use it; treat declared edges as the <em>possible</em> outputs and let the submodule decide
+which actually fire on each step.</p>
+<p><strong>Choosing the walk per request.</strong> Unlike Orpheus, BAGEL’s transitions are
+<em>schedule-driven</em>: the output modality is known up front from the request’s
+<code class="docutils literal notranslate"><span class="pre">output_modalities</span></code>, so <code class="docutils literal notranslate"><span class="pre">get_initial_forward_pass_args</span></code> builds a prefill <em>schedule</em>
+(walking interleaved text/image inputs) and <code class="docutils literal notranslate"><span class="pre">get_partition_forward_pass_args</span></code> steps
+through it, then transitions to <code class="docutils literal notranslate"><span class="pre">decode</span></code> (text out) or <code class="docutils literal notranslate"><span class="pre">image_gen</span></code> (image out). With
+<code class="docutils literal notranslate"><span class="pre">think_mode</span></code> the model decodes a reasoning trace first, <em>then</em> the EOS transitions it
+into <code class="docutils literal notranslate"><span class="pre">image_gen</span></code>. This is the same two methods Orpheus implements — they just encode a
+richer state machine.</p>
+<p><strong>Step 4 — Submodules.</strong> Each node maps to a <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> in <code class="docutils literal notranslate"><span class="pre">bagel/submodules.py</span></code>
+(<code class="docutils literal notranslate"><span class="pre">ViTEncoderSubmodule</span></code>, <code class="docutils literal notranslate"><span class="pre">VAEEncoderSubmodule</span></code>, <code class="docutils literal notranslate"><span class="pre">LLMSubmodule</span></code>,
+<code class="docutils literal notranslate"><span class="pre">VAEDecoderSubmodule</span></code>); <code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> builds them lazily so a worker that only runs
+<code class="docutils literal notranslate"><span class="pre">vit_encoder</span></code> never allocates the 7B LLM. <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> tokenizes the prompt (and
+a system prompt when <code class="docutils literal notranslate"><span class="pre">think_mode</span></code>); <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> branches on modality — <code class="docutils literal notranslate"><span class="pre">decode</span></code> →
+<code class="docutils literal notranslate"><span class="pre">utf-8</span></code> text, <code class="docutils literal notranslate"><span class="pre">image</span></code> → PNG bytes.</p>
+<p><strong>Step 7 — Config and disaggregation.</strong> This is where BAGEL pays off. The <em>same</em> model
+code runs on one GPU:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;bagel&quot;</span>
+<span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32768</span>
+<span class="nt">node_groups</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">vit_encoder</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]}</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">vae_encoder</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">vae_decoder</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]}</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]}</span>
+</pre></div>
+</div>
+<p>…or disaggregated across GPUs by pinning the <strong>same</strong> <code class="docutils literal notranslate"><span class="pre">LLM</span></code> node to different ranks
+<em>per graph walk</em> — prefill on GPU 0, decode on GPU 1, image generation on GPU 2:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">node_groups</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">],</span><span class="nt"> graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">prefill_text</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">prefill_vit</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">prefill_vae</span><span class="p p-Indicator">]}</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">1</span><span class="p p-Indicator">],</span><span class="nt"> graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">decode</span><span class="p p-Indicator">]}</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">2</span><span class="p p-Indicator">],</span><span class="nt"> graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">image_gen</span><span class="p p-Indicator">]}</span>
+</pre></div>
+</div>
+<p>BAGEL also supports a <strong>CFG-parallel</strong> mode: when the config names extra
+<code class="docutils literal notranslate"><span class="pre">LLM_cfg_text</span></code> / <code class="docutils literal notranslate"><span class="pre">LLM_cfg_img</span></code> nodes (see <code class="docutils literal notranslate"><span class="pre">configs/bagel_cfg_parallel.yaml</span></code>), the
+model swaps in an <code class="docutils literal notranslate"><span class="pre">image_gen_cfg</span></code> walk whose loop body is a <code class="docutils literal notranslate"><span class="pre">Parallel</span></code> of the three
+classifier-free-guidance branches — each on its own GPU — feeding a <code class="docutils literal notranslate"><span class="pre">combine_cfg</span></code> node.
+The model code detects this purely from the node names present in the config, so the
+extra parallelism is opt-in via YAML with no code change. This is the disaggregation
+principle taken to its conclusion: <strong>one model, many physical layouts.</strong></p>
+</section>
+<section id="advanced-async-partitions-and-streaming">
+<h2>Advanced: async partitions and streaming<a class="headerlink" href="#advanced-async-partitions-and-streaming" title="Link to this heading">#</a></h2>
+<p>Single-partition models can ignore this — the defaults in <code class="docutils literal notranslate"><span class="pre">Model</span></code> give you one
+<code class="docutils literal notranslate"><span class="pre">&quot;default&quot;</span></code> partition containing all walks. For pipelines where one stage should run
+asynchronously while another keeps producing (LLM → vocoder, thinker → talker),
+override:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">get_partition_topology()</span></code> — declare partitions and the streaming
+<code class="docutils literal notranslate"><span class="pre">Connection</span></code> s between them, including a <code class="docutils literal notranslate"><span class="pre">chunk_policy_factory</span></code> (e.g.
+<code class="docutils literal notranslate"><span class="pre">SlidingWindowChunkPolicy(window=...,</span> <span class="pre">stride=...)</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_partitions()</span></code> — declare each <code class="docutils literal notranslate"><span class="pre">PartitionDefinition</span></code> (its walks, its initial
+walk, and which partitions produce into it).</p></li>
+<li><p>Route cross-partition tensors with <code class="docutils literal notranslate"><span class="pre">StreamingGraphEdge(next_node=...,</span> <span class="pre">name=...,</span>
+<span class="pre">target_partition=...)</span></code> instead of a plain <code class="docutils literal notranslate"><span class="pre">GraphEdge</span></code>.</p></li>
+</ul>
+<p>The consumer partition’s <code class="docutils literal notranslate"><span class="pre">get_partition_forward_pass_args</span></code> reads
+<code class="docutils literal notranslate"><span class="pre">incoming_connections</span></code> (token counts, <code class="docutils literal notranslate"><span class="pre">producer_done</span></code>) to decide when to fire.</p>
+</section>
+<section id="checklist">
+<h2>Checklist<a class="headerlink" href="#checklist" title="Link to this heading">#</a></h2>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>[ ] mstar/model/&lt;your_model&gt;/config.py        — config dataclass
+[ ] mstar/model/&lt;your_model&gt;/components/       — the nn.Modules + weight loading
+[ ] mstar/model/&lt;your_model&gt;/submodules.py     — NodeSubmodule per node
+[ ] mstar/model/&lt;your_model&gt;/&lt;your_model&gt;_model.py — Model subclass:
+      [ ] get_kv_cache_config
+      [ ] get_node_engine_types
+      [ ] get_graph_walk_graphs
+      [ ] process_prompt
+      [ ] get_initial_forward_pass_args
+      [ ] get_partition_forward_pass_args
+      [ ] postprocess
+      [ ] get_submodule
+[ ] mstar/model/registry.py                    — add to MODEL_REGISTRY (+ HF_MODELS)
+[ ] configs/&lt;your_model&gt;.yaml                  — node_groups → ranks
+[ ] (optional) async partitions if pipelined
+</pre></div>
+</div>
+</section>
+<section id="testing">
+<h2>Testing<a class="headerlink" href="#testing" title="Link to this heading">#</a></h2>
+<p>Validate the graph and worker plumbing before touching real weights — the CPU modular
+tests exercise models with submodules in dummy mode (<code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> returning <code class="docutils literal notranslate"><span class="pre">None</span></code>):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>ruff<span class="w"> </span>check<span class="w"> </span>.
+pytest<span class="w"> </span>test/modular/<span class="w">                  </span><span class="c1"># CPU graph/worker tests</span>
+pytest<span class="w"> </span>test/integration/<span class="w">              </span><span class="c1"># requires GPU + weights</span>
+mstar-serve<span class="w"> </span>--config<span class="w"> </span>configs/your_model.yaml<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<p>Then send a <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code> request and confirm the streamed output. Modeling a new
+family on the closest existing one (Orpheus for a streaming LLM + codec, BAGEL for
+multi-engine understanding + generation, Qwen3-Omni for full omni-modal) is by far the
+fastest path.</p>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="_autosummary/mstar.worker.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">mstar.worker</p>
+      </div>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mental-model">Mental model</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-you-will-create">What you will create</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-register-the-model">Step 1 — Register the model</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-implement-the-model-class">Step 2 — Implement the <code class="docutils literal notranslate"><span class="pre">Model</span></code> class</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-declare-the-computation-graph">Step 3 — Declare the computation graph</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-4-implement-the-submodules">Step 4 — Implement the submodules</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#loading-weights">Loading weights</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-5-continuous-batching-and-cuda-graphs">Step 5 — Continuous batching and CUDA graphs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-6-choose-engine-types">Step 6 — Choose engine types</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-7-write-a-config-yaml">Step 7 — Write a config YAML</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallelism-sharding">Tensor parallelism (sharding)</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-orpheus">Worked example: Orpheus</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-bagel">Worked example: BAGEL</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-async-partitions-and-streaming">Advanced: async partitions and streaming</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checklist">Checklist</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing">Testing</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By M* Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, M* Team.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Jun 11, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

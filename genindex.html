@@ -1,0 +1,2607 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Index &#8212; M* v0.1.0 Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/sphinx-book-theme.css?v=3c74b3bc" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="_static/documentation_options.js?v=a1637f0b"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=ccdb6887"></script>
+    <script src="_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
+
+
+
+
+
+const initStyles = () => {
+    const defaultStyle = document.createElement('style');
+    defaultStyle.textContent = `pre.mermaid {
+    /* Same as .mermaid-container > pre */
+    display: block;
+    width: 100%;
+}
+
+pre.mermaid > svg {
+    /* Same as .mermaid-container > pre > svg */
+    height: 500px;
+    width: 100%;
+    max-width: 100% !important;
+}`;
+    document.head.appendChild(defaultStyle);
+
+    const fullscreenStyle = document.createElement('style');
+    fullscreenStyle.textContent = `.mermaid-container {
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+}
+
+.mermaid-container > pre {
+    display: block;
+    width: 100%;
+}
+
+.mermaid-container > pre > svg {
+    height: 500px;
+    width: 100%;
+    max-width: 100% !important;
+}
+
+.mermaid-fullscreen-btn {
+    width: 28px;
+    height: 28px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    font-size: 14px;
+    line-height: 1;
+    padding: 0;
+    color: #333;
+}
+
+.mermaid-fullscreen-btn:hover {
+    opacity: 100% !important;
+    background: rgba(255, 255, 255, 1);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+    transform: scale(1.1);
+}
+
+.mermaid-fullscreen-btn.dark-theme {
+    background: rgba(50, 50, 50, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    color: #e0e0e0;
+}
+
+.mermaid-fullscreen-btn.dark-theme:hover {
+    background: rgba(60, 60, 60, 1);
+    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-fullscreen-modal {
+    display: none;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 95vw;
+    height: 100vh;
+    background: rgba(255, 255, 255, 0.98);
+    z-index: 9999;
+    padding: 20px;
+    overflow: auto;
+}
+
+.mermaid-fullscreen-modal.dark-theme {
+    background: rgba(0, 0, 0, 0.98);
+}
+
+.mermaid-fullscreen-modal.active {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen {
+    position: relative;
+    width: 95vw;
+    height: 90vh;
+    max-width: 95vw;
+    max-height: 90vh;
+    background: white;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+    overflow: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen.dark-theme {
+    background: #1a1a1a;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+}
+
+.mermaid-container-fullscreen pre.mermaid {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen .mermaid svg {
+    height: 100% !important;
+    width: 100% !important;
+    cursor: grab;
+}
+
+.mermaid-fullscreen-close {
+    position: fixed !important;
+    top: 20px !important;
+    right: 20px !important;
+    width: 40px;
+    height: 40px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.2);
+    border-radius: 50%;
+    cursor: pointer;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    transition: all 0.2s;
+    font-size: 24px;
+    line-height: 1;
+    color: #333;
+}
+
+.mermaid-fullscreen-close:hover {
+    background: white;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+    transform: scale(1.1);
+}
+
+.mermaid-fullscreen-close.dark-theme {
+    background: rgba(50, 50, 50, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #e0e0e0;
+}
+
+.mermaid-fullscreen-close.dark-theme:hover {
+    background: rgba(60, 60, 60, 1);
+    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-fullscreen-modal .mermaid-fullscreen-btn {
+    display: none !important;
+}`;
+    document.head.appendChild(fullscreenStyle);
+}
+
+// Detect if page has dark background
+const isDarkTheme = () => {
+    // We use a set of heuristics:
+    // 1. Check for common dark mode classes or attributes
+    // 2. Check computed background color brightness
+    if (document.documentElement.classList.contains('dark') ||
+        document.documentElement.getAttribute('data-theme') === 'dark' ||
+        document.body.classList.contains('dark') ||
+        document.body.getAttribute('data-theme') === 'dark') {
+        // console.log("Dark theme detected via class/attribute");
+        return true;
+    }
+    if (document.documentElement.classList.contains('light') ||
+        document.documentElement.getAttribute('data-theme') === 'light' ||
+        document.body.classList.contains('light') ||
+        document.body.getAttribute('data-theme') === 'light') {
+        // console.log("Light theme detected via class/attribute");
+        return false;
+    }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        // console.log("Dark theme detected via prefers-color-scheme");
+        return true;
+    }
+    const bgColor = window.getComputedStyle(document.body).backgroundColor;
+    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (match) {
+        const r = parseInt(match[1]);
+        const g = parseInt(match[2]);
+        const b = parseInt(match[3]);
+        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+        // console.log("Background color brightness:", brightness);
+        return brightness < 128;
+    }
+    // console.log("No dark or light theme detected, defaulting to light theme");
+    return false;
+};
+
+let darkTheme = isDarkTheme();
+let modal = null;
+let modalContent = null;
+let previousScrollOffset = [window.scrollX, window.scrollY];
+
+const runMermaid = async (rerun) => {
+    console.log("Running mermaid diagrams, rerun =", rerun);
+    // clear all existing mermaid charts
+    let all_mermaids = document.querySelectorAll(".mermaid");
+
+    if (rerun) {
+        all_mermaids.forEach((el) => {
+            if(!el.hasAttribute("data-original-code")) {
+                // store original code
+                // console.log(`Storing original code for first run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+            if(el.getAttribute("data-processed") === "true") {
+                // remove and restore original
+                el.removeAttribute("data-processed");
+                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
+                el.innerHTML = el.getAttribute('data-original-code');
+            } else {
+                // store original code
+                // console.log(`Storing original code for re-run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+        });
+        await mermaid.run();
+    }
+
+    all_mermaids = document.querySelectorAll(".mermaid");
+    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
+
+    if ("False" === "True") {
+        const mermaids_to_add_zoom = -1 === -1 ? all_mermaids.length : -1;
+        if(mermaids_to_add_zoom > 0) {
+            var svgs = d3.selectAll("");
+            if(all_mermaids.length !== mermaids_processed.length) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            } else if(svgs.size() !== mermaids_to_add_zoom) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            } else {
+                svgs.each(function() {
+                    var svg = d3.select(this);
+                    svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+                    var inner = svg.select("g");
+                    var zoom = d3.zoom().on("zoom", function(event) {
+                        inner.attr("transform", event.transform);
+                    });
+                    svg.call(zoom);
+                });
+            }
+        }
+    } else if(all_mermaids.length !== mermaids_processed.length) {
+        // Wait for mermaid to process all diagrams
+        setTimeout(() => runMermaid(false), 200);
+        return;
+    }
+
+    // Stop here if not adding fullscreen capability
+    if ("True" !== "True") return;
+
+    if (modal !== null ) {
+        // Destroy existing modal
+        modal.remove();
+        modal = null;
+        modalContent = null;
+    }
+
+    modal = document.createElement('div');
+    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
+    modal.innerHTML = `
+        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
+        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modalContent = modal.querySelector('.mermaid-container-fullscreen');
+    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
+
+    const closeModal = () => {
+        modal.classList.remove('active');
+        modalContent.innerHTML = '';
+        document.body.style.overflow = ''
+        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
+    };
+
+    closeBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && modal.classList.contains('active')) {
+            closeModal();
+        }
+    });
+
+    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
+        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
+            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
+            // Already processed, adjust button class if needed
+            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
+            if (existingBtn) {
+                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+            }
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'mermaid-container';
+        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
+        container.appendChild(mermaidDiv);
+
+        const fullscreenBtn = document.createElement('button');
+        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
+        fullscreenBtn.textContent = '⛶';
+        fullscreenBtn.style.opacity = '50%';
+
+        // Calculate dynamic position based on diagram's margin and padding
+        const diagramStyle = window.getComputedStyle(mermaidDiv);
+        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
+        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
+        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
+        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
+        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
+        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
+
+        fullscreenBtn.addEventListener('click', () => {
+            previousScrollOffset = [window.scroll, window.scrollY];
+            const clone = mermaidDiv.cloneNode(true);
+            modalContent.innerHTML = '';
+            modalContent.appendChild(clone);
+
+            const svg = clone.querySelector('svg');
+            if (svg) {
+                svg.removeAttribute('width');
+                svg.removeAttribute('height');
+                svg.style.width = '100%';
+                svg.style.height = 'auto';
+                svg.style.maxWidth = '100%';
+                svg.style.sdisplay = 'block';
+
+                if ("False" === "True") {
+                    setTimeout(() => {
+                        const g = svg.querySelector('g');
+                        if (g) {
+                            var svgD3 = d3.select(svg);
+                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
+                            var inner = svgD3.select("g");
+                            var zoom = d3.zoom().on("zoom", function(event) {
+                                inner.attr("transform", event.transform);
+                            });
+                            svgD3.call(zoom);
+                        }
+                    }, 100);
+                }
+            }
+
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        });
+        container.appendChild(fullscreenBtn);
+    });
+};
+
+const load = async () => {
+    initStyles();
+
+    await runMermaid(true);
+
+    const reRunIfThemeChanges = async () => {
+        const newDarkTheme = isDarkTheme();
+        if (newDarkTheme !== darkTheme) {
+            darkTheme = newDarkTheme;
+            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
+            await mermaid.initialize(
+                {...JSON.parse(
+                    `{"startOnLoad": false}`
+                ),
+                ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+                }
+            );
+            await runMermaid(true);
+        }
+    };
+
+    // Update theme classes when theme changes
+    const themeObserver = new MutationObserver(reRunIfThemeChanges);
+    themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+    themeObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+};
+
+
+
+
+
+console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
+mermaid.initialize(
+    {...JSON.parse(
+        `{"startOnLoad": false}`
+    ),
+    ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+    }
+);
+
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'genindex';</script>
+    <link rel="index" title="Index" href="#" />
+    <link rel="search" title="Search" href="search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.1.0" />
+    <meta name="docbuild:last-update" content="Jun 11, 2026"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">M* v0.1.0 Documentation</p>
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="serving.html">Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="clients.html">Using a Server</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="architecture.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="models.html">Supported Models</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="_autosummary/mstar.engine.html">mstar.engine</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.base.html">mstar.graph.base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.loop_indices.html">mstar.graph.loop_indices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.graph.special_destinations.html">mstar.graph.special_destinations</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.streaming.topology.html">mstar.streaming.topology</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="adding_models.html">Adding a New Model</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2Fgenindex.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1></h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+
+<h1 id="index">Index</h1>
+
+<div class="genindex-jumpbox">
+ <a href="#A"><strong>A</strong></a>
+ | <a href="#B"><strong>B</strong></a>
+ | <a href="#C"><strong>C</strong></a>
+ | <a href="#D"><strong>D</strong></a>
+ | <a href="#E"><strong>E</strong></a>
+ | <a href="#F"><strong>F</strong></a>
+ | <a href="#G"><strong>G</strong></a>
+ | <a href="#H"><strong>H</strong></a>
+ | <a href="#I"><strong>I</strong></a>
+ | <a href="#L"><strong>L</strong></a>
+ | <a href="#M"><strong>M</strong></a>
+ | <a href="#N"><strong>N</strong></a>
+ | <a href="#O"><strong>O</strong></a>
+ | <a href="#P"><strong>P</strong></a>
+ | <a href="#Q"><strong>Q</strong></a>
+ | <a href="#R"><strong>R</strong></a>
+ | <a href="#S"><strong>S</strong></a>
+ | <a href="#T"><strong>T</strong></a>
+ | <a href="#U"><strong>U</strong></a>
+ | <a href="#V"><strong>V</strong></a>
+ | <a href="#W"><strong>W</strong></a>
+ | <a href="#Z"><strong>Z</strong></a>
+ 
+</div>
+<h2 id="A">A</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.ac_predictor">ac_predictor (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.accumulated_outputs">accumulated_outputs (mstar.graph.base.Loop attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.action_dim">action_dim (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.action_embed_dim">action_embed_dim (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.action_hidden_size">action_hidden_size (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.action_horizon">action_horizon (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.action_intermediate_size">action_intermediate_size (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.adarms_norm.html#mstar.utils.adarms_norm.adarms_norm_fused">adarms_norm_fused() (in module mstar.utils.adarms_norm)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.address">address (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.APIServerMessage">APIServerMessage (class in mstar.api_server.request_types)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.vit_encoder.html#mstar.model.vjepa2.components.vit_encoder.apply_masks">apply_masks() (in module mstar.model.vjepa2.components.vit_encoder)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2RopeAttention.apply_rotary_embeddings">apply_rotary_embeddings() (mstar.model.vjepa2.components.layers.VJEPA2RopeAttention method)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.attention_probs_dropout_prob">attention_probs_dropout_prob (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.attn_drop_rate">attn_drop_rate (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.audio">audio (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.audio_speech">audio_speech() (in module mstar.api_server.openai.router)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.available_voices">available_voices (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="B">B</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.BagelAdapter">BagelAdapter (class in mstar.api_server.openai.adapters)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator">BaseCommunicator (class in mstar.communication.communicator)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.APIServerMessage.body">body (mstar.api_server.request_types.APIServerMessage attribute)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="C">C</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.chat_completions">chat_completions() (in module mstar.api_server.openai.router)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.BagelAdapter.chat_to_request">chat_to_request() (mstar.api_server.openai.adapters.BagelAdapter method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.chat_to_request">(mstar.api_server.openai.adapters.OpenAIAdapter method)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter.chat_to_request">(mstar.api_server.openai.adapters.Qwen3OmniAdapter method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest">ChatCompletionRequest (class in mstar.api_server.openai.protocol)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatMessage">ChatMessage (class in mstar.api_server.openai.protocol)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunk.chunk_index">chunk_index (mstar.streaming.stream_buffer.StreamChunk attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.Connection.chunk_policy_factory">chunk_policy_factory (mstar.streaming.topology.Connection attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy">ChunkPolicy (class in mstar.streaming.chunk_policy)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.clear">clear() (mstar.graph.base.GraphNode method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphStateRegistry.clear">(mstar.graph.base.GraphStateRegistry method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.clear">(mstar.graph.base.Loop method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.clear">(mstar.graph.base.ReadySignals method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.clear">(mstar.graph.base.WorkerGraphStateRegistry method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.clear">(mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.clear_speculative_inputs">clear_speculative_inputs() (mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphEdge.clone">clone() (mstar.graph.base.GraphEdge method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.clone">(mstar.graph.base.TensorPointerInfo method)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.CommProtocol">CommProtocol (class in mstar.communication.communicator)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.complete">complete() (mstar.graph.base.GraphNode method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.complete_iter">complete_iter() (mstar.graph.base.Loop method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphEdge.conductor_new_token">conductor_new_token (mstar.graph.base.GraphEdge attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.Connection">Connection (class in mstar.streaming.topology)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology.connections">connections (mstar.streaming.topology.PartitionTopology attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.consumes_stream">consumes_stream (mstar.graph.base.GraphNode attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatMessage.content">content (mstar.api_server.openai.protocol.ChatMessage attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.continue_after_producer_done">continue_after_producer_done() (mstar.streaming.chunk_policy.ChunkPolicy method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy.continue_after_producer_done">(mstar.streaming.chunk_policy.FixedChunkPolicy method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.serving_chat.html#mstar.api_server.openai.serving_chat.create_chat_completion">create_chat_completion() (in module mstar.api_server.openai.serving_chat)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.serving_images.html#mstar.api_server.openai.serving_images.create_image_edit">create_image_edit() (in module mstar.api_server.openai.serving_images)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.serving_images.html#mstar.api_server.openai.serving_images.create_images">create_images() (in module mstar.api_server.openai.serving_images)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.serving_speech.html#mstar.api_server.openai.serving_speech.create_speech">create_speech() (in module mstar.api_server.openai.serving_speech)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.created">created (mstar.api_server.openai.protocol.ModelCard attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.crop_size">crop_size (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.curr_iter">curr_iter (mstar.graph.base.Loop attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.custom_token_base_id">custom_token_base_id (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="D">D</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelList.data">data (mstar.api_server.openai.protocol.ModelList attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultChunk.data">(mstar.api_server.request_types.ResultChunk attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunk.data">(mstar.streaming.stream_buffer.StreamChunk attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.default_action_dtype">default_action_dtype (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.depth">depth (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.dims">dims (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.pi05.components.flow_matching.html#mstar.model.pi05.components.flow_matching.discretize_state">discretize_state() (in module mstar.model.pi05.components.flow_matching)</a>
+</li>
+      <li><a href="_autosummary/mstar.communication.event.html#mstar.communication.event.EventWakeup.drain">drain() (mstar.communication.event.EventWakeup method)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.drop_path_rate">drop_path_rate (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.drop_path_rate">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.drop_rate">drop_rate (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.dtype">dtype (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="E">E</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.edge_name">edge_name (mstar.streaming.stream_buffer.StreamBuffer attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.Connection.edge_name">(mstar.streaming.topology.Connection attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.embed_dim">embed_dim (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.enable_async_scheduling">enable_async_scheduling (mstar.graph.base.GraphNode attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.components.tokenization.html#mstar.model.pi05.components.tokenization.Pi05Tokenizer.encode_prompt">encode_prompt() (mstar.model.pi05.components.tokenization.Pi05Tokenizer method)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.end_token_ids">end_token_ids (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.components.flow_matching.html#mstar.model.pi05.components.flow_matching.euler_step">euler_step() (in module mstar.model.pi05.components.flow_matching)</a>
+</li>
+      <li><a href="_autosummary/mstar.communication.event.html#mstar.communication.event.EventWakeup">EventWakeup (class in mstar.communication.event)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeInputsOutputs.ext_inputs">ext_inputs (mstar.graph.base.NodeInputsOutputs attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeInputsOutputs.ext_outputs">ext_outputs (mstar.graph.base.NodeInputsOutputs attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.extra">extra (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="F">F</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.communication.event.html#mstar.communication.event.EventWakeup.fd">fd (mstar.communication.event.EventWakeup property)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.SubmitArgs.file_paths">file_paths (mstar.api_server.openai.adapters.SubmitArgs attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.PreprocessInput.file_paths">(mstar.api_server.request_types.PreprocessInput attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeCompletionOutput.filtered_signals">filtered_signals (mstar.graph.base.NodeCompletionOutput attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestComplete.final_outputs">final_outputs (mstar.api_server.request_types.RequestComplete attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy">FixedChunkPolicy (class in mstar.streaming.chunk_policy)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper">FlashInferDecodeWrapper (class in mstar.utils.flashinfer_utils)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper">FlashInferPrefillWrapper (class in mstar.utils.flashinfer_utils)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.flatten_messages">flatten_messages() (in module mstar.api_server.openai.adapters)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.format_graph_edge_list">format_graph_edge_list() (in module mstar.graph.graph_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2Layer.forward">forward() (mstar.model.vjepa2.components.layers.VJEPA2Layer method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2MLP.forward">(mstar.model.vjepa2.components.layers.VJEPA2MLP method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2RopeAttention.forward">(mstar.model.vjepa2.components.layers.VJEPA2RopeAttention method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.predictor.html#mstar.model.vjepa2.components.predictor.VJEPA2Predictor.forward">(mstar.model.vjepa2.components.predictor.VJEPA2Predictor method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.predictor.html#mstar.model.vjepa2.components.predictor.VJEPA2PredictorEmbeddings.forward">(mstar.model.vjepa2.components.predictor.VJEPA2PredictorEmbeddings method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.vit_encoder.html#mstar.model.vjepa2.components.vit_encoder.VJEPA2Embeddings.forward">(mstar.model.vjepa2.components.vit_encoder.VJEPA2Embeddings method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.vit_encoder.html#mstar.model.vjepa2.components.vit_encoder.VJEPA2Encoder.forward">(mstar.model.vjepa2.components.vit_encoder.VJEPA2Encoder method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.vit_encoder.html#mstar.model.vjepa2.components.vit_encoder.VJEPA2PatchEmbeddings3D.forward">(mstar.model.vjepa2.components.vit_encoder.VJEPA2PatchEmbeddings3D method)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.frames_per_clip">frames_per_clip (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.from_hf_config">from_hf_config() (mstar.model.vjepa2.config.VJepa2Config class method)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.from_partition">from_partition (mstar.streaming.stream_buffer.StreamBuffer attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.Connection.from_partition">(mstar.streaming.topology.Connection attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+</tr></table>
+
+<h2 id="G">G</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.get_adapter">get_adapter() (in module mstar.api_server.openai.adapters)</a>
+</li>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator.get_all_new_messages">get_all_new_messages() (mstar.communication.communicator.BaseCommunicator method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.get_all_new_messages">(mstar.communication.communicator.ZMQCommunicator method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.get_inputs_outputs">get_inputs_outputs() (mstar.graph.base.GraphNode method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphSection.get_inputs_outputs">(mstar.graph.base.GraphSection method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.get_inputs_outputs">(mstar.graph.base.Loop method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Parallel.get_inputs_outputs">(mstar.graph.base.Parallel method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Sequential.get_inputs_outputs">(mstar.graph.base.Sequential method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.get_loop_indices">get_loop_indices() (mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.get_loops">get_loops() (mstar.graph.base.GraphNode method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphSection.get_loops">(mstar.graph.base.GraphSection method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.get_loops">(mstar.graph.base.Loop method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Parallel.get_loops">(mstar.graph.base.Parallel method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Sequential.get_loops">(mstar.graph.base.Sequential method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.get_nested_loop_idxs">get_nested_loop_idxs() (mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.get_nested_loop_idxs_for_node">get_nested_loop_idxs_for_node() (mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.get_node">get_node() (mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.get_nodes">get_nodes() (mstar.graph.base.GraphNode method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphSection.get_nodes">(mstar.graph.base.GraphSection method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.get_nodes">(mstar.graph.base.Loop method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Parallel.get_nodes">(mstar.graph.base.Parallel method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Sequential.get_nodes">(mstar.graph.base.Sequential method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2RopeAttention.get_position_ids">get_position_ids() (mstar.model.vjepa2.components.layers.VJEPA2RopeAttention method)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultTensors.graph_edge">graph_edge (mstar.api_server.request_types.ResultTensors attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeAndGraphWalk.graph_walk">graph_walk (mstar.graph.base.NodeAndGraphWalk attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphEdge">GraphEdge (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode">GraphNode (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphSection">GraphSection (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphStateRegistry">GraphStateRegistry (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.grid_depth">grid_depth (mstar.model.vjepa2.config.VJepa2Config property)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.grid_size">grid_size (mstar.model.vjepa2.config.VJepa2Config property)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="H">H</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.has_chunk_ready">has_chunk_ready() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.head_dim">head_dim (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.head_dim">(mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.hidden_act">hidden_act (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.hidden_size">hidden_size (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.hidden_size">(mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.hidden_size">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+</tr></table>
+
+<h2 id="I">I</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.id">id (mstar.api_server.openai.protocol.ModelCard attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.ignore_eos">ignore_eos (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.BagelAdapter.image_edit_to_request">image_edit_to_request() (mstar.api_server.openai.adapters.BagelAdapter method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.image_edit_to_request">(mstar.api_server.openai.adapters.OpenAIAdapter method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.BagelAdapter.image_to_request">image_to_request() (mstar.api_server.openai.adapters.BagelAdapter method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.image_to_request">(mstar.api_server.openai.adapters.OpenAIAdapter method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest">ImageGenerationRequest (class in mstar.api_server.openai.protocol)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.images_edits">images_edits() (in module mstar.api_server.openai.router)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.images_generations">images_generations() (in module mstar.api_server.openai.router)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.img_size">img_size (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.in_chans">in_chans (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.ingest_external_input">ingest_external_input() (mstar.graph.base.Loop method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.ingest_for_speculation">ingest_for_speculation() (mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.ingest_input">ingest_input() (mstar.graph.base.GraphNode method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.ingest_input">(mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.input">input (mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.SubmitArgs.input_modalities">input_modalities (mstar.api_server.openai.adapters.SubmitArgs attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.PreprocessInput.input_modalities">(mstar.api_server.request_types.PreprocessInput attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.input_names">input_names (mstar.graph.base.GraphNode attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.input_names">(mstar.graph.base.ReadySignals attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.intermediate_size">intermediate_size (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.CommProtocol.IPC">IPC (mstar.communication.communicator.CommProtocol attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.is_done">is_done (mstar.graph.base.Loop attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunk.is_final">is_final (mstar.streaming.stream_buffer.StreamChunk attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.is_frame_causal">is_frame_causal (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.SpeculativeNodeInfo.is_new_loop_iter">is_new_loop_iter (mstar.graph.base.SpeculativeNodeInfo attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.is_ready">is_ready (mstar.graph.base.ReadySignals attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.is_ready">is_ready() (mstar.streaming.chunk_policy.ChunkPolicy method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy.is_ready">(mstar.streaming.chunk_policy.FixedChunkPolicy method)</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.LeftContextChunkPolicy.is_ready">(mstar.streaming.chunk_policy.LeftContextChunkPolicy method)</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy.is_ready">(mstar.streaming.chunk_policy.SlidingWindowChunkPolicy method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.is_ready_for_speculation">is_ready_for_speculation() (mstar.graph.base.GraphNode method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.is_ready_for_streaming">is_ready_for_streaming (mstar.graph.base.ReadySignals attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphEdge.is_streaming">is_streaming (mstar.graph.base.GraphEdge attribute)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="L">L</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices.label_context_gt">label_context_gt() (mstar.graph.loop_indices.NestedLoopIndices method)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.layer_norm_eps">layer_norm_eps (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.layer_norm_eps">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.LeftContextChunkPolicy">LeftContextChunkPolicy (class in mstar.streaming.chunk_policy)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.list_models">list_models() (in module mstar.api_server.openai.router)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.load_pi05_config">load_pi05_config() (in module mstar.model.pi05.config)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop">Loop (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeInputsOutputs.loop_back">loop_back (mstar.graph.base.NodeInputsOutputs attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultTensors.loop_indices">loop_indices (mstar.api_server.request_types.ResultTensors attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices.loop_indices">(mstar.graph.loop_indices.NestedLoopIndices attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.SpeculativeNodeInfo.loop_name">loop_name (mstar.graph.base.SpeculativeNodeInfo attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices.loop_name_order">loop_name_order (mstar.graph.loop_indices.NestedLoopIndices attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.LoopStateRegistry">LoopStateRegistry (class in mstar.graph.base)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="M">M</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.predictor.html#mstar.model.vjepa2.components.predictor.VJEPA2Predictor.make_layer_loop_fn">make_layer_loop_fn() (mstar.model.vjepa2.components.predictor.VJEPA2Predictor method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphStateRegistry.managed_entities">managed_entities (mstar.graph.base.GraphStateRegistry attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.mark">mark() (in module mstar.utils.profiler)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphStateRegistry.mark_entity_complete">mark_entity_complete() (mstar.graph.base.GraphStateRegistry method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.LoopStateRegistry.mark_entity_complete">(mstar.graph.base.LoopStateRegistry method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.mark_entity_complete">(mstar.graph.base.WorkerGraphStateRegistry method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.mark_node_complete">mark_node_complete() (mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices.max">max() (mstar.graph.loop_indices.NestedLoopIndices method)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.max_completion_tokens">max_completion_tokens (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.max_iters">max_iters (mstar.graph.base.Loop attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.max_lang_tokens">max_lang_tokens (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.max_new_tokens">max_new_tokens (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.max_position_embeddings">max_position_embeddings (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.max_position_embeddings">(mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.max_rollout_horizon">max_rollout_horizon (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.max_tokens">max_tokens (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.maybe_cache_output">maybe_cache_output() (mstar.graph.base.Loop method)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.APIServerMessage.message_type">message_type (mstar.api_server.request_types.APIServerMessage attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.messages">messages (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultChunk.metadata">metadata (mstar.api_server.request_types.ResultChunk attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultTensors.metadata">(mstar.api_server.request_types.ResultTensors attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.mlp_ratio">mlp_ratio (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.mlp_ratio">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.modalities">modalities (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultChunk.modality">modality (mstar.api_server.request_types.ResultChunk attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultTensors.modality">(mstar.api_server.request_types.ResultTensors attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.modality_from_mime">modality_from_mime() (in module mstar.api_server.media_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.model">model (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest.model">(mstar.api_server.openai.protocol.ImageGenerationRequest attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.model">(mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.model_config">model_config (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatMessage.model_config">(mstar.api_server.openai.protocol.ChatMessage attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest.model_config">(mstar.api_server.openai.protocol.ImageGenerationRequest attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.model_config">(mstar.api_server.openai.protocol.ModelCard attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelList.model_config">(mstar.api_server.openai.protocol.ModelList attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.model_config">(mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.SubmitArgs.model_kwargs">model_kwargs (mstar.api_server.openai.adapters.SubmitArgs attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.PreprocessInput.model_kwargs">(mstar.api_server.request_types.PreprocessInput attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard">ModelCard (class in mstar.api_server.openai.protocol)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelList">ModelList (class in mstar.api_server.openai.protocol)</a>
+</li>
+      <li>
+    module
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.html#module-mstar.api_server">mstar.api_server</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.media_io.html#module-mstar.api_server.media_io">mstar.api_server.media_io</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.html#module-mstar.api_server.openai">mstar.api_server.openai</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#module-mstar.api_server.openai.adapters">mstar.api_server.openai.adapters</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#module-mstar.api_server.openai.protocol">mstar.api_server.openai.protocol</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.router.html#module-mstar.api_server.openai.router">mstar.api_server.openai.router</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.serving_chat.html#module-mstar.api_server.openai.serving_chat">mstar.api_server.openai.serving_chat</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.serving_images.html#module-mstar.api_server.openai.serving_images">mstar.api_server.openai.serving_images</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.serving_speech.html#module-mstar.api_server.openai.serving_speech">mstar.api_server.openai.serving_speech</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#module-mstar.api_server.request_types">mstar.api_server.request_types</a>
+</li>
+        <li><a href="_autosummary/mstar.communication.html#module-mstar.communication">mstar.communication</a>
+</li>
+        <li><a href="_autosummary/mstar.communication.communicator.html#module-mstar.communication.communicator">mstar.communication.communicator</a>
+</li>
+        <li><a href="_autosummary/mstar.communication.event.html#module-mstar.communication.event">mstar.communication.event</a>
+</li>
+        <li><a href="_autosummary/mstar.conductor.html#module-mstar.conductor">mstar.conductor</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.html#module-mstar.engine">mstar.engine</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.html#module-mstar.graph">mstar.graph</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#module-mstar.graph.base">mstar.graph.base</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.graph_io.html#module-mstar.graph.graph_io">mstar.graph.graph_io</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.loop_indices.html#module-mstar.graph.loop_indices">mstar.graph.loop_indices</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.special_destinations.html#module-mstar.graph.special_destinations">mstar.graph.special_destinations</a>
+</li>
+        <li><a href="_autosummary/mstar.model.html#module-mstar.model">mstar.model</a>
+</li>
+        <li><a href="_autosummary/mstar.model.orpheus.html#module-mstar.model.orpheus">mstar.model.orpheus</a>
+</li>
+        <li><a href="_autosummary/mstar.model.orpheus.components.html#module-mstar.model.orpheus.components">mstar.model.orpheus.components</a>
+</li>
+        <li><a href="_autosummary/mstar.model.orpheus.config.html#module-mstar.model.orpheus.config">mstar.model.orpheus.config</a>
+</li>
+        <li><a href="_autosummary/mstar.model.pi05.html#module-mstar.model.pi05">mstar.model.pi05</a>
+</li>
+        <li><a href="_autosummary/mstar.model.pi05.components.html#module-mstar.model.pi05.components">mstar.model.pi05.components</a>
+</li>
+        <li><a href="_autosummary/mstar.model.pi05.components.flow_matching.html#module-mstar.model.pi05.components.flow_matching">mstar.model.pi05.components.flow_matching</a>
+</li>
+        <li><a href="_autosummary/mstar.model.pi05.components.tokenization.html#module-mstar.model.pi05.components.tokenization">mstar.model.pi05.components.tokenization</a>
+</li>
+        <li><a href="_autosummary/mstar.model.pi05.config.html#module-mstar.model.pi05.config">mstar.model.pi05.config</a>
+</li>
+        <li><a href="_autosummary/mstar.model.pi05.kernels.html#module-mstar.model.pi05.kernels">mstar.model.pi05.kernels</a>
+</li>
+        <li><a href="_autosummary/mstar.model.pi05.kernels.image_normalize.html#module-mstar.model.pi05.kernels.image_normalize">mstar.model.pi05.kernels.image_normalize</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.html#module-mstar.model.vjepa2">mstar.model.vjepa2</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.html#module-mstar.model.vjepa2.components">mstar.model.vjepa2.components</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#module-mstar.model.vjepa2.components.layers">mstar.model.vjepa2.components.layers</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.predictor.html#module-mstar.model.vjepa2.components.predictor">mstar.model.vjepa2.components.predictor</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.rope_utils.html#module-mstar.model.vjepa2.components.rope_utils">mstar.model.vjepa2.components.rope_utils</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.vit_encoder.html#module-mstar.model.vjepa2.components.vit_encoder">mstar.model.vjepa2.components.vit_encoder</a>
+</li>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#module-mstar.model.vjepa2.config">mstar.model.vjepa2.config</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.html#module-mstar.streaming">mstar.streaming</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#module-mstar.streaming.chunk_policy">mstar.streaming.chunk_policy</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.stream_buffer.html#module-mstar.streaming.stream_buffer">mstar.streaming.stream_buffer</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.topology.html#module-mstar.streaming.topology">mstar.streaming.topology</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.html#module-mstar.utils">mstar.utils</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.adarms_norm.html#module-mstar.utils.adarms_norm">mstar.utils.adarms_norm</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#module-mstar.utils.flashinfer_utils">mstar.utils.flashinfer_utils</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.logging_config.html#module-mstar.utils.logging_config">mstar.utils.logging_config</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.profiler.html#module-mstar.utils.profiler">mstar.utils.profiler</a>
+</li>
+        <li><a href="_autosummary/mstar.worker.html#module-mstar.worker">mstar.worker</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.mpc_cost_fn">mpc_cost_fn (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li>
+    mstar.api_server
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.html#module-mstar.api_server">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.api_server.media_io
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.media_io.html#module-mstar.api_server.media_io">module</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li>
+    mstar.api_server.openai
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.html#module-mstar.api_server.openai">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.api_server.openai.adapters
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#module-mstar.api_server.openai.adapters">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.api_server.openai.protocol
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#module-mstar.api_server.openai.protocol">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.api_server.openai.router
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.router.html#module-mstar.api_server.openai.router">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.api_server.openai.serving_chat
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.serving_chat.html#module-mstar.api_server.openai.serving_chat">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.api_server.openai.serving_images
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.serving_images.html#module-mstar.api_server.openai.serving_images">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.api_server.openai.serving_speech
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.serving_speech.html#module-mstar.api_server.openai.serving_speech">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.api_server.request_types
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#module-mstar.api_server.request_types">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.communication
+
+      <ul>
+        <li><a href="_autosummary/mstar.communication.html#module-mstar.communication">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.communication.communicator
+
+      <ul>
+        <li><a href="_autosummary/mstar.communication.communicator.html#module-mstar.communication.communicator">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.communication.event
+
+      <ul>
+        <li><a href="_autosummary/mstar.communication.event.html#module-mstar.communication.event">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.conductor
+
+      <ul>
+        <li><a href="_autosummary/mstar.conductor.html#module-mstar.conductor">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.engine
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.html#module-mstar.engine">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.graph
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.html#module-mstar.graph">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.graph.base
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#module-mstar.graph.base">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.graph.graph_io
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.graph_io.html#module-mstar.graph.graph_io">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.graph.loop_indices
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.loop_indices.html#module-mstar.graph.loop_indices">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.graph.special_destinations
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.special_destinations.html#module-mstar.graph.special_destinations">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.html#module-mstar.model">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.orpheus
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.orpheus.html#module-mstar.model.orpheus">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.orpheus.components
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.orpheus.components.html#module-mstar.model.orpheus.components">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.orpheus.config
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.orpheus.config.html#module-mstar.model.orpheus.config">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.pi05
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.html#module-mstar.model.pi05">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.pi05.components
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.components.html#module-mstar.model.pi05.components">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.pi05.components.flow_matching
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.components.flow_matching.html#module-mstar.model.pi05.components.flow_matching">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.pi05.components.tokenization
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.components.tokenization.html#module-mstar.model.pi05.components.tokenization">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.pi05.config
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.config.html#module-mstar.model.pi05.config">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.pi05.kernels
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.kernels.html#module-mstar.model.pi05.kernels">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.pi05.kernels.image_normalize
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.kernels.image_normalize.html#module-mstar.model.pi05.kernels.image_normalize">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.vjepa2
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.html#module-mstar.model.vjepa2">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.vjepa2.components
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.html#module-mstar.model.vjepa2.components">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.vjepa2.components.layers
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#module-mstar.model.vjepa2.components.layers">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.vjepa2.components.predictor
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.predictor.html#module-mstar.model.vjepa2.components.predictor">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.vjepa2.components.rope_utils
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.rope_utils.html#module-mstar.model.vjepa2.components.rope_utils">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.vjepa2.components.vit_encoder
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.components.vit_encoder.html#module-mstar.model.vjepa2.components.vit_encoder">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.model.vjepa2.config
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#module-mstar.model.vjepa2.config">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.streaming
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.html#module-mstar.streaming">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.streaming.chunk_policy
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#module-mstar.streaming.chunk_policy">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.streaming.stream_buffer
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.stream_buffer.html#module-mstar.streaming.stream_buffer">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.streaming.topology
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.topology.html#module-mstar.streaming.topology">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.utils
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.html#module-mstar.utils">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.utils.adarms_norm
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.adarms_norm.html#module-mstar.utils.adarms_norm">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.utils.flashinfer_utils
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#module-mstar.utils.flashinfer_utils">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.utils.logging_config
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.logging_config.html#module-mstar.utils.logging_config">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.utils.profiler
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.profiler.html#module-mstar.utils.profiler">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.worker
+
+      <ul>
+        <li><a href="_autosummary/mstar.worker.html#module-mstar.worker">module</a>
+</li>
+      </ul></li>
+  </ul></td>
+</tr></table>
+
+<h2 id="N">N</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.n">n (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest.n">(mstar.api_server.openai.protocol.ImageGenerationRequest attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphEdge.name">name (mstar.graph.base.GraphEdge attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.name">(mstar.graph.base.GraphNode attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.name">(mstar.graph.base.Loop attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.nbytes">nbytes (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices">NestedLoopIndices (class in mstar.graph.loop_indices)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.next_chunk_size">next_chunk_size() (mstar.streaming.chunk_policy.ChunkPolicy method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy.next_chunk_size">(mstar.streaming.chunk_policy.FixedChunkPolicy method)</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.LeftContextChunkPolicy.next_chunk_size">(mstar.streaming.chunk_policy.LeftContextChunkPolicy method)</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy.next_chunk_size">(mstar.streaming.chunk_policy.SlidingWindowChunkPolicy method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphEdge.next_node">next_node (mstar.graph.base.GraphEdge attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeAndGraphWalk.node">node (mstar.graph.base.NodeAndGraphWalk attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.node_name">node_name (mstar.graph.base.ReadySignals attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.SpeculativeNodeInfo.node_name">(mstar.graph.base.SpeculativeNodeInfo attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeAndGraphWalk">NodeAndGraphWalk (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeCompletionOutput">NodeCompletionOutput (class in mstar.graph.base)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeInputsOutputs">NodeInputsOutputs (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.kernels.image_normalize.html#mstar.model.pi05.kernels.image_normalize.normalize_float_images">normalize_float_images() (in module mstar.model.pi05.kernels.image_normalize)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.components.tokenization.html#mstar.model.pi05.components.tokenization.normalize_prompt">normalize_prompt() (in module mstar.model.pi05.components.tokenization)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.num_attention_heads">num_attention_heads (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.num_attention_heads">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.num_cameras">num_cameras (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.num_flow_steps">num_flow_steps (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.num_frames">num_frames (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.num_heads">num_heads (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.num_hidden_layers">num_hidden_layers (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.num_hidden_layers">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.num_key_value_heads">num_key_value_heads (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.num_kv_heads">num_kv_heads (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.num_layers">num_layers (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.num_patches">num_patches (mstar.model.vjepa2.config.VJepa2Config property)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.num_qo_heads">num_qo_heads (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.nvtx_range">nvtx_range() (in module mstar.utils.profiler)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="O">O</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.object">object (mstar.api_server.openai.protocol.ModelCard attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelList.object">(mstar.api_server.openai.protocol.ModelList attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.offset">offset (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter">OpenAIAdapter (class in mstar.api_server.openai.adapters)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OrpheusAdapter">OrpheusAdapter (class in mstar.api_server.openai.adapters)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig">OrpheusModelConfig (class in mstar.model.orpheus.config)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeCompletionOutput.output_edges">output_edges (mstar.graph.base.NodeCompletionOutput attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.SubmitArgs.output_modalities">output_modalities (mstar.api_server.openai.adapters.SubmitArgs attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.PreprocessInput.output_modalities">(mstar.api_server.request_types.PreprocessInput attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphEdge.output_modality">output_modality (mstar.graph.base.GraphEdge attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.outputs">outputs (mstar.graph.base.GraphNode attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.outputs">(mstar.graph.base.Loop attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.owned_by">owned_by (mstar.api_server.openai.protocol.ModelCard attribute)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="P">P</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.pad_token_id">pad_token_id (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.pad_token_id">(mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.pali_intermediate_size">pali_intermediate_size (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Parallel">Parallel (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology.partitions">partitions (mstar.streaming.topology.PartitionTopology attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology">PartitionTopology (class in mstar.streaming.topology)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.patch_size">patch_size (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.patch_size">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.pcm16_to_container">pcm16_to_container() (in module mstar.api_server.media_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.pcm16_to_wav_bytes">pcm16_to_wav_bytes() (in module mstar.api_server.media_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphEdge.persist">persist (mstar.graph.base.GraphEdge attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config">Pi05Config (class in mstar.model.pi05.config)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.components.tokenization.html#mstar.model.pi05.components.tokenization.Pi05Tokenizer">Pi05Tokenizer (class in mstar.model.pi05.components.tokenization)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.plan">plan() (mstar.utils.flashinfer_utils.FlashInferDecodeWrapper method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.plan">(mstar.utils.flashinfer_utils.FlashInferPrefillWrapper method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.png_to_data_url">png_to_data_url() (in module mstar.api_server.media_io)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.policy">policy (mstar.streaming.stream_buffer.StreamBuffer attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.pop_chunk">pop_chunk() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.pop_waiting_edge">pop_waiting_edge() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.pre_read_register">pre_read_register() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.pred_hidden_size">pred_hidden_size (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.pred_mlp_ratio">pred_mlp_ratio (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.pred_num_attention_heads">pred_num_attention_heads (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.pred_num_hidden_layers">pred_num_hidden_layers (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.pred_num_mask_tokens">pred_num_mask_tokens (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.pred_zero_init_mask_tokens">pred_zero_init_mask_tokens (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.predictor_embed_dim">predictor_embed_dim (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.predictor_kind">predictor_kind (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.PreprocessInput">PreprocessInput (class in mstar.api_server.request_types)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.producer_done">producer_done (mstar.streaming.stream_buffer.StreamBuffer attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest.prompt">prompt (mstar.api_server.openai.protocol.ImageGenerationRequest attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.push_sockets">push_sockets (mstar.communication.communicator.ZMQCommunicator attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.put">put() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="Q">Q</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.qkv_bias">qkv_bias (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.qkv_bias">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.utils.logging_config.html#mstar.utils.logging_config.quiet_noisy_loggers">quiet_noisy_loggers() (in module mstar.utils.logging_config)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter">Qwen3OmniAdapter (class in mstar.api_server.openai.adapters)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="R">R</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.range_pop">range_pop() (in module mstar.utils.profiler)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.range_push">range_push() (in module mstar.utils.profiler)</a>
+</li>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.CommProtocol.RDMA">RDMA (mstar.communication.communicator.CommProtocol attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.ready_for_streaming">ready_for_streaming (mstar.graph.graph_io.WorkerGraphIO property)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.ready_inputs">ready_inputs (mstar.graph.base.ReadySignals attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.ready_names">ready_names (mstar.graph.base.ReadySignals attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.ready_node_names">ready_node_names (mstar.graph.graph_io.WorkerGraphIO property)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals">ReadySignals (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.register_chunk">register_chunk() (mstar.streaming.chunk_policy.ChunkPolicy method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.register_communication_info">register_communication_info() (mstar.graph.base.GraphNode method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.register_communication_info">(mstar.graph.base.Loop method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.register_communication_info">(mstar.graph.base.ReadySignals method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.register_communication_info">(mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.register_event_for_poll">register_event_for_poll() (mstar.communication.communicator.ZMQCommunicator method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.register_finished">register_finished() (mstar.graph.base.Loop method)</a>
+</li>
+      <li><a href="_autosummary/mstar.communication.event.html#mstar.communication.event.EventWakeup.register_future">register_future() (mstar.communication.event.EventWakeup method)</a>
+</li>
+      <li><a href="_autosummary/mstar.communication.event.html#mstar.communication.event.EventWakeup.register_futures">register_futures() (mstar.communication.event.EventWakeup method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphStateRegistry.register_ingested_input">register_ingested_input() (mstar.graph.base.GraphStateRegistry method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.LoopStateRegistry.register_ingested_input">(mstar.graph.base.LoopStateRegistry method)</a>
+</li>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.register_ingested_input">(mstar.graph.base.WorkerGraphStateRegistry method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.register_loop_finish_signal">register_loop_finish_signal() (mstar.graph.graph_io.WorkerGraphIO method)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.remove">remove() (mstar.graph.base.ReadySignals method)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.repetition_penalty">repetition_penalty (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.PreprocessInput.request_id">request_id (mstar.api_server.request_types.PreprocessInput attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestComplete.request_id">(mstar.api_server.request_types.RequestComplete attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultChunk.request_id">(mstar.api_server.request_types.ResultChunk attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultTensors.request_id">(mstar.api_server.request_types.ResultTensors attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.request_id">(mstar.streaming.stream_buffer.StreamBuffer attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestComplete">RequestComplete (class in mstar.api_server.request_types)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphStateRegistry.reset_for_iter">reset_for_iter() (mstar.graph.base.GraphStateRegistry method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.reset_for_iter">(mstar.graph.base.WorkerGraphStateRegistry method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.reset_for_outer_iter">reset_for_outer_iter() (mstar.graph.base.GraphNode method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.reset_for_outer_iter">(mstar.graph.base.Loop method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.reset_outputs">reset_outputs() (mstar.graph.base.GraphNode method)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.resolve_media_ref">resolve_media_ref() (in module mstar.api_server.media_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest.response_format">response_format (mstar.api_server.openai.protocol.ImageGenerationRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.response_format">(mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultChunk">ResultChunk (class in mstar.api_server.request_types)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultTensors">ResultTensors (class in mstar.api_server.request_types)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.rms_norm_eps">rms_norm_eps (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.rms_norm_eps">(mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatMessage.role">role (mstar.api_server.openai.protocol.ChatMessage attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.rollout_anticipation_seconds">rollout_anticipation_seconds (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.rollout_frames_per_second">rollout_frames_per_second (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.rollout_num_output_frames">rollout_num_output_frames (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.rope_scaling">rope_scaling (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.rope_theta">rope_theta (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.rope_theta">(mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.rope_utils.html#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys">rotate_queries_or_keys() (in module mstar.model.vjepa2.components.rope_utils)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.rope_utils.html#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys_BNHD">rotate_queries_or_keys_BNHD() (in module mstar.model.vjepa2.components.rope_utils)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.run">run() (mstar.utils.flashinfer_utils.FlashInferDecodeWrapper method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.run">(mstar.utils.flashinfer_utils.FlashInferPrefillWrapper method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.run_attention">run_attention() (in module mstar.utils.flashinfer_utils)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.run_rms_norm">run_rms_norm() (in module mstar.utils.flashinfer_utils)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="S">S</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.sample_rate">sample_rate (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_base64">save_base64() (in module mstar.api_server.media_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_data_url">save_data_url() (in module mstar.api_server.media_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_remote_url">save_remote_url() (in module mstar.api_server.media_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.section">section (mstar.graph.base.Loop attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Parallel.sections">sections (mstar.graph.base.Parallel attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Sequential.sections">(mstar.graph.base.Sequential attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.seed">seed (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest.seed">(mstar.api_server.openai.protocol.ImageGenerationRequest attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.seed">(mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator.send">send() (mstar.communication.communicator.BaseCommunicator method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.send">(mstar.communication.communicator.ZMQCommunicator method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Sequential">Sequential (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.set_kv_cache">set_kv_cache() (mstar.utils.flashinfer_utils.FlashInferDecodeWrapper method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.set_kv_cache">(mstar.utils.flashinfer_utils.FlashInferPrefillWrapper method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.CommProtocol.SHM">SHM (mstar.communication.communicator.CommProtocol attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.signal_done">signal_done() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.components.flow_matching.html#mstar.model.pi05.components.flow_matching.sincos_timestep_embedding">sincos_timestep_embedding() (in module mstar.model.pi05.components.flow_matching)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest.size">size (mstar.api_server.openai.protocol.ImageGenerationRequest attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy">SlidingWindowChunkPolicy (class in mstar.streaming.chunk_policy)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_audio_slice_end">snac_audio_slice_end (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_audio_slice_start">snac_audio_slice_start (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_model_id">snac_model_id (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_stride_tokens">snac_stride_tokens (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_window_tokens">snac_window_tokens (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.source_entity">source_entity (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.source_session_id">source_session_id (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.source_tp_rank">source_tp_rank (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.source_tp_size">source_tp_size (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.SpeculativeNodeInfo">SpeculativeNodeInfo (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.speech_to_request">speech_to_request() (mstar.api_server.openai.adapters.OpenAIAdapter method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OrpheusAdapter.speech_to_request">(mstar.api_server.openai.adapters.OrpheusAdapter method)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter.speech_to_request">(mstar.api_server.openai.adapters.Qwen3OmniAdapter method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest">SpeechRequest (class in mstar.api_server.openai.protocol)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.speed">speed (mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunk.start_offset">start_offset (mstar.streaming.stream_buffer.StreamChunk attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.start_token_id">start_token_id (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.state_dim">state_dim (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.state_token_bins">state_token_bins (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.state_token_offset">state_token_offset (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.stop">stop (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.stop_token_id">stop_token_id (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.store_uningested_edge">store_uningested_edge() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.stream">stream (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.stream">(mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer">StreamBuffer (class in mstar.streaming.stream_buffer)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunk">StreamChunk (class in mstar.streaming.stream_buffer)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.streaming_inputs">streaming_inputs (mstar.graph.base.ReadySignals attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.StreamingGraphEdge">StreamingGraphEdge (class in mstar.streaming.topology)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.stride">stride (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.SubmitArgs">SubmitArgs (class in mstar.api_server.openai.adapters)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.BagelAdapter.supports_chat">supports_chat (mstar.api_server.openai.adapters.BagelAdapter attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.supports_chat">(mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_chat">(mstar.api_server.openai.adapters.Qwen3OmniAdapter attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.BagelAdapter.supports_images">supports_images (mstar.api_server.openai.adapters.BagelAdapter attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.supports_images">(mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.supports_speech">supports_speech (mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OrpheusAdapter.supports_speech">(mstar.api_server.openai.adapters.OrpheusAdapter attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_speech">(mstar.api_server.openai.adapters.Qwen3OmniAdapter attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+</tr></table>
+
+<h2 id="T">T</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.StreamingGraphEdge.target_partition">target_partition (mstar.streaming.topology.StreamingGraphEdge attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.CommProtocol.TCP">TCP (mstar.communication.communicator.CommProtocol attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.temperature">temperature (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.temperature">(mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.temperature">(mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphEdge.tensor_info">tensor_info (mstar.graph.base.GraphEdge attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo">TensorPointerInfo (class in mstar.graph.base)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.SubmitArgs.text">text (mstar.api_server.openai.adapters.SubmitArgs attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.PreprocessInput.text">(mstar.api_server.request_types.PreprocessInput attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.timestep_max_period">timestep_max_period (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.timestep_min_period">timestep_min_period (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.Connection.to_partition">to_partition (mstar.streaming.topology.Connection attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.tokens_per_frame">tokens_per_frame (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.tokens_per_image">tokens_per_image (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.top_p">top_p (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.top_p">(mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.top_p">(mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.tubelet_size">tubelet_size (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.tubelet_size">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+</tr></table>
+
+<h2 id="U">U</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.update">update() (mstar.graph.base.ReadySignals method)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.use_extrinsics">use_extrinsics (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.use_rope">use_rope (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.uuid">uuid (mstar.graph.base.TensorPointerInfo attribute)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="V">V</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.vit_hidden_size">vit_hidden_size (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.vit_image_size">vit_image_size (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.vit_intermediate_size">vit_intermediate_size (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.vit_num_heads">vit_num_heads (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.vit_num_layers">vit_num_layers (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.vit_patch_size">vit_patch_size (mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig">VJepa2ACPredictorConfig (class in mstar.model.vjepa2.config)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config">VJepa2Config (class in mstar.model.vjepa2.config)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.vit_encoder.html#mstar.model.vjepa2.components.vit_encoder.VJEPA2Embeddings">VJEPA2Embeddings (class in mstar.model.vjepa2.components.vit_encoder)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.vit_encoder.html#mstar.model.vjepa2.components.vit_encoder.VJEPA2Encoder">VJEPA2Encoder (class in mstar.model.vjepa2.components.vit_encoder)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2Layer">VJEPA2Layer (class in mstar.model.vjepa2.components.layers)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2MLP">VJEPA2MLP (class in mstar.model.vjepa2.components.layers)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.vit_encoder.html#mstar.model.vjepa2.components.vit_encoder.VJEPA2PatchEmbeddings3D">VJEPA2PatchEmbeddings3D (class in mstar.model.vjepa2.components.vit_encoder)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.predictor.html#mstar.model.vjepa2.components.predictor.VJEPA2Predictor">VJEPA2Predictor (class in mstar.model.vjepa2.components.predictor)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.predictor.html#mstar.model.vjepa2.components.predictor.VJEPA2PredictorEmbeddings">VJEPA2PredictorEmbeddings (class in mstar.model.vjepa2.components.predictor)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2RopeAttention">VJEPA2RopeAttention (class in mstar.model.vjepa2.components.layers)</a>
+</li>
+      <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.vocab_size">vocab_size (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.vocab_size">(mstar.model.pi05.config.Pi05Config attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.voice">voice (mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="W">W</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.wait_for_work">wait_for_work() (mstar.communication.communicator.ZMQCommunicator method)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.wav_stream_header">wav_stream_header() (in module mstar.api_server.media_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices.wg_fwd_pass_idx">wg_fwd_pass_idx (mstar.graph.loop_indices.NestedLoopIndices attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.window_size">window_size() (mstar.streaming.chunk_policy.ChunkPolicy method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy.window_size">(mstar.streaming.chunk_policy.FixedChunkPolicy method)</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.LeftContextChunkPolicy.window_size">(mstar.streaming.chunk_policy.LeftContextChunkPolicy method)</a>
+</li>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy.window_size">(mstar.streaming.chunk_policy.SlidingWindowChunkPolicy method)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO">WorkerGraphIO (class in mstar.graph.graph_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry">WorkerGraphStateRegistry (class in mstar.graph.base)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="Z">Z</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator">ZMQCommunicator (class in mstar.communication.communicator)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By M* Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, M* Team.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Jun 11, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
