@@ -369,6 +369,26 @@ def test_thinker_prepare_inputs_prefill_text_uses_input_ids() -> None:
     torch.testing.assert_close(out.input_ids, token_ids)
 
 
+def test_thinker_prepare_inputs_absorbs_engine_kwargs() -> None:
+    """prepare_inputs must accept engine-passed extras it doesn't use.
+
+    The KV-cache engine calls prepare_inputs with pos_info AND seen_token_mask
+    (sampler token mask). A signature without **kwargs would TypeError at
+    serve time — regression guard for the engine→submodule contract.
+    """
+    sub = _build_thinker_submodule(hidden_size=32)
+    token_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+    out = sub.prepare_inputs(
+        graph_walk="prefill_text", fwd_info=None,
+        inputs={"text_inputs": [token_ids]},
+        pos_info={},
+        seen_token_mask=None,  # extra kwarg the engine passes
+        some_future_kwarg="ignored",
+    )
+    assert out.input_seq_len == 3
+    torch.testing.assert_close(out.input_ids, token_ids)
+
+
 def test_thinker_prepare_inputs_legacy_prefill_walk_still_works() -> None:
     """``prefill`` (the step 3f name) routes the same as prefill_text."""
     sub = _build_thinker_submodule()

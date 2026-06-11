@@ -434,8 +434,14 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
         pos_info: dict[str, PositionInfo] = {},
+        **kwargs,
     ) -> ARNodeInputs:
         """Dispatch on graph_walk to build per-request ARNodeInputs.
+
+        ``**kwargs`` absorbs engine-passed extras (e.g. ``seen_token_mask``
+        from the KV-cache engine's sampler) that this submodule doesn't use,
+        mirroring the peer models so the engine→submodule contract stays
+        forward-compatible.
 
         Text-only walks return ``input_ids`` (LingMoeModel embeds them
         inline). Multimodal walks return precomputed ``input_embeds``
