@@ -68,7 +68,7 @@ def server_seed_for(request_id: str) -> int:
 
 
 def reproduce_server_noise(request_id: str, device: torch.device) -> torch.Tensor:
-    """Reproduce the noise tensor that ``Pi05LLMSubmodule._preprocess_action_gen``
+    """Reproduce the noise tensor that ``Pi05ActionExpertSubmodule._preprocess_action_gen``
     will sample on iteration 0 for this request.
 
     Server code (mstar/model/pi05/submodules.py)::
