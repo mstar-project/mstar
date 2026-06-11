@@ -159,6 +159,7 @@ class FlashInferPrefillWrapper:
 
         self._total_tokens = 0
 
+    @torch.compiler.disable
     def plan(
         self,
         qo_indptr: torch.Tensor,

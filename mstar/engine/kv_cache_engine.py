@@ -219,12 +219,12 @@ class KVCacheEngine(BaseEngine):
                 submodule.forward = torch.compile(
                     submodule.forward,
                     fullgraph=False,
-                    dynamic=True,
+                    dynamic=False,
                 )
                 submodule.forward_batched = torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
-                    dynamic=True,
+                    dynamic=False,
                 )
                 logger.info("KVCacheEngine: torch.compile applied to %s language_model", node_name)
             except Exception:
