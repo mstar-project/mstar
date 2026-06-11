@@ -4,28 +4,28 @@ Architecture
 High-level components
 ---------------------
 
-``mminf`` is organized as a set of cooperating processes:
+``mstar`` is organized as a set of cooperating processes:
 
-- **API server** (``mminf/api_server/``): FastAPI layer that accepts ``POST /generate``,
+- **API server** (``mstar/api_server/``): FastAPI layer that accepts ``POST /generate``,
   tokenizes/loads media, dispatches the request, and streams results back to the client.
-  Entry point: ``mminf.api_server.entrypoint:main`` (the ``mminf-serve`` console script).
-- **Conductor** (``mminf/conductor/``): central coordinator. It manages the request
+  Entry point: ``mstar.api_server.entrypoint:main`` (the ``mstar-serve`` console script).
+- **Conductor** (``mstar/conductor/``): central coordinator. It manages the request
   lifecycle, handles graph-walk transitions, selects workers, routes inputs, and
   detects completion.
-- **Workers** (``mminf/worker/``): one process per GPU. Each runs an engine manager, a
+- **Workers** (``mstar/worker/``): one process per GPU. Each runs an engine manager, a
   micro-scheduler (continuous batching), and a KV cache manager, and routes tensors
   directly to downstream workers.
-- **Engines** (``mminf/engine/``): execution backends that actually run submodules on the
+- **Engines** (``mstar/engine/``): execution backends that actually run submodules on the
   GPU — ``KVCacheEngine`` (nodes with a persistent paged KV cache, e.g. autoregressive
   LLMs and LLM-as-denoiser flow loops) and ``StatelessEngine`` (everything else: ViT/VAE
   encoders and decoders, codec decoders, projection/combine stages).
-- **Models** (``mminf/model/``): each model declares its computation graph, tokenization,
-  engine types, and submodules. Registered via ``mminf/model/registry.py``.
-- **Graph** (``mminf/graph/``): computation-graph primitives — ``GraphNode``,
+- **Models** (``mstar/model/``): each model declares its computation graph, tokenization,
+  engine types, and submodules. Registered via ``mstar/model/registry.py``.
+- **Graph** (``mstar/graph/``): computation-graph primitives — ``GraphNode``,
   ``Sequential``, ``Parallel``, ``Loop``, ``GraphEdge``.
-- **Communication** (``mminf/communication/``): ZMQ-based IPC/TCP messaging; tensor
+- **Communication** (``mstar/communication/``): ZMQ-based IPC/TCP messaging; tensor
   transport over RDMA or TCP.
-- **Streaming** (``mminf/streaming/``): streaming output with configurable chunking
+- **Streaming** (``mstar/streaming/``): streaming output with configurable chunking
   policies and async partition topology.
 
 Core design principles
