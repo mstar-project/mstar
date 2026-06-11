@@ -152,6 +152,34 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
         )
         return {"pixel_values_videos": stacked}
 
+    def _encode(self, graph_walk: str, pixel_values_videos: torch.Tensor) -> torch.Tensor:
+        """Encode a video clip into the ``encoder_hidden`` context.
+
+        Two distinct schemes:
+
+        * **AC rollout** (``predictor_kind == "ac"`` *and* a ``*_rollout*``
+          walk): upstream's self-tubelet replication + post-encoder LayerNorm,
+          sliced to the first frame's tokens — see :meth:`_encode_self_tubelet`.
+          The AC rollout grows context from a single frame
+          (``z_hat = z[:, :tokens_per_frame]``).
+
+        * **Everything else** (masked/anticipative; AC single-pass, encoder-only,
+          and MPC walks): the natural encoder forward over the full
+          ``[B, T, C, H, W]`` clip, yielding ``[B, grid_depth * grid_size**2,
+          D]``.  These predictors attend over the full multi-frame context and
+          must NOT have it collapsed to a single frame:
+
+          - the masked anticipative rollout would get ``n_ctxt == n_pred`` and
+            trip its ``n_pred >= n_ctxt`` guard;
+          - the single-pass AC predictor interleaves per-frame context tokens
+            with the per-timestep ``actions``/``states`` (T_action = grid_depth),
+            so a single-frame context (t=1) mismatches T_action and fails the
+            ``torch.cat([a, s, x], dim=2)`` in ``_prepare_sequence``.
+        """
+        if self.config.predictor_kind == "ac" and "rollout" in graph_walk:
+            return self._encode_self_tubelet(pixel_values_videos)
+        return self.encoder(pixel_values_videos)
+
     def _encode_self_tubelet(self, pixel_values_videos: torch.Tensor) -> torch.Tensor:
         """Encode video via upstream's self-tubelet pattern + post-encoder LayerNorm.
 
@@ -202,7 +230,7 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
             pixel_values_videos.dtype,
             pixel_values_videos.device,
         )
-        hidden = self._encode_self_tubelet(pixel_values_videos)
+        hidden = self._encode(graph_walk, pixel_values_videos)
         logger.info("VJepa2EncoderSubmodule.forward: output shape=%s", tuple(hidden.shape))
         return {"encoder_hidden": [hidden]}
 
@@ -233,7 +261,7 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
                 f"pixel_values_videos batch dim {b_in} does not match "
                 f"request count {len(request_ids)}."
             )
-        hidden = self._encode_self_tubelet(pixel_values_videos)  # [B, N, D]
+        hidden = self._encode(graph_walk, pixel_values_videos)  # [B, N, D]
         return {
             rid: {"encoder_hidden": [hidden[i : i + 1]]}
             for i, rid in enumerate(request_ids)
