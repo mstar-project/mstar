@@ -589,7 +589,9 @@ back to itself, and the loop's ``outputs`` hand the final latents to ``vae_decod
    prefill_vit = Sequential([
        GraphNode(name="vit_encoder", input_names=["image_inputs"],
                  outputs=[GraphEdge(next_node="LLM", name="img_emb")]),
-       GraphNode(name="LLM", input_names=["img_emb"], outputs=[]),
+       GraphNode(name="LLM", input_names=["img_emb"],
+                 outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token",
+                                    output_modality="text", persist=True)]),
    ])
 
    image_gen = Sequential([
@@ -607,7 +609,7 @@ back to itself, and the loop's ``outputs`` hand the final latents to ``vae_decod
            name="vae_decoder",
            input_names=["latents"],
            outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="image_output",
-                              output_modality="image", persist=True)],
+                              output_modality="image")],
        ),
    ])
 
