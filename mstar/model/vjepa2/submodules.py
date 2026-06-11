@@ -152,6 +152,28 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
         )
         return {"pixel_values_videos": stacked}
 
+    def _encode(self, pixel_values_videos: torch.Tensor) -> torch.Tensor:
+        """Encode a video clip into the ``encoder_hidden`` context.
+
+        Two distinct schemes, keyed on ``config.predictor_kind``:
+
+        * **AC** (``predictor_kind == "ac"``): upstream's self-tubelet
+          replication + post-encoder LayerNorm, sliced to the first frame's
+          tokens — see :meth:`_encode_self_tubelet`.  The AC rollout uses a
+          single-frame context (``z_hat = z[:, :tokens_per_frame]``).
+
+        * **Masked / anticipative** (non-AC): the natural encoder forward over
+          the full ``[B, T, C, H, W]`` clip, yielding
+          ``[B, grid_depth * grid_size**2, D]``.  The anticipative rollout
+          predictor attends over this full multi-frame context, so it must
+          NOT be collapsed to a single frame — doing so makes
+          ``n_ctxt == n_pred`` and trips the rollout's
+          ``n_pred >= n_ctxt`` guard.
+        """
+        if self.config.predictor_kind == "ac":
+            return self._encode_self_tubelet(pixel_values_videos)
+        return self.encoder(pixel_values_videos)
+
     def _encode_self_tubelet(self, pixel_values_videos: torch.Tensor) -> torch.Tensor:
         """Encode video via upstream's self-tubelet pattern + post-encoder LayerNorm.
 
@@ -202,7 +224,7 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
             pixel_values_videos.dtype,
             pixel_values_videos.device,
         )
-        hidden = self._encode_self_tubelet(pixel_values_videos)
+        hidden = self._encode(pixel_values_videos)
         logger.info("VJepa2EncoderSubmodule.forward: output shape=%s", tuple(hidden.shape))
         return {"encoder_hidden": [hidden]}
 
@@ -233,7 +255,7 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
                 f"pixel_values_videos batch dim {b_in} does not match "
                 f"request count {len(request_ids)}."
             )
-        hidden = self._encode_self_tubelet(pixel_values_videos)  # [B, N, D]
+        hidden = self._encode(pixel_values_videos)  # [B, N, D]
         return {
             rid: {"encoder_hidden": [hidden[i : i + 1]]}
             for i, rid in enumerate(request_ids)
