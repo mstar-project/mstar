@@ -1002,17 +1002,27 @@ graph-walk / partition / streaming patterns transfer 1:1.
        `ImageGen` partition + `Thinker→ImageGen` streaming connection
        (`continue_after_done`) + `_create_imagegen_submodule` factory, all
        guarded on `config.image_gen`. Mirrors the Talker consumer pattern.
-       17 graph/partition/submodule tests.
 
-     **Remaining live-bringup gap (not modeling):** the thinker decode path
-     currently returns logits only — it does not yet *emit* the query-token
-     hidden states as a `thinker_hidden_states` streaming edge, so the
-     Thinker→ImageGen handoff is wired on the consumer side but the producer
-     side needs the thinker submodule to expose hidden states at the
-     `<imagePatch>` positions. End-to-end image output also needs live
-     multi-GPU serve (TP=8) + a working diffusers. The modeling + graph
-     wiring are complete and unit-validated; this producer-side hidden-state
-     emit + live bring-up is the only piece left.
+     **Producer↔consumer handoff — DONE.** Both ends of the Thinker→ImageGen
+     stream are wired:
+     * Producer: the thinker prefill node carries a `thinker_hidden_states`
+       `StreamingGraphEdge` (added when `config.image_gen` is set), and
+       `BailingMoeV2ThinkerSubmodule.forward` detects the `<imagePatch>` token
+       in the prefill ids, runs `LingMoeModel.forward(return_hidden_states=True)`,
+       slices the patch positions via `extract_image_gen_hidden_states`, and
+       publishes them under `thinker_hidden_states`. No metadata plumbing —
+       the gate is the patch token's presence in the tokenized prompt.
+     * Consumer: `get_initial_forward_pass_args` / `get_partition_forward_pass_args`
+       gained an `ImageGen` branch + `_get_imagegen_forward` state machine
+       (fires the `imagegen` walk once the producer is done, then request_done),
+       mirroring `_get_talker_forward`.
+     ~30 graph/partition/submodule/producer tests (incl. patch-token-gated
+     emit, consumer state machine fire-once-then-done).
+
+     **Remaining live-bringup gap (not code):** end-to-end image output still
+     needs live multi-GPU serve (TP=8) + a working diffusers (broken on this
+     box). The full modeling + graph + producer/consumer wiring are complete
+     and unit-validated; only the live run is left.
 
 10. **Configs — DONE.** `configs/ming_flash_omni.yaml` rewritten to the
     real registered node names: `vision_encoder` + `audio_encoder` +

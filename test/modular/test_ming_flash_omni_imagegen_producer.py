@@ -134,3 +134,116 @@ def test_model_returns_hidden_states_tuple() -> None:
     # The returned hidden states are exactly what lm_head consumed: feeding
     # them back through lm_head must reproduce the returned logits.
     assert torch.allclose(model.lm_head(hidden), logits, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Submodule forward emits thinker_hidden_states for image-gen prefill (CPU)
+# ---------------------------------------------------------------------------
+
+
+class _StubModel(torch.nn.Module):
+    """LingMoeModel stand-in: returns deterministic logits (+ hidden states).
+
+    Honors the (cache_handle, input_ids, position_ids, return_hidden_states)
+    signature the Thinker submodule calls, so the image-gen emit path can be
+    exercised without the CUDA-only RMSNorm forward.
+    """
+
+    def __init__(self, vocab_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(vocab_size, hidden_size)
+        self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+        self._vocab = vocab_size
+        self._hidden = hidden_size
+
+    def forward(self, cache_handle, input_ids=None, position_ids=None, return_hidden_states=False, **kw):
+        T = input_ids.shape[0]
+        # Per-position hidden = row index broadcast, so the slice is verifiable.
+        hidden = torch.arange(T, dtype=torch.float32).unsqueeze(1).repeat(1, self._hidden)
+        logits = torch.zeros(T, self._vocab)
+        if return_hidden_states:
+            return logits, hidden
+        return logits
+
+
+class _StubCache:
+    def advance_seq_lens(self):
+        pass
+
+
+class _StubReqInfo:
+    position_info: dict = {}
+
+
+class _StubEngineInputs:
+    cache_manager = _StubCache()
+    single_request_info = _StubReqInfo()
+
+
+def _thinker_with_imagegen(hidden_size: int = 8, vocab_size: int = 157200):
+    from mminf.model.ming_omni_flash.config import (
+        AudioEncoderConfig,
+        ImageGenConfig,
+        MingFlashOmniModelConfig,
+        ThinkerLLMConfig,
+        VisionEncoderConfig,
+    )
+
+    cfg = MingFlashOmniModelConfig(
+        local_dir="",
+        mlp_depth=2,
+        # Keep the default attention dims (head_dim=128, mrope [8,12,12]) so
+        # the MingFlashOmniModelConfig MRoPE/head_dim invariants pass; the stub
+        # model ignores them — only embed_tokens/lm_head dims (hidden_size) and
+        # vocab_size matter here.
+        thinker_llm=ThinkerLLMConfig(vocab_size=vocab_size, hidden_size=hidden_size, head_dim=128),
+        vision=VisionEncoderConfig(),
+        audio_encoder=AudioEncoderConfig(),
+        image_gen=ImageGenConfig(),
+    )
+    model = _StubModel(vocab_size, hidden_size)
+    return BailingMoeV2ThinkerSubmodule(model=model, config=cfg)
+
+
+def test_forward_emits_hidden_states_when_patch_tokens_present() -> None:
+    sub = _thinker_with_imagegen(hidden_size=8)
+    # prompt: 3 text tokens then a 2-wide imagePatch block.
+    ids = torch.tensor([10, 11, 12, PATCH, PATCH], dtype=torch.long)
+    out = sub.forward(graph_walk="prefill_text", engine_inputs=_StubEngineInputs(), text_inputs=ids)
+    assert "logits" in out
+    assert "thinker_hidden_states" in out
+    patch_hidden = out["thinker_hidden_states"][0]
+    # 2 patch positions (rows 3 and 4), hidden_size=8.
+    assert patch_hidden.shape == (2, 8)
+    assert torch.equal(patch_hidden[:, 0], torch.tensor([3.0, 4.0]))
+
+
+def test_forward_no_hidden_states_without_patch_tokens() -> None:
+    sub = _thinker_with_imagegen(hidden_size=8)
+    ids = torch.tensor([10, 11, 12, 13], dtype=torch.long)  # no patch tokens
+    out = sub.forward(graph_walk="prefill_text", engine_inputs=_StubEngineInputs(), text_inputs=ids)
+    assert "thinker_hidden_states" not in out
+    assert "logits" in out
+
+
+def test_forward_no_hidden_states_when_imagegen_config_absent() -> None:
+    from mminf.model.ming_omni_flash.config import (
+        AudioEncoderConfig,
+        MingFlashOmniModelConfig,
+        ThinkerLLMConfig,
+        VisionEncoderConfig,
+    )
+
+    cfg = MingFlashOmniModelConfig(
+        local_dir="",
+        mlp_depth=2,
+        thinker_llm=ThinkerLLMConfig(vocab_size=157200, hidden_size=8, head_dim=128),
+        vision=VisionEncoderConfig(),
+        audio_encoder=AudioEncoderConfig(),
+        image_gen=None,  # no imagegen deploy
+    )
+    sub = BailingMoeV2ThinkerSubmodule(model=_StubModel(157200, 8), config=cfg)
+    ids = torch.tensor([10, 11, PATCH, PATCH], dtype=torch.long)
+    out = sub.forward(graph_walk="prefill_text", engine_inputs=_StubEngineInputs(), text_inputs=ids)
+    # Even with patch tokens present, no imagegen config → no emit.
+    assert "thinker_hidden_states" not in out

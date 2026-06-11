@@ -484,16 +484,34 @@ class MingFlashOmniModel(Model):
         """
         max_decode = self.get_max_output_tokens()
 
+        imagegen_enabled = self.config.image_gen is not None
+
         def _thinker_prefill_node(input_names: list[str]) -> GraphNode:
+            outputs = [GraphEdge(
+                next_node=EMIT_TO_CLIENT,
+                name="new_token",
+                output_modality="text",
+                persist=True,
+            )]
+            if imagegen_enabled:
+                # Image-generation requests carry an <imagePatch> query-token
+                # block in the prompt; the thinker computes hidden states at
+                # those positions during prefill and streams them to the
+                # ImageGen partition. The submodule only populates this output
+                # when the request actually asked for an image (otherwise the
+                # edge carries nothing and the FixedChunkPolicy keeps the
+                # consumer idle until producer-done → request_done).
+                outputs.append(
+                    StreamingGraphEdge(
+                        next_node="ImageGen",
+                        name="thinker_hidden_states",
+                        target_partition="ImageGen",
+                    )
+                )
             return GraphNode(
                 name="Thinker",
                 input_names=input_names,
-                outputs=[GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="new_token",
-                    output_modality="text",
-                    persist=True,
-                )],
+                outputs=outputs,
             )
 
         prefill_text = _thinker_prefill_node(["text_inputs"])
@@ -843,6 +861,23 @@ class MingFlashOmniModel(Model):
                 unpersist_tensors=[],
                 request_done=not audio_output,
             )
+        if partition_name == "ImageGen":
+            # ImageGen is a consumer partition: it self-triggers when the
+            # Thinker's streamed ``thinker_hidden_states`` arrive. Image output
+            # only.
+            image_output = "image" in output_modalities
+            full_metadata = CurrentForwardConductorMetadata(
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk="imagegen",
+                is_prefill=False,
+            )
+            return ForwardPassArgs(
+                full_metadata=full_metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=not image_output,
+            )
         if partition_name != "Thinker":
             raise ValueError(f"Unknown partition: {partition_name!r}")
         schedule = self._build_thinker_prefill_schedule(
@@ -914,6 +949,8 @@ class MingFlashOmniModel(Model):
         """
         if partition_name == "Talker":
             return self._get_talker_forward(partition_metadata, incoming_connections)
+        if partition_name == "ImageGen":
+            return self._get_imagegen_forward(partition_metadata, incoming_connections)
         if partition_name != "Thinker":
             raise ValueError(f"Unknown partition: {partition_name!r}")
 
@@ -1001,6 +1038,50 @@ class MingFlashOmniModel(Model):
         metadata.kwargs["talker_fired"] = True
         metadata.graph_walk = "talker"
         edge = GraphEdge(next_node="Talker", name="thinker_tokens")
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=[edge],
+            unpersist_tensors=[],
+        )
+
+    def _get_imagegen_forward(
+        self,
+        metadata: CurrentForwardConductorMetadata,
+        incoming_connections: list[StreamingConnectionState] | None,
+    ) -> ForwardPassArgs:
+        """ImageGen partition state machine — runs once, then done.
+
+        Mirrors :meth:`_get_talker_forward`: the ImageGen node is a single
+        stateless diffusion node consuming the Thinker's streamed
+        ``thinker_hidden_states`` (the query-token hidden states sliced at the
+        ``<imagePatch>`` positions). The FixedChunkPolicy with
+        continue_after_done=True keeps the partition alive until the Thinker has
+        emitted them; we then fire the ``imagegen`` walk once (full denoise +
+        VAE decode happen inside ``ImageGenSubmodule.forward``) and report
+        request_done.
+        """
+        conn = incoming_connections[0] if incoming_connections else None
+        producer_done = conn.producer_done if conn else True
+
+        # Wait until the Thinker has produced the query-token hidden states.
+        if not producer_done:
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+            )
+
+        if metadata.kwargs.get("imagegen_fired"):
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
+            )
+
+        metadata.kwargs["imagegen_fired"] = True
+        metadata.graph_walk = "imagegen"
+        edge = GraphEdge(next_node="ImageGen", name="thinker_hidden_states")
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=[edge],

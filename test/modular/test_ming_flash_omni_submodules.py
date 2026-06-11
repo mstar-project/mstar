@@ -251,16 +251,16 @@ def test_get_node_engine_types_registers_encoders() -> None:
 def test_get_submodule_rejects_unknown_node() -> None:
     """Friendly error message for unregistered nodes.
 
-    Talker is now registered (step 6e-2); ImageGen is the remaining
-    unported node (step 9), so it's the canonical 'unknown' here.
+    Talker (step 6e-2) and ImageGen (step 9b) are both registered now, so a
+    genuinely unknown node name is the canonical 'unknown' here.
     """
     from mminf.model.ming_omni_flash.ming_omni_flash_model import MingFlashOmniModel
 
     inst = MingFlashOmniModel.__new__(MingFlashOmniModel)
     inst.config = _tiny_config()
     inst._submodule_cache = {}
-    with pytest.raises(ValueError, match="Unknown node: 'ImageGen'"):
-        inst.get_submodule("ImageGen", device="cpu")
+    with pytest.raises(ValueError, match="Unknown node: 'NotARealNode'"):
+        inst.get_submodule("NotARealNode", device="cpu")
 
 
 # ---------------------------------------------------------------------------
