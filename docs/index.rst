@@ -1,7 +1,7 @@
 M* Documentation
 ================
 
-``mminf`` is the package behind **M\*** ("M-star"), a **disaggregated, any-to-any
+``mstar`` is the package behind **M\*** ("M-star"), a **disaggregated, any-to-any
 multimodal inference engine**. It serves models built from structurally distinct
 components — vision encoders, transformer backbones, diffusion / flow heads, audio codecs,
 action generators, world-model predictors — whose execution path changes with the input
