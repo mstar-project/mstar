@@ -9,7 +9,7 @@ small HTTP / multipart overhead asymmetry vs our serving system is
 footnoted, not engineered around.
 
 The script loads ``facebook/vjepa2-ac-vitg-256`` (the action-conditioned
-V-JEPA 2 checkpoint that mminf's ``VJepa2AC`` model class also targets —
+V-JEPA 2 checkpoint that mstar's ``VJepa2AC`` model class also targets —
 see ``benchmark/base.py``). If that checkpoint isn't reachable on
 HuggingFace Hub, swap to the plain world-model checkpoint via
 ``--hf-model facebook/vjepa2-vitl-fpc64-256`` and note in the paper that
@@ -103,7 +103,7 @@ def _load_video_tensor(video_path: str, num_frames: int = 16):
 
     Returns a list of PIL frames; the processor will handle resize / crop /
     normalize. We sample ``num_frames`` evenly across the clip (the AC
-    checkpoint expects 64 in mminf, but the predictor only consumes a fixed
+    checkpoint expects 64 in mstar, but the predictor only consumes a fixed
     grid_depth so the processor + model handle that internally — for this
     baseline we just pass the raw frames and let the processor decide).
     """
@@ -133,7 +133,7 @@ def _run_one(model, processor, video_path: str, device: str, dtype):
 
     # VJEPA2WithMaskedInputModelOutput.predictor_output.last_hidden_state
     # has shape [B=1, N_tokens, hidden_size]. We treat each "rollout step"
-    # as a single forward (mminf's rollout calls the predictor H times; HF's
+    # as a single forward (mstar's rollout calls the predictor H times; HF's
     # plain VJEPA2 produces one prediction per call). For an AC checkpoint
     # that internally rolls out, this is one full prediction — the JCT
     # captures the full inference cost per request, which is what we want.
@@ -159,7 +159,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", default="bfloat16",
                    choices=["bfloat16", "float16", "float32"])
     p.add_argument("--output-dir", default="/tmp/hf_vjepa2")
-    p.add_argument("--local-cache", default="./mminf-benchmark-cache/",
+    p.add_argument("--local-cache", default="./mstar-benchmark-cache/",
                    help="Same default as runner.py so DROIDDataset reuses extracted videos.")
     p.add_argument("--hf-cache", default=None,
                    help="HuggingFace cache directory (for lerobot/droid_100 + model weights).")
