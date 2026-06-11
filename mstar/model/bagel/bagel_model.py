@@ -977,6 +977,11 @@ class BagelModel(Model):
         params["image_preprocess"] = "default"
         overridable_keys += ["width", "height", "image_preprocess"]
 
+        if "image" in input_modalities and "image" in output_modalities:
+            params["cfg_img_scale"] = 2.0
+            params["cfg_interval"] = [0.0, 1.0]
+            params["cfg_renorm_type"] = "text_channel"
+
         if model_kwargs:
             for key in overridable_keys:
                 if key in model_kwargs:
