@@ -28,9 +28,9 @@ from mstar.utils.logging_config import quiet_noisy_loggers
 
 logger = logging.getLogger(__name__)
 
-# Env-gated timing prints (MMINF_TIMING=1); pairs with the [DW-TIMING] prints
+# Env-gated timing prints (MSTAR_TIMING=1); pairs with the [DW-TIMING] prints
 # in data_worker.py to split HTTP/handler overhead from data-worker work.
-_TIMING = os.environ.get("MMINF_TIMING", "") not in ("", "0", "false")
+_TIMING = os.environ.get("MSTAR_TIMING", "") not in ("", "0", "false")
 
 
 def _tlog(msg: str) -> None:

@@ -665,7 +665,7 @@ class DROIDDataset(BaseDataset):
 
     HF_REPO = "lerobot/droid_100"
     # pi05 camera frames are letterboxed to this size client-side (matches the
-    # server's vit_image_size) so both mminf and openpi get identical input.
+    # server's vit_image_size) so both mstar and openpi get identical input.
     IMAGE_SIZE = 224
 
     def __init__(
@@ -830,7 +830,7 @@ class DROIDDataset(BaseDataset):
 
         # Decode + letterbox-resize each camera frame to 224x224 uint8 and save
         # as a ".npy" (the "numpy" modality). Sending pre-resized arrays lets the
-        # server skip both image decode and the resize, and lets us hand mminf
+        # server skip both image decode and the resize, and lets us hand mstar
         # and openpi identical input.
         npy_paths: list[str] = []
         for cam_key in camera_keys[:3]:

@@ -31,11 +31,11 @@ from mstar.utils.ipc_format import (
 
 logger = logging.getLogger(__name__)
 
-# Lightweight, env-gated timing prints (MMINF_TIMING=1). perf_counter is
+# Lightweight, env-gated timing prints (MSTAR_TIMING=1). perf_counter is
 # process-wide monotonic, so timestamps stamped in the API-server handler
 # thread and read in this data-worker thread are directly comparable — that's
 # how queue-wait (polling) latency is separated from actual work below.
-_TIMING = os.environ.get("MMINF_TIMING", "") not in ("", "0", "false")
+_TIMING = os.environ.get("MSTAR_TIMING", "") not in ("", "0", "false")
 
 
 def _tlog(msg: str) -> None:

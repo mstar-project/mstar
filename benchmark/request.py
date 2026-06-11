@@ -1680,7 +1680,7 @@ def _build_obs(req_input: RequestInput) -> dict:
     """Map our DROIDDataset RequestInput → openpi DroidInputs dict.
 
     DROIDDataset emits the camera frames as ``_numpy_bytes`` — already-decoded,
-    letterboxed 224x224 uint8 arrays (CxHxW), the same bytes mminf receives, so
+    letterboxed 224x224 uint8 arrays (CxHxW), the same bytes mstar receives, so
     both systems get identical input. openpi wants (H,W,3) uint8, so we just
     transpose; no decode/resize needed here. cam0 → exterior_image_1_left,
     cam1 → wrist_image_left. The 32-dim DROID state holds joint positions in

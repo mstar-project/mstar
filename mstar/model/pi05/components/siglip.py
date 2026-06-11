@@ -1,7 +1,7 @@
-"""SigLIP vision encoder for Pi0.5 (native mminf port).
+"""SigLIP vision encoder for Pi0.5 (native mstar port).
 
 Ports the inference path of HuggingFace's ``SiglipVisionModel`` (So400m/14)
-into mminf so we own the code and can fuse projections. Differences from the
+into mstar so we own the code and can fuse projections. Differences from the
 transformers implementation:
 
   * **Fused QKV** — the three ``q/k/v_proj`` GEMMs are merged into one
