@@ -835,7 +835,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;sincos embedding requires even dim, got </span><span class="si">{</span><span class="n">dim</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">t</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
         <span class="n">t</span> <span class="o">=</span> <span class="n">t</span><span class="p">[</span><span class="kc">None</span><span class="p">]</span>
-    
+
     <span class="n">period</span> <span class="o">=</span> <span class="n">min_period</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="n">max_period</span> <span class="o">/</span> <span class="n">min_period</span><span class="p">,</span> <span class="n">fraction</span><span class="p">)</span>
     <span class="n">omega</span> <span class="o">=</span> <span class="p">(</span><span class="mf">2.0</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">pi</span> <span class="o">/</span> <span class="n">period</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 

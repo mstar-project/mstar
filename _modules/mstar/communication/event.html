@@ -805,8 +805,8 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.communication.event</h1><div class="highlight"><pre>
-<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">Future</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">Future</span>
 
 
 <div class="viewcode-block" id="EventWakeup">
@@ -814,10 +814,10 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">EventWakeup</span><span class="p">:</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">event</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">eventfd</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">os</span><span class="o">.</span><span class="n">EFD_NONBLOCK</span> <span class="o">|</span> <span class="n">os</span><span class="o">.</span><span class="n">EFD_CLOEXEC</span><span class="p">)</span>
-    
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_wake</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">_fut</span><span class="p">):</span> <span class="c1"># runs on whatever thread finished the future</span>
         <span class="n">os</span><span class="o">.</span><span class="n">eventfd_write</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="c1"># one syscall, thread-safe, async-signal-safe</span>
-    
+
 <div class="viewcode-block" id="EventWakeup.register_future">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.event.html#mstar.communication.event.EventWakeup.register_future">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">register_future</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">future</span><span class="p">:</span> <span class="n">Future</span><span class="p">):</span>
@@ -825,17 +825,17 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span>
         <span class="n">future</span><span class="o">.</span><span class="n">add_done_callback</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_wake</span><span class="p">)</span></div>
 
-    
+
 <div class="viewcode-block" id="EventWakeup.register_futures">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.event.html#mstar.communication.event.EventWakeup.register_futures">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">register_futures</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">futures</span><span class="p">):</span>
         <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">register_future</span><span class="p">(</span><span class="n">fut</span><span class="p">)</span> <span class="k">for</span> <span class="n">fut</span> <span class="ow">in</span> <span class="n">futures</span><span class="p">]</span></div>
 
-    
+
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">fd</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">event</span>
-    
+
 <div class="viewcode-block" id="EventWakeup.drain">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.event.html#mstar.communication.event.EventWakeup.drain">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">drain</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>

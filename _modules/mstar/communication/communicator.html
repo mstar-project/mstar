@@ -895,14 +895,14 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">poller</span> <span class="o">=</span> <span class="n">zmq</span><span class="o">.</span><span class="n">Poller</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">poller</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="p">,</span> <span class="n">zmq</span><span class="o">.</span><span class="n">POLLIN</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">event</span> <span class="o">=</span> <span class="kc">None</span>
-    
+
 <div class="viewcode-block" id="ZMQCommunicator.register_event_for_poll">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.register_event_for_poll">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">register_event_for_poll</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">event</span><span class="p">:</span> <span class="n">EventWakeup</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">poller</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">fd</span><span class="p">,</span>  <span class="n">zmq</span><span class="o">.</span><span class="n">POLLIN</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">event</span> <span class="o">=</span> <span class="n">event</span></div>
 
-    
+
 <div class="viewcode-block" id="ZMQCommunicator.wait_for_work">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.wait_for_work">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">wait_for_work</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="mi">50</span><span class="p">):</span>

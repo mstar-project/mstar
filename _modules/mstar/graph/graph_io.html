@@ -859,18 +859,18 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">ready_node_names</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">wg_state_registry</span><span class="o">.</span><span class="n">ready_names</span>
-    
+
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">ready_for_streaming</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">wg_state_registry</span><span class="o">.</span><span class="n">ready_for_streaming</span>
-    
+
 <div class="viewcode-block" id="WorkerGraphIO.get_node">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.get_node">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_node</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">assert</span> <span class="n">name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">[</span><span class="n">name</span><span class="p">]</span></div>
 
-    
+
 <div class="viewcode-block" id="WorkerGraphIO.ingest_input">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.ingest_input">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_input</span><span class="p">(</span>
@@ -890,7 +890,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">graph_edge</span><span class="p">,</span> <span class="n">can_buffer</span>
         <span class="p">)</span></div>
 
-    
+
 <div class="viewcode-block" id="WorkerGraphIO.mark_node_complete">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.mark_node_complete">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">mark_node_complete</span><span class="p">(</span>
@@ -913,7 +913,7 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">num_times_run</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="k">return</span> <span class="n">completion</span></div>
 
-    
+
 <div class="viewcode-block" id="WorkerGraphIO.ingest_for_speculation">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.ingest_for_speculation">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_for_speculation</span><span class="p">(</span>
@@ -992,7 +992,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">loop_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">loops</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">loops</span><span class="p">[</span><span class="n">loop_name</span><span class="p">]</span><span class="o">.</span><span class="n">register_finished</span><span class="p">()</span></div>
 
-    
+
 <div class="viewcode-block" id="WorkerGraphIO.clear">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.clear">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">clear</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1011,7 +1011,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">communication_manager</span><span class="p">,</span> <span class="n">request_id</span>
             <span class="p">)</span></div>
 
-    
+
 <div class="viewcode-block" id="WorkerGraphIO.get_loop_indices">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.get_loop_indices">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_loop_indices</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1019,7 +1019,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">name</span><span class="p">:</span> <span class="n">loop</span><span class="o">.</span><span class="n">curr_iter</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">loop</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">loops</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
         <span class="p">}</span></div>
 
-    
+
 <div class="viewcode-block" id="WorkerGraphIO.get_nested_loop_idxs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.get_nested_loop_idxs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_nested_loop_idxs</span><span class="p">(</span>
@@ -1039,7 +1039,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">wg_fwd_pass_idx</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_times_run</span>
         <span class="p">)</span></div>
 
-    
+
 <div class="viewcode-block" id="WorkerGraphIO.get_nested_loop_idxs_for_node">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.get_nested_loop_idxs_for_node">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_nested_loop_idxs_for_node</span><span class="p">(</span>

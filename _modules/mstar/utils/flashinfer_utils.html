@@ -1023,7 +1023,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># even if we&#39;re not in a cuda graph</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_qo_indptr_buf</span> <span class="o">=</span> <span class="n">qo_indptr</span>
-    
+
         <span class="c1"># Compute per-token page and offset for vectorized KV writes</span>
         <span class="n">n_req</span> <span class="o">=</span> <span class="n">qo_indptr</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span>
         <span class="n">starts</span> <span class="o">=</span> <span class="n">qo_indptr</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
