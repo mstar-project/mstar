@@ -614,13 +614,13 @@ back to itself, and the loop's ``outputs`` hand the final latents to ``vae_decod
    ])
 
 **Declared outputs are conditional.** A node's ``outputs`` list is the set of edges it
-*can* emit; what it actually emits on a given step is whatever its submodule produces.
+*can* emit; what it actually emits on a given step is limited to whatever its submodule produces.
 ``new_token`` above is the clearest case — the LLM samples a token only when the request
 needs text out (the understanding path, and every ``decode`` step). On the
 image-generation / editing path the same node still runs and writes the KV cache but
-samples no token, so ``new_token`` is not produced and that edge carries nothing. It is in
-the graph because understanding requests use it; treat declared edges as the *possible*
-outputs and let the submodule decide which actually fire on each step.
+samples no token, so ``new_token`` is not produced. It is in the graph because understanding
+requests use it; treat declared edges as the *possible* outputs and let the submodule decide
+which actually fire on each step.
 
 **Choosing the walk per request.** Unlike Orpheus, BAGEL's transitions are
 *schedule-driven*: the output modality is known up front from the request's
