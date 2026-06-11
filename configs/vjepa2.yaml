@@ -2,7 +2,7 @@ model: "vjepa2"
 max_seq_len: 8192
 
 # Default checkpoint is facebook/vjepa2-vitl-fpc64-256 (~300M), set in
-# HF_MODELS["vjepa2"] in mminf/model/registry.py.  To swap to vith / vitg /
+# HF_MODELS["vjepa2"] in mstar/model/registry.py.  To swap to vith / vitg /
 # vitg-384, edit that entry — the same code path loads every variant by
 # reading its config.json.
 
