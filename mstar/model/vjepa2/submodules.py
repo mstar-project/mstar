@@ -1113,6 +1113,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 
         return out
 
+    @torch.compiler.disable
     def _rollout_step(
         self,
         encoder_hidden: torch.Tensor,            # [B, H*W, D]
@@ -1190,18 +1191,9 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> NameToTensorList:
         request_info = engine_inputs.single_request_info
-        iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
-        logger.info(
-            "VJepa2ACRolloutPredictorSubmodule.forward: iter=%d encoder_hidden=%s actions=%s states=%s",
-            iter_idx,
-            tuple(encoder_hidden.shape),
-            tuple(actions.shape),
-            tuple(states.shape),
-        )
-
         new_tg = self._rollout_step(
             encoder_hidden, actions, states,
-            t_0=iter_idx,
+            t_0=request_info.dynamic_loop_iter_counts.get("rollout_loop", 0),
             cache_handle=engine_inputs.cache_manager,
             extrinsics=extrinsics,
             request_ids=engine_inputs.request_ids,
