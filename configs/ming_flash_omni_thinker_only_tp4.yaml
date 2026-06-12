@@ -1,0 +1,19 @@
+# Ming-flash-omni-2.0 — thinker-only deploy, TP=4 (last-4-GPU test).
+#
+# Pinned to 4 ranks. Launch with CUDA_VISIBLE_DEVICES=4,5,6,7 so physical
+# GPUs 4-7 map to logical ranks 0-3.
+#
+# WARNING: TP=4 is documented to OOM at ~78.5/80 GB per rank (re-verified
+# 2026-06-08) — the loader's streaming overhead pushes past the 80 GB H100
+# limit. This config exists to run the benchmark within a 4-GPU constraint
+# and capture that behavior; TP=8 is the layout that fits with headroom.
+#
+# TP=4 IS dimensionally valid: 32 heads/4=8, 4 KV heads/4=1, 256 experts/4=64,
+# hidden 4096/4=1024, moe_inter 1024/4=256 — all divide.
+
+model: "ming_flash_omni"
+max_seq_len: 32768
+node_groups:
+  - node_names: [Thinker]
+    ranks: [0, 1, 2, 3]
+    tp_size: 4
