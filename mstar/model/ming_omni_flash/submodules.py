@@ -764,8 +764,14 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        """Stop the ``decode_loop`` when the sampled token is the EOS
-        (``<|role_end|>`` for Ming, token id 156895)."""
+        """Stop the ``thinker_decode_loop`` when the sampled token is the EOS
+        (``<|role_end|>`` for Ming, token id 156895).
+
+        The returned name MUST match the ``Loop(name=...)`` declared in
+        ``get_graph_walk_graphs`` (``thinker_decode_loop``). A mismatch makes
+        the worker's dynamic-loop registry raise ``KeyError(NodeAndGraphWalk(
+        node='decode_loop', ...))`` on the EOS step and crash the rank.
+        """
         new_tokens = outputs.get("new_token") or []
         if not new_tokens:
             return set()
@@ -775,7 +781,7 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         else:
             tok = int(last)
         if tok == self.eos_token_id:
-            return {"decode_loop"}
+            return {"thinker_decode_loop"}
         return set()
 
     def can_batch(self, batch, model_inputs) -> bool:

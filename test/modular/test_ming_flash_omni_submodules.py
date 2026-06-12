@@ -389,6 +389,37 @@ def test_thinker_prepare_inputs_absorbs_engine_kwargs() -> None:
     torch.testing.assert_close(out.input_ids, token_ids)
 
 
+def test_thinker_check_stop_returns_graph_loop_name_on_eos() -> None:
+    """check_stop must return the EXACT Loop name declared in the graph.
+
+    A mismatch (e.g. returning "decode_loop" when the graph declares
+    "thinker_decode_loop") makes the worker's dynamic-loop registry raise
+    KeyError(NodeAndGraphWalk(node='decode_loop', ...)) on the EOS step and
+    crash the rank. This test pins check_stop's output to the actual graph
+    Loop name so the two can't drift.
+    """
+    from mstar.graph.base import Loop
+    from mstar.model.ming_omni_flash.ming_omni_flash_model import MingFlashOmniModel
+
+    sub = _build_thinker_submodule()
+
+    # The decode loop's name as declared by the model graph.
+    model = MingFlashOmniModel.__new__(MingFlashOmniModel)
+    model.config = sub.config
+    walks = model.get_graph_walk_graphs()
+    decode = walks["thinker_decode"]
+    assert isinstance(decode, Loop)
+    graph_loop_name = decode.name
+
+    # EOS token -> check_stop must name that exact loop.
+    eos = sub.eos_token_id
+    stops = sub.check_stop("rid", None, {"new_token": [torch.tensor([eos])]})
+    assert stops == {graph_loop_name}, f"{stops} != {{{graph_loop_name!r}}}"
+
+    # Non-EOS token -> no stop.
+    assert sub.check_stop("rid", None, {"new_token": [torch.tensor([eos + 1])]}) == set()
+
+
 def test_thinker_prepare_inputs_legacy_prefill_walk_still_works() -> None:
     """``prefill`` (the step 3f name) routes the same as prefill_text."""
     sub = _build_thinker_submodule()
