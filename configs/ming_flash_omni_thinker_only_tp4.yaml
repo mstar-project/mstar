@@ -1,0 +1,20 @@
+# Ming-flash-omni-2.0 — thinker-only deploy, TP=4 (4-GPU layout).
+#
+# Pinned to 4 ranks. Launch with CUDA_VISIBLE_DEVICES=4,5,6,7 so physical
+# GPUs 4-7 map to logical ranks 0-3.
+#
+# TP=4 fits in ~57-62 GB per rank (verified 2026-06-12). Earlier notes
+# claimed TP=4 OOM'd at ~78.5/80 GB; that was a load-time bug — params were
+# allocated in fp32 before the bf16 cast, doubling the allocation peak. Fixed
+# in MingFlashOmniModel.get_submodule (cast the meta model to bf16 BEFORE
+# to_empty, so allocation happens directly in bf16).
+#
+# TP=4 IS dimensionally valid: 32 heads/4=8, 4 KV heads/4=1, 256 experts/4=64,
+# hidden 4096/4=1024, moe_inter 1024/4=256 — all divide.
+
+model: "ming_flash_omni"
+max_seq_len: 32768
+node_groups:
+  - node_names: [Thinker]
+    ranks: [0, 1, 2, 3]
+    tp_size: 4
