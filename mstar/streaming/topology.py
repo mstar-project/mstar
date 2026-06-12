@@ -45,13 +45,17 @@ class StreamingGraphEdge(GraphEdge):
 class ConsumerTransitionCtx:
     producer_walk: str
     consumer_walk: str | None        # None on the very first trigger
+    # Unused by qwen3omni's transition fn, but exposed so a future model can
+    # base its transition on the producer's full forward-pass state. This is
+    # the sole reason streaming depends on conductor.request_info; revisit
+    # (e.g. a lighter type) if that dependency direction becomes a problem.
     producer_fwd: CurrentForwardPassInfo
 
 
 @dataclass
 class WalkTransition:
     graph_walk: str | None = None
-    # TODO: hook up metadata if needed
+    # TODO [FUTURE]: hook up metadata if needed
 
 @dataclass
 class Connection:

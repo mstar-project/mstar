@@ -11,7 +11,6 @@ class ChunkPolicy(ABC):
         self.first_chunk_read = True
         self.items_consumed += chunk_size
 
-    # TODO: add graph walks to the methods in the implementors...
     @abstractmethod
     def is_ready(self, buffer_len: int, graph_walk: str | None=None) -> bool:
         """Return True if the buffer has enough items for a chunk."""

@@ -643,6 +643,17 @@ class Worker:
             request_id, consumer_partition
         )
 
+        sbuf._update_buffer()
+        # Note: "Consumed" here means drained into the buffer (high-water index),
+        # not popped out of it. These coincide for non-overlapping policies.
+        # For left-context/sliding-window policies the buffer retains items
+        # past this index as overlap, so a PD re-seed via set_index() would
+        # skip them. No sliding-window consumer spans multiple graph walks;
+        # revisit if that changes.
+        self.worker_graphs_manager.get_fwd_info(
+            request_id, consumer_partition
+        ).consumed_edge_idx[edge_name] = sbuf._current_index
+
         waiting_edge = sbuf.pop_waiting_edge()
         if waiting_edge is not None and waiting_edge.walk_transition is not None \
                                     and waiting_edge.walk_transition != graph_walk:
@@ -693,15 +704,6 @@ class Worker:
                     request_id, consumer_partition,
                     chunk.graph_walk_transition
                 )
-            # "Consumed" here means drained into the buffer (high-water index),
-            # not popped out of it. These coincide for non-overlapping policies.
-            # For left-context/sliding-window policies the buffer retains items
-            # past this index as overlap, so a PD re-seed via set_index() would
-            # skip them — fine today since no sliding-window consumer spans
-            # multiple graph walks; revisit if that changes.
-            self.worker_graphs_manager.get_fwd_info(
-                request_id, consumer_partition
-            ).consumed_edge_idx[edge_name] = sbuf._current_index
         return synthetic_edge
 
     def _poll_stream_buffers_for_speculation(

@@ -79,6 +79,10 @@ class StreamBuffer:
         the duplicate is dropped (first-arrival-wins). This handles the case
         where multiple colocated producer ranks emit the same streaming item.
         """
+        # Counts put attempts, not unique items: incremented before the dedup
+        # return so it stays balanced with ``_num_tensors_registered`` (which
+        # ``pre_read_register`` also bumps once per registered tensor, including
+        # duplicates). ``_producer_done_and_all_read`` relies on that symmetry.
         self._num_buffer_writes += 1
         if index < self._current_index or index in self._tensors:
             return
