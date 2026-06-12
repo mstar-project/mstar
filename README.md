@@ -14,7 +14,7 @@
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;·&nbsp;
   <a href="https://mstar-project.github.io/mstar/"><b>Docs</b></a> &nbsp;·&nbsp;
   <a href="https://mstar-project.github.io/"><b>Blog</b></a> &nbsp;·&nbsp;
-  <a href="https://mstar-project.github.io/mstar.pdf"><b>Paper</b></a>
+  <a href="https://arxiv.org/abs/2606.12688"><b>Paper</b></a>
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
   <img src="https://img.shields.io/badge/python-3.12-22d3ee.svg" alt="Python 3.12">
   <img src="https://img.shields.io/badge/modalities-text_image_audio_video_action-6a8cff.svg" alt="Modalities">
   <a href="https://mstar-project.github.io/mstar/"><img src="https://img.shields.io/badge/docs-online-3b82f6.svg" alt="Docs"></a>
-  <a href="https://mstar-project.github.io/mstar.pdf"><img src="https://img.shields.io/badge/paper-PDF-b31b1b.svg" alt="Paper (PDF)"></a>
+  <a href="https://arxiv.org/abs/2606.12688"><img src="https://img.shields.io/badge/paper-arXiv-b31b1b.svg" alt="Paper (arXiv)"></a>
 </p>
 
 ---
@@ -128,7 +128,7 @@ and schedules it; **Workers** each own a subgraph on their GPU and stream tensor
 another. Logical graph structure is decoupled from physical placement, so the same model runs
 single-GPU or fully disaggregated by changing only the YAML `node_groups`. Four composable
 primitives — `Sequential`, `Parallel`, `Loop`, and a cross-partition
-`StreamingGraphEdge` — express every model family above. See the [paper](https://mstar-project.github.io/mstar.pdf) for the full design.
+`StreamingGraphEdge` — express every model family above. See the [paper](https://arxiv.org/abs/2606.12688) for the full design.
 
 ## Performance
 
@@ -140,7 +140,7 @@ for audio codecs, and persistent-cache loops for world-model rollouts.
 
 Benchmark numbers shift as systems evolve — ours and everyone else's — so rather than freeze figures here
 that go stale, we keep the current results and full methodology in the
-[blog post](https://mstar-project.github.io/) and the [paper](https://mstar-project.github.io/mstar.pdf).
+[blog post](https://mstar-project.github.io/) and the [paper](https://arxiv.org/abs/2606.12688).
 
 ## Contributing
 
@@ -160,7 +160,9 @@ If you use M\* in your research, please cite:
             Sanda, Rohan and Gao, Steven and Horowitz, Mark and Zettlemoyer, Luke and
             Hsu, Olivia and Leskovec, Jure and Kasikci, Baris and Wang, Stephanie},
   year   = {2026},
-  note   = {Preprint}
+  eprint = {2606.12688},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.LG}
 }
 ```
 
