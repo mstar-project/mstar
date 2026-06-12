@@ -12,10 +12,11 @@
 #                                      INSIDE the Talker submodule (it is
 #                                      NOT a separate graph node).
 #
-# Thinker runs TP=8 across all 8 H100s: TP=4 OOMs at ~78.5/80 GB per rank
-# during ckpt streaming (re-verified 2026-06-08), TP=8 halves the
-# footprint to ~40 GB/rank with plenty of headroom. The stateless
-# encoders + the talker are small (~1.5 GB each) and colocate on rank 0.
+# Thinker runs TP=8 across all 8 H100s here to leave room for the
+# colocated talker + encoders. TP=4 also fits the thinker (~57-62 GB/rank,
+# verified 2026-06-12); an earlier fp32-allocation bug made it OOM at
+# ~78.5 GB and is now fixed (see get_submodule). The stateless encoders +
+# the talker are small (~1.5 GB each) and colocate on rank 0.
 #
 # The Thinker→Talker bridge passes DETOKENIZED TEXT (re-tokenized with
 # the talker's own talker/llm tokenizer), so the talker is a near-

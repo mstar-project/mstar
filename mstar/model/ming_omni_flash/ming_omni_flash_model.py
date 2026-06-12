@@ -1450,8 +1450,17 @@ class MingFlashOmniModel(Model):
                 comm_group=tp_group,
             )
         # Materialise + cast to bf16 (matches the released ckpt's torch_dtype).
-        model.to_empty(device=device)
+        #
+        # Cast dtype on the META model FIRST, then `to_empty`. `to_empty`
+        # allocates each Parameter using its current dtype; the meta model's
+        # constructor `torch.empty(...)` calls default to float32, so casting
+        # after allocation means every param is briefly materialised in fp32
+        # (2x the bf16 footprint) before the down-cast. At TP=4 that fp32
+        # allocation peak OOMs at ~78.5/80 GB per rank. Casting the meta model
+        # is metadata-only (no allocation), so `to_empty` then allocates
+        # directly in bf16 — halving the peak and letting TP=4 fit.
         model.to(self.get_autocast_dtype())
+        model.to_empty(device=device)
 
         load_thinker_weights(model, self.local_dir, device=device, strict=True)
         model.eval()

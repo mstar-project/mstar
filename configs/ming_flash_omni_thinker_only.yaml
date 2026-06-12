@@ -5,10 +5,10 @@
 # 31 MoE layers. With embed + lm_head + attention + dense layer 0 +
 # KV cache, ~40 GB per rank fits the 80 GB H100s comfortably.
 #
-# TP=4 OOMs at ~78.5 / 80 GB per rank even with
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (re-verified
-# 2026-06-08; loader streaming overhead pushes past the 80 GB limit).
-# TP=8 halves the model footprint with plenty of headroom.
+# TP=4 also fits (~57-62 GB/rank, verified 2026-06-12) — see
+# configs/ming_flash_omni_thinker_only_tp4.yaml. An earlier fp32-allocation
+# bug made TP=4 OOM at ~78.5 GB; fixed in get_submodule (cast meta model to
+# bf16 before to_empty). TP=8 still leaves the most headroom.
 #
 # Audio / vision / talker / image-gen are step 4+; this config is for
 # text-only T2T benchmarking and the first mstar-served Ming forward.
