@@ -504,7 +504,7 @@ class Worker:
                 partition_name=body.partition_name,
                 allow_graph_walk_transition=body.partition_name not in self._producer_triggered_partitions
             )
-            for edge, idx in body.request_info.consumed_edge_idx.items():
+            for edge, idx in body.request_info.next_stream_index.items():
                 req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
                 if edge in req_info.stream_buffers:
                     req_info.stream_buffers[edge].set_index(idx)
@@ -643,17 +643,6 @@ class Worker:
             request_id, consumer_partition
         )
 
-        sbuf._update_buffer()
-        # Note: "Consumed" here means drained into the buffer (high-water index),
-        # not popped out of it. These coincide for non-overlapping policies.
-        # For left-context/sliding-window policies the buffer retains items
-        # past this index as overlap, so a PD re-seed via set_index() would
-        # skip them. No sliding-window consumer spans multiple graph walks;
-        # revisit if that changes.
-        self.worker_graphs_manager.get_fwd_info(
-            request_id, consumer_partition
-        ).consumed_edge_idx[edge_name] = sbuf._current_index
-
         waiting_edge = sbuf.pop_waiting_edge()
         if waiting_edge is not None and waiting_edge.walk_transition is not None \
                                     and waiting_edge.walk_transition != graph_walk:
@@ -676,6 +665,7 @@ class Worker:
                     next_node=consumer_node,
                     name=edge_name,
                     tensor_info=[],
+                    _next_stream_index=chunk.next_stream_index,
                     _final_stream_chunk=chunk.is_final,
                 )
             else:
@@ -694,6 +684,7 @@ class Worker:
                     next_node=consumer_node,
                     name=edge_name,
                     tensor_info=tensor_infos.get(edge_name, []),
+                    _next_stream_index=chunk.next_stream_index,
                     _final_stream_chunk=chunk.is_final,
                 )
             if chunk.graph_walk_transition is not None and chunk.graph_walk_transition != graph_walk:
@@ -1113,7 +1104,7 @@ class Worker:
                     output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id),
                     per_label_seq_info=fwd_info.per_label_seq_info,
                     new_produced_edge_idx=fwd_info.produced_edge_idx,
-                    new_consumed_edge_idx=fwd_info.consumed_edge_idx,
+                    new_next_stream_index=fwd_info.next_stream_index,
                     # Key by consumer partition (not edge name) so it merges
                     # into the producer pstate's partition-keyed
                     # tracked_consumer_graph_walks on the conductor.
@@ -1650,6 +1641,17 @@ class Worker:
         self, batch_N: PendingBatch,
         output: NodeOutput,
     ):
+        for rid, node in batch_N.batch.node_objects.items():
+            for edge_name, edge in node.ready_signals.ready_inputs.items():
+                # Only synthetic streaming-input edges carry a next stream index;
+                # skip non-streaming inputs (None) so they don't write spurious
+                # zero entries into the reported next_stream_index.
+                if edge._next_stream_index is None:
+                    continue
+                self.worker_graphs_manager.get_fwd_info(
+                    rid, batch_N.partition
+                ).next_stream_index[edge_name] = edge._next_stream_index
+
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
         self._cleanup_consumed_inputs(batch_N.batch)

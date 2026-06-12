@@ -304,6 +304,13 @@ class WorkerGraphsManager:
                     current_fwd_info.produced_edge_idx[name] = max(
                         current_fwd_info.produced_edge_idx.get(name, 0), idx
                     )
+                # The conductor's per_label_seq_info lags (refreshed only at
+                # WorkerGraphsDone), so the wholesale replace below could rewind
+                # the KV write position mid-decode and overwrite live KV. Keep
+                # the locally-advanced (longer) per-(cache, label) seq info.
+                current_fwd_info.per_label_seq_info.merge_keep_longest(
+                    old_fwd_info.per_label_seq_info
+                )
             if allow_graph_walk_transition:
                 self.update_graph_walk(request_id, partition_name, current_fwd_info.graph_walk)
             else:

@@ -803,7 +803,7 @@ class Conductor:
                         max_tokens=request_data.max_output_tokens,
                         sampling_config=request_data.sampling_config,
                         produced_edge_idx=pstate.produced_edge_idx,
-                        consumed_edge_idx=pstate.consumed_edge_idx,
+                        next_stream_index=pstate.next_stream_index,
                         tracked_consumer_graph_walks=pstate.tracked_consumer_graph_walks,
                     ),
                 )
@@ -897,8 +897,8 @@ class Conductor:
         # rewind the index, re-emitting an already-used one. Merge with max.
         for name, idx in body.new_produced_edge_idx.items():
             pstate.produced_edge_idx[name] = max(pstate.produced_edge_idx.get(name, 0), idx)
-        for name, idx in body.new_consumed_edge_idx.items():
-            pstate.consumed_edge_idx[name] = max(pstate.consumed_edge_idx.get(name, 0), idx)
+        for name, idx in body.new_next_stream_index.items():
+            pstate.next_stream_index[name] = max(pstate.next_stream_index.get(name, 0), idx)
         # Unlike the indices above, graph walks have no ordering to max-merge on,
         # so this is a plain last-writer-wins update. Contract: a reporting rank
         # must send either the correct (just-applied) consumer walk or nothing —
@@ -1024,7 +1024,7 @@ class Conductor:
         else:
             # Call even with no inputs: a no-op for self-triggering partitions
             # (empty inputs_per_worker → no messages), but lets producer-triggered
-            # consumers get seeded (PD) / their consumed_edge_idx propagated.
+            # consumers get seeded (PD) / their next_stream_index propagated.
             self._send_partition_inputs(request_id, partition_name, fwd_args)
 
         self._un_persist_tensors(request_id, fwd_args.unpersist_tensors)
@@ -1077,7 +1077,7 @@ class Conductor:
                         max_tokens=request_data.max_output_tokens,
                         sampling_config=request_data.sampling_config,
                         produced_edge_idx=pstate.produced_edge_idx,
-                        consumed_edge_idx=pstate.consumed_edge_idx,
+                        next_stream_index=pstate.next_stream_index,
                         tracked_consumer_graph_walks=pstate.tracked_consumer_graph_walks,
                     ),
                     partition_name=partition_name

@@ -48,6 +48,23 @@ class PerLabelSeqInfo:
                 **val
             }
 
+    def merge_keep_longest(self, other: "PerLabelSeqInfo"):
+        """Merge ``other`` into self, keeping — per (kv_cache_string, rank,
+        label) — the ``SequenceInfo`` with the larger ``seq_len``.
+
+        Used on the worker to stop a lagging conductor copy from rewinding a
+        request's locally-advanced KV sequence positions: a request's KV length
+        only ever grows, so the longer entry is always the more recent one.
+        """
+        for key, label_info in other.info.items():
+            dst = self.info.setdefault(key, {})
+            for label, seq_info in label_info.items():
+                cur = dst.get(label)
+                if cur is None or seq_info.seq_len > cur.seq_len:
+                    dst[label] = seq_info
+        for kv_cache_str, ws in other.world_size.items():
+            self.world_size.setdefault(kv_cache_str, ws)
+
     def get(self, kv_cache_str: str, rank: int) -> dict:
         return self.info.get((kv_cache_str, rank), {})
 
@@ -77,7 +94,7 @@ class CurrentForwardPassInfo:
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")
     produced_edge_idx: dict[str, int] = field(default_factory=dict)
-    consumed_edge_idx: dict[str, int] = field(default_factory=dict)
+    next_stream_index: dict[str, int] = field(default_factory=dict)
     tracked_consumer_graph_walks: dict[str, str] = field(default_factory=dict)
 
     # Per-loop stop indices; stop decisions come from each submodule's check_stop.
@@ -141,7 +158,9 @@ class PartitionState:
     is_done: bool = False
     # streaming edge name -> number of times this edge has been emitted
     produced_edge_idx: dict[str, int] = field(default_factory=dict)
-    consumed_edge_idx: dict[str, int] = field(default_factory=dict)
+    # streaming edge name -> next stream index the consumer should drain
+    # (one past the last index a completed consumer pass has consumed)
+    next_stream_index: dict[str, int] = field(default_factory=dict)
     # only for producer-driven graph walk transitions
     tracked_consumer_graph_walks: dict[str, str] = field(default_factory=dict)
     new_tokens: dict[str, list[int]] = field(default_factory=dict)

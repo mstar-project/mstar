@@ -12,6 +12,10 @@ class StreamChunk:
     """A chunk of data popped from a StreamBuffer."""
     data: dict[str, torch.Tensor | None]
     chunk_index: int
+    # the next stream index to drain after this chunk is consumed (one past the
+    # last item in the chunk); used to re-seed a worker that takes over the
+    # partition (e.g. prefill->decode PD handoff)
+    next_stream_index: int
     start_offset: int = 0  # global position of the first item in this chunk
     is_final: bool = False
     graph_walk_transition: str | None = None
@@ -213,6 +217,7 @@ class StreamBuffer:
         chunk = StreamChunk(
             data=self._collate([it.tensor for it in items]),
             chunk_index=self._chunks_popped,
+            next_stream_index=items[-1].index + 1 if items else self._current_index,
             start_offset=offset,
             is_final=is_final,
             graph_walk_transition=transition,
