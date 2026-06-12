@@ -46,12 +46,18 @@ from mstar.engine.base import EngineType
 from mstar.engine.kv_store import KVCacheConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, MAX_OUTPUT_TOKENS, Model, TensorAndMetadata
+from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import Operation, WeightConverter
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
-from mstar.streaming.topology import Connection, ConsumerTransitionCtx, PartitionTopology, StreamingGraphEdge, WalkTransition
+from mstar.streaming.topology import (
+    Connection,
+    ConsumerTransitionCtx,
+    PartitionTopology,
+    StreamingGraphEdge,
+    WalkTransition,
+)
 from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
@@ -451,7 +457,7 @@ class Qwen3OmniModel(Model):
             if ctx.consumer_walk == "talker_prefill":
                 return WalkTransition("talker_last_prefill")
             return WalkTransition("talker_decode")
-            
+
         return PartitionTopology(
             partitions=["Thinker", "Talker", "Code2Wav"],
             connections=[

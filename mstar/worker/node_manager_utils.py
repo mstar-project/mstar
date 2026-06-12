@@ -18,7 +18,6 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, SPECIAL_DESTINATIONS
 from mstar.model.base import WorkerGraph
 from mstar.streaming.stream_buffer import StreamBuffer
-from mstar.streaming.topology import StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +192,7 @@ class PerPartitionInfo:
     # graph_walk_worker_graph_ids = worker graphs for current graph walk
     graph_walk_worker_graph_ids: list[str] = field(default_factory=list) # for this worker
     stream_partition_done: bool = False  # set True when last chunk pops with is_final
-    
+
     # edges that are pending a producer-triggered graph walk transition
     # {graph walk -> edges}
     pending_edges: dict[str, list[GraphEdge]] = field(default_factory=dict)
@@ -319,7 +318,7 @@ class WorkerGraphsManager:
         if per_label_seq_info is not None:
             fwd_info = self.get_fwd_info(request_id, partition_name)
             fwd_info.per_label_seq_info.update(per_label_seq_info)
-    
+
     def update_graph_walk(self, request_id: str, partition_name: str, graph_walk: str):
         part_info = self.per_request_info[request_id].per_partition_info[partition_name]
         if self.get_graph_walk(request_id, partition_name) != graph_walk:
@@ -353,7 +352,7 @@ class WorkerGraphsManager:
     def get_partition_for_node(self, node_name: str) -> str | None:
         """Look up which partition a node belongs to."""
         return self.node_to_partition.get(node_name)
-    
+
     def partition_clean(self, request_id: str, partition_name: str) -> bool:
         if request_id not in self.per_request_info:
             return True

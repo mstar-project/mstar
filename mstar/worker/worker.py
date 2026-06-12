@@ -461,7 +461,7 @@ class Worker:
             self.tensor_manager.dereference(
                 body.request_id, uuid, n=ref_cnt
             )
-    
+
     def _handle_producer_done(self, body: ProducerDone) -> None:
         # Handle producer_done signal: mark all StreamBuffers for this request as done
         req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
@@ -642,7 +642,7 @@ class Worker:
         graph_walk = self.worker_graphs_manager.get_graph_walk(
             request_id, consumer_partition
         )
-        
+
         waiting_edge = sbuf.pop_waiting_edge()
         if waiting_edge is not None and waiting_edge.walk_transition is not None \
                                     and waiting_edge.walk_transition != graph_walk:

@@ -21,7 +21,7 @@ class StreamingGraphEdge(GraphEdge):
 
     def __post_init__(self):
         self.is_streaming = True
-    
+
     def clone(self):
         return StreamingGraphEdge(
             next_node=self.next_node,

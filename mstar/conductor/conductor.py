@@ -759,7 +759,7 @@ class Conductor:
                 body.request_id, p.name, fwd_args.full_metadata.graph_walk,
             )
             partition_fwd_args[p.name] = fwd_args
-        
+
         # set up tracked_consumer_graph_walks
         for conn in topology.connections:
             producer = partition_states[conn.from_partition]
@@ -890,7 +890,7 @@ class Conductor:
                 partition_name, body.request_id,
             )
             return []
-        
+
         # Stream indices are monotonic, but only the emitting TP rank advances
         # them; sibling ranks report the (stale) seed they were given. With
         # last-writer-wins .update(), a sibling landing after the emitter would
