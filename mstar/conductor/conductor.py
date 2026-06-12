@@ -1091,6 +1091,7 @@ class Conductor:
     ):
         """Send producer_done signal to the consumer partition's worker(s)."""
         request_data = self.requests[request_id]
+        pstate = request_data.partition_states[producer_partition]
 
         # Find which workers handle this consumer partition
         consumer_workers = set()
@@ -1106,6 +1107,7 @@ class Conductor:
                 body=ProducerDone(
                     request_id=request_id,
                     partition_name=consumer_partition_name,
+                    last_produced_edge_idx=pstate.produced_edge_idx,
                     producer_done=set([producer_partition]),
                 ),
             )

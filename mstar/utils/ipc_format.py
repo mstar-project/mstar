@@ -63,6 +63,7 @@ class InputSignals(MessageBody):
 class ProducerDone(MessageBody):
     request_id: str
     partition_name: str
+    last_produced_edge_idx: dict[str, int]
     producer_done: set = field(default_factory=set)
 
 

@@ -470,7 +470,9 @@ class Worker:
                 if sbuf.from_partition in body.producer_done:
                     # If we have multiple consumer partitions colocated, we need to signal
                     # the right one
-                    sbuf.signal_done()
+                    sbuf.signal_done(
+                        body.last_produced_edge_idx.get(sbuf.edge_name)
+                    )
 
     def _process_new_inputs(self, body: InputSignals) -> None:
         logger.debug(

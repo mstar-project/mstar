@@ -59,6 +59,7 @@ class StreamBuffer:
     _consumed: int = 0
     _chunks_popped: int = 0
     producer_done: bool = False
+    _producer_edge_idx: int | None = None
 
     _num_tensors_registered = 0
     _num_buffer_writes = 0
@@ -96,9 +97,10 @@ class StreamBuffer:
             graph_walk=graph_walk,
         )
 
-    def signal_done(self) -> None:
+    def signal_done(self, producer_edge_idx: int | None=None) -> None:
         """Producer signals no more items will arrive."""
         self.producer_done = True
+        self._producer_edge_idx = producer_edge_idx
 
     def set_index(self, index: int):
         """Seed the next index to drain (e.g. when a new consumer worker takes
@@ -112,8 +114,10 @@ class StreamBuffer:
         self._current_index = max(self._current_index, index)
 
     def _producer_done_and_all_read(self) -> bool:
-        return self.producer_done and \
-            self._num_buffer_writes >= self._num_tensors_registered
+        return self.producer_done and (
+            self._producer_edge_idx is None or \
+                self._current_index >= self._producer_edge_idx
+            )  and self._num_buffer_writes >= self._num_tensors_registered
 
     def pop_waiting_edge(self) -> WaitingEdge | None:
         if len(self._waiting_graph_edges) > 0:
