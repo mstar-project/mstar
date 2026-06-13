@@ -588,25 +588,27 @@ class Pi05Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, autocast_dtype=autocast_dtype)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Successfully loaded Pi0.5 submodule for %s", node_name)
         return submodule
 
     def _create_submodule(
-        self, node_name: str, device: str
+        self, node_name: str, device: str,
+        autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule | None:
         if node_name == "vit_encoder":
-            self._init_vit_components(device)
+            self._init_vit_components(device, autocast_dtype=autocast_dtype)
             return Pi05ViTEncoderSubmodule(
                 encoder=self.siglip, config=self.config
             )
         if node_name == "LLM":
-            self._init_llm_components(device)
+            self._init_llm_components(device, autocast_dtype=autocast_dtype)
             return Pi05LLMSubmodule(
                 embed_tokens=self.embed_tokens,
                 paligemma=self.paligemma,
@@ -618,7 +620,7 @@ class Pi05Model(Model):
             )
         return None
 
-    def _init_vit_components(self, device: str):
+    def _init_vit_components(self, device: str, autocast_dtype: torch.dtype | None = None):
         if self.siglip is not None:
             return
         # Construct on the "meta" device — a special PyTorch device that
@@ -632,6 +634,10 @@ class Pi05Model(Model):
         # pattern HuggingFace ``from_pretrained`` uses under the hood.
         with torch.device("meta" if not self.skip_weight_loading else "cpu"):
             self.siglip = Pi05SiglipEncoder(self.config)
+        # Cast before to_empty (no allocation on meta) so storage is allocated
+        # directly in the target dtype instead of fp32-then-downcast.
+        if autocast_dtype is not None:
+            self.siglip = self.siglip.to(autocast_dtype)
         if self.skip_weight_loading:
             self.siglip = self.siglip.to_empty(device=device)
             _reset_non_persistent_buffers(self.siglip, device)
@@ -658,7 +664,7 @@ class Pi05Model(Model):
         siglip_sd = self._extract_siglip_state_dict(flat)
         load_hf_weights(self.siglip, siglip_sd.items())
 
-    def _init_llm_components(self, device: str):
+    def _init_llm_components(self, device: str, autocast_dtype: torch.dtype | None = None):
         if self.embed_tokens is not None:
             return
         # See ``_init_vit_components`` for why we build on the meta device:
@@ -691,6 +697,10 @@ class Pi05Model(Model):
                 self.action_out_proj,
                 self.time_mlp,
             ):
+                # Cast before to_empty (no allocation on meta) so storage is
+                # allocated directly in the target dtype.
+                if autocast_dtype is not None:
+                    mod.to(autocast_dtype)
                 mod.to_empty(device=device)
             return
 
@@ -707,6 +717,10 @@ class Pi05Model(Model):
             action_out_proj=self.action_out_proj,
             time_mlp=self.time_mlp,
         )
+        # Cast before to_empty (no allocation on meta) so storage is allocated
+        # directly in the target dtype instead of fp32-then-downcast.
+        if autocast_dtype is not None:
+            wrapper = wrapper.to(autocast_dtype)
         wrapper.to_empty(device=device)
         load_hf_weights(
             wrapper,
