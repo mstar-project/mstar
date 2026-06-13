@@ -14,7 +14,7 @@ These tests pin the contract with a tiny module so they run CPU-only:
     explicitly avoid (documented here so the intent is greppable).
 """
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 def _build_meta_module() -> nn.Module:
