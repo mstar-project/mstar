@@ -130,9 +130,15 @@ class Cosmos3Config:
 
     # ----- default sampling (overridable per request / yaml) -----
     # Number of denoise model evaluations. The per-mode cookbook defaults are
-    # t2i 50, t2v/i2v 35, action fd/id 30, DROID policy ~4; the value here is
-    # the t2i default and drives the denoise loop's iteration count.
+    # t2i 50, t2v/i2v 35, action fd/id 30, DROID policy ~4. ``num_inference_steps``
+    # is the image default; ``num_inference_steps_video`` is the video default.
+    # A request may override either; the value is clamped to ``max_inference_steps``.
     num_inference_steps: int = 50
+    num_inference_steps_video: int = 35
+    # Upper bound on the denoise loop's iteration count. The loop is built with
+    # this many iterations and each request stops early at its own step count, so
+    # one graph serves any per-request step count up to this cap.
+    max_inference_steps: int = 100
 
     # ----- sub-configs -----
     vae: Cosmos3VAEConfig = field(default_factory=Cosmos3VAEConfig)
