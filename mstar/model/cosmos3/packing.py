@@ -83,6 +83,83 @@ def get_3d_mrope_ids_vae_tokens(
     return mrope_ids, next_temporal_offset
 
 
+def get_3d_mrope_ids_action_tokens(
+    grid_t: int,
+    temporal_offset: int | float,
+    action_fps: float | None,
+    base_fps: float = 24.0,
+    base_temporal_compression_factor: int = 4,
+    start_frame_offset: int = 1,
+) -> tuple[torch.Tensor, int | float]:
+    """Action tokens: a frame-rate ``(T, 1, 1)`` temporal grid sharing the media
+    offset with the vision band. The action stream is uncompressed in time
+    (``temporal_compression_factor=1``) but its rate is expressed in the same
+    base-fps units as the vision latents (``base_temporal_compression_factor``),
+    so an action chunk lines up temporally with the conditioning video."""
+    return get_3d_mrope_ids_vae_tokens(
+        grid_t=grid_t,
+        grid_h=1,
+        grid_w=1,
+        temporal_offset=temporal_offset,
+        reset_spatial_indices=True,
+        fps=action_fps,
+        base_fps=base_fps,
+        temporal_compression_factor=1,
+        base_temporal_compression_factor=base_temporal_compression_factor,
+        start_frame_offset=start_frame_offset,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Action conditioning layout (ported from vllm-omni ``action.py``). Each mode
+# fixes which latent video frames and which action tokens are clean context vs
+# noisy/predicted:
+#   * forward_dynamics  -- action is the condition (all clean); video frame 0 is
+#                          clean, the rest are predicted.
+#   * inverse_dynamics  -- video is the condition (all latent frames clean);
+#                          every action token is predicted.
+#   * policy            -- video frame 0 is clean (the rest predicted) and every
+#                          action token is predicted.
+# ---------------------------------------------------------------------------
+
+ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
+ACTION_MODE_INVERSE_DYNAMICS = "inverse_dynamics"
+ACTION_MODE_POLICY = "policy"
+ACTION_MODES = (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_INVERSE_DYNAMICS, ACTION_MODE_POLICY)
+
+
+def action_condition_frame_indexes(mode: str, action_length: int) -> list[int]:
+    """Clean (conditioning) action tokens for ``mode``."""
+    if mode == ACTION_MODE_FORWARD_DYNAMICS:
+        return list(range(action_length))
+    if mode in (ACTION_MODE_INVERSE_DYNAMICS, ACTION_MODE_POLICY):
+        return []
+    raise ValueError(f"Unknown Cosmos3 action mode: {mode!r}")
+
+
+def vision_condition_frame_indexes(mode: str, latent_frames: int) -> list[int]:
+    """Clean (conditioning) latent video frames for ``mode``."""
+    if mode in (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_POLICY):
+        return [0]
+    if mode == ACTION_MODE_INVERSE_DYNAMICS:
+        return list(range(latent_frames))
+    raise ValueError(f"Unknown Cosmos3 action mode: {mode!r}")
+
+
+def action_start_frame_offset(action_length: int, video_length: int) -> int:
+    """mRoPE start-frame offset for the action band: action chunks of length
+    ``num_frames - 1`` start one frame in (aligned to predicted frames 1..N);
+    a full ``num_frames`` chunk starts at 0."""
+    if action_length == video_length - 1:
+        return 1
+    if action_length == video_length:
+        return 0
+    raise ValueError(
+        "Cosmos3 action_chunk_size must equal num_frames - 1 or num_frames; "
+        f"got action_chunk_size={action_length}, num_frames={video_length}."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Prompt tokenization — ported from pipeline.tokenize_prompt. Image mode
 # (num_frames == 1) and video mode differ only in the system prompt and the
@@ -212,20 +289,31 @@ def build_vision_segment(
     config,
     vae_scale_factor_temporal: int,
     device,
+    noisy_frames: list[int] | None = None,
 ) -> dict[str, Any]:
-    """``latent_shape`` is the vision latent tensor shape ``[B, C, T, H, W]``."""
+    """``latent_shape`` is the vision latent tensor shape ``[B, C, T, H, W]``.
+
+    ``noisy_frames`` lists the latent frames that are noisy (predicted); the rest
+    are clean conditioning context. When ``None`` it defaults to frame 0 clean
+    if ``has_image_condition`` else all frames noisy — i.e. the t2i/t2v/i2v
+    layouts. Action modes pass an explicit list (e.g. ``[]`` for
+    inverse-dynamics, where the whole video is conditioning)."""
     p = config.latent_patch_size
     _, _, latent_t, latent_h, latent_w = latent_shape
     patch_h = math.ceil(latent_h / p)
     patch_w = math.ceil(latent_w / p)
     num_vision_tokens = latent_t * patch_h * patch_w
 
-    noisy_start = 1 if has_image_condition else 0
-    noisy_frame_indexes = torch.arange(noisy_start, latent_t, device=device, dtype=torch.long)
+    if noisy_frames is None:
+        noisy_start = 1 if has_image_condition else 0
+        noisy_list = list(range(noisy_start, latent_t))
+    else:
+        noisy_list = sorted(noisy_frames)
+    noisy_frame_indexes = torch.tensor(noisy_list, device=device, dtype=torch.long)
 
     frame_token_stride = patch_h * patch_w
     mse_loss_indexes: list[int] = []
-    for frame_idx in range(noisy_start, latent_t):
+    for frame_idx in noisy_list:
         frame_start = curr + frame_idx * frame_token_stride
         mse_loss_indexes.extend(range(frame_start, frame_start + frame_token_stride))
 
@@ -248,7 +336,7 @@ def build_vision_segment(
         "vision_noisy_frame_indexes": [noisy_frame_indexes],
         "vision_mrope_ids": vision_mrope_ids.to(device),
         "num_vision_tokens": num_vision_tokens,
-        "num_noisy_vision_tokens": (latent_t - noisy_start) * frame_token_stride,
+        "num_noisy_vision_tokens": len(noisy_list) * frame_token_stride,
     }
 
 
@@ -301,3 +389,76 @@ def build_t2i_static_inputs(
         input_ids, latent_shape, config, vae_scale_factor_temporal, fps, device,
         has_image_condition=False,
     )
+
+
+def build_action_static_inputs(
+    input_ids: list[int],
+    video_latent_shape: tuple[int, int, int, int, int],
+    action_chunk_size: int,
+    mode: str,
+    config,
+    vae_scale_factor_temporal: int,
+    fps: float,
+    action_fps: float,
+    action_start_offset: int,
+    device,
+) -> dict[str, Any]:
+    """Assemble the static transformer inputs for joint video+action generation.
+
+    The generation sequence is ``[video tokens | action tokens]`` after the text
+    prefix. Both media bands share the post-text temporal offset (the 15000
+    margin), with the action band on its own frame-rate grid. Conditioning per
+    ``mode`` decides which video frames and action tokens are clean context vs
+    noisy/predicted (see :func:`vision_condition_frame_indexes` /
+    :func:`action_condition_frame_indexes`)."""
+    text = build_text_segment(input_ids, config, device)
+    media_offset = text["vision_start_temporal_offset"]
+    _, _, latent_t, _, _ = video_latent_shape
+
+    vision_clean = set(vision_condition_frame_indexes(mode, latent_t))
+    vision_noisy = [f for f in range(latent_t) if f not in vision_clean]
+    vision = build_vision_segment(
+        latent_shape=video_latent_shape,
+        has_image_condition=False,
+        mrope_offset=media_offset,
+        vision_fps=fps,
+        curr=text["und_len"],
+        config=config,
+        vae_scale_factor_temporal=vae_scale_factor_temporal,
+        device=device,
+        noisy_frames=vision_noisy,
+    )
+
+    curr = text["und_len"] + vision["num_vision_tokens"]
+    action_clean = set(action_condition_frame_indexes(mode, action_chunk_size))
+    action_noisy = [a for a in range(action_chunk_size) if a not in action_clean]
+    effective_action_fps = action_fps if config.enable_fps_modulation else None
+    action_mrope_ids, _ = get_3d_mrope_ids_action_tokens(
+        grid_t=action_chunk_size,
+        temporal_offset=media_offset,
+        action_fps=effective_action_fps,
+        base_fps=float(config.base_fps),
+        base_temporal_compression_factor=vae_scale_factor_temporal,
+        start_frame_offset=action_start_offset,
+    )
+
+    parts = [text["text_mrope_ids"], vision["vision_mrope_ids"], action_mrope_ids.to(device)]
+    pos_dtype = torch.float32 if any(p.is_floating_point() for p in parts) else torch.long
+    position_ids = torch.cat([p.to(pos_dtype) for p in parts], dim=1)
+
+    return {
+        **text,
+        **vision,
+        "action_token_shapes": [(action_chunk_size, 1, 1)],
+        "action_sequence_indexes": torch.arange(curr, curr + action_chunk_size, dtype=torch.long, device=device),
+        "action_noisy_frame_indexes": [torch.tensor(action_noisy, dtype=torch.long, device=device)],
+        "action_mse_loss_indexes": torch.tensor(
+            [curr + a for a in action_noisy], dtype=torch.long, device=device
+        ),
+        "action_mrope_ids": action_mrope_ids.to(device),
+        "num_action_tokens": action_chunk_size,
+        "num_noisy_action_tokens": len(action_noisy),
+        "action_mode": mode,
+        "position_ids": position_ids,
+        "sequence_length": curr + action_chunk_size,
+    }
