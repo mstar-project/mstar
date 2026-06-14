@@ -590,25 +590,35 @@ class Pi05Model(Model):
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
+        # NOTE: ``autocast_dtype`` is accepted for interface parity but
+        # deliberately NOT applied at param allocation. Pi0.5's submodules
+        # (Pi05ViTEncoderSubmodule / Pi05LLMSubmodule) override ``to()`` to
+        # keep precision-sensitive params in fp32 — the SigLIP vision tower
+        # entirely, and the transformer norm params — matching lerobot's
+        # ``to_bfloat16_for_selected_params``. Meta-casting to bf16 before
+        # ``to_empty`` would load those weights into bf16 storage and lose
+        # precision that the post-load fp32 upcast cannot recover (~0.2 abs
+        # delta on final actions). So we load in fp32 and let the submodule
+        # ``to()`` overrides do the selective down-cast. Pi0.5 (~14 GB) does
+        # not hit the load-time OOM this hint addresses.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, autocast_dtype=autocast_dtype)
+        submodule = self._create_submodule(node_name, device)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Successfully loaded Pi0.5 submodule for %s", node_name)
         return submodule
 
     def _create_submodule(
-        self, node_name: str, device: str,
-        autocast_dtype: torch.dtype | None = None,
+        self, node_name: str, device: str
     ) -> NodeSubmodule | None:
         if node_name == "vit_encoder":
-            self._init_vit_components(device, autocast_dtype=autocast_dtype)
+            self._init_vit_components(device)
             return Pi05ViTEncoderSubmodule(
                 encoder=self.siglip, config=self.config
             )
         if node_name == "LLM":
-            self._init_llm_components(device, autocast_dtype=autocast_dtype)
+            self._init_llm_components(device)
             return Pi05LLMSubmodule(
                 embed_tokens=self.embed_tokens,
                 paligemma=self.paligemma,
@@ -620,7 +630,7 @@ class Pi05Model(Model):
             )
         return None
 
-    def _init_vit_components(self, device: str, autocast_dtype: torch.dtype | None = None):
+    def _init_vit_components(self, device: str):
         if self.siglip is not None:
             return
         # Construct on the "meta" device — a special PyTorch device that
@@ -634,10 +644,6 @@ class Pi05Model(Model):
         # pattern HuggingFace ``from_pretrained`` uses under the hood.
         with torch.device("meta" if not self.skip_weight_loading else "cpu"):
             self.siglip = Pi05SiglipEncoder(self.config)
-        # Cast before to_empty (no allocation on meta) so storage is allocated
-        # directly in the target dtype instead of fp32-then-downcast.
-        if autocast_dtype is not None:
-            self.siglip = self.siglip.to(autocast_dtype)
         if self.skip_weight_loading:
             self.siglip = self.siglip.to_empty(device=device)
             _reset_non_persistent_buffers(self.siglip, device)
@@ -664,7 +670,7 @@ class Pi05Model(Model):
         siglip_sd = self._extract_siglip_state_dict(flat)
         load_hf_weights(self.siglip, siglip_sd.items())
 
-    def _init_llm_components(self, device: str, autocast_dtype: torch.dtype | None = None):
+    def _init_llm_components(self, device: str):
         if self.embed_tokens is not None:
             return
         # See ``_init_vit_components`` for why we build on the meta device:
@@ -697,10 +703,6 @@ class Pi05Model(Model):
                 self.action_out_proj,
                 self.time_mlp,
             ):
-                # Cast before to_empty (no allocation on meta) so storage is
-                # allocated directly in the target dtype.
-                if autocast_dtype is not None:
-                    mod.to(autocast_dtype)
                 mod.to_empty(device=device)
             return
 
@@ -717,10 +719,6 @@ class Pi05Model(Model):
             action_out_proj=self.action_out_proj,
             time_mlp=self.time_mlp,
         )
-        # Cast before to_empty (no allocation on meta) so storage is allocated
-        # directly in the target dtype instead of fp32-then-downcast.
-        if autocast_dtype is not None:
-            wrapper = wrapper.to(autocast_dtype)
         wrapper.to_empty(device=device)
         load_hf_weights(
             wrapper,
