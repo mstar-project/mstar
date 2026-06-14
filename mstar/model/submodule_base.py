@@ -165,6 +165,12 @@ class NodeSubmodule(torch.nn.Module):
     """Base class for a model's compute units: defines the prepare_inputs →
     preprocess → forward(_batched) contract the engines drive."""
 
+    # Set True on a submodule whose forward does not benefit from (or is broken
+    # by) torch.compile — e.g. a data-dependent denoise loop, or a one-shot
+    # forward where the trace cost dwarfs the win. The KV-cache / stateless
+    # engines skip compiling such submodules (CUDA-graph capture is unaffected).
+    disable_torch_compile: bool = False
+
     def get_device(self):
         return next(self.parameters()).device
 
