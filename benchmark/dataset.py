@@ -735,7 +735,7 @@ class DROIDDataset(BaseDataset):
                 f"No video keys found in {self.HF_REPO}/meta/info.json. "
                 f"Top-level keys: {list(info.keys())}"
             )
-        
+
         if task == "pi05":
             assert all((key in camera_keys for key in self.PI05_KEYS)),  \
                 f"Expected camera keys {self.PI05_KEYS} not all found in {camera_keys}"
