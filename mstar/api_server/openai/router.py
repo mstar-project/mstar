@@ -12,7 +12,12 @@ import json
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from mstar.api_server.openai import serving_chat, serving_images, serving_speech
+from mstar.api_server.openai import (
+    serving_chat,
+    serving_images,
+    serving_speech,
+    serving_videos,
+)
 from mstar.api_server.openai._util import now
 from mstar.api_server.openai.adapters import get_adapter
 from mstar.api_server.openai.protocol import (
@@ -21,6 +26,7 @@ from mstar.api_server.openai.protocol import (
     ModelCard,
     ModelList,
     SpeechRequest,
+    VideoGenerationRequest,
 )
 
 router = APIRouter()
@@ -108,6 +114,18 @@ async def images_generations(request: ImageGenerationRequest):
         return err
     try:
         result = await serving_images.create_images(api, model_name, adapter, request)
+    except Exception as e:  # noqa: BLE001
+        return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+    return JSONResponse(result)
+
+
+@router.post("/v1/videos/generations")
+async def videos_generations(request: VideoGenerationRequest):
+    api, model_name, adapter, err = _resolve("supports_videos")
+    if err is not None:
+        return err
+    try:
+        result = await serving_videos.create_videos(api, model_name, adapter, request)
     except Exception as e:  # noqa: BLE001
         return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
     return JSONResponse(result)
