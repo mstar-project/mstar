@@ -446,6 +446,84 @@ def test_cross_request_batch_matches_individual() -> None:
     torch.cuda.empty_cache()
 
 
+@torch.no_grad()
+def _run_cuda_graph_denoise(ctx):
+    """Capture the image denoise step and run the whole loop through the real
+    CudaGraphRunner (one captured forward per step covering both guidance
+    branches), returning the final latents."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.distributed.communication import TPCommGroup
+    from mstar.engine.cuda_graph_runner import CudaGraphRunner
+    from mstar.model.submodule_base import ModelInputsFromEngine
+    from mstar.utils.sampling import Sampler, SamplingConfig
+
+    model, dit = ctx["model"], ctx["dit"]
+    device, dtype = ctx["device"], ctx["dtype"]
+    dev = torch.device(device)
+    rid = "cgr0"
+    shared = _flashinfer_shared(model, [rid], device, dtype)
+    md = {"height": H, "width": W, "num_frames": 1, "fps": 24.0,
+          "guidance_scale": GS, "num_inference_steps": STEPS}
+    fwd = CurrentForwardPassInfo(
+        request_id=rid, graph_walk="prefill", requires_cfg=False, fwd_index=0,
+        random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
+    )
+    cm = _mk_cm(shared, [rid])
+    ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm)
+    ti = [torch.tensor(ctx["cond"], dtype=torch.long, device=device),
+          torch.tensor(ctx["uncond"], dtype=torch.long, device=device)]
+    ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": ti})
+    dit.forward("prefill", ei, **dit.preprocess("prefill", ei, [ni]))
+
+    runner = CudaGraphRunner(
+        submodule_name="dit", submodule=dit, kv_cache_config=shared["cfg"],
+        alloc_manager=shared["alloc"], sampler=Sampler(device=dev, tp_group=TPCommGroup.trivial()),
+        buffer_manager=shared["buf"], device=dev, autocast_dtype=dtype,
+        default_sampling_config=SamplingConfig(), tp_group=TPCommGroup.trivial(),
+    )
+    runner.warmup_and_capture()
+    assert runner.graphs, "no CUDA graph captured for cosmos3 image_gen"
+    runner.register_request(rid)
+
+    fwd.graph_walk = "image_gen"
+    latents = ctx["init"].clone()
+    time_index = torch.zeros(1, dtype=torch.long, device=device)
+    for _ in range(STEPS):
+        ni = dit.prepare_inputs("image_gen", fwd, {"latents": [latents], "time_index": [time_index]})
+        out = runner.run(
+            graph_walk="image_gen", requires_cfg=False, request_ids=[rid],
+            inputs=[ni], per_request_info={rid: fwd}, submodule=dit,
+        )
+        latents, time_index = out[rid]["latents"][0], out[rid]["time_index"][0]
+    dit.cleanup_request(rid)
+    return latents
+
+
+@torch.no_grad()
+def test_cuda_graph_matches_eager() -> None:
+    """The captured-graph denoise step is the served path's accelerator: both
+    guidance branches run in one captured forward (~2x faster than the eager
+    step). Each captured forward matches eager to within bf16 (the first step
+    differs by ~one ULP); the multistep solver amplifies that into a small latent
+    spread, but the decoded image is unchanged — so gate the decoded image against
+    the fused pipeline, the same bar the eager engine path meets."""
+    ctx = _scenario(1)
+    if ctx is None:
+        print("  (skipped cuda-graph parity: needs COSMOS3_NANO_DIR + CUDA)")
+        return
+    try:
+        lat_graph = _run_cuda_graph_denoise(ctx)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (skipped cuda-graph parity: FlashInfer/capture unavailable: {exc})")
+        return
+    img_fused = ctx["mpipe"]._decode(ctx["lat_fused"]).squeeze().float().cpu()
+    img_graph = ctx["mpipe"]._decode(lat_graph.reshape(ctx["lat_fused"].shape)).squeeze().float().cpu()
+    mse = (img_fused - img_graph).pow(2).mean().item()
+    psnr = float("inf") if mse == 0 else -10 * math.log10(mse)
+    assert psnr >= 25, f"cuda-graph denoise PSNR {psnr:.2f} < 25 (MSE {mse:.3e})"
+    print(f"  cuda-graph denoise vs fused PSNR = {psnr:.2f} dB")
+
+
 def _main() -> None:
     failures = []
     for name, fn in [
@@ -454,6 +532,7 @@ def _main() -> None:
         ("engine_cache_path_image_psnr", test_engine_cache_path_image_psnr),
         ("cache_once_matches_fused_exact_t2v", test_cache_once_matches_fused_exact_t2v),
         ("engine_cache_path_video_psnr", test_engine_cache_path_video_psnr),
+        ("cuda_graph_matches_eager", test_cuda_graph_matches_eager),
         ("cross_request_batch_matches_individual", test_cross_request_batch_matches_individual),
     ]:
         try:

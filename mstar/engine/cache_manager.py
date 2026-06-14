@@ -585,14 +585,43 @@ class BatchedCacheManager:
         paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
         paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
 
-        wrapper = FlashInferPrefillWrapper(
-            workspace_buffer=self.buffer_manager.get(combined_label),
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            page_size=page_size,
-            enable_nvtx=self.enable_nvtx,
-        )
+        ps = self._plan_states.get(combined_label)
+        if self._cuda_graph_mode and ps is not None and ps.wrapper is not None:
+            # CUDA-graph mode: reuse the persistent wrapper across denoise steps.
+            # plan() updates its static buffers via .copy_() so the captured
+            # kernel picks up each step's page table without reallocating.
+            wrapper = ps.wrapper
+        elif self._cuda_graph_mode:
+            # First call under capture: build the persistent wrapper sized for the
+            # fixed batch (labels x requests) and token budget.
+            wrapper = FlashInferPrefillWrapper(
+                workspace_buffer=self.buffer_manager.get(combined_label),
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                batch_size=len(labels) * len(self.request_ids),
+                max_total_tokens=sum(combined_seq_lens),
+                max_num_pages=cfg.max_num_pages,
+                device=self.device,
+                use_cuda_graph=True,
+                enable_nvtx=self.enable_nvtx,
+            )
+            ps = _PlanState(wrapper=wrapper)
+            self._plan_states[combined_label] = ps
+        else:
+            # Eager mode: a fresh wrapper each call (the cache manager is rebuilt
+            # per forward, so there is nothing persistent to reuse).
+            wrapper = FlashInferPrefillWrapper(
+                workspace_buffer=self.buffer_manager.get(combined_label),
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                enable_nvtx=self.enable_nvtx,
+            )
+            ps = _PlanState(wrapper=wrapper)
+            self._plan_states[combined_label] = ps
 
         wrapper.plan(
             qo_indptr=qo_indptr,
@@ -602,13 +631,8 @@ class BatchedCacheManager:
             causal=is_causal,
             dtype=dtype,
         )
-
-        ps = _PlanState(
-            wrapper=wrapper,
-            seq_lens=combined_seq_lens,
-            write_store=write_store,
-        )
-        self._plan_states[combined_label] = ps
+        ps.seq_lens = combined_seq_lens
+        ps.write_store = write_store
 
     @torch.compiler.disable
     def plan_rope_batched_cfg(

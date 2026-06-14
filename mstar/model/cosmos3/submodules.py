@@ -27,6 +27,7 @@ import logging
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.cuda_graph_config import BasicBatchedCudaGraphConfig
 from mstar.model.cosmos3.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
@@ -74,6 +75,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # Cap on how many requests share one batched denoise step. Concurrent
     # requests at the image-generation walk run their step in a single forward.
     max_gen_batch_size = 8
+
+    # Image resolutions (height, width) to capture a denoise-step CUDA graph for.
+    # Each becomes one fixed-shape capture; requests at other resolutions fall
+    # back to the eager path. num_frames is fixed at 1 (text-to-image).
+    gen_capture_resolutions: tuple[tuple[int, int], ...] = ((256, 256),)
+    # Batch sizes to capture per resolution.
+    gen_capture_batch_sizes: tuple[int, ...] = (1,)
 
     def __init__(self, transformer, config, scheduler=None):
         super().__init__()
@@ -256,9 +264,20 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             latents = inputs["latents"][0]
             time_index = inputs["time_index"][0]
+        tensors = {"latents": latents, "time_index": time_index}
+        # The CUDA-graph capture reads the timestep and rotary positions as static
+        # buffers (it can't reach the per-request scheduler at replay), so
+        # materialize them here. The eager path ignores these and recomputes from
+        # per-request state. Only built in the two-branch guidance regime — the
+        # one the graph captures.
+        if st["uncond"] is not None:
+            t = st["scheduler"].timesteps[time_index.reshape(-1)].to(torch.float32)
+            tensors["vision_timesteps"] = t.expand(st["num_noisy"]).contiguous()
+            tensors["position_ids_cond"] = st["cond"]["vision_mrope_ids"]
+            tensors["position_ids_uncond"] = st["uncond"]["vision_mrope_ids"]
         return ARNodeInputs(
             input_seq_len=st["num_vision"],
-            tensor_inputs={"latents": latents, "time_index": time_index},
+            tensor_inputs=tensors,
         )
 
     def _prepare_action_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
@@ -296,8 +315,35 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=COND_LABEL, write_store=False)
             cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=UNCOND_LABEL, write_store=False)
 
+    def _preprocess_image_gen_captured(self, cm, inputs) -> dict:
+        """Plan a denoise step for the CUDA-graph path.
+
+        Runs with synthetic request ids (no per-request state), so it derives the
+        token count from ``input_seq_len``. Both guidance branches are planned as
+        one combined attention (``plan_attention_batched_cfg``) so the captured
+        forward runs a single transformer pass over both — one weight load instead
+        of two. The static-input tensors (latents, timestep, rotary positions)
+        pass straight through to the captured forward.
+        """
+        seq_lens = [inp.input_seq_len for inp in inputs]
+        cm.plan_attention_batched_cfg(
+            labels=[COND_LABEL, UNCOND_LABEL], seq_lens=seq_lens,
+            is_causal=False, write_store=False,
+        )
+        inp = inputs[0]
+        return {
+            "latents": inp.tensor_inputs["latents"],
+            "vision_timesteps": inp.tensor_inputs["vision_timesteps"],
+            "position_ids_cond": inp.tensor_inputs["position_ids_cond"],
+            "position_ids_uncond": inp.tensor_inputs["position_ids_uncond"],
+        }
+
     def preprocess(self, graph_walk, engine_inputs: ModelInputsFromEngine, inputs) -> dict:
         cm = engine_inputs.cache_manager
+
+        if graph_walk == IMAGE_GEN_WALK and getattr(cm, "_cuda_graph_mode", False):
+            return self._preprocess_image_gen_captured(cm, inputs)
+
         st = self._req[engine_inputs.request_ids[0]]
 
         if graph_walk == PREFILL_WALK:
@@ -542,6 +588,111 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )[0].squeeze(0)
             out[rid] = {"latents": [new_latents], "time_index": [ti + 1]}
         return out
+
+    # ------------------------------------------------------------------
+    # CUDA-graph capture of the denoise step. Only the transformer velocity
+    # computation is captured; the guidance combine and the (Python, multistep)
+    # scheduler step run eagerly afterwards.
+    # ------------------------------------------------------------------
+
+    def get_cuda_graph_configs(self, device, tp_world_size: int = 1):
+        """Declare one fixed-shape capture of the image denoise step per
+        resolution. Requests at other resolutions, or without guidance, fall back
+        to the eager path. The per-resolution token layout is prompt-independent,
+        so bake it once here and key it by latent shape; the per-prompt rotary
+        positions, the latents and the timestep flow in as static-buffer inputs."""
+        if self.transformer is None:
+            return []
+        dtype = self.transformer.proj_in.weight.dtype
+        self._capture_layout: dict[tuple, dict] = {}
+        configs = []
+        for height, width in self.gen_capture_resolutions:
+            static = self._build_static(
+                [0] * 8, height, width, num_frames=1, fps=24.0,
+                has_image_condition=False, device=device,
+            )
+            latent_shape = self._latent_shape(height, width, num_frames=1)
+            num_vision = static["num_vision_tokens"]
+            num_noisy = static["num_noisy_vision_tokens"]
+            self._capture_layout[tuple(latent_shape)] = {
+                "vision_token_shapes": static["vision_token_shapes"],
+                "vision_noisy_frame_indexes": static["vision_noisy_frame_indexes"],
+                "mse_gen_indexes": static["mse_gen_indexes"],
+            }
+            single = ARNodeInputs(
+                input_seq_len=num_vision,
+                tensor_inputs={
+                    "latents": torch.zeros(latent_shape, device=device, dtype=dtype),
+                    "vision_timesteps": torch.zeros(num_noisy, device=device, dtype=torch.float32),
+                    "position_ids_cond": static["vision_mrope_ids"].clone(),
+                    "position_ids_uncond": static["vision_mrope_ids"].clone(),
+                },
+            )
+            configs.append(BasicBatchedCudaGraphConfig(
+                capture_graph_walk=IMAGE_GEN_WALK,
+                single_request_inputs=single,
+                requires_cfg=False,
+                labels=[COND_LABEL, UNCOND_LABEL],
+                capture_forward_method="forward_captured",
+                advance_seq_lens=False,
+                compile=False,
+                capture_batch_sizes=list(self.gen_capture_batch_sizes),
+            ))
+        return configs
+
+    def can_use_cuda_graphs(self, batch, model_inputs) -> bool:
+        # Only the image denoise step is captured, only with two-branch guidance,
+        # and only at a resolution we captured a graph for.
+        if batch.graph_walk != IMAGE_GEN_WALK:
+            return False
+        layout = getattr(self, "_capture_layout", None)
+        if not layout:
+            return False
+        for rid in batch.request_ids:
+            st = self._req.get(rid)
+            if st is None or st["uncond"] is None:
+                return False
+            if tuple(st["latent_shape"]) not in layout:
+                return False
+        return True
+
+    def forward_captured(
+        self, graph_walk, engine_inputs: ModelInputsFromEngine,
+        latents, vision_timesteps, position_ids_cond, position_ids_uncond, **kwargs,
+    ) -> dict:
+        """Velocity-only denoise forward captured into a CUDA graph: both guidance
+        branches in one batched pass (the combined plan), no scheduler step. The
+        token layout is baked per resolution; the latents, timestep and rotary
+        positions are static-buffer inputs."""
+        cm = engine_inputs.cache_manager
+        layout = self._capture_layout[tuple(latents.shape)]
+        cm.set_active_label(CFG_BATCHED_LABEL)
+        cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
+            latents, vision_timesteps, position_ids_cond, position_ids_uncond,
+            layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
+            layout["mse_gen_indexes"], cm,
+        )
+        rid = engine_inputs.request_ids[0]
+        return {rid: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
+
+    def postprocess_captured(self, request_ids, inputs, per_request_info, outputs) -> dict:
+        """Eager tail run after graph replay: the classifier-free-guidance combine
+        and the (Python, multistep) scheduler step the graph can't hold. Mirrors
+        the tail of ``_forward_image_gen``."""
+        for rid, inp in zip(request_ids, inputs):
+            st = self._req[rid]
+            cond_v = outputs[rid]["cond_v"][0]
+            uncond_v = outputs[rid]["uncond_v"][0]
+            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            latents = inp.tensor_inputs["latents"]
+            time_index = inp.tensor_inputs["time_index"]
+            step_index = int(time_index.reshape(-1)[0].item())
+            t = st["scheduler"].timesteps[step_index]
+            new_latents = st["scheduler"].step(
+                velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
+            )[0].squeeze(0)
+            outputs[rid] = {"latents": [new_latents], "time_index": [time_index + 1]}
+        return outputs
 
     def cleanup_request(self, request_id: str):
         self._req.pop(request_id, None)
