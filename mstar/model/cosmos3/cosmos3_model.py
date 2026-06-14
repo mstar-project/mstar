@@ -338,13 +338,22 @@ class Cosmos3Model(Model):
     def _create_submodule(self, node_name: str, device: str):
         if node_name == DIT_NODE:
             return Cosmos3DiTSubmodule(
-                transformer=self._build_transformer(device), config=self.config
+                transformer=self._build_transformer(device),
+                config=self.config,
+                scheduler=self._build_scheduler(),
             )
         if node_name == VAE_DECODER_NODE:
             return Cosmos3VAEDecoderSubmodule(
                 vae=self._build_vae(device), config=self.config
             )
         return None
+
+    def _build_scheduler(self):
+        if self.skip_weight_loading:
+            return None
+        from diffusers import UniPCMultistepScheduler
+
+        return UniPCMultistepScheduler.from_pretrained(str(self._ensure_repo() / "scheduler"))
 
     def _build_transformer(self, device: str):
         from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer

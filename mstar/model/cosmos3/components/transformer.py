@@ -222,6 +222,34 @@ class Cosmos3PackedMoTAttention(nn.Module):
 
         return self.to_out(causal_out), self.to_add_out(full_out)
 
+    # ------------------------------------------------------------------
+    # Cached-attention variants: the two pathways run in separate passes and
+    # share their K/V through a paged cache handle instead of in-pass concat.
+    # The understanding pass writes its K/V (causal); the generation pass reads
+    # that frozen K/V plus its own (non-causal) — causality is fixed by the
+    # handle's attention plan, not here.
+    # ------------------------------------------------------------------
+
+    def forward_und(self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache_handle) -> torch.Tensor:
+        H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
+        q = self.norm_q(self.to_q(und_seq).view(-1, H, D))
+        k = self.norm_k(self.to_k(und_seq).view(-1, Hkv, D))
+        v = self.to_v(und_seq).view(-1, Hkv, D)
+        q = self._apply_rope(q, cos, sin)
+        k = self._apply_rope(k, cos, sin)
+        out = cache_handle.run_attention(q=q, k=k, v=v).reshape(-1, H * D)
+        return self.to_out(out)
+
+    def forward_gen(self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache_handle) -> torch.Tensor:
+        H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
+        q = self.norm_added_q(self.add_q_proj(gen_seq).view(-1, H, D))
+        k = self.norm_added_k(self.add_k_proj(gen_seq).view(-1, Hkv, D))
+        v = self.add_v_proj(gen_seq).view(-1, Hkv, D)
+        q = self._apply_rope(q, cos, sin)
+        k = self._apply_rope(k, cos, sin)
+        out = cache_handle.run_attention(q=q, k=k, v=v).reshape(-1, H * D)
+        return self.to_add_out(out)
+
 
 class Cosmos3MoTDecoderLayer(nn.Module):
     """One dual-pathway decoder layer (UND + GEN parameter sets)."""
@@ -270,6 +298,18 @@ class Cosmos3MoTDecoderLayer(nn.Module):
         mlp_out_gen = self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(residual_gen))
 
         return residual_und + mlp_out_und, residual_gen + mlp_out_gen
+
+    def forward_und(self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache_handle) -> torch.Tensor:
+        und_norm = self.input_layernorm(und_seq)
+        attn_out = self.self_attn.forward_und(und_norm, cos, sin, cache_handle)
+        residual = und_seq + attn_out
+        return residual + self.mlp(self.post_attention_layernorm(residual))
+
+    def forward_gen(self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache_handle) -> torch.Tensor:
+        gen_norm = self.input_layernorm_moe_gen(gen_seq)
+        attn_out = self.self_attn.forward_gen(gen_norm, cos, sin, cache_handle)
+        residual = gen_seq + attn_out
+        return residual + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(residual))
 
 
 class DomainAwareLinear(nn.Module):
@@ -370,7 +410,7 @@ class Cosmos3OmniTransformer(nn.Module):
     ) -> torch.Tensor:
         start_noisy_index = 0
         flattened_noisy_frame_indexes: list[torch.Tensor] = []
-        for noisy_indexes_i, token_shape_i in zip(noisy_frame_indexes, token_shapes):
+        for noisy_indexes_i, token_shape_i in zip(noisy_frame_indexes, token_shapes, strict=True):
             spatial_numel_i = math.prod(token_shape_i[1:])
             spatial_indexes_i = torch.arange(spatial_numel_i, device=packed_tokens.device)
             frame_offsets = (noisy_indexes_i * spatial_numel_i).unsqueeze(-1) + spatial_indexes_i + start_noisy_index
@@ -417,7 +457,7 @@ class Cosmos3OmniTransformer(nn.Module):
         unpatchified_latents: list[torch.Tensor] = []
         start_idx = 0
         for token_shape, noisy_frame_indexes, original_shape in zip(
-            token_shapes_vision, noisy_frame_indexes_vision, original_latent_shapes
+            token_shapes_vision, noisy_frame_indexes_vision, original_latent_shapes, strict=True
         ):
             t_c = token_shape[0]
             _, h_orig, w_orig = original_shape
@@ -446,7 +486,8 @@ class Cosmos3OmniTransformer(nn.Module):
         self, tokens_sound: list[torch.Tensor], token_shapes_sound: list[tuple[int, int, int]]
     ) -> torch.Tensor:
         return torch.cat(
-            [sound[:, : shape[0]].permute(1, 0) for sound, shape in zip(tokens_sound, token_shapes_sound)], dim=0
+            [sound[:, : shape[0]].permute(1, 0) for sound, shape in zip(tokens_sound, token_shapes_sound, strict=True)],
+            dim=0,
         )
 
     def _unpack_sound_latents(
@@ -458,7 +499,7 @@ class Cosmos3OmniTransformer(nn.Module):
         sound_dim = self.config.sound_dim
         unpacked: list[torch.Tensor] = []
         start_idx = 0
-        for shape, noisy_idxs in zip(token_shapes_sound, noisy_frame_indexes_sound):
+        for shape, noisy_idxs in zip(token_shapes_sound, noisy_frame_indexes_sound, strict=True):
             T = shape[0]
             output = torch.zeros((sound_dim, T), device=packed_preds.device, dtype=packed_preds.dtype)
             t_n = len(noisy_idxs)
@@ -560,3 +601,74 @@ class Cosmos3OmniTransformer(nn.Module):
             preds_sound = self._unpack_sound_latents(preds_sound_packed, sound_token_shapes, sound_noisy_frame_indexes)
 
         return preds_vision, preds_sound
+
+    # ------------------------------------------------------------------
+    # Cache-once engine path: the understanding tower runs once and writes its
+    # K/V; the generation tower then runs per denoising step, re-reading that
+    # frozen K/V. Because the text tokens never receive a timestep embedding,
+    # their K/V is step-independent, so caching it once is exact. ``cache_handle``
+    # is a paged attention handle (set_layer_idx / run_attention / advance_seq_lens);
+    # the attention plan (causal vs not, which label) is configured by the caller.
+    # ------------------------------------------------------------------
+
+    def _rotary(self, position_ids: torch.Tensor, device, dtype):
+        """cos/sin of shape [N, head_dim] for a [3, N] block of 3D mRoPE ids."""
+        cos, sin = self.rotary_emb(position_ids.unsqueeze(1), device=device, dtype=dtype)
+        return cos.squeeze(0), sin.squeeze(0)
+
+    def prefill_und(
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor, cache_handle
+    ) -> None:
+        """Run the understanding tower over the text prefix, writing per-layer K/V
+        to the cache under the active label and committing the prefix length.
+        ``position_ids`` are the text segment's 3D mRoPE ids ([3, und_len])."""
+        und_seq = self.embed_tokens(input_ids)
+        cos, sin = self._rotary(position_ids, und_seq.device, und_seq.dtype)
+        for i, layer in enumerate(self.layers):
+            cache_handle.set_layer_idx(i)
+            und_seq = layer.forward_und(und_seq, cos, sin, cache_handle)
+        cache_handle.advance_seq_lens()
+
+    def denoise_step(
+        self,
+        latents: torch.Tensor,
+        vision_timesteps: torch.Tensor,
+        position_ids: torch.Tensor,
+        vision_token_shapes: list[tuple[int, int, int]],
+        vision_noisy_frame_indexes: list[torch.Tensor],
+        vision_mse_loss_indexes: torch.Tensor,
+        cache_handle,
+    ) -> torch.Tensor:
+        """One generation-tower evaluation against the frozen understanding K/V.
+
+        Patchifies ``latents`` ([1, C, T, H, W]), scatter-adds the timestep
+        embedding to the noisy tokens, runs the generation layers (each reading
+        the active label's cached understanding K/V plus its own freshly written
+        K/V), and decodes the flow velocity. ``position_ids`` are the vision
+        segment's 3D mRoPE ids ([3, num_vision]); ``vision_mse_loss_indexes`` are
+        gen-relative (into the vision token block). Returns the velocity latent
+        ([1, C, T, H, W])."""
+        packed, original_latent_shapes = self._patchify_and_pack_latents([latents])
+        packed = self.proj_in(packed)
+        target_dtype = packed.dtype
+        timesteps = vision_timesteps * self.config.timestep_scale
+        ts_embeds = self.time_embedder(self.time_proj(timesteps)).to(target_dtype)
+        gen_seq = self._apply_timestep_embeds_to_noisy_tokens(
+            packed_tokens=packed,
+            packed_timestep_embeds=ts_embeds,
+            noisy_frame_indexes=vision_noisy_frame_indexes,
+            token_shapes=vision_token_shapes,
+        )
+        cos, sin = self._rotary(position_ids, gen_seq.device, gen_seq.dtype)
+        for i, layer in enumerate(self.layers):
+            cache_handle.set_layer_idx(i)
+            gen_seq = layer.forward_gen(gen_seq, cos, sin, cache_handle)
+        gen_out = self.norm_moe_gen(gen_seq)
+        preds_packed = self.proj_out(gen_out[vision_mse_loss_indexes])
+        preds = self._unpatchify_and_unpack_latents(
+            preds_packed,
+            token_shapes_vision=vision_token_shapes,
+            noisy_frame_indexes_vision=vision_noisy_frame_indexes,
+            original_latent_shapes=original_latent_shapes,
+        )
+        return preds[0]
