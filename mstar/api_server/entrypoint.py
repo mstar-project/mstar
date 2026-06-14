@@ -15,11 +15,13 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from mstar.api_server._timing import TIMING_ENABLED as _TIMING
+from mstar.api_server._timing import make_tlog
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
@@ -28,7 +30,15 @@ from mstar.utils.logging_config import quiet_noisy_loggers
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({"text", "image", "audio", "video", "action", "scalar", "tensor"})
+# See mstar.api_server._timing; env-gated [API-TIMING] prints (MSTAR_TIMING=1)
+# that pair with the [DW-TIMING] prints to split HTTP/handler overhead from
+# data-worker work.
+_tlog = make_tlog("API-TIMING")
+
+
+SUPPORTED_MODALITIES = frozenset(
+    {"text", "image", "audio", "video", "action", "scalar", "tensor", "numpy"}
+)
 
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
@@ -36,6 +46,7 @@ for _mod, _exts in {
     "image": (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif"),
     "audio": (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"),
     "video": (".mp4", ".avi", ".mov", ".mkv", ".webm"),
+    "numpy": (".npy",)
 }.items():
     for _ext in _exts:
         _EXT_TO_MODALITY[_ext] = _mod
@@ -224,6 +235,7 @@ class APIServer:
         *,
         text: str | None = None,
         file_paths: dict[str, list[str]] | None = None,
+        numpy_bytes: list[bytes] | None = None,
         input_modalities: list[str],
         output_modalities: list[str],
         model_kwargs: dict | None = None,
@@ -254,12 +266,14 @@ class APIServer:
                 "input_modalities": input_modalities,
                 "output_modalities": output_modalities,
                 "final_outputs": {},
+                "_t_submit": time.perf_counter(),  # for end-to-end wait timing
             }
 
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=request_id,
             text=text,
             file_paths=file_paths,
+            numpy_bytes=numpy_bytes,
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             model_kwargs=model_kwargs
@@ -335,6 +349,14 @@ class APIServer:
                         result_chunk.modality, result_chunk.request_id
                     )
                     rid = result_chunk.request_id
+                    if _TIMING:
+                        _oq = getattr(result_chunk, "_t_outqueue", None)
+                        if _oq is not None:
+                            _tlog(
+                                f"{rid[:8]} CHUNK  "
+                                # out_queue.put -> picked up here (output polling hop)
+                                f"outq_wait={(time.perf_counter() - _oq) * 1e3:.2f}ms"
+                            )
                     with self.request_lock:
                         self.pending_requests[rid]["chunks"].append(
                             result_chunk
@@ -360,6 +382,10 @@ class APIServer:
         pre-serialized line).
         """
         start = time.time()
+        with self.request_lock:
+            _req0 = self.pending_requests.get(request_id)
+            _t_submit = _req0["_t_submit"] if _req0 else None
+        _t_first = None
         while True:
             if time.time() - start > self.timeout_seconds:
                 with self.request_lock:
@@ -380,9 +406,19 @@ class APIServer:
                     done = True
 
             for chunk in new_chunks:
+                if _t_first is None:
+                    _t_first = time.perf_counter()
                 yield chunk
 
             if done:
+                if _TIMING and _t_submit is not None:
+                    _now = time.perf_counter()
+                    _tlog(
+                        f"{request_id[:8]} STREAM "
+                        # submit -> first chunk delivered (full worker round-trip)
+                        f"ttfc={(_t_first - _t_submit) * 1e3 if _t_first else -1:.2f} "
+                        f"total={(_now - _t_submit) * 1e3:.2f}ms"  # submit -> done
+                    )
                 logger.info("Async stream results received finish for %s", request_id)
                 # flush remaining
                 remaining: list[ResultChunk] = []
@@ -460,6 +496,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def _stamp_recv_time(request: Request, call_next):
+    # Stamp ASGI request arrival. The gap to the handler body (_t_in) covers
+    # routing + multipart form parsing (FastAPI reads the upload bodies while
+    # resolving the File()/Form() params, before the handler runs) — that's the
+    # HTTP-side overhead not visible in the [DW-TIMING]/STREAM brackets.
+    if _TIMING:
+        request.state._t_recv = time.perf_counter()
+    return await call_next(request)
+
+
 api_server: APIServer | None = None
 
 # Mount the OpenAI-compatible routes (/v1/*) alongside the native /generate.
@@ -472,6 +520,7 @@ app.include_router(openai_router)
 
 @app.post("/generate")
 async def generate(
+    request: Request,
     text: Optional[str] = Form(None),
     files: Optional[list[UploadFile]] = File(None),
     input_modalities: Optional[str] = Form(None),
@@ -500,10 +549,20 @@ async def generate(
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
 
+    _t_in = time.perf_counter()
+    if _TIMING:
+        _recv = getattr(request.state, "_t_recv", None)
+        if _recv is not None:
+            # ASGI receive -> handler body = routing + multipart parse (HTTP-side)
+            _tlog(f"PREHDLR parse={(_t_in - _recv) * 1e3:.2f}ms")
     out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
 
     # --- save uploaded files, grouped by modality ----------------
+    # The "numpy" modality (.npy) is kept in memory and np.load'd by the data
+    # worker; image/audio/video are written to disk so their decoders work from
+    # a file (PNG/mp4 decode prefers a path).
     file_paths: dict[str, list[str]] = {}
+    numpy_bytes: list[bytes] = []
     if files:
         for f in files:
             modality = _detect_modality(f.filename or "")
@@ -512,9 +571,12 @@ async def generate(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
                 )
+            content = await f.read()
+            if modality == "numpy":
+                numpy_bytes.append(content)
+                continue
             save_name = f"{uuid.uuid4()}_{f.filename}"
             save_path = api_server.upload_dir / save_name
-            content = await f.read()
             await run_in_threadpool(save_path.write_bytes, content)
             file_paths.setdefault(modality, []).append(str(save_path))
 
@@ -524,21 +586,33 @@ async def generate(
     else:
         in_mods: list[str] = []
         in_mods.extend(file_paths.keys())
+        # ".npy" uploads bypass file_paths (kept in memory as numpy_bytes), so
+        # add their "numpy" modality explicitly or auto-detect would drop it.
+        if numpy_bytes:
+            in_mods.append("numpy")
         if text:
             in_mods.append("text")
 
     parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
+    _t_files = time.perf_counter()  # multipart read + disk save done
 
     try:
         request_id = api_server.submit_request(
             text=text,
             file_paths=file_paths or None,
+            numpy_bytes=numpy_bytes or None,
             input_modalities=in_mods,
             output_modalities=out_mods,
             model_kwargs=parsed_kwargs,
             streaming=streaming,
             request_id=request_id,
         )
+        if _TIMING:
+            _tlog(
+                f"{request_id[:8]} HANDLER "
+                f"files={(_t_files - _t_in) * 1e3:.2f} "  # multipart read + disk write
+                f"submit={(time.perf_counter() - _t_files) * 1e3:.2f}ms"  # submit_request
+            )
 
         if streaming:
             return StreamingResponse(
@@ -550,12 +624,20 @@ async def generate(
         chunks = await run_in_threadpool(
             api_server.collect_results, request_id
         )
+        _t_results = time.perf_counter()
         outputs: dict[str, list[dict]] = {}
         for chunk in chunks:
             outputs.setdefault(chunk.modality, []).append({
                 "data": base64.b64encode(chunk.data).decode("ascii"),
                 "metadata": chunk.metadata,
             })
+        if _TIMING:
+            _tlog(
+                f"{request_id[:8]} BLOCKING "
+                f"wait={(_t_results - _t_files) * 1e3:.2f} "  # submit -> all results in
+                f"serialize={(time.perf_counter() - _t_results) * 1e3:.2f} "  # b64 + json
+                f"total={(time.perf_counter() - _t_in) * 1e3:.2f}ms"
+            )
         return JSONResponse({
             "request_id": request_id,
             "outputs": outputs,

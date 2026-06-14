@@ -672,8 +672,9 @@ def test_pi05_model_loaded_via_remapper_matches_lerobot():
     This is the strictest "real Pi05Model" check we can run without
     standing up a full mstar worker process: it exercises
     :class:`Pi05Model`'s lazy submodule construction, the lerobot→mstar
-    state-dict remap, and the actual ``Pi05ViTEncoderSubmodule`` and
-    ``Pi05LLMSubmodule`` forward methods. The only thing it bypasses is
+    state-dict remap, and the actual ``Pi05ViTEncoderSubmodule``,
+    ``Pi05PaligemmaSubmodule``, and ``Pi05ActionExpertSubmodule`` forward
+    methods. The only thing it bypasses is
     the FlashInfer/KVCacheEngine paged KV cache (replaced with the same
     ``MockCacheHandle`` used by the other integration tests, which has
     been validated against the real FlashInfer wrapper separately).
