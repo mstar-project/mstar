@@ -1,15 +1,16 @@
-"""GPU parity for the cache-once engine path of the Cosmos3 t2i generator.
+"""GPU parity for the cache-once engine path of the Cosmos3 generator.
 
 The understanding tower runs once and writes its per-layer K/V; the generation
 tower then runs each denoise step re-reading that frozen K/V (the text tokens get
 no timestep embedding, so their K/V is denoise-step independent — caching it once
 is exact). This checks the ``Cosmos3DiTSubmodule`` prefill + denoise loop against
-the fused ``Cosmos3T2IPipeline`` that runs the whole transformer every step.
+the fused ``Cosmos3Pipeline`` that runs the whole transformer every step, for both
+image (single frame) and video (multi-frame, fps-modulated mRoPE) generation.
 
-Two GPU-gated checks (need ``COSMOS3_NANO_DIR`` + CUDA; skipped otherwise):
+Two GPU-gated checks per mode (need ``COSMOS3_NANO_DIR`` + CUDA; skipped otherwise):
   * with an in-process sdpa cache (same attention kernel as the fused pipeline),
     the cache-once output is bit-for-bit identical;
-  * with the engine's FlashInfer paged cache (the served path), the decoded image
+  * with the engine's FlashInfer paged cache (the served path), the decoded output
     matches the fused pipeline within PSNR >= 30 (FlashInfer-vs-sdpa precision).
 
 Run: COSMOS3_NANO_DIR=<snap> python3 test_engine_cache.py
@@ -30,6 +31,7 @@ H = W = 256
 STEPS = 12
 GS = 6.0
 SEED = 42
+VIDEO_FRAMES = 17  # latent T = 1 + (17 - 1) // 4 = 5
 
 
 class _SdpaCacheHandle:
@@ -102,12 +104,13 @@ def _flashinfer_cache(model, rid, device, dtype):
 
 
 @torch.no_grad()
-def _run_cache_once(model, dit, cm, init, cond_ids, uncond_ids, device):
+def _run_cache_once(model, dit, cm, init, cond_ids, uncond_ids, device, num_frames):
     from mstar.conductor.request_info import CurrentForwardPassInfo
     from mstar.model.submodule_base import ModelInputsFromEngine
 
     rid = "r0"
-    md = {"height": H, "width": W, "fps": 24.0, "guidance_scale": GS, "num_inference_steps": STEPS}
+    md = {"height": H, "width": W, "num_frames": num_frames, "fps": 24.0,
+          "guidance_scale": GS, "num_inference_steps": STEPS}
     fwd = CurrentForwardPassInfo(
         request_id=rid, graph_walk="prefill", requires_cfg=(GS != 1.0),
         fwd_index=0, random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
@@ -134,67 +137,103 @@ def _run_cache_once(model, dit, cm, init, cond_ids, uncond_ids, device):
 _SETUP_CACHE: dict = {}
 
 
-def _setup():
-    if "ctx" in _SETUP_CACHE:
-        return _SETUP_CACHE["ctx"]
+def _load():
+    """Load the model / DiT / fused pipeline once (mode-independent)."""
+    if "base" in _SETUP_CACHE:
+        return _SETUP_CACHE["base"]
     snap = os.environ.get("COSMOS3_NANO_DIR")
     if not snap or not torch.cuda.is_available():
-        _SETUP_CACHE["ctx"] = None
+        _SETUP_CACHE["base"] = None
         return None
     torch.use_deterministic_algorithms(True, warn_only=True)
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-    from mstar.model.cosmos3.packing import tokenize_t2i_prompt
-    from mstar.model.cosmos3.t2i_pipeline import Cosmos3T2IPipeline
+    from mstar.model.cosmos3.pipeline import Cosmos3Pipeline
 
     device, dtype = "cuda:0", torch.bfloat16
     model = Cosmos3Model(model_path_hf=snap)
-    mpipe = Cosmos3T2IPipeline.from_model(model, device=device, dtype=dtype)
+    mpipe = Cosmos3Pipeline.from_model(model, device=device, dtype=dtype)
     dit = model.get_submodule("dit", device=device)  # shares mpipe's transformer
-    cond_ids, uncond_ids = tokenize_t2i_prompt(model.tokenizer, PROMPT, "", H, W)
-    gen = torch.Generator(device=device).manual_seed(SEED)
-    init = torch.randn((1, 48, 1, H // 16, W // 16), generator=gen, device=device, dtype=dtype)
-    lat_fused = mpipe(
-        prompt=PROMPT, negative_prompt="", height=H, width=W, num_inference_steps=STEPS,
-        guidance_scale=GS, latents=init.clone(), decode=False,
+    _SETUP_CACHE["base"] = dict(model=model, mpipe=mpipe, dit=dit, device=device, dtype=dtype)
+    return _SETUP_CACHE["base"]
+
+
+def _scenario(num_frames):
+    """Per-mode context: video-aware token ids, shared initial latents, and the
+    fused-pipeline latents the cache-once path must reproduce."""
+    key = f"frames{num_frames}"
+    if key in _SETUP_CACHE:
+        return _SETUP_CACHE[key]
+    base = _load()
+    if base is None:
+        _SETUP_CACHE[key] = None
+        return None
+    from mstar.model.cosmos3.packing import tokenize_prompt
+
+    device, dtype, mpipe = base["device"], base["dtype"], base["mpipe"]
+    cond_ids, uncond_ids = tokenize_prompt(
+        base["model"].tokenizer, PROMPT, "", num_frames=num_frames, height=H, width=W
     )
-    ctx = dict(model=model, mpipe=mpipe, dit=dit, cond=cond_ids, uncond=uncond_ids,
-               init=init, lat_fused=lat_fused, device=device, dtype=dtype)
-    _SETUP_CACHE["ctx"] = ctx
+    lat_t = 1 if num_frames == 1 else 1 + (num_frames - 1) // mpipe.vae_scale_temporal
+    gen = torch.Generator(device=device).manual_seed(SEED)
+    init = torch.randn((1, 48, lat_t, H // 16, W // 16), generator=gen, device=device, dtype=dtype)
+    lat_fused = mpipe(
+        prompt=PROMPT, negative_prompt="", num_frames=num_frames, height=H, width=W,
+        num_inference_steps=STEPS, guidance_scale=GS, latents=init.clone(), decode=False,
+    )
+    ctx = dict(cond=cond_ids, uncond=uncond_ids, init=init, lat_fused=lat_fused, num_frames=num_frames, **base)
+    _SETUP_CACHE[key] = ctx
     return ctx
 
 
-def test_cache_once_matches_fused_exact() -> None:
-    ctx = _setup()
+def _check_cache_once_exact(num_frames, tag):
+    ctx = _scenario(num_frames)
     if ctx is None:
-        print("  (skipped cache-once parity: needs COSMOS3_NANO_DIR + CUDA)")
+        print(f"  (skipped {tag} cache-once parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
     lat = _run_cache_once(
-        ctx["model"], ctx["dit"], _SdpaCacheHandle(), ctx["init"], ctx["cond"], ctx["uncond"], ctx["device"]
+        ctx["model"], ctx["dit"], _SdpaCacheHandle(), ctx["init"], ctx["cond"], ctx["uncond"],
+        ctx["device"], num_frames,
     )
     diff = (ctx["lat_fused"].float() - lat.reshape(ctx["lat_fused"].shape).float()).abs().max().item()
-    assert diff <= 1e-3, f"cache-once latents differ from fused by {diff:.3e} (> 1e-3)"
-    print(f"  cache-once (sdpa) latent abs-max diff = {diff:.3e}")
+    assert diff <= 1e-3, f"{tag} cache-once latents differ from fused by {diff:.3e} (> 1e-3)"
+    print(f"  {tag} cache-once (sdpa) latent abs-max diff = {diff:.3e}")
 
 
-def test_engine_cache_path_image_psnr() -> None:
-    ctx = _setup()
+def _check_engine_psnr(num_frames, tag):
+    ctx = _scenario(num_frames)
     if ctx is None:
-        print("  (skipped engine cache parity: needs COSMOS3_NANO_DIR + CUDA)")
+        print(f"  (skipped {tag} engine cache parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
     try:
         cm = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"])
     except Exception as exc:  # noqa: BLE001
-        print(f"  (skipped engine cache parity: FlashInfer unavailable: {exc})")
+        print(f"  (skipped {tag} engine cache parity: FlashInfer unavailable: {exc})")
         return
     lat = _run_cache_once(
-        ctx["model"], ctx["dit"], cm, ctx["init"], ctx["cond"], ctx["uncond"], ctx["device"]
+        ctx["model"], ctx["dit"], cm, ctx["init"], ctx["cond"], ctx["uncond"], ctx["device"], num_frames,
     )
     img_fused = ctx["mpipe"]._decode(ctx["lat_fused"]).squeeze().float().cpu()
     img_engine = ctx["mpipe"]._decode(lat.reshape(ctx["lat_fused"].shape)).squeeze().float().cpu()
     mse = (img_fused - img_engine).pow(2).mean().item()
     psnr = float("inf") if mse == 0 else -10 * math.log10(mse)
-    assert psnr >= 30, f"engine-path image PSNR {psnr:.2f} < 30 (MSE {mse:.3e})"
-    print(f"  engine cache path (flashinfer) image PSNR = {psnr:.2f} dB")
+    assert psnr >= 30, f"{tag} engine-path PSNR {psnr:.2f} < 30 (MSE {mse:.3e})"
+    print(f"  {tag} engine cache path (flashinfer) PSNR = {psnr:.2f} dB")
+
+
+def test_cache_once_matches_fused_exact() -> None:
+    _check_cache_once_exact(1, "t2i")
+
+
+def test_engine_cache_path_image_psnr() -> None:
+    _check_engine_psnr(1, "t2i")
+
+
+def test_cache_once_matches_fused_exact_t2v() -> None:
+    _check_cache_once_exact(VIDEO_FRAMES, "t2v")
+
+
+def test_engine_cache_path_video_psnr() -> None:
+    _check_engine_psnr(VIDEO_FRAMES, "t2v")
 
 
 def _main() -> None:
@@ -202,6 +241,8 @@ def _main() -> None:
     for name, fn in [
         ("cache_once_matches_fused_exact", test_cache_once_matches_fused_exact),
         ("engine_cache_path_image_psnr", test_engine_cache_path_image_psnr),
+        ("cache_once_matches_fused_exact_t2v", test_cache_once_matches_fused_exact_t2v),
+        ("engine_cache_path_video_psnr", test_engine_cache_path_video_psnr),
     ]:
         try:
             fn()
