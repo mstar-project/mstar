@@ -23,6 +23,7 @@ matches running the whole transformer each step.
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 
@@ -600,8 +601,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         resolution. Requests at other resolutions, or without guidance, fall back
         to the eager path. The per-resolution token layout is prompt-independent,
         so bake it once here and key it by latent shape; the per-prompt rotary
-        positions, the latents and the timestep flow in as static-buffer inputs."""
-        if self.transformer is None:
+        positions, the latents and the timestep flow in as static-buffer inputs.
+
+        Set ``COSMOS3_DISABLE_CUDA_GRAPH=1`` to skip capture and run the denoise
+        loop eagerly (escape hatch for a misbehaving driver, and an A/B switch)."""
+        if self.transformer is None or os.environ.get("COSMOS3_DISABLE_CUDA_GRAPH"):
             return []
         dtype = self.transformer.proj_in.weight.dtype
         self._capture_layout: dict[tuple, dict] = {}
