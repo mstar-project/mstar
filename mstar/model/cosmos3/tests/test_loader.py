@@ -1,9 +1,9 @@
-"""CPU-only structural checks for the Cosmos3 scaffold.
+"""CPU-only structural checks for the Cosmos3 model package.
 
 No GPU and no model weights are required: the config is parsed from the
 checkpoint's JSON files, the backbone is built on the ``meta`` device (shapes
 only, zero storage), and weight-key coverage is checked against the shard
-index. Run directly (``python3 test_phase_a.py``) or via pytest.
+index. Run directly (``python3 test_loader.py``) or via pytest.
 
 Point ``COSMOS3_NANO_DIR`` at a Cosmos3-Nano checkpoint directory (config +
 tokenizer + shard index; the safetensors tensor data itself is not read).
@@ -22,6 +22,7 @@ from mstar.model.cosmos3.loader import (
     DROP_KEYS,
     cosmos3_name_remapper,
     read_transformer_weight_keys,
+    read_transformer_weight_shapes,
 )
 
 NANO_DIR = Path(
@@ -109,6 +110,33 @@ def test_loader_key_coverage() -> None:
     assert len(model_keys) == 813, len(model_keys)
 
 
+def test_loader_shape_coverage() -> None:
+    """Every backbone param's *shape* matches the checkpoint tensor it loads
+    from. Reads only safetensors headers (no tensor data, CPU-safe). Returns
+    early if the shards are LFS pointers (asset-only clone) rather than real
+    weights. Complements the name-only coverage check — it is what would have
+    caught a wrong per-domain action-projection shape before a GPU load.
+    """
+    cfg = Cosmos3Config.from_pretrained(NANO_DIR)
+    with torch.device("meta"):
+        model = Cosmos3OmniTransformer(cfg)
+
+    try:
+        ckpt_shapes = read_transformer_weight_shapes(NANO_DIR)
+    except Exception as exc:  # noqa: BLE001 — LFS pointer / missing shards
+        print(f"  (shape check skipped: transformer shards unreadable: {exc})")
+        return
+
+    model_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items()}
+    # The remapper is identity for backbone keys, so model key == checkpoint key.
+    mismatched = {
+        k: {"model": s, "ckpt": ckpt_shapes.get(k)}
+        for k, s in model_shapes.items()
+        if s != ckpt_shapes.get(k)
+    }
+    assert not mismatched, mismatched
+
+
 def test_tokenizer_roundtrip() -> None:
     from transformers import AutoTokenizer
 
@@ -124,6 +152,7 @@ def _main() -> None:
     for name, fn in [
         ("config_roundtrip", test_config_roundtrip),
         ("loader_key_coverage", test_loader_key_coverage),
+        ("loader_shape_coverage", test_loader_shape_coverage),
         ("tokenizer_roundtrip", test_tokenizer_roundtrip),
     ]:
         try:
@@ -134,7 +163,7 @@ def _main() -> None:
             print(f"FAIL  {name}: {exc!r}")
     if failures:
         raise SystemExit(1)
-    print("\nAll Cosmos3 Phase A CPU checks passed.")
+    print("\nAll Cosmos3 structural checks passed.")
 
 
 if __name__ == "__main__":
