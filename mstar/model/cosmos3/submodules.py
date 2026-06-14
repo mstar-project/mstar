@@ -71,6 +71,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # set False to fall back to the sequential path.
     batched_cfg = True
 
+    # Cap on how many requests share one batched denoise step. Concurrent
+    # requests at the image-generation walk run their step in a single forward.
+    max_gen_batch_size = 8
+
     def __init__(self, transformer, config, scheduler=None):
         super().__init__()
         self.transformer = transformer
@@ -305,6 +309,19 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return {}
 
         if graph_walk == IMAGE_GEN_WALK:
+            rids = engine_inputs.request_ids
+            if len(rids) > 1:
+                # Cross-request batch: one batched plan over every request's two
+                # guidance branches, each with its own page set and token count.
+                cm.plan_attention_batched_cfg(
+                    labels=[COND_LABEL, UNCOND_LABEL],
+                    seq_lens=[self._req[r]["num_vision"] for r in rids],
+                    is_causal=False, write_store=False,
+                )
+                return {
+                    "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs)},
+                    "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs)},
+                }
             self._plan_gen(cm, st, st["num_vision"])
             return {
                 "latents": inputs[0].tensor_inputs["latents"],
@@ -473,6 +490,58 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "time_index": [time_index + 1],
             "action_output": [new_action[:, :, :raw]],
         }
+
+    # ------------------------------------------------------------------
+    # Cross-request batching: run several requests' denoise step together.
+    # ------------------------------------------------------------------
+
+    def can_batch(self, batch, model_inputs) -> bool:
+        # Only the image/video denoise step batches across requests, and only
+        # when every request is in the two-branch guidance regime (so a single
+        # batched plan covers them). One request stays on the simpler path.
+        if batch.graph_walk != IMAGE_GEN_WALK or not self.batched_cfg:
+            return False
+        if len(batch.request_ids) < 2:
+            return False
+        return all(
+            rid in self._req and self._req[rid]["uncond"] is not None
+            for rid in batch.request_ids
+        )
+
+    def max_batch_size(self, graph_walk: str):
+        return self.max_gen_batch_size if graph_walk == IMAGE_GEN_WALK else None
+
+    def forward_batched(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, time_index, **kwargs):
+        if graph_walk != IMAGE_GEN_WALK:
+            raise ValueError(f"Cosmos3 batched forward only supports image generation, got {graph_walk!r}")
+        cm = engine_inputs.cache_manager
+        cm.set_active_label(CFG_BATCHED_LABEL)
+        reqs, meta = [], []
+        for rid in engine_inputs.request_ids:
+            st = self._req[rid]
+            lat, ti = latents[rid], time_index[rid]
+            t = st["scheduler"].timesteps[int(ti.reshape(-1)[0].item())]
+            reqs.append({
+                "latents": lat,
+                "vision_timesteps": torch.full((st["num_noisy"],), t.item(), device=lat.device),
+                "position_ids_cond": st["cond"]["vision_mrope_ids"],
+                "position_ids_uncond": st["uncond"]["vision_mrope_ids"],
+                "vision_token_shapes": st["cond"]["vision_token_shapes"],
+                "vision_noisy_frame_indexes": st["cond"]["vision_noisy_frame_indexes"],
+                "vision_mse_loss_indexes": st["cond"]["mse_gen_indexes"],
+            })
+            meta.append((rid, st, lat, ti, t))
+
+        results = self.transformer.denoise_step_batched(reqs, cm)
+
+        out = {}
+        for (rid, st, lat, ti, t), (cond_v, uncond_v) in zip(meta, results):
+            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            new_latents = st["scheduler"].step(
+                velocity.unsqueeze(0), t, lat.unsqueeze(0), return_dict=False
+            )[0].squeeze(0)
+            out[rid] = {"latents": [new_latents], "time_index": [ti + 1]}
+        return out
 
     def cleanup_request(self, request_id: str):
         self._req.pop(request_id, None)
