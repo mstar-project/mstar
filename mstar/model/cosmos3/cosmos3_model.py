@@ -48,6 +48,8 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import (
+    ACTION_GEN_LOOP,
+    IMAGE_GEN_LOOP,
     Cosmos3DiTSubmodule,
     Cosmos3VAEDecoderSubmodule,
 )
@@ -176,13 +178,15 @@ class Cosmos3Model(Model):
         )
 
         # image_gen: denoising loop -> VAE decode -> emit image. The loop body
-        # threads the latents + denoise-step index back to itself each
-        # iteration; on the final iteration the latents route to the decoder.
-        # max_iters is the number of denoise model evaluations and is
-        # reconciled with the scheduler timestep schedule when the step is wired.
+        # threads the latents + denoise-step index back to itself each iteration;
+        # on the final iteration the latents route to the decoder. max_iters is an
+        # upper bound — each request stops the loop at its own denoise-step count
+        # (Cosmos3DiTSubmodule.check_stop), so one graph serves image and video
+        # (and any per-request num_inference_steps) without a rebuild.
         image_gen = Sequential(
             [
                 Loop(
+                    name=IMAGE_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
                         input_names=["latents", "time_index"],
@@ -191,7 +195,7 @@ class Cosmos3Model(Model):
                             GraphEdge(next_node=DIT_NODE, name="time_index"),
                         ],
                     ),
-                    max_iters=self.config.num_inference_steps,
+                    max_iters=self.config.max_inference_steps,
                     outputs=[
                         GraphEdge(next_node=VAE_DECODER_NODE, name="latents"),
                     ],
@@ -216,6 +220,7 @@ class Cosmos3Model(Model):
         action_gen = Sequential(
             [
                 Loop(
+                    name=ACTION_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
                         input_names=["latents", "action_latents", "time_index"],
@@ -225,7 +230,7 @@ class Cosmos3Model(Model):
                             GraphEdge(next_node=DIT_NODE, name="time_index"),
                         ],
                     ),
-                    max_iters=self.config.num_inference_steps,
+                    max_iters=self.config.max_inference_steps,
                     outputs=[
                         GraphEdge(
                             next_node=EMIT_TO_CLIENT,
@@ -339,16 +344,24 @@ class Cosmos3Model(Model):
                 width, height = int(sw), int(sh)
             except ValueError:
                 pass
+        num_frames = int(mk.get("num_frames", 1))
+        # The image and video cookbook step counts differ (image 50, video 35);
+        # default by mode and let the request override. The denoise loop runs this
+        # many steps and stops early (Cosmos3DiTSubmodule.check_stop), so the value
+        # is only bounded above by the loop's static max_iters.
+        default_steps = (
+            self.config.num_inference_steps_video if num_frames > 1
+            else self.config.num_inference_steps
+        )
+        steps = int(mk.get("num_inference_steps", default_steps))
+        steps = max(1, min(steps, self.config.max_inference_steps))
         params = {
             "width": int(mk.get("width", width)),
             "height": int(mk.get("height", height)),
-            "num_frames": int(mk.get("num_frames", 1)),
+            "num_frames": num_frames,
             "fps": float(mk.get("fps", 24.0)),
             "guidance_scale": float(mk.get("guidance_scale", 6.0)),
-            # The denoise Loop's iteration count is fixed at graph-build time from
-            # the config, so the per-request scheduler must use the same value (a
-            # per-request override would desync the loop and the timestep schedule).
-            "num_inference_steps": self.config.num_inference_steps,
+            "num_inference_steps": steps,
             "has_image_condition": "image" in (input_modalities or []),
         }
         if mk.get("flow_shift") is not None:

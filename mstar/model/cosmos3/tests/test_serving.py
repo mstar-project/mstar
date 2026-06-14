@@ -56,26 +56,92 @@ def test_gen_params_and_step_metadata() -> None:
     assert (p["width"], p["height"]) == (480, 256)
     assert p["num_frames"] == 1 and p["has_image_condition"] is False
 
-    # The denoise loop count is fixed at graph build, so a per-request
-    # num_inference_steps must NOT change the resolved value (it would desync the
-    # loop and the scheduler); guidance_scale, however, is honored per request.
+    # The denoise loop stops per-request (check_stop), so a per-request
+    # num_inference_steps is honored, clamped to [1, max_inference_steps];
+    # guidance_scale is likewise per request.
     p = model._resolve_gen_params(
         {"num_inference_steps": 3, "guidance_scale": 2.5}, ["text"], ["image"]
     )
-    assert p["num_inference_steps"] == model.config.num_inference_steps
+    assert p["num_inference_steps"] == 3
     assert p["guidance_scale"] == 2.5
+    # A request above the loop's upper bound is clamped; the image/video defaults
+    # differ by mode.
+    assert model._resolve_gen_params(
+        {"num_inference_steps": 10_000}, ["text"], ["image"]
+    )["num_inference_steps"] == model.config.max_inference_steps
+    assert model._resolve_gen_params({}, ["text"], ["image"])[
+        "num_inference_steps"
+    ] == model.config.num_inference_steps
+    assert model._resolve_gen_params({"num_frames": 17}, ["text"], ["video"])[
+        "num_inference_steps"
+    ] == model.config.num_inference_steps_video
 
     # i2v conditioning is inferred from the input modalities.
     p = model._resolve_gen_params({}, ["image", "text"], ["image"])
     assert p["has_image_condition"] is True
 
     fpa = model.get_initial_forward_pass_args(
-        "p0", ["text"], ["image"], {"text_inputs": []}, model_kwargs={"size": "256x256"}
+        "p0", ["text"], ["image"], {"text_inputs": []},
+        model_kwargs={"size": "256x256", "num_inference_steps": 7},
     )
     sm = fpa.step_metadata
     assert sm["is_prefill"] is True
     assert sm["height"] == 256 and sm["width"] == 256
-    assert sm["num_inference_steps"] == model.config.num_inference_steps
+    assert sm["num_inference_steps"] == 7
+
+
+def test_dynamic_loop_check_stop_and_wasted_step() -> None:
+    """The denoise loop stops at each request's own step count, and a step
+    dispatched one past that count is a no-op — so the loop's single speculative
+    extra iteration can't index the scheduler out of range."""
+    import types
+
+    import torch
+
+    from mstar.model.cosmos3.submodules import (
+        ACTION_GEN_LOOP,
+        ACTION_GEN_WALK,
+        Cosmos3DiTSubmodule,
+        IMAGE_GEN_LOOP,
+        IMAGE_GEN_WALK,
+    )
+
+    dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
+        model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
+
+    class _Sched:
+        def __init__(self, n):
+            self.timesteps = list(range(n))
+
+    n = 4
+    dit._req["r"] = {"scheduler": _Sched(n), "raw_action_dim": 2}
+
+    def info(walk, it):
+        return types.SimpleNamespace(
+            graph_walk=walk,
+            dynamic_loop_iter_counts={IMAGE_GEN_LOOP: it, ACTION_GEN_LOOP: it},
+        )
+
+    # Stops only on the last real step (iter n-1), not before; routes by walk.
+    assert dit.check_stop("r", info(IMAGE_GEN_WALK, n - 2), {}) == set()
+    assert dit.check_stop("r", info(IMAGE_GEN_WALK, n - 1), {}) == {IMAGE_GEN_LOOP}
+    assert dit.check_stop("r", info(ACTION_GEN_WALK, n - 1), {}) == {ACTION_GEN_LOOP}
+    # Unknown request -> no stop.
+    assert dit.check_stop("missing", info(IMAGE_GEN_WALK, 0), {}) == set()
+
+    # A forward one past the step count returns its inputs unchanged without
+    # touching the transformer or cache manager (both None here).
+    lat = torch.zeros(1, 4, 1, 2, 2)
+    ti = torch.tensor([n])
+    out = dit._forward_image_gen(None, dit._req["r"], latents=lat, time_index=ti)
+    assert torch.equal(out["latents"][0], lat) and torch.equal(out["time_index"][0], ti)
+
+    act = torch.zeros(1, 3, 5)
+    out = dit._forward_action_gen(
+        None, dit._req["r"], latents=lat, action_latents=act, time_index=ti
+    )
+    assert torch.equal(out["latents"][0], lat)
+    assert torch.equal(out["action_output"][0], act[:, :, :2])
 
 
 @pytest.mark.skipif(not NANO_DIR.exists(), reason="set COSMOS3_NANO_DIR to a Cosmos3-Nano dir")
