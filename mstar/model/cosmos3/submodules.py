@@ -46,6 +46,12 @@ from mstar.model.submodule_base import (
 logger = logging.getLogger(__name__)
 
 PREFILL_WALK = "prefill"
+# Image/video-conditioned generation prefills the same understanding tower, but
+# also VAE-encodes the conditioning frame into a clean anchor latent (see
+# Cosmos3DiTSubmodule._encode_conditioning). It is a separate walk from the
+# text-only prefill because the graph node only fires once all of its declared
+# inputs arrive, so the conditioning image has to be one of them.
+PREFILL_COND_WALK = "prefill_cond"
 IMAGE_GEN_WALK = "image_gen"
 VIDEO_GEN_WALK = "video_gen"
 ACTION_GEN_WALK = "action_gen"
@@ -99,13 +105,18 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # Batch sizes to capture per resolution.
     gen_capture_batch_sizes: tuple[int, ...] = (1,)
 
-    def __init__(self, transformer, config, scheduler=None):
+    def __init__(self, transformer, config, scheduler=None, vae=None):
         super().__init__()
         self.transformer = transformer
         self.config = config
         # Template scheduler; a fresh instance (with its own multistep state) is
         # built per request from this one's config.
         self._scheduler_template = scheduler
+        # Wan VAE (shared with the decoder node) — used to encode the
+        # conditioning frame for image-to-video / action conditioning. None for
+        # text-only generation.
+        self.vae = vae
+        self._video_processor = None
         # Per-request denoising state: packed static inputs (cond/uncond),
         # scheduler, guidance scale, latent shape.
         self._req: dict[str, dict] = {}
@@ -172,7 +183,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         self, graph_walk, fwd_info, inputs, seen_token_mask=None, pos_info={},
     ) -> ARNodeInputs:
         device = self.get_device()
-        if graph_walk == PREFILL_WALK:
+        if graph_walk in (PREFILL_WALK, PREFILL_COND_WALK):
             return self._prepare_prefill(fwd_info, inputs, device)
         if graph_walk in GEN_WALKS:
             return self._prepare_image_gen(fwd_info, inputs, device)
@@ -215,7 +226,45 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "num_vision": cond["num_vision_tokens"],
             "latent_shape": self._latent_shape(height, width, num_frames),
         }
+        # Image-to-video: encode the conditioning frame now (the understanding
+        # tower and the VAE encode are both prefill-time, per-request work) and
+        # stash its clean anchor latents for the denoise loop to inject.
+        if has_image_condition:
+            image = (inputs or {}).get("image_inputs")
+            if image:
+                self._req[fwd_info.request_id]["cond_latents"] = self._encode_conditioning(
+                    image[0], height, width, num_frames, device
+                )
         return ARNodeInputs(input_seq_len=cond["und_len"])
+
+    def _encode_conditioning(self, image, height, width, num_frames, device):
+        """VAE-encode a conditioning frame into clean anchor latents.
+
+        Mirrors the fused pipeline's image-to-video latent prep: the frame is
+        resized and normalized to [-1, 1], repeat-padded across the clip, and
+        Wan-VAE encoded with the pipeline-side latent normalization. Latent
+        frame 0 is the clean anchor the denoise loop keeps fixed."""
+        from diffusers.video_processor import VideoProcessor
+
+        vae = self.vae
+        dtype = self.transformer.proj_in.weight.dtype
+        if self._video_processor is None:
+            self._video_processor = VideoProcessor(
+                vae_scale_factor=self.config.vae.scale_factor_spatial, resample="bilinear"
+            )
+        # load_image gives [C, H, W] in [0, 1]; preprocess -> [1, 3, H, W] in [-1, 1].
+        frame = self._video_processor.preprocess(image, height=height, width=width).to(
+            device=device, dtype=dtype
+        )
+        vision = frame.unsqueeze(2)
+        if num_frames > 1:
+            vision = vision.expand(-1, -1, num_frames, -1, -1)
+        mean = torch.tensor(vae.config.latents_mean, dtype=vae.dtype, device=device).view(1, -1, 1, 1, 1)
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae.dtype, device=device)).view(
+            1, -1, 1, 1, 1
+        )
+        raw_mu = vae.encode(vision.to(vae.dtype)).latent_dist.mode()
+        return ((raw_mu - mean) * inv_std).to(dtype)
 
     def _prepare_action_prefill(
         self, fwd_info, md, cond_ids, uncond_ids, height, width, fps, gs, steps, device,
@@ -276,6 +325,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latents = torch.randn(
                 st["latent_shape"], generator=gen, device=device, dtype=self.transformer.proj_in.weight.dtype
             )
+            cond_latents = st.get("cond_latents")
+            if cond_latents is not None:
+                # Image-to-video: latent frame 0 is the clean conditioning anchor;
+                # the rest is noise. It stays clean through the loop because the
+                # predicted velocity is zero on conditioning frames (unpatchify
+                # only fills the noisy frames), matching the fused pipeline.
+                latents[:, :, 0] = cond_latents[:, :, 0].to(latents.dtype)
             time_index = torch.zeros(1, dtype=torch.long, device=device)
         else:
             latents = inputs["latents"][0]
@@ -367,7 +423,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         st = self._req[engine_inputs.request_ids[0]]
 
-        if graph_walk == PREFILL_WALK:
+        if graph_walk in (PREFILL_WALK, PREFILL_COND_WALK):
             cm.plan_attention(seq_lens=[st["cond"]["und_len"]], is_causal=True, label=COND_LABEL, write_store=False)
             if st["uncond"] is not None:
                 cm.plan_attention(
@@ -411,7 +467,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, **kwargs):
         cm = engine_inputs.cache_manager
         rid = engine_inputs.request_ids[0]
-        if graph_walk == PREFILL_WALK:
+        if graph_walk in (PREFILL_WALK, PREFILL_COND_WALK):
             return self._forward_prefill(cm, self._req[rid])
         if graph_walk in GEN_WALKS:
             return self._forward_image_gen(cm, self._req[rid], **kwargs)
