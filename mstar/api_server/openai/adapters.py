@@ -326,12 +326,7 @@ class Cosmos3Adapter(OpenAIAdapter):
             model_kwargs=mk,
         )
 
-    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
-        if getattr(req, "image", None):
-            # Image-to-video needs the conditioning frame VAE-encoded on the
-            # worker (the served frame-0 anchor), which is not wired yet; reject
-            # here so the request fails fast rather than silently ignoring it.
-            raise NotImplementedError("Cosmos3 image-to-video is not yet supported")
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
         if getattr(req, "size", None):
             mk.setdefault("size", req.size)
@@ -342,6 +337,18 @@ class Cosmos3Adapter(OpenAIAdapter):
             mk.setdefault("num_frames", req.num_frames)
         if getattr(req, "fps", None) is not None:
             mk.setdefault("fps", req.fps)
+        # Image-to-video: the conditioning frame (URL / data URI) is persisted and
+        # loaded by the worker, which VAE-encodes it into the clean frame-0 anchor.
+        image = getattr(req, "image", None)
+        if image:
+            _, path = media_io.resolve_media_ref(image, upload_dir)
+            return SubmitArgs(
+                text=req.prompt,
+                file_paths={"image": [path]},
+                input_modalities=["image", "text"],
+                output_modalities=["video"],
+                model_kwargs=mk,
+            )
         return SubmitArgs(
             text=req.prompt,
             input_modalities=["text"],

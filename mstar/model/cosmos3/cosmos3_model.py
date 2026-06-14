@@ -65,6 +65,7 @@ class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
     PREFILL_WALK = "prefill"
+    PREFILL_COND_WALK = "prefill_cond"
     IMAGE_GEN_WALK = "image_gen"
     VIDEO_GEN_WALK = "video_gen"
     ACTION_GEN_WALK = "action_gen"
@@ -86,6 +87,9 @@ class Cosmos3Model(Model):
         self.tokenizer = self._load_tokenizer()
 
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}
+        # The Wan VAE is shared between the DiT submodule (conditioning encode)
+        # and the decoder submodule, so build it once.
+        self._vae = None
 
     # ------------------------------------------------------------------
     # Config + tokenizer
@@ -179,6 +183,15 @@ class Cosmos3Model(Model):
             outputs=[],
         )
 
+        # prefill_cond: like prefill, but image-to-video also hands the DiT node
+        # the conditioning image, which it VAE-encodes into the clean anchor
+        # latents that seed the denoise loop (stashed on the per-request state).
+        prefill_cond = GraphNode(
+            name=DIT_NODE,
+            input_names=["text_inputs", "image_inputs"],
+            outputs=[],
+        )
+
         # image_gen: denoising loop -> VAE decode -> emit image. The loop body
         # threads the latents + denoise-step index back to itself each iteration;
         # on the final iteration the latents route to the decoder. max_iters is an
@@ -253,6 +266,7 @@ class Cosmos3Model(Model):
 
         return {
             self.PREFILL_WALK: prefill,
+            self.PREFILL_COND_WALK: prefill_cond,
             self.IMAGE_GEN_WALK: image_gen,
             self.VIDEO_GEN_WALK: video_gen,
             self.ACTION_GEN_WALK: action_gen,
@@ -421,10 +435,14 @@ class Cosmos3Model(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
+        # Image-to-video routes through prefill_cond, which also feeds the DiT the
+        # conditioning image to encode. Fall back to the text-only prefill if no
+        # image signal actually arrived (so the conditioned node can't stall).
+        conditioned = params.get("has_image_condition") and "image_inputs" in input_signals
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            graph_walk=self.PREFILL_WALK,
+            graph_walk=self.PREFILL_COND_WALK if conditioned else self.PREFILL_WALK,
             is_prefill=True,
             kwargs=params,
         )
@@ -433,6 +451,10 @@ class Cosmos3Model(Model):
         if "text_inputs" in input_signals:
             edge = GraphEdge(next_node=DIT_NODE, name="text_inputs")
             edge.tensor_info = input_signals["text_inputs"]
+            inputs.append(edge)
+        if conditioned:
+            edge = GraphEdge(next_node=DIT_NODE, name="image_inputs")
+            edge.tensor_info = input_signals["image_inputs"]
             inputs.append(edge)
 
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
@@ -456,7 +478,7 @@ class Cosmos3Model(Model):
 
         is_action = "action" in metadata.output_modalities
         is_video = "video" in metadata.output_modalities
-        if metadata.graph_walk == self.PREFILL_WALK:
+        if metadata.graph_walk in (self.PREFILL_WALK, self.PREFILL_COND_WALK):
             metadata.is_prefill = False
             # Pick the denoise walk by output modality: action and video each emit
             # their own modality (image and video share the same loop but differ
@@ -511,6 +533,7 @@ class Cosmos3Model(Model):
                 transformer=self._build_transformer(device),
                 config=self.config,
                 scheduler=self._build_scheduler(),
+                vae=self._build_vae(device),
             )
         if node_name == VAE_DECODER_NODE:
             return Cosmos3VAEDecoderSubmodule(
@@ -554,7 +577,10 @@ class Cosmos3Model(Model):
     def _build_vae(self, device: str):
         if self.skip_weight_loading:
             return None
+        if self._vae is not None:
+            return self._vae
         from diffusers import AutoencoderKLWan
 
         vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
-        return vae.to(device).eval()
+        self._vae = vae.to(device).eval()
+        return self._vae
