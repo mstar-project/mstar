@@ -48,9 +48,7 @@ def test_adapter_registered_for_images() -> None:
     assert args.model_kwargs["guidance_scale"] == 4.0
 
 
-def test_video_adapter_t2v() -> None:
-    import pytest as _pytest
-
+def test_video_adapter_t2v_and_i2v(tmp_path) -> None:
     from mstar.api_server.openai.adapters import get_adapter
     from mstar.api_server.openai.protocol import VideoGenerationRequest
 
@@ -62,7 +60,7 @@ def test_video_adapter_t2v() -> None:
         prompt="a kite", size="256x256", seed=1, num_frames=17, fps=16.0,
         guidance_scale=6.0,
     )
-    args = adapter.video_to_request(req, upload_dir="/tmp")
+    args = adapter.video_to_request(req, upload_dir=str(tmp_path))
     assert args.text == "a kite"
     assert args.input_modalities == ["text"]
     assert args.output_modalities == ["video"]
@@ -71,13 +69,15 @@ def test_video_adapter_t2v() -> None:
     assert args.model_kwargs["fps"] == 16.0
     assert args.model_kwargs["guidance_scale"] == 6.0
 
-    # image-to-video is not wired yet; it must reject fast rather than silently
-    # dropping the conditioning image.
-    with _pytest.raises(NotImplementedError):
-        adapter.video_to_request(
-            VideoGenerationRequest(prompt="zoom in", image="data:image/png;base64,AAAA"),
-            upload_dir="/tmp",
-        )
+    # image-to-video: the conditioning image (data URI) is persisted and routed
+    # in as an image input; the worker VAE-encodes it into the frame-0 anchor.
+    i2v = adapter.video_to_request(
+        VideoGenerationRequest(prompt="zoom in", image="data:image/png;base64,AAAA"),
+        upload_dir=str(tmp_path),
+    )
+    assert i2v.input_modalities == ["image", "text"]
+    assert i2v.output_modalities == ["video"]
+    assert i2v.file_paths and i2v.file_paths["image"]
 
 
 def test_gen_params_and_step_metadata() -> None:
