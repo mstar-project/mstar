@@ -48,6 +48,38 @@ def test_adapter_registered_for_images() -> None:
     assert args.model_kwargs["guidance_scale"] == 4.0
 
 
+def test_video_adapter_t2v() -> None:
+    import pytest as _pytest
+
+    from mstar.api_server.openai.adapters import get_adapter
+    from mstar.api_server.openai.protocol import VideoGenerationRequest
+
+    adapter = get_adapter("cosmos3")
+    assert adapter is not None and adapter.supports_videos
+
+    # text-to-video: text-only input, video output, num_frames/fps threaded.
+    req = VideoGenerationRequest(
+        prompt="a kite", size="256x256", seed=1, num_frames=17, fps=16.0,
+        guidance_scale=6.0,
+    )
+    args = adapter.video_to_request(req, upload_dir="/tmp")
+    assert args.text == "a kite"
+    assert args.input_modalities == ["text"]
+    assert args.output_modalities == ["video"]
+    assert args.file_paths is None
+    assert args.model_kwargs["num_frames"] == 17
+    assert args.model_kwargs["fps"] == 16.0
+    assert args.model_kwargs["guidance_scale"] == 6.0
+
+    # image-to-video is not wired yet; it must reject fast rather than silently
+    # dropping the conditioning image.
+    with _pytest.raises(NotImplementedError):
+        adapter.video_to_request(
+            VideoGenerationRequest(prompt="zoom in", image="data:image/png;base64,AAAA"),
+            upload_dir="/tmp",
+        )
+
+
 def test_gen_params_and_step_metadata() -> None:
     model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
 

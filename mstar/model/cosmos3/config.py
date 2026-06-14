@@ -139,6 +139,12 @@ class Cosmos3Config:
     # this many iterations and each request stops early at its own step count, so
     # one graph serves any per-request step count up to this cap.
     max_inference_steps: int = 100
+    # Default frames-per-second for video generation + mp4 playback (overridable
+    # per request via ``fps``).
+    fps: float = 24.0
+    # Default frame count for a video request that doesn't specify ``num_frames``
+    # (the Wan VAE downsamples time by 4, so latent frames = 1 + (n - 1) // 4).
+    num_frames_video: int = 17
 
     # ----- sub-configs -----
     vae: Cosmos3VAEConfig = field(default_factory=Cosmos3VAEConfig)

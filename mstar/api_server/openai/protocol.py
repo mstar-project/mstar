@@ -71,6 +71,28 @@ class ImageGenerationRequest(BaseModel):
     seed: int | None = None
 
 
+class VideoGenerationRequest(BaseModel):
+    """``/v1/videos/generations`` (text-to-video / image-to-video).
+
+    Not an OpenAI-standard surface; modeled on the image endpoint. ``image`` (a
+    URL or data URI) conditions image-to-video. Extra knobs
+    (``guidance_scale``, ``num_inference_steps``, ``negative_prompt`` …) flow
+    through via ``extra_body``.
+    """
+
+    model_config = _CFG
+
+    prompt: str
+    model: str | None = None
+    n: int | None = 1
+    size: str | None = None
+    response_format: str = "b64_json"
+    seed: int | None = None
+    num_frames: int | None = None
+    fps: float | None = None
+    image: str | None = None  # URL or data URI for image-to-video conditioning
+
+
 class ModelCard(BaseModel):
     id: str
     object: str = "model"
