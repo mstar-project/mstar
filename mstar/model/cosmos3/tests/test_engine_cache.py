@@ -155,6 +155,82 @@ def _run_cache_once(model, dit, cm, init, cond_ids, uncond_ids, device, num_fram
     return latents
 
 
+def _flashinfer_shared(model, rids, device, dtype):
+    """A KV cache + paged allocator shared by several requests, each with both
+    guidance labels (mirrors the engine's persistent per-node cache)."""
+    from mstar.communication.tensors import LocalTransferEngine
+    from mstar.engine.cache_manager import WorkspaceBufferManager
+    from mstar.engine.kv_store import PagedAllocationManager, TransferEngineInfo
+    from mstar.model.cosmos3.submodules import COND_LABEL, UNCOND_LABEL
+
+    cfg = model.get_kv_cache_config()[0]
+    cfg.max_num_pages = 256
+    cfg.shard(1)
+    kv_cache = torch.zeros(
+        cfg.num_layers, cfg.max_num_pages, 2, cfg.page_size, cfg.num_kv_heads, cfg.head_dim,
+        dtype=dtype, device=device,
+    )
+    alloc = PagedAllocationManager(cfg, kv_cache, TransferEngineInfo("h", "h", LocalTransferEngine("h")))
+    for rid in rids:
+        alloc.add_request(rid, [COND_LABEL, UNCOND_LABEL])
+    buf = WorkspaceBufferManager(256 * 1024 * 1024, device)
+    return {"kv_cache": kv_cache, "alloc": alloc, "buf": buf, "cfg": cfg, "device": device}
+
+
+def _mk_cm(shared, rids):
+    from mstar.engine.cache_manager import BatchedCacheManager
+    from mstar.model.cosmos3.submodules import COND_LABEL
+
+    return BatchedCacheManager(
+        request_ids=rids, active_labels_per_request={r: COND_LABEL for r in rids},
+        kv_cache=shared["kv_cache"], alloc_manager=shared["alloc"], buffer_manager=shared["buf"],
+        kv_cache_config=shared["cfg"], device=shared["device"], auto_write_store=False,
+    )
+
+
+@torch.no_grad()
+def _run_batched(model, dit, shared, init, conds, unconds, device, rids):
+    """Prefill each request (sequential, like the engine), then run the whole
+    denoise loop as one batched step per iteration. Returns final latents per rid."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    md = {"height": H, "width": W, "num_frames": 1, "fps": 24.0,
+          "guidance_scale": GS, "num_inference_steps": STEPS}
+    fwds = {}
+    for i, rid in enumerate(rids):
+        fwd = CurrentForwardPassInfo(
+            request_id=rid, graph_walk="prefill", requires_cfg=True, fwd_index=0,
+            random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
+        )
+        fwds[rid] = fwd
+        cm1 = _mk_cm(shared, [rid])
+        ei1 = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm1)
+        ti = [torch.tensor(conds[i], dtype=torch.long, device=device),
+              torch.tensor(unconds[i], dtype=torch.long, device=device)]
+        ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": ti})
+        dit.forward("prefill", ei1, **dit.preprocess("prefill", ei1, [ni]))
+
+    cmN = _mk_cm(shared, rids)
+    eiN = ModelInputsFromEngine(request_ids=rids, per_request_info=fwds, cache_manager=cmN)
+    for rid in rids:
+        fwds[rid].graph_walk = "image_gen"
+    latents = {rid: init.clone() for rid in rids}
+    time_index = {rid: torch.zeros(1, dtype=torch.long, device=device) for rid in rids}
+    for _ in range(STEPS):
+        inputs = [
+            dit.prepare_inputs("image_gen", fwds[rid],
+                               {"latents": [latents[rid]], "time_index": [time_index[rid]]})
+            for rid in rids
+        ]
+        out = dit.forward_batched("image_gen", eiN, **dit.preprocess("image_gen", eiN, inputs))
+        for rid in rids:
+            latents[rid], time_index[rid] = out[rid]["latents"][0], out[rid]["time_index"][0]
+    for rid in rids:
+        dit.cleanup_request(rid)
+    return latents
+
+
 _SETUP_CACHE: dict = {}
 
 
@@ -295,6 +371,81 @@ def test_engine_cache_path_video_psnr() -> None:
     _check_engine_psnr(VIDEO_FRAMES, "t2v")
 
 
+@torch.no_grad()
+def test_cross_request_batch_matches_individual() -> None:
+    """Several requests denoised together in one batch must reproduce each
+    request run alone. Distinct prompts are decoded and compared to the fused
+    pipeline: batching must (a) keep each request isolated — its own image far
+    closer than any other request's — and (b) not lose quality versus the bs=1
+    path (per-prompt fidelity varies with the FlashInfer kernel, so the bar is
+    relative to bs=1, not an absolute PSNR)."""
+    base = _load()
+    if base is None:
+        print("  (skipped cross-request batch parity: needs COSMOS3_NANO_DIR + CUDA)")
+        return
+    from mstar.model.cosmos3.packing import tokenize_prompt
+
+    model, dit, mpipe = base["model"], base["dit"], base["mpipe"]
+    device, dtype = base["device"], base["dtype"]
+    prompts = [
+        "A red cube resting on a polished wooden table, soft daylight.",
+        "A blue ceramic vase of yellow tulips beside a sunny window.",
+        "A small wooden sailboat on a calm turquoise sea at dawn.",
+        "A snowy mountain peak under a clear starry night sky.",
+    ]
+    rids = [f"r{i}" for i in range(len(prompts))]
+    conds, unconds = [], []
+    for p in prompts:
+        c, u = tokenize_prompt(model.tokenizer, p, "", num_frames=1, height=H, width=W)
+        conds.append(c)
+        unconds.append(u)
+    gen = torch.Generator(device=device).manual_seed(SEED)
+    init = torch.randn((1, 48, 1, H // 16, W // 16), generator=gen, device=device, dtype=dtype)
+    shape = (1, 48, 1, H // 16, W // 16)
+
+    def _dec(lat):
+        return mpipe._decode(lat.reshape(shape)).squeeze().float().cpu()
+
+    def _psnr(a, b):
+        mse = (a - b).pow(2).mean().item()
+        return float("inf") if mse == 0 else -10 * math.log10(mse)
+
+    try:
+        fused = [
+            _dec(mpipe(prompt=p, negative_prompt="", num_frames=1, height=H, width=W,
+                       num_inference_steps=STEPS, guidance_scale=GS, latents=init.clone(), decode=False))
+            for p in prompts
+        ]
+        bs1 = []
+        for i, rid in enumerate(rids):
+            cm = _flashinfer_cache(model, "r0", device, dtype)
+            bs1.append(_dec(_run_cache_once(model, dit, cm, init, conds[i], unconds[i], device, 1)))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (skipped cross-request batch parity: FlashInfer unavailable: {exc})")
+        return
+
+    shared = _flashinfer_shared(model, rids, device, dtype)
+    bat = _run_batched(model, dit, shared, init, conds, unconds, device, rids)
+    batched = [_dec(bat[rid]) for rid in rids]
+
+    n = len(prompts)
+    for i in range(n):
+        match = _psnr(batched[i], fused[i])
+        cross = max(_psnr(batched[i], fused[j]) for j in range(n) if j != i)
+        ref = _psnr(bs1[i], fused[i])
+        assert match > cross + 8, f"request {i} not isolated: self {match:.2f} vs other {cross:.2f}"
+        assert match >= ref - 3.0, f"request {i} batched {match:.2f} degrades vs bs=1 {ref:.2f}"
+    print(f"  cross-request batch (bs={n}) vs fused PSNR = "
+          + ", ".join(f"{_psnr(batched[i], fused[i]):.1f}" for i in range(n))
+          + " dB (bs=1: " + ", ".join(f"{_psnr(bs1[i], fused[i]):.1f}" for i in range(n)) + ")")
+    # This test holds several requests' caches at once; release them so later
+    # GPU checks in the same process aren't starved.
+    del fused, bs1, batched, bat, shared
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _main() -> None:
     failures = []
     for name, fn in [
@@ -303,6 +454,7 @@ def _main() -> None:
         ("engine_cache_path_image_psnr", test_engine_cache_path_image_psnr),
         ("cache_once_matches_fused_exact_t2v", test_cache_once_matches_fused_exact_t2v),
         ("engine_cache_path_video_psnr", test_engine_cache_path_video_psnr),
+        ("cross_request_batch_matches_individual", test_cross_request_batch_matches_individual),
     ]:
         try:
             fn()
@@ -310,6 +462,8 @@ def _main() -> None:
         except Exception as exc:  # noqa: BLE001
             failures.append((name, exc))
             print(f"FAIL  {name}: {exc!r}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     if failures:
         raise SystemExit(1)
     print("\nAll Cosmos3 engine-cache checks passed.")

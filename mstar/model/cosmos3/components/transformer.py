@@ -848,3 +848,70 @@ class Cosmos3OmniTransformer(nn.Module):
             return preds[0], action_pred
 
         return _decode(gen_out[:n]), _decode(gen_out[n:])
+
+    def denoise_step_batched(self, requests: list[dict], cache_handle):
+        """Denoise one step for several requests at once (image / video).
+
+        Each request carries its own latents, timestep, rotary positions (which
+        differ per request, and per guidance branch) and token layout. Every
+        request contributes a conditional and an unconditional sequence, packed
+        as ``[cond r0 | cond r1 | ... | uncond r0 | uncond r1 | ...]`` to match
+        the order the handle's batched plan lays out its entries. The layers run
+        once over the whole pack; the cache routes each piece to its own request
+        and guidance label. Returns one ``(cond_velocity, uncond_velocity)`` pair
+        per request, in request order.
+
+        Each ``requests`` entry is a dict with: ``latents``, ``vision_timesteps``,
+        ``position_ids_cond``, ``position_ids_uncond``, ``vision_token_shapes``,
+        ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``."""
+        gen_seqs, shapes, cos_cond, sin_cond, cos_uncond, sin_uncond = [], [], [], [], [], []
+        for req in requests:
+            packed, original_latent_shapes = self._patchify_and_pack_latents([req["latents"]])
+            packed = self.proj_in(packed)
+            ts_embeds = self.time_embedder(
+                self.time_proj(req["vision_timesteps"] * self.config.timestep_scale)
+            ).to(packed.dtype)
+            gen_seq = self._apply_timestep_embeds_to_noisy_tokens(
+                packed_tokens=packed,
+                packed_timestep_embeds=ts_embeds,
+                noisy_frame_indexes=req["vision_noisy_frame_indexes"],
+                token_shapes=req["vision_token_shapes"],
+            )
+            gen_seqs.append(gen_seq)
+            shapes.append(original_latent_shapes)
+            cc, sc = self._rotary(req["position_ids_cond"], gen_seq.device, gen_seq.dtype)
+            cu, su = self._rotary(req["position_ids_uncond"], gen_seq.device, gen_seq.dtype)
+            cos_cond.append(cc); sin_cond.append(sc)
+            cos_uncond.append(cu); sin_uncond.append(su)
+
+        # Conditional block first (all requests), then unconditional block.
+        all_gen = torch.cat(gen_seqs + gen_seqs, dim=0)
+        cos = torch.cat(cos_cond + cos_uncond, dim=0)
+        sin = torch.cat(sin_cond + sin_uncond, dim=0)
+        for i, layer in enumerate(self.layers):
+            cache_handle.set_layer_idx(i)
+            all_gen = layer.forward_gen(all_gen, cos, sin, cache_handle)
+        gen_out = self.norm_moe_gen(all_gen)
+
+        sizes = [g.shape[0] for g in gen_seqs]
+        total = sum(sizes)
+        cond_out, uncond_out = gen_out[:total], gen_out[total:]
+
+        def _decode(out, req, original_latent_shapes):
+            preds_packed = self.proj_out(out[req["vision_mse_loss_indexes"]])
+            preds = self._unpatchify_and_unpack_latents(
+                preds_packed,
+                token_shapes_vision=req["vision_token_shapes"],
+                noisy_frame_indexes_vision=req["vision_noisy_frame_indexes"],
+                original_latent_shapes=original_latent_shapes,
+            )
+            return preds[0]
+
+        results, off = [], 0
+        for i, req in enumerate(requests):
+            n = sizes[i]
+            cond_v = _decode(cond_out[off:off + n], req, shapes[i])
+            uncond_v = _decode(uncond_out[off:off + n], req, shapes[i])
+            off += n
+            results.append((cond_v, uncond_v))
+        return results
