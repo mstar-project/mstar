@@ -378,11 +378,11 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
 
         for info in read_info:
             slice = tensor[
-                info.layer_idx, info.remote_page_idx,
+                info.layer_idx, info.remote_page_idx, :,
                 info.token_start:info.token_end
             ].to(self._device)
             self._kv_cache[
-                info.layer_idx, info.local_page_idx,
+                info.layer_idx, info.local_page_idx, :,
                 info.token_start:info.token_end
             ] = slice
 

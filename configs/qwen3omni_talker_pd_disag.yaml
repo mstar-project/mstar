@@ -1,0 +1,24 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+node_groups:
+  - node_names: [audio_encoder, vision_encoder]
+    ranks: [0]
+  
+  - node_names: [Thinker]
+    ranks: [0]
+    graph_walks: [prefill_text, prefill_audio, prefill_vision]
+
+  - node_names: [Thinker]
+    ranks: [1]
+    graph_walks: [thinker_decode]
+  
+  - node_names: [Talker]
+    ranks: [2]
+    graph_walks: [talker_prefill, talker_last_prefill]
+  
+  - node_names: [Talker]
+    ranks: [3]
+    graph_walks: [talker_decode]
+  
+  - node_names: [Code2Wav]
+    ranks: [3]

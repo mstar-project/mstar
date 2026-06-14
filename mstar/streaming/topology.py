@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Callable
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge
 from mstar.streaming.chunk_policy import ChunkPolicy
 
@@ -15,10 +16,46 @@ class StreamingGraphEdge(GraphEdge):
     consuming node's input.
     """
     target_partition: str = ""
+    _index: int = 0
+    _graph_walk_transition: str | None = None
 
     def __post_init__(self):
         self.is_streaming = True
 
+    def clone(self):
+        return StreamingGraphEdge(
+            next_node=self.next_node,
+            name=self.name,
+            tensor_info=self.tensor_info[:],
+            persist=self.persist,
+            conductor_new_token=self.conductor_new_token,
+            is_streaming=self.is_streaming,
+            output_modality=self.output_modality,
+            _persist_for_loop=self._persist_for_loop,
+            _total_fanin=self._total_fanin,
+            _shard_dim=self._shard_dim,
+            _target_graph_walk=self._target_graph_walk,
+            target_partition=self.target_partition,
+            _index=self._index,
+            _graph_walk_transition=self._graph_walk_transition,
+        )
+
+
+@dataclass(frozen=True)
+class ConsumerTransitionCtx:
+    producer_walk: str
+    consumer_walk: str | None        # None on the very first trigger
+    # Unused by qwen3omni's transition fn, but exposed so a future model can
+    # base its transition on the producer's full forward-pass state. This is
+    # the sole reason streaming depends on conductor.request_info; revisit
+    # (e.g. a lighter type) if that dependency direction becomes a problem.
+    producer_fwd: CurrentForwardPassInfo
+
+
+@dataclass
+class WalkTransition:
+    graph_walk: str | None = None
+    # TODO [FUTURE]: hook up metadata if needed
 
 @dataclass
 class Connection:
@@ -27,6 +64,7 @@ class Connection:
     to_partition: str
     edge_name: str
     chunk_policy_factory: Callable[[], ChunkPolicy]
+    consumer_walk_transition: Callable[[ConsumerTransitionCtx], WalkTransition] | None = None
 
 
 @dataclass

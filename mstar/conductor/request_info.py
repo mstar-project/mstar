@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -47,6 +48,23 @@ class PerLabelSeqInfo:
                 **val
             }
 
+    def merge_keep_longest(self, other: "PerLabelSeqInfo"):
+        """Merge ``other`` into self, keeping — per (kv_cache_string, rank,
+        label) — the ``SequenceInfo`` with the larger ``seq_len``.
+
+        Used on the worker to stop a lagging conductor copy from rewinding a
+        request's locally-advanced KV sequence positions: a request's KV length
+        only ever grows, so the longer entry is always the more recent one.
+        """
+        for key, label_info in other.info.items():
+            dst = self.info.setdefault(key, {})
+            for label, seq_info in label_info.items():
+                cur = dst.get(label)
+                if cur is None or seq_info.seq_len > cur.seq_len:
+                    dst[label] = seq_info
+        for kv_cache_str, ws in other.world_size.items():
+            self.world_size.setdefault(kv_cache_str, ws)
+
     def get(self, kv_cache_str: str, rank: int) -> dict:
         return self.info.get((kv_cache_str, rank), {})
 
@@ -75,6 +93,9 @@ class CurrentForwardPassInfo:
     step_metadata: dict = field(default_factory=dict)
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")
+    produced_edge_idx: dict[str, int] = field(default_factory=dict)
+    next_stream_index: dict[str, int] = field(default_factory=dict)
+    tracked_consumer_graph_walks: dict[str, str] = field(default_factory=dict)
 
     # Per-loop stop indices; stop decisions come from each submodule's check_stop.
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
@@ -88,6 +109,20 @@ class CurrentForwardPassInfo:
 # Partition types for async graph partitions
 # ---------------------------------------------------------------------------
 
+class TransitionSource(str, Enum):
+    """Who owns a partition's graph-walk transitions.
+
+    A partition's walk is moved by exactly one authority:
+      - STATE_MACHINE: the conductor advances the walk via the model's
+        ``get_partition_forward_pass_args``.
+      - PRODUCER_TRIGGERED: a producer partition drives the walk via streaming
+        transition markers (``Connection.consumer_walk_transition``); the
+        conductor does not advance it.
+    """
+    STATE_MACHINE = "state_machine"
+    PRODUCER_TRIGGERED = "producer_triggered"
+
+
 @dataclass
 class PartitionDefinition:
     """Defines a partition within a model's computation graph.
@@ -99,6 +134,7 @@ class PartitionDefinition:
     graph_walks: set[str]                                       # walks this partition uses
     initial_walk: str | None = None                             # first walk, or None = triggered later
     producer_partitions: list[str] = field(default_factory=list)  # partitions feeding tokens to this one
+    transition_source: TransitionSource = TransitionSource.STATE_MACHINE
 
 
 @dataclass
@@ -120,6 +156,14 @@ class PartitionState:
     fwd_pass_number: int = 0
     random_seed: int = 0
     is_done: bool = False
+    # streaming edge name -> number of times this edge has been emitted
+    produced_edge_idx: dict[str, int] = field(default_factory=dict)
+    # streaming edge name -> next stream index the consumer should drain
+    # (one past the last index a completed consumer pass has consumed)
+    next_stream_index: dict[str, int] = field(default_factory=dict)
+    # only for producer-driven graph walk transitions
+    tracked_consumer_graph_walks: dict[str, str] = field(default_factory=dict)
+    new_tokens: dict[str, list[int]] = field(default_factory=dict)
     completed_worker_graph_ids: set[str] = field(default_factory=set)
     current_worker_graph_ids: set[str] = field(default_factory=set)
     # wg_id -> count of distinct TP ranks that have reported completion
