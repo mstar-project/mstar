@@ -1184,10 +1184,15 @@ class Qwen3OmniModel(Model):
     # Model ABC: submodule loading
     # -----------------------------------------------------------------------
 
-    def get_submodule(self, node_name: str, device: str = "cpu", tp_group=None) -> NodeSubmodule | None:
+    def get_submodule(
+        self, node_name: str, device: str = "cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group=tp_group)
+        submodule = self._create_submodule(
+            node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+        )
         logger.info("Successfully loaded Qwen3-Omni submodule for %s", node_name)
         self._submodule_cache[node_name] = submodule
 
@@ -1211,11 +1216,18 @@ class Qwen3OmniModel(Model):
 
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str, tp_group=None) -> NodeSubmodule | None:
+    def _create_submodule(
+        self, node_name: str, device: str, tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule | None:
         if node_name == "Thinker":
-            return self._create_thinker_submodule(device, tp_group=tp_group)
+            return self._create_thinker_submodule(
+                device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+            )
         elif node_name == "Talker":
-            return self._create_talker_submodule(device, tp_group=tp_group)
+            return self._create_talker_submodule(
+                device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+            )
         elif node_name == "Code2Wav":
             return self._create_code2wav_submodule(device)
         elif node_name == "audio_encoder":
@@ -1295,13 +1307,20 @@ class Qwen3OmniModel(Model):
         self._THINKER_STACKED_PARAMS = rules
         return rules
 
-    def _create_thinker_submodule(self, device: str, tp_group=None) -> NodeSubmodule:
+    def _create_thinker_submodule(
+        self, device: str, tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule:
         from mstar.model.loader import load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
 
         with torch.device("meta"):
             thinker_model = Qwen3OmniThinkerModel(self.config, comm_group=tp_group)
+        # Cast on meta (no allocation) so to_empty allocates directly in the
+        # target dtype instead of fp32-then-downcast.
+        if autocast_dtype is not None:
+            thinker_model = thinker_model.to(autocast_dtype)
         thinker_model.to_empty(device=device)
 
         weights = iter_safetensors_shards(
@@ -1325,7 +1344,10 @@ class Qwen3OmniModel(Model):
             config=self.config,
         )
 
-    def _create_talker_submodule(self, device: str, tp_group=None) -> NodeSubmodule:
+    def _create_talker_submodule(
+        self, device: str, tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule:
         from mstar.model.loader import load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.qwen3_omni.components.talker import (
@@ -1340,6 +1362,10 @@ class Qwen3OmniModel(Model):
             # replication is cheaper than 150+ NCCL all-reduces per
             # decode step (5 layers x 15 unrolled iterations).
             talker_model = Qwen3OmniTalkerModel(self.config, comm_group=tp_group)
+        # Cast on meta (no allocation) so to_empty allocates directly in the
+        # target dtype instead of fp32-then-downcast.
+        if autocast_dtype is not None:
+            talker_model = talker_model.to(autocast_dtype)
         talker_model.to_empty(device=device)
 
         # Talker and CodePredictor share the "talker." prefix. We stream
@@ -1381,6 +1407,10 @@ class Qwen3OmniModel(Model):
 
         with torch.device("meta"):
             code_predictor = Qwen3OmniCodePredictor(self.config)
+        # Cast on meta (no allocation) so to_empty allocates directly in the
+        # target dtype instead of fp32-then-downcast.
+        if autocast_dtype is not None:
+            code_predictor = code_predictor.to(autocast_dtype)
         code_predictor.to_empty(device=device)
         load_hf_weights(
             code_predictor, iter(code_pred_weights),

@@ -588,7 +588,19 @@ class Pi05Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
+        # NOTE: ``autocast_dtype`` is accepted for interface parity but
+        # deliberately NOT applied at param allocation. Pi0.5's submodules
+        # (Pi05ViTEncoderSubmodule / Pi05LLMSubmodule) override ``to()`` to
+        # keep precision-sensitive params in fp32 — the SigLIP vision tower
+        # entirely, and the transformer norm params — matching lerobot's
+        # ``to_bfloat16_for_selected_params``. Meta-casting to bf16 before
+        # ``to_empty`` would load those weights into bf16 storage and lose
+        # precision that the post-load fp32 upcast cannot recover (~0.2 abs
+        # delta on final actions). So we load in fp32 and let the submodule
+        # ``to()`` overrides do the selective down-cast. Pi0.5 (~14 GB) does
+        # not hit the load-time OOM this hint addresses.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(node_name, device)
