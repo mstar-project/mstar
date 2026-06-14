@@ -27,7 +27,7 @@ import logging
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.model.cosmos3.packing import build_t2i_static_inputs
+from mstar.model.cosmos3.packing import build_static_inputs
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -71,14 +71,21 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # Static packing + scheduler helpers
     # ------------------------------------------------------------------
 
-    def _latent_shape(self, height: int, width: int) -> tuple[int, int, int, int, int]:
+    def _latent_shape(
+        self, height: int, width: int, num_frames: int = 1
+    ) -> tuple[int, int, int, int, int]:
         s = self.config.vae.scale_factor_spatial
-        return (1, self.config.latent_channel, 1, height // s, width // s)
+        t = 1 if num_frames == 1 else 1 + (num_frames - 1) // self.config.vae.scale_factor_temporal
+        return (1, self.config.latent_channel, t, height // s, width // s)
 
-    def _build_static(self, ids: list[int], height: int, width: int, fps: float, device) -> dict:
-        static = build_t2i_static_inputs(
-            list(ids), self._latent_shape(height, width), self.config,
+    def _build_static(
+        self, ids: list[int], height: int, width: int, num_frames: int,
+        fps: float, has_image_condition: bool, device,
+    ) -> dict:
+        static = build_static_inputs(
+            list(ids), self._latent_shape(height, width, num_frames), self.config,
             self.config.vae.scale_factor_temporal, fps, device,
+            has_image_condition=has_image_condition,
         )
         # proj_out runs on the generation token block, so shift the joint-sequence
         # mse indexes to be relative to the vision tokens.
@@ -109,14 +116,23 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _prepare_prefill(self, fwd_info, inputs, device) -> ARNodeInputs:
         md = fwd_info.step_metadata
         height, width = int(md.get("height", 256)), int(md.get("width", 256))
+        num_frames = int(md.get("num_frames", 1))
         fps = float(md.get("fps", 24.0))
         gs = float(md.get("guidance_scale", 6.0))
         steps = int(md.get("num_inference_steps", self.config.num_inference_steps))
+        # Image-to-video: latent frame 0 is a clean conditioning anchor supplied
+        # in the first denoise step's ``latents``; it stays in the sequence but is
+        # not denoised. (Text-to-image / text-to-video have no clean anchor.)
+        has_image_condition = bool(md.get("has_image_condition", False))
 
-        cond = self._build_static(inputs["text_inputs"][0].tolist(), height, width, fps, device)
+        cond = self._build_static(
+            inputs["text_inputs"][0].tolist(), height, width, num_frames, fps, has_image_condition, device
+        )
         uncond = None
         if gs != 1.0:
-            uncond = self._build_static(inputs["text_inputs"][1].tolist(), height, width, fps, device)
+            uncond = self._build_static(
+                inputs["text_inputs"][1].tolist(), height, width, num_frames, fps, has_image_condition, device
+            )
 
         self._req[fwd_info.request_id] = {
             "cond": cond,
@@ -125,7 +141,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "scheduler": self._new_scheduler(steps, device),
             "num_noisy": cond["num_noisy_vision_tokens"],
             "num_vision": cond["num_vision_tokens"],
-            "latent_shape": self._latent_shape(height, width),
+            "latent_shape": self._latent_shape(height, width, num_frames),
         }
         return ARNodeInputs(input_seq_len=cond["und_len"])
 
