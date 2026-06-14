@@ -559,7 +559,11 @@ class CudaGraphRunner:
                 spec = prepare_slot(slot_idx)
                 dummy_rids_to_free.append(spec.dummy_rids)
 
-                forward = submodule.forward_batched
+                # Usually ``forward_batched`` (the same method the eager batched
+                # path runs). Diffusion walks override this to a velocity-only
+                # method so the non-capturable scheduler tail stays out of the
+                # graph (run later in ``postprocess_captured``).
+                forward = getattr(submodule, config.capture_forward_method)
                 if config.compile:
                     forward = torch.compile(
                         forward,
@@ -1391,9 +1395,13 @@ class CudaGraphRunner:
                 range_push("gpu_thread.postprocess", synchronize=False)
             if self.enable_nvtx:
                 range_push("cg.advance_seq_lens", synchronize=False)
-            for label in config_labels:
-                static_cm.set_active_label(label)
-                static_cm.advance_seq_lens()
+            # Frozen-prefix denoise walks re-read a fixed prefix and overwrite the
+            # same tail pages every step, so they opt out of the advance (it would
+            # grow the prefix across steps and corrupt attention).
+            if graph_data.config.advance_seq_lens:
+                for label in config_labels:
+                    static_cm.set_active_label(label)
+                    static_cm.advance_seq_lens()
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -1421,6 +1429,18 @@ class CudaGraphRunner:
             )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
+
+            # Eager tail for walks that captured only a velocity/raw forward and
+            # keep a non-capturable step (e.g. a multistep scheduler) out of the
+            # graph. Runs with REAL request ids, the original ``inputs``, and the
+            # cloned captured outputs, so it can finish each request's step.
+            if hasattr(submodule, "postprocess_captured"):
+                outputs = submodule.postprocess_captured(
+                    request_ids=request_ids,
+                    inputs=inputs,
+                    per_request_info=per_request_info,
+                    outputs=outputs,
+                )
 
             success = True
             return outputs
@@ -1608,9 +1628,13 @@ class CudaGraphRunner:
                 range_push("gpu_thread.postprocess", synchronize=False)
             if self.enable_nvtx:
                 range_push("cg.advance_seq_lens", synchronize=False)
-            for label in config_labels:
-                static_cm.set_active_label(label)
-                static_cm.advance_seq_lens()
+            # Frozen-prefix denoise walks re-read a fixed prefix and overwrite the
+            # same tail pages every step, so they opt out of the advance (it would
+            # grow the prefix across steps and corrupt attention).
+            if graph_data.config.advance_seq_lens:
+                for label in config_labels:
+                    static_cm.set_active_label(label)
+                    static_cm.advance_seq_lens()
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -1631,6 +1655,18 @@ class CudaGraphRunner:
             )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
+
+            # Eager tail for walks that captured only a velocity/raw forward and
+            # keep a non-capturable step (e.g. a multistep scheduler) out of the
+            # graph. Runs with REAL request ids, the original ``inputs``, and the
+            # cloned captured outputs, so it can finish each request's step.
+            if hasattr(submodule, "postprocess_captured"):
+                outputs = submodule.postprocess_captured(
+                    request_ids=request_ids,
+                    inputs=inputs,
+                    per_request_info=per_request_info,
+                    outputs=outputs,
+                )
 
             success = True
             return outputs
