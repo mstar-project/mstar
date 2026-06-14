@@ -35,6 +35,7 @@ if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __f
         ChatCompletionRequest,
         ImageGenerationRequest,
         SpeechRequest,
+        VideoGenerationRequest,
     )
 
 
@@ -164,6 +165,7 @@ class OpenAIAdapter:
     supports_chat: bool = False     # POST /v1/chat/completions
     supports_speech: bool = False   # POST /v1/audio/speech
     supports_images: bool = False   # POST /v1/images/generations and /v1/images/edits
+    supports_videos: bool = False   # POST /v1/videos/generations
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
@@ -175,6 +177,9 @@ class OpenAIAdapter:
 
     def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("image generation is not supported by this model")
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        raise NotImplementedError("video generation is not supported by this model")
 
     def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("image editing is not supported by this model")
@@ -298,7 +303,7 @@ class OrpheusAdapter(OpenAIAdapter):
 
 
 class Cosmos3Adapter(OpenAIAdapter):
-    """NVIDIA Cosmos3: text-to-image generation.
+    """NVIDIA Cosmos3: text-to-image and text/image-to-video generation.
 
     ``size`` ("WxH") maps to the generation resolution; ``seed`` and any
     extra knobs (``guidance_scale``, ``num_inference_steps``, ``negative_prompt``,
@@ -306,6 +311,7 @@ class Cosmos3Adapter(OpenAIAdapter):
     """
 
     supports_images = True
+    supports_videos = True
 
     def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)
@@ -317,6 +323,29 @@ class Cosmos3Adapter(OpenAIAdapter):
             text=req.prompt,
             input_modalities=["text"],
             output_modalities=["image"],
+            model_kwargs=mk,
+        )
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        if getattr(req, "image", None):
+            # Image-to-video needs the conditioning frame VAE-encoded on the
+            # worker (the served frame-0 anchor), which is not wired yet; reject
+            # here so the request fails fast rather than silently ignoring it.
+            raise NotImplementedError("Cosmos3 image-to-video is not yet supported")
+        mk = _passthrough(req)
+        if getattr(req, "size", None):
+            mk.setdefault("size", req.size)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        # num_frames / fps are first-class video fields (not in extra_body).
+        if getattr(req, "num_frames", None) is not None:
+            mk.setdefault("num_frames", req.num_frames)
+        if getattr(req, "fps", None) is not None:
+            mk.setdefault("fps", req.fps)
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["video"],
             model_kwargs=mk,
         )
 

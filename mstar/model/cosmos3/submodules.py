@@ -47,13 +47,21 @@ logger = logging.getLogger(__name__)
 
 PREFILL_WALK = "prefill"
 IMAGE_GEN_WALK = "image_gen"
+VIDEO_GEN_WALK = "video_gen"
 ACTION_GEN_WALK = "action_gen"
+
+# image_gen and video_gen run the identical denoise step (the DiT loop is
+# shape-general over the frame count); they differ only in the emitted output
+# modality (a single image frame vs an encoded video), which the graph fixes per
+# walk, so the submodule treats them the same.
+GEN_WALKS = (IMAGE_GEN_WALK, VIDEO_GEN_WALK)
 
 # Names of the denoise loops in the graph walks. The loops are built with a fixed
 # upper-bound iteration count and each request stops its loop early at its own
 # denoise-step count (see ``check_stop``), so one graph serves any per-request
 # step count.
 IMAGE_GEN_LOOP = "image_gen_loop"
+VIDEO_GEN_LOOP = "video_gen_loop"
 ACTION_GEN_LOOP = "action_gen_loop"
 
 # Conditional prompt K/V lives under the primary label; the unconditional
@@ -166,7 +174,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         device = self.get_device()
         if graph_walk == PREFILL_WALK:
             return self._prepare_prefill(fwd_info, inputs, device)
-        if graph_walk == IMAGE_GEN_WALK:
+        if graph_walk in GEN_WALKS:
             return self._prepare_image_gen(fwd_info, inputs, device)
         if graph_walk == ACTION_GEN_WALK:
             return self._prepare_action_gen(fwd_info, inputs, device)
@@ -367,7 +375,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 )
             return {}
 
-        if graph_walk == IMAGE_GEN_WALK:
+        if graph_walk in GEN_WALKS:
             rids = engine_inputs.request_ids
             if len(rids) > 1:
                 # Cross-request batch: one batched plan over every request's two
@@ -405,7 +413,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         rid = engine_inputs.request_ids[0]
         if graph_walk == PREFILL_WALK:
             return self._forward_prefill(cm, self._req[rid])
-        if graph_walk == IMAGE_GEN_WALK:
+        if graph_walk in GEN_WALKS:
             return self._forward_image_gen(cm, self._req[rid], **kwargs)
         if graph_walk == ACTION_GEN_WALK:
             return self._forward_action_gen(cm, self._req[rid], **kwargs)
@@ -750,10 +758,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         st = self._req.get(request_id)
         if st is None:
             return set()
-        loop = (
-            ACTION_GEN_LOOP if request_info.graph_walk == ACTION_GEN_WALK
-            else IMAGE_GEN_LOOP
-        )
+        loop = {
+            ACTION_GEN_WALK: ACTION_GEN_LOOP,
+            VIDEO_GEN_WALK: VIDEO_GEN_LOOP,
+        }.get(request_info.graph_walk, IMAGE_GEN_LOOP)
         iter_idx = request_info.dynamic_loop_iter_counts.get(loop, 0)
         if iter_idx + 1 >= len(st["scheduler"].timesteps):
             return {loop}
@@ -791,4 +799,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         z = latents.to(vae.dtype) / inv_std + mean
         decoded = vae.decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
         image = (decoded / 2 + 0.5).clamp(0, 1).to(torch.float32)
-        return {"image_output": [image]}
+        # Route the decoded tensor to the active walk's emit edge: image_gen
+        # emits "image_output" (one frame), video_gen emits "video_output".
+        out_name = "video_output" if graph_walk == VIDEO_GEN_WALK else "image_output"
+        return {out_name: [image]}

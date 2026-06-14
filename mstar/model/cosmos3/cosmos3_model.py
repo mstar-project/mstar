@@ -50,6 +50,7 @@ from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
     IMAGE_GEN_LOOP,
+    VIDEO_GEN_LOOP,
     Cosmos3DiTSubmodule,
     Cosmos3VAEDecoderSubmodule,
 )
@@ -65,6 +66,7 @@ class Cosmos3Model(Model):
 
     PREFILL_WALK = "prefill"
     IMAGE_GEN_WALK = "image_gen"
+    VIDEO_GEN_WALK = "video_gen"
     ACTION_GEN_WALK = "action_gen"
 
     def __init__(
@@ -183,36 +185,43 @@ class Cosmos3Model(Model):
         # upper bound — each request stops the loop at its own denoise-step count
         # (Cosmos3DiTSubmodule.check_stop), so one graph serves image and video
         # (and any per-request num_inference_steps) without a rebuild.
-        image_gen = Sequential(
-            [
-                Loop(
-                    name=IMAGE_GEN_LOOP,
-                    section=GraphNode(
-                        name=DIT_NODE,
-                        input_names=["latents", "time_index"],
+        # image_gen and video_gen are the same denoise loop + VAE decode; they
+        # differ only in the emitted modality (one frame vs an encoded clip), so
+        # the request's output modality selects between them.
+        def _gen_walk(loop_name: str, emit_name: str, modality: str) -> Sequential:
+            return Sequential(
+                [
+                    Loop(
+                        name=loop_name,
+                        section=GraphNode(
+                            name=DIT_NODE,
+                            input_names=["latents", "time_index"],
+                            outputs=[
+                                GraphEdge(next_node=DIT_NODE, name="latents"),
+                                GraphEdge(next_node=DIT_NODE, name="time_index"),
+                            ],
+                        ),
+                        max_iters=self.config.max_inference_steps,
                         outputs=[
-                            GraphEdge(next_node=DIT_NODE, name="latents"),
-                            GraphEdge(next_node=DIT_NODE, name="time_index"),
+                            GraphEdge(next_node=VAE_DECODER_NODE, name="latents"),
                         ],
                     ),
-                    max_iters=self.config.max_inference_steps,
-                    outputs=[
-                        GraphEdge(next_node=VAE_DECODER_NODE, name="latents"),
-                    ],
-                ),
-                GraphNode(
-                    name=VAE_DECODER_NODE,
-                    input_names=["latents"],
-                    outputs=[
-                        GraphEdge(
-                            next_node=EMIT_TO_CLIENT,
-                            name="image_output",
-                            output_modality="image",
-                        ),
-                    ],
-                ),
-            ]
-        )
+                    GraphNode(
+                        name=VAE_DECODER_NODE,
+                        input_names=["latents"],
+                        outputs=[
+                            GraphEdge(
+                                next_node=EMIT_TO_CLIENT,
+                                name=emit_name,
+                                output_modality=modality,
+                            ),
+                        ],
+                    ),
+                ]
+            )
+
+        image_gen = _gen_walk(IMAGE_GEN_LOOP, "image_output", "image")
+        video_gen = _gen_walk(VIDEO_GEN_LOOP, "video_output", "video")
 
         # action_gen: like image_gen but the loop body jointly denoises the video
         # and action latents (threaded as two self-edges), and the predicted
@@ -245,6 +254,7 @@ class Cosmos3Model(Model):
         return {
             self.PREFILL_WALK: prefill,
             self.IMAGE_GEN_WALK: image_gen,
+            self.VIDEO_GEN_WALK: video_gen,
             self.ACTION_GEN_WALK: action_gen,
         }
 
@@ -320,6 +330,26 @@ class Cosmos3Model(Model):
             buf = io.BytesIO()
             Image.fromarray(arr).save(buf, format="PNG")
             return buf.getvalue()
+        if modality == "video":
+            import os
+            import tempfile
+
+            from torchvision.io import write_video
+
+            # Wan VAE decode is [B, C, T, H, W] in [0, 1]; encode all frames as
+            # H.264 mp4. The frames already reflect the request fps (it modulates
+            # the temporal positions during generation); the container plays back
+            # at the model's default fps.
+            x = output[0] if output.ndim == 5 else output  # [C, T, H, W]
+            frames = (x.permute(1, 2, 3, 0).clamp(0, 1) * 255).to(torch.uint8).cpu()
+            fd, path = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd)
+            try:
+                write_video(path, frames, fps=self.config.fps, video_codec="libx264")
+                with open(path, "rb") as f:
+                    return f.read()
+            finally:
+                os.remove(path)
         if modality == "action":
             return output.detach().to(torch.float32).cpu().numpy().tobytes()
         raise ValueError(f"Unsupported modality for Cosmos3: {modality!r}")
@@ -344,7 +374,12 @@ class Cosmos3Model(Model):
                 width, height = int(sw), int(sh)
             except ValueError:
                 pass
-        num_frames = int(mk.get("num_frames", 1))
+        # A video request without an explicit frame count gets the video default
+        # (>1); image requests stay single-frame.
+        default_frames = (
+            self.config.num_frames_video if "video" in (output_modalities or []) else 1
+        )
+        num_frames = int(mk.get("num_frames", default_frames))
         # The image and video cookbook step counts differ (image 50, video 35);
         # default by mode and let the request override. The denoise loop runs this
         # many steps and stops early (Cosmos3DiTSubmodule.check_stop), so the value
@@ -359,7 +394,7 @@ class Cosmos3Model(Model):
             "width": int(mk.get("width", width)),
             "height": int(mk.get("height", height)),
             "num_frames": num_frames,
-            "fps": float(mk.get("fps", 24.0)),
+            "fps": float(mk.get("fps", self.config.fps)),
             "guidance_scale": float(mk.get("guidance_scale", 6.0)),
             "num_inference_steps": steps,
             "has_image_condition": "image" in (input_modalities or []),
@@ -420,9 +455,18 @@ class Cosmos3Model(Model):
         inputs: list[GraphEdge] = []
 
         is_action = "action" in metadata.output_modalities
+        is_video = "video" in metadata.output_modalities
         if metadata.graph_walk == self.PREFILL_WALK:
             metadata.is_prefill = False
-            metadata.graph_walk = self.ACTION_GEN_WALK if is_action else self.IMAGE_GEN_WALK
+            # Pick the denoise walk by output modality: action and video each emit
+            # their own modality (image and video share the same loop but differ
+            # in what the VAE node emits).
+            if is_action:
+                metadata.graph_walk = self.ACTION_GEN_WALK
+            elif is_video:
+                metadata.graph_walk = self.VIDEO_GEN_WALK
+            else:
+                metadata.graph_walk = self.IMAGE_GEN_WALK
             # The first denoise iteration's initial noise + step index are
             # sampled inside the DiT submodule's preprocess. Action requests also
             # thread the action latents through the loop.
@@ -432,7 +476,9 @@ class Cosmos3Model(Model):
             ]
             if is_action:
                 inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="action_latents"))
-        elif metadata.graph_walk in (self.IMAGE_GEN_WALK, self.ACTION_GEN_WALK):
+        elif metadata.graph_walk in (
+            self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK, self.ACTION_GEN_WALK
+        ):
             request_done = True
 
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
