@@ -297,12 +297,37 @@ class OrpheusAdapter(OpenAIAdapter):
         )
 
 
+class Cosmos3Adapter(OpenAIAdapter):
+    """NVIDIA Cosmos3: text-to-image generation.
+
+    ``size`` ("WxH") maps to the generation resolution; ``seed`` and any
+    extra knobs (``guidance_scale``, ``num_inference_steps``, ``negative_prompt``,
+    and for video ``num_frames`` / ``fps``) pass through via ``extra_body``.
+    """
+
+    supports_images = True
+
+    def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        mk = _passthrough(req)
+        if getattr(req, "size", None):
+            mk.setdefault("size", req.size)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["image"],
+            model_kwargs=mk,
+        )
+
+
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "bagel": BagelAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "orpheus": OrpheusAdapter(),
+    "cosmos3": Cosmos3Adapter(),
 }
 
 
