@@ -63,6 +63,7 @@ class Cosmos3Model(Model):
 
     PREFILL_WALK = "prefill"
     IMAGE_GEN_WALK = "image_gen"
+    ACTION_GEN_WALK = "action_gen"
 
     def __init__(
         self,
@@ -209,9 +210,37 @@ class Cosmos3Model(Model):
             ]
         )
 
+        # action_gen: like image_gen but the loop body jointly denoises the video
+        # and action latents (threaded as two self-edges), and the predicted
+        # action — not a decoded video — is what the request emits.
+        action_gen = Sequential(
+            [
+                Loop(
+                    section=GraphNode(
+                        name=DIT_NODE,
+                        input_names=["latents", "action_latents", "time_index"],
+                        outputs=[
+                            GraphEdge(next_node=DIT_NODE, name="latents"),
+                            GraphEdge(next_node=DIT_NODE, name="action_latents"),
+                            GraphEdge(next_node=DIT_NODE, name="time_index"),
+                        ],
+                    ),
+                    max_iters=self.config.num_inference_steps,
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="action_output",
+                            output_modality="action",
+                        ),
+                    ],
+                ),
+            ]
+        )
+
         return {
             self.PREFILL_WALK: prefill,
             self.IMAGE_GEN_WALK: image_gen,
+            self.ACTION_GEN_WALK: action_gen,
         }
 
     # ------------------------------------------------------------------
@@ -299,16 +328,20 @@ class Cosmos3Model(Model):
         request_done = False
         inputs: list[GraphEdge] = []
 
+        is_action = "action" in metadata.output_modalities
         if metadata.graph_walk == self.PREFILL_WALK:
             metadata.is_prefill = False
-            metadata.graph_walk = self.IMAGE_GEN_WALK
+            metadata.graph_walk = self.ACTION_GEN_WALK if is_action else self.IMAGE_GEN_WALK
             # The first denoise iteration's initial noise + step index are
-            # sampled inside the DiT submodule's preprocess.
+            # sampled inside the DiT submodule's preprocess. Action requests also
+            # thread the action latents through the loop.
             inputs = [
                 GraphEdge(next_node=DIT_NODE, name="latents"),
                 GraphEdge(next_node=DIT_NODE, name="time_index"),
             ]
-        elif metadata.graph_walk == self.IMAGE_GEN_WALK:
+            if is_action:
+                inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="action_latents"))
+        elif metadata.graph_walk in (self.IMAGE_GEN_WALK, self.ACTION_GEN_WALK):
             request_done = True
 
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])

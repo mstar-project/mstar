@@ -388,6 +388,7 @@ class Cosmos3OmniTransformer(nn.Module):
             self.audio_modality_embed = nn.Parameter(torch.zeros(h))
 
         # Action heads (per-embodiment domain-aware projections).
+        self.action_dim = config.max_action_dim
         if config.action_gen:
             self.action_proj_in = DomainAwareLinear(
                 config.max_action_dim, h, config.num_embodiment_domains
@@ -509,6 +510,48 @@ class Cosmos3OmniTransformer(nn.Module):
             unpacked.append(output)
         return unpacked
 
+    def _embed_action(
+        self,
+        action_latents: torch.Tensor,
+        action_domain_id: torch.Tensor,
+        action_timesteps: torch.Tensor,
+        action_token_shapes: list[tuple[int, int, int]],
+        action_noisy_frame_indexes: list[torch.Tensor],
+        target_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Project action tokens ([1, T, D]) into the hidden space: domain-aware
+        in-projection + the action modality embedding, then scatter-add the
+        timestep embedding to the noisy (predicted) action tokens only. Returns
+        [T, hidden]."""
+        packed = self.action_proj_in(action_latents, action_domain_id)[0]  # [T, hidden]
+        packed = packed + self.action_modality_embed.to(packed.dtype)
+        ts = action_timesteps * self.config.timestep_scale
+        ts_embeds = self.time_embedder(self.time_proj(ts)).to(target_dtype)
+        return self._apply_timestep_embeds_to_noisy_tokens(
+            packed_tokens=packed,
+            packed_timestep_embeds=ts_embeds,
+            noisy_frame_indexes=action_noisy_frame_indexes,
+            token_shapes=action_token_shapes,
+        )
+
+    def _decode_action(
+        self,
+        gen_hidden: torch.Tensor,
+        action_domain_id: torch.Tensor,
+        action_token_shapes: list[tuple[int, int, int]],
+        action_noisy_frame_indexes: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Domain-aware out-projection of the noisy action hidden states back to
+        action space, scattered into a full [1, T, D] tensor (clean tokens left
+        zero, matching the velocity mask the scheduler applies)."""
+        preds = self.action_proj_out(gen_hidden.unsqueeze(0), action_domain_id)[0]  # [n_noisy, D]
+        t_a = action_token_shapes[0][0]
+        out = preds.new_zeros((t_a, self.action_dim))
+        noisy = action_noisy_frame_indexes[0]
+        if noisy.numel() > 0:
+            out[noisy] = preds
+        return out.unsqueeze(0)  # [1, T, D]
+
     # ------------------------------------------------------------------
     # forward: full per-step pass — encode text/vision, run layers, decode velocity.
     # ------------------------------------------------------------------
@@ -532,8 +575,18 @@ class Cosmos3OmniTransformer(nn.Module):
         sound_mse_loss_indexes: torch.Tensor | None = None,
         sound_timesteps: torch.Tensor | None = None,
         sound_noisy_frame_indexes: list[torch.Tensor] | None = None,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor] | None]:
+        action_tokens: torch.Tensor | None = None,
+        action_token_shapes: list[tuple[int, int, int]] | None = None,
+        action_sequence_indexes: torch.Tensor | None = None,
+        action_mse_loss_indexes: torch.Tensor | None = None,
+        action_timesteps: torch.Tensor | None = None,
+        action_noisy_frame_indexes: list[torch.Tensor] | None = None,
+        action_domain_id: torch.Tensor | None = None,
+    ) -> tuple:
+        # Returns ``(vision, sound)`` for video/sound generation (diffusers-
+        # compatible) or ``(vision, action, sound)`` when action tokens are given.
         has_sound = sound_tokens is not None and sound_sequence_indexes is not None
+        has_action = action_tokens is not None and action_sequence_indexes is not None
 
         # Embed text into the joint hidden_states buffer at its sequence positions.
         packed_text_embedding = self.embed_tokens(input_ids)
@@ -568,6 +621,16 @@ class Cosmos3OmniTransformer(nn.Module):
             )
             hidden_states[sound_sequence_indexes] = packed_tokens_sound
 
+        # Project + place action tokens (after the vision block in the gen
+        # sequence): domain-aware in-projection + modality embed, timestep embed
+        # added only to noisy (predicted) action tokens.
+        if has_action:
+            packed_tokens_action = self._embed_action(
+                action_tokens, action_domain_id, action_timesteps,
+                action_token_shapes, action_noisy_frame_indexes, target_dtype,
+            )
+            hidden_states[action_sequence_indexes] = packed_tokens_action
+
         # mRoPE once for the joint sequence, then slice into und/gen halves.
         cos, sin = self.rotary_emb(
             position_ids=position_ids.unsqueeze(0) if position_ids.ndim == 1 else position_ids.unsqueeze(1),
@@ -595,11 +658,23 @@ class Cosmos3OmniTransformer(nn.Module):
             original_latent_shapes=original_latent_shapes,
         )
 
+        preds_action: torch.Tensor | None = None
+        if has_action:
+            preds_action = self._decode_action(
+                last_hidden_state[action_mse_loss_indexes],
+                action_domain_id, action_token_shapes, action_noisy_frame_indexes,
+            )
+
         preds_sound: list[torch.Tensor] | None = None
         if has_sound:
             preds_sound_packed = self.audio_proj_out(last_hidden_state[sound_mse_loss_indexes])
             preds_sound = self._unpack_sound_latents(preds_sound_packed, sound_token_shapes, sound_noisy_frame_indexes)
 
+        # Video/sound generation keeps the diffusers ``(vision, sound)`` return so
+        # this module is a drop-in for the diffusers transformer; action
+        # generation additionally returns the predicted action band.
+        if has_action:
+            return preds_vision, preds_action, preds_sound
         return preds_vision, preds_sound
 
     # ------------------------------------------------------------------
@@ -638,16 +713,25 @@ class Cosmos3OmniTransformer(nn.Module):
         vision_noisy_frame_indexes: list[torch.Tensor],
         vision_mse_loss_indexes: torch.Tensor,
         cache_handle,
-    ) -> torch.Tensor:
+        action_latents: torch.Tensor | None = None,
+        action_token_shapes: list[tuple[int, int, int]] | None = None,
+        action_noisy_frame_indexes: list[torch.Tensor] | None = None,
+        action_mse_gen_indexes: torch.Tensor | None = None,
+        action_timesteps: torch.Tensor | None = None,
+        action_domain_id: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """One generation-tower evaluation against the frozen understanding K/V.
 
         Patchifies ``latents`` ([1, C, T, H, W]), scatter-adds the timestep
         embedding to the noisy tokens, runs the generation layers (each reading
         the active label's cached understanding K/V plus its own freshly written
-        K/V), and decodes the flow velocity. ``position_ids`` are the vision
-        segment's 3D mRoPE ids ([3, num_vision]); ``vision_mse_loss_indexes`` are
-        gen-relative (into the vision token block). Returns the velocity latent
-        ([1, C, T, H, W])."""
+        K/V), and decodes the flow velocity. ``position_ids`` are the generation
+        segment's 3D mRoPE ids ([3, num_gen]) — the vision band, then the action
+        band when present. ``vision_mse_loss_indexes`` / ``action_mse_gen_indexes``
+        index into the generation token block. With action, the generation
+        sequence is ``[vision tokens | action tokens]`` and the call returns
+        ``(video_velocity, action_velocity)``."""
+        has_action = action_latents is not None
         packed, original_latent_shapes = self._patchify_and_pack_latents([latents])
         packed = self.proj_in(packed)
         target_dtype = packed.dtype
@@ -659,6 +743,13 @@ class Cosmos3OmniTransformer(nn.Module):
             noisy_frame_indexes=vision_noisy_frame_indexes,
             token_shapes=vision_token_shapes,
         )
+        if has_action:
+            action_seq = self._embed_action(
+                action_latents, action_domain_id, action_timesteps,
+                action_token_shapes, action_noisy_frame_indexes, target_dtype,
+            )
+            gen_seq = torch.cat([gen_seq, action_seq], dim=0)
+
         cos, sin = self._rotary(position_ids, gen_seq.device, gen_seq.dtype)
         for i, layer in enumerate(self.layers):
             cache_handle.set_layer_idx(i)
@@ -671,4 +762,10 @@ class Cosmos3OmniTransformer(nn.Module):
             noisy_frame_indexes_vision=vision_noisy_frame_indexes,
             original_latent_shapes=original_latent_shapes,
         )
-        return preds[0]
+        if not has_action:
+            return preds[0]
+        action_pred = self._decode_action(
+            gen_out[action_mse_gen_indexes], action_domain_id,
+            action_token_shapes, action_noisy_frame_indexes,
+        )
+        return preds[0], action_pred
