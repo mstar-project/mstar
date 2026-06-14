@@ -66,6 +66,7 @@ class Cosmos3Model(Model):
 
     PREFILL_WALK = "prefill"
     PREFILL_COND_WALK = "prefill_cond"
+    PREFILL_COND_VIDEO_WALK = "prefill_cond_video"
     IMAGE_GEN_WALK = "image_gen"
     VIDEO_GEN_WALK = "video_gen"
     ACTION_GEN_WALK = "action_gen"
@@ -192,6 +193,14 @@ class Cosmos3Model(Model):
             outputs=[],
         )
 
+        # prefill_cond_video: action inverse-dynamics conditions on a whole video,
+        # which the DiT VAE-encodes into the clean anchor latents for the loop.
+        prefill_cond_video = GraphNode(
+            name=DIT_NODE,
+            input_names=["text_inputs", "video_inputs"],
+            outputs=[],
+        )
+
         # image_gen: denoising loop -> VAE decode -> emit image. The loop body
         # threads the latents + denoise-step index back to itself each iteration;
         # on the final iteration the latents route to the decoder. max_iters is an
@@ -253,10 +262,15 @@ class Cosmos3Model(Model):
                         ],
                     ),
                     max_iters=self.config.max_inference_steps,
+                    # The loop's terminal output is matched into the section by
+                    # name (Loop.__post_init__ filters to the section's own output
+                    # edges), so it must reuse a loop-back name: on the final
+                    # iteration the predicted action latents go to the client
+                    # instead of back into the loop.
                     outputs=[
                         GraphEdge(
                             next_node=EMIT_TO_CLIENT,
-                            name="action_output",
+                            name="action_latents",
                             output_modality="action",
                         ),
                     ],
@@ -267,6 +281,7 @@ class Cosmos3Model(Model):
         return {
             self.PREFILL_WALK: prefill,
             self.PREFILL_COND_WALK: prefill_cond,
+            self.PREFILL_COND_VIDEO_WALK: prefill_cond_video,
             self.IMAGE_GEN_WALK: image_gen,
             self.VIDEO_GEN_WALK: video_gen,
             self.ACTION_GEN_WALK: action_gen,
@@ -297,36 +312,28 @@ class Cosmos3Model(Model):
         # tokenized up front; the denoiser reads the second only when guidance is
         # on. Image/video prompts get the chat template + resolution/duration
         # sentences; action prompts are tokenized raw.
-        negative_prompt = kwargs.get("negative_prompt")
-        if "action" in output_modalities:
-            cond_ids, uncond_ids = self._tokenize_action(prompt, negative_prompt)
-        else:
-            from mstar.model.cosmos3.packing import tokenize_prompt
+        from mstar.model.cosmos3.packing import tokenize_prompt
 
-            p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
-            cond_ids, uncond_ids = tokenize_prompt(
-                self.tokenizer, prompt, negative_prompt,
-                num_frames=p["num_frames"], height=p["height"], width=p["width"], fps=p["fps"],
-            )
+        negative_prompt = kwargs.get("negative_prompt")
+        p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
+        # Action prompts skip the image/video system prompt and the
+        # resolution/duration sentences — they are just the chat-templated user
+        # text plus the end-of-text + start-of-generation markers (matching the
+        # NVIDIA action references).
+        is_action = "action" in output_modalities
+        cond_ids, uncond_ids = tokenize_prompt(
+            self.tokenizer, prompt, negative_prompt,
+            num_frames=p["num_frames"], height=p["height"], width=p["width"], fps=p["fps"],
+            use_system_prompt=not is_action,
+            add_resolution_template=not is_action,
+            add_duration_template=not is_action,
+        )
         return {
             "text_inputs": [
                 torch.tensor(cond_ids, dtype=torch.long),
                 torch.tensor(uncond_ids, dtype=torch.long),
             ]
         }
-
-    def _tokenize_action(self, prompt: str, negative_prompt: str | None):
-        """Raw prompt tokenization for action modes: no system prompt or
-        resolution/duration sentences, just the text plus the end-of-text and
-        start-of-generation markers."""
-        eos = self.tokenizer.eos_token_id
-        sog = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-
-        def enc(text: str | None) -> list[int]:
-            ids = self.tokenizer(text or "", add_special_tokens=False)["input_ids"]
-            return list(ids) + [eos, sog]
-
-        return enc(prompt), enc(negative_prompt)
 
     def postprocess(self, output: torch.Tensor, modality: str) -> bytes:
         if modality == "image":
@@ -365,8 +372,29 @@ class Cosmos3Model(Model):
             finally:
                 os.remove(path)
         if modality == "action":
-            return output.detach().to(torch.float32).cpu().numpy().tobytes()
+            # The predicted action latents [1, chunk, action_dim] -> [chunk,
+            # action_dim] float32 bytes. Columns beyond the request's
+            # raw_action_dim are zero padding (the client keeps the first
+            # raw_action_dim, the real action width for its embodiment).
+            x = output[0] if output.ndim == 3 else output
+            return x.detach().to(torch.float32).cpu().numpy().tobytes()
         raise ValueError(f"Unsupported modality for Cosmos3: {modality!r}")
+
+    def load_video(self, filepath: str, device: str):
+        """Decode a conditioning video to ``[T, C, H, W]`` in ``[0, 1]``.
+
+        Overrides the base implementation, which reads ``self.device`` (this model
+        does not set one); the data worker passes the decode device explicitly,
+        exactly as ``load_image`` already receives it."""
+        from dataclasses import asdict
+
+        from torchcodec.decoders import VideoDecoder
+
+        from mstar.model.base import TensorAndMetadata
+
+        decoder = VideoDecoder(filepath, device=device)
+        video = torch.stack([frame for frame in decoder]).float() / 255.0
+        return TensorAndMetadata(data=video, metadata=asdict(decoder.metadata))
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration
@@ -415,8 +443,10 @@ class Cosmos3Model(Model):
         }
         if mk.get("flow_shift") is not None:
             params["flow_shift"] = float(mk["flow_shift"])
-        # Action requests carry a few extra keys straight through.
-        for k in ("action_mode", "action_chunk_size", "raw_action_dim", "domain_id", "action_fps"):
+        # Action requests carry a few extra keys straight through (``action`` is
+        # the clean conditioning action chunk for forward-dynamics).
+        for k in ("action_mode", "action_chunk_size", "raw_action_dim", "domain_id",
+                  "action_fps", "action"):
             if k in mk:
                 params[k] = mk[k]
         return params
@@ -435,14 +465,22 @@ class Cosmos3Model(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
-        # Image-to-video routes through prefill_cond, which also feeds the DiT the
-        # conditioning image to encode. Fall back to the text-only prefill if no
-        # image signal actually arrived (so the conditioned node can't stall).
-        conditioned = params.get("has_image_condition") and "image_inputs" in input_signals
+        # Visual conditioning routes through a conditioned prefill that also feeds
+        # the DiT the input to VAE-encode: a video (action inverse-dynamics) or an
+        # image (image-to-video, action policy/forward-dynamics). Fall back to the
+        # text-only prefill if no conditioning signal actually arrived.
+        video_cond = "video" in input_modalities and "video_inputs" in input_signals
+        image_cond = params.get("has_image_condition") and "image_inputs" in input_signals
+        if video_cond:
+            walk = self.PREFILL_COND_VIDEO_WALK
+        elif image_cond:
+            walk = self.PREFILL_COND_WALK
+        else:
+            walk = self.PREFILL_WALK
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            graph_walk=self.PREFILL_COND_WALK if conditioned else self.PREFILL_WALK,
+            graph_walk=walk,
             is_prefill=True,
             kwargs=params,
         )
@@ -452,9 +490,10 @@ class Cosmos3Model(Model):
             edge = GraphEdge(next_node=DIT_NODE, name="text_inputs")
             edge.tensor_info = input_signals["text_inputs"]
             inputs.append(edge)
-        if conditioned:
-            edge = GraphEdge(next_node=DIT_NODE, name="image_inputs")
-            edge.tensor_info = input_signals["image_inputs"]
+        cond_signal = "video_inputs" if video_cond else ("image_inputs" if image_cond else None)
+        if cond_signal:
+            edge = GraphEdge(next_node=DIT_NODE, name=cond_signal)
+            edge.tensor_info = input_signals[cond_signal]
             inputs.append(edge)
 
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
@@ -478,7 +517,9 @@ class Cosmos3Model(Model):
 
         is_action = "action" in metadata.output_modalities
         is_video = "video" in metadata.output_modalities
-        if metadata.graph_walk in (self.PREFILL_WALK, self.PREFILL_COND_WALK):
+        if metadata.graph_walk in (
+            self.PREFILL_WALK, self.PREFILL_COND_WALK, self.PREFILL_COND_VIDEO_WALK
+        ):
             metadata.is_prefill = False
             # Pick the denoise walk by output modality: action and video each emit
             # their own modality (image and video share the same loop but differ

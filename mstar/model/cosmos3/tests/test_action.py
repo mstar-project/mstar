@@ -311,7 +311,10 @@ def test_action_engine_matches_fused() -> None:
         out = dit.forward("action_gen", ei, **dit.preprocess("action_gen", ei, [ni]))
         latents, action_latents, time_index = out["latents"][0], out["action_latents"][0], out["time_index"][0]
     dit.cleanup_request(rid)
-    diff = (act_fused.float() - out["action_output"][0].float()).abs().max().item()
+    # The loop emits the full action latents (self-edge); trim to the raw action
+    # width to compare with the fused pipeline's trimmed output.
+    pred_action = out["action_latents"][0][:, :, :raw]
+    diff = (act_fused.float() - pred_action.float()).abs().max().item()
     assert diff <= 1e-3, f"engine action differs from fused by {diff:.3e}"
     print(f"  action engine cache-once (sdpa) abs-max diff = {diff:.3e}")
 
