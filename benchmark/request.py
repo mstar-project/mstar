@@ -1686,6 +1686,11 @@ def _build_obs(req_input: RequestInput) -> dict:
     cam1 → wrist_image_left. The 32-dim DROID state holds joint positions in
     [:7] and gripper in [7]; the rest is padding we ignore.
 
+    NOTE: lerobot/droid_100 ships no gripper signal, so state[7:8] is always
+    padding 0.0 — actions are not semantically valid for either system. Fine
+    here: the benchmark measures latency (identical tensor shapes => identical
+    compute), not action quality.
+
     openpi DroidInputs (droid_policy.py:make_droid_example) expects:
       observation/exterior_image_1_left : (H,W,3) uint8
       observation/wrist_image_left      : (H,W,3) uint8

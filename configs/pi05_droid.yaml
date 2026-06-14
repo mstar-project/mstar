@@ -18,9 +18,10 @@ max_seq_len: 2048
 #      post-compute Python, so both systems do identical 32-dim work.
 #
 # CUDA-graph note: action_horizon and action_dim are both baked into the
-# graph captures (see Pi05LLMSubmodule.get_cuda_graph_configs in
-# mstar/model/pi05/submodules.py:325-329). They MUST be set at server-init
-# time, never per-request — that's what this yaml override is for.
+# graph captures (see Pi05ActionExpertSubmodule.get_cuda_graph_configs
+# They MUST be set at server-init time, never per-request — that's what
+# this yaml override is for.
+
 model_kwargs:
   action_horizon: 15
   num_cameras: 2

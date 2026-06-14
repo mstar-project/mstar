@@ -68,7 +68,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         return result
 
     def _prepare_one(self, images: torch.Tensor) -> torch.Tensor:
-        """Resize one request's stack of camera images with aspect-preserving
+        """Resize one request's camera image(s) with aspect-preserving
         letterbox padding.
 
         Matches openpi's ``image_tools.resize_with_pad_torch`` exactly:
@@ -179,9 +179,14 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        return NodeInputs(tensor_inputs={"pixel_values": self._prepare_one(
-            inputs["image_inputs"][0]
-        )})
+        images = torch.cat([
+            self._prepare_one(img) for img in inputs["image_inputs"]
+        ])
+        # TODO: assert images.shape == (num_cameras, 3, H, W) once worker errors
+        # are surfaced. A wrong count silently broadcasts in the static CUDA
+        # graph; today a raised error is swallowed and the client hangs, so this
+        # needs prepare_inputs errors threaded engine -> conductor -> API server.
+        return NodeInputs(tensor_inputs={"pixel_values": images})
 
     def preprocess(
         self,

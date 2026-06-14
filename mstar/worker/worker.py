@@ -1511,6 +1511,9 @@ class Worker:
             rid_outputs = output_N.per_request_output_tensors.get(rid, {})
             ok = True
             for input_name, _ in speculation.consumed_edges:
+                # NOTE: this assumes that submodules may output a empty list as valid
+                # output, and will omit the key entirely from the output upon, e.g.,
+                # an internal failure. Revisit if this contract ever changes.
                 tensors = rid_outputs.get(input_name, None)
                 if tensors is None:
                     ok = False

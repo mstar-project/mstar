@@ -668,6 +668,11 @@ class DROIDDataset(BaseDataset):
     # server's vit_image_size) so both mstar and openpi get identical input.
     IMAGE_SIZE = 224
 
+    PI05_KEYS = [
+        "observation.images.exterior_image_1_left",
+        "observation.images.wrist_image_left"
+    ]
+
     def __init__(
         self,
         local_file_dir: str,
@@ -730,6 +735,12 @@ class DROIDDataset(BaseDataset):
                 f"No video keys found in {self.HF_REPO}/meta/info.json. "
                 f"Top-level keys: {list(info.keys())}"
             )
+        
+        if task == "pi05":
+            assert all((key in camera_keys for key in self.PI05_KEYS)),  \
+                f"Expected camera keys {self.PI05_KEYS} not all found in {camera_keys}"
+            camera_keys = self.PI05_KEYS
+
         chunks_size: int = info.get("chunks_size", info.get("chunk_size", 1000))
         print(f"  camera keys : {camera_keys}")
         print(f"  chunks_size : {chunks_size}")

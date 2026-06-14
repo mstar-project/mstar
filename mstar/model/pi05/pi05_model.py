@@ -90,36 +90,6 @@ class _Pi05LLMWeightContainer(nn.Module):
         self.time_mlp = time_mlp
 
 
-def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
-    """Re-initialize non-persistent buffers like ``position_ids`` after a
-    ``meta + to_empty`` materialization.
-
-    Modules constructed on the meta device skip ``post_init``, and
-    ``to_empty`` only allocates uninitialized storage for parameters and
-    buffers. Non-persistent buffers (registered with ``persistent=False``)
-    are not in the state_dict, so ``load_state_dict`` will not restore them
-    either — leaving them as garbage. The most common offender is HuggingFace
-    SigLIP's ``position_ids`` buffer (``register_buffer("position_ids",
-    arange(num_positions), persistent=False)``), which feeds the position
-    embedding lookup. If left as garbage int64 it produces wildly incorrect
-    image embeddings (off by the full norm of the position table).
-
-    This walks the module tree and resets any sub-module that has a
-    ``position_ids`` buffer to the canonical ``arange(num_positions)``.
-    """
-    with torch.no_grad():
-        for sub in module.modules():
-            pos = getattr(sub, "position_ids", None)
-            if isinstance(pos, torch.Tensor):
-                shape = pos.shape
-                num_positions = shape[-1]
-                pos.copy_(
-                    torch.arange(
-                        num_positions, device=pos.device, dtype=pos.dtype
-                    ).expand(shape)
-                )
-
-
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
     ACTION_GEN_WALK = "action_gen"
@@ -457,14 +427,17 @@ class Pi05Model(Model):
         here so the resulting ``text_inputs`` stream matches the production
         format.
         """
-        # A "numpy" upload arrives as "raw_inputs"; Pi0.5 treats it as the image.
+        # A "numpy" upload arrives as "raw_inputs"; Pi0.5 treats it as an image input
+        # We append the raw_inputs onto the image_inputs, so the user can pass in both
+        # images and numpy arrays
         tensors = kwargs.get("tensors")
         if tensors is not None and "raw_inputs" in tensors:
-            assert "image_inputs" not in tensors, "got both raw_inputs and image_inputs"
-            tensors["image_inputs"] = tensors.pop("raw_inputs")
+            tensors.setdefault("image_inputs", []).extend(tensors.pop("raw_inputs"))
             input_metadata = kwargs.get("input_metadata")
             if input_metadata is not None and "raw_inputs" in input_metadata:
-                input_metadata["image_inputs"] = input_metadata.pop("raw_inputs")
+                input_metadata.setdefault("image_inputs", []).extend(
+                    input_metadata.pop("raw_inputs")
+                )
 
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
@@ -610,22 +583,10 @@ class Pi05Model(Model):
             self.siglip = Pi05SiglipEncoder(self.config)
         if self.skip_weight_loading:
             self.siglip = self.siglip.to_empty(device=device)
-            _reset_non_persistent_buffers(self.siglip, device)
             return
 
         flat = self._ensure_lerobot_flat()
         self.siglip.to_empty(device=device)
-        # CRITICAL: HF's SiglipVisionEmbeddings registers ``position_ids`` as
-        # a NON-persistent buffer (persistent=False), so it's not in any
-        # state_dict. ``to_empty`` materializes it as uninitialized GPU
-        # memory, ``_init_weights`` is never called (we never go through
-        # post_init), and ``load_state_dict(strict=False)`` does not restore
-        # it. The result is garbage int64 indices feeding into
-        # ``position_embedding``, which corrupts every image embedding by
-        # ~the full norm of the position table. We must manually reset any
-        # non-persistent ``position_ids`` buffer with the canonical
-        # ``arange`` values before running the forward.
-        _reset_non_persistent_buffers(self.siglip, device)
         # The extracted bucket may contain stray pooling-head keys that
         # Pi05SiglipEncoder doesn't model (``vision_use_head=False``);
         # ``load_hf_weights`` silently ignores any key that has no matching
