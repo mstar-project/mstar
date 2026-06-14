@@ -58,6 +58,9 @@ PREFILL_COND_VIDEO_WALK = "prefill_cond_video"
 IMAGE_GEN_WALK = "image_gen"
 VIDEO_GEN_WALK = "video_gen"
 ACTION_GEN_WALK = "action_gen"
+# Forward-dynamics runs the same joint video+action denoise but emits the
+# predicted video (VAE-decoded) instead of the action, so it has its own walk.
+ACTION_VIDEO_GEN_WALK = "action_video_gen"
 
 # image_gen and video_gen run the identical denoise step (the DiT loop is
 # shape-general over the frame count); they differ only in the emitted output
@@ -77,6 +80,11 @@ PREFILL_WALKS = (PREFILL_WALK, PREFILL_COND_WALK, PREFILL_COND_VIDEO_WALK)
 IMAGE_GEN_LOOP = "image_gen_loop"
 VIDEO_GEN_LOOP = "video_gen_loop"
 ACTION_GEN_LOOP = "action_gen_loop"
+ACTION_VIDEO_GEN_LOOP = "action_video_gen_loop"
+
+# Both action walks run the joint video+action denoise loop body; they differ
+# only in what they emit (the predicted action vs the predicted video).
+ACTION_WALKS = (ACTION_GEN_WALK, ACTION_VIDEO_GEN_WALK)
 
 # Conditional prompt K/V lives under the primary label; the unconditional
 # (negative) prompt's K/V lives under a second label for classifier-free
@@ -195,7 +203,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return self._prepare_prefill(fwd_info, inputs, device)
         if graph_walk in GEN_WALKS:
             return self._prepare_image_gen(fwd_info, inputs, device)
-        if graph_walk == ACTION_GEN_WALK:
+        if graph_walk in ACTION_WALKS:
             return self._prepare_action_gen(fwd_info, inputs, device)
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
 
@@ -531,7 +539,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 "time_index": inputs[0].tensor_inputs["time_index"],
             }
 
-        if graph_walk == ACTION_GEN_WALK:
+        if graph_walk in ACTION_WALKS:
             self._plan_gen(cm, st, st["num_vision"] + st["num_action"])
             return {
                 "latents": inputs[0].tensor_inputs["latents"],
@@ -551,7 +559,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return self._forward_prefill(cm, self._req[rid])
         if graph_walk in GEN_WALKS:
             return self._forward_image_gen(cm, self._req[rid], **kwargs)
-        if graph_walk == ACTION_GEN_WALK:
+        if graph_walk in ACTION_WALKS:
             return self._forward_action_gen(cm, self._req[rid], **kwargs)
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
 
@@ -894,6 +902,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return set()
         loop = {
             ACTION_GEN_WALK: ACTION_GEN_LOOP,
+            ACTION_VIDEO_GEN_WALK: ACTION_VIDEO_GEN_LOOP,
             VIDEO_GEN_WALK: VIDEO_GEN_LOOP,
         }.get(request_info.graph_walk, IMAGE_GEN_LOOP)
         iter_idx = request_info.dynamic_loop_iter_counts.get(loop, 0)
@@ -934,6 +943,11 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         decoded = vae.decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
         image = (decoded / 2 + 0.5).clamp(0, 1).to(torch.float32)
         # Route the decoded tensor to the active walk's emit edge: image_gen
-        # emits "image_output" (one frame), video_gen emits "video_output".
-        out_name = "video_output" if graph_walk == VIDEO_GEN_WALK else "image_output"
+        # emits "image_output" (one frame); video_gen and forward-dynamics
+        # (action_video_gen) emit "video_output".
+        out_name = (
+            "video_output"
+            if graph_walk in (VIDEO_GEN_WALK, ACTION_VIDEO_GEN_WALK)
+            else "image_output"
+        )
         return {out_name: [image]}

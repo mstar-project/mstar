@@ -49,6 +49,7 @@ from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
+    ACTION_VIDEO_GEN_LOOP,
     IMAGE_GEN_LOOP,
     VIDEO_GEN_LOOP,
     Cosmos3DiTSubmodule,
@@ -70,6 +71,7 @@ class Cosmos3Model(Model):
     IMAGE_GEN_WALK = "image_gen"
     VIDEO_GEN_WALK = "video_gen"
     ACTION_GEN_WALK = "action_gen"
+    ACTION_VIDEO_GEN_WALK = "action_video_gen"
 
     def __init__(
         self,
@@ -278,10 +280,48 @@ class Cosmos3Model(Model):
             ]
         )
 
+        # action_video_gen (forward dynamics): the same joint video+action denoise,
+        # but the action is the clean condition and the predicted video is decoded
+        # and emitted. The loop's terminal output reuses the "latents" loop-back
+        # name; on the final iteration the video latents route to the VAE decoder
+        # instead of back into the loop.
+        action_video_gen = Sequential(
+            [
+                Loop(
+                    name=ACTION_VIDEO_GEN_LOOP,
+                    section=GraphNode(
+                        name=DIT_NODE,
+                        input_names=["latents", "action_latents", "time_index"],
+                        outputs=[
+                            GraphEdge(next_node=DIT_NODE, name="latents"),
+                            GraphEdge(next_node=DIT_NODE, name="action_latents"),
+                            GraphEdge(next_node=DIT_NODE, name="time_index"),
+                        ],
+                    ),
+                    max_iters=self.config.max_inference_steps,
+                    outputs=[
+                        GraphEdge(next_node=VAE_DECODER_NODE, name="latents"),
+                    ],
+                ),
+                GraphNode(
+                    name=VAE_DECODER_NODE,
+                    input_names=["latents"],
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="video_output",
+                            output_modality="video",
+                        ),
+                    ],
+                ),
+            ]
+        )
+
         return {
             self.PREFILL_WALK: prefill,
             self.PREFILL_COND_WALK: prefill_cond,
             self.PREFILL_COND_VIDEO_WALK: prefill_cond_video,
+            self.ACTION_VIDEO_GEN_WALK: action_video_gen,
             self.IMAGE_GEN_WALK: image_gen,
             self.VIDEO_GEN_WALK: video_gen,
             self.ACTION_GEN_WALK: action_gen,
@@ -515,32 +555,40 @@ class Cosmos3Model(Model):
         request_done = False
         inputs: list[GraphEdge] = []
 
+        # Forward-dynamics conditions on a clean action chunk and emits the
+        # predicted video; inverse-dynamics / policy emit the action.
+        is_fd = metadata.kwargs.get("action_mode") == "forward_dynamics"
         is_action = "action" in metadata.output_modalities
         is_video = "video" in metadata.output_modalities
+        joint_action = is_fd or is_action  # walks that also thread action latents
         if metadata.graph_walk in (
             self.PREFILL_WALK, self.PREFILL_COND_WALK, self.PREFILL_COND_VIDEO_WALK
         ):
             metadata.is_prefill = False
-            # Pick the denoise walk by output modality: action and video each emit
-            # their own modality (image and video share the same loop but differ
-            # in what the VAE node emits).
-            if is_action:
+            # Pick the denoise walk: forward-dynamics runs the joint denoise but
+            # decodes the predicted video; inverse-dynamics / policy emit the
+            # action; image and video share the loop but differ in what the VAE
+            # node emits.
+            if is_fd:
+                metadata.graph_walk = self.ACTION_VIDEO_GEN_WALK
+            elif is_action:
                 metadata.graph_walk = self.ACTION_GEN_WALK
             elif is_video:
                 metadata.graph_walk = self.VIDEO_GEN_WALK
             else:
                 metadata.graph_walk = self.IMAGE_GEN_WALK
             # The first denoise iteration's initial noise + step index are
-            # sampled inside the DiT submodule's preprocess. Action requests also
+            # sampled inside the DiT submodule's preprocess. Action walks also
             # thread the action latents through the loop.
             inputs = [
                 GraphEdge(next_node=DIT_NODE, name="latents"),
                 GraphEdge(next_node=DIT_NODE, name="time_index"),
             ]
-            if is_action:
+            if joint_action:
                 inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="action_latents"))
         elif metadata.graph_walk in (
-            self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK, self.ACTION_GEN_WALK
+            self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK,
+            self.ACTION_GEN_WALK, self.ACTION_VIDEO_GEN_WALK,
         ):
             request_done = True
 
