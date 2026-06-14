@@ -173,7 +173,9 @@ def test_dynamic_loop_check_stop_and_wasted_step() -> None:
         None, dit._req["r"], latents=lat, action_latents=act, time_index=ti
     )
     assert torch.equal(out["latents"][0], lat)
-    assert torch.equal(out["action_output"][0], act[:, :, :2])
+    # The action latents (the looped self-edge the loop emits on finish) pass
+    # through unchanged on the discarded extra step.
+    assert torch.equal(out["action_latents"][0], act)
 
 
 @pytest.mark.skipif(not NANO_DIR.exists(), reason="set COSMOS3_NANO_DIR to a Cosmos3-Nano dir")
