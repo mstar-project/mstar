@@ -264,8 +264,40 @@ class Cosmos3Model(Model):
                     torch.tensor(list(prompt.encode("utf-8")), dtype=torch.long)
                 ]
             }
-        ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        return {"text_inputs": [torch.tensor(ids, dtype=torch.long)]}
+        # Both the conditional (positive) and unconditional (negative) prompts are
+        # tokenized up front; the denoiser reads the second only when guidance is
+        # on. Image/video prompts get the chat template + resolution/duration
+        # sentences; action prompts are tokenized raw.
+        negative_prompt = kwargs.get("negative_prompt")
+        if "action" in output_modalities:
+            cond_ids, uncond_ids = self._tokenize_action(prompt, negative_prompt)
+        else:
+            from mstar.model.cosmos3.packing import tokenize_prompt
+
+            p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
+            cond_ids, uncond_ids = tokenize_prompt(
+                self.tokenizer, prompt, negative_prompt,
+                num_frames=p["num_frames"], height=p["height"], width=p["width"], fps=p["fps"],
+            )
+        return {
+            "text_inputs": [
+                torch.tensor(cond_ids, dtype=torch.long),
+                torch.tensor(uncond_ids, dtype=torch.long),
+            ]
+        }
+
+    def _tokenize_action(self, prompt: str, negative_prompt: str | None):
+        """Raw prompt tokenization for action modes: no system prompt or
+        resolution/duration sentences, just the text plus the end-of-text and
+        start-of-generation markers."""
+        eos = self.tokenizer.eos_token_id
+        sog = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+
+        def enc(text: str | None) -> list[int]:
+            ids = self.tokenizer(text or "", add_special_tokens=False)["input_ids"]
+            return list(ids) + [eos, sog]
+
+        return enc(prompt), enc(negative_prompt)
 
     def postprocess(self, output: torch.Tensor, modality: str) -> bytes:
         if modality == "image":
@@ -273,9 +305,13 @@ class Cosmos3Model(Model):
 
             from PIL import Image
 
-            # output: [C, H, W] (or [1, C, H, W]) in [0, 1].
-            frame = output[0] if output.ndim == 4 else output
-            arr = (frame.permute(1, 2, 0).clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
+            # Wan VAE decode is [B, C, T, H, W] in [0, 1]; take the first frame.
+            x = output
+            if x.ndim == 5:
+                x = x[0, :, 0]
+            elif x.ndim == 4:
+                x = x[0]
+            arr = (x.permute(1, 2, 0).clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
             buf = io.BytesIO()
             Image.fromarray(arr).save(buf, format="PNG")
             return buf.getvalue()
@@ -287,6 +323,47 @@ class Cosmos3Model(Model):
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
+    def _resolve_gen_params(
+        self, model_kwargs: dict | None, input_modalities: list[str], output_modalities: list[str],
+    ) -> dict:
+        """Resolve the per-request generation knobs (size, steps, guidance, …)
+        from request ``model_kwargs``, applying defaults. Used by both
+        ``process_prompt`` (for resolution-aware tokenization) and the forward-
+        pass metadata, so the two stay consistent."""
+        mk = model_kwargs or {}
+        width = height = 1024
+        size = mk.get("size")
+        if isinstance(size, str) and "x" in size.lower():
+            sw, sh = size.lower().split("x", 1)
+            try:
+                width, height = int(sw), int(sh)
+            except ValueError:
+                pass
+        params = {
+            "width": int(mk.get("width", width)),
+            "height": int(mk.get("height", height)),
+            "num_frames": int(mk.get("num_frames", 1)),
+            "fps": float(mk.get("fps", 24.0)),
+            "guidance_scale": float(mk.get("guidance_scale", 6.0)),
+            # The denoise Loop's iteration count is fixed at graph-build time from
+            # the config, so the per-request scheduler must use the same value (a
+            # per-request override would desync the loop and the timestep schedule).
+            "num_inference_steps": self.config.num_inference_steps,
+            "has_image_condition": "image" in (input_modalities or []),
+        }
+        if mk.get("flow_shift") is not None:
+            params["flow_shift"] = float(mk["flow_shift"])
+        # Action requests carry a few extra keys straight through.
+        for k in ("action_mode", "action_chunk_size", "raw_action_dim", "domain_id", "action_fps"):
+            if k in mk:
+                params[k] = mk[k]
+        return params
+
+    def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
+        md = {"is_prefill": metadata.is_prefill}
+        md.update(metadata.kwargs)
+        return md
+
     def get_initial_forward_pass_args(
         self,
         partition_name: str,
@@ -295,12 +372,13 @@ class Cosmos3Model(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
+        params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             graph_walk=self.PREFILL_WALK,
             is_prefill=True,
-            kwargs={},
+            kwargs=params,
         )
 
         inputs: list[GraphEdge] = []
@@ -314,7 +392,7 @@ class Cosmos3Model(Model):
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
+            step_metadata=self._step_metadata(full_metadata),
         )
 
     def get_partition_forward_pass_args(
@@ -349,7 +427,7 @@ class Cosmos3Model(Model):
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
+            step_metadata=self._step_metadata(metadata),
             request_done=request_done,
         )
 
