@@ -54,6 +54,41 @@ def read_transformer_weight_keys(checkpoint_dir: str | Path) -> set[str]:
     return keys
 
 
+def _transformer_shard_names(tdir: Path) -> list[str]:
+    """Resolve the ``transformer/`` shard filenames.
+
+    The diffusers checkpoint indexes its shards under
+    ``diffusion_pytorch_model.safetensors.index.json`` (not the
+    ``model.safetensors`` name the generic shard iterator assumes), so the
+    shard list is read from that index; a single-file checkpoint is the
+    fallback.
+    """
+    index = tdir / "diffusion_pytorch_model.safetensors.index.json"
+    if index.exists():
+        with open(index) as f:
+            return sorted(set(json.load(f)["weight_map"].values()))
+    shards = sorted(p.name for p in tdir.glob("*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"no transformer weights found under {tdir}")
+    return shards
+
+
+def read_transformer_weight_shapes(checkpoint_dir: str | Path) -> dict[str, tuple[int, ...]]:
+    """Return ``{key: shape}`` for every ``transformer/`` tensor by reading only
+    the safetensors headers — no tensor data is materialized. Enables CPU-side
+    shape verification of the meta-built backbone against the checkpoint.
+    """
+    from safetensors import safe_open
+
+    tdir = Path(checkpoint_dir) / "transformer"
+    shapes: dict[str, tuple[int, ...]] = {}
+    for shard in _transformer_shard_names(tdir):
+        with safe_open(tdir / shard, framework="pt") as handle:
+            for key in handle.keys():
+                shapes[key] = tuple(handle.get_slice(key).get_shape())
+    return shapes
+
+
 def load_transformer_weights(
     model: torch.nn.Module,
     checkpoint_dir: str | Path,
@@ -62,13 +97,30 @@ def load_transformer_weights(
     """Stream the ``transformer/`` shards into ``model`` and return loaded keys.
 
     Mirrors the meta-device + ``load_hf_weights`` path the other model packages
-    use. No stacked-parameter rules: the checkpoint's projections are unfused
-    and match the backbone parameter names directly.
+    use, but resolves the shard list from the diffusers ``diffusion_pytorch_model``
+    index (the generic iterator only knows the ``model.safetensors`` name). No
+    stacked-parameter rules: the checkpoint's projections are unfused and match
+    the backbone parameter names directly. Raises if any backbone parameter is
+    left unfilled — the completeness guarantee bagel's loader also enforces.
     """
-    from mstar.model.loader import load_hf_weights
-    from mstar.model.loader.iterators import iter_safetensors_shards
+    from mstar.model.loader import iter_safetensors_file, load_hf_weights
 
-    weights = iter_safetensors_shards(
-        Path(checkpoint_dir) / "transformer", device=device
-    )
-    return load_hf_weights(model, weights, name_remapper=cosmos3_name_remapper)
+    tdir = Path(checkpoint_dir) / "transformer"
+    shard_names = _transformer_shard_names(tdir)
+
+    def _weights():
+        for shard in shard_names:
+            yield from iter_safetensors_file(tdir / shard, device=device)
+
+    loaded = load_hf_weights(model, _weights(), name_remapper=cosmos3_name_remapper)
+
+    expected = set(dict(model.named_parameters()).keys())
+    missing = expected - loaded
+    if missing:
+        sample = sorted(missing)[:10]
+        more = "…" if len(missing) > 10 else ""
+        raise KeyError(
+            f"Cosmos3 transformer load left {len(missing)} parameter(s) unfilled "
+            f"from {tdir}: {sample}{more}"
+        )
+    return loaded

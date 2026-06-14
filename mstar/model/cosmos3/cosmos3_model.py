@@ -350,16 +350,25 @@ class Cosmos3Model(Model):
         from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
         from mstar.model.cosmos3.loader import load_transformer_weights
 
-        # Build on the meta device (shapes only, no storage), then materialize
-        # uninitialized tensors on the target device and overwrite with the
-        # checkpoint weights — the same path the other model packages use.
+        # Build on the meta device (shapes only, no storage), pin the
+        # checkpoint's bf16 dtype, then materialize uninitialized tensors on the
+        # target device and overwrite with the checkpoint weights — the same
+        # path the other model packages use. bf16 matches the published
+        # checkpoint exactly and halves resident weight memory vs the float32
+        # meta default; the engine additionally runs the forward under a bf16
+        # autocast (a no-op here).
         with torch.device("meta" if not self.skip_weight_loading else "cpu"):
             model = Cosmos3OmniTransformer(self.config)
+        model = model.to(torch.bfloat16)
         if self.skip_weight_loading:
             return model.to_empty(device=device)
 
         model.to_empty(device=device)
         load_transformer_weights(model, self._ensure_repo(), device=device)
+        # Keep the timestep embedder in fp32, like diffusers'
+        # ``_keep_in_fp32_modules=["time_embedder"]`` (the upcast is lossless from
+        # the bf16 checkpoint and matches diffusers' numerics).
+        model.time_embedder.to(torch.float32)
         model.eval()
         return model
 
