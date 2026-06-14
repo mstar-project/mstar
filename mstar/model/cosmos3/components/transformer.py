@@ -769,3 +769,82 @@ class Cosmos3OmniTransformer(nn.Module):
             action_token_shapes, action_noisy_frame_indexes,
         )
         return preds[0], action_pred
+
+    def denoise_step_batched_cfg(
+        self,
+        latents: torch.Tensor,
+        vision_timesteps: torch.Tensor,
+        position_ids_cond: torch.Tensor,
+        position_ids_uncond: torch.Tensor,
+        vision_token_shapes: list[tuple[int, int, int]],
+        vision_noisy_frame_indexes: list[torch.Tensor],
+        vision_mse_loss_indexes: torch.Tensor,
+        cache_handle,
+        action_latents: torch.Tensor | None = None,
+        action_token_shapes: list[tuple[int, int, int]] | None = None,
+        action_noisy_frame_indexes: list[torch.Tensor] | None = None,
+        action_mse_gen_indexes: torch.Tensor | None = None,
+        action_timesteps: torch.Tensor | None = None,
+        action_domain_id: torch.Tensor | None = None,
+    ):
+        """Conditional and unconditional generation in one batched pass.
+
+        The two classifier-free-guidance branches share identical generation
+        tokens — same latents, same timestep, so the patchified input and its
+        timestep embedding are built once and repeated. They differ only in (a)
+        the text-conditioning K/V they attend to (held under two cache labels)
+        and (b) their rotary positions: the media band starts just after each
+        branch's text, and the two prompts have different lengths. So pack
+        ``[cond tokens | uncond tokens]`` into one sequence carrying per-branch
+        positions, and let the handle's batched plan route each branch to its
+        own label's pages. Returns the conditional and unconditional results in
+        the same form as ``denoise_step`` (a velocity, or a (video, action)
+        pair when action tokens are present)."""
+        has_action = action_latents is not None
+        packed, original_latent_shapes = self._patchify_and_pack_latents([latents])
+        packed = self.proj_in(packed)
+        target_dtype = packed.dtype
+        timesteps = vision_timesteps * self.config.timestep_scale
+        ts_embeds = self.time_embedder(self.time_proj(timesteps)).to(target_dtype)
+        gen_seq = self._apply_timestep_embeds_to_noisy_tokens(
+            packed_tokens=packed,
+            packed_timestep_embeds=ts_embeds,
+            noisy_frame_indexes=vision_noisy_frame_indexes,
+            token_shapes=vision_token_shapes,
+        )
+        if has_action:
+            action_seq = self._embed_action(
+                action_latents, action_domain_id, action_timesteps,
+                action_token_shapes, action_noisy_frame_indexes, target_dtype,
+            )
+            gen_seq = torch.cat([gen_seq, action_seq], dim=0)
+
+        n = gen_seq.shape[0]
+        gen_seq = torch.cat([gen_seq, gen_seq], dim=0)
+        cos_c, sin_c = self._rotary(position_ids_cond, gen_seq.device, gen_seq.dtype)
+        cos_u, sin_u = self._rotary(position_ids_uncond, gen_seq.device, gen_seq.dtype)
+        cos = torch.cat([cos_c, cos_u], dim=0)
+        sin = torch.cat([sin_c, sin_u], dim=0)
+
+        for i, layer in enumerate(self.layers):
+            cache_handle.set_layer_idx(i)
+            gen_seq = layer.forward_gen(gen_seq, cos, sin, cache_handle)
+        gen_out = self.norm_moe_gen(gen_seq)
+
+        def _decode(out):
+            preds_packed = self.proj_out(out[vision_mse_loss_indexes])
+            preds = self._unpatchify_and_unpack_latents(
+                preds_packed,
+                token_shapes_vision=vision_token_shapes,
+                noisy_frame_indexes_vision=vision_noisy_frame_indexes,
+                original_latent_shapes=original_latent_shapes,
+            )
+            if not has_action:
+                return preds[0]
+            action_pred = self._decode_action(
+                out[action_mse_gen_indexes], action_domain_id,
+                action_token_shapes, action_noisy_frame_indexes,
+            )
+            return preds[0], action_pred
+
+        return _decode(gen_out[:n]), _decode(gen_out[n:])
