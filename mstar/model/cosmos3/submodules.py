@@ -53,6 +53,10 @@ ACTION_GEN_WALK = "action_gen"
 COND_LABEL = "main"
 UNCOND_LABEL = "uncond"
 
+# Combined label for the single FlashInfer plan that runs both guidance branches
+# in one forward (see cache_manager.plan_attention_batched_cfg).
+CFG_BATCHED_LABEL = "_cfg_batched"
+
 
 class Cosmos3DiTSubmodule(ARNodeSubmodule):
     """Dual-pathway DiT node (understanding tower + generation denoiser)."""
@@ -61,6 +65,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # step, classifier-free guidance combine), so torch.compile graph-breaks and
     # buys little; CUDA-graph capture of the fixed-shape step is the accelerator.
     disable_torch_compile = True
+
+    # Run the two classifier-free-guidance branches as a single batched forward
+    # per denoise step instead of two sequential forwards. The math is the same;
+    # set False to fall back to the sequential path.
+    batched_cfg = True
 
     def __init__(self, transformer, config, scheduler=None):
         super().__init__()
@@ -269,6 +278,20 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # preprocess: plan paged attention for the labels this walk touches.
     # ------------------------------------------------------------------
 
+    def _plan_gen(self, cm, st, num_gen: int) -> None:
+        """Plan a denoise step's non-causal attention: one batched plan covering
+        both guidance branches when they run together, else a plan per label."""
+        if st["uncond"] is None:
+            cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=COND_LABEL, write_store=False)
+        elif self.batched_cfg:
+            cm.plan_attention_batched_cfg(
+                labels=[COND_LABEL, UNCOND_LABEL], seq_lens=[num_gen],
+                is_causal=False, write_store=False,
+            )
+        else:
+            cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=COND_LABEL, write_store=False)
+            cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=UNCOND_LABEL, write_store=False)
+
     def preprocess(self, graph_walk, engine_inputs: ModelInputsFromEngine, inputs) -> dict:
         cm = engine_inputs.cache_manager
         st = self._req[engine_inputs.request_ids[0]]
@@ -282,20 +305,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return {}
 
         if graph_walk == IMAGE_GEN_WALK:
-            num_vision = st["num_vision"]
-            cm.plan_attention(seq_lens=[num_vision], is_causal=False, label=COND_LABEL, write_store=False)
-            if st["uncond"] is not None:
-                cm.plan_attention(seq_lens=[num_vision], is_causal=False, label=UNCOND_LABEL, write_store=False)
+            self._plan_gen(cm, st, st["num_vision"])
             return {
                 "latents": inputs[0].tensor_inputs["latents"],
                 "time_index": inputs[0].tensor_inputs["time_index"],
             }
 
         if graph_walk == ACTION_GEN_WALK:
-            num_gen = st["num_vision"] + st["num_action"]
-            cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=COND_LABEL, write_store=False)
-            if st["uncond"] is not None:
-                cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=UNCOND_LABEL, write_store=False)
+            self._plan_gen(cm, st, st["num_vision"] + st["num_action"])
             return {
                 "latents": inputs[0].tensor_inputs["latents"],
                 "action_latents": inputs[0].tensor_inputs["action_latents"],
@@ -345,14 +362,28 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         t = scheduler.timesteps[step_index]
         vision_timesteps = torch.full((st["num_noisy"],), t.item(), device=latents.device)
 
-        cm.set_active_label(COND_LABEL)
-        cond_v = self._denoise(cm, st["cond"], latents, vision_timesteps)
-        if st["uncond"] is not None:
+        if st["uncond"] is None:
+            cm.set_active_label(COND_LABEL)
+            velocity = self._denoise(cm, st["cond"], latents, vision_timesteps)
+        elif self.batched_cfg:
+            cm.set_active_label(CFG_BATCHED_LABEL)
+            cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
+                latents,
+                vision_timesteps,
+                st["cond"]["vision_mrope_ids"],
+                st["uncond"]["vision_mrope_ids"],
+                st["cond"]["vision_token_shapes"],
+                st["cond"]["vision_noisy_frame_indexes"],
+                st["cond"]["mse_gen_indexes"],
+                cm,
+            )
+            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+        else:
+            cm.set_active_label(COND_LABEL)
+            cond_v = self._denoise(cm, st["cond"], latents, vision_timesteps)
             cm.set_active_label(UNCOND_LABEL)
             uncond_v = self._denoise(cm, st["uncond"], latents, vision_timesteps)
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
-        else:
-            velocity = cond_v
 
         new_latents = scheduler.step(
             velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
@@ -389,9 +420,32 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         velocity_mask, vmask = st["velocity_mask"], st["vmask"]
         action_vmask, action_cmask = st["action_velocity_mask"], st["action_clean_mask"]
 
-        cm.set_active_label(COND_LABEL)
-        video_v, action_v = self._denoise_action(cm, st["cond"], latents, action_latents, vts, ats, domain)
-        if st["uncond"] is not None:
+        if st["uncond"] is None:
+            cm.set_active_label(COND_LABEL)
+            video_v, action_v = self._denoise_action(cm, st["cond"], latents, action_latents, vts, ats, domain)
+        elif self.batched_cfg:
+            cm.set_active_label(CFG_BATCHED_LABEL)
+            (video_v, action_v), (v_u, a_u) = self.transformer.denoise_step_batched_cfg(
+                latents,
+                vts,
+                st["cond"]["position_ids"][:, st["cond"]["und_len"]:],
+                st["uncond"]["position_ids"][:, st["uncond"]["und_len"]:],
+                st["cond"]["vision_token_shapes"],
+                st["cond"]["vision_noisy_frame_indexes"],
+                st["cond"]["mse_gen_indexes"],
+                cm,
+                action_latents=action_latents,
+                action_token_shapes=st["cond"]["action_token_shapes"],
+                action_noisy_frame_indexes=st["cond"]["action_noisy_frame_indexes"],
+                action_mse_gen_indexes=st["cond"]["action_mse_gen_indexes"],
+                action_timesteps=ats,
+                action_domain_id=domain,
+            )
+            video_v = v_u + st["gs"] * (video_v - v_u)
+            action_v = a_u + st["gs"] * (action_v - a_u)
+        else:
+            cm.set_active_label(COND_LABEL)
+            video_v, action_v = self._denoise_action(cm, st["cond"], latents, action_latents, vts, ats, domain)
             cm.set_active_label(UNCOND_LABEL)
             v_u, a_u = self._denoise_action(cm, st["uncond"], latents, action_latents, vts, ats, domain)
             video_v = v_u + st["gs"] * (video_v - v_u)

@@ -38,6 +38,11 @@ class _SdpaCacheHandle:
     """In-process reference cache with the ``BatchedCacheManager`` surface the
     DiT uses, backed by stored tensors + sdpa (same kernel as the fused pipeline).
     Prefill stashes each layer's understanding K/V; every denoise step re-reads it.
+
+    Also models the batched classifier-free-guidance plan: when both guidance
+    branches run in one forward, ``run_attention`` receives the two branches
+    concatenated and routes each half to its own label's cached prefix, so the
+    batched result equals running the branches sequentially.
     """
 
     def __init__(self):
@@ -46,6 +51,7 @@ class _SdpaCacheHandle:
         self.committed: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.pending: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.is_causal: dict[str, bool] = {}
+        self.batched_labels: list[str] | None = None
 
     def set_active_label(self, label):
         self.active = label
@@ -55,6 +61,10 @@ class _SdpaCacheHandle:
 
     def plan_attention(self, seq_lens=None, dtype=None, is_causal=True, write_store=True, label=None):
         self.is_causal[label or self.active] = is_causal
+
+    def plan_attention_batched_cfg(self, labels, seq_lens, is_causal=False, write_store=False, **kwargs):
+        self.batched_labels = list(labels)
+        self.is_causal["_cfg_batched"] = is_causal
 
     def plan_rope(self, *args, **kwargs):
         pass
@@ -67,14 +77,25 @@ class _SdpaCacheHandle:
         )
         return out.transpose(1, 2).squeeze(0)
 
-    def run_attention(self, q, k, v, layer_idx=None):
-        key = (self.active, self.layer if layer_idx is None else layer_idx)
-        causal = self.is_causal[self.active]
+    def _attend_label(self, label, layer, q, k, v, causal):
+        key = (label, layer)
         if key in self.committed:
             pk, pv = self.committed[key]
             return self._sdpa(q, torch.cat([pk, k], 0), torch.cat([pv, v], 0), causal)
         self.pending[key] = (k, v)
         return self._sdpa(q, k, v, causal)
+
+    def run_attention(self, q, k, v, layer_idx=None):
+        layer = self.layer if layer_idx is None else layer_idx
+        if self.active == "_cfg_batched":
+            causal = self.is_causal["_cfg_batched"]
+            n = q.shape[0] // len(self.batched_labels)
+            outs = []
+            for bi, label in enumerate(self.batched_labels):
+                sl = slice(bi * n, (bi + 1) * n)
+                outs.append(self._attend_label(label, layer, q[sl], k[sl], v[sl], causal))
+            return torch.cat(outs, 0)
+        return self._attend_label(self.active, layer, q, k, v, self.is_causal[self.active])
 
     def advance_seq_lens(self, pos_id_ns=None):
         self.committed.update(self.pending)
@@ -190,10 +211,18 @@ def _check_cache_once_exact(num_frames, tag):
     if ctx is None:
         print(f"  (skipped {tag} cache-once parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
-    lat = _run_cache_once(
-        ctx["model"], ctx["dit"], _SdpaCacheHandle(), ctx["init"], ctx["cond"], ctx["uncond"],
-        ctx["device"], num_frames,
-    )
+    dit = ctx["dit"]
+    prev = dit.batched_cfg
+    # The sequential guidance path matches the fused pipeline bit-for-bit; the
+    # batched path differs only in bf16 GEMM rounding (covered by the PSNR checks).
+    dit.batched_cfg = False
+    try:
+        lat = _run_cache_once(
+            ctx["model"], dit, _SdpaCacheHandle(), ctx["init"], ctx["cond"], ctx["uncond"],
+            ctx["device"], num_frames,
+        )
+    finally:
+        dit.batched_cfg = prev
     diff = (ctx["lat_fused"].float() - lat.reshape(ctx["lat_fused"].shape).float()).abs().max().item()
     assert diff <= 1e-3, f"{tag} cache-once latents differ from fused by {diff:.3e} (> 1e-3)"
     print(f"  {tag} cache-once (sdpa) latent abs-max diff = {diff:.3e}")
@@ -220,6 +249,36 @@ def _check_engine_psnr(num_frames, tag):
     print(f"  {tag} engine cache path (flashinfer) PSNR = {psnr:.2f} dB")
 
 
+@torch.no_grad()
+def test_batched_cfg_matches_sequential() -> None:
+    """Running both guidance branches in one batched forward must match running
+    them sequentially. The two paths differ only in bf16 GEMM rounding (a batched
+    matmul tiles differently), so compare the decoded images by PSNR."""
+    ctx = _scenario(1)
+    if ctx is None:
+        print("  (skipped batched-CFG vs sequential: needs COSMOS3_NANO_DIR + CUDA)")
+        return
+    dit, prev, decoded = ctx["dit"], ctx["dit"].batched_cfg, {}
+    try:
+        for flag in (False, True):
+            dit.batched_cfg = flag
+            try:
+                cm = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"])
+            except Exception as exc:  # noqa: BLE001
+                print(f"  (skipped batched-CFG vs sequential: FlashInfer unavailable: {exc})")
+                return
+            lat = _run_cache_once(
+                ctx["model"], dit, cm, ctx["init"], ctx["cond"], ctx["uncond"], ctx["device"], 1
+            )
+            decoded[flag] = ctx["mpipe"]._decode(lat.reshape(ctx["lat_fused"].shape)).squeeze().float().cpu()
+    finally:
+        dit.batched_cfg = prev
+    mse = (decoded[False] - decoded[True]).pow(2).mean().item()
+    psnr = float("inf") if mse == 0 else -10 * math.log10(mse)
+    assert psnr >= 35, f"batched vs sequential PSNR {psnr:.2f} < 35 (MSE {mse:.3e})"
+    print(f"  batched-CFG vs sequential decoded PSNR = {psnr:.2f} dB")
+
+
 def test_cache_once_matches_fused_exact() -> None:
     _check_cache_once_exact(1, "t2i")
 
@@ -239,6 +298,7 @@ def test_engine_cache_path_video_psnr() -> None:
 def _main() -> None:
     failures = []
     for name, fn in [
+        ("batched_cfg_matches_sequential", test_batched_cfg_matches_sequential),
         ("cache_once_matches_fused_exact", test_cache_once_matches_fused_exact),
         ("engine_cache_path_image_psnr", test_engine_cache_path_image_psnr),
         ("cache_once_matches_fused_exact_t2v", test_cache_once_matches_fused_exact_t2v),
