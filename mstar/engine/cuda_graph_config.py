@@ -25,7 +25,18 @@ class CudaGraphConfig(ABC):
         # StatelessCudaGraphRunner picks its own default). Useful for codec-style
         # submodules where memory cost per size is high, or for AR walks where a
         # small subset is enough.
-        capture_batch_sizes: list[int] | None = None
+        capture_batch_sizes: list[int] | None = None,
+        # Method on the submodule to capture. Defaults to ``forward_batched`` (the
+        # same method the eager batched path uses). Diffusion-style walks that must
+        # keep a non-capturable tail (e.g. a multistep scheduler step) out of the
+        # graph capture a velocity-only method here and run the tail in
+        # ``postprocess_captured`` after replay.
+        capture_forward_method: str = "forward_batched",
+        # Whether the runner advances KV seq_lens after replay. True for
+        # autoregressive walks (each step appends a token). False for frozen-prefix
+        # denoise loops that re-read a fixed prefix and overwrite the same tail
+        # pages every step (advancing would grow the prefix and corrupt attention).
+        advance_seq_lens: bool = True,
     ):
         self.capture_graph_walk = capture_graph_walk
         self.replay_graph_walks = replay_graph_walks or [capture_graph_walk]
@@ -33,6 +44,8 @@ class CudaGraphConfig(ABC):
         self.labels = labels or ["main"]
         self.compile = compile
         self.capture_batch_sizes = capture_batch_sizes
+        self.capture_forward_method = capture_forward_method
+        self.advance_seq_lens = advance_seq_lens
 
     @abstractmethod
     def get_config_type(self) -> CudaGraphConfigType:
@@ -52,7 +65,9 @@ class BasicBatchedCudaGraphConfig(CudaGraphConfig):
         requires_cfg: bool = False,
         labels: list[str]  = None,
         compile: bool = True,
-        capture_batch_sizes: list[int] | None = None
+        capture_batch_sizes: list[int] | None = None,
+        capture_forward_method: str = "forward_batched",
+        advance_seq_lens: bool = True,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -60,7 +75,9 @@ class BasicBatchedCudaGraphConfig(CudaGraphConfig):
             requires_cfg=requires_cfg,
             labels=labels,
             compile=compile,
-            capture_batch_sizes=capture_batch_sizes
+            capture_batch_sizes=capture_batch_sizes,
+            capture_forward_method=capture_forward_method,
+            advance_seq_lens=advance_seq_lens,
         )
         self.single_request_inputs = single_request_inputs
 

@@ -215,6 +215,10 @@ class KVCacheEngine(BaseEngine):
         for node_name, submodule_mgmt in self.submodule_management.items():
             submodule = submodule_mgmt.submodule
 
+            if getattr(submodule, "disable_torch_compile", False):
+                logger.info("KVCacheEngine: torch.compile disabled for %s (submodule opt-out)", node_name)
+                continue
+
             try:
                 submodule.forward = torch.compile(
                     submodule.forward,
