@@ -57,6 +57,11 @@ UNCOND_LABEL = "uncond"
 class Cosmos3DiTSubmodule(ARNodeSubmodule):
     """Dual-pathway DiT node (understanding tower + generation denoiser)."""
 
+    # The denoise loop is data-dependent (per-step timestep .item(), scheduler
+    # step, classifier-free guidance combine), so torch.compile graph-breaks and
+    # buys little; CUDA-graph capture of the fixed-shape step is the accelerator.
+    disable_torch_compile = True
+
     def __init__(self, transformer, config, scheduler=None):
         super().__init__()
         self.transformer = transformer
@@ -425,6 +430,10 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     Applies the pipeline-side latent normalization (the VAE itself returns raw
     latents) before decoding, matching the fused t2i pipeline's decode.
     """
+
+    # One-shot decode per request; CUDA-graph capture (not torch.compile) is the
+    # speedup path.
+    disable_torch_compile = True
 
     def __init__(self, vae, config):
         super().__init__()
