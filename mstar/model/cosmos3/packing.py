@@ -84,17 +84,82 @@ def get_3d_mrope_ids_vae_tokens(
 
 
 # ---------------------------------------------------------------------------
-# Prompt tokenization (image mode) — ported from pipeline.tokenize_prompt.
+# Prompt tokenization — ported from pipeline.tokenize_prompt. Image mode
+# (num_frames == 1) and video mode differ only in the system prompt and the
+# metadata sentences appended to the prompt (resolution always; duration for
+# video). Both append the eos + start-of-generation special tokens.
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT_IMAGE = "You are a helpful assistant who will generate images from a give prompt."
+SYSTEM_PROMPT_VIDEO = "You are a helpful assistant who will generate videos from a give prompt."
 IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
 INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{width} resolution."
+VIDEO_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
+INVERSE_VIDEO_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
+DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
+INVERSE_DURATION_TEMPLATE = "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
 
 
 def _append(base: str, addition: str) -> str:
     base = base.rstrip(".")
     return f"{base}. {addition}" if base else addition
+
+
+def tokenize_prompt(
+    tokenizer,
+    prompt: str,
+    negative_prompt: str | None,
+    num_frames: int,
+    height: int,
+    width: int,
+    fps: float = 24.0,
+    use_system_prompt: bool = True,
+    add_resolution_template: bool = True,
+    add_duration_template: bool = True,
+) -> tuple[list[int], list[int]]:
+    """Return ``(cond_input_ids, uncond_input_ids)`` for image/video generation.
+
+    Mirrors the diffusers pipeline: apply the Qwen2 chat template with the
+    mode-specific system prompt and metadata sentences (duration for video, then
+    resolution), using inverse templates for the negative prompt, then append the
+    eos + start-of-generation (``<|vision_start|>``) special tokens. Image mode is
+    ``num_frames == 1``.
+    """
+    is_image = num_frames == 1
+    if negative_prompt is None:
+        negative_prompt = ""
+    eos_id = tokenizer.eos_token_id
+    sog_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+
+    resolution_template = IMAGE_RESOLUTION_TEMPLATE if is_image else VIDEO_RESOLUTION_TEMPLATE
+    inverse_resolution_template = (
+        INVERSE_IMAGE_RESOLUTION_TEMPLATE if is_image else INVERSE_VIDEO_RESOLUTION_TEMPLATE
+    )
+
+    def _apply_templates(text: str, is_negative: bool) -> str:
+        if not is_image and add_duration_template:
+            tmpl = INVERSE_DURATION_TEMPLATE if is_negative else DURATION_TEMPLATE
+            text = _append(text, tmpl.format(duration=num_frames / fps, fps=fps))
+        if add_resolution_template:
+            tmpl = inverse_resolution_template if is_negative else resolution_template
+            text = _append(text, tmpl.format(height=height, width=width))
+        return text
+
+    def _tokenize(text: str) -> list[int]:
+        conversations = []
+        if use_system_prompt:
+            conversations.append(
+                {"role": "system", "content": SYSTEM_PROMPT_IMAGE if is_image else SYSTEM_PROMPT_VIDEO}
+            )
+        conversations.append({"role": "user", "content": text})
+        enc = tokenizer.apply_chat_template(
+            conversations, tokenize=True, add_generation_prompt=True, add_vision_id=False, return_dict=True
+        )
+        return list(enc["input_ids"]) + [eos_id, sog_id]
+
+    cond = _tokenize(_apply_templates(prompt, is_negative=False))
+    uncond = _tokenize(_apply_templates(negative_prompt, is_negative=True))
+    return cond, uncond
 
 
 def tokenize_t2i_prompt(
@@ -106,36 +171,17 @@ def tokenize_t2i_prompt(
     use_system_prompt: bool = True,
     add_resolution_template: bool = True,
 ) -> tuple[list[int], list[int]]:
-    """Return ``(cond_input_ids, uncond_input_ids)`` for image generation.
-
-    Mirrors the diffusers pipeline: apply the Qwen2 chat template with the image
-    system prompt and the resolution template, then append the eos +
-    start-of-generation (``<|vision_start|>``) special tokens.
-    """
-    if negative_prompt is None:
-        negative_prompt = ""
-    eos_id = tokenizer.eos_token_id
-    sog_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
-
-    def _apply_templates(text: str, is_negative: bool) -> str:
-        if add_resolution_template:
-            tmpl = INVERSE_IMAGE_RESOLUTION_TEMPLATE if is_negative else IMAGE_RESOLUTION_TEMPLATE
-            text = _append(text, tmpl.format(height=height, width=width))
-        return text
-
-    def _tokenize(text: str) -> list[int]:
-        conversations = []
-        if use_system_prompt:
-            conversations.append({"role": "system", "content": SYSTEM_PROMPT_IMAGE})
-        conversations.append({"role": "user", "content": text})
-        enc = tokenizer.apply_chat_template(
-            conversations, tokenize=True, add_generation_prompt=True, add_vision_id=False, return_dict=True
-        )
-        return list(enc["input_ids"]) + [eos_id, sog_id]
-
-    cond = _tokenize(_apply_templates(prompt, is_negative=False))
-    uncond = _tokenize(_apply_templates(negative_prompt, is_negative=True))
-    return cond, uncond
+    """Image-mode convenience wrapper around :func:`tokenize_prompt`."""
+    return tokenize_prompt(
+        tokenizer,
+        prompt,
+        negative_prompt,
+        num_frames=1,
+        height=height,
+        width=width,
+        use_system_prompt=use_system_prompt,
+        add_resolution_template=add_resolution_template,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -206,21 +252,26 @@ def build_vision_segment(
     }
 
 
-def build_t2i_static_inputs(
+def build_static_inputs(
     input_ids: list[int],
     latent_shape: tuple[int, int, int, int, int],
     config,
     vae_scale_factor_temporal: int,
     fps: float,
     device,
+    has_image_condition: bool = False,
 ) -> dict[str, Any]:
-    """Assemble the per-prompt static transformer inputs for t2i (all-noisy,
-    no image condition). Step-varying fields (``vision_tokens``,
+    """Assemble the per-prompt static transformer inputs for image/video
+    generation. ``latent_shape`` is ``[B, C, T, H, W]`` (``T == 1`` for images;
+    ``T == 1 + (num_frames - 1) // temporal_factor`` for video). When
+    ``has_image_condition`` is set, latent frame 0 is a clean conditioning anchor
+    (image-to-video): it stays in the sequence but is excluded from the noisy /
+    predicted frames. Step-varying fields (``vision_tokens``,
     ``vision_timesteps``) are spliced in per denoising step by the caller."""
     text = build_text_segment(input_ids, config, device)
     vision = build_vision_segment(
         latent_shape=latent_shape,
-        has_image_condition=False,
+        has_image_condition=has_image_condition,
         mrope_offset=text["vision_start_temporal_offset"],
         vision_fps=fps,
         curr=text["und_len"],
@@ -235,3 +286,18 @@ def build_t2i_static_inputs(
         "position_ids": position_ids,
         "sequence_length": text["und_len"] + vision["num_vision_tokens"],
     }
+
+
+def build_t2i_static_inputs(
+    input_ids: list[int],
+    latent_shape: tuple[int, int, int, int, int],
+    config,
+    vae_scale_factor_temporal: int,
+    fps: float,
+    device,
+) -> dict[str, Any]:
+    """Image-mode convenience wrapper around :func:`build_static_inputs`."""
+    return build_static_inputs(
+        input_ids, latent_shape, config, vae_scale_factor_temporal, fps, device,
+        has_image_condition=False,
+    )
