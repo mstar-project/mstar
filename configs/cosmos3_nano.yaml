@@ -1,0 +1,9 @@
+model: "cosmos3"
+# Joint text + vision-latent sequence length for the scheduler. 720p single-
+# image generation fits comfortably here; long video raises this.
+max_seq_len: 8192
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0]
+  - node_names: ["vae_decoder"]
+    ranks: [0]

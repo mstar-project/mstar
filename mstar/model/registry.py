@@ -1,5 +1,6 @@
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.base import Model
+from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.model.pi05.pi05_model import Pi05Model
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
@@ -7,6 +8,7 @@ from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
 
 MODEL_REGISTRY: dict[str, type[Model]] = {
     "bagel": BagelModel,
+    "cosmos3": Cosmos3Model,
     "orpheus": OrpheusModel,
     "pi05": Pi05Model,
     "qwen3_omni": Qwen3OmniModel,
@@ -16,6 +18,8 @@ MODEL_REGISTRY: dict[str, type[Model]] = {
 
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
+    # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
+    "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
