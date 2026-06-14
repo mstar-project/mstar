@@ -49,6 +49,13 @@ PREFILL_WALK = "prefill"
 IMAGE_GEN_WALK = "image_gen"
 ACTION_GEN_WALK = "action_gen"
 
+# Names of the denoise loops in the graph walks. The loops are built with a fixed
+# upper-bound iteration count and each request stops its loop early at its own
+# denoise-step count (see ``check_stop``), so one graph serves any per-request
+# step count.
+IMAGE_GEN_LOOP = "image_gen_loop"
+ACTION_GEN_LOOP = "action_gen_loop"
+
 # Conditional prompt K/V lives under the primary label; the unconditional
 # (negative) prompt's K/V lives under a second label for classifier-free
 # guidance. Both are written once at prefill and read every denoise step.
@@ -272,7 +279,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # per-request state. Only built in the two-branch guidance regime — the
         # one the graph captures.
         if st["uncond"] is not None:
-            t = st["scheduler"].timesteps[time_index.reshape(-1)].to(torch.float32)
+            # The denoise loop may dispatch one extra (discarded) step past this
+            # request's step count; clamp so materializing the static timestep
+            # buffer can't index past the schedule.
+            n_steps = len(st["scheduler"].timesteps)
+            idx = time_index.reshape(-1).clamp(max=n_steps - 1)
+            t = st["scheduler"].timesteps[idx].to(torch.float32)
             tensors["vision_timesteps"] = t.expand(st["num_noisy"]).contiguous()
             tensors["position_ids_cond"] = st["cond"]["vision_mrope_ids"]
             tensors["position_ids_uncond"] = st["uncond"]["vision_mrope_ids"]
@@ -423,6 +435,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_image_gen(self, cm, st, latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            # One extra step past this request's denoise count: the loop has
+            # already been told to stop and this output is discarded. Pass the
+            # finished latents through without touching the (stateful) scheduler.
+            return {"latents": [latents], "time_index": [time_index]}
         t = scheduler.timesteps[step_index]
         vision_timesteps = torch.full((st["num_noisy"],), t.item(), device=latents.device)
 
@@ -475,6 +492,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_action_gen(self, cm, st, latents, action_latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            # One extra step past this request's denoise count (discarded output).
+            return {
+                "latents": [latents],
+                "action_latents": [action_latents],
+                "time_index": [time_index],
+                "action_output": [action_latents[:, :, : st["raw_action_dim"]]],
+            }
         t = scheduler.timesteps[step_index]
         device = latents.device
         vts = torch.full((st["num_noisy"],), t.item(), device=device)
@@ -567,7 +592,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         for rid in engine_inputs.request_ids:
             st = self._req[rid]
             lat, ti = latents[rid], time_index[rid]
-            t = st["scheduler"].timesteps[int(ti.reshape(-1)[0].item())]
+            step_index = int(ti.reshape(-1)[0].item())
+            n_steps = len(st["scheduler"].timesteps)
+            # A request may be one step past its denoise count (a discarded extra
+            # step) while others in the batch are still running; clamp its
+            # timestep so the shared forward can't index past the schedule, and
+            # skip its scheduler step below.
+            past_end = step_index >= n_steps
+            t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
             reqs.append({
                 "latents": lat,
                 "vision_timesteps": torch.full((st["num_noisy"],), t.item(), device=lat.device),
@@ -577,12 +609,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 "vision_noisy_frame_indexes": st["cond"]["vision_noisy_frame_indexes"],
                 "vision_mse_loss_indexes": st["cond"]["mse_gen_indexes"],
             })
-            meta.append((rid, st, lat, ti, t))
+            meta.append((rid, st, lat, ti, t, past_end))
 
         results = self.transformer.denoise_step_batched(reqs, cm)
 
         out = {}
-        for (rid, st, lat, ti, t), (cond_v, uncond_v) in zip(meta, results):
+        for (rid, st, lat, ti, t, past_end), (cond_v, uncond_v) in zip(meta, results):
+            if past_end:
+                out[rid] = {"latents": [lat], "time_index": [ti]}
+                continue
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
             new_latents = st["scheduler"].step(
                 velocity.unsqueeze(0), t, lat.unsqueeze(0), return_dict=False
@@ -691,12 +726,38 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latents = inp.tensor_inputs["latents"]
             time_index = inp.tensor_inputs["time_index"]
             step_index = int(time_index.reshape(-1)[0].item())
+            if step_index >= len(st["scheduler"].timesteps):
+                # Discarded extra step past this request's denoise count.
+                outputs[rid] = {"latents": [latents], "time_index": [time_index]}
+                continue
             t = st["scheduler"].timesteps[step_index]
             new_latents = st["scheduler"].step(
                 velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
             )[0].squeeze(0)
             outputs[rid] = {"latents": [new_latents], "time_index": [time_index + 1]}
         return outputs
+
+    def check_stop(self, request_id, request_info, outputs) -> set[str]:
+        """Stop this request's denoise loop once it has run its own step count.
+
+        The loop is built with a fixed upper-bound iteration count
+        (``config.max_inference_steps``); each request runs only as many steps as
+        its scheduler holds (e.g. image 50, video 35, action 30, distilled policy
+        ~4), which can differ between concurrent requests. Runs on the worker's
+        slow-postprocess path, so reading the per-request step count is fine. The
+        one extra step the loop dispatches before this stop takes effect is a
+        no-op (see the ``step_index >=`` guards in the forward methods)."""
+        st = self._req.get(request_id)
+        if st is None:
+            return set()
+        loop = (
+            ACTION_GEN_LOOP if request_info.graph_walk == ACTION_GEN_WALK
+            else IMAGE_GEN_LOOP
+        )
+        iter_idx = request_info.dynamic_loop_iter_counts.get(loop, 0)
+        if iter_idx + 1 >= len(st["scheduler"].timesteps):
+            return {loop}
+        return set()
 
     def cleanup_request(self, request_id: str):
         self._req.pop(request_id, None)
