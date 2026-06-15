@@ -27,6 +27,9 @@ import torch
 import torch.nn.functional as F
 
 PROMPT = "A red cube resting on a polished wooden table, soft daylight."
+# Square 256x256: the captured CUDA-graph resolution (the graph reproduces eager
+# at square sizes; non-square capture is a known follow-up). Parity checks here
+# are resolution-independent.
 H = W = 256
 STEPS = 12
 GS = 6.0

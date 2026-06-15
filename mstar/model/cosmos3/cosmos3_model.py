@@ -217,6 +217,14 @@ class Cosmos3Model(Model):
                 [
                     Loop(
                         name=loop_name,
+                        # Disable speculative (async) scheduling on the denoise
+                        # step: with it on, the worker pre-dispatches a single
+                        # request's next step and drains that one request's whole
+                        # loop before others are scheduled, so concurrent requests
+                        # never share a forward. Off, the scheduler groups all
+                        # ready requests at this node into one batched denoise
+                        # step (see can_batch/forward_batched). Mirrors the BAGEL
+                        # image-gen loop nodes.
                         section=GraphNode(
                             name=DIT_NODE,
                             input_names=["latents", "time_index"],
@@ -224,6 +232,7 @@ class Cosmos3Model(Model):
                                 GraphEdge(next_node=DIT_NODE, name="latents"),
                                 GraphEdge(next_node=DIT_NODE, name="time_index"),
                             ],
+                            enable_async_scheduling=False,
                         ),
                         max_iters=self.config.max_inference_steps,
                         outputs=[
@@ -262,6 +271,7 @@ class Cosmos3Model(Model):
                             GraphEdge(next_node=DIT_NODE, name="action_latents"),
                             GraphEdge(next_node=DIT_NODE, name="time_index"),
                         ],
+                        enable_async_scheduling=False,
                     ),
                     max_iters=self.config.max_inference_steps,
                     # The loop's terminal output is matched into the section by
@@ -297,6 +307,7 @@ class Cosmos3Model(Model):
                             GraphEdge(next_node=DIT_NODE, name="action_latents"),
                             GraphEdge(next_node=DIT_NODE, name="time_index"),
                         ],
+                        enable_async_scheduling=False,
                     ),
                     max_iters=self.config.max_inference_steps,
                     outputs=[
