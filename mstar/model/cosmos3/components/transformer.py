@@ -881,8 +881,10 @@ class Cosmos3OmniTransformer(nn.Module):
             shapes.append(original_latent_shapes)
             cc, sc = self._rotary(req["position_ids_cond"], gen_seq.device, gen_seq.dtype)
             cu, su = self._rotary(req["position_ids_uncond"], gen_seq.device, gen_seq.dtype)
-            cos_cond.append(cc); sin_cond.append(sc)
-            cos_uncond.append(cu); sin_uncond.append(su)
+            cos_cond.append(cc)
+            sin_cond.append(sc)
+            cos_uncond.append(cu)
+            sin_uncond.append(su)
 
         # Conditional block first (all requests), then unconditional block.
         all_gen = torch.cat(gen_seqs + gen_seqs, dim=0)
@@ -914,4 +916,107 @@ class Cosmos3OmniTransformer(nn.Module):
             uncond_v = _decode(uncond_out[off:off + n], req, shapes[i])
             off += n
             results.append((cond_v, uncond_v))
+        return results
+
+    def denoise_step_action_batched(self, requests: list[dict], cache_handle, with_cfg: bool):
+        """Joint ``[video | action]`` denoise for several action requests at once.
+
+        The action analogue of ``denoise_step_batched``. Each request carries its
+        own video latents, action latents, per-band timesteps, rotary positions
+        (per guidance branch), token layout and embodiment domain id; its
+        generation block is ``[vision tokens | action tokens]``. With classifier-
+        free guidance every request contributes a conditional and an
+        unconditional copy, packed ``[cond r0 | ... | cond rN | uncond r0 | ... |
+        uncond rN]`` to match the handle's batched plan; without guidance (the
+        guidance-scale-1 forward/inverse-dynamics and base policy case) each
+        request contributes a single sequence ``[r0 | r1 | ... | rN]``. The layers
+        run once over the whole pack; the cache routes each piece to its own
+        request and guidance label. The per-request action projection is
+        domain-aware, so requests from different embodiments can share the batch.
+
+        Returns one entry per request, in request order: a tuple of branch
+        results, each a ``(video_velocity, action_velocity)`` pair — one branch
+        without guidance, ``(conditional, unconditional)`` with.
+
+        Each ``requests`` entry is a dict with: ``latents``, ``action_latents``,
+        ``vision_timesteps``, ``action_timesteps``, ``position_ids_cond``
+        (plus ``position_ids_uncond`` when ``with_cfg``), ``vision_token_shapes``,
+        ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``,
+        ``action_token_shapes``, ``action_noisy_frame_indexes``,
+        ``action_mse_gen_indexes``, ``action_domain_id``."""
+        gen_seqs, shapes, cos_cond, sin_cond, cos_uncond, sin_uncond = [], [], [], [], [], []
+        for req in requests:
+            packed, original_latent_shapes = self._patchify_and_pack_latents([req["latents"]])
+            packed = self.proj_in(packed)
+            target_dtype = packed.dtype
+            ts_embeds = self.time_embedder(
+                self.time_proj(req["vision_timesteps"] * self.config.timestep_scale)
+            ).to(target_dtype)
+            gen_seq = self._apply_timestep_embeds_to_noisy_tokens(
+                packed_tokens=packed,
+                packed_timestep_embeds=ts_embeds,
+                noisy_frame_indexes=req["vision_noisy_frame_indexes"],
+                token_shapes=req["vision_token_shapes"],
+            )
+            action_seq = self._embed_action(
+                req["action_latents"], req["action_domain_id"], req["action_timesteps"],
+                req["action_token_shapes"], req["action_noisy_frame_indexes"], target_dtype,
+            )
+            gen_seq = torch.cat([gen_seq, action_seq], dim=0)
+            gen_seqs.append(gen_seq)
+            shapes.append(original_latent_shapes)
+            cc, sc = self._rotary(req["position_ids_cond"], gen_seq.device, gen_seq.dtype)
+            cos_cond.append(cc)
+            sin_cond.append(sc)
+            if with_cfg:
+                cu, su = self._rotary(req["position_ids_uncond"], gen_seq.device, gen_seq.dtype)
+                cos_uncond.append(cu)
+                sin_uncond.append(su)
+
+        if with_cfg:
+            all_gen = torch.cat(gen_seqs + gen_seqs, dim=0)
+            cos = torch.cat(cos_cond + cos_uncond, dim=0)
+            sin = torch.cat(sin_cond + sin_uncond, dim=0)
+        else:
+            all_gen = torch.cat(gen_seqs, dim=0)
+            cos = torch.cat(cos_cond, dim=0)
+            sin = torch.cat(sin_cond, dim=0)
+
+        for i, layer in enumerate(self.layers):
+            cache_handle.set_layer_idx(i)
+            all_gen = layer.forward_gen(all_gen, cos, sin, cache_handle)
+        gen_out = self.norm_moe_gen(all_gen)
+
+        sizes = [g.shape[0] for g in gen_seqs]
+        total = sum(sizes)
+        offsets, acc = [], 0
+        for n in sizes:
+            offsets.append(acc)
+            acc += n
+
+        def _decode(out, req, original_latent_shapes):
+            preds_packed = self.proj_out(out[req["vision_mse_loss_indexes"]])
+            preds = self._unpatchify_and_unpack_latents(
+                preds_packed,
+                token_shapes_vision=req["vision_token_shapes"],
+                noisy_frame_indexes_vision=req["vision_noisy_frame_indexes"],
+                original_latent_shapes=original_latent_shapes,
+            )
+            action_pred = self._decode_action(
+                out[req["action_mse_gen_indexes"]], req["action_domain_id"],
+                req["action_token_shapes"], req["action_noisy_frame_indexes"],
+            )
+            return preds[0], action_pred
+
+        cond_block = gen_out[:total]
+        uncond_block = gen_out[total:] if with_cfg else None
+        results = []
+        for i, req in enumerate(requests):
+            o, n = offsets[i], sizes[i]
+            cond_res = _decode(cond_block[o:o + n], req, shapes[i])
+            if with_cfg:
+                uncond_res = _decode(uncond_block[o:o + n], req, shapes[i])
+                results.append((cond_res, uncond_res))
+            else:
+                results.append((cond_res,))
         return results

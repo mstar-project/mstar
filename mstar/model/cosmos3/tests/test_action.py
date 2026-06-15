@@ -75,11 +75,15 @@ def _cfg() -> Cosmos3Config:
 class _SdpaCache:
     """In-process cache-once handle (stored K/V + sdpa), the BatchedCacheManager
     surface the DiT uses. Prefill stashes the understanding K/V; the denoise step
-    re-reads it."""
+    re-reads it. Also models the batched-CFG plan: under the combined label the
+    packed sequence is split into one block per batched label, each routed to its
+    own committed prefix (so a single-label batch of one request equals the plain
+    single-request path)."""
 
     def __init__(self):
         self.active, self.layer = "main", 0
         self.committed, self.pending, self.is_causal = {}, {}, {}
+        self.batched_labels = None
 
     def set_active_label(self, label):
         self.active = label
@@ -94,6 +98,10 @@ class _SdpaCache:
     def plan_attention(self, seq_lens=None, dtype=None, is_causal=True, write_store=True, label=None):
         self.is_causal[label or self.active] = is_causal
 
+    def plan_attention_batched_cfg(self, labels, seq_lens, is_causal=False, write_store=False, **kwargs):
+        self.batched_labels = list(labels)
+        self.is_causal["_cfg_batched"] = is_causal
+
     def plan_rope(self, *a, **k):
         pass
 
@@ -104,13 +112,25 @@ class _SdpaCache:
             v.unsqueeze(0).transpose(1, 2), is_causal=c, enable_gqa=True)
         return o.transpose(1, 2).squeeze(0)
 
-    def run_attention(self, q, k, v, layer_idx=None):
-        key = (self.active, self.layer if layer_idx is None else layer_idx)
+    def _attend_label(self, label, layer, q, k, v, causal):
+        key = (label, layer)
         if key in self.committed:
             pk, pv = self.committed[key]
-            return self._sdpa(q, torch.cat([pk, k], 0), torch.cat([pv, v], 0), self.is_causal[self.active])
+            return self._sdpa(q, torch.cat([pk, k], 0), torch.cat([pv, v], 0), causal)
         self.pending[key] = (k, v)
-        return self._sdpa(q, k, v, self.is_causal[self.active])
+        return self._sdpa(q, k, v, causal)
+
+    def run_attention(self, q, k, v, layer_idx=None):
+        layer = self.layer if layer_idx is None else layer_idx
+        if self.active == "_cfg_batched":
+            causal = self.is_causal["_cfg_batched"]
+            n = q.shape[0] // len(self.batched_labels)
+            outs = []
+            for bi, label in enumerate(self.batched_labels):
+                sl = slice(bi * n, (bi + 1) * n)
+                outs.append(self._attend_label(label, layer, q[sl], k[sl], v[sl], causal))
+            return torch.cat(outs, 0)
+        return self._attend_label(self.active, layer, q, k, v, self.is_causal[self.active])
 
     def advance_seq_lens(self, pos_id_ns=None):
         self.committed.update(self.pending)
@@ -232,6 +252,67 @@ def test_action_denoise_step_matches_fused() -> None:
         assert (pa - da).abs().max().item() < 1e-4, mode
 
 
+def test_action_batched_one_matches_single() -> None:
+    """The cross-request action batched forward, run with a single request and no
+    guidance, reproduces the single-request ``denoise_step`` bit-for-bit. Checks
+    the batched packing / per-request decode plumbing; multi-request isolation is
+    the GPU-gated cross-request parity test."""
+    cfg = _cfg()
+    torch.manual_seed(0)
+    model = Cosmos3OmniTransformer(cfg).eval()
+    action_chunk = 8
+    latent_t = 1 + (9 - 1) // cfg.vae.scale_factor_temporal
+    latent_shape = (1, cfg.latent_channel, latent_t, 4, 4)
+    for mode in _MODES:
+        s, _, latents, action_lat, domain, vts, ats, _, _, _ = _run_mode(
+            model, cfg, mode, latent_shape, action_chunk, [1, 2, 3, 4]
+        )
+        und_len = s["und_len"]
+        # Reference: the single-request joint denoise step.
+        cache = _SdpaCache()
+        cache.set_active_label("main")
+        cache.plan(is_causal=True)
+        model.prefill_und(s["input_ids"], s["text_mrope_ids"], cache)
+        cache.plan(is_causal=False)
+        with torch.no_grad():
+            dv, da = model.denoise_step(
+                latents, vts, s["position_ids"][:, und_len:],
+                s["vision_token_shapes"], s["vision_noisy_frame_indexes"],
+                s["vision_mse_loss_indexes"] - und_len, cache,
+                action_latents=action_lat, action_token_shapes=s["action_token_shapes"],
+                action_noisy_frame_indexes=s["action_noisy_frame_indexes"],
+                action_mse_gen_indexes=s["action_mse_loss_indexes"] - und_len,
+                action_timesteps=ats, action_domain_id=domain,
+            )
+        # Batched path with one request and no guidance (single-label batch).
+        cache2 = _SdpaCache()
+        cache2.set_active_label("main")
+        cache2.plan(is_causal=True)
+        model.prefill_und(s["input_ids"], s["text_mrope_ids"], cache2)
+        cache2.plan_attention_batched_cfg(
+            labels=["main"],
+            seq_lens=[s["num_vision_tokens"] + s["num_action_tokens"]],
+            is_causal=False,
+        )
+        cache2.set_active_label("_cfg_batched")
+        req = {
+            "latents": latents, "action_latents": action_lat,
+            "vision_timesteps": vts, "action_timesteps": ats,
+            "position_ids_cond": s["position_ids"][:, und_len:],
+            "vision_token_shapes": s["vision_token_shapes"],
+            "vision_noisy_frame_indexes": s["vision_noisy_frame_indexes"],
+            "vision_mse_loss_indexes": s["vision_mse_loss_indexes"] - und_len,
+            "action_token_shapes": s["action_token_shapes"],
+            "action_noisy_frame_indexes": s["action_noisy_frame_indexes"],
+            "action_mse_gen_indexes": s["action_mse_loss_indexes"] - und_len,
+            "action_domain_id": domain,
+        }
+        with torch.no_grad():
+            ((bv, ba),), = model.denoise_step_action_batched([req], cache2, with_cfg=False)
+        assert (dv - bv).abs().max().item() < 1e-5, mode
+        assert (da - ba).abs().max().item() < 1e-5, mode
+
+
 # --- GPU-gated parity (needs COSMOS3_NANO_DIR + CUDA + diffusers) ------------
 import math  # noqa: E402
 import os  # noqa: E402
@@ -258,6 +339,40 @@ def _gpu_base():
     dit = model.get_submodule("dit", device=device)
     _GPU["base"] = dict(model=model, mpipe=mpipe, dit=dit, device=device, dtype=dtype, snap=snap)
     return _GPU["base"]
+
+
+def _flashinfer_action_shared(model, rids, device, dtype):
+    """A KV cache + paged allocator shared by several action requests, each with
+    only the conditional label (guidance-scale-1 action has no unconditional
+    branch). Mirrors the engine's persistent per-node cache."""
+    from mstar.communication.tensors import LocalTransferEngine
+    from mstar.engine.cache_manager import WorkspaceBufferManager
+    from mstar.engine.kv_store import PagedAllocationManager, TransferEngineInfo
+    from mstar.model.cosmos3.submodules import COND_LABEL
+
+    cfg = model.get_kv_cache_config()[0]
+    cfg.max_num_pages = 128
+    cfg.shard(1)
+    kv_cache = torch.zeros(
+        cfg.num_layers, cfg.max_num_pages, 2, cfg.page_size, cfg.num_kv_heads, cfg.head_dim,
+        dtype=dtype, device=device,
+    )
+    alloc = PagedAllocationManager(cfg, kv_cache, TransferEngineInfo("h", "h", LocalTransferEngine("h")))
+    for rid in rids:
+        alloc.add_request(rid, [COND_LABEL])
+    buf = WorkspaceBufferManager(256 * 1024 * 1024, device)
+    return {"kv_cache": kv_cache, "alloc": alloc, "buf": buf, "cfg": cfg, "device": device}
+
+
+def _mk_action_cm(shared, rids):
+    from mstar.engine.cache_manager import BatchedCacheManager
+    from mstar.model.cosmos3.submodules import COND_LABEL
+
+    return BatchedCacheManager(
+        request_ids=rids, active_labels_per_request={r: COND_LABEL for r in rids},
+        kv_cache=shared["kv_cache"], alloc_manager=shared["alloc"], buffer_manager=shared["buf"],
+        kv_cache_config=shared["cfg"], device=shared["device"], auto_write_store=False,
+    )
 
 
 def test_action_engine_matches_fused() -> None:
@@ -423,6 +538,127 @@ def test_action_fd_agibotworld_golden_gate() -> None:
     print(f"  fd agibotworld: {n} frames, PSNR = {psnr:.2f} dB")
 
 
+@torch.no_grad()
+def test_action_cross_request_batch_matches_individual() -> None:
+    """Several action requests denoised together in one batch reproduce each
+    request run alone (guidance-scale-1 inverse-dynamics, real FlashInfer cache).
+    Each batched action must (a) stay isolated — closer to its own bs=1 action
+    than to any other request's — and (b) not drift from bs=1 beyond bf16 batch-
+    variance. The action analogue of the image cross-request batch parity test."""
+    base = _gpu_base()
+    if base is None:
+        print("  (skipped action cross-request batch parity: needs COSMOS3_NANO_DIR + CUDA)")
+        return
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.cosmos3.packing import tokenize_prompt
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    device, dtype, dit, model = base["device"], base["dtype"], base["dit"], base["model"]
+    chunk, raw, dom, fps, steps, h, w = 12, 9, 1, 10.0, 6, 128, 128
+    nf = chunk + 1
+    prompts = [
+        "You are an autonomous vehicle planning system.",
+        "Drive forward and keep to the center of the lane.",
+        "Slow down and prepare to stop at the intersection.",
+    ]
+    rids = [f"ab{i}" for i in range(len(prompts))]
+    seeds = [10, 20, 30]
+    lat_t = 1 + (nf - 1) // 4
+    # A distinct conditioning clip per request so their predicted actions clearly
+    # differ (sharper isolation signal); the same clip is used in both runs.
+    cond_videos = {
+        rid: torch.rand((nf, 3, h, w), generator=torch.Generator().manual_seed(s), dtype=torch.float32)
+        for rid, s in zip(rids, seeds, strict=True)
+    }
+
+    def _md():
+        return {"height": h, "width": w, "num_frames": nf, "fps": fps, "action_fps": fps,
+                "guidance_scale": 1.0, "num_inference_steps": steps, "action_mode": "inverse_dynamics",
+                "action_chunk_size": chunk, "raw_action_dim": raw, "domain_id": dom, "flow_shift": 10.0}
+
+    conds = [tokenize_prompt(model.tokenizer, p, "", num_frames=nf, height=h, width=w, fps=fps,
+                             use_system_prompt=False, add_resolution_template=False,
+                             add_duration_template=False)[0] for p in prompts]
+
+    def _prefill(rid, idx, cm):
+        fwd = CurrentForwardPassInfo(
+            request_id=rid, graph_walk="prefill", requires_cfg=False, fwd_index=0,
+            random_seed=seeds[idx], max_tokens=0, sampling_config={}, step_metadata=_md())
+        ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm)
+        ni = dit.prepare_inputs("prefill", fwd, {
+            "text_inputs": [torch.tensor(conds[idx], dtype=torch.long, device=device)],
+            "video_inputs": [cond_videos[rid].to(device)],
+        })
+        dit.forward("prefill", ei, **dit.preprocess("prefill", ei, [ni]))
+        fwd.graph_walk = "action_gen"
+        return fwd
+
+    def _run_one(rid, idx):
+        shared = _flashinfer_action_shared(model, [rid], device, dtype)
+        cm = _mk_action_cm(shared, [rid])
+        fwd = _prefill(rid, idx, cm)
+        ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm)
+        lat = act = ti = None
+        for _ in range(steps):
+            inp = {} if lat is None else {"latents": [lat], "action_latents": [act], "time_index": [ti]}
+            ni = dit.prepare_inputs("action_gen", fwd, inp)
+            out = dit.forward("action_gen", ei, **dit.preprocess("action_gen", ei, [ni]))
+            lat, act, ti = out["latents"][0], out["action_latents"][0], out["time_index"][0]
+        dit.cleanup_request(rid)
+        return act[:, :, :raw].float().cpu()
+
+    def _run_batched():
+        shared = _flashinfer_action_shared(model, rids, device, dtype)
+        fwds = {}
+        for i, rid in enumerate(rids):
+            fwds[rid] = _prefill(rid, i, _mk_action_cm(shared, [rid]))
+        cmN = _mk_action_cm(shared, rids)
+        eiN = ModelInputsFromEngine(request_ids=rids, per_request_info=fwds, cache_manager=cmN)
+        lat = {r: None for r in rids}
+        act = {r: None for r in rids}
+        ti = {r: None for r in rids}
+        for _ in range(steps):
+            inputs = []
+            for rid in rids:
+                inp = {} if lat[rid] is None else {
+                    "latents": [lat[rid]], "action_latents": [act[rid]], "time_index": [ti[rid]]}
+                inputs.append(dit.prepare_inputs("action_gen", fwds[rid], inp))
+            out = dit.forward_batched("action_gen", eiN, **dit.preprocess("action_gen", eiN, inputs))
+            for rid in rids:
+                o = out[rid]
+                lat[rid], act[rid], ti[rid] = o["latents"][0], o["action_latents"][0], o["time_index"][0]
+        res = {rid: act[rid][:, :, :raw].float().cpu() for rid in rids}
+        for rid in rids:
+            dit.cleanup_request(rid)
+        return res
+
+    try:
+        bs1 = {rid: _run_one(rid, i) for i, rid in enumerate(rids)}
+        bat = _run_batched()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (skipped action cross-request batch parity: FlashInfer unavailable: {exc})")
+        return
+
+    def _mse(a, b):
+        return (a - b).pow(2).mean().item()
+
+    n = len(rids)
+    selfs, crosses = [], []
+    for i, rid in enumerate(rids):
+        self_mse = _mse(bat[rid], bs1[rid])
+        cross_mse = min(_mse(bat[rid], bs1[rids[j]]) for j in range(n) if j != i)
+        selfs.append(self_mse)
+        crosses.append(cross_mse)
+        assert self_mse < cross_mse, (
+            f"request {i} not isolated: self {self_mse:.4e} vs nearest other {cross_mse:.4e}")
+        assert self_mse < 5e-3, f"request {i} batched action MSE {self_mse:.4e} drifts from bs=1"
+    print("  action cross-request batch (bs=%d): self MSE = %s | nearest-other = %s" % (
+        n, ", ".join(f"{v:.2e}" for v in selfs), ", ".join(f"{v:.2e}" for v in crosses)))
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _main() -> None:
     fns = [
         ("action_mrope_matches_reference", test_action_mrope_matches_reference),
@@ -430,7 +666,9 @@ def _main() -> None:
         ("action_static_layout", test_action_static_layout),
         ("action_forward_shapes_and_masks", test_action_forward_shapes_and_masks),
         ("action_denoise_step_matches_fused", test_action_denoise_step_matches_fused),
+        ("action_batched_one_matches_single", test_action_batched_one_matches_single),
         ("action_engine_matches_fused", test_action_engine_matches_fused),
+        ("action_cross_request_batch_matches_individual", test_action_cross_request_batch_matches_individual),
         ("action_id_golden_gate", test_action_id_golden_gate),
         ("action_fd_agibotworld_golden_gate", test_action_fd_agibotworld_golden_gate),
     ]
