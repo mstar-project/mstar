@@ -22,6 +22,13 @@ import math
 import os
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+# These checks validate the eager cache-once mechanism's numerical exactness, so
+# run the eager denoise step. The served default torch.compiles it, which fuses
+# pointwise ops and perturbs the latents past the tight bit-exact bounds below
+# without changing image quality (the FlashInfer PSNR checks still pass with
+# compile on — validated over HTTP). Set COSMOS3_DISABLE_COMPILE_DENOISE= (empty)
+# to exercise the compiled path here instead.
+os.environ.setdefault("COSMOS3_DISABLE_COMPILE_DENOISE", "1")
 
 import torch
 import torch.nn.functional as F
