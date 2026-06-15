@@ -538,8 +538,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     is_causal=False, write_store=False,
                 )
                 return {
-                    "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs)},
-                    "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs)},
+                    "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
+                    "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs, strict=True)},
                 }
             self._plan_gen(cm, st, st["num_vision"])
             return {
@@ -548,6 +548,29 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             }
 
         if graph_walk in ACTION_WALKS:
+            rids = engine_inputs.request_ids
+            if len(rids) > 1:
+                # Cross-request batch: one batched plan over every request's joint
+                # [video | action] block, each with its own page set and token
+                # count. A single label when guidance is off (the common
+                # guidance-scale-1 case), both labels with classifier-free
+                # guidance.
+                sts = [self._req[r] for r in rids]
+                labels = (
+                    [COND_LABEL, UNCOND_LABEL] if sts[0]["uncond"] is not None else [COND_LABEL]
+                )
+                cm.plan_attention_batched_cfg(
+                    labels=labels,
+                    seq_lens=[s["num_vision"] + s["num_action"] for s in sts],
+                    is_causal=False, write_store=False,
+                )
+                return {
+                    "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
+                    "action_latents": {
+                        r: inp.tensor_inputs["action_latents"] for r, inp in zip(rids, inputs, strict=True)
+                    },
+                    "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs, strict=True)},
+                }
             self._plan_gen(cm, st, st["num_vision"] + st["num_action"])
             return {
                 "latents": inputs[0].tensor_inputs["latents"],
@@ -649,6 +672,28 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             action_domain_id=domain,
         )
 
+    def _action_scheduler_step(self, st, latents, action_latents, video_v, action_v, t):
+        """One joint [video | action] scheduler step for an action request: mask
+        the predicted velocities to their noisy bands, step the request's own
+        scheduler over the packed [video | action] state, then re-inject the clean
+        conditioning anchors (conditioning frames / action stay clean each step,
+        their masked-in values invariant). Shared by the single-request and
+        cross-request batched action forwards."""
+        raw, chunk, adim = st["raw_action_dim"], st["action_chunk"], st["action_dim"]
+        video_v = video_v * st["velocity_mask"]
+        action_v = action_v * st["action_velocity_mask"]
+        action_v[..., raw:] = 0
+        nv = video_v.numel()
+        packed = torch.cat([video_v.reshape(1, -1), action_v.reshape(1, -1)], dim=1)
+        packed_lat = torch.cat([latents.reshape(1, -1), action_latents.reshape(1, -1)], dim=1)
+        packed_next = st["scheduler"].step(packed, t, packed_lat, return_dict=False)[0]
+        new_latents = packed_next[:, :nv].reshape(latents.shape)
+        new_action = packed_next[:, nv:].reshape(1, chunk, adim)
+        new_latents = st["velocity_mask"] * new_latents + st["vmask"] * latents
+        new_action = st["action_velocity_mask"] * new_action + st["action_clean_mask"] * action_latents
+        new_action[..., raw:] = 0
+        return new_latents, new_action
+
     def _forward_action_gen(self, cm, st, latents, action_latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
@@ -664,9 +709,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         vts = torch.full((st["num_noisy"],), t.item(), device=device)
         ats = torch.full((st["num_noisy_action"],), t.item(), device=device)
         domain = st["domain_t"]
-        raw, chunk, adim = st["raw_action_dim"], st["action_chunk"], st["action_dim"]
-        velocity_mask, vmask = st["velocity_mask"], st["vmask"]
-        action_vmask, action_cmask = st["action_velocity_mask"], st["action_clean_mask"]
 
         if st["uncond"] is None:
             cm.set_active_label(COND_LABEL)
@@ -699,22 +741,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             video_v = v_u + st["gs"] * (video_v - v_u)
             action_v = a_u + st["gs"] * (action_v - a_u)
 
-        video_v = video_v * velocity_mask
-        action_v = action_v * action_vmask
-        action_v[..., raw:] = 0
-
-        nv = video_v.numel()
-        packed = torch.cat([video_v.reshape(1, -1), action_v.reshape(1, -1)], dim=1)
-        packed_lat = torch.cat([latents.reshape(1, -1), action_latents.reshape(1, -1)], dim=1)
-        packed_next = scheduler.step(packed, t, packed_lat, return_dict=False)[0]
-        new_latents = packed_next[:, :nv].reshape(latents.shape)
-        new_action = packed_next[:, nv:].reshape(1, chunk, adim)
-
-        # Re-inject the clean anchors (the conditioning video frames / action
-        # tokens stay clean each step; their masked-in values are invariant).
-        new_latents = velocity_mask * new_latents + vmask * latents
-        new_action = action_vmask * new_action + action_cmask * action_latents
-        new_action[..., raw:] = 0
+        new_latents, new_action = self._action_scheduler_step(
+            st, latents, action_latents, video_v, action_v, t
+        )
         return {
             "latents": [new_latents],
             "action_latents": [new_action],
@@ -726,26 +755,42 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # ------------------------------------------------------------------
 
     def can_batch(self, batch, model_inputs) -> bool:
-        # The image/video denoise step batches across concurrent requests, and
-        # only when every request is in the two-branch guidance regime (so a
-        # single batched plan covers them). One request stays on the simpler
-        # path. The batched forward packs each request's own token shapes, so
-        # requests at different resolutions / frame counts can share the batch.
-        if batch.graph_walk not in GEN_WALKS or not self.batched_cfg:
+        # The denoise step batches across concurrent requests at the same walk.
+        # The batched forward packs each request's own token shapes, so requests
+        # at different resolutions / frame counts (and, for action, different
+        # modes / embodiment domains) can share the batch. One request stays on
+        # the simpler single-request path.
+        if not self.batched_cfg or len(batch.request_ids) < 2:
             return False
-        if len(batch.request_ids) < 2:
+        sts = [self._req.get(rid) for rid in batch.request_ids]
+        if any(st is None for st in sts):
             return False
-        return all(
-            rid in self._req and self._req[rid]["uncond"] is not None
-            for rid in batch.request_ids
-        )
+        if batch.graph_walk in GEN_WALKS:
+            # Image/video batch only in the two-branch guidance regime, so one
+            # batched-CFG plan covers them.
+            return all(st["uncond"] is not None for st in sts)
+        if batch.graph_walk in ACTION_WALKS:
+            # Action batches when all requests share the guidance regime (all
+            # single-branch -- guidance-scale-1 inverse/forward-dynamics and base
+            # policy -- or all two-branch), so one plan covers the batch. Modes
+            # and embodiment domains may differ: each request's masks, scheduler
+            # and domain-aware action projection are applied per request.
+            return len({st["uncond"] is not None for st in sts}) == 1
+        return False
 
     def max_batch_size(self, graph_walk: str):
-        return self.max_gen_batch_size if graph_walk in GEN_WALKS else None
+        if graph_walk in GEN_WALKS or graph_walk in ACTION_WALKS:
+            return self.max_gen_batch_size
+        return None
 
-    def forward_batched(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, time_index, **kwargs):
+    def forward_batched(
+        self, graph_walk, engine_inputs: ModelInputsFromEngine,
+        latents, time_index, action_latents=None, **kwargs,
+    ):
+        if graph_walk in ACTION_WALKS:
+            return self._forward_batched_action(engine_inputs, latents, action_latents, time_index)
         if graph_walk not in GEN_WALKS:
-            raise ValueError(f"Cosmos3 batched forward only supports image/video generation, got {graph_walk!r}")
+            raise ValueError(f"Cosmos3 batched forward only supports generation walks, got {graph_walk!r}")
         cm = engine_inputs.cache_manager
         cm.set_active_label(CFG_BATCHED_LABEL)
         reqs, meta = [], []
@@ -774,7 +819,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         results = self.transformer.denoise_step_batched(reqs, cm)
 
         out = {}
-        for (rid, st, lat, ti, t, past_end), (cond_v, uncond_v) in zip(meta, results):
+        for (rid, st, lat, ti, t, past_end), (cond_v, uncond_v) in zip(meta, results, strict=True):
             if past_end:
                 out[rid] = {"latents": [lat], "time_index": [ti]}
                 continue
@@ -783,6 +828,71 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 velocity.unsqueeze(0), t, lat.unsqueeze(0), return_dict=False
             )[0].squeeze(0)
             out[rid] = {"latents": [new_latents], "time_index": [ti + 1]}
+        return out
+
+    def _forward_batched_action(self, engine_inputs, latents, action_latents, time_index):
+        """Run several action requests' joint [video | action] denoise step in one
+        forward. Mirrors the image batched path: build each request's static gen
+        inputs (clamping a request that has run one step past its denoise count),
+        run one batched transformer pass, then per request combine the guidance
+        branches (when present) and apply its own joint scheduler step."""
+        cm = engine_inputs.cache_manager
+        cm.set_active_label(CFG_BATCHED_LABEL)
+        rids = engine_inputs.request_ids
+        with_cfg = self._req[rids[0]]["uncond"] is not None
+        reqs, meta = [], []
+        for rid in rids:
+            st = self._req[rid]
+            lat, act, ti = latents[rid], action_latents[rid], time_index[rid]
+            step_index = int(ti.reshape(-1)[0].item())
+            n_steps = len(st["scheduler"].timesteps)
+            # A request may be one (discarded) step past its denoise count while
+            # others in the batch are still running; clamp its timestep so the
+            # shared forward can't index past the schedule, and skip its scheduler
+            # step below.
+            past_end = step_index >= n_steps
+            t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
+            cond = st["cond"]
+            und = cond["und_len"]
+            req = {
+                "latents": lat,
+                "action_latents": act,
+                "vision_timesteps": torch.full((st["num_noisy"],), t.item(), device=lat.device),
+                "action_timesteps": torch.full((st["num_noisy_action"],), t.item(), device=lat.device),
+                "position_ids_cond": cond["position_ids"][:, und:],
+                "vision_token_shapes": cond["vision_token_shapes"],
+                "vision_noisy_frame_indexes": cond["vision_noisy_frame_indexes"],
+                "vision_mse_loss_indexes": cond["mse_gen_indexes"],
+                "action_token_shapes": cond["action_token_shapes"],
+                "action_noisy_frame_indexes": cond["action_noisy_frame_indexes"],
+                "action_mse_gen_indexes": cond["action_mse_gen_indexes"],
+                "action_domain_id": st["domain_t"],
+            }
+            if with_cfg:
+                unc = st["uncond"]
+                req["position_ids_uncond"] = unc["position_ids"][:, unc["und_len"]:]
+            reqs.append(req)
+            meta.append((rid, st, lat, act, ti, t, past_end))
+
+        results = self.transformer.denoise_step_action_batched(reqs, cm, with_cfg)
+
+        out = {}
+        for (rid, st, lat, act, ti, t, past_end), branches in zip(meta, results, strict=True):
+            if past_end:
+                out[rid] = {"latents": [lat], "action_latents": [act], "time_index": [ti]}
+                continue
+            if with_cfg:
+                (cond_video, cond_action), (uncond_video, uncond_action) = branches
+                video_v = uncond_video + st["gs"] * (cond_video - uncond_video)
+                action_v = uncond_action + st["gs"] * (cond_action - uncond_action)
+            else:
+                (video_v, action_v), = branches
+            new_latents, new_action = self._action_scheduler_step(st, lat, act, video_v, action_v, t)
+            out[rid] = {
+                "latents": [new_latents],
+                "action_latents": [new_action],
+                "time_index": [ti + 1],
+            }
         return out
 
     # ------------------------------------------------------------------
@@ -893,7 +1003,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         """Eager tail run after graph replay: the classifier-free-guidance combine
         and the (Python, multistep) scheduler step the graph can't hold. Mirrors
         the tail of ``_forward_image_gen``."""
-        for rid, inp in zip(request_ids, inputs):
+        for rid, inp in zip(request_ids, inputs, strict=True):
             st = self._req[rid]
             cond_v = outputs[rid]["cond_v"][0]
             uncond_v = outputs[rid]["uncond_v"][0]
