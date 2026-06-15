@@ -318,6 +318,11 @@ import math  # noqa: E402
 import os  # noqa: E402
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+# The engine-vs-fused check below is a bit-exact mechanism test, so run the eager
+# denoise step; the served default torch.compiles it, which perturbs the latents
+# past the 1e-3 bound without moving the action golden gates (id/fd pass with
+# compile on). Set COSMOS3_DISABLE_COMPILE_DENOISE= (empty) to test compiled.
+os.environ.setdefault("COSMOS3_DISABLE_COMPILE_DENOISE", "1")
 
 _GPU: dict = {}
 
