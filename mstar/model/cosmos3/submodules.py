@@ -114,9 +114,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # requests at the image-generation walk run their step in a single forward.
     max_gen_batch_size = 8
 
-    # Image resolutions (height, width) to capture a denoise-step CUDA graph for.
-    # Each becomes one fixed-shape capture; requests at other resolutions fall
-    # back to the eager path. num_frames is fixed at 1 (text-to-image).
+    # Image resolution (height, width) to capture a denoise-step CUDA graph for.
+    # Requests at other resolutions fall back to the eager path. num_frames is
+    # fixed at 1 (text-to-image). The graph accelerates the single-request
+    # (batch size 1) denoise step, where the forward is launch-bound; concurrent
+    # requests batch via the eager path regardless. Only a square resolution is
+    # captured today — the captured graph reproduces the eager output at square
+    # sizes but diverges at non-square ones (an H/W asymmetry in the baked static
+    # layout, gated by tests/test_engine_cache.py::test_cuda_graph_matches_eager),
+    # so non-square requests use the eager path until that is fixed.
     gen_capture_resolutions: tuple[tuple[int, int], ...] = ((256, 256),)
     # Batch sizes to capture per resolution.
     gen_capture_batch_sizes: tuple[int, ...] = (1,)
@@ -718,10 +724,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # ------------------------------------------------------------------
 
     def can_batch(self, batch, model_inputs) -> bool:
-        # Only the image/video denoise step batches across requests, and only
-        # when every request is in the two-branch guidance regime (so a single
-        # batched plan covers them). One request stays on the simpler path.
-        if batch.graph_walk != IMAGE_GEN_WALK or not self.batched_cfg:
+        # The image/video denoise step batches across concurrent requests, and
+        # only when every request is in the two-branch guidance regime (so a
+        # single batched plan covers them). One request stays on the simpler
+        # path. The batched forward packs each request's own token shapes, so
+        # requests at different resolutions / frame counts can share the batch.
+        if batch.graph_walk not in GEN_WALKS or not self.batched_cfg:
             return False
         if len(batch.request_ids) < 2:
             return False
@@ -731,11 +739,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         )
 
     def max_batch_size(self, graph_walk: str):
-        return self.max_gen_batch_size if graph_walk == IMAGE_GEN_WALK else None
+        return self.max_gen_batch_size if graph_walk in GEN_WALKS else None
 
     def forward_batched(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, time_index, **kwargs):
-        if graph_walk != IMAGE_GEN_WALK:
-            raise ValueError(f"Cosmos3 batched forward only supports image generation, got {graph_walk!r}")
+        if graph_walk not in GEN_WALKS:
+            raise ValueError(f"Cosmos3 batched forward only supports image/video generation, got {graph_walk!r}")
         cm = engine_inputs.cache_manager
         cm.set_active_label(CFG_BATCHED_LABEL)
         reqs, meta = [], []
@@ -826,6 +834,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 advance_seq_lens=False,
                 compile=False,
                 capture_batch_sizes=list(self.gen_capture_batch_sizes),
+                # The captured sizes (default just bs=1, for single-request
+                # latency) are an acceleration subset, not a batch ceiling:
+                # concurrent requests must still batch into one denoise step via
+                # the eager batched path (forward_batched), so don't let this
+                # capture cap max_batch_size to the captured sizes.
+                caps_eager_batch_size=False,
             ))
         return configs
 
