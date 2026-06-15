@@ -27,9 +27,12 @@ import torch
 import torch.nn.functional as F
 
 PROMPT = "A red cube resting on a polished wooden table, soft daylight."
-# Square 256x256: the captured CUDA-graph resolution (the graph reproduces eager
-# at square sizes; non-square capture is a known follow-up). Parity checks here
-# are resolution-independent.
+# Parity checks here are resolution-independent; 256x256 keeps them quick. The
+# CUDA-graph check below captures at whatever (H, W) it sets. NOTE: the in-process
+# graph-vs-fused PSNR is a coarse smoke check — it carries a cache-setup artifact
+# of this harness. The authoritative bit-exactness gate for the served graph is
+# the HTTP A/B (graph-on vs COSMOS3_DISABLE_CUDA_GRAPH=1), which is byte-identical
+# at every resolution.
 H = W = 256
 STEPS = 12
 GS = 6.0
@@ -463,6 +466,8 @@ def _run_cuda_graph_denoise(ctx):
     model, dit = ctx["model"], ctx["dit"]
     device, dtype = ctx["device"], ctx["dtype"]
     dev = torch.device(device)
+    # Capture at this test's (H, W) regardless of the production default.
+    dit.gen_capture_resolutions = ((H, W),)
     rid = "cgr0"
     shared = _flashinfer_shared(model, [rid], device, dtype)
     md = {"height": H, "width": W, "num_frames": 1, "fps": 24.0,
