@@ -114,16 +114,18 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # requests at the image-generation walk run their step in a single forward.
     max_gen_batch_size = 8
 
-    # Image resolution (height, width) to capture a denoise-step CUDA graph for.
+    # Image resolutions (height, width) to capture a denoise-step CUDA graph for.
     # Requests at other resolutions fall back to the eager path. num_frames is
     # fixed at 1 (text-to-image). The graph accelerates the single-request
-    # (batch size 1) denoise step, where the forward is launch-bound; concurrent
-    # requests batch via the eager path regardless. Only a square resolution is
-    # captured today — the captured graph reproduces the eager output at square
-    # sizes but diverges at non-square ones (an H/W asymmetry in the baked static
-    # layout, gated by tests/test_engine_cache.py::test_cuda_graph_matches_eager),
-    # so non-square requests use the eager path until that is fixed.
-    gen_capture_resolutions: tuple[tuple[int, int], ...] = ((256, 256),)
+    # (batch size 1) denoise step, where the forward is launch-bound: the win is
+    # large at low resolution (~2.5x at 320x192) and shrinks as the step becomes
+    # compute-bound at higher resolution. Concurrent requests batch via the eager
+    # path regardless. The default covers the three standard generation tiers;
+    # override with COSMOS3_GEN_CAPTURE_RES. The served graph output is identical
+    # to the eager path (compare with COSMOS3_DISABLE_CUDA_GRAPH=1).
+    gen_capture_resolutions: tuple[tuple[int, int], ...] = (
+        (192, 320), (480, 832), (720, 1280),
+    )
     # Batch sizes to capture per resolution.
     gen_capture_batch_sizes: tuple[int, ...] = (1,)
 
@@ -797,13 +799,22 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         positions, the latents and the timestep flow in as static-buffer inputs.
 
         Set ``COSMOS3_DISABLE_CUDA_GRAPH=1`` to skip capture and run the denoise
-        loop eagerly (escape hatch for a misbehaving driver, and an A/B switch)."""
+        loop eagerly (escape hatch for a misbehaving driver, and an A/B switch).
+        Set ``COSMOS3_GEN_CAPTURE_RES`` (e.g. ``"192x320,480x832"``, height x
+        width) to override which resolutions are captured."""
         if self.transformer is None or os.environ.get("COSMOS3_DISABLE_CUDA_GRAPH"):
             return []
+        res_env = os.environ.get("COSMOS3_GEN_CAPTURE_RES")
+        if res_env:
+            resolutions = tuple(
+                tuple(int(x) for x in pair.split("x")) for pair in res_env.split(",")
+            )
+        else:
+            resolutions = self.gen_capture_resolutions
         dtype = self.transformer.proj_in.weight.dtype
         self._capture_layout: dict[tuple, dict] = {}
         configs = []
-        for height, width in self.gen_capture_resolutions:
+        for height, width in resolutions:
             static = self._build_static(
                 [0] * 8, height, width, num_frames=1, fps=24.0,
                 has_image_condition=False, device=device,

@@ -782,23 +782,32 @@ class CudaGraphRunner:
     ) -> CudaGraphKey | None:
         if not self.graphs:
             return None
-        config = self._config_for(graph_walk, requires_cfg)
-        if config is None:
-            return None
-        padded_bs = self._get_padded_batch_size(batch_size, config)
-        if padded_bs is None:
-            return None
-        padded_num_tokens = self._get_padded_num_tokens(num_tokens, padded_bs, config)
-        if padded_num_tokens is None:
-            return None
-
-        key = CudaGraphKey(
-            graph_walk=graph_walk,
-            requires_cfg=requires_cfg,
-            bs=padded_bs,
-            num_tokens=padded_num_tokens,
-        )
-        return key if key in self.graphs else None
+        # A walk may have several captures (e.g. one per image resolution, each a
+        # fixed shape with its own token count). Consider every matching config and
+        # pick the tightest captured (bs, num_tokens) bucket that fits this batch,
+        # so a request lands on the graph for its own shape rather than the first
+        # config declared. With a single config this is the same as before.
+        best: CudaGraphKey | None = None
+        for config in self.capture_configs:
+            if graph_walk not in config.replay_graph_walks or config.requires_cfg != requires_cfg:
+                continue
+            padded_bs = self._get_padded_batch_size(batch_size, config)
+            if padded_bs is None:
+                continue
+            padded_num_tokens = self._get_padded_num_tokens(num_tokens, padded_bs, config)
+            if padded_num_tokens is None:
+                continue
+            key = CudaGraphKey(
+                graph_walk=graph_walk,
+                requires_cfg=requires_cfg,
+                bs=padded_bs,
+                num_tokens=padded_num_tokens,
+            )
+            if key in self.graphs and (
+                best is None or (key.num_tokens, key.bs) < (best.num_tokens, best.bs)
+            ):
+                best = key
+        return best
 
     def _config_for(self, graph_walk: str, requires_cfg: bool) -> CudaGraphConfig | None:
         for cfg in self.capture_configs:
