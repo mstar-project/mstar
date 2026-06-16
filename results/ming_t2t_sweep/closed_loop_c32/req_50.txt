@@ -1,0 +1,20 @@
+In programming, syntax and semantics are two fundamental concepts that are often used to describe the structure and meaning of code. Here's a brief explanation of each:
+
+Syntax: Syntax refers to the rules that govern the structure of a programming language. It defines how code should be written, including the order of keywords, operators, and other elements. In other words, syntax is concerned with the form of the code, not its meaning. For example, in Python, the syntax for defining a function is as follows:
+
+```
+def function_name(parameters):
+    # function body
+```
+
+If you write code that doesn't follow this syntax, such as forgetting to include the colon after the function name, the code will not run and will result in a syntax error.
+
+Semantics: Semantics, on the other hand, refers to the meaning of the code. It describes what the code does and how it behaves when executed. Semantics is concerned with the function of the code, not just its form. For example, consider the following Python code:
+
+```
+x = 5
+y = 10
+z = x + y
+```
+
+The syntax of this code is correct, but the semantics depend on the values of

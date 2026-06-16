@@ -1,0 +1,9 @@
+A combustion engine is a type of heat engine that converts the chemical energy stored in fuel into mechanical energy. The process involves the controlled burning of fuel, typically gasoline or diesel, within an internal combustion engine. Here's a simplified explanation of how it works:
+
+1. **Intake Stroke**: The engine starts with the intake stroke, where the piston moves down the cylinder, creating a vacuum that draws in a mixture of air and fuel through the open intake valve.
+
+2. **Compression Stroke**: Once the air-fuel mixture is in the cylinder, the intake valve closes, and the piston moves back up, compressing the mixture. This compression increases the temperature and pressure of the mixture, making it easier to ignite.
+
+3. **Power (Combustion) Stroke**: At the top of the compression stroke, the spark plug ignites the compressed air-fuel mixture. The resulting explosion forces the piston down, generating power. This is the stroke that actually produces the mechanical energy that drives the vehicle.
+
+4. **Exhaust Stroke**: After the power stroke, the exhaust valve opens, and the piston moves back up, pushing the spent gases out of the cylinder through the exhaust valve. This completes the cycle, and the engine is ready to start the

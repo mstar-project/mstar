@@ -1,0 +1,11 @@
+The human immune system is a complex network of cells, tissues, and organs that work together to defend the body against pathogens such as bacteria, viruses, fungi, and parasites. It is designed to recognize and eliminate foreign invaders while distinguishing them from the body's own healthy cells. The immune system can be broadly divided into two main components: the innate immune system and the adaptive immune system.
+
+### Innate Immune System
+The innate immune system is the first line of defense and provides immediate, non-specific protection against a wide range of pathogens. It includes:
+
+1. **Physical Barriers**: Skin and mucous membranes act as physical barriers to prevent pathogens from entering the body.
+2. **Chemical Barriers**: Substances like stomach acid, enzymes in tears and saliva, and antimicrobial peptides help to kill or inhibit pathogens.
+3. **Cells**: Various types of white blood cells (leukocytes) are involved, including:
+   - **Phagocytes**: Such as macrophages and neutrophils, which engulf and digest pathogens.
+   - **Natural Killer (NK) Cells**: Which target and destroy infected or cancerous cells.
+4. **Inflammatory Response**: When tissues are injured or infected, an inflammatory response is triggered, leading to increased blood

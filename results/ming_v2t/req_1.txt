@@ -1,0 +1,3 @@
+This video presents a classic "shell game" or "three-card monte" puzzle.
+
+A red ball is hidden under one of three blue cups. The cups are shuffled around, and the viewer is asked to guess which cup the ball is under. A countdown timer appears above the cups, adding a sense of urgency to the challenge.

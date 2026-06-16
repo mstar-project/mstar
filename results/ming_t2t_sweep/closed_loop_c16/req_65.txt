@@ -1,0 +1,9 @@
+The Electoral College is a process established by the United States Constitution for electing the President and Vice President of the United States. Here's how it works:
+
+1. **Number of Electors**: Each state has a number of electors equal to the total number of its Senators and Representatives in Congress. The District of Columbia has three electors, as if it were a state. This means there are 538 electors in total (435 Representatives + 100 Senators + 3 for D.C.).
+
+2. **Winning the Election**: To win the presidency, a candidate must receive a majority of the electoral votes, which is at least 270 out of 538.
+
+3. **State-by-State Voting**: When citizens vote for president, they are actually voting for a slate of electors pledged to their chosen candidate. These electors are typically chosen by the political parties in each state.
+
+4. **Electoral Votes Allocation**: In most states, the candidate who wins the popular vote in that state receives all of that state's electoral votes. This is known as the "winner-takes-all" system. However, Maine and Nebraska use a different system where electoral votes can be

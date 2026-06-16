@@ -1,0 +1,11 @@
+The stock market is a platform where investors can buy and sell shares of publicly traded companies. When you buy a share of a company, you are essentially buying a small piece of ownership in that company. The price of a share is determined by supply and demand, which is influenced by factors such as the company's financial performance, industry trends, and overall economic conditions.
+
+Here's a simplified overview of how the stock market works:
+
+1. **Publicly Traded Companies**: Companies that want to raise capital for expansion or other purposes may choose to go public by issuing shares through an Initial Public Offering (IPO). This allows them to sell shares to the public and raise money.
+
+2. **Stock Exchanges**: These are the platforms where stocks are bought and sold. Major stock exchanges include the New York Stock Exchange (NYSE), NASDAQ, London Stock Exchange, and Tokyo Stock Exchange, among others.
+
+3. **Brokers and Dealers**: Investors typically buy and sell stocks through brokers or dealers. Brokers act as intermediaries between buyers and sellers, executing trades on behalf of their clients. Dealers, on the other hand, buy and sell stocks for their own accounts.
+
+4. **Trading**: Stocks are traded during specific hours on weekdays.

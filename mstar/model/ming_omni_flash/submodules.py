@@ -32,6 +32,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mstar.engine.kv_store import PositionInfo
 from mstar.model.ming_omni_flash.components.model import LingMoeModel
 from mstar.model.ming_omni_flash.config import MingFlashOmniModelConfig
@@ -301,6 +302,12 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
     # Walk names treated as autoregressive decode (one-token step).
     _DECODE_WALKS = ("decode", "thinker_decode")
 
+    # Batch sizes to capture for the thinker_decode CUDA graph. Kept modest
+    # because each capture allocates persistent FlashInfer wrappers + static
+    # buffers for the full 100B MoE thinker (per slot, per rank). Powers of
+    # two up to 32 mirror qwen3_omni's decode captures.
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+
     def __init__(
         self,
         model: LingMoeModel,
@@ -449,10 +456,23 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         )
 
         if graph_walk in self._DECODE_WALKS or graph_walk in self._TEXT_PREFILL_WALKS:
+            from mstar.model.ming_omni_flash.components.positions import (
+                get_rope_index_text,
+            )
             token_ids = inputs["text_inputs"][0].to(device)
+            seq_len = token_ids.shape[0]
+            # Emit explicit 3D MRoPE positions here (rather than rebuilding
+            # them from the position counter inside forward via torch.arange).
+            # forward consuming a passed-in tensor is what makes the decode
+            # walk CUDA-graph-capturable: the runner interns custom_pos_ids
+            # as a static buffer and .copy_()s the real position in before
+            # each replay. For text/decode all three (T,H,W) components are
+            # the sequential range [start_pos, start_pos+seq_len).
+            pos_ids = get_rope_index_text(seq_len, start_pos, device=device)
             return ARNodeInputs(
                 input_ids=token_ids,
-                input_seq_len=token_ids.shape[0],
+                input_seq_len=seq_len,
+                custom_pos_ids=pos_ids,
             )
 
         if graph_walk == "prefill_audio":
@@ -600,20 +620,22 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        """Plan attention; pack inputs for forward.
+        """Plan attention; pack inputs for forward / forward_batched.
 
-        Single-request only in step 3d; batched preprocess folds in
-        step 3e+ via ``can_batch`` + ``forward_batched``. The text and
-        multimodal paths use mutually exclusive keys downstream so the
-        forward can branch on which one is set: ``text_inputs`` for
-        the input-ids path, ``input_embeds`` + ``position_ids`` for
-        the embeds path.
+        Single-request and multi-request are unified here: ``plan_attention``
+        takes per-request ``seq_lens`` and the model runs on a packed
+        ``(total_tokens, ...)`` layout, so batching is just concatenation.
+
+        The decode/text path packs ``text_inputs`` (concatenated token ids)
+        and ``position_ids`` (concatenated 3D MRoPE positions, ``(3, total)``).
+        For decode every request contributes exactly one token, so the packed
+        tensors are ``(bs,)`` / ``(3, bs)`` — the shape the CUDA-graph decode
+        capture interns and refreshes per replay.
+
+        The multimodal embeds path (prefill_audio/vision) stays single-request
+        for now — batched multimodal prefill needs the FlashInferPacked
+        last-token-index machinery (future work).
         """
-        if len(inputs) > 1:
-            raise NotImplementedError(
-                f"BailingMoeV2ThinkerSubmodule: multi-request batching is "
-                f"step-3e scope; got {len(inputs)} requests"
-            )
         cache_manager = engine_inputs.cache_manager
         seq_lens = [inp.input_seq_len for inp in inputs]
 
@@ -627,16 +649,62 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         # — keep this call for parity with Orpheus.
         cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
 
-        inp = inputs[0]
-        if inp.input_embeds is not None:
-            # Multimodal path: forward gets embeds + explicit positions.
+        # Multimodal embeds path: single-request only (see docstring).
+        if any(inp.input_embeds is not None for inp in inputs):
+            if len(inputs) > 1:
+                raise NotImplementedError(
+                    "BailingMoeV2ThinkerSubmodule: batched multimodal-embeds "
+                    f"prefill is not supported; got {len(inputs)} requests. "
+                    "Only the text/decode path batches."
+                )
+            inp = inputs[0]
             return {
                 "input_embeds": inp.input_embeds,
                 "position_ids": inp.custom_pos_ids,
             }
-        return {
+
+        # Text / decode path: concat token ids + 3D positions across requests.
+        # ``input_ids`` is (seq_len,) per request; cat → (total_tokens,).
+        # ``custom_pos_ids`` is (3, seq_len) per request; cat on dim=1 →
+        # (3, total_tokens) so each request's positions stay contiguous.
+        #
+        # IMPORTANT: emit position_ids BATCH-FIRST as (total_tokens, 3). The
+        # CUDA-graph runner's static-buffer interning slices the LEADING dim
+        # as the batch/token axis (``shared[:n]``) and requires trailing dims
+        # to be constant across buckets. A (3, total_tokens) layout would put
+        # the varying axis last and fail interning. forward / forward_batched
+        # transpose back to (3, total_tokens) for the rope, which is cheap.
+        out: dict[str, torch.Tensor | Any] = {
             "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
         }
+        pos = [inp.custom_pos_ids for inp in inputs]
+        if all(p is not None for p in pos):
+            # each (3, seq_len) -> transpose to (seq_len, 3), cat on tokens.
+            out["position_ids"] = torch.cat(
+                [p.transpose(0, 1) for p in pos], dim=0
+            )
+        return out
+
+    @staticmethod
+    def _positions_for_model(
+        position_ids: torch.Tensor, num_tokens: int,
+    ) -> torch.Tensor:
+        """Normalise position_ids to the ``(3, T)`` layout the rope expects.
+
+        Positions reach forward in one of two layouts:
+          * ``(3, T)`` — the multimodal/eager path (custom_pos_ids built by
+            the prefill helpers and passed straight through).
+          * ``(T, 3)`` — the text/decode path, which preprocess emits
+            batch-first so the CUDA-graph static-buffer interning can slice
+            the leading (token) axis. Transpose it back here.
+          * ``(T,)`` — a 1D fallback (direct callers); passed through (the
+            rope accepts 1D).
+        """
+        if position_ids.dim() == 2 and position_ids.shape[0] != 3 \
+                and position_ids.shape[1] == 3:
+            # (T, 3) batch-first -> (3, T)
+            return position_ids.transpose(0, 1).contiguous()
+        return position_ids
 
     def forward(
         self,
@@ -681,28 +749,32 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
                     "BailingMoeV2ThinkerSubmodule.forward: neither "
                     "text_inputs nor input_embeds provided."
                 )
-            # Text-only path: build 1D positions from the request's
-            # position counter (same as step 3f).
-            start_pos = 0
-            try:
-                start_pos = (
-                    request_info.position_info.get("main", PositionInfo())
-                    .position_id_start
+            # Text / decode path: positions come from prepare_inputs via the
+            # passed-in ``position_ids`` tensor (3D MRoPE, shape (3, T)). This
+            # is what makes the decode walk CUDA-graph-capturable — the runner
+            # holds position_ids in a static buffer and refreshes it per
+            # replay, so forward must NOT rebuild positions internally.
+            if position_ids is None:
+                # Fallback for any caller that didn't route positions through
+                # prepare_inputs (e.g. direct unit-test invocation): rebuild
+                # the sequential range from the request's position counter.
+                start_pos = 0
+                try:
+                    start_pos = (
+                        request_info.position_info.get("main", PositionInfo())
+                        .position_id_start
+                    )
+                except AttributeError:
+                    pass
+                num_tokens = text_inputs.shape[0]
+                position_ids = torch.arange(
+                    start_pos, start_pos + num_tokens,
+                    dtype=torch.long, device=text_inputs.device,
                 )
-            except AttributeError:
-                # ARNodeSubmodule contract may not always provide
-                # position_info; fall back to 0.
-                pass
-
-            num_tokens = text_inputs.shape[0]
-            position_ids_1d = torch.arange(
-                start_pos, start_pos + num_tokens,
-                dtype=torch.long, device=text_inputs.device,
-            )
             model_out = self.model(
                 cache_handle,
                 input_ids=text_inputs,
-                position_ids=position_ids_1d,
+                position_ids=self._positions_for_model(position_ids, text_inputs.shape[0]),
                 return_hidden_states=want_image_gen,
             )
 
@@ -724,6 +796,54 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
                 hidden_states, text_inputs, self.config.thinker_llm.image_patch_token,
             )
             outputs["thinker_hidden_states"] = [patch_hidden]
+        return outputs
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        text_inputs: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        """Batched decode forward: run the packed batch through the model once
+        and return per-request next-token logits.
+
+        Used for the ``thinker_decode`` walk (and required by the decode CUDA
+        graph capture, which always routes through ``forward_batched`` even at
+        bs=1). Each decode request contributes exactly one token, so the packed
+        ``text_inputs`` is ``(bs,)``, ``position_ids`` is ``(3, bs)``, and the
+        model emits ``(bs, vocab)`` logits — row ``i`` is request ``i``'s
+        next-token distribution (no last-token gather needed, unlike the
+        variable-length prefill path).
+
+        Returns per-rid ``{"logits": [(1, V)]}`` plus a ``__batched_logits__``
+        ``(bs, V)`` sentinel so the engine / graph runner samples the whole
+        batch in one call (mirrors qwen3_omni's ThinkerSubmodule).
+        """
+        if text_inputs is None:
+            raise ValueError(
+                "BailingMoeV2ThinkerSubmodule.forward_batched: text_inputs is "
+                "required (batched multimodal-embeds decode is not supported)."
+            )
+        cache_handle = engine_inputs.cache_manager
+
+        logits = self.model(
+            cache_handle,
+            input_ids=text_inputs,
+            position_ids=self._positions_for_model(position_ids, text_inputs.shape[0])
+            if position_ids is not None else None,
+        )
+        cache_handle.advance_seq_lens()
+
+        # logits: (bs, vocab) — one row per request (decode = 1 token each).
+        request_ids = cache_handle.request_ids
+        outputs: dict[str, NameToTensorList] = {}
+        for i, rid in enumerate(request_ids):
+            outputs[rid] = {"logits": [logits[i : i + 1]]}
+        # Stacked sentinel so the sampler / graph runner samples once.
+        outputs["__batched_logits__"] = logits
         return outputs
 
     def postprocess(
@@ -769,12 +889,65 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         else:
             tok = int(last)
         if tok == self.eos_token_id:
-            return {"decode_loop"}
+            return {"thinker_decode_loop"}
+        # Budget guard: stop once the next step would exceed max_tokens (+1
+        # counts the token just sampled). Guarded on request_info presence so
+        # direct callers / unit tests that pass request_info=None still get the
+        # EOS-only behavior instead of an AttributeError.
+        if request_info is not None and getattr(request_info, "max_tokens", None):
+            reached_max = (
+                request_info.dynamic_loop_iter_counts.get("thinker_decode_loop", 0) + 1
+                >= request_info.max_tokens
+            )
+            if reached_max:
+                return {"thinker_decode_loop"}
         return set()
 
+    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1):
+        """Declare a CUDA graph capture for the ``thinker_decode`` walk.
+
+        Decode is the hot path (one forward per generated token); without a
+        captured graph each step pays full Python + kernel-launch overhead,
+        which dominated the native single-stream latency. We capture one
+        ``BasicBatchedCudaGraphConfig`` per decode batch size: the runner
+        clones ``single_request_inputs``, runs our ``preprocess`` (which
+        plans attention/RoPE and emits ``text_inputs`` + ``position_ids`` as
+        static buffers), captures the graph, and at replay ``.copy_()``s the
+        real token + position into those buffers before replaying.
+
+        The template carries both ``input_ids`` (the decode token) and
+        ``custom_pos_ids`` (the 3D MRoPE position, shape ``(3, 1)``) so
+        ``preprocess`` produces the ``position_ids`` static buffer — Ming's
+        partial-3D rope is computed inline in the attention layer from this
+        tensor, so it must be a captured static input (unlike qwen3_omni,
+        which feeds decode through mrope cos/sin buffers).
+
+        Prefill walks are NOT captured yet (variable token counts need the
+        FlashInferPacked path; future work) — they stay on the eager path.
+        """
+        dummy = ARNodeInputs(
+            input_ids=torch.zeros(1, dtype=torch.long, device=device),
+            input_seq_len=1,
+            custom_pos_ids=torch.zeros((3, 1), dtype=torch.long, device=device),
+        )
+        return [
+            BasicBatchedCudaGraphConfig(
+                capture_graph_walk="thinker_decode",
+                requires_cfg=False,
+                labels=["main"],
+                single_request_inputs=dummy.clone(),
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+            ),
+        ]
+
     def can_batch(self, batch, model_inputs) -> bool:
-        # Step 3d is single-request; step 3e adds batching.
-        return False
+        # Batch the autoregressive decode walk only: every request is a single
+        # token, so they pack into one (bs,) forward (see forward_batched).
+        # Prefill walks stay sequential — text prefill has variable token
+        # counts (needs the FlashInferPacked last-token machinery) and the
+        # multimodal embeds path is single-request. Decode is the hot path and
+        # the one the CUDA-graph capture targets.
+        return batch.graph_walk in self._DECODE_WALKS
 
 
 # ===================================================================

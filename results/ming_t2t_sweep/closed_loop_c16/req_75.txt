@@ -1,0 +1,7 @@
+TCP (Transmission Control Protocol) and UDP (User Datagram Protocol) are both protocols used for sending bits of data over the internet, but they differ in how they manage the transmission.
+
+TCP is a connection-oriented protocol, which means that it establishes a connection between two devices before transmitting data. It guarantees delivery of data packets in the correct order and checks for errors to ensure reliable communication. This makes TCP suitable for applications that require high reliability, such as web browsing, email, and file transfers.
+
+UDP, on the other hand, is a connectionless protocol, which means that it sends data without establishing a connection first. It does not guarantee delivery or order of data packets, and there is no error checking. This makes UDP faster and more efficient than TCP, but less reliable. It is often used for applications that can tolerate some loss of data, such as streaming audio or video, online gaming, and voice over IP (VoIP).
+
+In summary, TCP provides reliable, ordered, and error-checked delivery of data, while UDP provides faster, but less reliable, delivery of data.

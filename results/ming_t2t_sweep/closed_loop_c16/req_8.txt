@@ -1,0 +1,7 @@
+Photosynthesis is the process by which plants, algae, and some bacteria convert light energy into chemical energy in the form of glucose. It occurs in the chloroplasts of plant cells, where the pigment chlorophyll absorbs light energy from the sun.
+
+The process of photosynthesis can be divided into two stages: the light-dependent reactions and the light-independent reactions (also known as the Calvin cycle).
+
+1. Light-dependent reactions: These reactions occur in the thylakoid membranes of the chloroplasts and require light energy. The light energy is absorbed by chlorophyll and other pigments, which excites electrons to a higher energy state. These high-energy electrons are then passed through a series of proteins called the electron transport chain, which generates a proton gradient across the thylakoid membrane. This gradient is used to produce ATP (adenosine triphosphate) and NADPH (nicotinamide adenine dinucleotide phosphate), which are energy-rich molecules that will be used in the next stage of photosynthesis.
+
+2. Light-independent reactions (Calvin cycle): These reactions occur in the stroma of the chloroplasts and do not require light energy. The ATP and NADPH produced in the light-dependent reactions are used to power the conversion of carbon dioxide (CO

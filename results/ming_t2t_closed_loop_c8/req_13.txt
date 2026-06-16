@@ -1,0 +1,5 @@
+Quantum entanglement is a phenomenon in quantum physics where pairs or groups of particles interact in such a way that the quantum state of each particle cannot be described independently of the state of the others, even when the particles are separated by large distances. This means that the state of one entangled particle is directly connected to the state of the other, no matter how far apart they are.
+
+When two particles are entangled, measuring the state of one particle instantly determines the state of the other, regardless of the distance between them. This instantaneous connection defies the classical notion of locality, which states that objects can only be influenced by their immediate surroundings.
+
+Quantum entanglement is a fundamental aspect of quantum mechanics and has been experimentally verified through various experiments, including those involving photons, electrons, and atoms. It plays a crucial role in many areas of quantum information science, such as quantum computing, quantum cryptography, and quantum teleportation.
