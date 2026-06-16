@@ -618,7 +618,12 @@ class Cosmos3Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
+        # autocast_dtype is accepted for interface parity (the engine manager
+        # passes it to every model). Cosmos3 already casts the meta module to
+        # bf16 before to_empty in _build_transformer, so params are allocated
+        # directly in the checkpoint dtype and the hint is redundant here.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(node_name, device)
