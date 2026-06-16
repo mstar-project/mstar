@@ -787,6 +787,7 @@ class KVCacheEngine(BaseEngine):
             range_pop(synchronize=False)
 
         node_inputs: list[ARNodeInputs] = []
+        skipped_rids: set[str] = set()
         if self.enable_nvtx:
             range_push("kv_cache.prepare_inputs")
         for rid in batch.request_ids:
@@ -796,15 +797,26 @@ class KVCacheEngine(BaseEngine):
                     rid, label
                 ).get_pos_info() for label in labels
             }
-            node_inputs.append(
-                submodule.prepare_inputs(
-                    graph_walk=batch.graph_walk,
-                    fwd_info=batch.per_request_info[rid],
-                    inputs=batch.per_request_input_tensors[rid],
-                    pos_info=pos_info,
-                    seen_token_mask=submod_mgmt.sampler.get_token_mask(rid)
-                )
+            req_inputs = submodule.prepare_inputs(
+                graph_walk=batch.graph_walk,
+                fwd_info=batch.per_request_info[rid],
+                inputs=batch.per_request_input_tensors[rid],
+                pos_info=pos_info,
+                seen_token_mask=submod_mgmt.sampler.get_token_mask(rid)
             )
+            if req_inputs is None:
+                skipped_rids.add(rid)
+            else:
+                node_inputs.append(req_inputs)
+        
+        if skipped_rids:
+            batch.request_ids = [rid for rid in batch.request_ids if rid not in skipped_rids]
+            batch.per_request_info = {
+                rid: info
+                for rid, info in batch.per_request_info.items()
+                if rid not in skipped_rids
+            }
+
         if self.enable_nvtx:
             range_pop(synchronize=False)
 

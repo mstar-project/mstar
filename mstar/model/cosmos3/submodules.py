@@ -469,6 +469,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             latents = inputs["latents"][0]
             time_index = inputs["time_index"][0]
+        
+        scheduler = st["scheduler"]
+        step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            return None
+    
         tensors = {"latents": latents, "time_index": time_index}
         # The CUDA-graph capture reads the timestep and rotary positions as static
         # buffers (it can't reach the per-request scheduler at replay), so
@@ -710,11 +716,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_image_gen(self, cm, st, latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
-        if step_index >= len(scheduler.timesteps):
-            # One extra step past this request's denoise count: the loop has
-            # already been told to stop and this output is discarded. Pass the
-            # finished latents through without touching the (stateful) scheduler.
-            return {"latents": [latents], "time_index": [time_index]}
         t = scheduler.timesteps[step_index]
         vision_timesteps = torch.full((st["num_noisy"],), t.item(), device=latents.device)
 
