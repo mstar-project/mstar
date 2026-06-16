@@ -98,7 +98,9 @@ class LingMoeModel(nn.Module):
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
 
         # Single rotary instance shared across every layer — inv_freq is
-        # config-only, no per-layer state.
+        # config-only, no per-layer state. Stored on the model so forward can
+        # compute cos/sin ONCE (position-only) and pass it to every layer,
+        # instead of each layer recomputing the identical tables.
         rotary = LingPartialMRotaryEmbedding(
             head_dim=head_dim,
             partial_rotary_factor=partial_rotary_factor,
@@ -106,6 +108,7 @@ class LingMoeModel(nn.Module):
             rope_theta=rope_theta,
             max_position_embeddings=max_position_embeddings,
         )
+        self.rotary = rotary
 
         self.layers = nn.ModuleList([
             LingDecoderLayer(
@@ -200,12 +203,19 @@ class LingMoeModel(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(T, device=h.device)
 
+        # Compute rope cos/sin ONCE here (position-only, identical across all
+        # layers) and pass it down, instead of recomputing the tables + the
+        # video_rope remap inside every layer's attention. Profiling showed
+        # the per-layer recompute was ~1/3 of the decode-step compute.
+        rope_cos_sin = self.rotary.compute_cos_sin(position_ids)
+
         for layer_idx, layer in enumerate(self.layers):
             cache_handle.set_layer_idx(layer_idx)
             h = layer(
                 h, cache_handle, position_ids,
                 image_mask=image_mask,
                 audio_mask=audio_mask,
+                rope_cos_sin=rope_cos_sin,
             )
 
         h = self.norm(h)

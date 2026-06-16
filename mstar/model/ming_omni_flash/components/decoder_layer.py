@@ -96,10 +96,11 @@ class LingDecoderLayer(nn.Module):
         position_ids: torch.Tensor,
         image_mask: torch.Tensor | None = None,
         audio_mask: torch.Tensor | None = None,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         h = self.input_layernorm(hidden_states)
-        h = self.self_attn(h, cache_handle, position_ids)
+        h = self.self_attn(h, cache_handle, position_ids, rope_cos_sin=rope_cos_sin)
         h = residual + h
 
         residual = h

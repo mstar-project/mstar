@@ -219,28 +219,37 @@ class LingPartialMRotaryEmbedding(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(
-        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor,
+    def compute_cos_sin(
+        self, position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rotate the first ``rotary_dim`` dims of q and k in-place.
+        """Build the ``(num_tokens, rotary_dim)`` cos/sin tables for these
+        positions.
 
-        Args:
-            q, k: ``(..., num_tokens, head_dim)`` (typical layout from
-                ParallelAttention is ``(num_tokens, num_heads, head_dim)``).
-                Only the last dim and the per-token axis matter.
-            position_ids: ``(num_tokens,)`` for 1D rope or
-                ``(3, num_tokens)`` for video_rope.
+        cos/sin depend ONLY on ``position_ids`` (and the static ``inv_freq``),
+        not on q/k — so for a stack of N decoder layers they are identical
+        across every layer. Computing them once per forward and reusing them
+        (via :meth:`apply_cos_sin`) avoids recomputing the tables (and the
+        video_rope remap) N times. Profiling showed this recompute was ~1/3 of
+        the per-decode-step compute on the 32-layer thinker.
 
-        Returns:
-            ``(q, k)`` with rotation applied to the rotary half.
+        ``position_ids`` is ``(num_tokens,)`` for 1D rope or ``(3, num_tokens)``
+        for video_rope.
+        """
+        return self._compute_cos_sin(position_ids)
+
+    def apply_cos_sin(
+        self, q: torch.Tensor, k: torch.Tensor,
+        cos: torch.Tensor, sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate q/k using precomputed cos/sin tables (from
+        :meth:`compute_cos_sin`). This is the per-layer hot path; the table
+        build is hoisted out.
         """
         if q.shape[-1] != self.head_dim or k.shape[-1] != self.head_dim:
             raise ValueError(
                 f"q/k last dim {q.shape[-1]}/{k.shape[-1]} != "
                 f"head_dim {self.head_dim}"
             )
-
-        cos, sin = self._compute_cos_sin(position_ids)
         # Broadcast cos/sin across the leading axes of q (typically a
         # heads axis comes BEFORE the token axis: q is (..., heads, T,
         # head_dim)). cos starts as (T, rotary_dim); we need to insert
@@ -263,3 +272,20 @@ class LingPartialMRotaryEmbedding(nn.Module):
             torch.cat([q_rot, q_pass], dim=-1),
             torch.cat([k_rot, k_pass], dim=-1),
         )
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate the first ``rotary_dim`` dims of q and k.
+
+        Back-compat single-call entry: computes cos/sin then applies. Hot
+        multi-layer paths should call :meth:`compute_cos_sin` once and
+        :meth:`apply_cos_sin` per layer instead.
+
+        Args:
+            q, k: ``(..., num_tokens, head_dim)``.
+            position_ids: ``(num_tokens,)`` for 1D rope or
+                ``(3, num_tokens)`` for video_rope.
+        """
+        cos, sin = self._compute_cos_sin(position_ids)
+        return self.apply_cos_sin(q, k, cos, sin)
