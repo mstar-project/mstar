@@ -88,13 +88,24 @@ class EngineManager:
         if "autocast_dtype" in model_config:
             autocast_dtype = model_config["autocast_dtype"]
 
-        # Pre-resolve submodules: needed to ask each STATELESS node's
-        # submodule for its flavor before we know which engine to build.
+        # Allocation dtype hint for get_submodule: a node's params should be
+        # allocated directly in ``autocast_dtype`` (cast meta -> dtype before
+        # ``to_empty``) instead of allocating fp32 then down-casting after
+        # return — the latter doubles the load-time VRAM peak. This is the
+        # SAME resolved dtype applied by the post-return cast at the
+        # ``engine.has_autocast()`` branch below, so allocation and runtime
+        # dtype stay consistent. ``None`` (no model/config autocast) means
+        # leave fp32. Build paths that must stay fp32 regardless (e.g. the
+        # audio-codec vocoders, whose stateless engine locks autocast off)
+        # don't use the meta+to_empty path and simply ignore this hint.
         node_submodules: dict[str, torch.nn.Module | None] = {}
         if model is not None:
             for name in node_names:
                 node_tp_group = tp_groups.get_tp_config_for_node(name)
-                node_submodules[name] = model.get_submodule(name, device, tp_group=node_tp_group)
+                node_submodules[name] = model.get_submodule(
+                    name, device, tp_group=node_tp_group,
+                    autocast_dtype=autocast_dtype,
+                )
 
         # Group nodes by the factory key. STATELESS nodes split further by
         # the flavor declared on the submodule; other engine types group

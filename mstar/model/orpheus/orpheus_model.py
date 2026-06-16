@@ -412,22 +412,35 @@ class OrpheusModel(Model):
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
 
-    def get_submodule(self, node_name: str, device: str = "cpu", tp_group=None) -> NodeSubmodule | None:
+    def get_submodule(
+        self, node_name: str, device: str = "cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group=tp_group)
+        submodule = self._create_submodule(
+            node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+        )
         logger.info("Successfully loaded Orpheus submodule for %s", node_name)
         self._submodule_cache[node_name] = submodule
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str, tp_group=None) -> NodeSubmodule | None:
+    def _create_submodule(
+        self, node_name: str, device: str, tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule | None:
         if node_name == "LLM":
-            return self._create_llm_submodule(device, tp_group=tp_group)
+            return self._create_llm_submodule(
+                device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+            )
         elif node_name == "snac_decoder":
             return self._create_snac_submodule(device)
         return None
 
-    def _create_llm_submodule(self, device: str, tp_group=None) -> NodeSubmodule:
+    def _create_llm_submodule(
+        self, device: str, tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule:
         from mstar.model.loader import load_weights
         from mstar.model.orpheus.components.language_model import OrpheusForCausalLM
         from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
@@ -439,6 +452,10 @@ class OrpheusModel(Model):
 
         with torch.device("meta"):
             language_model = OrpheusForCausalLM(self.config, comm_group=tp_group)
+        # Cast on meta (no allocation) so to_empty allocates directly in the
+        # target dtype instead of fp32-then-downcast.
+        if autocast_dtype is not None:
+            language_model = language_model.to(autocast_dtype)
         language_model.to_empty(device=device)
 
         load_weights(language_model, local_dir, device=device)
