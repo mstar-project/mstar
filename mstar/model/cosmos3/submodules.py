@@ -514,20 +514,21 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         token count from ``input_seq_len``. Both guidance branches are planned as
         one combined attention (``plan_attention_batched_cfg``) so the captured
         forward runs a single transformer pass over both — one weight load instead
-        of two. The static-input tensors (latents, timestep, rotary positions)
-        pass straight through to the captured forward.
+        of two. The static-input tensors (latents, timestep, rotary positions) are
+        stacked on a leading batch dim, so one captured graph spans a whole
+        concurrent batch (a batch of one for the single-request latency path); the
+        replay side copies each request's tensors into these fixed buffers.
         """
         seq_lens = [inp.input_seq_len for inp in inputs]
         cm.plan_attention_batched_cfg(
             labels=[COND_LABEL, UNCOND_LABEL], seq_lens=seq_lens,
             is_causal=False, write_store=False,
         )
-        inp = inputs[0]
         return {
-            "latents": inp.tensor_inputs["latents"],
-            "vision_timesteps": inp.tensor_inputs["vision_timesteps"],
-            "position_ids_cond": inp.tensor_inputs["position_ids_cond"],
-            "position_ids_uncond": inp.tensor_inputs["position_ids_uncond"],
+            "latents": torch.stack([inp.tensor_inputs["latents"] for inp in inputs]),
+            "vision_timesteps": torch.stack([inp.tensor_inputs["vision_timesteps"] for inp in inputs]),
+            "position_ids_cond": torch.stack([inp.tensor_inputs["position_ids_cond"] for inp in inputs]),
+            "position_ids_uncond": torch.stack([inp.tensor_inputs["position_ids_uncond"] for inp in inputs]),
         }
 
     def preprocess(self, graph_walk, engine_inputs: ModelInputsFromEngine, inputs) -> dict:
@@ -930,7 +931,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         Set ``COSMOS3_DISABLE_CUDA_GRAPH=1`` to skip capture and run the denoise
         loop eagerly (escape hatch for a misbehaving driver, and an A/B switch).
         Set ``COSMOS3_GEN_CAPTURE_RES`` (e.g. ``"192x320,480x832"``, height x
-        width) to override which resolutions are captured."""
+        width) to override which resolutions are captured, and
+        ``COSMOS3_GEN_CAPTURE_BS`` (e.g. ``"1,4,8"``) to also capture batched
+        denoise steps so concurrent requests replay a padded graph instead of
+        falling back to the eager path."""
         if self.transformer is None or os.environ.get("COSMOS3_DISABLE_CUDA_GRAPH"):
             return []
         res_env = os.environ.get("COSMOS3_GEN_CAPTURE_RES")
@@ -940,6 +944,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
         else:
             resolutions = self.gen_capture_resolutions
+        bs_env = os.environ.get("COSMOS3_GEN_CAPTURE_BS")
+        if bs_env:
+            capture_batch_sizes = [int(x) for x in bs_env.split(",")]
+        else:
+            capture_batch_sizes = list(self.gen_capture_batch_sizes)
         dtype = self.transformer.proj_in.weight.dtype
         self._capture_layout: dict[tuple, dict] = {}
         configs = []
@@ -973,50 +982,78 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 capture_forward_method="forward_captured",
                 advance_seq_lens=False,
                 compile=False,
-                capture_batch_sizes=list(self.gen_capture_batch_sizes),
+                capture_batch_sizes=capture_batch_sizes,
                 # The captured sizes (default just bs=1, for single-request
-                # latency) are an acceleration subset, not a batch ceiling:
-                # concurrent requests must still batch into one denoise step via
-                # the eager batched path (forward_batched), so don't let this
-                # capture cap max_batch_size to the captured sizes.
+                # latency; COSMOS3_GEN_CAPTURE_BS adds batched sizes) are an
+                # acceleration subset, not a batch ceiling: a concurrent batch at
+                # an uncaptured size or mixed resolution still runs the eager
+                # batched denoise (forward_batched), so don't let this capture cap
+                # max_batch_size to the captured sizes.
                 caps_eager_batch_size=False,
             ))
         return configs
 
     def can_use_cuda_graphs(self, batch, model_inputs) -> bool:
         # Only the image denoise step is captured, only with two-branch guidance,
-        # and only at a resolution we captured a graph for.
+        # and only at a resolution we captured a graph for. A batched capture is a
+        # single fixed resolution, so a concurrent batch must be uniform-resolution
+        # to share one captured (batch size, token count) bucket; mixed-resolution
+        # batches fall back to the eager cross-request denoise.
         if batch.graph_walk != IMAGE_GEN_WALK:
             return False
         layout = getattr(self, "_capture_layout", None)
         if not layout:
             return False
+        shapes = set()
         for rid in batch.request_ids:
             st = self._req.get(rid)
             if st is None or st["uncond"] is None:
                 return False
-            if tuple(st["latent_shape"]) not in layout:
+            shape = tuple(st["latent_shape"])
+            if shape not in layout:
                 return False
-        return True
+            shapes.add(shape)
+        return len(shapes) == 1
 
     def forward_captured(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
         latents, vision_timesteps, position_ids_cond, position_ids_uncond, **kwargs,
     ) -> dict:
         """Velocity-only denoise forward captured into a CUDA graph: both guidance
-        branches in one batched pass (the combined plan), no scheduler step. The
-        token layout is baked per resolution; the latents, timestep and rotary
-        positions are static-buffer inputs."""
+        branches in one pass (the combined plan), no scheduler step. The token
+        layout is baked per resolution; the latents, timestep and rotary positions
+        are static-buffer inputs stacked on a leading batch dim. A single request
+        keeps the two-branch path; a concurrent batch runs the per-request denoise
+        (the same compute as the eager cross-request forward), one transformer pass
+        over the whole batch."""
         cm = engine_inputs.cache_manager
-        layout = self._capture_layout[tuple(latents.shape)]
         cm.set_active_label(CFG_BATCHED_LABEL)
-        cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
-            latents, vision_timesteps, position_ids_cond, position_ids_uncond,
-            layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
-            layout["mse_gen_indexes"], cm,
-        )
-        rid = engine_inputs.request_ids[0]
-        return {rid: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
+        layout = self._capture_layout[tuple(latents.shape[1:])]
+        rids = engine_inputs.request_ids
+        if latents.shape[0] == 1:
+            cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
+                latents[0], vision_timesteps[0], position_ids_cond[0], position_ids_uncond[0],
+                layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
+                layout["mse_gen_indexes"], cm,
+            )
+            return {rids[0]: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
+        reqs = [
+            {
+                "latents": latents[i],
+                "vision_timesteps": vision_timesteps[i],
+                "position_ids_cond": position_ids_cond[i],
+                "position_ids_uncond": position_ids_uncond[i],
+                "vision_token_shapes": layout["vision_token_shapes"],
+                "vision_noisy_frame_indexes": layout["vision_noisy_frame_indexes"],
+                "vision_mse_loss_indexes": layout["mse_gen_indexes"],
+            }
+            for i in range(latents.shape[0])
+        ]
+        results = self.transformer.denoise_step_batched(reqs, cm)
+        return {
+            rid: {"cond_v": [cond_v], "uncond_v": [uncond_v]}
+            for rid, (cond_v, uncond_v) in zip(rids, results, strict=True)
+        }
 
     def postprocess_captured(self, request_ids, inputs, per_request_info, outputs) -> dict:
         """Eager tail run after graph replay: the classifier-free-guidance combine
