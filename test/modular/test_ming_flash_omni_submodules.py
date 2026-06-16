@@ -356,7 +356,11 @@ def _build_thinker_submodule(
 
 
 def test_thinker_prepare_inputs_prefill_text_uses_input_ids() -> None:
-    """Text prefill returns input_ids path (no splice, no embeds)."""
+    """Text prefill returns input_ids path (no splice, no embeds).
+
+    custom_pos_ids is now emitted (3D MRoPE positions) so the decode walk is
+    CUDA-graph-capturable; for text it's the sequential range with T=H=W.
+    """
     sub = _build_thinker_submodule(hidden_size=32)
     token_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
     out = sub.prepare_inputs(
@@ -365,8 +369,13 @@ def test_thinker_prepare_inputs_prefill_text_uses_input_ids() -> None:
     )
     assert out.input_seq_len == 5
     assert out.input_embeds is None
-    assert out.custom_pos_ids is None
     torch.testing.assert_close(out.input_ids, token_ids)
+    # 3D positions, shape (3, seq_len), each row the sequential range.
+    assert out.custom_pos_ids is not None
+    assert tuple(out.custom_pos_ids.shape) == (3, 5)
+    expected_row = torch.arange(5, dtype=out.custom_pos_ids.dtype)
+    for r in range(3):
+        torch.testing.assert_close(out.custom_pos_ids[r], expected_row)
 
 
 def test_thinker_prepare_inputs_absorbs_engine_kwargs() -> None:
