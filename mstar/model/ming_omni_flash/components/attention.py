@@ -115,6 +115,7 @@ class LingAttention(nn.Module):
         hidden_states: torch.Tensor,
         cache_handle: BatchedCacheManager,
         position_ids: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Engine-facing forward (packed tokens, cache-aware, TP-aware).
 
@@ -123,6 +124,11 @@ class LingAttention(nn.Module):
                 — QKVParallelLinear takes the full hidden dim as input.
             cache_handle: see step 3d.
             position_ids: see step 3d.
+            rope_cos_sin: optional precomputed ``(cos, sin)`` from
+                ``rotary.compute_cos_sin(position_ids)``. When provided,
+                skip the per-layer cos/sin recompute (the model hoists it
+                out of the layer loop — cos/sin are position-only and thus
+                identical across layers). Falls back to recompute when None.
 
         Returns:
             ``(num_tokens, hidden_size)`` — full hidden dim after the
@@ -148,10 +154,14 @@ class LingAttention(nn.Module):
         )
 
         # Partial 3D rope on this rank's heads (rope cos/sin are
-        # head_dim-shaped, identical at every rank).
+        # head_dim-shaped, identical at every rank). Use the model-hoisted
+        # cos/sin when provided to avoid recomputing the tables per layer.
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
-        q, k = self.rotary(q, k, position_ids)
+        if rope_cos_sin is not None:
+            q, k = self.rotary.apply_cos_sin(q, k, rope_cos_sin[0], rope_cos_sin[1])
+        else:
+            q, k = self.rotary(q, k, position_ids)
         q = q.transpose(0, 1).contiguous()
         k = k.transpose(0, 1).contiguous()
 
