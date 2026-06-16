@@ -169,6 +169,7 @@ def _stacked_source_keys(
 def _load_into(
     module: nn.Module, source_path: Path, device: str,
     stacked_params: list[StackedParamRule] | None = None,
+    autocast_dtype: torch.dtype | None = None,
 ) -> None:
     """Materialise ``module`` on ``device`` and load every parameter from
     ``source_path``. Raises ``KeyError`` if any parameter is missing from
@@ -177,7 +178,12 @@ def _load_into(
     ``stacked_params`` routes per-shard checkpoint tensors into fused
     parameters (e.g. ``q/k/v_proj`` → ``qkv_proj``); pass it for modules
     that use ``FusedColumnLinear`` projections.
+    ``autocast_dtype`` (when not None) casts ``module`` on the meta device
+    before ``to_empty`` so storage is allocated directly in that dtype
+    instead of fp32-then-downcast (halves the load-time VRAM peak).
     """
+    if autocast_dtype is not None:
+        module = module.to(autocast_dtype)
     module.to_empty(device=device)
     expected = set(dict(module.named_parameters()).keys())
     read_keys = _stacked_source_keys(expected, stacked_params)
@@ -287,7 +293,7 @@ class BagelModel(Model):
         )
         self.repo = Path(local_dir)
 
-    def _init_language_model_components(self, device):
+    def _init_language_model_components(self, device, autocast_dtype=None):
         if self.llm_initialized:
             return
         self._download_hf()
@@ -302,6 +308,7 @@ class BagelModel(Model):
             _BagelLLMEMA(self.language_model, self.llm2vae),
             ema_path, device,
             stacked_params=LLAMA_STACKED_PARAMS,
+            autocast_dtype=autocast_dtype,
         )
 
         if not self.vae_initialized:
@@ -317,9 +324,10 @@ class BagelModel(Model):
                     self.vae2llm, self.time_embedder, self.latent_pos_embed,
                 ),
                 ema_path, device,
+                autocast_dtype=autocast_dtype,
             )
 
-    def _init_vae_components(self, device):
+    def _init_vae_components(self, device, autocast_dtype=None):
         self._download_hf()
         if self.vae_initialized:
             return
@@ -330,7 +338,7 @@ class BagelModel(Model):
 
         # Load in weights: VAE
         vae_path = self.repo / "ae.safetensors"
-        _load_into(self.vae_model, vae_path, device)
+        _load_into(self.vae_model, vae_path, device, autocast_dtype=autocast_dtype)
 
         if not self.llm_initialized:
             # LLM components also need these for image gen, so these
@@ -347,10 +355,11 @@ class BagelModel(Model):
                     self.vae2llm, self.time_embedder, self.latent_pos_embed,
                 ),
                 ema_path, device,
+                autocast_dtype=autocast_dtype,
             )
 
 
-    def _init_vit_components(self, device):
+    def _init_vit_components(self, device, autocast_dtype=None):
         self._download_hf()
         with torch.device("meta"):
             self.vit_model = BagelVisionModel(self.config.vit_config)
@@ -371,6 +380,7 @@ class BagelModel(Model):
         _load_into(
             _BagelViTEMA(self.vit_model, self.connector, self.vit_pos_embed),
             ema_path, device,
+            autocast_dtype=autocast_dtype,
         )
 
 
@@ -378,11 +388,14 @@ class BagelModel(Model):
     # Lazy submodule initialization
     # -----------------------------------------------------------------------
 
-    def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
+    def _create_submodule(
+        self, node_name: str, device: str,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule | None:
         """Create a submodule wrapper on first access."""
         logger.debug("Creating submodule for BAGEL model node %s", node_name)
         if node_name in ("LLM", "LLM_cfg_text", "LLM_cfg_img"):
-            self._init_language_model_components(device)
+            self._init_language_model_components(device, autocast_dtype=autocast_dtype)
             return LLMSubmodule(
                 language_model=self.language_model,
                 llm2vae=self.llm2vae,
@@ -397,13 +410,13 @@ class BagelModel(Model):
                 node_name=node_name,
             )
         elif node_name == "combine_cfg":
-            self._init_language_model_components(device)
+            self._init_language_model_components(device, autocast_dtype=autocast_dtype)
             return CombineCFGSubmodule(
                 llm2vae=self.llm2vae,
                 config=self.config,
             )
         elif node_name == "vit_encoder":
-            self._init_vit_components(device)
+            self._init_vit_components(device, autocast_dtype=autocast_dtype)
             return ViTEncoderSubmodule(
                 vit_model=self.vit_model,
                 connector=self.connector,
@@ -412,7 +425,7 @@ class BagelModel(Model):
                 vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side
             )
         elif node_name == "vae_encoder":
-            self._init_vae_components(device)
+            self._init_vae_components(device, autocast_dtype=autocast_dtype)
             return VAEEncoderSubmodule(
                 vae_model=self.vae_model,
                 vae2llm=self.vae2llm,
@@ -424,7 +437,7 @@ class BagelModel(Model):
                 max_latent_size=self.config.max_latent_size,
             )
         elif node_name == "vae_decoder":
-            self._init_vae_components(device)
+            self._init_vae_components(device, autocast_dtype=autocast_dtype)
             return VAEDecoderSubmodule(
                 vae_model=self.vae_model,
                 latent_patch_size=self.config.latent_patch_size,
@@ -589,10 +602,13 @@ class BagelModel(Model):
             num_qo_heads=self.config.num_attention_heads,
         )]
 
-    def get_submodule(self, node_name: str, device: str = "cpu", tp_group=None) -> torch.nn.Module | None:
+    def get_submodule(
+        self, node_name: str, device: str = "cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> torch.nn.Module | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, autocast_dtype=autocast_dtype)
         logger.info(f"Successfully loaded in BAGEL submodule for {node_name}")
         self._submodule_cache[node_name] = submodule
         return submodule

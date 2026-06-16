@@ -928,26 +928,32 @@ class VJepa2Model(Model):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
-    def get_submodule(self, node_name: str, device: str = "cpu", tp_group=None) -> torch.nn.Module | None:
+    def get_submodule(
+        self, node_name: str, device: str = "cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> torch.nn.Module | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, autocast_dtype=autocast_dtype)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded V-JEPA 2 submodule for %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
+    def _create_submodule(
+        self, node_name: str, device: str,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule | None:
         if node_name == "video_encoder":
-            self._init_encoder(device)
+            self._init_encoder(device, autocast_dtype=autocast_dtype)
             return VJepa2EncoderSubmodule(self.encoder, self.config)
         if node_name == "predictor":
-            self._init_predictor(device)
+            self._init_predictor(device, autocast_dtype=autocast_dtype)
             if self.config.predictor_kind == "ac":
                 return VJepa2ACPredictorSubmodule(self.predictor, self.config)
             return VJepa2PredictorSubmodule(self.predictor, self.config)
         if node_name == "rollout_predictor":
-            self._init_predictor(device)
+            self._init_predictor(device, autocast_dtype=autocast_dtype)
             if self.config.predictor_kind == "ac":
                 # Sliding-window AC autoregressive rollout.  Shares the
                 # predictor nn.Module with the single-shot ``predictor``
@@ -972,7 +978,7 @@ class VJepa2Model(Model):
                 raise NotImplementedError(
                     "ac_predictor_mpc is only available with predictor_kind='ac'."
                 )
-            self._init_predictor(device)
+            self._init_predictor(device, autocast_dtype=autocast_dtype)
             return VJepa2MPCPredictorSubmodule(self.predictor, self.config)
         if node_name == "mpc_scorer":
             if self.config.predictor_kind != "ac":
@@ -982,12 +988,16 @@ class VJepa2Model(Model):
             return VJepa2MPCScorerSubmodule(self.config)
         return None
 
-    def _init_encoder(self, device: str) -> None:
+    def _init_encoder(self, device: str, autocast_dtype: torch.dtype | None = None) -> None:
         if self.encoder is not None:
             return
         meta = torch.device("meta" if not self.skip_weight_loading else "cpu")
         with meta:
             self.encoder = VJEPA2Encoder(self.config)
+        # Cast on meta (no allocation) so to_empty allocates directly in the
+        # target dtype instead of fp32-then-downcast.
+        if autocast_dtype is not None:
+            self.encoder = self.encoder.to(autocast_dtype)
         if self.skip_weight_loading:
             self.encoder = self.encoder.to_empty(device=device)
             return
@@ -1017,7 +1027,7 @@ class VJepa2Model(Model):
             device=device,
         )
 
-    def _init_predictor(self, device: str) -> None:
+    def _init_predictor(self, device: str, autocast_dtype: torch.dtype | None = None) -> None:
         if self.predictor is not None:
             return
         meta = torch.device("meta" if not self.skip_weight_loading else "cpu")
@@ -1026,6 +1036,10 @@ class VJepa2Model(Model):
             with meta:
                 predictor = VisionTransformerPredictorAC(self.config.ac_predictor)
             self.predictor = predictor
+            # Cast on meta (no allocation) so to_empty allocates directly in
+            # the target dtype instead of fp32-then-downcast.
+            if autocast_dtype is not None:
+                self.predictor = self.predictor.to(autocast_dtype)
             if self.skip_weight_loading:
                 self.predictor = self.predictor.to_empty(device=device)
                 return
@@ -1041,6 +1055,10 @@ class VJepa2Model(Model):
 
         with meta:
             self.predictor = VJEPA2Predictor(self.config)
+        # Cast on meta (no allocation) so to_empty allocates directly in the
+        # target dtype instead of fp32-then-downcast.
+        if autocast_dtype is not None:
+            self.predictor = self.predictor.to(autocast_dtype)
         if self.skip_weight_loading:
             self.predictor = self.predictor.to_empty(device=device)
             return

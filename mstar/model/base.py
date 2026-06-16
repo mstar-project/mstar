@@ -415,7 +415,10 @@ class Model(ABC):
         return output.cpu().numpy().tobytes()
 
     @abstractmethod
-    def get_submodule(self, node_name: str, device="cpu", tp_group=None) -> torch.nn.Module | None:
+    def get_submodule(
+        self, node_name: str, device="cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
 
         ``tp_group`` is the :class:`TPCommGroup` for this node on the
@@ -423,6 +426,15 @@ class Model(ABC):
         Models that support tensor parallelism should forward it to
         parallel-linear constructors so weight shapes are partitioned at
         init time and the weight loaders shard correctly.
+
+        ``autocast_dtype`` is the dtype this node's params should be
+        allocated in. Models that build on the meta device must cast the
+        meta module to this dtype *before* ``to_empty(device)`` so storage
+        is allocated directly in the target dtype — casting after
+        ``to_empty`` first materialises every param in the meta default
+        (float32), doubling the load-time VRAM peak. ``None`` means leave
+        the default (float32); the engine manager passes ``None`` for
+        nodes whose engine does not autocast.
         """
         pass
 
