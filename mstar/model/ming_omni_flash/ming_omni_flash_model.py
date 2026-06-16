@@ -1390,7 +1390,10 @@ class MingFlashOmniModel(Model):
             shard_dim={},
         )
 
-    def get_submodule(self, node_name: str, device="cpu", tp_group=None):
+    def get_submodule(
+        self, node_name: str, device="cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         if node_name == "vision_encoder":
@@ -1420,6 +1423,11 @@ class MingFlashOmniModel(Model):
         # `torch.empty(...)` allocations don't materialise on the target
         # device. Then `.to_empty(device=device)` reallocates each Parameter
         # in real memory, and the loader streams weights into them.
+        #
+        # The engine manager passes the resolved ``autocast_dtype``; fall back
+        # to the model's own preference for direct callers (tests).
+        if autocast_dtype is None:
+            autocast_dtype = self.get_autocast_dtype()
         llm = self.config.thinker_llm
         mrope = llm.mrope_section
         with torch.device("meta"):
@@ -1449,9 +1457,12 @@ class MingFlashOmniModel(Model):
                 use_bias=llm.use_bias,
                 comm_group=tp_group,
             )
-        # Materialise + cast to bf16 (matches the released ckpt's torch_dtype).
+        # Cast on meta (no allocation) BEFORE to_empty so params allocate
+        # directly in the target dtype instead of fp32-then-downcast — the
+        # latter doubles the load-time VRAM peak and OOMs TP=4 at ~78.5/80 GB.
+        if autocast_dtype is not None:
+            model.to(autocast_dtype)
         model.to_empty(device=device)
-        model.to(self.get_autocast_dtype())
 
         load_thinker_weights(model, self.local_dir, device=device, strict=True)
         model.eval()
