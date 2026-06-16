@@ -1570,14 +1570,14 @@ class Worker:
                         or pending_stop.rid not in batch_N.node_batch.request_ids:
                     continue
                 stopped_rid = pending_stop.rid
-                if stopped_rid not in batch_N.batch.node_objects:
-                    continue
                 output.per_request_output_tensors.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
-                batch_N.batch.node_objects.pop(stopped_rid)
-                batch_N.batch.request_to_worker_graph.pop(stopped_rid)
-                batch_N.node_batch.per_request_info.pop(stopped_rid)
+                batch_N.batch.node_objects.pop(stopped_rid, None)
+                batch_N.batch.request_to_worker_graph.pop(stopped_rid, None)
+                batch_N.node_batch.per_request_info.pop(stopped_rid, None)
         batch_N.node_batch.request_ids = list(valid_rids)
+        if not valid_rids:
+            return
 
         # pending stops are only needed for one iteration, so can be cleared now
         self._pending_loop_stops.clear()
