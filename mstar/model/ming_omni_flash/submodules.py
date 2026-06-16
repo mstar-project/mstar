@@ -878,8 +878,20 @@ class BailingMoeV2ThinkerSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        """Stop the ``decode_loop`` when the sampled token is the EOS
-        (``<|role_end|>`` for Ming, token id 156895)."""
+        """Stop the ``thinker_decode_loop`` when the sampled token is the EOS
+        (``<|role_end|>`` for Ming, token id 156895) OR the per-request
+        ``max_tokens`` budget is reached.
+
+        Without the ``max_tokens`` guard, prompts where the model never emits
+        EOS (e.g. list-style or open-ended generation) decode until the client
+        timeout — runaway generation that also degenerates into repetition.
+        Mirrors qwen3_omni's check_stop (``submodules.py`` ThinkerSubmodule).
+
+        The returned name MUST match the ``Loop(name=...)`` declared in
+        ``get_graph_walk_graphs`` (``thinker_decode_loop``). A mismatch makes
+        the worker's dynamic-loop registry raise ``KeyError(NodeAndGraphWalk(
+        node='decode_loop', ...))`` on the EOS step and crash the rank.
+        """
         new_tokens = outputs.get("new_token") or []
         if not new_tokens:
             return set()
