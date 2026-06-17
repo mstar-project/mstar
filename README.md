@@ -28,11 +28,11 @@
 ---
 
 <p align="center">
-  <img src="assets/mstar_headline.png" alt="M* performance across models and modalities — M* matches or beats specialized serving systems" width="100%">
+  <img src="assets/mstar_headline.png" alt="M* performance across models and modalities — M* matches or beats state-of-the-art inference systems" width="100%">
 </p>
 
 <p align="center">
-  <em>One runtime that matches or beats systems specialized for each model. Full methodology and current numbers in the <a href="https://mstar-project.github.io/">blog post</a> and <a href="https://arxiv.org/abs/2606.12688">paper</a>.</em>
+  <em>One runtime that matches or beats state-of-the-art inference systems. Full methodology and current numbers in the <a href="https://mstar-project.github.io/">blog post</a> and <a href="https://arxiv.org/abs/2606.12688">paper</a>.</em>
 </p>
 
 ## What is M*?
