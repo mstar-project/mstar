@@ -27,6 +27,14 @@
 
 ---
 
+<p align="center">
+  <img src="assets/mstar_headline.png" alt="M* performance across models and modalities — M* matches or beats state-of-the-art inference systems" width="100%">
+</p>
+
+<p align="center">
+  <em>One runtime that matches or beats state-of-the-art inference systems. Full methodology and current numbers in the <a href="https://mstar-project.github.io/">blog post</a> and <a href="https://arxiv.org/abs/2606.12688">paper</a>.</em>
+</p>
+
 ## What is M*?
 
 **M\*** (pronounced *"M-star"*) is a serving system for the new generation of **composite multimodal models** — models built from structurally distinct components (vision encoders, transformer backbones, diffusion and flow heads, audio codecs, action generators, world-model predictors) whose execution path changes with the input and the task.
