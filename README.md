@@ -13,7 +13,7 @@
   <a href="#supported-models"><b>Models</b></a> &nbsp;·&nbsp;
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;·&nbsp;
   <a href="https://mstar-project.github.io/mstar/"><b>Docs</b></a> &nbsp;·&nbsp;
-  <a href="https://mstar-project.github.io/"><b>Blog</b></a> &nbsp;·&nbsp;
+  <a href="https://m-star.org/"><b>Blog</b></a> &nbsp;·&nbsp;
   <a href="https://arxiv.org/abs/2606.12688"><b>Paper</b></a>
 </p>
 
