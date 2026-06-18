@@ -417,7 +417,15 @@ class Cosmos3Model(Model):
             fd, path = tempfile.mkstemp(suffix=".mp4")
             os.close(fd)
             try:
-                write_video(path, frames, fps=self.config.fps, video_codec="libx264")
+                # CRF 18 keeps the H.264 output near-visually-lossless; libx264
+                # otherwise defaults to 23, which is visibly lossier.
+                write_video(
+                    path,
+                    frames,
+                    fps=self.config.fps,
+                    video_codec="libx264",
+                    options={"crf": "18"},
+                )
                 with open(path, "rb") as f:
                     return f.read()
             finally:
