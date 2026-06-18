@@ -392,13 +392,13 @@ class Cosmos3Model(Model):
 
             from PIL import Image
 
-            # Wan VAE decode is [B, C, T, H, W] in [0, 1]; take the first frame.
+            # The decoder emits 8-bit frames [B, C, T, H, W]; take the first one.
             x = output
             if x.ndim == 5:
                 x = x[0, :, 0]
             elif x.ndim == 4:
                 x = x[0]
-            arr = (x.permute(1, 2, 0).clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
+            arr = x.permute(1, 2, 0).cpu().numpy()  # H, W, C uint8
             buf = io.BytesIO()
             Image.fromarray(arr).save(buf, format="PNG")
             return buf.getvalue()
@@ -408,12 +408,12 @@ class Cosmos3Model(Model):
 
             from torchvision.io import write_video
 
-            # Wan VAE decode is [B, C, T, H, W] in [0, 1]; encode all frames as
-            # H.264 mp4. The frames already reflect the request fps (it modulates
+            # The decoder emits 8-bit frames [B, C, T, H, W]; encode all of them as
+            # an H.264 mp4. The frames already reflect the request fps (it modulates
             # the temporal positions during generation); the container plays back
             # at the model's default fps.
-            x = output[0] if output.ndim == 5 else output  # [C, T, H, W]
-            frames = (x.permute(1, 2, 3, 0).clamp(0, 1) * 255).to(torch.uint8).cpu()
+            x = output[0] if output.ndim == 5 else output  # [C, T, H, W] uint8
+            frames = x.permute(1, 2, 3, 0).cpu()  # [T, H, W, C] uint8
             fd, path = tempfile.mkstemp(suffix=".mp4")
             os.close(fd)
             try:
