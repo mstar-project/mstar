@@ -419,6 +419,56 @@ def test_anchor_encode_matches_full() -> None:
 
 
 @torch.no_grad()
+def _check_compile_vae(num_frames, tag):
+    """torch.compile of the Wan VAE decode (COSMOS3_COMPILE_VAE) must reproduce
+    the eager decode. Compile fuses the pointwise epilogues around the (fp32) 3D
+    convolutions without changing their math, so the decoded uint8 frames match
+    the eager path to fp rounding; a real fusion/ordering bug shows up as visible
+    banding that tanks the PSNR. Checked for both a single image frame and a
+    multi-frame video clip (video is the lever's main beneficiary)."""
+    ctx = _scenario(num_frames)
+    if ctx is None:
+        print(f"  (skipped {tag} compile-VAE parity: needs COSMOS3_NANO_DIR + CUDA)")
+        return
+    from mstar.model.cosmos3.submodules import Cosmos3VAEDecoderSubmodule
+
+    model, lat = ctx["model"], ctx["lat_fused"]
+    vae, config = model._build_vae(ctx["device"]), model.config
+    walk = "video_gen" if num_frames > 1 else "image_gen"
+    out_key = "video_output" if num_frames > 1 else "image_output"
+    had = os.environ.pop("COSMOS3_COMPILE_VAE", None)
+    try:
+        eager = Cosmos3VAEDecoderSubmodule(vae=vae, config=config)
+        img_eager = eager.forward(walk, None, latents=lat.clone())[out_key][0]
+        os.environ["COSMOS3_COMPILE_VAE"] = "1"
+        compiled = Cosmos3VAEDecoderSubmodule(vae=vae, config=config)
+        img_comp = compiled.forward(walk, None, latents=lat.clone())[out_key][0]
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (skipped {tag} compile-VAE parity: VAE/compile unavailable: {exc})")
+        return
+    finally:
+        if had is None:
+            os.environ.pop("COSMOS3_COMPILE_VAE", None)
+        else:
+            os.environ["COSMOS3_COMPILE_VAE"] = had
+    a = img_eager.float().cpu() / 255.0
+    b = img_comp.float().cpu() / 255.0
+    maxdiff = (a - b).abs().max().item() * 255.0
+    mse = (a - b).pow(2).mean().item()
+    psnr = float("inf") if mse == 0 else -10 * math.log10(mse)
+    assert psnr >= 40, f"{tag} compile-VAE vs eager PSNR {psnr:.2f} < 40 (max uint8 diff {maxdiff:.0f})"
+    print(f"  {tag} compile-VAE vs eager decoded PSNR = {psnr:.2f} dB (max uint8 diff {maxdiff:.0f})")
+
+
+def test_compile_vae_matches_eager() -> None:
+    _check_compile_vae(1, "t2i")
+
+
+def test_compile_vae_matches_eager_t2v() -> None:
+    _check_compile_vae(VIDEO_FRAMES, "t2v")
+
+
+@torch.no_grad()
 def test_batched_cfg_matches_sequential() -> None:
     """Running both guidance branches in one batched forward must match running
     them sequentially. The two paths differ only in bf16 GEMM rounding (a batched
@@ -630,6 +680,8 @@ def _main() -> None:
         ("dense_fa3_image_psnr", test_dense_fa3_image_psnr),
         ("dense_fa3_video_psnr", test_dense_fa3_video_psnr),
         ("anchor_encode_matches_full", test_anchor_encode_matches_full),
+        ("compile_vae_matches_eager", test_compile_vae_matches_eager),
+        ("compile_vae_matches_eager_t2v", test_compile_vae_matches_eager_t2v),
         ("cuda_graph_matches_eager", test_cuda_graph_matches_eager),
         ("cross_request_batch_matches_individual", test_cross_request_batch_matches_individual),
     ]:
