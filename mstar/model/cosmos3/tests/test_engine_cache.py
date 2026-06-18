@@ -339,6 +339,66 @@ def _check_engine_psnr(num_frames, tag):
 
 
 @torch.no_grad()
+def _check_dense_fa3(num_frames, tag):
+    """Dense FlashAttention-3 generation attention vs the paged FlashInfer path.
+    Both attend each guidance branch's generation tokens over its frozen text
+    prefix; they differ only in the attention kernel (FA3 over a gathered
+    contiguous [prefix | gen] vs FlashInfer paged) and its bf16 rounding. So the
+    decoded images must match closely, and the dense path must clear the same
+    fused-reference bar the paged path meets."""
+    ctx = _scenario(num_frames)
+    if ctx is None:
+        print(f"  (skipped {tag} dense-FA3 parity: needs COSMOS3_NANO_DIR + CUDA)")
+        return
+    had = os.environ.pop("COSMOS3_DENSE_FA3", None)
+    try:
+        cm = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"])
+        lat_paged = _run_cache_once(
+            ctx["model"], ctx["dit"], cm, ctx["init"], ctx["cond"], ctx["uncond"],
+            ctx["device"], num_frames,
+        )
+        os.environ["COSMOS3_DENSE_FA3"] = "1"
+        cm2 = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"])
+        lat_dense = _run_cache_once(
+            ctx["model"], ctx["dit"], cm2, ctx["init"], ctx["cond"], ctx["uncond"],
+            ctx["device"], num_frames,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (skipped {tag} dense-FA3 parity: FA3/FlashInfer unavailable: {exc})")
+        return
+    finally:
+        if had is None:
+            os.environ.pop("COSMOS3_DENSE_FA3", None)
+        else:
+            os.environ["COSMOS3_DENSE_FA3"] = had
+    shape = ctx["lat_fused"].shape
+    img_fused = ctx["mpipe"]._decode(ctx["lat_fused"]).squeeze().float().cpu()
+    img_paged = ctx["mpipe"]._decode(lat_paged.reshape(shape)).squeeze().float().cpu()
+    img_dense = ctx["mpipe"]._decode(lat_dense.reshape(shape)).squeeze().float().cpu()
+
+    def _psnr(a, b):
+        mse = (a - b).pow(2).mean().item()
+        return float("inf") if mse == 0 else -10 * math.log10(mse)
+
+    vs_paged = _psnr(img_dense, img_paged)
+    vs_fused = _psnr(img_dense, img_fused)
+    # The dense path must match the fused reference as well as the paged engine
+    # path does (>= 30, the same bar), and the two engine kernels must agree to
+    # within their bf16 rounding (a real ordering/gather bug tanks this < 15).
+    assert vs_fused >= 30, f"{tag} dense-FA3 vs fused PSNR {vs_fused:.2f} < 30"
+    assert vs_paged >= 30, f"{tag} dense-FA3 vs paged PSNR {vs_paged:.2f} < 30"
+    print(f"  {tag} dense-FA3 PSNR vs paged = {vs_paged:.2f} dB, vs fused = {vs_fused:.2f} dB")
+
+
+def test_dense_fa3_image_psnr() -> None:
+    _check_dense_fa3(1, "t2i")
+
+
+def test_dense_fa3_video_psnr() -> None:
+    _check_dense_fa3(VIDEO_FRAMES, "t2v")
+
+
+@torch.no_grad()
 def test_batched_cfg_matches_sequential() -> None:
     """Running both guidance branches in one batched forward must match running
     them sequentially. The two paths differ only in bf16 GEMM rounding (a batched
@@ -547,6 +607,8 @@ def _main() -> None:
         ("engine_cache_path_image_psnr", test_engine_cache_path_image_psnr),
         ("cache_once_matches_fused_exact_t2v", test_cache_once_matches_fused_exact_t2v),
         ("engine_cache_path_video_psnr", test_engine_cache_path_video_psnr),
+        ("dense_fa3_image_psnr", test_dense_fa3_image_psnr),
+        ("dense_fa3_video_psnr", test_dense_fa3_video_psnr),
         ("cuda_graph_matches_eager", test_cuda_graph_matches_eager),
         ("cross_request_batch_matches_individual", test_cross_request_batch_matches_individual),
     ]:
