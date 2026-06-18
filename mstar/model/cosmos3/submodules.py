@@ -1126,13 +1126,24 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
 
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
         vae = self.vae
-        mean = torch.tensor(vae.config.latents_mean, dtype=vae.dtype, device=latents.device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae.dtype, device=latents.device)).view(
+        # The Wan VAE's 3D convolutions run several times faster in fp32 (TF32
+        # tensor cores) than in bf16 on this cuDNN, and the reference pipeline
+        # decodes in fp32. The engine casts this submodule to bf16, so restore the
+        # vae to fp32 once and decode outside autocast to keep the fast path.
+        if next(vae.parameters()).dtype != torch.float32:
+            vae.float()
+        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=latents.device)).view(
             1, -1, 1, 1, 1
         )
-        z = latents.to(vae.dtype) / inv_std + mean
-        decoded = vae.decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
-        image = (decoded / 2 + 0.5).clamp(0, 1).to(torch.float32)
+        z = latents.float() / inv_std + mean
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            decoded = vae.decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
+        # Quantize to 8-bit here (the output is an 8-bit image/mp4 either way) so
+        # only the uint8 frames cross the SHM edge to the data worker, not a 4x
+        # larger fp32 tensor — the decoded video transfer dominates the fixed cost
+        # at higher resolutions.
+        image = (decoded / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
         # Route the decoded tensor to the active walk's emit edge: image_gen
         # emits "image_output" (one frame); video_gen and forward-dynamics
         # (action_video_gen) emit "video_output".
