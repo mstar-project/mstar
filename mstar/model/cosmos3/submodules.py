@@ -1136,6 +1136,20 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         super().__init__()
         self.vae = vae
         self.config = config
+        # The Wan VAE decode is 3D-conv bound and is not captured into a CUDA
+        # graph (it runs once per request at request-specific frame/resolution
+        # shapes). torch.compile fuses the pointwise epilogues around those convs;
+        # fullgraph=False lets dynamo break around the VAE's Python-level
+        # causal-conv feature cache, and dynamic=False gives the best per-shape
+        # kernels at the cost of a one-time trace per new (frames, height, width)
+        # — fine for the few fixed generation tiers (the first request at each
+        # shape pays the trace). Off by default; set COSMOS3_COMPILE_VAE=1 to
+        # enable (A/B against the eager decode, which is identical bar fp
+        # rounding). The compile wraps the same fp32, autocast-off decode below.
+        self._decode = vae.decode if vae is not None else None
+        if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE"):
+            self._decode = torch.compile(vae.decode, fullgraph=False, dynamic=False)
+            logger.info("Cosmos3 VAE decode torch.compile enabled")
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
@@ -1154,7 +1168,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         )
         z = latents.float() / inv_std + mean
         with torch.autocast(device_type=z.device.type, enabled=False):
-            decoded = vae.decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
+            decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
         # Quantize to 8-bit here (the output is an 8-bit image/mp4 either way) so
         # only the uint8 frames cross the SHM edge to the data worker, not a 4x
         # larger fp32 tensor — the decoded video transfer dominates the fixed cost
