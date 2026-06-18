@@ -24,6 +24,7 @@ from benchmark.dataset import (
 from benchmark.request import (
     AggregateMetrics,
     InferenceSystem,
+    OpenPi,
     OursOpenAI,
     OurSystem,
     RequestInput,
@@ -52,6 +53,7 @@ class InferenceSystemType(Enum):
     VLLM_OMNI = "vllm_omni"
     VOX_SERVE = "vox_serve"
     SGLANG_OMNI = "sglang_omni"
+    OPENPI = "openpi"
 
     def instantiate(self) -> InferenceSystem:
         if self == InferenceSystemType.OURS:
@@ -64,6 +66,10 @@ class InferenceSystemType(Enum):
             return VoxServe()
         elif self == InferenceSystemType.SGLANG_OMNI:
             return SGLangOmni()
+        elif self == InferenceSystemType.OPENPI:
+            return OpenPi()
+        else:
+            raise NotImplementedError("Unknown inference system", self)
 
 
 class ProfilingType(Enum):

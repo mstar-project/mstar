@@ -9,7 +9,7 @@ tensor next to the corresponding lerobot tensor:
 
   Stage 1: Pi05ViTEncoderSubmodule output (per-camera image embeddings)
            vs lerobot ``paligemma_with_expert.embed_image(image)``.
-  Stage 2: Pi05LLMSubmodule._preprocess_prefill output (prefix_embs)
+  Stage 2: Pi05PaligemmaSubmodule._preprocess_prefill output (prefix_embs)
            vs lerobot ``embed_prefix(images, masks, tokens, masks)``.
   Stage 3: Action expert first-step velocity
            vs lerobot ``denoise_step`` first iteration.
@@ -333,7 +333,7 @@ def main():
             }
         ]
         # We don't actually need a real cache_manager for this stage — just to
-        # call the helper that builds prefix_embs. Pi05LLMSubmodule._preprocess_prefill
+        # call the helper that builds prefix_embs. Pi05PaligemmaSubmodule._preprocess_prefill
         # also calls plan_attention/plan_rope which need a real cache manager.
         # Build a dummy that just no-ops the plan_* calls:
         class _NoopCache:

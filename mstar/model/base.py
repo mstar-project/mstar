@@ -379,7 +379,11 @@ class Model(ABC):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         import torchvision
 
-        img = torchvision.io.decode_image(filepath).to(device)  # uint8 CxHxW
+        with open(filepath, "rb") as f:
+            raw = f.read()
+        img = torchvision.io.decode_image(
+            torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+        ).to(device)  # uint8 CxHxW
         img = img.float() / 255.0
 
         return TensorAndMetadata(img)

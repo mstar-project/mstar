@@ -376,7 +376,8 @@ def test_extract_siglip_state_dict_filters_and_renames_vision_keys():
 
     pali = "paligemma_with_expert.paligemma.model"
     flat = {
-        # Vision tower -> vision_model.vision_model.<rest>
+        # Vision tower -> vision_model.<rest> (native port; our
+        # Pi05SiglipEncoder owns ``vision_model`` directly, no double nest).
         f"{pali}.vision_tower.vision_model.embeddings.patch_embedding.weight": t(1152, 3, 14, 14),
         f"{pali}.vision_tower.vision_model.encoder.layers.0.layer_norm1.weight": t(1152),
         # multi_modal_projector.linear -> connector
@@ -389,8 +390,8 @@ def test_extract_siglip_state_dict_filters_and_renames_vision_keys():
     }
     siglip = Pi05Model._extract_siglip_state_dict(flat)
 
-    assert "vision_model.vision_model.embeddings.patch_embedding.weight" in siglip
-    assert "vision_model.vision_model.encoder.layers.0.layer_norm1.weight" in siglip
+    assert "vision_model.embeddings.patch_embedding.weight" in siglip
+    assert "vision_model.encoder.layers.0.layer_norm1.weight" in siglip
     assert "connector.weight" in siglip
     assert "connector.bias" in siglip
     assert not any("multi_modal_projector" in k for k in siglip)

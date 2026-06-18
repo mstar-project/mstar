@@ -40,7 +40,6 @@ from mstar.graph.base import (
     GraphEdge,
     GraphNode,
     GraphSection,
-    Loop,
     Sequential,
     TensorPointerInfo,
 )
@@ -49,10 +48,10 @@ from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
-from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
+from mstar.model.pi05.components.siglip import SIGLIP_STACKED_PARAMS, Pi05SiglipEncoder
 from mstar.model.pi05.components.tokenization import Pi05Tokenizer
 from mstar.model.pi05.config import Pi05Config, load_pi05_config
-from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05ActionExpertSubmodule, Pi05PaligemmaSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -91,40 +90,8 @@ class _Pi05LLMWeightContainer(nn.Module):
         self.time_mlp = time_mlp
 
 
-def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
-    """Re-initialize non-persistent buffers like ``position_ids`` after a
-    ``meta + to_empty`` materialization.
-
-    Modules constructed on the meta device skip ``post_init``, and
-    ``to_empty`` only allocates uninitialized storage for parameters and
-    buffers. Non-persistent buffers (registered with ``persistent=False``)
-    are not in the state_dict, so ``load_state_dict`` will not restore them
-    either — leaving them as garbage. The most common offender is HuggingFace
-    SigLIP's ``position_ids`` buffer (``register_buffer("position_ids",
-    arange(num_positions), persistent=False)``), which feeds the position
-    embedding lookup. If left as garbage int64 it produces wildly incorrect
-    image embeddings (off by the full norm of the position table).
-
-    This walks the module tree and resets any sub-module that has a
-    ``position_ids`` buffer to the canonical ``arange(num_positions)``.
-    """
-    with torch.no_grad():
-        for sub in module.modules():
-            pos = getattr(sub, "position_ids", None)
-            if isinstance(pos, torch.Tensor):
-                shape = pos.shape
-                num_positions = shape[-1]
-                pos.copy_(
-                    torch.arange(
-                        num_positions, device=pos.device, dtype=pos.dtype
-                    ).expand(shape)
-                )
-
-
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
-
-    PREFILL_WALK = "prefill"
     ACTION_GEN_WALK = "action_gen"
 
     def __init__(
@@ -365,12 +332,13 @@ class Pi05Model(Model):
             if inner.startswith("vision_tower.vision_model."):
                 # The lerobot key is
                 #   paligemma.model.vision_tower.vision_model.<rest>
-                # Pi05SiglipEncoder owns ``self.vision_model = SiglipVisionModel(...)``,
-                # and HF's SiglipVisionModel has its own inner ``.vision_model``
-                # attribute, so the corresponding key is
-                # ``vision_model.vision_model.<rest>``. We replace
-                # ``vision_tower`` with ``vision_model`` to make that explicit.
-                out["vision_model." + inner.removeprefix("vision_tower.")] = tensor
+                # Pi05SiglipEncoder owns ``self.vision_model`` (our native
+                # _SiglipVisionTransformer) directly, so the matching key is
+                # ``vision_model.<rest>``. Stripping ``vision_tower.`` yields
+                # exactly that. The separate q/k/v_proj keys under
+                # ``<rest> = encoder.layers.N.self_attn.*`` are fused into
+                # ``qkv_proj`` by SIGLIP_STACKED_PARAMS at load time.
+                out[inner.removeprefix("vision_tower.")] = tensor
             elif inner.startswith("multi_modal_projector.linear."):
                 sub = inner.removeprefix("multi_modal_projector.linear.")
                 out[f"connector.{sub}"] = tensor
@@ -387,68 +355,50 @@ class Pi05Model(Model):
             head_dim=self.config.head_dim,
             max_seq_len=self.config.max_position_embeddings,
             num_qo_heads=self.config.num_qo_heads,
+            nodes=["paligemma_LLM", "action_expert_LLM"]
         )]
 
     def get_node_engine_types(self) -> dict[str, EngineType]:
         return {
             "vit_encoder": EngineType.STATELESS,
-            "LLM": EngineType.KV_CACHE,
+            "paligemma_LLM": EngineType.KV_CACHE,
+            "action_expert_LLM": EngineType.KV_CACHE,
         }
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # Pi0.5 encodes the robot state as a decimal-string suffix on the
-        # language prompt (e.g. "Task: pick up the block, State: 12 87 ...;
-        # \nAction: ") and tokenizes the whole thing with the PaliGemma
-        # tokenizer. So the model only ever sees a single "text_inputs"
-        # stream — there are no separate state-bin tokens. This matches
-        # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
-        prefill = Sequential(
+        # NOTE: the full action generation flow loop is extremely short (total < 50ms), so
+        # we opt to have it as one node to reduce cuda graph startup, flashinfer planning,
+        # etc. overhead. Cache planning only needs to happen at the beginning of the flow
+        # loop, so this collapsed loop is valid.
+        action_gen = Sequential(
             [
                 GraphNode(
                     name="vit_encoder",
                     input_names=["image_inputs"],
-                    outputs=[GraphEdge(next_node="LLM", name="img_emb")],
+                    outputs=[GraphEdge(next_node="paligemma_LLM", name="img_emb")],
                 ),
                 GraphNode(
-                    name="LLM",
+                    name="paligemma_LLM",
                     input_names=["img_emb", "text_inputs"],
-                    outputs=[],
+                    outputs=[
+                        GraphEdge(next_node="action_expert_LLM", name="action_expert_trigger")
+                    ],
                 ),
+                GraphNode(
+                    name="action_expert_LLM",
+                    input_names=["action_expert_trigger"],
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="actions",
+                            output_modality="action",
+                        )
+                    ],
+                )
             ]
         )
 
-        # NOTE: The Loop's terminal ``outputs`` are matched into the section's
-        # node outputs by **name** (see Loop._replace_outputs_for_final_iter
-        # in mstar/graph/base.py): on the final iteration, any section-output
-        # edge whose name matches a terminal output's name is replaced with
-        # the terminal version. This is the same convention BAGEL's image_gen
-        # uses (section returns ``latents`` looping back to LLM, terminal
-        # output is ``name="latents" → vae_decoder``). So our terminal output
-        # MUST be named ``noisy_actions`` to match the section's loop-back
-        # edge — the name is just a graph-internal key, while the actual
-        # client-facing modality bucket is determined by ``output_modality``.
-        action_gen = Loop(
-            section=GraphNode(
-                name="LLM",
-                input_names=["noisy_actions", "timestep_index"],
-                outputs=[
-                    GraphEdge(next_node="LLM", name="noisy_actions"),
-                    GraphEdge(next_node="LLM", name="timestep_index"),
-                ],
-            ),
-            max_iters=self.config.num_flow_steps,
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="noisy_actions",
-                    output_modality="action",
-                    persist=True,
-                ),
-            ],
-        )
-
         return {
-            self.PREFILL_WALK: prefill,
             self.ACTION_GEN_WALK: action_gen,
         }
 
@@ -477,6 +427,18 @@ class Pi05Model(Model):
         here so the resulting ``text_inputs`` stream matches the production
         format.
         """
+        # A "numpy" upload arrives as "raw_inputs"; Pi0.5 treats it as an image input
+        # We append the raw_inputs onto the image_inputs, so the user can pass in both
+        # images and numpy arrays
+        tensors = kwargs.get("tensors")
+        if tensors is not None and "raw_inputs" in tensors:
+            tensors.setdefault("image_inputs", []).extend(tensors.pop("raw_inputs"))
+            input_metadata = kwargs.get("input_metadata")
+            if input_metadata is not None and "raw_inputs" in input_metadata:
+                input_metadata.setdefault("image_inputs", []).extend(
+                    input_metadata.pop("raw_inputs")
+                )
+
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             if prompt is not None:
@@ -527,7 +489,7 @@ class Pi05Model(Model):
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            graph_walk=self.PREFILL_WALK,
+            graph_walk=self.ACTION_GEN_WALK,
             is_prefill=True,
             kwargs={},
         )
@@ -538,7 +500,7 @@ class Pi05Model(Model):
             edge.tensor_info = input_signals["image_inputs"]
             inputs.append(edge)
         if "text_inputs" in input_signals:
-            edge = GraphEdge(next_node="LLM", name="text_inputs")
+            edge = GraphEdge(next_node="paligemma_LLM", name="text_inputs")
             edge.tensor_info = input_signals["text_inputs"]
             inputs.append(edge)
 
@@ -547,7 +509,6 @@ class Pi05Model(Model):
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
         )
 
     def get_partition_forward_pass_args(
@@ -557,29 +518,12 @@ class Pi05Model(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        if metadata.graph_walk == self.PREFILL_WALK:
-            metadata.is_prefill = False
-            metadata.graph_walk = self.ACTION_GEN_WALK
-            # Inputs for the first action_gen iteration are sampled inside the
-            # LLM submodule's preprocess (Gaussian noise + timestep_index=0).
-            inputs = [
-                GraphEdge(next_node="LLM", name="noisy_actions"),
-                GraphEdge(next_node="LLM", name="timestep_index"),
-            ]
-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+        # only one graph walk, so we're done
         return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-            request_done=request_done,
+            full_metadata=partition_metadata,
+            inputs=[],
+            unpersist_tensors=[],
+            request_done=True,
         )
 
     # ------------------------------------------------------------------
@@ -617,11 +561,16 @@ class Pi05Model(Model):
             return Pi05ViTEncoderSubmodule(
                 encoder=self.siglip, config=self.config
             )
-        if node_name == "LLM":
+        if node_name == "paligemma_LLM":
             self._init_llm_components(device)
-            return Pi05LLMSubmodule(
+            return Pi05PaligemmaSubmodule(
                 embed_tokens=self.embed_tokens,
                 paligemma=self.paligemma,
+                config=self.config,
+            )
+        if node_name == "action_expert_LLM":
+            self._init_llm_components(device)
+            return Pi05ActionExpertSubmodule(
                 action_expert=self.action_expert,
                 action_in_proj=self.action_in_proj,
                 action_out_proj=self.action_out_proj,
@@ -646,29 +595,19 @@ class Pi05Model(Model):
             self.siglip = Pi05SiglipEncoder(self.config)
         if self.skip_weight_loading:
             self.siglip = self.siglip.to_empty(device=device)
-            _reset_non_persistent_buffers(self.siglip, device)
             return
 
         flat = self._ensure_lerobot_flat()
         self.siglip.to_empty(device=device)
-        # CRITICAL: HF's SiglipVisionEmbeddings registers ``position_ids`` as
-        # a NON-persistent buffer (persistent=False), so it's not in any
-        # state_dict. ``to_empty`` materializes it as uninitialized GPU
-        # memory, ``_init_weights`` is never called (we never go through
-        # post_init), and ``load_state_dict(strict=False)`` does not restore
-        # it. The result is garbage int64 indices feeding into
-        # ``position_embedding``, which corrupts every image embedding by
-        # ~the full norm of the position table. We must manually reset any
-        # non-persistent ``position_ids`` buffer with the canonical
-        # ``arange`` values before running the forward.
-        _reset_non_persistent_buffers(self.siglip, device)
         # The extracted bucket may contain stray pooling-head keys that
         # Pi05SiglipEncoder doesn't model (``vision_use_head=False``);
         # ``load_hf_weights`` silently ignores any key that has no matching
         # parameter in the target module, so the leftover keys are dropped
         # without needing an explicit ``strict=False`` switch.
         siglip_sd = self._extract_siglip_state_dict(flat)
-        load_hf_weights(self.siglip, siglip_sd.items())
+        load_hf_weights(
+            self.siglip, siglip_sd.items(), stacked_params=SIGLIP_STACKED_PARAMS,
+        )
 
     def _init_llm_components(self, device: str):
         if self.embed_tokens is not None:

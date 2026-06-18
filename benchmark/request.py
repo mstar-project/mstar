@@ -14,7 +14,7 @@ from typing import Optional
 import aiohttp
 import numpy as np
 
-from benchmark.base import Bagel, Model, Orpheus, RequestType, Status
+from benchmark.base import Bagel, Model, Orpheus, Pi05, RequestType, Status
 from benchmark.utils import _write_wav
 
 
@@ -604,6 +604,11 @@ class RequestInput:
     # All paths are uploaded as separate "files" form fields alongside image_path.
     extra_image_paths: list[str] = field(default_factory=list)
 
+    # Pre-decoded ".npy" uploads (the "numpy" modality): paths to raw uint8
+    # arrays the server np.loads in memory (no disk, no decode). Used by pi0.5
+    # (resized 224x224 camera frames); each path is one camera.
+    _numpy_paths: list[str] = field(default_factory=list)
+
     # Per-request model_kwargs merged into the JSON payload at send time.
     # Use this for robotics-specific fields: robot_state, actions, states,
     # rollout_horizon, etc.
@@ -620,6 +625,7 @@ class RequestInput:
     _audio_b64: Optional[str] = field(default=None, repr=False)
     _video_b64: Optional[str] = field(default=None, repr=False)
     _extra_image_bytes: list[bytes] = field(default_factory=list, repr=False)
+    _numpy_bytes: list[bytes] = field(default_factory=list, repr=False)
 
     def __post_init__(self):
         if self.image_path and self._image_bytes is None:
@@ -633,6 +639,8 @@ class RequestInput:
             self._video_b64 = base64.b64encode(self._video_bytes).decode()
         if self.extra_image_paths and not self._extra_image_bytes:
             self._extra_image_bytes = [Path(p).read_bytes() for p in self.extra_image_paths]
+        if self._numpy_paths and not self._numpy_bytes:
+            self._numpy_bytes = [Path(p).read_bytes() for p in self._numpy_paths]
 
     def get_all_filepaths(self) -> dict[str, str]:
         res = {}
@@ -721,7 +729,9 @@ class OurSystem(InferenceSystem):
             input_mod = req_type.get_input_modalities()
             if "," in input_mod or input_mod not in ("text",):
                 # TODO: if a request does not have text as an input modality, this must be revisited
-                form.add_field("input_modalities", ",".join([input_mod, "text"]))
+                if "text" not in input_mod:
+                    input_mod = ",".join([input_mod, "text"])
+                form.add_field("input_modalities", input_mod)
 
             for modality in req_input.get_all_filepaths():
                 file_content = req_input.get_bytes(modality)
@@ -739,7 +749,16 @@ class OurSystem(InferenceSystem):
                     "files",
                     content,
                     filename=os.path.basename(path),
-                    content_type="image/png",
+                    content_type="application/octet-stream",
+                )
+            # Pre-decoded ".npy" uploads (numpy modality): the server keeps these
+            # in memory and np.loads them — no disk, no decode (pi0.5 cameras).
+            for path, content in zip(req_input._numpy_paths, req_input._numpy_bytes, strict=True):
+                form.add_field(
+                    "files",
+                    content,
+                    filename=os.path.basename(path),
+                    content_type="application/octet-stream",
                 )
 
             metrics.start_time = time.monotonic()
@@ -1652,3 +1671,142 @@ class OursOpenAI(VLLMOmni):
         else:
             metrics.record_completion()
         return metrics
+
+
+# ---------------------------------------------------------------------------
+# openpi: call their own api server
+# ---------------------------------------------------------------------------
+def _build_obs(req_input: RequestInput) -> dict:
+    """Map our DROIDDataset RequestInput → openpi DroidInputs dict.
+
+    DROIDDataset emits the camera frames as ``_numpy_bytes`` — already-decoded,
+    letterboxed 224x224 uint8 arrays (CxHxW), the same bytes mstar receives, so
+    both systems get identical input. openpi wants (H,W,3) uint8, so we just
+    transpose; no decode/resize needed here. cam0 → exterior_image_1_left,
+    cam1 → wrist_image_left. The 32-dim DROID state holds joint positions in
+    [:7] and gripper in [7]; the rest is padding we ignore.
+
+    NOTE: lerobot/droid_100 ships no gripper signal, so state[7:8] is always
+    padding 0.0 — actions are not semantically valid for either system. Fine
+    here: the benchmark measures latency (identical tensor shapes => identical
+    compute), not action quality.
+
+    openpi DroidInputs (droid_policy.py:make_droid_example) expects:
+      observation/exterior_image_1_left : (H,W,3) uint8
+      observation/wrist_image_left      : (H,W,3) uint8
+      observation/joint_position        : (7,) float
+      observation/gripper_position      : (1,) float
+      prompt                            : str
+    """
+    import io
+
+    import numpy as np
+
+    state = np.asarray(req_input.model_kwargs.get("robot_state", []), dtype=np.float32)
+    if state.size < 8:
+        state = np.pad(state, (0, 8 - state.size))
+
+    imgs = [np.load(io.BytesIO(b)).transpose(1, 2, 0)  # CxHxW uint8 -> HxWxC
+            for b in req_input._numpy_bytes]
+    base_img = imgs[0]
+    wrist_img = imgs[1] if len(imgs) > 1 else imgs[0]
+
+    return {
+        "observation/exterior_image_1_left": base_img,
+        "observation/wrist_image_left": wrist_img,
+        "observation/joint_position": state[:7],
+        "observation/gripper_position": state[7:8],
+        "prompt": req_input.prompt or "manipulate the object",
+    }
+
+class OpenPi(InferenceSystem):
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        assert isinstance(model, Pi05), "openpi only supports Pi05 models"
+        assert req_input.req_type == RequestType.VLA, "openpi only supports VLA requests"
+
+        import numpy as np
+        from openpi_client import msgpack_numpy
+        metrics = RequestMetrics(
+            request_id=request_id,
+            type=req_input.req_type,
+            expected_output_modalities=["action"],
+        )
+
+        # base_url is expected to be an http(s) URL for consistency with the rest
+        # of the harness; convert to ws(s) for the websocket handshake.
+        ws_url = base_url
+        if ws_url.startswith("http://"):
+            ws_url = "ws://" + ws_url[len("http://"):]
+        elif ws_url.startswith("https://"):
+            ws_url = "wss://" + ws_url[len("https://"):]
+
+        # Build the observation. _build_obs gives us full-res images + a
+        # 32-dim DROID state; openpi expects 224x224 uint8 images and
+        # separate joint/gripper vectors, which _build_obs already provides.
+        obs = _build_obs(req_input)
+        packer = msgpack_numpy.Packer()
+        payload = packer.pack(obs)
+
+        try:
+            metrics.start_time = time.monotonic()
+            async with session.ws_connect(
+                ws_url,
+                max_msg_size=0,           # no limit; action chunks are small but obs is large
+                compress=0,               # match the openpi client (compression=None)
+                timeout=aiohttp.ClientWSTimeout(ws_close=30),
+            ) as ws:
+                # Server sends metadata as the first message on connect.
+                # Drain it; we don't need it for benchmarking, but we MUST read
+                # it before sending or the server's send buffer can stall.
+                metadata_msg = await ws.receive()
+                if metadata_msg.type != aiohttp.WSMsgType.BINARY:
+                    raise RuntimeError(
+                        f"Expected binary metadata frame, got {metadata_msg.type}: "
+                        f"{metadata_msg.data!r}"
+                    )
+                _ = msgpack_numpy.unpackb(metadata_msg.data)
+
+                # Send observation, await action chunk.
+                await ws.send_bytes(payload)
+                response_msg = await ws.receive()
+
+                if response_msg.type == aiohttp.WSMsgType.TEXT:
+                    # The openpi server signals errors by sending a string.
+                    raise RuntimeError(f"Error in inference server:\n{response_msg.data}")
+                if response_msg.type != aiohttp.WSMsgType.BINARY:
+                    raise RuntimeError(
+                        f"Unexpected ws frame type {response_msg.type}: "
+                        f"{response_msg.data!r}"
+                    )
+
+                arrival_time = time.monotonic()
+                response = msgpack_numpy.unpackb(response_msg.data)
+                action_chunk = response["actions"]  # (action_horizon, action_dim)
+
+                # One-shot output: the entire action chunk arrives at once,
+                # so TTFT == E2E. Encode the chunk as a single output unit.
+                # n_tokens = action_horizon so throughput numbers are
+                # in "actions/sec" if the metrics layer divides by n_tokens.
+                action_bytes = np.asarray(action_chunk, dtype=np.float32).tobytes()
+                metrics.record_output_chunk(
+                    modality="action",
+                    data_b64=base64.b64encode(action_bytes),
+                    arrival_time=arrival_time,
+                    n_tokens=int(action_chunk.shape[0]),
+                )
+
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+
+        return metrics
+

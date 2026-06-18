@@ -26,8 +26,9 @@ Coverage:
     ``BatchPrefillWithPagedKVCacheWrapper`` against vanilla SDPA, both for
     the bidirectional prefill and the suffix-attends-to-prefix flow used
     during the action_gen denoising loop
-  * Pi05SiglipEncoder produces bit-identical features to a freshly-built
-    HF SiglipVisionModel with matched weights
+  * Pi05SiglipEncoder (native port w/ fused QKV + SDPA) produces features
+    matching a freshly-built HF SiglipVisionModel, loaded via the same
+    stacked-param path the real checkpoint loader uses
 
 The attention used inside the action-expert tests is a small vanilla-SDPA
 implementation shared by the mock cache handle and the reference code; the
@@ -725,17 +726,23 @@ def test_flashinfer_paged_prefill_attention_matches_sdpa():
 
 
 def test_pi05_siglip_encoder_matches_hf_reference():
-    """``Pi05SiglipEncoder`` produces bit-identical features to HF SiglipVisionModel.
+    """``Pi05SiglipEncoder`` (native port) matches HF SiglipVisionModel.
 
-    Both wrap the same HF class; the only difference is mstar adds a
-    ``nn.Linear`` connector to project to the LLM hidden size. The reference
-    PaliGemma uses an analogous ``multi_modal_projector``. We verify the
-    pre-connector features match exactly and the connector preserves the
-    expected output shape.
+    The port fuses q/k/v into one projection and runs SDPA, so it is no
+    longer the same class as the reference. We load the HF reference's
+    weights into our encoder through ``load_hf_weights`` with
+    ``SIGLIP_STACKED_PARAMS`` — the same stacked-param path the real
+    checkpoint loader uses — then check the pre-connector features match
+    (allclose, since fused-QKV + SDPA differ from HF only by fp32 rounding)
+    and the connector preserves the expected output shape.
     """
     from transformers import SiglipVisionConfig, SiglipVisionModel
 
-    from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
+    from mstar.model.loader import load_hf_weights
+    from mstar.model.pi05.components.siglip import (
+        SIGLIP_STACKED_PARAMS,
+        Pi05SiglipEncoder,
+    )
 
     torch.manual_seed(0)
     config = Pi05Config(
@@ -748,8 +755,6 @@ def test_pi05_siglip_encoder_matches_hf_reference():
         hidden_size=128,
     )
 
-    ours = Pi05SiglipEncoder(config).to(DEVICE).eval()
-
     siglip_cfg = SiglipVisionConfig(
         hidden_size=config.vit_hidden_size,
         intermediate_size=config.vit_intermediate_size,
@@ -761,19 +766,34 @@ def test_pi05_siglip_encoder_matches_hf_reference():
         # Match Pi05SiglipEncoder, which disables the pooling head to match
         # the production lerobot/pi05_base checkpoint key set.
         vision_use_head=False,
+        attn_implementation="sdpa",
     )
     ref_vision = SiglipVisionModel(siglip_cfg).to(DEVICE).eval()
-    ref_vision.load_state_dict(ours.vision_model.state_dict())
+
+    ours = Pi05SiglipEncoder(config).to(DEVICE).eval()
+    # HF SiglipVisionModel state_dict keys (``vision_model.encoder.layers.N.
+    # self_attn.{q,k,v,out}_proj.*`` etc.) line up 1:1 with our encoder after
+    # the stacked-param rules fuse q/k/v into ``qkv_proj``.
+    load_hf_weights(
+        ours, ref_vision.state_dict().items(), stacked_params=SIGLIP_STACKED_PARAMS,
+    )
 
     images = torch.randn(2, 3, config.vit_image_size, config.vit_image_size, device=DEVICE)
-    with torch.no_grad():
-        ref_features = ref_vision(pixel_values=images).last_hidden_state
-        ours_inner = ours.vision_model(pixel_values=images).last_hidden_state
-        ours_full = ours(images)
+    # Disable TF32 for the comparison: the fused [3*H, H] QKV GEMM tiles
+    # differently from HF's three separate [H, H] GEMMs, so with TF32 tensor
+    # cores enabled the two paths round differently (~1e-3 abs — negligible
+    # for actions, but not bit-exact). In true fp32 the port is identical.
+    tf32_prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        with torch.no_grad():
+            ref_features = ref_vision(pixel_values=images).last_hidden_state
+            ours_inner = ours.vision_model(images)
+            ours_full = ours(images)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32_prev
 
-    # Pre-connector features should be exactly bit-identical (same HF class,
-    # same weights, same input).
-    assert torch.equal(ref_features, ours_inner)
+    torch.testing.assert_close(ours_inner, ref_features, atol=1e-5, rtol=1e-5)
 
     # Connector output shape: [batch, num_patches, llm_hidden_size]
     n_patches = (config.vit_image_size // config.vit_patch_size) ** 2
@@ -787,7 +807,7 @@ def test_pi05_siglip_encoder_matches_hf_reference():
 
 def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
     """Reference port of ``image_tools.resize_with_pad_torch`` (channels-first
-    float32 path). Used to verify ``Pi05ViTEncoderSubmodule._preprocess_one``.
+    float32 path). Used to verify ``Pi05ViTEncoderSubmodule._prepare_one``.
     """
     assert images.dim() == 4 and images.dtype == torch.float32
     _, _, cur_h, cur_w = images.shape
@@ -807,7 +827,7 @@ def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> 
 
 
 def test_pi05_image_preprocessing_matches_resize_with_pad_letterbox():
-    """``Pi05ViTEncoderSubmodule._preprocess_one`` vs openpi's resize_with_pad_torch.
+    """``Pi05ViTEncoderSubmodule._prepare_one`` vs openpi's resize_with_pad_torch.
 
     Tests three cases that exercise the letterbox path:
       * already-target square (no resize / no pad — identity-ish)
@@ -840,7 +860,7 @@ def test_pi05_image_preprocessing_matches_resize_with_pad_letterbox():
     for name, shape in cases:
         torch.manual_seed(hash(name) & 0xFFFF)
         images = torch.rand(*shape) * 2.0 - 1.0  # [-1, 1] float32
-        ours = submodule._preprocess_one(images)
+        ours = submodule._prepare_one(images)
         ref = _ref_resize_with_pad(images, cfg.vit_image_size, cfg.vit_image_size)
         assert ours.shape == ref.shape == (1, 3, 224, 224), f"{name}: shape mismatch"
         # Padding regions are exactly -1, content region matches the resized
@@ -861,7 +881,7 @@ def test_pi05_image_preprocessing_uint8_to_float():
     submodule = Pi05ViTEncoderSubmodule(Pi05SiglipEncoder(cfg), cfg)
     images_u8 = torch.zeros(1, 3, 224, 224, dtype=torch.uint8)
     images_u8[..., 100:200, 100:200] = 255
-    out = submodule._preprocess_one(images_u8)
+    out = submodule._prepare_one(images_u8)
     assert out.dtype == torch.float32
     # Background pixels (0) -> -1, foreground pixels (255) -> +1.
     assert out[0, 0, 0, 0].item() == pytest.approx(-1.0, abs=1e-6)

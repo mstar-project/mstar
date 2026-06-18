@@ -1,12 +1,11 @@
 """NodeSubmodule wrappers for the Pi0.5 model nodes.
 
-Two submodules:
-  Pi05ViTEncoderSubmodule -- SigLIP vision encoder for camera images.
-  Pi05LLMSubmodule        -- combined PaliGemma + action expert. Dispatches by
-                             graph_walk between prefill (PaliGemma writes the
-                             prefix KV cache) and action_gen (action expert
-                             reads the frozen prefix KV cache and runs one
-                             Euler flow-matching step).
+Three submodules:
+  Pi05ViTEncoderSubmodule    -- SigLIP vision encoder for camera images.
+  Pi05PaligemmaSubmodule     -- PaliGemma prefix expert; prefills and writes the
+                                prefix KV cache.
+  Pi05ActionExpertSubmodule  -- action expert; reads the frozen prefix KV cache
+                                and runs the Euler flow-matching denoising loop.
 """
 
 import logging
@@ -69,7 +68,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         return result
 
     def _prepare_one(self, images: torch.Tensor) -> torch.Tensor:
-        """Resize one request's stack of camera images with aspect-preserving
+        """Resize one request's camera image(s) with aspect-preserving
         letterbox padding.
 
         Matches openpi's ``image_tools.resize_with_pad_torch`` exactly:
@@ -152,16 +151,13 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         (num_cameras, 3, H, W). preprocess() stacks them to (bs, num_cameras,
         3, H, W) so shape[0] == bs, satisfying StatelessCudaGraphRunner's
         leading-dim == bs requirement.
-
-        compile=False because warmup() already applies torch.compile to
-        forward_batched; _capture_one captures the compiled callable directly.
         """
         from mstar.engine.cuda_graph_config import BasicBatchedCudaGraphConfig
         H = W = self.config.vit_image_size
         num_cameras = self.config.num_cameras
         return [
             BasicBatchedCudaGraphConfig(
-                capture_graph_walk="prefill",
+                capture_graph_walk="action_gen",
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=0,  # not used by StatelessCudaGraphRunner
                     tensor_inputs={
@@ -172,7 +168,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
                     },
                 ),
                 capture_batch_sizes=[1],
-                compile=False,
+                compile=False, # empircally does better than compile=True for now
             )
         ]
 
@@ -183,9 +179,14 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        return NodeInputs(tensor_inputs={"pixel_values": self._prepare_one(
-            inputs["image_inputs"][0]
-        )})
+        images = torch.cat([
+            self._prepare_one(img) for img in inputs["image_inputs"]
+        ])
+        # TODO: assert images.shape == (num_cameras, 3, H, W) once worker errors
+        # are surfaced. A wrong count silently broadcasts in the static CUDA
+        # graph; today a raised error is swallowed and the client hangs, so this
+        # needs prepare_inputs errors threaded engine -> conductor -> API server.
+        return NodeInputs(tensor_inputs={"pixel_values": images})
 
     def preprocess(
         self,
@@ -254,20 +255,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         }
 
 
-class Pi05LLMSubmodule(ARNodeSubmodule):
-    """Combined PaliGemma prefix expert + action expert.
-
-    Dispatches by graph_walk:
-      - ``prefill``:    PaliGemma forwards over the prefix
-                        ``[image_tokens, language_tokens, state_tokens]`` and
-                        writes the KV cache.
-      - ``action_gen``: action expert runs one Euler step of flow-matching
-                        denoising over the action suffix, attending to the
-                        frozen prefix KV cache. The current ``noisy_actions``
-                        and ``timestep_index`` cycle through the loop via
-                        loop-back graph edges; on the final iteration the
-                        denoised action tensor is emitted as ``action_output``.
-    """
+class Pi05PaligemmaSubmodule(ARNodeSubmodule):
+    """PaliGemma prefix expert: forwards over the prefix
+    ``[image_tokens, language_tokens]`` and writes the KV cache that the
+    action expert later reads."""
 
     # Parameter name fragments whose weights must stay in float32 even when
     # the rest of the model is bf16. Matches lerobot's
@@ -283,12 +274,229 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
     # For the default image size and a simple text prompt, one request is about 400 tokens
     PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
-    ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
     def __init__(
         self,
         embed_tokens: nn.Embedding,
         paligemma: Pi05PaliGemmaExpert,
+        config: Pi05Config,
+    ):
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        self.paligemma = paligemma
+        self.config = config
+        # lerobot scales images by sqrt(H) but text by H: its
+        # embed_language_tokens routes through HF Gemma's
+        # GemmaTextScaledWordEmbedding, which already bakes in a sqrt(H) factor,
+        # so the effective text scale is sqrt(H)*sqrt(H) = H. Our plain
+        # nn.Embedding has no internal scale, so we apply the full H here.
+        # Mismatching makes the text prefix ~45x too small and corrupts context.
+        self._image_embed_scale = math.sqrt(config.hidden_size)
+        self._text_embed_scale = float(config.hidden_size)
+
+    def to(self, *args, **kwargs):
+        """Apply standard ``to()`` then upcast norm parameters back to fp32.
+
+        Matches lerobot's ``to_bfloat16_for_selected_params`` which keeps
+        ``input_layernorm``, ``post_attention_layernorm``, and ``model.norm``
+        in float32 while the rest of the transformer runs in bfloat16.
+        """
+        result = super().to(*args, **kwargs)
+        for name, param in result.named_parameters():
+            if any(sel in name for sel in self._FLOAT32_PARAM_SELECTORS):
+                param.data = param.data.to(torch.float32)
+        return result
+
+    def can_batch(
+        self,
+        batch: NodeBatch,
+        model_inputs: list[NodeInputs],
+    ) -> bool:
+        return True
+
+    def get_needed_cache_labels(
+        self,
+        graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> list[str] | None:
+        return ["main"]
+
+    def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
+        emb = self.embed_tokens(ids)
+        return emb * self._text_embed_scale
+
+    def get_cuda_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
+        prefill_packed = {
+            num_tokens: {
+                "prefix_embs": torch.zeros(num_tokens, self.config.hidden_size, device=device)
+            }
+            for num_tokens in self.PREFILL_TOKEN_BUCKETS
+        }
+        return [
+            FlashInferPackedCudaGraphConfig(
+                capture_graph_walk="action_gen",
+                packed_seq_len_to_inputs=prefill_packed,
+                requires_cfg=False,
+                labels=["main"],
+                compile=True,
+                causal_attention=False,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            ),
+        ]
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> ARNodeInputs:
+        return self._prepare_inputs_prefill(
+            inputs=inputs,
+            fwd_info=fwd_info,
+        )
+
+    def _prepare_inputs_prefill(
+        self,
+        inputs: NameToTensorList,
+        **kwargs
+    ) -> ARNodeInputs:
+        # Prefix layout [image_tokens, language_tokens]. Robot state is not a
+        # separate stream — process_prompt already appended it as a decimal
+        # suffix on the prompt. Image and text embeds use different scales (see
+        # __init__); applying them here is load-bearing.
+        img_emb = inputs["img_emb"][0] * self._image_embed_scale
+        text_ids = inputs["text_inputs"][0]
+        text_emb = self._embed_tokens_scaled(text_ids)
+        prefix_emb = torch.cat([img_emb, text_emb], dim=0)
+        seq_len = prefix_emb.shape[0]
+
+        return ARNodeInputs(input_embeds=prefix_emb, input_seq_len=seq_len)
+
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
+    ) -> dict[str, torch.Tensor | Any]:
+
+        return self._preprocess_prefill(
+            inputs=inputs,
+            cache_manager=engine_inputs.cache_manager,
+        )
+
+    def _preprocess_prefill(
+        self,
+        inputs: list[ARNodeInputs],
+        cache_manager: BatchedCacheManager,
+    ) -> dict[str, torch.Tensor | Any]:
+        per_request_seqs = [inp.input_embeds for inp in inputs]
+        prefix_embs = torch.cat(per_request_seqs, dim=0)
+        seq_lens = [inp.input_seq_len for inp in inputs]
+
+        # Bidirectional attention over the prefix; PaliGemma is a prefix-LM.
+        cache_manager.plan_attention(
+            seq_lens=seq_lens, is_causal=False, label="main", dtype=torch.bfloat16
+        )
+        cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
+        return {"prefix_embs": prefix_embs}
+
+    # ------------------------------------------------------------------
+    # forward
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        **kwargs # coming from preprocess output
+    ) -> NameToTensorList:
+        cache_handle=engine_inputs.cache_manager
+
+        return self._forward_prefill(cache_handle=cache_handle, **kwargs)
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        **kwargs, # coming from preprocess output
+    )  -> dict[str, NameToTensorList]:
+        """Batched forward: process all requests in a single transformer pass.
+
+        Called by ``KVCacheEngine._execute_batched`` when ``can_batch()`` returns
+        True. ``packed_inputs`` comes from ``preprocess()`` which already
+        concatenated per-request tensors and planned attention/RoPE for the
+        full batch.
+        """
+
+        return self._forward_prefill_batched(
+            cache_manager=engine_inputs.cache_manager,
+            request_ids=engine_inputs.request_ids,
+            **kwargs,
+        )
+
+
+    def _forward_prefill_batched(
+        self,
+        cache_manager: BatchedCacheManager,
+        request_ids: list[str],
+        prefix_embs: torch.Tensor,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        """Batched prefill: single PaliGemma forward over concatenated prefixes."""
+        cache_manager.set_active_label("main")
+        self.paligemma(
+            query_sequence=prefix_embs,
+            cache_handle=cache_manager,
+            write_cache=True,
+        )
+        # Prefill produces no graph-edge outputs.
+        return {rid: {} for rid in request_ids}
+
+    def _forward_prefill(
+        self,
+        prefix_embs: torch.Tensor,
+        cache_handle: BatchedCacheManager,
+        **kwargs,
+    ) -> NameToTensorList:
+        if cache_handle is not None:
+            cache_handle.set_active_label("main")
+        self.paligemma(
+            query_sequence=prefix_embs,
+            cache_handle=cache_handle,
+            write_cache=True,
+        )
+        return {}
+
+    def postprocess(self, request_id, request_info, outputs, **kwargs):
+        outputs["action_expert_trigger"] = []
+
+
+class Pi05ActionExpertSubmodule(ARNodeSubmodule):
+    """Action expert flow-matching loop.
+
+    Runs all ``num_flow_steps`` Euler denoising steps over the action suffix
+    in a single forward, attending to the frozen prefix KV cache that the
+    PaliGemma submodule wrote, then emits the denoised action tensor.
+    """
+
+    # Parameter name fragments whose weights must stay in float32 even when
+    # the rest of the model is bf16. Matches lerobot's
+    # ``to_bfloat16_for_selected_params`` — keeping norms in fp32 prevents
+    # the per-layer precision loss that otherwise compounds across 18 layers
+    # and causes ~0.2 abs delta on the final actions.
+    _FLOAT32_PARAM_SELECTORS = (
+        "input_layernorm",
+        "post_attention_layernorm",
+        ".norm.",   # final RMSNorm / adaRMS norm
+    )
+
+    ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
+
+    def __init__(
+        self,
         action_expert: Pi05ActionExpert,
         action_in_proj: nn.Linear,
         action_out_proj: nn.Linear,
@@ -296,34 +504,11 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         config: Pi05Config,
     ):
         super().__init__()
-        self.embed_tokens = embed_tokens
-        self.paligemma = paligemma
         self.action_expert = action_expert
         self.action_in_proj = action_in_proj
         self.action_out_proj = action_out_proj
         self.time_mlp = time_mlp
         self.config = config
-        # Image features and language token embeddings use DIFFERENT scaling
-        # factors in lerobot's reference, even though both end up calling it
-        # ``sqrt(hidden_size)``:
-        #
-        #   * Images: ``embed_image`` returns
-        #     ``connector(siglip_features) * sqrt(hidden_size)``  -> scale = sqrt(H).
-        #
-        #   * Text: lerobot's ``lang_embed_func`` does
-        #     ``embed_language_tokens(tokens) * sqrt(hidden_size)``, but
-        #     ``embed_language_tokens`` calls HF Gemma's
-        #     ``GemmaTextScaledWordEmbedding`` whose ``forward`` already
-        #     multiplies the raw lookup by an internal ``embed_scale =
-        #     sqrt(hidden_size)``. So the EFFECTIVE text scale is
-        #     ``sqrt(H) * sqrt(H) = H``, not ``sqrt(H)``.
-        #
-        # We use a plain ``nn.Embedding`` for ``embed_tokens`` (no internal
-        # scale), so we have to apply the full ``H`` factor manually here.
-        # Mismatching this produces a ~45x undersized text prefix and the
-        # action expert sees a wildly wrong context.
-        self._image_embed_scale = math.sqrt(config.hidden_size)
-        self._text_embed_scale = float(config.hidden_size)
 
         # Lazily allocated on first action Euler step, sized for the largest
         # captured batch. sincos_timestep_embedding fully overwrites this buffer
@@ -349,16 +534,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         batch: NodeBatch,
         model_inputs: list[NodeInputs],
     ) -> bool:
-        """Pi0.5 supports batched execution for both graph walks.
-
-        - ``prefill``: prefix embeddings are concatenated across requests and
-          processed in a single PaliGemma forward with batched FlashInfer
-          attention. Each request can have a different prefix length (different
-          text prompt lengths).
-        - ``action_gen``: all requests in a batch are at the same Euler
-          iteration (guaranteed by the Loop primitive), so their suffix tokens
-          can be concatenated and processed in a single action expert forward.
-        """
         return True
 
     def get_needed_cache_labels(
@@ -400,10 +575,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             )
         return self._time_emb_buffer[:bs]
 
-    def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
-        emb = self.embed_tokens(ids)
-        return emb * self._text_embed_scale
-
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
@@ -413,7 +584,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         # are read directly from self.config — same source as the nn.Linear
         # weight shapes — so they're guaranteed consistent.
         logger.info(
-            "Pi05LLMSubmodule.get_cuda_graph_configs: capturing 'action_gen' "
+            "Pi05ActionExpertSubmodule.get_cuda_graph_configs: capturing 'action_gen' "
             "graph with input_seq_len=%d, noisy_actions=(%d, %d), batch_sizes=[1,2,4] "
             "(num_flow_steps=%d denoising iters runs INSIDE this captured graph; "
             "denoising count is independent of horizon)",
@@ -421,12 +592,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             self.config.action_horizon, self.config.action_dim,
             self.config.num_flow_steps,
         )
-        prefill_packed = {
-            num_tokens: {
-                "prefix_embs": torch.zeros(num_tokens, self.config.hidden_size, device=device)
-            }
-            for num_tokens in self.PREFILL_TOKEN_BUCKETS
-        }
         return [
             # Action generation always has latents of the same size, so it is a similar
             # paradigm to AR decode and can use the batched cuda graphs
@@ -443,15 +608,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                 ),
                 capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
             ),
-            FlashInferPackedCudaGraphConfig(
-                capture_graph_walk="prefill",
-                packed_seq_len_to_inputs=prefill_packed,
-                requires_cfg=False,
-                labels=["main"],
-                compile=True,
-                causal_attention=False,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-            ),
         ]
 
     def prepare_inputs(
@@ -461,46 +617,10 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> ARNodeInputs:
-        if graph_walk == "prefill":
-            return self._prepare_inputs_prefill(
-                inputs=inputs,
-            )
-        if graph_walk == "action_gen":
-            return self._prepare_inputs_action_gen(
-                inputs=inputs,
-                fwd_info=fwd_info,
-            )
-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
-
-    def _prepare_inputs_prefill(
-        self,
-        inputs: NameToTensorList,
-        **kwargs
-    ) -> ARNodeInputs:
-        # Pi0.5 prefix layout (matches lerobot's embed_prefix):
-        #   [image_tokens, language_tokens]
-        # The robot state is *not* a separate token stream — it has already
-        # been formatted as a decimal-string suffix on the language prompt
-        # by ``Pi05Model.process_prompt``, then tokenized by the PaliGemma
-        # tokenizer. So the LLM only consumes ``img_emb`` + ``text_inputs``.
-        #
-        # IMPORTANT: lerobot's ``embed_prefix`` scales BOTH the image features
-        # (after the multi_modal_projector) and the language token embeddings
-        # by ``sqrt(hidden_size)``. We mirror that here. Without the image
-        # scaling the SigLIP tokens come in ~sqrt(2048)≈45x too small relative
-        # to the language tokens and the action expert sees a wildly wrong
-        # prefix. (The standalone test_pi05_model_loaded_via_remapper_matches_
-        # lerobot integration test missed this because it bypasses
-        # _preprocess_prefill and feeds in lerobot's pre-scaled embed_prefix
-        # output directly.)
-
-        img_emb = inputs["img_emb"][0] * self._image_embed_scale
-        text_ids = inputs["text_inputs"][0]
-        text_emb = self._embed_tokens_scaled(text_ids)
-        prefix_emb = torch.cat([img_emb, text_emb], dim=0)
-        seq_len = prefix_emb.shape[0]
-
-        return ARNodeInputs(input_embeds=prefix_emb, input_seq_len=seq_len)
+        return self._prepare_inputs_action_gen(
+            inputs=inputs,
+            fwd_info=fwd_info,
+        )
 
     def _prepare_inputs_action_gen(
         self,
@@ -512,23 +632,20 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         action_horizon = self.config.action_horizon
         action_dim = self.config.action_dim
 
-        if "noisy_actions" not in inputs or len(inputs["noisy_actions"]) == 0:
-            generator = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
-            noisy = torch.randn(
-                action_horizon, action_dim, device=device, generator=generator
-            )
-            ts = torch.zeros(1, device=device, dtype=torch.long)
-        else:
-            noisy = inputs["noisy_actions"][0]
-            ts = inputs["timestep_index"][0]
+        generator = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
+        noisy = torch.randn(
+            action_horizon, action_dim, device=device, generator=generator
+        )
+        ts = torch.zeros(1, device=device, dtype=torch.long)
 
         seq_len = action_horizon
-        return ARNodeInputs(input_seq_len=seq_len,
-                            tensor_inputs={
-                                "noisy_actions": noisy,
-                                "ts": ts
-                            })
-
+        return ARNodeInputs(
+            input_seq_len=seq_len,
+            tensor_inputs={
+                "noisy_actions": noisy,
+                "ts": ts
+            }
+        )
 
     def preprocess(
         self,
@@ -536,34 +653,10 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-
-        if graph_walk == "prefill":
-            return self._preprocess_prefill(
-                inputs=inputs,
-                cache_manager=engine_inputs.cache_manager,
-            )
-        if graph_walk == "action_gen":
-            return self._preprocess_action_gen(
-                inputs=inputs,
-                cache_manager=engine_inputs.cache_manager,
-            )
-
-    def _preprocess_prefill(
-        self,
-        inputs: list[ARNodeInputs],
-        cache_manager: BatchedCacheManager,
-    ) -> dict[str, torch.Tensor | Any]:
-        per_request_seqs = [inp.input_embeds for inp in inputs]
-        prefix_embs = torch.cat(per_request_seqs, dim=0)
-        seq_lens = [inp.input_seq_len for inp in inputs]
-
-        # Bidirectional attention over the prefix; PaliGemma is a prefix-LM.
-        cache_manager.plan_attention(
-            seq_lens=seq_lens, is_causal=False, label="main", dtype=torch.bfloat16
+        return self._preprocess_action_gen(
+            inputs=inputs,
+            cache_manager=engine_inputs.cache_manager,
         )
-        cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
-
-        return {"prefix_embs": prefix_embs}
 
     def _preprocess_action_gen(
         self,
@@ -614,12 +707,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         **kwargs # coming from preprocess output
     ) -> NameToTensorList:
         cache_handle=engine_inputs.cache_manager
-
-        if graph_walk == "prefill":
-            return self._forward_prefill(cache_handle=cache_handle, **kwargs)
-        if graph_walk == "action_gen":
-            return self._forward_action_gen(cache_handle=cache_handle, **kwargs)
-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
+        return self._forward_action_gen(cache_handle=cache_handle, **kwargs)
 
     def forward_batched(
         self,
@@ -627,45 +715,11 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         **kwargs, # coming from preprocess output
     )  -> dict[str, NameToTensorList]:
-        """Batched forward: process all requests in a single transformer pass.
-
-        Called by ``KVCacheEngine._execute_batched`` when ``can_batch()`` returns
-        True. ``packed_inputs`` comes from ``preprocess()`` which already
-        concatenated per-request tensors and planned attention/RoPE for the
-        full batch.
-        """
-
-        if graph_walk == "prefill":
-            return self._forward_prefill_batched(
-                cache_manager=engine_inputs.cache_manager,
-                request_ids=engine_inputs.request_ids,
-                **kwargs,
-            )
-        if graph_walk == "action_gen":
-            return self._forward_action_gen_batched(
-                cache_manager=engine_inputs.cache_manager,
-                request_ids=engine_inputs.request_ids,
-                **kwargs,
-            )
-        raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
-
-
-    def _forward_prefill_batched(
-        self,
-        cache_manager: BatchedCacheManager,
-        request_ids: list[str],
-        prefix_embs: torch.Tensor,
-        **kwargs,
-    ) -> dict[str, NameToTensorList]:
-        """Batched prefill: single PaliGemma forward over concatenated prefixes."""
-        cache_manager.set_active_label("main")
-        self.paligemma(
-            query_sequence=prefix_embs,
-            cache_handle=cache_manager,
-            write_cache=True,
+        return self._forward_action_gen_batched(
+            cache_manager=engine_inputs.cache_manager,
+            request_ids=engine_inputs.request_ids,
+            **kwargs,
         )
-        # Prefill produces no graph-edge outputs.
-        return {rid: {} for rid in request_ids}
 
     def _forward_action_gen_batched(
         self,
@@ -681,12 +735,13 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
 
         horizon = self.config.action_horizon
 
-        next_actions, next_index = self._euler_step(
-            noisy_actions, timestep_index,
-            fraction=fraction,
-            time_emb_buffer=time_emb_buffer,
-            cache_handle=cache_manager
-        )
+        for _ in range(self.config.num_flow_steps):
+            noisy_actions, timestep_index = self._euler_step(
+                noisy_actions, timestep_index,
+                fraction=fraction,
+                time_emb_buffer=time_emb_buffer,
+                cache_handle=cache_manager
+            )
 
         # Split back per-request by horizon.
         result: dict[str, NameToTensorList] = {}
@@ -694,25 +749,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             start = i * horizon
             end = start + horizon
             result[rid] = {
-                "noisy_actions": [next_actions[start:end]],
-                "timestep_index": [next_index[i:i+1]],
+                "actions": [noisy_actions[start:end]],
             }
         return result
-
-    def _forward_prefill(
-        self,
-        prefix_embs: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        **kwargs,
-    ) -> NameToTensorList:
-        if cache_handle is not None:
-            cache_handle.set_active_label("main")
-        self.paligemma(
-            query_sequence=prefix_embs,
-            cache_handle=cache_handle,
-            write_cache=True,
-        )
-        return {}
 
     def _forward_action_gen(
         self,
@@ -727,8 +766,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
 
         ``noisy_actions`` and ``timestep_index`` arrive as single-element
         lists from preprocess (to keep the data structure uniform with the
-        batched path). We unpack the first element, run one Euler step, and
-        return the loop-back edges.
+        batched path). We unpack the first element, run the full
+        ``num_flow_steps`` Euler denoising loop, and return the denoised action
+        tensor.
         """
         # Unpack from list form (preprocess always returns lists now).
         if isinstance(noisy_actions, list):
@@ -736,22 +776,15 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         if isinstance(timestep_index, list):
             timestep_index = timestep_index[0]
 
-        next_actions, next_index = self._euler_step(
-            noisy_actions, timestep_index,
-            fraction=fraction,
-            time_emb_buffer=time_emb_buffer,
-            cache_handle=cache_handle
-        )
-        # We ALWAYS return both loop-back edges, even on the final iteration.
-        # The Loop primitive (mstar/graph/base.py:Loop) handles the final-iter
-        # swap automatically: it matches the section's output ``noisy_actions``
-        # to the Loop's terminal output (also named ``noisy_actions``, but
-        # routed to EMIT_TO_CLIENT with ``output_modality="action"``) and
-        # filters out the ``timestep_index`` loop-back edge. Same convention
-        # BAGEL's image_gen uses for ``latents`` / ``time_index``.
+        for _ in range(self.config.num_flow_steps):
+            noisy_actions, timestep_index = self._euler_step(
+                noisy_actions, timestep_index,
+                fraction=fraction,
+                time_emb_buffer=time_emb_buffer,
+                cache_handle=cache_handle
+            )
         return {
-            "noisy_actions": [next_actions],
-            "timestep_index": [next_index],
+            "actions": [noisy_actions],
         }
 
     def _euler_step(
