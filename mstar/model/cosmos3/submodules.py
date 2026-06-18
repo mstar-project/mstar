@@ -276,20 +276,30 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             image = (inputs or {}).get("image_inputs")
             if image:
                 self._req[fwd_info.request_id]["cond_latents"] = self._encode_conditioning(
-                    image[0], height, width, num_frames, device
+                    image[0], height, width, num_frames, device, anchor_only=True
                 )
         return ARNodeInputs(input_seq_len=cond["und_len"])
 
-    def _encode_conditioning(self, image, height, width, num_frames, device):
+    def _encode_conditioning(self, image, height, width, num_frames, device, anchor_only=False):
         """VAE-encode a conditioning frame into clean anchor latents.
 
         Mirrors the fused pipeline's image-to-video latent prep: the frame is
         resized and normalized to [-1, 1], repeat-padded across the clip, and
         Wan-VAE encoded with the pipeline-side latent normalization. Latent
-        frame 0 is the clean anchor the denoise loop keeps fixed."""
+        frame 0 is the clean anchor the denoise loop keeps fixed.
+
+        Image-to-video only consumes latent frame 0, and the Wan VAE encodes
+        frame 0 as a standalone causal anchor, so ``anchor_only`` skips the
+        repeat-pad and encodes the single frame (a bit-identical frame 0)
+        instead of the whole clip — at video lengths the full encode is the
+        bulk of the conditioning cost. The encode runs in fp32 outside autocast:
+        the VAE's 3D convs are far faster in fp32 (TF32) than bf16 on this cuDNN
+        and the reference pipeline encodes in fp32 (matching the decoder)."""
         from diffusers.video_processor import VideoProcessor
 
         vae = self.vae
+        if next(vae.parameters()).dtype != torch.float32:
+            vae.float()
         dtype = self.transformer.proj_in.weight.dtype
         if self._video_processor is None:
             self._video_processor = VideoProcessor(
@@ -297,16 +307,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
         # load_image gives [C, H, W] in [0, 1]; preprocess -> [1, 3, H, W] in [-1, 1].
         frame = self._video_processor.preprocess(image, height=height, width=width).to(
-            device=device, dtype=dtype
+            device=device, dtype=torch.float32
         )
         vision = frame.unsqueeze(2)
-        if num_frames > 1:
+        if num_frames > 1 and not anchor_only:
             vision = vision.expand(-1, -1, num_frames, -1, -1)
-        mean = torch.tensor(vae.config.latents_mean, dtype=vae.dtype, device=device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae.dtype, device=device)).view(
+        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, -1, 1, 1, 1)
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device)).view(
             1, -1, 1, 1, 1
         )
-        raw_mu = vae.encode(vision.to(vae.dtype)).latent_dist.mode()
+        with torch.autocast(device_type=vision.device.type, enabled=False):
+            raw_mu = vae.encode(vision).latent_dist.mode()
         return ((raw_mu - mean) * inv_std).to(dtype)
 
     def _prepare_action_prefill(
@@ -401,6 +412,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         from diffusers.video_processor import VideoProcessor
 
         vae = self.vae
+        if next(vae.parameters()).dtype != torch.float32:
+            vae.float()
         dtype = self.transformer.proj_in.weight.dtype
         if self._video_processor is None:
             self._video_processor = VideoProcessor(
@@ -411,12 +424,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             self._video_processor.preprocess(clip[i], height=height, width=width).squeeze(0)
             for i in range(clip.shape[0])
         ]
-        vision = torch.stack(frames, dim=1).unsqueeze(0).to(device=device, dtype=dtype)  # [1,3,T,H,W]
-        mean = torch.tensor(vae.config.latents_mean, dtype=vae.dtype, device=device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae.dtype, device=device)).view(
+        # fp32 outside autocast: the VAE 3D convs are much faster in fp32 (TF32)
+        # than bf16 on this cuDNN, and the reference pipeline encodes in fp32.
+        vision = torch.stack(frames, dim=1).unsqueeze(0).to(device=device, dtype=torch.float32)  # [1,3,T,H,W]
+        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, -1, 1, 1, 1)
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device)).view(
             1, -1, 1, 1, 1
         )
-        raw_mu = vae.encode(vision.to(vae.dtype)).latent_dist.mode()
+        with torch.autocast(device_type=vision.device.type, enabled=False):
+            raw_mu = vae.encode(vision).latent_dist.mode()
         return ((raw_mu - mean) * inv_std).to(dtype)
 
     def _prepare_image_gen(self, fwd_info, inputs, device) -> ARNodeInputs:

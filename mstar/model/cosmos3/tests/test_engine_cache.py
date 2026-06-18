@@ -399,6 +399,26 @@ def test_dense_fa3_video_psnr() -> None:
 
 
 @torch.no_grad()
+def test_anchor_encode_matches_full() -> None:
+    """Image-to-video only consumes latent frame 0, and the Wan VAE encodes it as
+    a standalone causal anchor, so encoding the single conditioning frame
+    (anchor_only=True) must give a bit-identical frame 0 to encoding the whole
+    repeat-padded clip — at a fraction of the cost."""
+    base = _load()
+    if base is None:
+        print("  (skipped anchor-encode parity: needs COSMOS3_NANO_DIR + CUDA)")
+        return
+    dit, device = base["dit"], base["device"]
+    img = torch.rand(3, H, W, device=device)  # [C, H, W] in [0, 1], like load_image
+    anchor = dit._encode_conditioning(img, H, W, VIDEO_FRAMES, device, anchor_only=True)
+    full = dit._encode_conditioning(img, H, W, VIDEO_FRAMES, device, anchor_only=False)
+    assert anchor.shape[2] == 1, f"anchor_only must encode one latent frame, got T={anchor.shape[2]}"
+    diff = (anchor[:, :, 0].float() - full[:, :, 0].float()).abs().max().item()
+    assert diff < 1e-4, f"anchor frame-0 differs from full-clip frame-0 by {diff:.3e} (> 1e-4)"
+    print(f"  anchor-encode 1-frame vs full-clip frame-0 abs-max diff = {diff:.3e}")
+
+
+@torch.no_grad()
 def test_batched_cfg_matches_sequential() -> None:
     """Running both guidance branches in one batched forward must match running
     them sequentially. The two paths differ only in bf16 GEMM rounding (a batched
@@ -609,6 +629,7 @@ def _main() -> None:
         ("engine_cache_path_video_psnr", test_engine_cache_path_video_psnr),
         ("dense_fa3_image_psnr", test_dense_fa3_image_psnr),
         ("dense_fa3_video_psnr", test_dense_fa3_video_psnr),
+        ("anchor_encode_matches_full", test_anchor_encode_matches_full),
         ("cuda_graph_matches_eager", test_cuda_graph_matches_eager),
         ("cross_request_batch_matches_individual", test_cross_request_batch_matches_individual),
     ]:
