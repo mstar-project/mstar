@@ -378,17 +378,21 @@ class Cosmos3Model(Model):
 
         negative_prompt = kwargs.get("negative_prompt")
         p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
-        # Action prompts skip the image/video system prompt and the
-        # resolution/duration sentences — they are just the chat-templated user
-        # text plus the end-of-text + start-of-generation markers (matching the
-        # NVIDIA action references).
+        # The chat system prompt and the resolution/duration metadata sentences
+        # are opt-in, off by default: the model sees the bare user prompt, which
+        # matches the reference serving pipeline (its system-prompt and
+        # resolution/duration templates default off too). A request may re-enable
+        # any of them. Action prompts never use them — they are just the
+        # chat-templated user text plus the end-of-text + start-of-generation
+        # markers (matching the NVIDIA action references).
         is_action = "action" in output_modalities
+        allow_templates = not is_action
         cond_ids, uncond_ids = tokenize_prompt(
             self.tokenizer, prompt, negative_prompt,
             num_frames=p["num_frames"], height=p["height"], width=p["width"], fps=p["fps"],
-            use_system_prompt=not is_action,
-            add_resolution_template=not is_action,
-            add_duration_template=not is_action,
+            use_system_prompt=allow_templates and bool(kwargs.get("use_system_prompt", False)),
+            add_resolution_template=allow_templates and bool(kwargs.get("use_resolution_template", False)),
+            add_duration_template=allow_templates and bool(kwargs.get("use_duration_template", False)),
         )
         return {
             "text_inputs": [
@@ -400,6 +404,8 @@ class Cosmos3Model(Model):
     def postprocess(self, output: torch.Tensor, modality: str) -> bytes:
         if modality == "image":
             import io
+            import os
+            import time
 
             from PIL import Image
 
@@ -409,9 +415,22 @@ class Cosmos3Model(Model):
                 x = x[0, :, 0]
             elif x.ndim == 4:
                 x = x[0]
+            _prof = os.environ.get("COSMOS3_PROFILE")
+            _t0 = time.perf_counter()
             arr = x.permute(1, 2, 0).cpu().numpy()  # H, W, C uint8
+            _t1 = time.perf_counter()
             buf = io.BytesIO()
-            Image.fromarray(arr).save(buf, format="PNG")
+            # PNG is lossless at every compression level, so the level only trades
+            # encode time for file size. PIL defaults to 6, which spends ~0.75 s on a
+            # 720p frame and dominates the serving latency. Level 0 (no deflate) is
+            # the fastest and matches what the OpenAI image endpoint emits at full
+            # quality; the decoded pixels are identical regardless. Override with
+            # COSMOS3_PNG_COMPRESS for A/B.
+            compress_level = int(os.environ.get("COSMOS3_PNG_COMPRESS", "0"))
+            Image.fromarray(arr).save(buf, format="PNG", compress_level=compress_level)
+            if _prof:
+                print(f"COSMOS3_PROFILE png d2h={1000 * (_t1 - _t0):.1f}ms "
+                      f"encode={1000 * (time.perf_counter() - _t1):.1f}ms bytes={buf.tell()}", flush=True)
             return buf.getvalue()
         if modality == "video":
             import os
@@ -424,21 +443,38 @@ class Cosmos3Model(Model):
             # the temporal positions during generation); the container plays back
             # at the model's default fps.
             x = output[0] if output.ndim == 5 else output  # [C, T, H, W] uint8
+            _prof = os.environ.get("COSMOS3_PROFILE")
+            import time as _time
+            _vt0 = _time.perf_counter()
             frames = x.permute(1, 2, 3, 0).cpu()  # [T, H, W, C] uint8
+            _vt1 = _time.perf_counter()
             fd, path = tempfile.mkstemp(suffix=".mp4")
             os.close(fd)
             try:
                 # CRF 18 keeps the H.264 output near-visually-lossless; libx264
-                # otherwise defaults to 23, which is visibly lossier.
+                # otherwise defaults to 23, which is visibly lossier. The "ultrafast"
+                # preset and multithreading (threads=0) target the same CRF/quality
+                # but encode several times faster than libx264's default "medium"
+                # preset, which otherwise dominates the serving latency for a
+                # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
                 write_video(
                     path,
                     frames,
                     fps=self.config.fps,
                     video_codec="libx264",
-                    options={"crf": "18"},
+                    options={
+                        "crf": "18",
+                        "preset": os.environ.get("COSMOS3_X264_PRESET", "ultrafast"),
+                        "threads": "0",
+                    },
                 )
                 with open(path, "rb") as f:
-                    return f.read()
+                    data = f.read()
+                if _prof:
+                    print(f"COSMOS3_PROFILE mp4 d2h={1000 * (_vt1 - _vt0):.1f}ms "
+                          f"encode={1000 * (_time.perf_counter() - _vt1):.1f}ms frames={frames.shape[0]} "
+                          f"bytes={len(data)}", flush=True)
+                return data
             finally:
                 os.remove(path)
         if modality == "action":
@@ -513,6 +549,12 @@ class Cosmos3Model(Model):
         }
         if mk.get("flow_shift") is not None:
             params["flow_shift"] = float(mk["flow_shift"])
+        # Cosmos3's text-to-image recipe applies classifier-free guidance only on
+        # a timestep interval [lo, hi]; outside it the denoise step runs the
+        # conditional branch alone. Forwarded verbatim when the request sets it.
+        gi = mk.get("guidance_interval")
+        if gi is not None:
+            params["guidance_interval"] = (float(gi[0]), float(gi[1]))
         # Action requests carry a few extra keys straight through (``action`` is
         # the clean conditioning action chunk for forward-dynamics).
         for k in ("action_mode", "action_chunk_size", "raw_action_dim", "domain_id",
