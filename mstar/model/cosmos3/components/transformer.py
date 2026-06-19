@@ -14,8 +14,11 @@ The module mirrors the published diffusers checkpoint layout one-to-one, so the
 flat ``layers.N.*`` safetensors keys load with no key remapping beyond dropping
 the unused text ``lm_head``.
 
-UND and GEN run together in one fused pass every denoising step. Projections are
-plain ``nn.Linear`` here; tensor-parallel variants are a later concern.
+UND and GEN run together in one fused pass every denoising step. The attention
+and MLP projections are tensor-parallel: with a trivial (world-size-1) comm
+group they behave exactly like plain ``nn.Linear``; with a real group the
+q/k/v and gate/up projections are column-sharded along the head / intermediate
+dim and the out / down projections row-shard their input and all-reduce.
 """
 
 from __future__ import annotations
@@ -26,6 +29,12 @@ import torch
 import torch.nn.functional as F
 from diffusers.models.embeddings import Timesteps
 from torch import nn
+
+from mstar.distributed.communication import TPCommGroup
+from mstar.model.components.distributed.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 
 
 class RMSNorm(nn.Module):
@@ -116,13 +125,25 @@ class TimestepEmbedder(nn.Module):
 
 
 class Cosmos3MLP(nn.Module):
-    """SwiGLU feed-forward (``gate_proj``/``up_proj``/``down_proj``, no bias)."""
+    """SwiGLU feed-forward (``gate_proj``/``up_proj``/``down_proj``, no bias).
 
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    Tensor-parallel: ``gate_proj``/``up_proj`` are column-sharded along the
+    intermediate dim and ``down_proj`` row-shards its input and all-reduces.
+    A trivial comm group (world size 1) makes these plain linears.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        comm_group: TPCommGroup | None = None,
+    ):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        if comm_group is None:
+            comm_group = TPCommGroup.trivial()
+        self.gate_proj = ColumnParallelLinear(comm_group, hidden_size, intermediate_size, bias=False)
+        self.up_proj = ColumnParallelLinear(comm_group, hidden_size, intermediate_size, bias=False)
+        self.down_proj = RowParallelLinear(comm_group, intermediate_size, hidden_size, bias=False)
         self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -147,28 +168,40 @@ class Cosmos3PackedMoTAttention(nn.Module):
         num_key_value_heads: int,
         attention_bias: bool,
         rms_norm_eps: float,
+        comm_group: TPCommGroup | None = None,
     ):
         super().__init__()
+        if comm_group is None:
+            comm_group = TPCommGroup.trivial()
+        tp_size = comm_group.world_size
+        if num_attention_heads % tp_size or num_key_value_heads % tp_size:
+            raise ValueError(
+                f"TP size {tp_size} must divide both num_attention_heads "
+                f"({num_attention_heads}) and num_key_value_heads "
+                f"({num_key_value_heads})"
+            )
         self.head_dim = head_dim
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
+        # Per-rank head counts: TP shards the head dimension, so the q/k/v
+        # reshapes below operate on this rank's slice of heads.
+        self.num_attention_heads = num_attention_heads // tp_size
+        self.num_key_value_heads = num_key_value_heads // tp_size
 
         q_dim = num_attention_heads * head_dim
         kv_dim = num_key_value_heads * head_dim
 
         # Understanding pathway.
-        self.to_q = nn.Linear(hidden_size, q_dim, bias=attention_bias)
-        self.to_k = nn.Linear(hidden_size, kv_dim, bias=attention_bias)
-        self.to_v = nn.Linear(hidden_size, kv_dim, bias=attention_bias)
-        self.to_out = nn.Linear(q_dim, hidden_size, bias=attention_bias)
+        self.to_q = ColumnParallelLinear(comm_group, hidden_size, q_dim, bias=attention_bias)
+        self.to_k = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
+        self.to_v = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
+        self.to_out = RowParallelLinear(comm_group, q_dim, hidden_size, bias=attention_bias)
         self.norm_q = RMSNorm(head_dim, eps=rms_norm_eps)
         self.norm_k = RMSNorm(head_dim, eps=rms_norm_eps)
 
         # Generation pathway.
-        self.add_q_proj = nn.Linear(hidden_size, q_dim, bias=attention_bias)
-        self.add_k_proj = nn.Linear(hidden_size, kv_dim, bias=attention_bias)
-        self.add_v_proj = nn.Linear(hidden_size, kv_dim, bias=attention_bias)
-        self.to_add_out = nn.Linear(q_dim, hidden_size, bias=attention_bias)
+        self.add_q_proj = ColumnParallelLinear(comm_group, hidden_size, q_dim, bias=attention_bias)
+        self.add_k_proj = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
+        self.add_v_proj = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
+        self.to_add_out = RowParallelLinear(comm_group, q_dim, hidden_size, bias=attention_bias)
         self.norm_added_q = RMSNorm(head_dim, eps=rms_norm_eps)
         self.norm_added_k = RMSNorm(head_dim, eps=rms_norm_eps)
 
@@ -263,6 +296,7 @@ class Cosmos3MoTDecoderLayer(nn.Module):
         intermediate_size: int,
         attention_bias: bool,
         rms_norm_eps: float,
+        comm_group: TPCommGroup | None = None,
     ):
         super().__init__()
         self.self_attn = Cosmos3PackedMoTAttention(
@@ -272,9 +306,10 @@ class Cosmos3MoTDecoderLayer(nn.Module):
             num_key_value_heads=num_key_value_heads,
             attention_bias=attention_bias,
             rms_norm_eps=rms_norm_eps,
+            comm_group=comm_group,
         )
-        self.mlp = Cosmos3MLP(hidden_size, intermediate_size)
-        self.mlp_moe_gen = Cosmos3MLP(hidden_size, intermediate_size)
+        self.mlp = Cosmos3MLP(hidden_size, intermediate_size, comm_group=comm_group)
+        self.mlp_moe_gen = Cosmos3MLP(hidden_size, intermediate_size, comm_group=comm_group)
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.input_layernorm_moe_gen = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -347,7 +382,7 @@ class Cosmos3OmniTransformer(nn.Module):
     predicts flow velocity through ``proj_out`` and never decodes text logits.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, comm_group: TPCommGroup | None = None):
         super().__init__()
         self.config = config
         h = config.hidden_size
@@ -362,6 +397,7 @@ class Cosmos3OmniTransformer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 attention_bias=config.attention_bias,
                 rms_norm_eps=config.rms_norm_eps,
+                comm_group=comm_group,
             )
             for _ in range(config.num_hidden_layers)
         )
