@@ -264,6 +264,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "cond": cond,
             "uncond": uncond,
             "gs": gs,
+            "guidance_interval": md.get("guidance_interval"),
             "scheduler": self._new_scheduler(steps, device),
             "num_noisy": cond["num_noisy_vision_tokens"],
             "num_vision": cond["num_vision_tokens"],
@@ -631,6 +632,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
 
     def _forward_prefill(self, cm, st) -> dict:
+        _prof = os.environ.get("COSMOS3_PROFILE")
+        if _prof:
+            _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
+            _e0.record()
         cond = st["cond"]
         cm.set_active_label(COND_LABEL)
         self.transformer.prefill_und(cond["input_ids"], cond["text_mrope_ids"], cm)
@@ -638,6 +643,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             uncond = st["uncond"]
             cm.set_active_label(UNCOND_LABEL)
             self.transformer.prefill_und(uncond["input_ids"], uncond["text_mrope_ids"], cm)
+        if _prof:
+            _e1.record(); torch.cuda.synchronize()
+            logger.info("COSMOS3_PROFILE prefill %.1f ms", _e0.elapsed_time(_e1))
         return {}
 
     def _denoise(self, cm, static, latents, vision_timesteps):
@@ -662,7 +670,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         t = scheduler.timesteps[step_index]
         vision_timesteps = torch.full((st["num_noisy"],), t.item(), device=latents.device)
 
-        if st["uncond"] is None:
+        # Classifier-free guidance is applied only when an uncond branch exists
+        # (guidance_scale != 1) and, for the text-to-image recipe, only on the
+        # configured timestep interval. Outside the interval the step runs the
+        # conditional branch alone (cond-only velocity), matching the recipe.
+        gi = st.get("guidance_interval")
+        cfg_active = st["uncond"] is not None and (
+            gi is None or gi[0] <= float(t.item()) <= gi[1]
+        )
+
+        if not cfg_active:
             cm.set_active_label(COND_LABEL)
             velocity = self._denoise(cm, st["cond"], latents, vision_timesteps)
         elif self.batched_cfg:
@@ -1167,8 +1184,15 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
             1, -1, 1, 1, 1
         )
         z = latents.float() / inv_std + mean
+        _prof = os.environ.get("COSMOS3_PROFILE")
+        if _prof:
+            _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
+            _e0.record()
         with torch.autocast(device_type=z.device.type, enabled=False):
             decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
+        if _prof:
+            _e1.record(); torch.cuda.synchronize()
+            logger.info("COSMOS3_PROFILE vae_decode %.1f ms out=%s", _e0.elapsed_time(_e1), tuple(decoded.shape))
         # Quantize to 8-bit here (the output is an 8-bit image/mp4 either way) so
         # only the uint8 frames cross the SHM edge to the data worker, not a 4x
         # larger fp32 tensor — the decoded video transfer dominates the fixed cost
