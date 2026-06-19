@@ -164,6 +164,21 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             logger.info("Cosmos3 denoise compute torch.compile enabled")
 
+    def to(self, *args, **kwargs):
+        # The engine casts this submodule to bf16 (worker.engine_manager), which
+        # also casts the timestep embedder. Diffusers keeps that module in fp32
+        # (_keep_in_fp32_modules) and the reference pipeline computes the timestep
+        # embedding in fp32; the multi-step video denoise is sensitive to its
+        # precision (running it in bf16 perturbs the velocity enough to scramble
+        # the latents). Re-assert fp32 after any cast — paired with the
+        # autocast-disabled forward below so it actually runs in fp32. The upcast
+        # is lossless (the checkpoint weights are bf16).
+        super().to(*args, **kwargs)
+        te = getattr(self.transformer, "time_embedder", None)
+        if te is not None:
+            te.float()
+        return self
+
     def get_needed_cache_labels(
         self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
     ) -> list[str] | None:
@@ -620,6 +635,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # forward
     # ------------------------------------------------------------------
 
+    # Run the prefill/denoise in the model's native bf16, NOT under the engine's
+    # autocast. The fused reference pipeline runs the transformer in pure bf16;
+    # autocast keeps normalization in fp32, which perturbs the predicted velocity
+    # by ~1 ULP per step. A single image step stays well within tolerance, but the
+    # multi-step video denoise amplifies that perturbation geometrically into a
+    # scrambled latent. The cache-once engine path must reproduce the reference,
+    # so this submodule opts out of autocast (the VAE decoder does the same).
+    @torch.autocast(device_type="cuda", enabled=False)
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, **kwargs):
         cm = engine_inputs.cache_manager
         rid = engine_inputs.request_ids[0]
@@ -836,6 +859,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return self.max_gen_batch_size
         return None
 
+    # Native bf16, not the engine autocast — see the note on forward(). The
+    # cross-request batched denoise must match the per-request path exactly.
+    @torch.autocast(device_type="cuda", enabled=False)
     def forward_batched(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
         latents, time_index, action_latents=None, **kwargs,
