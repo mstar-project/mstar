@@ -9,6 +9,7 @@ from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
 MODEL_REGISTRY: dict[str, type[Model]] = {
     "bagel": BagelModel,
     "cosmos3": Cosmos3Model,
+    "cosmos3_super": Cosmos3Model,
     "orpheus": OrpheusModel,
     "pi05": Pi05Model,
     "qwen3_omni": Qwen3OmniModel,
@@ -20,6 +21,10 @@ HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
     # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
     "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
+    # Cosmos3-Super (64B) — same architecture + class; dims (64 layers / 5120
+    # hidden / 25600 intermediate) load from the checkpoint's config.json, so it
+    # needs tensor parallelism (it does not fit on one GPU).
+    "cosmos3_super": {"model_path_hf": "nvidia/Cosmos3-Super"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar

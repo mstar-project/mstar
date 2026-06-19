@@ -364,6 +364,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "qwen3_omni": Qwen3OmniAdapter(),
     "orpheus": OrpheusAdapter(),
     "cosmos3": Cosmos3Adapter(),
+    "cosmos3_super": Cosmos3Adapter(),
 }
 
 
