@@ -739,6 +739,35 @@ class Conductor:
             if graph_walk in self.worker_graphs[wg_id].graph_walks
         }
 
+    def _abort_request(self, request_id: str):
+        """Tear down a request the client abandoned, freeing its worker GPU state."""
+        for i, body in enumerate(self.waiting_queue):
+            if body.request_id == request_id:
+                self.waiting_queue.pop(i)
+                logger.info("Aborted request %s before admission", request_id)
+                return
+
+        request_data = self.requests.get(request_id)
+        if request_data is None:
+            return
+
+        workers = {
+            worker_id
+            for worker_ids in request_data.worker_graph_to_workers.values()
+            for worker_id in worker_ids
+        }
+        for worker_id in workers:
+            self.communicator.send(
+                worker_id,
+                WorkerMessage(
+                    message_type=WorkerMessageType.REMOVE_REQUEST,
+                    body=RemoveRequest(request_id),
+                ),
+            )
+        del self.requests[request_id]
+        logger.info("Aborted request %s; freed worker resources", request_id)
+        self._try_admit_waiting()
+
     def _process_request_done(
         self, request_id: str
     ):
@@ -1033,6 +1062,8 @@ class Conductor:
                 for message in startup_backlog + self.communicator.get_all_new_messages():
                     if message.message_type == ConductorMessageType.NEW_REQUEST:
                         self._ingest_request(message.body)
+                    elif message.message_type == ConductorMessageType.ABORT_REQUEST:
+                        self._abort_request(message.body.request_id)
                     elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
                         rid = message.body.request_id
                         if rid not in self.requests:

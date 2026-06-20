@@ -20,6 +20,7 @@ from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.model.base import Model
 from mstar.utils.ipc_format import (
+    AbortRequest,
     ConductorMessage,
     ConductorMessageType,
     NewRequestConductor,
@@ -51,6 +52,7 @@ class PreprocessWorker:
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
+        self.abort_request_queue = queue.Queue()
         self.output_queue = queue.Queue()
         self.stop_event = threading.Event()
 
@@ -64,6 +66,7 @@ class PreprocessWorker:
                 result_tensor_queue=self.result_tensor_input_queue,
                 out_queue=self.output_queue,
                 cleanup_request_queue=self.cleanup_request_queue,
+                abort_request_queue=self.abort_request_queue,
                 stop_event=self.stop_event,
                 hostname=hostname,
                 socket_path_prefix=socket_path_prefix,
@@ -78,6 +81,9 @@ class PreprocessWorker:
         self.output_loop_idxs[input.request_id] = {}
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
+
+    def abort_request(self, request_id: str):
+        self.abort_request_queue.put(request_id)
 
     def new_result_tensors(self, input: ResultTensors):
         name = input.graph_edge.name
@@ -123,8 +129,8 @@ class PreprocessWorker:
 
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
-        del self.output_loop_idxs[request_id]
-        del self.per_request_reading_tensors[request_id]
+        self.output_loop_idxs.pop(request_id, None)
+        self.per_request_reading_tensors.pop(request_id, None)
 
     def shutdown(self):
         self.stop_event.set()
@@ -139,6 +145,7 @@ class PreprocessWorkerThread:
         result_tensor_queue: queue.Queue, # for output streaming
         out_queue: queue.Queue,
         cleanup_request_queue: queue.Queue,
+        abort_request_queue: queue.Queue,
         stop_event: threading.Event,
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mstar",
@@ -150,6 +157,7 @@ class PreprocessWorkerThread:
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
         self.cleanup_request_queue = cleanup_request_queue
+        self.abort_request_queue = abort_request_queue
         self.out_queue = out_queue
 
         self.stop_event = stop_event
@@ -348,6 +356,15 @@ class PreprocessWorkerThread:
                 if not self.result_tensor_queue.empty():
                     did_work = True
                     self._read_result_tensor(self.result_tensor_queue.get())
+                if not self.abort_request_queue.empty():
+                    did_work = True
+                    self.communicator.send(
+                        "conductor",
+                        ConductorMessage(
+                            message_type=ConductorMessageType.ABORT_REQUEST,
+                            body=AbortRequest(request_id=self.abort_request_queue.get()),
+                        ),
+                    )
                 if not self.cleanup_request_queue.empty():
                     did_work = True
                     req_id = self.cleanup_request_queue.get()
