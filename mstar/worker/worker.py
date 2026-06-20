@@ -270,6 +270,9 @@ class Worker:
         self._in_flight_rids: set[str] = set()
         self._pending_removes: set[str] = set()
         self._pending_loop_stops: set[PendingLoopStop] = set()
+        # Let the scheduler see deferred removes so it stops initiating new work
+        # for those rids (shared by reference — mutations are visible to both).
+        self.scheduler.pending_removes = self._pending_removes
 
         # Side stream for D→H copies in postprocess (check_stop pre-materialize).
         # The default stream has GPU(N+1) queued behind GPU(N)'s outputs after

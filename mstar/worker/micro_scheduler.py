@@ -71,6 +71,9 @@ class MicroScheduler:
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[str, float] = {}
+        # Rids with a deferred remove; stop initiating new work for them.
+        # Shared by reference with Worker._pending_removes.
+        self.pending_removes: set[str] = set()
 
     def _select_node_priority(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
@@ -226,6 +229,8 @@ class MicroScheduler:
             for request_id, node_names in ready_map.items():
                 if request_id not in worker_graphs_manager.per_request_info:
                     continue  # request was removed between scheduling cycles
+                if request_id in self.pending_removes:
+                    continue  # remove deferred for in-flight safety; don't start new work
                 # Skip requests in OOM backoff
                 if request_id in self.held_until:
                     continue
