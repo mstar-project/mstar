@@ -1265,16 +1265,19 @@ class TalkerSubmodule(ARNodeSubmodule):
         constant tensors during model init.
         """
         device = next(self.model.parameters()).device
+        # The Thinker embedding table may be fp32 while the Talker runs in
+        # autocast dtype; match text_projection's weight dtype before projecting.
+        proj_dtype = self.model.text_projection.linear_fc1.weight.dtype
         with torch.no_grad():
             pad_raw = thinker_embed_tokens(
                 torch.tensor([self.config.tts_pad_token_id], device=device)
-            )
+            ).to(proj_dtype)
             bos_raw = thinker_embed_tokens(
                 torch.tensor([self.config.tts_bos_token_id], device=device)
-            )
+            ).to(proj_dtype)
             eos_raw = thinker_embed_tokens(
                 torch.tensor([self.config.tts_eos_token_id], device=device)
-            )
+            ).to(proj_dtype)
             self._tts_pad_embed_cached = self.model.text_projection(pad_raw).squeeze(0)
             self._tts_bos_embed_cached = self.model.text_projection(bos_raw).squeeze(0)
             self._tts_eos_embed_cached = self.model.text_projection(eos_raw).squeeze(0)
