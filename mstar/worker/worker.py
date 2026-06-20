@@ -29,6 +29,7 @@ from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
     InputSignals,
+    MessageSource,
     NewRequest,
     RemoveRequest,
     ScheduleTPNode,
@@ -230,6 +231,9 @@ class Worker:
                 f"Multiple TP nodes {self.tp_nodes} found in worker {worker_id}; "
                 "current implementation requires at most one TP node per worker."
             )
+
+        self.is_tp_follower = len(self.tp_nodes - self.tp_rank_zero_nodes) > 0
+
         self.scheduler = MicroScheduler(
             self.engine_manager,
             tp_rank_zero_nodes=self.tp_rank_zero_nodes
@@ -434,6 +438,9 @@ class Worker:
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
+        if self.is_tp_follower and body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
+            return # wait for removal message from TP rank 0 to avoid race conditions
+
         # Async-scheduling deferral: if this rid is currently held by an
         # in-flight GPU step (or its speculation), tearing down engine /
         # tensor state now would race the GPU thread reading those tensors
@@ -443,6 +450,30 @@ class Worker:
         if body.request_id in getattr(self, "_in_flight_rids", set()):
             self._pending_removes.add(body.request_id)
             return
+
+        # If we are the TP leader for this request, signal the followers to
+        # remove it too. Followers defer removal until they get this message
+        # (see the guard at the top of this method) so they can't tear down
+        # state we're still reading from an in-flight step/speculation.
+        cfg = self.worker_graphs_manager.per_request_info.get(body.request_id)
+        if cfg is not None:
+            followers: set[str] = set()
+            for group in cfg.sharding_config.groups:
+                # _workers is rank-ordered; index 0 is this worker when we are
+                # rank 0. Only real TP groups (tp_size > 1) have followers.
+                if group.tp_size > 1 and group._tp_rank == 0:
+                    followers.update(group._workers[1:])
+            for worker in followers:
+                self.communicator.send(
+                    worker, msg=WorkerMessage(
+                        message_type=WorkerMessageType.REMOVE_REQUEST,
+                        body=RemoveRequest(
+                            request_id=body.request_id,
+                            source=MessageSource.TP_RANK_0,
+                        )
+                    )
+                )
+
         self.engine_manager.remove_request(body.request_id)
         self.worker_graphs_manager.remove_request(body.request_id)
         self.tensor_manager.cleanup_request(body.request_id)
@@ -1883,7 +1914,7 @@ class Worker:
         to_apply = [r for r in self._pending_removes if r not in in_flight_rids]
         for rid in to_apply:
             self._pending_removes.discard(rid)
-            self._remove_request(RemoveRequest(request_id=rid))
+            self._remove_request(RemoveRequest(request_id=rid, source=MessageSource.SELF))
 
     def run(self) -> None:
         switch_interval = os.environ.get("MSTAR_PY_SWITCH_INTERVAL_SEC", "")
