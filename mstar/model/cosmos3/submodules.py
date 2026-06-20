@@ -280,7 +280,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "uncond": uncond,
             "gs": gs,
             "guidance_interval": md.get("guidance_interval"),
-            "scheduler": self._new_scheduler(steps, device),
+            "scheduler": self._new_scheduler(steps, device, flow_shift=md.get("flow_shift")),
             "num_noisy": cond["num_noisy_vision_tokens"],
             "num_vision": cond["num_vision_tokens"],
             "latent_shape": self._latent_shape(height, width, num_frames),
@@ -525,10 +525,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # preprocess: plan paged attention for the labels this walk touches.
     # ------------------------------------------------------------------
 
-    def _plan_gen(self, cm, st, num_gen: int) -> None:
+    def _plan_gen(self, cm, st, num_gen: int, cfg_active: bool = True) -> None:
         """Plan a denoise step's non-causal attention: one batched plan covering
-        both guidance branches when they run together, else a plan per label."""
-        if st["uncond"] is None:
+        both guidance branches when they run together, else a plan per label.
+        ``cfg_active`` False (a guidance_interval out-of-interval step, or
+        gs==1) plans the conditional branch alone — matching the cond-only
+        forward — so an interval step costs no wasted uncond/batched plan."""
+        if st["uncond"] is None or not cfg_active:
             cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=COND_LABEL, write_store=False)
         elif self.batched_cfg:
             cm.plan_attention_batched_cfg(
@@ -593,10 +596,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
                     "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs, strict=True)},
                 }
-            self._plan_gen(cm, st, st["num_vision"])
+            ti = inputs[0].tensor_inputs["time_index"]
+            step_index = int(ti.reshape(-1)[0].item())
+            self._plan_gen(
+                cm, st, st["num_vision"], cfg_active=self._cfg_active(st, step_index)
+            )
             return {
                 "latents": inputs[0].tensor_inputs["latents"],
-                "time_index": inputs[0].tensor_inputs["time_index"],
+                "time_index": ti,
             }
 
         if graph_walk in ACTION_WALKS:
@@ -682,6 +689,24 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cm,
         )
 
+    def _cfg_active(self, st, step_index: int) -> bool:
+        """Whether this denoise step runs classifier-free guidance (both
+        branches combined). False ⇒ the conditional branch runs alone — the
+        guidance_scale==1 case and, for the t2i recipe, steps whose timestep
+        falls outside the guidance_interval [lo, hi]. ``preprocess`` and
+        ``_forward_image_gen`` both call this for the same step so the planned
+        attention (batched vs cond-only) matches the forward that runs."""
+        if st["uncond"] is None:
+            return False
+        gi = st.get("guidance_interval")
+        if gi is None:
+            return True
+        sched = st["scheduler"]
+        if step_index >= len(sched.timesteps):
+            return False
+        t = float(sched.timesteps[step_index].item())
+        return gi[0] <= t <= gi[1]
+
     def _forward_image_gen(self, cm, st, latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
@@ -697,10 +722,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # (guidance_scale != 1) and, for the text-to-image recipe, only on the
         # configured timestep interval. Outside the interval the step runs the
         # conditional branch alone (cond-only velocity), matching the recipe.
-        gi = st.get("guidance_interval")
-        cfg_active = st["uncond"] is not None and (
-            gi is None or gi[0] <= float(t.item()) <= gi[1]
-        )
+        cfg_active = self._cfg_active(st, step_index)
 
         if not cfg_active:
             cm.set_active_label(COND_LABEL)

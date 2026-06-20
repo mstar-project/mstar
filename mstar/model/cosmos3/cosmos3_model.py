@@ -547,12 +547,21 @@ class Cosmos3Model(Model):
             "num_inference_steps": steps,
             "has_image_condition": "image" in (input_modalities or []),
         }
-        if mk.get("flow_shift") is not None:
-            params["flow_shift"] = float(mk["flow_shift"])
-        # Cosmos3's text-to-image recipe applies classifier-free guidance only on
-        # a timestep interval [lo, hi]; outside it the denoise step runs the
-        # conditional branch alone. Forwarded verbatim when the request sets it.
+        # Text-to-image (single frame, no visual conditioning) follows the
+        # reference Cosmos3 t2i recipe: classifier-free guidance only on the
+        # timestep interval [400, 1000] (outside it the denoise step runs the
+        # conditional branch alone) and flow_shift 3.0. Request kwargs override;
+        # video / image-conditioned paths keep their own defaults (full CFG,
+        # scheduler-config flow_shift).
+        is_t2i = num_frames == 1 and not params["has_image_condition"]
+        fs = mk.get("flow_shift")
+        if fs is None and is_t2i:
+            fs = 3.0
+        if fs is not None:
+            params["flow_shift"] = float(fs)
         gi = mk.get("guidance_interval")
+        if gi is None and is_t2i:
+            gi = (400.0, 1000.0)
         if gi is not None:
             params["guidance_interval"] = (float(gi[0]), float(gi[1]))
         # Action requests carry a few extra keys straight through (``action`` is
