@@ -1034,11 +1034,23 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         self._capture_layout: dict[tuple, dict] = {}
         configs = []
         for height, width in resolutions:
+            latent_shape = self._latent_shape(height, width, num_frames=1)
+            # patchify-2 pads an odd latent height/width (e.g. 720p: 720 // 16 =
+            # 45 -> pad to 46), and the captured/replayed padded layout produces
+            # degraded output (clean on the left, scrambled on the right). Skip
+            # capture for such resolutions; they fall back to the eager path,
+            # which is clean and ~as fast at these compute-bound tiers.
+            if latent_shape[3] % 2 or latent_shape[4] % 2:
+                logger.info(
+                    "Cosmos3: skipping CUDA-graph capture for %dx%d "
+                    "(odd latent dim %s -> patchify pad -> eager fallback)",
+                    height, width, tuple(latent_shape[3:]),
+                )
+                continue
             static = self._build_static(
                 [0] * 8, height, width, num_frames=1, fps=24.0,
                 has_image_condition=False, device=device,
             )
-            latent_shape = self._latent_shape(height, width, num_frames=1)
             num_vision = static["num_vision_tokens"]
             num_noisy = static["num_noisy_vision_tokens"]
             self._capture_layout[tuple(latent_shape)] = {
