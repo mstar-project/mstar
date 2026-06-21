@@ -325,10 +325,14 @@ class APIServer:
                                     message.body.final_outputs
                         elif rid in self.recently_completed:
                             logger.debug("Late message for completed %s: %s", rid, message.message_type)
+                            if message.message_type == "result_tensors":
+                                self.preprocess_worker.discard_result_tensors(message.body)
                         else:
                             logger.warning(
                                 "Message for unknown request %s: %s", rid, message.message_type
                             )
+                            if message.message_type == "result_tensors":
+                                self.preprocess_worker.discard_result_tensors(message.body)
                 for result_chunk in self.preprocess_worker.get_result_chunks():
                     logger.debug(
                         "Got result chunk of %s modality for request %s",
