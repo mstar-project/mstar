@@ -596,7 +596,10 @@ class Worker:
             WorkerMessageType.INPUT_SIGNALS,
             WorkerMessageType.STOP_LOOPS
         ]
-        for message in messages:
+        # Snapshot: a REMOVE handled mid-iteration can re-buffer trailing
+        # signals onto this same list, and mutating it while iterating it would
+        # never terminate.
+        for message in list(messages):
             if (
                 message.message_type in msg_types_needing_active_request and \
                 message.body.request_id not in self.worker_graphs_manager.per_request_info
