@@ -233,6 +233,20 @@ class BatchedCacheManager:
                     range_push("cache.plan_attention.skipped_pre_planned", synchronize=False)
                     range_pop(synchronize=False)
                 return
+            if (_dense_gen_attn_enabled() and not is_causal
+                    and not self._cuda_graph_mode):
+                # Lean dense generation-attention path: the gen K/V is never
+                # written to pages and attention is one varlen FA3 over the
+                # frozen prefix + fresh gen, so the whole paged-FlashInfer plan
+                # (per-step page alloc, index tensors, and wrapper.plan()'s
+                # radix-sort/fills) is dead work — _run_dense_gen reads none of
+                # it. Build only the dense gather/varlen plan.
+                ps = self._plan_states.get(effective_label) or _PlanState()
+                self._plan_states[effective_label] = ps
+                ps.seq_lens = seq_lens
+                ps.write_store = write_store
+                ps.dense_gen = self._build_dense_gen_plan([effective_label], seq_lens)
+                return
             self._plan_attention_impl(
                 seq_lens=seq_lens,
                 dtype=dtype,
@@ -566,6 +580,19 @@ class BatchedCacheManager:
         """
         assert self.kv_cache is not None
 
+        if (_dense_gen_attn_enabled() and not is_causal
+                and not self._cuda_graph_mode):
+            # Lean dense generation-attention path (see plan_attention): skip the
+            # paged-FlashInfer plan (per-label page alloc, index tensors, and
+            # wrapper.plan()'s radix-sort/fills) — _run_dense_gen reads none of
+            # it. Build only the per-segment dense gather/varlen plan.
+            ps = self._plan_states.get(combined_label) or _PlanState()
+            self._plan_states[combined_label] = ps
+            ps.seq_lens = seq_lens
+            ps.write_store = write_store
+            ps.dense_gen = self._build_dense_gen_plan(labels, seq_lens)
+            return
+
         cfg = self.kv_cache_config
         page_size = cfg.page_size
         num_kv_heads = cfg.num_kv_heads
@@ -779,7 +806,10 @@ class BatchedCacheManager:
                 idx = torch.tensor(
                     state.page_indices[:n_pages], dtype=torch.long, device=self.device
                 )
-                segs.append((idx, prefix_len, gen_len))
+                # Carry the persistent KVRequestState so run_attention can cache
+                # the gathered frozen prefix on it across denoise steps (the
+                # manager itself is rebuilt every forward).
+                segs.append((idx, prefix_len, gen_len, state))
                 cu_q.append(cu_q[-1] + gen_len)
                 cu_k.append(cu_k[-1] + prefix_len + gen_len)
                 max_q = max(max_q, gen_len)
@@ -796,11 +826,13 @@ class BatchedCacheManager:
     def _run_dense_gen(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_idx: int, dg: dict
     ) -> torch.Tensor:
-        """Dense generation attention: per segment, gather the frozen text-prefix
-        K/V from the paged cache, concatenate it with this segment's fresh K/V,
-        and attend non-causally with one FlashAttention-3 varlen kernel. Bypasses
-        the paged write entirely (the generation K/V is recomputed every step, so
-        persisting it is wasted work)."""
+        """Dense generation attention: per segment, take the frozen text-prefix
+        K/V, concatenate it with this segment's fresh K/V, and attend
+        non-causally with one FlashAttention-3 varlen kernel. Bypasses the paged
+        write entirely (the generation K/V is recomputed every step, so
+        persisting it is wasted work). The frozen prefix is gathered from the
+        paged cache once per layer and cached on the request state, then reused
+        across denoise steps (it never changes during denoise)."""
         from fa3_fwd_interface import flash_attn_varlen_func
 
         cfg = self.kv_cache_config
@@ -809,11 +841,21 @@ class BatchedCacheManager:
 
         k_parts, v_parts = [], []
         offset = 0
-        for idx, prefix_len, gen_len in dg["segs"]:
-            sub = kv_layer[idx]  # [n_pages, 2, page_size, num_kv_heads, head_dim]
-            k_parts.append(sub[:, 0].reshape(-1, num_kv_heads, head_dim)[:prefix_len])
+        for idx, prefix_len, gen_len, state in dg["segs"]:
+            prefix_cache = state.dense_prefix_kv
+            if prefix_cache is None:
+                prefix_cache = state.dense_prefix_kv = {}
+            cached = prefix_cache.get(layer_idx)
+            if cached is None:
+                sub = kv_layer[idx]  # [n_pages, 2, page_size, num_kv_heads, head_dim]
+                k_pref = sub[:, 0].reshape(-1, num_kv_heads, head_dim)[:prefix_len].clone()
+                v_pref = sub[:, 1].reshape(-1, num_kv_heads, head_dim)[:prefix_len].clone()
+                prefix_cache[layer_idx] = (k_pref, v_pref)
+            else:
+                k_pref, v_pref = cached
+            k_parts.append(k_pref)
             k_parts.append(k[offset:offset + gen_len])
-            v_parts.append(sub[:, 1].reshape(-1, num_kv_heads, head_dim)[:prefix_len])
+            v_parts.append(v_pref)
             v_parts.append(v[offset:offset + gen_len])
             offset += gen_len
         key = torch.cat(k_parts, dim=0)
