@@ -10,13 +10,11 @@ from __future__ import annotations
 
 import base64
 
-from starlette.concurrency import run_in_threadpool
-
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, now, rid, sse
 
 
-async def create_chat_completion(api, model_name, adapter, req):
+async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     args = adapter.chat_to_request(req, api.upload_dir)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
@@ -33,7 +31,7 @@ async def create_chat_completion(api, model_name, adapter, req):
 
     if req.stream:
         return _stream(api, model_name, request_id, sample_rate)
-    chunks = await run_in_threadpool(api.collect_results, request_id)
+    chunks = await api.collect_results(request_id, raw_request)
     return _build_response(model_name, request_id, chunks, sample_rate)
 
 

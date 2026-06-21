@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
@@ -325,10 +325,14 @@ class APIServer:
                                     message.body.final_outputs
                         elif rid in self.recently_completed:
                             logger.debug("Late message for completed %s: %s", rid, message.message_type)
+                            if message.message_type == "result_tensors":
+                                self.preprocess_worker.discard_result_tensors(message.body)
                         else:
                             logger.warning(
                                 "Message for unknown request %s: %s", rid, message.message_type
                             )
+                            if message.message_type == "result_tensors":
+                                self.preprocess_worker.discard_result_tensors(message.body)
                 for result_chunk in self.preprocess_worker.get_result_chunks():
                     logger.debug(
                         "Got result chunk of %s modality for request %s",
@@ -360,42 +364,46 @@ class APIServer:
         pre-serialized line).
         """
         start = time.time()
-        while True:
-            if time.time() - start > self.timeout_seconds:
-                with self.request_lock:
-                    self.pending_requests.pop(request_id, None)
-                raise HTTPException(status_code=500, detail="Request timed out")
+        finished = False
+        try:
+            while True:
+                if time.time() - start > self.timeout_seconds:
+                    raise HTTPException(status_code=500, detail="Request timed out")
 
-            new_chunks: list[ResultChunk] = []
-            done = False
-            with self.request_lock:
-                req = self.pending_requests.get(request_id)
-                if req:
-                    avail = len(req["chunks"])
-                    consumed = req["consumed_chunks"]
-                    new_chunks = req["chunks"][consumed:avail]
-                    req["consumed_chunks"] = avail
-                    done = req["event"].is_set()
-                else:
-                    done = True
-
-            for chunk in new_chunks:
-                yield chunk
-
-            if done:
-                logger.info("Async stream results received finish for %s", request_id)
-                # flush remaining
-                remaining: list[ResultChunk] = []
+                new_chunks: list[ResultChunk] = []
+                done = False
                 with self.request_lock:
                     req = self.pending_requests.get(request_id)
                     if req:
-                        remaining = req["chunks"][req["consumed_chunks"]:]
-                        self.pending_requests.pop(request_id, None)
-                for chunk in remaining:
-                    yield chunk
-                break
+                        avail = len(req["chunks"])
+                        consumed = req["consumed_chunks"]
+                        new_chunks = req["chunks"][consumed:avail]
+                        req["consumed_chunks"] = avail
+                        done = req["event"].is_set()
+                    else:
+                        done = True
 
-            await asyncio.sleep(0.001)
+                for chunk in new_chunks:
+                    yield chunk
+
+                if done:
+                    logger.info("Async stream results received finish for %s", request_id)
+                    # flush remaining
+                    remaining: list[ResultChunk] = []
+                    with self.request_lock:
+                        req = self.pending_requests.get(request_id)
+                        if req:
+                            remaining = req["chunks"][req["consumed_chunks"]:]
+                            self.pending_requests.pop(request_id, None)
+                    for chunk in remaining:
+                        yield chunk
+                    finished = True
+                    break
+
+                await asyncio.sleep(0.001)
+        finally:
+            if not finished:
+                self.abort_request(request_id)
 
     async def async_stream_results(self, request_id: str):
         """Yield NDJSON lines as result chunks arrive (``/generate`` format)."""
@@ -411,28 +419,46 @@ class APIServer:
         }) + "\n"
 
     # ----------------------------------------------------------
-    # Blocking helper (non-streaming)
+    # Non-streaming helper
     # ----------------------------------------------------------
 
-    def collect_results(self, request_id: str) -> list[ResultChunk]:
-        """Block until the request completes, then return all chunks."""
-        with self.request_lock:
-            req = self.pending_requests.get(request_id)
-            if not req:
-                raise HTTPException(
-                    status_code=404, detail=f"Request {request_id} not found"
-                )
-            event = req["event"]
-
-        if not event.wait(timeout=self.timeout_seconds):
+    async def collect_results(
+        self, request_id: str, raw_request: Request | None = None
+    ) -> list[ResultChunk]:
+        """Wait for the request to finish (or the client to disconnect), then
+        return its chunks. Disconnecting or timing out releases engine state."""
+        start = time.time()
+        while True:
             with self.request_lock:
-                self.pending_requests.pop(request_id, None)
-            raise HTTPException(status_code=500, detail="Request timed out")
+                req = self.pending_requests.get(request_id)
+                done = req["event"].is_set() if req else True
+            if done:
+                break
+            if time.time() - start > self.timeout_seconds:
+                self.abort_request(request_id)
+                raise HTTPException(status_code=500, detail="Request timed out")
+            if raw_request is not None and await raw_request.is_disconnected():
+                self.abort_request(request_id)
+                return []
+            await asyncio.sleep(0.005)
 
         with self.request_lock:
-            chunks = self.pending_requests[request_id]["chunks"][:]
+            req = self.pending_requests.pop(request_id, None)
+            return list(req["chunks"]) if req else []
+
+    def abort_request(self, request_id: str) -> None:
+        """Stop GPU work for a request the client abandoned and drop its state."""
+        with self.request_lock:
+            active = (
+                request_id in self.pending_requests
+                or request_id in self.recently_completed
+            )
             self.pending_requests.pop(request_id, None)
-        return chunks
+            self.recently_completed.pop(request_id, None)
+        if not active:
+            return
+        logger.info("Client cancelled request %s; releasing resources", request_id)
+        self.preprocess_worker.abort_request(request_id)
 
     # ----------------------------------------------------------
     # Cleanup
@@ -472,6 +498,7 @@ app.include_router(openai_router)
 
 @app.post("/generate")
 async def generate(
+    request: Request,
     text: Optional[str] = Form(None),
     files: Optional[list[UploadFile]] = File(None),
     input_modalities: Optional[str] = Form(None),
@@ -547,9 +574,7 @@ async def generate(
                 headers={"Cache-Control": "no-cache"},
             )
 
-        chunks = await run_in_threadpool(
-            api_server.collect_results, request_id
-        )
+        chunks = await api_server.collect_results(request_id, request)
         outputs: dict[str, list[dict]] = {}
         for chunk in chunks:
             outputs.setdefault(chunk.modality, []).append({

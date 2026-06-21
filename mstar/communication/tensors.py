@@ -589,6 +589,16 @@ class TensorCommunicationManager(ABC):
                 ),
             )
 
+    def ack_unread_tensors(
+        self, request_id: str, graph_edges: list[GraphEdge],
+    ):
+        """Ack result tensors for an already-removed request without reading them.
+
+        The producer holds these output buffers until it gets the
+        TENSOR_RECEIVED ack; emit it here so it can reclaim them.
+        """
+        self._collect_and_send_acks(request_id, graph_edges)
+
     def get_ready_tensors(self, graph_walk: str | None=None) -> dict[str, list[GraphEdge]]:
         ready: dict[str, list[GraphEdge]] = {}
         still_pending = []

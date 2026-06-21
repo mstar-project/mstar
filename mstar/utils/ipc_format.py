@@ -1,5 +1,5 @@
 from dataclasses import asdict, dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 
 from mstar.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
@@ -45,9 +45,15 @@ class NewRequest(MessageBody):
     request_info: CurrentForwardPassInfo
 
 
+class MessageSource(IntEnum):
+    CONDUCTOR = 0
+    TP_RANK_0 = 1
+    SELF = 2
+
 @dataclass
 class RemoveRequest(MessageBody):
     request_id: str
+    source: int = MessageSource.CONDUCTOR
 
 
 @dataclass
@@ -99,6 +105,7 @@ class ConductorMessageType(Enum):
     NEW_REQUEST = "new_request"
     WORKER_GRAPHS_DONE = "worker_graphs_done"
     SETUP_DONE = "setup_done"
+    ABORT_REQUEST = "abort_request"
 
 
 @dataclass
@@ -129,6 +136,12 @@ class WorkerGraphsDone(MessageBody):
 @dataclass
 class SetupDone(MessageBody):
     worker_id: str
+
+
+@dataclass
+class AbortRequest(MessageBody):
+    request_id: str
+
 
 @dataclass
 class ConductorMessage:

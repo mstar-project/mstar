@@ -8,13 +8,12 @@ the audio is produced.
 from __future__ import annotations
 
 from fastapi.responses import Response, StreamingResponse
-from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import rid
 
 
-async def create_speech(api, model_name, adapter, req):  # noqa: ARG001
+async def create_speech(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
     args = adapter.speech_to_request(req, api.upload_dir)
     request_id = rid("speech")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
@@ -37,7 +36,7 @@ async def create_speech(api, model_name, adapter, req):  # noqa: ARG001
             headers={"Cache-Control": "no-cache"},
         )
 
-    chunks = await run_in_threadpool(api.collect_results, request_id)
+    chunks = await api.collect_results(request_id, raw_request)
     pcm = b"".join(c.data for c in chunks if c.modality == "audio")
     audio_bytes, mime = media_io.pcm16_to_container(pcm, sample_rate, fmt)
     return Response(content=audio_bytes, media_type=mime)
