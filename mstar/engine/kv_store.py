@@ -120,6 +120,16 @@ class KVRequestState:
     # sequence length of the in-distributed-store KV cache
     is_paused: bool = False
 
+    # Lazily-filled {layer_idx: (k_pref, v_pref)} contiguous copies of the frozen
+    # text-prefix K/V, used by the dense generation-attention path. The prefix is
+    # written once at prefill and immutable through denoise (text tokens get no
+    # timestep embedding; the dense path never writes generation K/V to pages), so
+    # it is gathered once and reused across steps rather than re-gathered from the
+    # paged cache every step. Reset to None by _new_state()
+    # (add_request/reset_label/remove_request) — exactly when the prefix pages are
+    # (re)allocated — so it needs no manual invalidation.
+    dense_prefix_kv: dict | None = None
+
     def get_pos_info(self):
         return PositionInfo(
             full_seq_len=self.seq_len,
