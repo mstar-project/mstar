@@ -749,6 +749,7 @@ class Conductor:
 
         request_data = self.requests.get(request_id)
         if request_data is None:
+            logger.info("Abort for request %s ignored; already finished or unknown", request_id)
             return
 
         workers = {

@@ -459,7 +459,6 @@ class APIServer:
             return
         logger.info("Client cancelled request %s; releasing resources", request_id)
         self.preprocess_worker.abort_request(request_id)
-        self.preprocess_worker.cleanup_request(request_id)
 
     # ----------------------------------------------------------
     # Cleanup

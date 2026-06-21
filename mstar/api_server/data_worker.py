@@ -86,6 +86,7 @@ class PreprocessWorker:
 
     def abort_request(self, request_id: str):
         self.abort_request_queue.put(request_id)
+        self.cleanup_request(request_id)
 
     def new_result_tensors(self, input: ResultTensors):
         name = input.graph_edge.name
