@@ -282,7 +282,7 @@ class Cosmos3Model(Model):
                             GraphEdge(next_node=DIT_NODE, name="action_latents"),
                             GraphEdge(next_node=DIT_NODE, name="time_index"),
                         ],
-                        enable_async_scheduling=False,
+                        enable_async_scheduling=True,
                     ),
                     max_iters=self.config.max_inference_steps,
                     # The loop's terminal output is matched into the section by
@@ -318,7 +318,7 @@ class Cosmos3Model(Model):
                             GraphEdge(next_node=DIT_NODE, name="action_latents"),
                             GraphEdge(next_node=DIT_NODE, name="time_index"),
                         ],
-                        enable_async_scheduling=False,
+                        enable_async_scheduling=True,
                     ),
                     max_iters=self.config.max_inference_steps,
                     outputs=[

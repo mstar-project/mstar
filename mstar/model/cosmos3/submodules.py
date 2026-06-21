@@ -285,6 +285,26 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "num_vision": cond["num_vision_tokens"],
             "latent_shape": self._latent_shape(height, width, num_frames),
         }
+        # Step-0 workload dump: confirms the macro-work (steps x tokens x CFG
+        # branches x dtype) matches the reference before blaming kernel
+        # efficiency. Set COSMOS3_STEP0=1. Fires once per request at prefill.
+        if os.environ.get("COSMOS3_STEP0"):
+            st0 = self._req[fwd_info.request_id]
+            n_tok = cond["num_vision_tokens"]
+            cfg_branches = 2 if uncond is not None else 1
+            if self.batched_cfg and cfg_branches == 2:
+                fwds, tok_per_fwd = 1, 2 * n_tok
+            else:
+                fwds, tok_per_fwd = cfg_branches, n_tok
+            logger.info(
+                "COSMOS3_STEP0 mstar res=%dx%d frames=%d latent=%s steps=%d "
+                "tokens/branch=%d num_noisy=%d cfg_branches=%d batched_cfg=%s "
+                "forwards/step=%d tokens/forward=%d guidance_scale=%.3f dtype=%s",
+                width, height, num_frames, tuple(st0["latent_shape"]),
+                len(st0["scheduler"].timesteps), n_tok,
+                cond["num_noisy_vision_tokens"], cfg_branches, self.batched_cfg,
+                fwds, tok_per_fwd, gs, next(self.transformer.parameters()).dtype,
+            )
         # Image-to-video: encode the conditioning frame now (the understanding
         # tower and the VAE encode are both prefill-time, per-request work) and
         # stash its clean anchor latents for the denoise loop to inject.
@@ -522,6 +542,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latents = inputs["latents"][0]
             action_latents = inputs["action_latents"][0]
             time_index = inputs["time_index"][0]
+        scheduler = st["scheduler"]
+        step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            return None
+
         return ARNodeInputs(
             input_seq_len=st["num_vision"] + st["num_action"],
             tensor_inputs={"latents": latents, "action_latents": action_latents, "time_index": time_index},
@@ -796,13 +821,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_action_gen(self, cm, st, latents, action_latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
-        if step_index >= len(scheduler.timesteps):
-            # One extra step past this request's denoise count (discarded output).
-            return {
-                "latents": [latents],
-                "action_latents": [action_latents],
-                "time_index": [time_index],
-            }
         t = scheduler.timesteps[step_index]
         device = latents.device
         vts = torch.full((st["num_noisy"],), t.item(), device=device)
@@ -1161,10 +1179,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latents = inp.tensor_inputs["latents"]
             time_index = inp.tensor_inputs["time_index"]
             step_index = int(time_index.reshape(-1)[0].item())
-            if step_index >= len(st["scheduler"].timesteps):
-                # Discarded extra step past this request's denoise count.
-                outputs[rid] = {"latents": [latents], "time_index": [time_index]}
-                continue
             t = st["scheduler"].timesteps[step_index]
             new_latents = st["scheduler"].step(
                 velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
