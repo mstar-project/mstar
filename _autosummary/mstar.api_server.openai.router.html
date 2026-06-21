@@ -457,16 +457,16 @@ the surface is supported, and delegates to a serving handler. The native
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.audio_speech" title="mstar.api_server.openai.router.audio_speech"><code class="xref py py-obj docutils literal notranslate"><span class="pre">audio_speech</span></code></a>(request)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.audio_speech" title="mstar.api_server.openai.router.audio_speech"><code class="xref py py-obj docutils literal notranslate"><span class="pre">audio_speech</span></code></a>(request, raw_request)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.chat_completions" title="mstar.api_server.openai.router.chat_completions"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chat_completions</span></code></a>(request)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.chat_completions" title="mstar.api_server.openai.router.chat_completions"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chat_completions</span></code></a>(request, raw_request)</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.images_edits" title="mstar.api_server.openai.router.images_edits"><code class="xref py py-obj docutils literal notranslate"><span class="pre">images_edits</span></code></a>(request)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.images_generations" title="mstar.api_server.openai.router.images_generations"><code class="xref py py-obj docutils literal notranslate"><span class="pre">images_generations</span></code></a>(request)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.images_generations" title="mstar.api_server.openai.router.images_generations"><code class="xref py py-obj docutils literal notranslate"><span class="pre">images_generations</span></code></a>(request, raw_request)</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.list_models" title="mstar.api_server.openai.router.list_models"><code class="xref py py-obj docutils literal notranslate"><span class="pre">list_models</span></code></a>()</p></td>
@@ -477,20 +477,26 @@ the surface is supported, and delegates to a serving handler. The native
 </div>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.openai.router.audio_speech">
-<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.router.</span></span><span class="sig-name descname"><span class="pre">audio_speech</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/router.html#audio_speech"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.router.audio_speech" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.router.</span></span><span class="sig-name descname"><span class="pre">audio_speech</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">raw_request</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/router.html#audio_speech"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.router.audio_speech" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>request</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest" title="mstar.api_server.openai.protocol.SpeechRequest"><em>SpeechRequest</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest" title="mstar.api_server.openai.protocol.SpeechRequest"><em>SpeechRequest</em></a>)</p></li>
+<li><p><strong>raw_request</strong> (<em>Request</em>)</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.openai.router.chat_completions">
-<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.router.</span></span><span class="sig-name descname"><span class="pre">chat_completions</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/router.html#chat_completions"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.router.chat_completions" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.router.</span></span><span class="sig-name descname"><span class="pre">chat_completions</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">raw_request</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/router.html#chat_completions"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.router.chat_completions" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>request</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest" title="mstar.api_server.openai.protocol.ChatCompletionRequest"><em>ChatCompletionRequest</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest" title="mstar.api_server.openai.protocol.ChatCompletionRequest"><em>ChatCompletionRequest</em></a>)</p></li>
+<li><p><strong>raw_request</strong> (<em>Request</em>)</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
@@ -507,10 +513,13 @@ the surface is supported, and delegates to a serving handler. The native
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.openai.router.images_generations">
-<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.router.</span></span><span class="sig-name descname"><span class="pre">images_generations</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/router.html#images_generations"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.router.images_generations" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.router.</span></span><span class="sig-name descname"><span class="pre">images_generations</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">raw_request</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/router.html#images_generations"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.router.images_generations" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>request</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest" title="mstar.api_server.openai.protocol.ImageGenerationRequest"><em>ImageGenerationRequest</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest" title="mstar.api_server.openai.protocol.ImageGenerationRequest"><em>ImageGenerationRequest</em></a>)</p></li>
+<li><p><strong>raw_request</strong> (<em>Request</em>)</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
