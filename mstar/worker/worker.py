@@ -1577,6 +1577,7 @@ class Worker:
                 batch_N.node_batch.per_request_info.pop(stopped_rid, None)
         batch_N.node_batch.request_ids = list(valid_rids)
         if not valid_rids:
+            range_pop(synchronize=False)
             return
 
         # pending stops are only needed for one iteration, so can be cleared now

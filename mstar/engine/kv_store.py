@@ -130,6 +130,14 @@ class KVRequestState:
     # (re)allocated — so it needs no manual invalidation.
     dense_prefix_kv: dict | None = None
 
+    # Cached (key, plan) for the dense generation-attention layout. Like
+    # dense_prefix_kv, the plan (prefix page indices, gen/prefix cu-seqlens) is
+    # invariant across denoise steps, but the cache manager that builds it is
+    # rebuilt every forward — so cache it on the persistent state. Reset to None
+    # by _new_state() alongside dense_prefix_kv (same validity window). Only used
+    # on the single-request latency path; batched layouts rebuild.
+    dense_gen_plan: tuple | None = None
+
     def get_pos_info(self):
         return PositionInfo(
             full_seq_len=self.seq_len,

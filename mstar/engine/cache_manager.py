@@ -788,8 +788,22 @@ class BatchedCacheManager:
         generation tokens over its frozen text prefix; the prefix lives in the
         pages written at prefill, so we record the page indices to gather it from
         (the same across all layers) and the cumulative-sequence-length tensors a
-        single varlen kernel needs. Built once per denoise step, reused by every
-        layer's run_attention."""
+        single varlen kernel needs. Reused by every layer's run_attention, and
+        across denoise steps via the persistent-state cache below."""
+        # The layout is invariant across a request's denoise steps (frozen
+        # prefix, fixed gen_len, stable prefix pages), but this manager is rebuilt
+        # every forward, so cache the built plan on the persistent primary state.
+        # Only the single-request latency path is cached; batched layouts vary in
+        # request_ids order and rebuild. The state's dense_gen_plan resets with
+        # dense_prefix_kv (new request / page realloc), so no manual invalidation.
+        cache_state = None
+        key = None
+        if len(self.request_ids) == 1:
+            key = (tuple(labels), tuple(seq_lens))
+            cache_state = self._get_state(self.request_ids[0], labels[0])
+            cached = cache_state.dense_gen_plan
+            if cached is not None and cached[0] == key:
+                return cached[1]
         cfg = self.kv_cache_config
         page_size = cfg.page_size
         segs = []  # (prefix_page_indices, prefix_len, gen_len)
@@ -814,13 +828,16 @@ class BatchedCacheManager:
                 cu_k.append(cu_k[-1] + prefix_len + gen_len)
                 max_q = max(max_q, gen_len)
                 max_k = max(max_k, prefix_len + gen_len)
-        return {
+        plan = {
             "segs": segs,
             "cu_q": torch.tensor(cu_q, dtype=torch.int32, device=self.device),
             "cu_k": torch.tensor(cu_k, dtype=torch.int32, device=self.device),
             "max_q": max_q,
             "max_k": max_k,
         }
+        if cache_state is not None:
+            cache_state.dense_gen_plan = (key, plan)
+        return plan
 
     @torch.compiler.disable
     def _run_dense_gen(

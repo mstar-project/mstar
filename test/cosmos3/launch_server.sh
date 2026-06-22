@@ -8,7 +8,8 @@ else
 fi
 
 
-CUDA_VISIBLE_DEVICES=$DEVICES DENSE=1 python mstar/api_server/entrypoint.py \
+CUDA_VISIBLE_DEVICES=$DEVICES COSMOS3_DENSE_FA3=1 COSMOS3_PROFILE=1 COSMOS3_VAE_BF16=1 COSMOS3_DISABLE_HOST_STEP=1 \
+    python mstar/api_server/entrypoint.py \
     --config configs/cosmos3_nano.yaml \
     --socket-path-prefix /tmp/mstar_$WHO/ \
     --upload-dir /tmp/mstar_uploads_$WHO/ \

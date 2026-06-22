@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import torch
 
@@ -144,6 +145,18 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # Per-request denoising state: packed static inputs (cond/uncond),
         # scheduler, guidance scale, latent shape.
         self._req: dict[str, dict] = {}
+        # The image-gen denoise step is GPU-saturated at high resolution, so the
+        # only host-exposed cost is the per-step CPU<->GPU sync from reading the
+        # device ``time_index`` (.item()) in prepare/preprocess/forward, which
+        # drains the pipeline each step and idles the GPU (~1ms/step bubble).
+        # When enabled, derive the step index from the engine's host-side loop
+        # counter (``fwd_info.dynamic_loop_iter_counts``, the same counter
+        # ``check_stop`` trusts) instead of the device ``time_index``. Measured
+        # no win: at the generation tiers the denoise loop is already ~98%
+        # GPU-bound, so the engine overlaps these per-step syncs and the residual
+        # bubble (~1ms/step) is framework-level, not these reads. Left opt-in
+        # (COSMOS3_ENABLE_HOST_STEP=1) behind the proven device-index default.
+        self._host_step = bool(os.environ.get("COSMOS3_ENABLE_HOST_STEP"))
         # torch.compile the pure denoise compute (the generation-layer stack +
         # norms + projections). fullgraph=False leaves the FlashInfer attention an
         # opaque graph break, so compile fuses the bandwidth-bound pointwise ops
@@ -212,10 +225,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _new_scheduler(self, num_inference_steps: int, device, flow_shift=None):
         from diffusers import UniPCMultistepScheduler
 
+        # The shipped checkpoint scheduler_config has use_karras_sigmas=True, but
+        # the reference Cosmos3 generation (and vllm-omni) runs the plain flow
+        # sigmas. Karras remapping shifts the schedule enough to move ~2 of 50
+        # steps across the t2i guidance_interval boundary (43/7 vs 41/9 cfg/cond
+        # steps), which both diverges the denoise trajectory from the reference
+        # and costs the extra cfg steps. Force it off to match the reference.
+        # TODO: drive from Cosmos3SchedulerConfig once the config knob is wired.
+        overrides = {"use_karras_sigmas": False}
         if flow_shift is not None:
-            scheduler = UniPCMultistepScheduler.from_config(self._scheduler_template.config, flow_shift=flow_shift)
-        else:
-            scheduler = UniPCMultistepScheduler.from_config(self._scheduler_template.config)
+            overrides["flow_shift"] = flow_shift
+        scheduler = UniPCMultistepScheduler.from_config(self._scheduler_template.config, **overrides)
         scheduler.set_timesteps(num_inference_steps, device=device)
         return scheduler
 
@@ -491,17 +511,30 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             time_index = inputs["time_index"][0]
         
         scheduler = st["scheduler"]
-        step_index = int(time_index.reshape(-1)[0].item())
+        if self._host_step:
+            # _prepare_image_gen serves both image and video gen walks; key the
+            # host loop counter by the walk so video reads its own counter.
+            loop_key = IMAGE_GEN_LOOP if fwd_info.graph_walk == IMAGE_GEN_WALK else VIDEO_GEN_LOOP
+            step_index = fwd_info.dynamic_loop_iter_counts.get(loop_key, 0)
+        else:
+            step_index = int(time_index.reshape(-1)[0].item())
         if step_index >= len(scheduler.timesteps):
             return None
-    
+        # Bridge the host step index to preprocess/forward for this request,
+        # avoiding their device-tensor .item() syncs. Safe because prepare ->
+        # preprocess -> forward are issued in order on the main thread per
+        # request before the next step's prepare overwrites it.
+        st["step"] = step_index
+
         tensors = {"latents": latents, "time_index": time_index}
         # The CUDA-graph capture reads the timestep and rotary positions as static
         # buffers (it can't reach the per-request scheduler at replay), so
         # materialize them here. The eager path ignores these and recomputes from
-        # per-request state. Only built in the two-branch guidance regime — the
+        # per-request state, so only build them when this resolution is actually
+        # captured (skips ~5 wasted device kernels/step on the eager tiers, e.g.
+        # the odd-latent 720p path). Only in the two-branch guidance regime — the
         # one the graph captures.
-        if st["uncond"] is not None:
+        if st["uncond"] is not None and tuple(st["latent_shape"]) in getattr(self, "_capture_layout", {}):
             # The denoise loop may dispatch one extra (discarded) step past this
             # request's step count; clamp so materializing the static timestep
             # buffer can't index past the schedule.
@@ -628,7 +661,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs, strict=True)},
                 }
             ti = inputs[0].tensor_inputs["time_index"]
-            step_index = int(ti.reshape(-1)[0].item())
+            step_index = st["step"] if self._host_step else int(ti.reshape(-1)[0].item())
             self._plan_gen(
                 cm, st, st["num_vision"], cfg_active=self._cfg_active(st, step_index)
             )
@@ -732,23 +765,46 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         gi = st.get("guidance_interval")
         if gi is None:
             return True
-        sched = st["scheduler"]
-        if step_index >= len(sched.timesteps):
+        # Cache the schedule host-side (one sync at first use, not per step) so
+        # the per-step interval test reads a Python float, not a device scalar.
+        ts_host = st.get("timesteps_host")
+        if ts_host is None:
+            ts_host = st["timesteps_host"] = st["scheduler"].timesteps.tolist()
+        if step_index >= len(ts_host):
             return False
-        t = float(sched.timesteps[step_index].item())
-        return gi[0] <= t <= gi[1]
+        return gi[0] <= ts_host[step_index] <= gi[1]
 
     def _forward_image_gen(self, cm, st, latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
-        step_index = int(time_index.reshape(-1)[0].item())
+        step_index = st["step"] if self._host_step else int(time_index.reshape(-1)[0].item())
         t = scheduler.timesteps[step_index]
-        vision_timesteps = torch.full((st["num_noisy"],), t.item(), device=latents.device)
+        # Keep the timestep on-device (expand the device scalar) instead of
+        # round-tripping through t.item(), which would sync the loop every step.
+        vision_timesteps = t.to(device=latents.device, dtype=torch.float32).expand(st["num_noisy"]).contiguous()
 
         # Classifier-free guidance is applied only when an uncond branch exists
         # (guidance_scale != 1) and, for the text-to-image recipe, only on the
         # configured timestep interval. Outside the interval the step runs the
         # conditional branch alone (cond-only velocity), matching the recipe.
         cfg_active = self._cfg_active(st, step_index)
+
+        # Per-step denoise profiling (COSMOS3_PROFILE). A CUDA-event pair brackets
+        # each step's compute (forward + CFG combine + scheduler step). Events are
+        # recorded every step but only read after the final step's single
+        # synchronize, so this adds no per-step sync and does not perturb the
+        # eager/graph timing. ``gpu`` is summed GPU-busy time; ``wall`` is the
+        # host-side span across the whole loop (includes the engine's per-step
+        # preprocess/planning between calls). gpu/wall ~= 100% => compute-bound;
+        # gpu/wall low => host-bound (GPU idle waiting on per-step host work).
+        _prof = os.environ.get("COSMOS3_PROFILE")
+        if _prof:
+            prof = st.get("_prof")
+            if prof is None:
+                prof = st["_prof"] = {"wall0": time.perf_counter(), "events": []}
+            _e0 = torch.cuda.Event(enable_timing=True)
+            _e1 = torch.cuda.Event(enable_timing=True)
+            prof["events"].append((_e0, _e1, bool(cfg_active)))
+            _e0.record()
 
         if not cfg_active:
             cm.set_active_label(COND_LABEL)
@@ -776,6 +832,30 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         new_latents = scheduler.step(
             velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
         )[0].squeeze(0)
+
+        if _prof:
+            _e1.record()
+            if step_index >= len(scheduler.timesteps) - 1:
+                wall_ms = 1000.0 * (time.perf_counter() - prof["wall0"])
+                torch.cuda.synchronize()
+                per_step = [a.elapsed_time(b) for a, b, _ in prof["events"]]
+                gpu_ms = sum(per_step)
+                cfg_ms = [ms for (_, _, c), ms in zip(prof["events"], per_step) if c]
+                cond_ms = [ms for (_, _, c), ms in zip(prof["events"], per_step) if not c]
+
+                def _stat(xs):
+                    return (min(xs), sum(xs) / len(xs), max(xs)) if xs else (0.0, 0.0, 0.0)
+
+                logger.info(
+                    "COSMOS3_PROFILE denoise steps=%d gpu=%.1fms wall=%.1fms "
+                    "gpu/wall=%.0f%% gpu/step=%.2fms cfg_step[n=%d min/mean/max]=%.2f/%.2f/%.2f "
+                    "cond_step[n=%d min/mean/max]=%.2f/%.2f/%.2f",
+                    len(per_step), gpu_ms, wall_ms, 100.0 * gpu_ms / wall_ms,
+                    gpu_ms / len(per_step), len(cfg_ms), *_stat(cfg_ms),
+                    len(cond_ms), *_stat(cond_ms),
+                )
+                st.pop("_prof", None)
+
         return {"latents": [new_latents], "time_index": [time_index + 1]}
 
     def _denoise_action(self, cm, static, latents, action_latents, vts, ats, domain):
@@ -1106,6 +1186,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return configs
 
     def can_use_cuda_graphs(self, batch, model_inputs) -> bool:
+        return False # TODO DEBUG
         # Only the image denoise step is captured, only with two-branch guidance,
         # and only at a resolution we captured a graph for. A batched capture is a
         # single fixed resolution, so a concurrent batch must be uniform-resolution
@@ -1248,17 +1329,22 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
 
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
         vae = self.vae
-        # The Wan VAE's 3D convolutions run several times faster in fp32 (TF32
-        # tensor cores) than in bf16 on this cuDNN, and the reference pipeline
-        # decodes in fp32. The engine casts this submodule to bf16, so restore the
-        # vae to fp32 once and decode outside autocast to keep the fast path.
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
+        # VAE decode dtype. An earlier cuDNN/GPU favored fp32 (TF32) for the Wan
+        # 3D convs, and the reference pipeline decodes in fp32 -- so fp32 is the
+        # parity-safe default. But on the current GPU a bf16 decode measured
+        # ~1.6x faster (65ms vs 105ms at 720p) and matches what vllm-omni runs;
+        # set COSMOS3_VAE_BF16=1 to use it (validate output quality vs golden
+        # first -- bf16 changes the pixels beyond fp rounding). Decode runs
+        # outside autocast so the chosen dtype is what actually executes.
+        vae_dtype = torch.bfloat16 if os.environ.get("COSMOS3_VAE_BF16") else torch.float32
+        if next(vae.parameters()).dtype != vae_dtype:
+            vae.to(vae_dtype)
         mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
         inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=latents.device)).view(
             1, -1, 1, 1, 1
         )
-        z = latents.float() / inv_std + mean
+        # Normalize in fp32 for precision, then cast to the decode dtype.
+        z = (latents.float() / inv_std + mean).to(vae_dtype)
         _prof = os.environ.get("COSMOS3_PROFILE")
         if _prof:
             _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
