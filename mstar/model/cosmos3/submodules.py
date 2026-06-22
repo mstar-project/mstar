@@ -1113,15 +1113,21 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         configs = []
         for height, width in resolutions:
             latent_shape = self._latent_shape(height, width, num_frames=1)
-            # patchify-2 pads an odd latent height/width (e.g. 720p: 720 // 16 =
-            # 45 -> pad to 46), and the captured/replayed padded layout produces
-            # degraded output (clean on the left, scrambled on the right). Skip
-            # capture for such resolutions; they fall back to the eager path,
-            # which is clean and ~as fast at these compute-bound tiers.
-            if latent_shape[3] % 2 or latent_shape[4] % 2:
+            # CUDA-graph capture of the denoise step corrupts the output at some
+            # resolutions: the served image is globally degraded while the eager
+            # path stays clean. Empirically the capture is faithful only when
+            # both latent dims are divisible by 4 (256p latent 12x20 is clean;
+            # 480p 30x52 and 720p 45x80 corrupt). The underlying capture cause is
+            # still open (ruled out: latent padding, attention backend,
+            # torch.compile, cuBLAS workspace, and the baked token layout); until
+            # it is fixed, capture only divisible-by-4 dims and run the rest
+            # eagerly, which is clean and only marginally slower at these
+            # compute-bound tiers.
+            if any(d % 4 for d in latent_shape[3:5]):
                 logger.info(
                     "Cosmos3: skipping CUDA-graph capture for %dx%d "
-                    "(odd latent dim %s -> patchify pad -> eager fallback)",
+                    "(latent dim %s not divisible by 4 -> known graph-capture "
+                    "corruption -> eager fallback)",
                     height, width, tuple(latent_shape[3:]),
                 )
                 continue
