@@ -469,6 +469,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             latents = inputs["latents"][0]
             time_index = inputs["time_index"][0]
+        
+        scheduler = st["scheduler"]
+        step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            return None
         tensors = {"latents": latents, "time_index": time_index}
         # The CUDA-graph capture reads the timestep and rotary positions as static
         # buffers (it can't reach the per-request scheduler at replay), so
@@ -516,6 +521,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latents = inputs["latents"][0]
             action_latents = inputs["action_latents"][0]
             time_index = inputs["time_index"][0]
+        
+        scheduler = st["scheduler"]
+        step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            return None
         return ARNodeInputs(
             input_seq_len=st["num_vision"] + st["num_action"],
             tensor_inputs={"latents": latents, "action_latents": action_latents, "time_index": time_index},
@@ -710,11 +720,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_image_gen(self, cm, st, latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
-        if step_index >= len(scheduler.timesteps):
-            # One extra step past this request's denoise count: the loop has
-            # already been told to stop and this output is discarded. Pass the
-            # finished latents through without touching the (stateful) scheduler.
-            return {"latents": [latents], "time_index": [time_index]}
         t = scheduler.timesteps[step_index]
         vision_timesteps = torch.full((st["num_noisy"],), t.item(), device=latents.device)
 
@@ -795,13 +800,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_action_gen(self, cm, st, latents, action_latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
-        if step_index >= len(scheduler.timesteps):
-            # One extra step past this request's denoise count (discarded output).
-            return {
-                "latents": [latents],
-                "action_latents": [action_latents],
-                "time_index": [time_index],
-            }
         t = scheduler.timesteps[step_index]
         device = latents.device
         vts = torch.full((st["num_noisy"],), t.item(), device=device)
@@ -904,7 +902,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # step) while others in the batch are still running; clamp its
             # timestep so the shared forward can't index past the schedule, and
             # skip its scheduler step below.
-            past_end = step_index >= n_steps
             t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
             reqs.append({
                 "latents": lat,
@@ -915,15 +912,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 "vision_noisy_frame_indexes": st["cond"]["vision_noisy_frame_indexes"],
                 "vision_mse_loss_indexes": st["cond"]["mse_gen_indexes"],
             })
-            meta.append((rid, st, lat, ti, t, past_end))
+            meta.append((rid, st, lat, ti, t))
 
         results = self.transformer.denoise_step_batched(reqs, cm)
 
         out = {}
-        for (rid, st, lat, ti, t, past_end), (cond_v, uncond_v) in zip(meta, results, strict=True):
-            if past_end:
-                out[rid] = {"latents": [lat], "time_index": [ti]}
-                continue
+        for (rid, st, lat, ti, t), (cond_v, uncond_v) in zip(meta, results, strict=True):
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
             new_latents = st["scheduler"].step(
                 velocity.unsqueeze(0), t, lat.unsqueeze(0), return_dict=False
@@ -951,7 +945,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # others in the batch are still running; clamp its timestep so the
             # shared forward can't index past the schedule, and skip its scheduler
             # step below.
-            past_end = step_index >= n_steps
             t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
             cond = st["cond"]
             und = cond["und_len"]
@@ -973,15 +966,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 unc = st["uncond"]
                 req["position_ids_uncond"] = unc["position_ids"][:, unc["und_len"]:]
             reqs.append(req)
-            meta.append((rid, st, lat, act, ti, t, past_end))
+            meta.append((rid, st, lat, act, ti, t))
 
         results = self.transformer.denoise_step_action_batched(reqs, cm, with_cfg)
 
         out = {}
-        for (rid, st, lat, act, ti, t, past_end), branches in zip(meta, results, strict=True):
-            if past_end:
-                out[rid] = {"latents": [lat], "action_latents": [act], "time_index": [ti]}
-                continue
+        for (rid, st, lat, act, ti, t), branches in zip(meta, results, strict=True):
             if with_cfg:
                 (cond_video, cond_action), (uncond_video, uncond_action) = branches
                 video_v = uncond_video + st["gs"] * (cond_video - uncond_video)
