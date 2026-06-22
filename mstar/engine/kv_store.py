@@ -78,6 +78,11 @@ class KVCacheConfig:
     num_qo_heads: int | None = None  # Optional, defaults to num_kv_heads
     cpu_offload_pages: int = 0  # >0 enables CPU offloading with this many CPU pages
     nodes: list[str] = None # defaults to all AR nodes
+    # When True, run the non-causal generation attention through the dense FA3
+    # path (gather frozen prefix + fresh gen, one varlen kernel) instead of the
+    # paged FlashInfer prefill. Only the diffusion generator sets this; the
+    # cache manager additionally restricts it to eager, single-request batches.
+    dense_gen_attn: bool = False
 
     def __post_init__(self):
         if self.num_qo_heads is None:

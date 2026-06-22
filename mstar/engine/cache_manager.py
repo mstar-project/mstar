@@ -13,10 +13,16 @@ from mstar.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPref
 # pure overhead here; a dense pass gathers the small prefix, concatenates it with
 # the freshly projected K/V, and runs one varlen kernel — which is also the
 # faster attention kernel at these shapes. Eager-only (the captured image path
-# keeps the paged wrapper). Off unless COSMOS3_DENSE_FA3 is set; read per plan
-# (once per denoise step) so it can be toggled for A/B parity checks.
-def _dense_gen_attn_enabled() -> bool:
-    return bool(os.environ.get("COSMOS3_DENSE_FA3"))
+# keeps the paged wrapper) and single-request only (the launch-overhead it
+# removes is what matters at bs=1; bs>1 amortizes the plan and grows the
+# per-request prefix gather, so it stays on the paged path). Defaults to the
+# model's KVCacheConfig.dense_gen_attn; COSMOS3_DENSE_FA3 overrides per plan for
+# A/B parity ("0"/"false"/"off" forces paged, any other value forces dense).
+def _dense_gen_attn_enabled(config_default: bool) -> bool:
+    env = os.environ.get("COSMOS3_DENSE_FA3")
+    if env:
+        return env.lower() not in ("0", "false", "no", "off")
+    return config_default
 
 
 @dataclass
@@ -241,8 +247,9 @@ class BatchedCacheManager:
                     range_push("cache.plan_attention.skipped_pre_planned", synchronize=False)
                     range_pop(synchronize=False)
                 return
-            if (_dense_gen_attn_enabled() and not is_causal
-                    and not self._cuda_graph_mode):
+            if (_dense_gen_attn_enabled(self.kv_cache_config.dense_gen_attn)
+                    and not is_causal and not self._cuda_graph_mode
+                    and len(self.request_ids) == 1):
                 # Lean dense generation-attention path: the gen K/V is never
                 # written to pages and attention is one varlen FA3 over the
                 # frozen prefix + fresh gen, so the whole paged-FlashInfer plan
@@ -423,7 +430,9 @@ class BatchedCacheManager:
         # reader — dropped along with their per-rid GPU construction above.
         ps.seq_lens = seq_lens
         ps.write_store = write_store
-        if _dense_gen_attn_enabled() and not is_causal and not self._cuda_graph_mode:
+        if (_dense_gen_attn_enabled(self.kv_cache_config.dense_gen_attn)
+                and not is_causal and not self._cuda_graph_mode
+                and len(self.request_ids) == 1):
             ps.dense_gen = self._build_dense_gen_plan([effective_label], seq_lens)
         else:
             ps.dense_gen = None
@@ -557,8 +566,9 @@ class BatchedCacheManager:
             per_label_seq_len=seq_lens
         )
 
-        if (_dense_gen_attn_enabled() and not is_causal
-                and not self._cuda_graph_mode):
+        if (_dense_gen_attn_enabled(self.kv_cache_config.dense_gen_attn)
+                and not is_causal and not self._cuda_graph_mode
+                and len(self.request_ids) == 1):
             # Lean dense generation-attention path (see plan_attention): skip the
             # paged-FlashInfer plan (per-label page alloc, index tensors, and
             # wrapper.plan()'s radix-sort/fills) — _run_dense_gen reads none of
@@ -659,7 +669,9 @@ class BatchedCacheManager:
         )
         ps.seq_lens = combined_seq_lens
         ps.write_store = write_store
-        if _dense_gen_attn_enabled() and not is_causal and not self._cuda_graph_mode:
+        if (_dense_gen_attn_enabled(self.kv_cache_config.dense_gen_attn)
+                and not is_causal and not self._cuda_graph_mode
+                and len(self.request_ids) == 1):
             ps.dense_gen = self._build_dense_gen_plan(labels, seq_lens)
         else:
             ps.dense_gen = None
