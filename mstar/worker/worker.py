@@ -1572,9 +1572,9 @@ class Worker:
                 stopped_rid = pending_stop.rid
                 output.per_request_output_tensors.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
-                batch_N.batch.node_objects.pop(stopped_rid)
-                batch_N.batch.request_to_worker_graph.pop(stopped_rid)
-                batch_N.node_batch.per_request_info.pop(stopped_rid)
+                batch_N.batch.node_objects.pop(stopped_rid, None)
+                batch_N.batch.request_to_worker_graph.pop(stopped_rid, None)
+                batch_N.node_batch.per_request_info.pop(stopped_rid, None)
         batch_N.node_batch.request_ids = list(valid_rids)
         if not valid_rids:
             range_pop(synchronize=False)

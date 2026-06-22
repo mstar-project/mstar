@@ -469,7 +469,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             latents = inputs["latents"][0]
             time_index = inputs["time_index"][0]
-        
+
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
         if step_index >= len(scheduler.timesteps):
@@ -521,7 +521,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latents = inputs["latents"][0]
             action_latents = inputs["action_latents"][0]
             time_index = inputs["time_index"][0]
-        
+
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
         if step_index >= len(scheduler.timesteps):
@@ -1223,23 +1223,19 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
 
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
         vae = self.vae
-        # The Wan VAE's 3D convolutions run several times faster in fp32 (TF32
-        # tensor cores) than in bf16 on this cuDNN, and the reference pipeline
-        # decodes in fp32. The engine casts this submodule to bf16, so restore the
-        # vae to fp32 once and decode outside autocast to keep the fast path.
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
-        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=latents.device)).view(
+        vae_dtype = torch.bfloat16
+        if next(vae.parameters()).dtype != vae_dtype:
+            vae = vae.to(vae_dtype)
+        mean = torch.tensor(vae.config.latents_mean, dtype=vae_dtype, device=latents.device).view(1, -1, 1, 1, 1)
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae_dtype, device=latents.device)).view(
             1, -1, 1, 1, 1
         )
-        z = latents.float() / inv_std + mean
+        z = latents.to(vae_dtype) / inv_std + mean
         _prof = os.environ.get("COSMOS3_PROFILE")
         if _prof:
             _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
             _e0.record()
-        with torch.autocast(device_type=z.device.type, enabled=False):
-            decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
+        decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
         if _prof:
             _e1.record(); torch.cuda.synchronize()
             logger.info("COSMOS3_PROFILE vae_decode %.1f ms out=%s", _e0.elapsed_time(_e1), tuple(decoded.shape))
