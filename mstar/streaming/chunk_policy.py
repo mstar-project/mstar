@@ -12,12 +12,12 @@ class ChunkPolicy(ABC):
         self.items_consumed += chunk_size
 
     @abstractmethod
-    def is_ready(self, buffer_len: int) -> bool:
+    def is_ready(self, buffer_len: int, graph_walk: str | None=None) -> bool:
         """Return True if the buffer has enough items for a chunk."""
         ...
 
     @abstractmethod
-    def next_chunk_size(self, buffer_len: int) -> int:
+    def next_chunk_size(self, buffer_len: int, graph_walk: str | None=None) -> int:
         """Return the number of items to consume for the next chunk.
 
         Only called when is_ready() returns True.
@@ -26,7 +26,7 @@ class ChunkPolicy(ABC):
         ...
 
     @abstractmethod
-    def window_size(self) -> int:
+    def window_size(self, graph_walk: str | None=None) -> int:
         """Return the full window of items to include in the chunk.
 
         For non-overlapping policies, equals next_chunk_size.
@@ -35,7 +35,7 @@ class ChunkPolicy(ABC):
         """
         ...
 
-    def continue_after_producer_done(self) -> bool:
+    def continue_after_producer_done(self, graph_walk: str | None=None) -> bool:
         """Whether the buffer should keep producing (empty) chunks after the
         producer signals done and all buffered items have been consumed.
 
@@ -66,13 +66,13 @@ class SlidingWindowChunkPolicy(ChunkPolicy):
         self._window = window
         self._stride = stride
 
-    def is_ready(self, buffer_len: int) -> bool:
+    def is_ready(self, buffer_len: int, graph_walk: str | None = None) -> bool:
         return buffer_len >= self._window
 
-    def next_chunk_size(self, buffer_len: int) -> int:
+    def next_chunk_size(self, buffer_len: int, graph_walk: str | None = None) -> int:
         return self._stride
 
-    def window_size(self) -> int:
+    def window_size(self, graph_walk: str | None = None) -> int:
         return self._window
 
 
@@ -104,19 +104,19 @@ class LeftContextChunkPolicy(ChunkPolicy):
         self._left_context = left_context
         self._window = chunk + left_context
 
-    def is_ready(self, buffer_len: int) -> bool:
+    def is_ready(self, buffer_len: int, graph_walk: str | None = None) -> bool:
         if not self.first_chunk_read:
             return buffer_len >= self._chunk
         return buffer_len >= self._window
 
-    def next_chunk_size(self, buffer_len: int) -> int:
+    def next_chunk_size(self, buffer_len: int, graph_walk: str | None = None) -> int:
         # First pop: advance by (chunk - left_context) so the tail of the
         # first chunk stays in the buffer as overlap for the next pop.
         if not self.first_chunk_read:
             return self._chunk - self._left_context
         return self._chunk
 
-    def window_size(self) -> int:
+    def window_size(self, graph_walk: str | None = None) -> int:
         if not self.first_chunk_read:
             return self._chunk
         return self._window
@@ -134,19 +134,20 @@ class FixedChunkPolicy(ChunkPolicy):
             the producer finishes and all buffered items are consumed.
     """
 
-    def __init__(self, chunk_size: int, continue_after_done: bool = False):
+    def __init__(self, chunk_size: int, continue_after_done: set[str] | None=None):
         super().__init__()
         self._chunk_size = chunk_size
         self._continue_after_done = continue_after_done
 
-    def is_ready(self, buffer_len) -> bool:
+    def is_ready(self, buffer_len, graph_walk: str | None = None) -> bool:
         return buffer_len >= self._chunk_size
 
-    def next_chunk_size(self, buffer_len: int) -> int:
+    def next_chunk_size(self, buffer_len: int, graph_walk: str | None = None) -> int:
         return self._chunk_size
 
-    def window_size(self) -> int:
+    def window_size(self, graph_walk: str | None = None) -> int:
         return self._chunk_size
 
-    def continue_after_producer_done(self) -> bool:
-        return self._continue_after_done
+    def continue_after_producer_done(self, graph_walk: str | None = None) -> bool:
+        return self._continue_after_done is not None \
+            and graph_walk in self._continue_after_done

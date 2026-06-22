@@ -63,6 +63,11 @@ class GraphEdge:
     # only for EMIT_TO_CLIENT
     output_modality: str = field(default="")  # text | image | video | audio
     _persist_for_loop: bool = field(default=False)
+
+    # set on a synthetic streaming-input edge: the next stream index the
+    # consumer should drain after the pass that consumes this edge (None on
+    # non-streaming edges, which carry no stream position)
+    _next_stream_index: int | None = field(default=None)
     # set on a synthetic streaming-input edge carrying the final chunk, so the
     # consuming pass (not the earlier ingest) reports the partition done
     _final_stream_chunk: bool = field(default=False)
@@ -70,6 +75,9 @@ class GraphEdge:
     # Set for sharded configurations
     _total_fanin: int = 1
     _shard_dim: int | None = None
+
+    # set for non-streaming inputs
+    _target_graph_walk: str | None = None
 
     def clone(self):
         return GraphEdge(
@@ -81,7 +89,9 @@ class GraphEdge:
             is_streaming=self.is_streaming,
             output_modality=self.output_modality,
             _persist_for_loop=self._persist_for_loop,
+            _next_stream_index=self._next_stream_index,
             _final_stream_chunk=self._final_stream_chunk,
+            _target_graph_walk=self._target_graph_walk,
         )
 
 
@@ -717,8 +727,10 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
 
         self.ready_for_streaming = set(self.only_streaming_inputs)
         self.ready_streaming_next_iter = set(self.only_streaming_inputs)
+        self.clean = True
 
     def register_ingested_input(self, graph_edge: GraphEdge):
+        self.clean = False
         node = self.nodes[graph_edge.next_node]
         # If node._speculatively_scheduled, the node is already executing as
         # a spec batch. We don't want to double-queue it (either for the
@@ -766,6 +778,7 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         )
 
     def clear(self):
+        self.clean = True
         super().clear()
         self.ready_names.clear()
         self.ready_for_streaming = set(self.only_streaming_inputs)
