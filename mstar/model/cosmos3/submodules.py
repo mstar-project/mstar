@@ -209,13 +209,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         static["mse_gen_indexes"] = static["vision_mse_loss_indexes"] - static["und_len"]
         return static
 
-    def _new_scheduler(self, num_inference_steps: int, device, flow_shift=None):
+    def _new_scheduler(self, num_inference_steps: int, device, use_karras_sigma=False, flow_shift=None):
         from diffusers import UniPCMultistepScheduler
 
+        overrides = {"use_karras_sigmas": use_karras_sigma}
         if flow_shift is not None:
-            scheduler = UniPCMultistepScheduler.from_config(self._scheduler_template.config, flow_shift=flow_shift)
-        else:
-            scheduler = UniPCMultistepScheduler.from_config(self._scheduler_template.config)
+            overrides["flow_shift"] = flow_shift
+
+        scheduler = UniPCMultistepScheduler.from_config(self._scheduler_template.config, **overrides)
         scheduler.set_timesteps(num_inference_steps, device=device)
         return scheduler
 
@@ -280,7 +281,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "uncond": uncond,
             "gs": gs,
             "guidance_interval": md.get("guidance_interval"),
-            "scheduler": self._new_scheduler(steps, device, flow_shift=md.get("flow_shift")),
+            "scheduler": self._new_scheduler(
+                steps, device, flow_shift=md.get("flow_shift"),
+                use_karras_sigma=md.get("use_karras_sigma", False)
+            ),
             "num_noisy": cond["num_noisy_vision_tokens"],
             "num_vision": cond["num_vision_tokens"],
             "latent_shape": self._latent_shape(height, width, num_frames),
@@ -398,7 +402,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "cond": cond,
             "uncond": uncond,
             "gs": gs,
-            "scheduler": self._new_scheduler(steps, device, flow_shift=md.get("flow_shift")),
+            "scheduler": self._new_scheduler(
+                steps, device, flow_shift=md.get("flow_shift"),
+                use_karras_sigma=md.get("use_karras_sigma", False)
+            ),
             "num_noisy": cond["num_noisy_vision_tokens"],
             "num_noisy_action": cond["num_noisy_action_tokens"],
             "num_vision": cond["num_vision_tokens"],

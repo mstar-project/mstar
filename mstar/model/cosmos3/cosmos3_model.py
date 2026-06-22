@@ -522,6 +522,7 @@ class Cosmos3Model(Model):
                 width, height = int(sw), int(sh)
             except ValueError:
                 pass
+        
         # A video request without an explicit frame count gets the video default
         # (>1); image requests stay single-frame.
         default_frames = (
@@ -546,6 +547,7 @@ class Cosmos3Model(Model):
             "guidance_scale": float(mk.get("guidance_scale", 6.0)),
             "num_inference_steps": steps,
             "has_image_condition": "image" in (input_modalities or []),
+            "use_karras_sigma": mk.get("use_karras_sigmas", False),
         }
         # Text-to-image (single frame, no visual conditioning) follows the
         # reference Cosmos3 t2i recipe: classifier-free guidance only on the
