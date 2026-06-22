@@ -28,7 +28,10 @@ import os
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BasicBatchedCudaGraphConfig
+from mstar.engine.cuda_graph_config import (
+    BasicBatchedCudaGraphConfig,
+    FlashInferPackedCudaGraphConfig,
+)
 from mstar.model.cosmos3.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
@@ -128,6 +131,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     )
     # Batch sizes to capture per resolution.
     gen_capture_batch_sizes: tuple[int, ...] = (1,)
+
+    # Understanding-tower (text prefill) CUDA-graph capture. The text length is
+    # prompt-dependent, so capture a few combined (cond+uncond) token buckets and
+    # round up at replay; prompts past the largest bucket fall back to eager.
+    # Targets the small-prompt, non-compute-bound regime where the launch
+    # overhead the graph removes actually matters. Override with
+    # COSMOS3_PREFILL_CAPTURE_TOKENS / COSMOS3_PREFILL_CAPTURE_BS.
+    prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
+    prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
     def __init__(self, transformer, config, scheduler=None, vae=None):
         super().__init__()
@@ -302,36 +314,20 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return self._get_prefill_node_inputs(cond, uncond)
 
     def _get_prefill_node_inputs(self, cond, uncond):
-        if uncond is None:
-            return ARNodeInputs(
-                input_ids=cond["input_ids"],
-                input_seq_len=cond["und_len"],
-                tensor_inputs={
-                    "text_mrope_ids": cond["text_mrope_ids"]
-                },
-                kwargs=dict(
-                    cfg=False,
-                    seq_lens={
-                        COND_LABEL: cond["und_len"]
-                    }
-                )
-            )
+        statics = {COND_LABEL: cond}
+        if uncond is not None:
+            statics[UNCOND_LABEL] = uncond
+        tensor_inputs = {}
+        for label, s in statics.items():
+            tensor_inputs[f"input_ids_{label}"] = s["input_ids"]
+            tensor_inputs[f"text_mrope_ids_{label}"] = s["text_mrope_ids"]
         return ARNodeInputs(
-            input_seq_len=cond["und_len"] + uncond["und_len"],
-            input_ids=torch.concat((cond["input_ids"], uncond["input_ids"])),
-            tensor_inputs={
-                "text_mrope_ids": torch.concat(
-                    (cond["text_mrope_ids"], uncond["text_mrope_ids"]),
-                    dim=1
-                )
-            },
+            input_seq_len=sum(s["und_len"] for s in statics.values()),
+            tensor_inputs=tensor_inputs,
             kwargs=dict(
-                cfg=True,
-                seq_lens={
-                    COND_LABEL: cond["und_len"],
-                    UNCOND_LABEL: uncond["und_len"],
-                }
-            )
+                cfg=uncond is not None,
+                seq_lens={label: s["und_len"] for label, s in statics.items()},
+            ),
         )
 
     def _encode_conditioning(self, image, height, width, num_frames, device, anchor_only=False):
@@ -626,12 +622,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if graph_walk == IMAGE_GEN_WALK and getattr(cm, "_cuda_graph_mode", False):
             return self._preprocess_image_gen_captured(cm, inputs)
 
-        st = self._req[engine_inputs.request_ids[0]]
-
         if graph_walk in PREFILL_WALKS:
             has_cfg = inputs[0].kwargs.get("cfg")
+            labels = [COND_LABEL, UNCOND_LABEL] if has_cfg else [COND_LABEL]
             if has_cfg:
-                labels = [COND_LABEL, UNCOND_LABEL]
                 cm.plan_attention_batched_cfg(
                     labels=labels,
                     seq_lens={
@@ -645,13 +639,21 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     is_causal=True, label=COND_LABEL,
                     write_store=False
                 )
+            # Pack label-major (all cond segments, then all uncond) to match the
+            # (label, request) batch order of the plan above.
             return {
                 "cfg": has_cfg,
-                "input_ids": torch.concat([inp.input_ids for inp in inputs]),
+                "input_ids": torch.concat([
+                    inp.tensor_inputs[f"input_ids_{label}"]
+                    for label in labels for inp in inputs
+                ]),
                 "text_mrope_ids": torch.concat([
-                    inp.tensor_inputs["text_mrope_ids"] for inp in inputs
-                ], dim=1)
+                    inp.tensor_inputs[f"text_mrope_ids_{label}"]
+                    for label in labels for inp in inputs
+                ], dim=1),
             }
+        
+        st = self._req[engine_inputs.request_ids[0]]
 
         if graph_walk in GEN_WALKS:
             rids = engine_inputs.request_ids
@@ -956,7 +958,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     ):
         cm = engine_inputs.cache_manager
         if graph_walk in PREFILL_WALKS:
-            _prof = os.environ.get("COSMOS3_PROFILE")
+            # The synchronize() in the profiling block is illegal while a CUDA
+            # graph is capturing this forward, so skip timing during capture.
+            _prof = os.environ.get("COSMOS3_PROFILE") and not torch.cuda.is_current_stream_capturing()
             if _prof:
                 _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
                 _e0.record()
@@ -1158,9 +1162,66 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # max_batch_size to the captured sizes.
                 caps_eager_batch_size=False,
             ))
+
+        # Understanding-tower text prefill: cond+uncond packed into one combined
+        # sequence (batched CFG). The dummy zeros are placeholders — the real
+        # input_ids / mrope ids are copied into the static buffers at replay.
+        if not os.environ.get("COSMOS3_DISABLE_PREFILL_CUDA_GRAPH"):
+            tok_env = os.environ.get("COSMOS3_PREFILL_CAPTURE_TOKENS")
+            prefill_tokens = (
+                [int(x) for x in tok_env.split(",")] if tok_env
+                else list(self.prefill_capture_token_buckets)
+            )
+            bs_env = os.environ.get("COSMOS3_PREFILL_CAPTURE_BS")
+            prefill_bs = (
+                [int(x) for x in bs_env.split(",")] if bs_env
+                else list(self.prefill_capture_batch_sizes)
+            )
+            mrope_dtype = torch.float32 if self.config.enable_fps_modulation else torch.long
+
+            def _prefill_template(n):
+                return {
+                    "input_ids": torch.zeros(n, dtype=torch.long, device=device),
+                    "text_mrope_ids": torch.zeros((3, n), dtype=mrope_dtype, device=device),
+                    "cfg": True,
+                }
+
+            configs.append(FlashInferPackedCudaGraphConfig(
+                capture_graph_walk=PREFILL_WALK,
+                replay_graph_walks=list(PREFILL_WALKS),
+                packed_seq_len_to_inputs={n: _prefill_template(n) for n in prefill_tokens},
+                requires_cfg=False,
+                labels=[COND_LABEL, UNCOND_LABEL],
+                batched_cfg=True,
+                causal_attention=True,
+                compile=False,
+                capture_batch_sizes=prefill_bs,
+                caps_eager_batch_size=False,
+                zero_padding_input=ARNodeInputs(
+                    input_seq_len=0,
+                    tensor_inputs={
+                        "input_ids_" + COND_LABEL: torch.zeros(0, dtype=torch.long, device=device),
+                        "input_ids_" + UNCOND_LABEL: torch.zeros(0, dtype=torch.long, device=device),
+                        "text_mrope_ids_" + COND_LABEL: torch.zeros((3, 0), dtype=mrope_dtype, device=device),
+                        "text_mrope_ids_" + UNCOND_LABEL: torch.zeros((3, 0), dtype=mrope_dtype, device=device),
+                    },
+                    kwargs=dict(
+                        cfg=True,
+                        seq_lens={COND_LABEL: 0, UNCOND_LABEL: 0},
+                    ),
+                ),
+            ))
         return configs
 
     def can_use_cuda_graphs(self, batch, model_inputs) -> bool:
+        # Text prefill is captured only with two-branch guidance (the combined
+        # cond+uncond packed sequence); the runner's can_run picks the token
+        # bucket, so a prompt past the largest bucket falls back to eager here.
+        if batch.graph_walk in PREFILL_WALKS:
+            return all(
+                (st := self._req.get(rid)) is not None and st["uncond"] is not None
+                for rid in batch.request_ids
+            )
         # Only the image denoise step is captured, only with two-branch guidance,
         # and only at a resolution we captured a graph for. A batched capture is a
         # single fixed resolution, so a concurrent batch must be uniform-resolution
@@ -1222,10 +1283,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             for rid, (cond_v, uncond_v) in zip(rids, results, strict=True)
         }
 
-    def postprocess_captured(self, request_ids, inputs, per_request_info, outputs) -> dict:
+    def postprocess_captured(
+        self, request_ids: list[str],
+        inputs: list,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        outputs: dict
+    ) -> dict:
         """Eager tail run after graph replay: the classifier-free-guidance combine
         and the (Python, multistep) scheduler step the graph can't hold. Mirrors
         the tail of ``_forward_image_gen``."""
+        if per_request_info[request_ids[0]].graph_walk not in GEN_WALKS:
+            return outputs
         for rid, inp in zip(request_ids, inputs, strict=True):
             st = self._req[rid]
             cond_v = outputs[rid]["cond_v"][0]

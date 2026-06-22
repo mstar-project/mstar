@@ -434,49 +434,67 @@ class Cosmos3Model(Model):
             return buf.getvalue()
         if modality == "video":
             import os
-            import tempfile
-
-            from torchvision.io import write_video
+            import time as _time
 
             # The decoder emits 8-bit frames [B, C, T, H, W]; encode all of them as
             # an H.264 mp4. The frames already reflect the request fps (it modulates
             # the temporal positions during generation); the container plays back
             # at the model's default fps.
+            #
+            # CRF 18 keeps the H.264 output near-visually-lossless; libx264
+            # otherwise defaults to 23, which is visibly lossier. The "ultrafast"
+            # preset and multithreading (threads=0) target the same CRF/quality
+            # but encode several times faster than libx264's default "medium"
+            # preset, which otherwise dominates the serving latency for a
+            # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
             x = output[0] if output.ndim == 5 else output  # [C, T, H, W] uint8
             _prof = os.environ.get("COSMOS3_PROFILE")
-            import time as _time
+            fps = self.config.fps
+            preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
             _vt0 = _time.perf_counter()
-            frames = x.permute(1, 2, 3, 0).cpu()  # [T, H, W, C] uint8
-            _vt1 = _time.perf_counter()
-            fd, path = tempfile.mkstemp(suffix=".mp4")
-            os.close(fd)
             try:
-                # CRF 18 keeps the H.264 output near-visually-lossless; libx264
-                # otherwise defaults to 23, which is visibly lossier. The "ultrafast"
-                # preset and multithreading (threads=0) target the same CRF/quality
-                # but encode several times faster than libx264's default "medium"
-                # preset, which otherwise dominates the serving latency for a
-                # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
-                write_video(
-                    path,
-                    frames,
-                    fps=self.config.fps,
-                    video_codec="libx264",
-                    options={
-                        "crf": "18",
-                        "preset": os.environ.get("COSMOS3_X264_PRESET", "ultrafast"),
-                        "threads": "0",
-                    },
+                # Preferred: torchcodec (torchvision >= 0.27 removed write_video).
+                from torchcodec.encoders import VideoEncoder
+
+                frames = x.permute(1, 0, 2, 3).contiguous().cpu()  # [T, C, H, W] uint8
+                _vt1 = _time.perf_counter()
+                encoded = VideoEncoder(frames, frame_rate=fps).to_tensor(
+                    "mp4",
+                    codec="libx264",
+                    crf=18,
+                    preset=preset,
+                    extra_options={"threads": "0"},
                 )
-                with open(path, "rb") as f:
-                    data = f.read()
-                if _prof:
-                    print(f"COSMOS3_PROFILE mp4 d2h={1000 * (_vt1 - _vt0):.1f}ms "
-                          f"encode={1000 * (_time.perf_counter() - _vt1):.1f}ms frames={frames.shape[0]} "
-                          f"bytes={len(data)}", flush=True)
-                return data
-            finally:
-                os.remove(path)
+                data = encoded.numpy().tobytes()
+            except ImportError:
+                # Fallback for environments without torchcodec (or with the
+                # older decode-only torchcodec that lacks VideoEncoder), where
+                # torchvision still ships write_video.
+                import tempfile
+
+                from torchvision.io import write_video
+
+                frames = x.permute(1, 2, 3, 0).cpu()  # [T, H, W, C] uint8
+                _vt1 = _time.perf_counter()
+                fd, path = tempfile.mkstemp(suffix=".mp4")
+                os.close(fd)
+                try:
+                    write_video(
+                        path,
+                        frames,
+                        fps=fps,
+                        video_codec="libx264",
+                        options={"crf": "18", "preset": preset, "threads": "0"},
+                    )
+                    with open(path, "rb") as f:
+                        data = f.read()
+                finally:
+                    os.remove(path)
+            if _prof:
+                print(f"COSMOS3_PROFILE mp4 d2h={1000 * (_vt1 - _vt0):.1f}ms "
+                      f"encode={1000 * (_time.perf_counter() - _vt1):.1f}ms frames={frames.shape[0]} "
+                      f"bytes={len(data)}", flush=True)
+            return data
         if modality == "action":
             # The predicted action latents [1, chunk, action_dim] -> [chunk,
             # action_dim] float32 bytes. Columns beyond the request's

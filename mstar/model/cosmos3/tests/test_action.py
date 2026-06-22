@@ -236,7 +236,10 @@ def test_action_denoise_step_matches_fused() -> None:
         und_len = s["und_len"]
         cache.set_active_label("main")
         cache.plan(is_causal=True)
-        model.prefill_und(s["input_ids"], s["text_mrope_ids"], cache)
+        _cos, _sin = model._rotary(
+            s["text_mrope_ids"], s["input_ids"].device, model.embed_tokens.weight.dtype
+        )
+        model.prefill_und(s["input_ids"], _cos, _sin, cache)
         cache.plan(is_causal=False)
         with torch.no_grad():
             dv, da = model.denoise_step(
@@ -272,7 +275,10 @@ def test_action_batched_one_matches_single() -> None:
         cache = _SdpaCache()
         cache.set_active_label("main")
         cache.plan(is_causal=True)
-        model.prefill_und(s["input_ids"], s["text_mrope_ids"], cache)
+        _cos, _sin = model._rotary(
+            s["text_mrope_ids"], s["input_ids"].device, model.embed_tokens.weight.dtype
+        )
+        model.prefill_und(s["input_ids"], _cos, _sin, cache)
         cache.plan(is_causal=False)
         with torch.no_grad():
             dv, da = model.denoise_step(
@@ -288,7 +294,10 @@ def test_action_batched_one_matches_single() -> None:
         cache2 = _SdpaCache()
         cache2.set_active_label("main")
         cache2.plan(is_causal=True)
-        model.prefill_und(s["input_ids"], s["text_mrope_ids"], cache2)
+        _cos, _sin = model._rotary(
+            s["text_mrope_ids"], s["input_ids"].device, model.embed_tokens.weight.dtype
+        )
+        model.prefill_und(s["input_ids"], _cos, _sin, cache2)
         cache2.plan_attention_batched_cfg(
             labels=["main"],
             seq_lens=[s["num_vision_tokens"] + s["num_action_tokens"]],
