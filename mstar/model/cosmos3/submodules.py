@@ -298,7 +298,41 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 self._req[fwd_info.request_id]["cond_latents"] = self._encode_conditioning(
                     image[0], height, width, num_frames, device, anchor_only=True
                 )
-        return ARNodeInputs(input_seq_len=cond["und_len"])
+
+        return self._get_prefill_node_inputs(cond, uncond)
+
+    def _get_prefill_node_inputs(self, cond, uncond):
+        if uncond is None:
+            return ARNodeInputs(
+                input_ids=cond["input_ids"],
+                input_seq_len=cond["und_len"],
+                tensor_inputs={
+                    "text_mrope_ids": cond["text_mrope_ids"]
+                },
+                kwargs=dict(
+                    cfg=False,
+                    seq_lens={
+                        COND_LABEL: cond["und_len"]
+                    }
+                )
+            )
+        return ARNodeInputs(
+            input_seq_len=cond["und_len"] + uncond["und_len"],
+            input_ids=torch.concat((cond["input_ids"], uncond["input_ids"])),
+            tensor_inputs={
+                "text_mrope_ids": torch.concat(
+                    (cond["text_mrope_ids"], uncond["text_mrope_ids"]),
+                    dim=1
+                )
+            },
+            kwargs=dict(
+                cfg=True,
+                seq_lens={
+                    COND_LABEL: cond["und_len"],
+                    UNCOND_LABEL: uncond["und_len"],
+                }
+            )
+        )
 
     def _encode_conditioning(self, image, height, width, num_frames, device, anchor_only=False):
         """VAE-encode a conditioning frame into clean anchor latents.
@@ -423,7 +457,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "cond_video_latents": cond_latents,
             "clean_action": clean_action,
         }
-        return ARNodeInputs(input_seq_len=cond["und_len"])
+        return self._get_prefill_node_inputs(cond, uncond)
 
     def _encode_conditioning_video(self, video, height, width, num_frames, device):
         """VAE-encode a conditioning video clip into clean anchor latents.
@@ -583,7 +617,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "position_ids_uncond": torch.stack([inp.tensor_inputs["position_ids_uncond"] for inp in inputs]),
         }
 
-    def preprocess(self, graph_walk, engine_inputs: ModelInputsFromEngine, inputs) -> dict:
+    def preprocess(
+        self, graph_walk, engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs]
+    ) -> dict:
         cm = engine_inputs.cache_manager
 
         if graph_walk == IMAGE_GEN_WALK and getattr(cm, "_cuda_graph_mode", False):
@@ -592,12 +629,29 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         st = self._req[engine_inputs.request_ids[0]]
 
         if graph_walk in PREFILL_WALKS:
-            cm.plan_attention(seq_lens=[st["cond"]["und_len"]], is_causal=True, label=COND_LABEL, write_store=False)
-            if st["uncond"] is not None:
-                cm.plan_attention(
-                    seq_lens=[st["uncond"]["und_len"]], is_causal=True, label=UNCOND_LABEL, write_store=False
+            has_cfg = inputs[0].kwargs.get("cfg")
+            if has_cfg:
+                labels = [COND_LABEL, UNCOND_LABEL]
+                cm.plan_attention_batched_cfg(
+                    labels=labels,
+                    seq_lens={
+                        key: [inp.kwargs["seq_lens"][key] for inp in inputs] \
+                            for key in labels
+                    }, is_causal=True, write_store=False
                 )
-            return {}
+            else:
+                cm.plan_attention(
+                    seq_lens=[inp.input_seq_len for inp in inputs],
+                    is_causal=True, label=COND_LABEL,
+                    write_store=False
+                )
+            return {
+                "cfg": has_cfg,
+                "input_ids": torch.concat([inp.input_ids for inp in inputs]),
+                "text_mrope_ids": torch.concat([
+                    inp.tensor_inputs["text_mrope_ids"] for inp in inputs
+                ], dim=1)
+            }
 
         if graph_walk in GEN_WALKS:
             rids = engine_inputs.request_ids
@@ -671,25 +725,31 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         cm = engine_inputs.cache_manager
         rid = engine_inputs.request_ids[0]
         if graph_walk in PREFILL_WALKS:
-            return self._forward_prefill(cm, self._req[rid])
+            return self._forward_prefill(cm, **kwargs)
         if graph_walk in GEN_WALKS:
             return self._forward_image_gen(cm, self._req[rid], **kwargs)
         if graph_walk in ACTION_WALKS:
             return self._forward_action_gen(cm, self._req[rid], **kwargs)
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
 
-    def _forward_prefill(self, cm, st) -> dict:
+    def _forward_prefill(
+        self, cm,
+        input_ids: torch.Tensor,
+        text_mrope_ids: torch.Tensor,
+        cfg=False,
+        **kwargs
+    ) -> dict:
         _prof = os.environ.get("COSMOS3_PROFILE")
         if _prof:
             _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
             _e0.record()
-        cond = st["cond"]
-        cm.set_active_label(COND_LABEL)
-        self.transformer.prefill_und(cond["input_ids"], cond["text_mrope_ids"], cm)
-        if st["uncond"] is not None:
-            uncond = st["uncond"]
-            cm.set_active_label(UNCOND_LABEL)
-            self.transformer.prefill_und(uncond["input_ids"], uncond["text_mrope_ids"], cm)
+
+        if cfg:
+            cm.set_active_label(CFG_BATCHED_LABEL)
+        else:
+            cm.set_active_label(COND_LABEL)
+
+        self.transformer.prefill_und(input_ids, text_mrope_ids, cm)
         if _prof:
             _e1.record(); torch.cuda.synchronize()
             logger.info("COSMOS3_PROFILE prefill %.1f ms", _e0.elapsed_time(_e1))
@@ -868,7 +928,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         sts = [self._req.get(rid) for rid in batch.request_ids]
         if any(st is None for st in sts):
             return False
-        if batch.graph_walk in GEN_WALKS:
+        if batch.graph_walk in GEN_WALKS or batch.graph_walk in PREFILL_WALKS:
             # Image/video batch only in the two-branch guidance regime, so one
             # batched-CFG plan covers them.
             return all(st["uncond"] is not None for st in sts)
@@ -891,13 +951,30 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     @torch.autocast(device_type="cuda", enabled=False)
     def forward_batched(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
-        latents, time_index, action_latents=None, **kwargs,
+        latents=None, time_index=None, action_latents=None,
+        input_ids=None, text_mrope_ids=None, **kwargs,
     ):
+        cm = engine_inputs.cache_manager
+        if graph_walk in PREFILL_WALKS:
+            _prof = os.environ.get("COSMOS3_PROFILE")
+            if _prof:
+                _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
+                _e0.record()
+
+            if kwargs.get("cfg"):
+                cm.set_active_label(CFG_BATCHED_LABEL)
+            else:
+                cm.set_active_label(COND_LABEL)
+
+            self.transformer.prefill_und(input_ids, text_mrope_ids, cm)
+            if _prof:
+                _e1.record(); torch.cuda.synchronize()
+                logger.info("COSMOS3_PROFILE prefill %.1f ms", _e0.elapsed_time(_e1))
+            return {}
         if graph_walk in ACTION_WALKS:
             return self._forward_batched_action(engine_inputs, latents, action_latents, time_index)
         if graph_walk not in GEN_WALKS:
             raise ValueError(f"Cosmos3 batched forward only supports generation walks, got {graph_walk!r}")
-        cm = engine_inputs.cache_manager
         cm.set_active_label(CFG_BATCHED_LABEL)
         reqs, meta = [], []
         for rid in engine_inputs.request_ids:

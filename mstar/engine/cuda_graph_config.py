@@ -112,6 +112,7 @@ class FlashInferPackedCudaGraphConfig(CudaGraphConfig):
         labels: list[str]  = None,
         compile: bool = True,
         causal_attention: bool = True,
+        batched_cfg: bool = False,
         capture_batch_sizes: list[int] | None = None,
         zero_padding_input: ARNodeInputs | None = None,
     ):

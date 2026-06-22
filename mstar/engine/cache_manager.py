@@ -71,6 +71,11 @@ class WorkspaceBufferManager:
         return self.buffers[label]
 
 
+@dataclass
+class BatchedCfgInfo:
+    per_label_seq_len: dict[str, list[int]]
+
+
 class BatchedCacheManager:
     """Manages batched FlashInfer attention for multiple requests simultaneously.
 
@@ -149,6 +154,8 @@ class BatchedCacheManager:
         # pre-plan was applied.
         self._plan_done_event: "torch.cuda.Event | None" = None
 
+        self._batched_cfg_info: BatchedCfgInfo | None = None
+
     @torch.compiler.disable
     def _get_state(self, request_id: str, label: str | None = None) -> KVRequestState:
         label = label or self.active_labels.get(request_id, "main")
@@ -208,6 +215,7 @@ class BatchedCacheManager:
             label: cache label to plan for. If None, uses the current active label.
         """
         from mstar.utils.profiler import range_pop, range_push
+        self._batched_cfg_info = None
 
         if self.enable_nvtx:
             range_push("cache.plan_attention", synchronize=False)
@@ -386,45 +394,6 @@ class BatchedCacheManager:
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[effective_label] = ps
 
-        # TODO(perf): overlap wrapper.plan(step N+1) with the previous step's
-        # replay+sample to hide its ~750 µs critical-path cost.
-        #
-        # plan() only depends on the next KV state (seq_lens + page indices),
-        # not on the token sampled by the previous step, so it can be issued
-        # as soon as advance_seq_lens(N) runs — well before sample(N) returns.
-        # At bs=8 on H200, sample_and_remap is ~0.9 ms vs plan ~0.75 ms, so
-        # the whole plan could in principle be hidden.
-        #
-        # Design sketch (double-buffered wrappers):
-        #   * Keep two FlashInferDecodeWrappers, wrapper[0] and wrapper[1],
-        #     each with its own persistent workspace + static plan buffers.
-        #   * Step N's run() uses wrapper[N % 2]; a background worker thread
-        #     calls plan(N+1) on wrapper[(N+1) % 2] concurrently.
-        #   * Main thread join()s the plan future just before replay(N+1).
-        #
-        # Why a worker *thread* and not just a side CUDA stream:
-        #   plan()'s wall-clock is dominated by CPU-side work — Python
-        #   bookkeeping, a dozen cudaMemcpyAsync API calls (~13 µs host-side
-        #   each), and two internal D→H reads (CUB scan result) that block
-        #   the calling thread. A side stream only hides plan's ~50 µs of
-        #   actual GPU kernel time; the thread still stalls on the D→H waits.
-        #   PyTorch releases the GIL inside CUDA ops, so a Python thread can
-        #   issue plan() while the main thread submits sample(N).
-        #
-        # Risks / prerequisites:
-        #   * PagedAllocationManager mutation (.alloc, .reset_label, etc.)
-        #     is now guarded by a per-manager RLock; the underlying
-        #     PageAllocator's queue compound-ops are guarded by their own
-        #     Lock so qsize-then-get cannot race with concurrent free.
-        #   * advance_seq_lens() inside a captured CUDA graph updates state
-        #     via .copy_(); the worker must wait on a real cudaEvent, not a
-        #     torch stream sync, before reading page indices.
-        #   * wrapper[(N+1) % 2]'s static buffers are read by the main
-        #     thread's next replay — need a handshake (Event/Condition) so
-        #     replay doesn't start before the worker finishes plan().
-        #   * If sample(N) ever runs shorter than plan(N+1) (short prefill,
-        #     very small batch), the main thread waits. Still no worse than
-        #     today.
         if self.enable_nvtx:
             range_push("cache.plan_attention.wrapper_plan", synchronize=False)
         try:
@@ -559,7 +528,7 @@ class BatchedCacheManager:
     def plan_attention_batched_cfg(
         self,
         labels: list[str],
-        seq_lens: list[int],
+        seq_lens: list[int] | dict[str, list[int]],
         is_causal: bool = False,
         write_store: bool = False,
         dtype=torch.bfloat16,
@@ -579,6 +548,14 @@ class BatchedCacheManager:
             combined_label: key for the combined _PlanState.
         """
         assert self.kv_cache is not None
+        if isinstance(seq_lens, list):
+            seq_lens = {
+                key: seq_lens for key in labels
+            }
+
+        self._batched_cfg_info = BatchedCfgInfo(
+            per_label_seq_len=seq_lens
+        )
 
         if (_dense_gen_attn_enabled() and not is_causal
                 and not self._cuda_graph_mode):
@@ -610,7 +587,7 @@ class BatchedCacheManager:
         for label in labels:
             for i, rid in enumerate(self.request_ids):
                 state = self._get_state(rid, label)
-                sl = seq_lens[i]
+                sl = seq_lens[label][i]
                 total_len = state.seq_len + sl
 
                 self.alloc_manager.alloc(rid, label=label, seq_len=total_len)
@@ -691,7 +668,7 @@ class BatchedCacheManager:
     def plan_rope_batched_cfg(
         self,
         labels: list[str],
-        seq_lens: list[int],
+        seq_lens: list[int] | dict[str, list[int]],
         per_label_pos_ids: dict[str, list[torch.Tensor]] | None = None,
         combined_label: str = "_cfg_batched",
     ):
@@ -705,6 +682,11 @@ class BatchedCacheManager:
             combined_label: key for the combined _PlanState (must already exist
                 from plan_attention_batched_cfg).
         """
+        if isinstance(seq_lens, list):
+            seq_lens = {
+                key: seq_lens for key in labels
+            }
+
         # Build one tensor *per label* in `labels` order, then concat. Order
         # matters: downstream attention indexes these positions by
         # (label_i * per_label_len + within_label_offset), so reordering the
@@ -717,7 +699,7 @@ class BatchedCacheManager:
                 parts.append(torch.cat(per_label_pos_ids[label]))
             else:
                 pos_ids_list: list[int] = []
-                for rid, sl in zip(self.request_ids, seq_lens, strict=True):
+                for rid, sl in zip(self.request_ids, seq_lens[label], strict=True):
                     start = self._get_state(rid, label).position_id_start
                     pos_ids_list.extend(range(start, start + sl))
                 parts.append(torch.tensor(
@@ -781,7 +763,10 @@ class BatchedCacheManager:
 
         return ps.wrapper.run(q, self.kv_cache[layer_idx]).to(orig_dtype)
 
-    def _build_dense_gen_plan(self, labels: list[str], seq_lens: list[int]) -> dict:
+    def _build_dense_gen_plan(
+        self, labels: list[str],
+        seq_lens: list[int] | dict[str, list[int]]
+    ) -> dict:
         """Pre-compute the per-segment gather + varlen layout for the dense
         generation-attention path, in the same (label, request) batch order the
         generation tokens are packed in. Each segment attends its fresh
@@ -790,6 +775,12 @@ class BatchedCacheManager:
         (the same across all layers) and the cumulative-sequence-length tensors a
         single varlen kernel needs. Built once per denoise step, reused by every
         layer's run_attention."""
+
+        if isinstance(seq_lens, list):
+            seq_lens = {
+                key: seq_lens for key in labels
+            }
+
         cfg = self.kv_cache_config
         page_size = cfg.page_size
         segs = []  # (prefix_page_indices, prefix_len, gen_len)
@@ -801,7 +792,7 @@ class BatchedCacheManager:
             for i, rid in enumerate(self.request_ids):
                 state = self._get_state(rid, label)
                 prefix_len = state.seq_len
-                gen_len = seq_lens[i]
+                gen_len = seq_lens[label][i]
                 n_pages = (prefix_len + page_size - 1) // page_size
                 idx = torch.tensor(
                     state.page_indices[:n_pages], dtype=torch.long, device=self.device
@@ -986,20 +977,35 @@ class BatchedCacheManager:
         side-channel is auto-cleared after use so it doesn't leak across
         calls.
         """
-        for i, rid in enumerate(self.request_ids):
-            ps = self._plan_states[self.active_labels[rid]]
-            n = ps.seq_lens[i]
-            state = self._get_state(rid)
-            state.seq_len += n
-            if pos_id_ns is None:
-                if ps.custom_pos_advance is not None:
-                    state.position_id_start += ps.custom_pos_advance[i]
+
+        if self._batched_cfg_info:
+            for label, seq_lens in self._batched_cfg_info.per_label_seq_len.items():
+                for i, rid in enumerate(self.request_ids):
+                    n = seq_lens[i]
+                    state = self._get_state(rid, label=label)
+                    state.seq_len += n
+                    if pos_id_ns is None:
+                        state.position_id_start += n
+                    elif isinstance(pos_id_ns, int):
+                        state.position_id_start += pos_id_ns
+                    else:
+                        state.position_id_start += pos_id_ns[i]
+        else:
+            for i, rid in enumerate(self.request_ids):
+                label = self.active_labels[rid]
+                ps = self._plan_states[label]
+                n = ps.seq_lens[i]
+                state = self._get_state(rid, label=label)
+                state.seq_len += n
+                if pos_id_ns is None:
+                    if ps.custom_pos_advance is not None:
+                        state.position_id_start += ps.custom_pos_advance[i]
+                    else:
+                        state.position_id_start += n
+                elif isinstance(pos_id_ns, int):
+                    state.position_id_start += pos_id_ns
                 else:
-                    state.position_id_start += n
-            elif isinstance(pos_id_ns, int):
-                state.position_id_start += pos_id_ns
-            else:
-                state.position_id_start += pos_id_ns[i]
+                    state.position_id_start += pos_id_ns[i]
         # Clear the side-channel on every consumer so a stale value can't
         # bleed into a subsequent walk.
         for ps in self._plan_states.values():
