@@ -25,8 +25,8 @@ def pretty_print_profile(prof: RequestProfile, filename=None):
 
     Writes to ``filename`` (appended) when given, otherwise to stdout. Stage
     timings are only shown for segments whose endpoints were both recorded, so
-    metrics that depend on the conductor (not yet wired up) are simply skipped
-    rather than reported as zero.
+    any checkpoint that wasn't stamped is simply skipped rather than reported
+    as zero.
     """
     lines: list[str] = []
     sep = "=" * _WIDTH
@@ -75,6 +75,22 @@ def pretty_print_profile(prof: RequestProfile, filename=None):
         lines.append(f"   {'total':<40} {_ms(present[0][1], present[-1][1])}")
     else:
         lines.append(" Timeline: (no timing recorded)")
+
+    # ---- per-node graph timings (summed over the request) -----------------
+    if prof.graph_timings:
+        lines.append(rule)
+        lines.append(" Graph timings (CPU, summed over the request) [ms]:")
+        for gt in sorted(prof.graph_timings, key=lambda g: g.total_time, reverse=True):
+            label = f"{gt.node}:{gt.graph_walk}"
+            if len(label) > 24:
+                label = label[:23] + "…"
+            lines.append(
+                f"   {label:<24} n={gt.exec_count:<5}"
+                f" tot {gt.total_time * 1e3:7.1f}"
+                f"  fwd {gt.forward_time * 1e3:7.1f}"
+                f"  pre {gt.preprocess_time * 1e3:6.1f}"
+                f"  post {gt.postprocess_time * 1e3:6.1f}"
+            )
     lines.append(sep)
 
     text = "\n".join(lines) + "\n"
