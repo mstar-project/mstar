@@ -1368,11 +1368,15 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # causal-conv feature cache, and dynamic=False gives the best per-shape
         # kernels at the cost of a one-time trace per new (frames, height, width)
         # — fine for the few fixed generation tiers (the first request at each
-        # shape pays the trace). Off by default; set COSMOS3_COMPILE_VAE=1 to
-        # enable (A/B against the eager decode, which is identical bar fp
-        # rounding). The compile wraps the same bf16, autocast-off decode below.
+        # shape pays the trace). On by default — it cuts the 189-frame video VAE
+        # decode ~30% (a large share of video latency) and is neutral for the
+        # tiny single-frame image decode; set COSMOS3_COMPILE_VAE=0 to disable
+        # (A/B against the eager decode, which is identical bar fp rounding). The
+        # compile wraps the same bf16, autocast-off decode below.
         self._decode = vae.decode if vae is not None else None
-        if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE"):
+        if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
+            "0", "false", "no", "off",
+        ):
             self._decode = torch.compile(vae.decode, fullgraph=False, dynamic=False)
             logger.info("Cosmos3 VAE decode torch.compile enabled")
 
