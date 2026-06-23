@@ -99,9 +99,13 @@ class Cosmos3RotaryEmbedding(nn.Module):
         )
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)  # [3,B,N]
-        inv_freq_expanded = inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1).to(device)
-        position_ids_expanded = position_ids[:, :, None, :].float()  # [3,B,1,N]
-        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)  # [3,B,N,head_dim//2]
+        # Outer product position ⊗ inv_freq via broadcast multiply. The original
+        # form built stride-0 broadcast views and ran a batched matmul whose
+        # output the CUDA-graph memory pool can mis-capture at some sequence
+        # lengths (the rotary table comes out wrong on replay, scrambling the
+        # image). A plain broadcast multiply produces a fresh contiguous tensor
+        # and is capture-faithful — bit-identical eagerly.
+        freqs = position_ids[:, :, :, None].float() * inv_freq.view(1, 1, 1, -1)  # [3,B,N,head_dim//2]
         freqs = self.apply_interleaved_mrope(freqs)  # [B,N,head_dim//2]
         emb = torch.cat((freqs, freqs), dim=-1)  # [B,N,head_dim]
         return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)

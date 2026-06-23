@@ -1113,22 +1113,22 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         configs = []
         for height, width in resolutions:
             latent_shape = self._latent_shape(height, width, num_frames=1)
-            # CUDA-graph capture of the denoise step corrupts the output at some
-            # resolutions: the served image is globally degraded while the eager
-            # path stays clean. Empirically the capture is faithful only when
-            # both latent dims are divisible by 4 (256p latent 12x20 is clean;
-            # 480p 30x52 and 720p 45x80 corrupt). The underlying capture cause is
-            # still open (ruled out: latent padding, attention backend,
-            # torch.compile, cuBLAS workspace, and the baked token layout); until
-            # it is fixed, capture only divisible-by-4 dims and run the rest
-            # eagerly, which is clean and only marginally slower at these
-            # compute-bound tiers.
-            if any(d % 4 for d in latent_shape[3:5]):
+            # The denoise CUDA-graph capture is bit-faithful at every resolution
+            # (the rotary outer product is a broadcast multiply, not a batched
+            # matmul over stride-0 views — see Cosmos3RotaryEmbedding; the matmul
+            # form was mis-captured by the graph memory pool at some sequence
+            # lengths). The graph only HELPS the launch-bound tiers, though: its
+            # per-step input copies scale with resolution, so at large latents
+            # (720p+) the graph is net-slower than the eager dense path. So
+            # capture only below COSMOS3_GRAPH_MAX_LATENT_AREA (latent H*W): 256p
+            # (240) and 480p (1560) graph; 720p (3600) and video run eager+dense.
+            latent_area = latent_shape[3] * latent_shape[4]
+            max_area = int(os.environ.get("COSMOS3_GRAPH_MAX_LATENT_AREA", "2000"))
+            if latent_area > max_area:
                 logger.info(
-                    "Cosmos3: skipping CUDA-graph capture for %dx%d "
-                    "(latent dim %s not divisible by 4 -> known graph-capture "
-                    "corruption -> eager fallback)",
-                    height, width, tuple(latent_shape[3:]),
+                    "Cosmos3: skipping CUDA-graph capture for %dx%d (latent H*W "
+                    "%d > %d -> graph net-slower than eager dense here -> eager)",
+                    height, width, latent_area, max_area,
                 )
                 continue
             static = self._build_static(
@@ -1370,7 +1370,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # — fine for the few fixed generation tiers (the first request at each
         # shape pays the trace). Off by default; set COSMOS3_COMPILE_VAE=1 to
         # enable (A/B against the eager decode, which is identical bar fp
-        # rounding). The compile wraps the same fp32, autocast-off decode below.
+        # rounding). The compile wraps the same bf16, autocast-off decode below.
         self._decode = vae.decode if vae is not None else None
         if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE"):
             self._decode = torch.compile(vae.decode, fullgraph=False, dynamic=False)
