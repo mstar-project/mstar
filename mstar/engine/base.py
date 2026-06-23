@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+import time
 from typing import Any
 
 import torch
@@ -9,6 +10,7 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerTPGroups
 from mstar.engine.kv_store import KVCacheConfig, StoreWritePolicy
+from mstar.profile.worker import ExecTimings
 
 
 class EngineType(Enum):
@@ -45,6 +47,7 @@ class NodeBatch:
     # rids whose consumed streaming input was the final chunk — this pass
     # reports the partition done (see worker._postprocess_batch)
     final_stream_rids: set[str] = field(default_factory=set)
+    exec_timings: ExecTimings = field(default_factory=ExecTimings)
 
 
 @dataclass
@@ -126,8 +129,13 @@ class NodeOutput:
 
 
 class BaseEngine(ABC):
-    def __init__(self, enable_nvtx: bool = False, **kwargs):
+    def __init__(
+        self, enable_nvtx: bool = False,
+        enable_profile: bool=False,
+        **kwargs
+    ):
         self.enable_nvtx = enable_nvtx
+        self.enable_profile = enable_profile
 
     def has_autocast(self):
         return True
@@ -216,6 +224,8 @@ class BaseEngine(ABC):
         recovery, finally-block state writebacks) may override this entirely
         and call the hooks themselves to keep the cleanup invariant intact.
         """
+        if self.enable_profile and batch.exec_timings.start is None:
+            batch.exec_timings.start = time.perf_counter()
         prepared = self.prepare_batch(batch)
         if not prepared.active_request_ids:
             return NodeOutput(
@@ -329,6 +339,8 @@ class BaseEngine(ABC):
         return False
 
     def execute_with_max_batch_size(self, batch: NodeBatch) -> NodeOutput:
+        if self.enable_profile:
+            batch.exec_timings.start = time.perf_counter()
         bs = self.get_max_batch_size(batch.node_name, batch.graph_walk)
         n = len(batch.request_ids)
         if bs is None or n <= bs:
@@ -340,7 +352,7 @@ class BaseEngine(ABC):
 
         for i in range(0, n, bs):
             rids = batch.request_ids[i:min(i+bs, n)]
-            minibatch_out = self.execute_batch(NodeBatch(
+            minibatch = NodeBatch(
                 node_name=batch.node_name,
                 graph_walk=batch.graph_walk,
                 request_ids=rids,
@@ -353,7 +365,13 @@ class BaseEngine(ABC):
                         if rid in batch.per_request_info
                 },
                 metadata=batch.metadata
-            ))
+            )
+            minibatch_out = self.execute_batch(minibatch)
+            # Fold each sub-batch's forward window back into the parent batch's
+            # exec_timings (earliest launch wins); the worker sets fwd_end on the
+            # parent once the whole split forward has been submitted.
+            if self.enable_profile:
+                batch.exec_timings.update(minibatch.exec_timings)
             output.per_request_output_tensors.update(
                 minibatch_out.per_request_output_tensors
             )

@@ -12,6 +12,7 @@ Stateful engines (paged KV cache, FlashInfer planning, sampling, CFG) live in
 """
 
 import logging
+import time
 from dataclasses import dataclass
 
 import torch
@@ -107,9 +108,10 @@ class StatelessEngine(BaseEngine):
         config: StatelessEngineConfig | None = None,
         enable_nvtx: bool = False,
         autocast_dtype: torch.dtype | None = None,
+        enable_prof: bool = False,
         **kwargs,
     ):
-        super().__init__(enable_nvtx=enable_nvtx)
+        super().__init__(enable_nvtx=enable_nvtx, enable_profile=enable_prof)
         if config is None:
             config = StatelessEngineConfig()
         if autocast_dtype is not None and config.autocast_dtype is not None:
@@ -412,6 +414,7 @@ class StatelessEngine(BaseEngine):
             per_request_info=batch.per_request_info,
             submodule=submodule,
             launch_started_event=batch.metadata.get("launch_started_event"),
+            exec_timings=batch.exec_timings if self.enable_profile else None,
         )
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -446,6 +449,8 @@ class StatelessEngine(BaseEngine):
         launch_started_event = batch.metadata.get("launch_started_event")
         if launch_started_event is not None:
             launch_started_event.set()
+        if self.enable_profile:
+            batch.exec_timings.fwd_start = time.perf_counter()
         outputs = submodule.forward_batched(
             graph_walk=batch.graph_walk,
             engine_inputs=engine_inputs,
@@ -485,6 +490,9 @@ class StatelessEngine(BaseEngine):
             launch_started_event = batch.metadata.get("launch_started_event")
             if launch_started_event is not None:
                 launch_started_event.set()
+            # Batch-level fwd_start: stamp once, on the first rid's launch.
+            if self.enable_profile and batch.exec_timings.fwd_start is None:
+                batch.exec_timings.fwd_start = time.perf_counter()
             outputs[rid] = submodule.forward(
                 graph_walk=batch.graph_walk,
                 engine_inputs=engine_inputs,

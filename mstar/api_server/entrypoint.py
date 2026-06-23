@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import collections
+from dataclasses import dataclass, field
 import json
 import logging
 import multiprocessing as mp
@@ -24,6 +25,8 @@ from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.model.registry import HF_MODELS
+from mstar.profile.display import pretty_print_profile
+from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils.logging_config import quiet_noisy_loggers
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,7 @@ def _conductor_process_target(
     config_path: str,
     socket_path_prefix: str,
     enable_nvtx: bool = False,
+    enable_prof: bool = False,
     log_level: str = "INFO",
     cache_dir: str | None = None,
     tensor_comm_protocol=CommProtocol.RDMA,
@@ -98,6 +102,7 @@ def _conductor_process_target(
         model_config_file=config_path,
         socket_path_prefix=socket_path_prefix,
         enable_nvtx=enable_nvtx,
+        enable_prof=enable_prof,
         log_level=log_level,
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device
@@ -135,6 +140,19 @@ def _shutdown_conductor_process(
 # APIServer
 # ------------------------------------------------------------------
 
+
+@dataclass
+class PendingRequest:
+    streaming: bool
+    input_modalities: list[str]
+    output_modalities: list[str]
+    profile: RequestProfile
+    event: threading.Event = field(default_factory=threading.Event)
+    chunks: list[ResultChunk] = field(default_factory=list)
+    final_outputs: dict = field(default_factory=dict)
+    consumed_chunks: int = 0
+
+
 class APIServer:
     """Accept multimodal requests, forward to conductor, collect results."""
 
@@ -148,10 +166,18 @@ class APIServer:
         tcp_transfer_device="",
         model=None,
         model_name: str = "dummy",
+        log_stats: bool = False,
+        log_stats_file: str | None = None,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
+
+        # Per-request profiling: when enabled, a RequestProfile is collected for
+        # each request and pretty-printed when the request finishes. ``log_stats_file``
+        # (optional) appends the report to a file instead of only stdout.
+        self.log_stats = log_stats
+        self.log_stats_file = log_stats_file
 
         # Kept so the OpenAI-compatible layer can look up the per-model adapter
         # (``model_name``) and query model-level metadata such as the audio
@@ -169,7 +195,7 @@ class APIServer:
         )
 
         # Concurrent request tracking
-        self.pending_requests: dict[str, dict] = {}
+        self.pending_requests: dict[str, PendingRequest] = {}
         self.recently_completed: collections.OrderedDict[str, float] = (
             collections.OrderedDict()
         )
@@ -246,15 +272,15 @@ class APIServer:
 
         # Register pending request
         with self.request_lock:
-            self.pending_requests[request_id] = {
-                "chunks": [],           # list[ResultChunk]
-                "event": threading.Event(),
-                "streaming": streaming,
-                "consumed_chunks": 0,
-                "input_modalities": input_modalities,
-                "output_modalities": output_modalities,
-                "final_outputs": {},
-            }
+            self.pending_requests[request_id] = PendingRequest(
+                streaming=streaming,
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                profile=RequestProfile(
+                    rid=request_id,
+                    timing=RequestTiming(recv_time=time.perf_counter()),
+                ),
+            )
 
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=request_id,
@@ -283,13 +309,13 @@ class APIServer:
             if (
                 (not self.preprocess_worker.has_pending_tensors(rid)) \
                     and self.preprocess_worker.received_final_chunks(
-                        rid, self.pending_requests[rid]["final_outputs"]
+                        rid, self.pending_requests[rid].final_outputs
                     )
             ) or (now - ts) >= self._recently_completed_ttl
         ]
         for rid in stale:
             # only set the event when there are no more pending chunks
-            self.pending_requests[rid]["event"].set()
+            self.pending_requests[rid].event.set()
             self.preprocess_worker.cleanup_request(rid)
             self.recently_completed.pop(rid, None)
 
@@ -321,8 +347,13 @@ class APIServer:
                             elif message.message_type == "request_complete":
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
-                                self.pending_requests[rid]["final_outputs"] = \
-                                    message.body.final_outputs
+                                req = self.pending_requests[rid]
+                                req.final_outputs = message.body.final_outputs
+                                req.profile.timing.conductor_ingest_time = \
+                                    message.body.conductor_ingest_time
+                                req.profile.timing.conductor_finish_time = \
+                                    message.body.conductor_finish_time
+                                req.profile.graph_timings = list(message.body.graph_timings.values())
                         elif rid in self.recently_completed:
                             logger.debug("Late message for completed %s: %s", rid, message.message_type)
                             if message.message_type == "result_tensors":
@@ -333,6 +364,16 @@ class APIServer:
                             )
                             if message.message_type == "result_tensors":
                                 self.preprocess_worker.discard_result_tensors(message.body)
+                # Apply preprocess-side profiling (preprocess finish time +
+                # input sizes) reported by the data worker for each request.
+                for update in self.preprocess_worker.get_profile_updates():
+                    with self.request_lock:
+                        req = self.pending_requests.get(update.request_id)
+                        if req is not None:
+                            req.profile.timing.preprocess_finish_time = \
+                                update.preprocess_finish_time
+                            req.profile.inputs = update.inputs
+
                 for result_chunk in self.preprocess_worker.get_result_chunks():
                     logger.debug(
                         "Got result chunk of %s modality for request %s",
@@ -340,9 +381,12 @@ class APIServer:
                     )
                     rid = result_chunk.request_id
                     with self.request_lock:
-                        self.pending_requests[rid]["chunks"].append(
-                            result_chunk
-                        )
+                        req = self.pending_requests[rid]
+                        now = time.perf_counter()
+                        if req.profile.timing.first_chunk_time is None:
+                            req.profile.timing.first_chunk_time = now
+                        req.profile.timing.last_chunk_time = now
+                        req.chunks.append(result_chunk)
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
@@ -375,11 +419,11 @@ class APIServer:
                 with self.request_lock:
                     req = self.pending_requests.get(request_id)
                     if req:
-                        avail = len(req["chunks"])
-                        consumed = req["consumed_chunks"]
-                        new_chunks = req["chunks"][consumed:avail]
-                        req["consumed_chunks"] = avail
-                        done = req["event"].is_set()
+                        avail = len(req.chunks)
+                        consumed = req.consumed_chunks
+                        new_chunks = req.chunks[consumed:avail]
+                        req.consumed_chunks = avail
+                        done = req.event.is_set()
                     else:
                         done = True
 
@@ -390,11 +434,16 @@ class APIServer:
                     logger.info("Async stream results received finish for %s", request_id)
                     # flush remaining
                     remaining: list[ResultChunk] = []
+                    finished_req: PendingRequest | None = None
                     with self.request_lock:
                         req = self.pending_requests.get(request_id)
                         if req:
-                            remaining = req["chunks"][req["consumed_chunks"]:]
-                            self.pending_requests.pop(request_id, None)
+                            remaining = req.chunks[req.consumed_chunks:]
+                            finished_req = self.pending_requests.pop(request_id, None)
+                    # Profiling (incl. the optional file write) runs outside the
+                    # lock; the popped request is no longer shared with other threads.
+                    if finished_req is not None:
+                        self._finalize_profile(finished_req)
                     for chunk in remaining:
                         yield chunk
                     finished = True
@@ -431,7 +480,7 @@ class APIServer:
         while True:
             with self.request_lock:
                 req = self.pending_requests.get(request_id)
-                done = req["event"].is_set() if req else True
+                done = req.event.is_set() if req else True
             if done:
                 break
             if time.time() - start > self.timeout_seconds:
@@ -444,7 +493,41 @@ class APIServer:
 
         with self.request_lock:
             req = self.pending_requests.pop(request_id, None)
-            return list(req["chunks"]) if req else []
+        if req is None:
+            return []
+        # Profiling (incl. the optional file write) runs outside the lock; the
+        # popped request is no longer shared with other threads.
+        self._finalize_profile(req)
+        return list(req.chunks)
+
+    def _finalize_profile(self, req: PendingRequest) -> None:
+        """Stamp the finish time, aggregate output sizes, and emit the report.
+
+        Called once per request from whichever completion path pops it
+        (streaming or non-streaming), after the request has been removed from
+        ``pending_requests`` so it is no longer shared — callers must NOT hold
+        ``request_lock``. No-op unless ``--log-stats`` is set.
+        """
+        if not self.log_stats:
+            return
+
+        req.profile.timing.finish_time = time.perf_counter()
+
+        # Aggregate the collected chunks into per-modality output info.
+        by_modality: dict[str, OutputInfo] = {}
+        for chunk in req.chunks:
+            info = by_modality.get(chunk.modality)
+            if info is None:
+                info = OutputInfo(modality=chunk.modality, count=0, total_bytes=0)
+                by_modality[chunk.modality] = info
+            info.count += 1
+            info.total_bytes += len(chunk.data)
+        req.profile.outputs = list(by_modality.values())
+
+        try:
+            pretty_print_profile(req.profile, self.log_stats_file)
+        except Exception:
+            logger.exception("Failed to emit request profile for %s", req.profile.rid)
 
     def abort_request(self, request_id: str) -> None:
         """Stop GPU work for a request the client abandoned and drop its state."""
@@ -667,6 +750,15 @@ def main(argv: list[str] | None = None):
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument(
+        "--log-stats",
+        action="store_true",
+        help="Print per-request profiling stats when each request finishes",
+    )
+    parser.add_argument(
+        "--log-stats-file", type=str, default=None,
+        help="Append per-request profiling stats to this file (implies --log-stats)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -694,6 +786,7 @@ def main(argv: list[str] | None = None):
     )
 
     global api_server
+    log_stats = args.log_stats or args.log_stats_file is not None
     api_server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
@@ -701,7 +794,9 @@ def main(argv: list[str] | None = None):
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         model_name=model_name,
-        tcp_transfer_device=args.tcp_transfer_device
+        tcp_transfer_device=args.tcp_transfer_device,
+        log_stats=log_stats,
+        log_stats_file=args.log_stats_file,
     )
 
     # Spawn conductor in a separate process
@@ -713,6 +808,7 @@ def main(argv: list[str] | None = None):
             args.config,
             args.socket_path_prefix,
             args.enable_nvtx,
+            log_stats,
             args.log_level,
             args.cache_dir,
             CommProtocol(args.tensor_comm_protocol),

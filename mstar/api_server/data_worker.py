@@ -15,7 +15,13 @@ try:
 except (ImportError, RuntimeError, OSError):
     VideoDecoder = None
 
-from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
+from mstar.api_server.request_types import (
+    PreprocessInput,
+    PreprocessProfile,
+    ResultChunk,
+    ResultTensors,
+)
+from mstar.profile.format import InputInfo
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.model.base import Model
@@ -55,6 +61,7 @@ class PreprocessWorker:
         self.abort_request_queue = queue.Queue()
         self.discard_tensor_queue = queue.Queue()
         self.output_queue = queue.Queue()
+        self.profile_queue = queue.Queue()
         self.stop_event = threading.Event()
 
         self.per_request_reading_tensors = {}
@@ -66,6 +73,7 @@ class PreprocessWorker:
                 in_queue=self.request_input_queue,
                 result_tensor_queue=self.result_tensor_input_queue,
                 out_queue=self.output_queue,
+                profile_queue=self.profile_queue,
                 cleanup_request_queue=self.cleanup_request_queue,
                 abort_request_queue=self.abort_request_queue,
                 discard_tensor_queue=self.discard_tensor_queue,
@@ -141,6 +149,13 @@ class PreprocessWorker:
             results.append(result)
         return results
 
+    def get_profile_updates(self) -> list[PreprocessProfile]:
+        """Drain preprocess-side profiling updates emitted by the worker thread."""
+        updates = []
+        while not self.profile_queue.empty():
+            updates.append(self.profile_queue.get())
+        return updates
+
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
         self.output_loop_idxs.pop(request_id, None)
@@ -158,6 +173,7 @@ class PreprocessWorkerThread:
         in_queue: queue.Queue, # for preprocessing
         result_tensor_queue: queue.Queue, # for output streaming
         out_queue: queue.Queue,
+        profile_queue: queue.Queue,
         cleanup_request_queue: queue.Queue,
         abort_request_queue: queue.Queue,
         discard_tensor_queue: queue.Queue,
@@ -175,6 +191,7 @@ class PreprocessWorkerThread:
         self.abort_request_queue = abort_request_queue
         self.discard_tensor_queue = discard_tensor_queue
         self.out_queue = out_queue
+        self.profile_queue = profile_queue
 
         self.stop_event = stop_event
         self.device = device
@@ -284,6 +301,38 @@ class PreprocessWorkerThread:
             ),
         )
         self.communicator.send("conductor", msg)
+
+        # Record preprocess-side profiling: the moment the fully preprocessed
+        # request was handed off to the conductor, and the per-modality sizes of
+        # the input tensors we produced. ``perf_counter`` is consistent here
+        # because the worker runs as a thread inside the API server process.
+        self.profile_queue.put(PreprocessProfile(
+            request_id=input.request_id,
+            preprocess_finish_time=time.perf_counter(),
+            inputs=self._summarize_inputs(tensors),
+        ))
+
+    @staticmethod
+    def _summarize_inputs(tensors: NameToTensorList) -> list[InputInfo]:
+        """Aggregate the preprocessed input tensors into per-modality sizes.
+
+        Keys are the tensor-bundle names (e.g. ``image_inputs``); the trailing
+        ``_inputs`` is stripped to recover the modality label.
+        """
+        infos = []
+        for name, tensor_list in tensors.items():
+            modality = name[: -len("_inputs")] if name.endswith("_inputs") else name
+            total_bytes = sum(
+                t.numel() * t.element_size()
+                for t in tensor_list
+                if t is not None
+            )
+            infos.append(InputInfo(
+                modality=modality,
+                count=len(tensor_list),
+                total_bytes=total_bytes,
+            ))
+        return infos
 
     def _read_result_tensor(
         self, result: ResultTensors

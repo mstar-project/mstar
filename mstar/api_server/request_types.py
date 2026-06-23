@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.profile.format import InputInfo
+from mstar.profile.worker import GraphTimings
 
 
 @dataclass
@@ -30,6 +32,9 @@ class RequestComplete:
     # The API server waits until all entries are received before
     # completing the request.
     final_outputs: dict[str, NestedLoopIndices]
+    conductor_ingest_time: float
+    conductor_finish_time: float
+    graph_timings: GraphTimings = field(default_factory=dict)
 
 
 @dataclass
@@ -37,6 +42,16 @@ class APIServerMessage:
     """Envelope for messages received by the API server."""
     message_type: str  # "result_tensors" | "request_complete" | "setup_done"
     body: ResultTensors | RequestComplete | None = None  # None for setup_done message
+
+
+@dataclass
+class PreprocessProfile:
+    """Preprocess-side profiling reported by the data worker back to the API
+    server. Carries the timestamp at which preprocessing finished (and the
+    request was handed to the conductor) plus the per-modality input sizes."""
+    request_id: str
+    preprocess_finish_time: float  # time.perf_counter
+    inputs: list[InputInfo] = field(default_factory=list)
 
 
 @dataclass

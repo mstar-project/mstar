@@ -123,6 +123,10 @@ def _serve(args: argparse.Namespace) -> None:
     ]
     if args.cache_dir:
         argv += ["--cache-dir", args.cache_dir]
+    if args.log_stats:
+        argv += ["--log-stats"]
+    if args.log_stats_file:
+        argv += ["--log-stats-file", args.log_stats_file]
 
     print(_next_steps(args.model, args.host, args.port), file=sys.stderr)
 
@@ -150,6 +154,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    serve.add_argument(
+        "--log-stats", action="store_true",
+        help="print per-request profiling stats when each request finishes",
+    )
+    serve.add_argument(
+        "--log-stats-file", default=None,
+        help="append per-request profiling stats to this file (implies --log-stats)",
     )
     serve.set_defaults(func=_serve)
     return parser

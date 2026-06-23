@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from dataclasses import asdict, dataclass, field
 
 import torch
@@ -67,8 +68,9 @@ class KVCacheEngine(BaseEngine):
         self,
         autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
+        enable_prof: bool = False,
     ):
-        super().__init__(enable_nvtx=enable_nvtx)
+        super().__init__(enable_nvtx=enable_nvtx, enable_profile=enable_prof)
 
         self.kv_management: dict[str, KVManagement] = {}
         self.submodule_management: dict[str, SubmoduleManagement] = {}
@@ -429,6 +431,8 @@ class KVCacheEngine(BaseEngine):
         launch_started_event = batch.metadata.get("launch_started_event")
         if launch_started_event is not None:
             launch_started_event.set()
+        if self.enable_profile:
+            batch.exec_timings.fwd_start = time.perf_counter()
         batched_output = submodule.forward_batched(
             graph_walk=batch.graph_walk,
             engine_inputs=engine_inputs,
@@ -512,6 +516,9 @@ class KVCacheEngine(BaseEngine):
             launch_started_event = batch.metadata.get("launch_started_event")
             if launch_started_event is not None and not launch_started_event.is_set():
                 launch_started_event.set()
+            # Batch-level fwd_start: stamp once, on the first rid's launch.
+            if self.enable_profile and batch.exec_timings.fwd_start is None:
+                batch.exec_timings.fwd_start = time.perf_counter()
             output = submodule.forward(
                 graph_walk=batch.graph_walk,
                 engine_inputs=engine_inputs,
@@ -645,6 +652,7 @@ class KVCacheEngine(BaseEngine):
             slot=batch.metadata.get("cuda_graph_slot"),
             advance_event=batch.metadata.get("advance_event"),
             launch_started_event=batch.metadata.get("launch_started_event"),
+            exec_timings=batch.exec_timings if self.enable_profile else None,
         )
 
         return NodeOutput(per_request_output_tensors=batched_output)

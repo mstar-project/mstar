@@ -4,6 +4,7 @@ from enum import Enum, IntEnum
 from mstar.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.profile.worker import GraphTimings
 
 
 class Status(Enum):
@@ -131,6 +132,7 @@ class WorkerGraphsDone(MessageBody):
     partition_done: bool = field(default=False)
     stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
     output_loop_indices: dict[str, NestedLoopIndices] = field(default_factory=dict)
+    graph_timings: GraphTimings = field(default_factory=dict)
 
 
 @dataclass

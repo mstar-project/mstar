@@ -8,6 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from time import sleep
+import time
 
 import torch
 
@@ -24,6 +25,7 @@ from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
+from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.ipc_format import (
     ConductorMessage,
@@ -129,12 +131,16 @@ class Worker:
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         device: torch.device = torch.device("cuda"),
         enable_nvtx: bool = False,
+        enable_prof: bool = False,
         tcp_transfer_device="",
         dist_init_method=None
     ):
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = enable_nvtx
+
+        self.enable_prof = enable_prof
+        self.profile_info = WorkerProfileInfo()
 
         if self.device.type == "cuda" and self.device.index is not None:
             torch.cuda.set_device(self.device)
@@ -195,7 +201,8 @@ class Worker:
                 transfer_engine=self.tensor_manager.transfer_engine
             ),
             model=model,
-            enable_nvtx=self.enable_nvtx
+            enable_nvtx=self.enable_nvtx,
+            enable_prof=self.enable_prof
         )
 
         self.worker_graphs_manager = WorkerGraphsManager(
@@ -480,6 +487,7 @@ class Worker:
         self.engine_manager.remove_request(body.request_id)
         self.worker_graphs_manager.remove_request(body.request_id)
         self.tensor_manager.cleanup_request(body.request_id)
+        self.profile_info.pop_request(body.request_id)
         self.streaming_buffers.pop(body.request_id, None)
 
         for node_name in self.engine_manager.lru_tracked_nodes():
@@ -1071,6 +1079,7 @@ class Worker:
                     partition_done=p_done,
                     stream_tokens_consumed=stream_consumed,
                     output_loop_indices=self.worker_graphs_manager.get_output_loop_indices(request_id),
+                    graph_timings=self.profile_info.per_rid_graph_timings.get(request_id, {})
                 ),
             )
             self.communicator.send("conductor", message)
@@ -1649,6 +1658,9 @@ class Worker:
                     range_pop(synchronize=False)
             else:
                 torch.cuda.default_stream().synchronize()
+        
+        if self.enable_prof:
+            batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -1775,6 +1787,14 @@ class Worker:
             if req_info is not None:
                 req_info.per_partition_info[batch_N.partition].stream_partition_done = True
 
+        # set this before send_outputs so that we can send updated profiling info to the conductor
+        if self.enable_prof:
+            self.profile_info.register_end(
+                batch_N.node_batch.node_name,
+                batch_N.node_batch.graph_walk,
+                batch_N.node_batch.request_ids,
+                batch_N.node_batch.exec_timings,
+            )
         for rid, routing in routing_per_request.items():
             self._send_outputs(
                 rid, routing,

@@ -17,17 +17,24 @@ from mstar.engine.stateless_engine import (
 from mstar.model.base import Model
 
 
-def _make_kv_cache(autocast_dtype: torch.dtype, enable_nvtx: bool) -> BaseEngine:
-    return KVCacheEngine(autocast_dtype=autocast_dtype, enable_nvtx=enable_nvtx)
+def _make_kv_cache(
+    autocast_dtype: torch.dtype, enable_nvtx: bool, enable_prof: bool = False
+) -> BaseEngine:
+    return KVCacheEngine(
+        autocast_dtype=autocast_dtype, enable_nvtx=enable_nvtx, enable_prof=enable_prof
+    )
 
 
 def _make_stateless_factory(
     config_factory: Callable[[torch.dtype | None], StatelessEngineConfig],
-) -> Callable[[torch.dtype | None, bool], BaseEngine]:
-    def factory(autocast_dtype: torch.dtype | None, enable_nvtx: bool) -> BaseEngine:
+) -> Callable[[torch.dtype | None, bool, bool], BaseEngine]:
+    def factory(
+        autocast_dtype: torch.dtype | None, enable_nvtx: bool, enable_prof: bool = False
+    ) -> BaseEngine:
         return StatelessEngine(
             config=config_factory(autocast_dtype),
             enable_nvtx=enable_nvtx,
+            enable_prof=enable_prof,
         )
 
     return factory
@@ -36,7 +43,7 @@ def _make_stateless_factory(
 # Engine-type strings (``EngineType.value``) → factory. ``STATELESS`` is
 # resolved via ``STATELESS_FLAVOR_FACTORIES`` instead because its config
 # depends on the submodule (enc_dec vs audio_codec).
-ENGINE_TYPE_FACTORIES: dict[str, Callable[[torch.dtype | None, bool], BaseEngine]] = {
+ENGINE_TYPE_FACTORIES: dict[str, Callable[[torch.dtype | None, bool, bool], BaseEngine]] = {
     "kv_cache": _make_kv_cache,
 }
 
@@ -45,7 +52,7 @@ ENGINE_TYPE_FACTORIES: dict[str, Callable[[torch.dtype | None, bool], BaseEngine
 # ``NodeSubmodule.get_stateless_flavor()``; the EngineManager groups
 # ``STATELESS`` nodes by that flavor so each flavor gets one engine with the
 # right config (autocast, force_float32, torch.compile, piecewise runner).
-STATELESS_FLAVOR_FACTORIES: dict[str, Callable[[torch.dtype | None, bool], BaseEngine]] = {
+STATELESS_FLAVOR_FACTORIES: dict[str, Callable[[torch.dtype | None, bool, bool], BaseEngine]] = {
     "enc_dec": _make_stateless_factory(make_enc_dec_config),
     "audio_codec": _make_stateless_factory(make_audio_codec_config),
 }
@@ -69,6 +76,7 @@ class EngineManager:
         transfer_engine_info: TransferEngineInfo,
         model: Model,
         enable_nvtx: bool = False,
+        enable_prof: bool=False,
     ) -> "EngineManager":
         """
         Build an EngineManager from a list of engine configs.
@@ -127,7 +135,7 @@ class EngineManager:
                 factory = STATELESS_FLAVOR_FACTORIES[flavor]
             else:
                 factory = ENGINE_TYPE_FACTORIES[engine_type_str]
-            engine = factory(autocast_dtype, enable_nvtx)
+            engine = factory(autocast_dtype, enable_nvtx, enable_prof)
 
             submodules: dict[str, torch.nn.Module] = {}
             for name in engine_node_names:
