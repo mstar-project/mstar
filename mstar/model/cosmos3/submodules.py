@@ -1308,8 +1308,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latents = inp.tensor_inputs["latents"]
             time_index = inp.tensor_inputs["time_index"]
             step_index = int(time_index.reshape(-1)[0].item())
-            if step_index >= len(st["scheduler"].timesteps):
-                # Discarded extra step past this request's denoise count.
+            sched = st["scheduler"]
+            sched_idx = sched.step_index
+            if step_index >= len(sched.timesteps) or (
+                sched_idx is not None and sched_idx >= len(sched.timesteps)
+            ):
+                # Discarded extra step past this request's denoise count. Guard on
+                # BOTH the engine step counter and the scheduler's own step_index:
+                # with concurrent (bs>1) requests the batched loop dispatches one
+                # extra step whose engine time_index can lag the scheduler, and
+                # stepping an already-exhausted UniPC scheduler trips
+                # `assert self.this_order > 0`.
                 outputs[rid] = {"latents": [latents], "time_index": [time_index]}
                 continue
             t = st["scheduler"].timesteps[step_index]
