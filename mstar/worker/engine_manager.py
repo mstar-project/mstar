@@ -102,9 +102,16 @@ class EngineManager:
         if model is not None:
             for name in node_names:
                 node_tp_group = tp_groups.get_tp_config_for_node(name)
+                # Sequence parallelism is opt-in per node; only forward the SP
+                # group when this node actually participates in one, so models
+                # that don't support SP keep their existing get_submodule call.
+                extra = {}
+                node_sp_group = tp_groups.get_sp_config_for_node(name)
+                if node_sp_group.world_size > 1:
+                    extra["sp_group"] = node_sp_group
                 node_submodules[name] = model.get_submodule(
                     name, device, tp_group=node_tp_group,
-                    autocast_dtype=autocast_dtype,
+                    autocast_dtype=autocast_dtype, **extra,
                 )
 
         # Group nodes by the factory key. STATELESS nodes split further by

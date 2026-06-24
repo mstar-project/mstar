@@ -118,13 +118,26 @@ class KVCacheEngine(BaseEngine):
             tp_ranks = set([
                 tp_groups.get_tp_config_for_node(node).rank for node in nodes
             ])
-            if len(world_sizes) > 1 or len(tp_ranks) > 1:
+            sp_sizes = set([
+                tp_groups.get_sp_config_for_node(node).world_size for node in nodes
+            ])
+            sp_ranks = set([
+                tp_groups.get_sp_config_for_node(node).rank for node in nodes
+            ])
+            if (
+                len(world_sizes) > 1 or len(tp_ranks) > 1
+                or len(sp_sizes) > 1 or len(sp_ranks) > 1
+            ):
                 raise RuntimeError(
                     "It is disallowed to share a KV cache among colocated nodes "
-                    f"from different TP groups: {nodes}."
+                    f"from different TP/SP groups: {nodes}."
                 )
             tp_size = world_sizes.pop()
-            cfg.shard(tp_size)
+            sp_size = sp_sizes.pop()
+            # Ulysses sequence parallelism makes attention run at effective
+            # head-degree tp*sp (the all-to-all redistributes heads across the
+            # SP group), so each rank's cache holds num_kv_heads / (tp*sp).
+            cfg.shard(tp_size * sp_size)
             num_kv_heads = cfg.num_kv_heads
 
             kv_cache = torch.zeros(
