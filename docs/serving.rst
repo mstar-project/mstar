@@ -347,5 +347,4 @@ RDMA-read or SHM file-read time on ``rx``; the registration / serialize-and-writ
 .. note::
 
    Profiling is gated end-to-end on ``--log-stats``: when it is off, the workers,
-   conductor, and data worker skip the timing/transfer bookkeeping entirely, so there is no
-   steady-state overhead.
+   conductor, and data worker skip the timing/transfer bookkeeping entirely.
