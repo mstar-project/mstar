@@ -1,0 +1,22 @@
+model: "cosmos3"
+# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
+max_seq_len: 8192
+# Per-rank KV pool. With 2D tensor + sequence parallelism each rank holds
+# num_kv_heads / (tp_size * sp_size) heads, so the cache is light; 1024 pages
+# leave ample headroom.
+kv_cache:
+  max_num_pages: 1024
+# 2D parallel mesh over 4 ranks: tensor-parallel (heads/weights shard, the
+# row-parallel projections all-reduce) composed with Ulysses sequence-parallel
+# (the generation sequence shards, an all-to-all swaps sequence for heads around
+# attention). The 4 ranks form a [sp_size, tp_size] grid: TP groups {0,1},{2,3};
+# SP groups {0,2},{1,3}. Used to validate TP x SP composition on Nano (the small
+# model fits on one GPU, so this is a correctness cross-check, not a perf config).
+# Serve eager (DISABLE_GRAPH=1).
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1, 2, 3]
+    tp_size: 2
+    sp_size: 2
+  - node_names: ["vae_decoder"]
+    ranks: [0]
