@@ -17,6 +17,34 @@ class OutputInfo:
 
 
 @dataclass
+class TxInfo:
+    edge_name: str
+    source_entity: str
+    count: int = 0
+    num_bytes: int = 0
+    time: float = 0.0 # seconds
+
+    def update(self, num_bytes: int, time: float, count_increment: int=1):
+        self.count += count_increment
+        self.num_bytes += num_bytes
+        self.time += time
+
+@dataclass
+class RxInfo:
+    edge_name: str
+    source_entity: str
+    dest_entity: str
+    count: int = 0
+    num_bytes: int = 0
+    time: float = 0.0 # seconds
+
+    def update(self, num_bytes: int, time: float, count_increment: int=1):
+        self.count += count_increment
+        self.num_bytes += num_bytes
+        self.time += time
+
+
+@dataclass
 class GraphTiming:
     node: str
     graph_walk: str
@@ -39,18 +67,6 @@ class GraphTiming:
         )
 
 
-def accumulate_graph_timing(timings: list[GraphTiming]) -> list[GraphTiming]:
-    """Accumulate timings by node and graph_walk."""
-    acc: dict[str, GraphTiming] = {}
-    for timing in timings:
-        key = f"{timing.node}:{timing.graph_walk}"
-        if key in acc:
-            acc[key] += timing
-        else:
-            acc[key] = timing
-    return list(acc.values())
-
-
 @dataclass
 class RequestTiming:
     recv_time: float | None = None # all are time.perf_counter
@@ -67,5 +83,7 @@ class RequestProfile:
     rid: str
     timing: RequestTiming = field(default_factory=RequestTiming)
     graph_timings: list[GraphTiming] = field(default_factory=list)
+    rx_info: list[RxInfo] = field(default_factory=list)
+    tx_info: list[TxInfo] = field(default_factory=list)
     inputs: list[InputInfo] = field(default_factory=list)
     outputs: list[OutputInfo] = field(default_factory=list)

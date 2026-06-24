@@ -1,9 +1,8 @@
 
-from dataclasses import dataclass, field
 import time
+from dataclasses import dataclass, field
 
 from mstar.profile.format import GraphTiming
-
 
 # (node, graph_walk) -> accumulated GraphTiming for a single request
 GraphTimings = dict[tuple[str, str], GraphTiming]

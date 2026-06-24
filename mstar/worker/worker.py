@@ -2,13 +2,13 @@ import logging
 import os
 import sys
 import threading
+import time
 import time as _time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from time import sleep
-import time
 
 import torch
 
@@ -183,6 +183,7 @@ class Worker:
             device=self.device,
             communicator=self.communicator,
             tcp_transfer_device=tcp_transfer_device,
+            enable_prof=enable_prof
         )
 
         node_names = set()
@@ -1079,7 +1080,9 @@ class Worker:
                     partition_done=p_done,
                     stream_tokens_consumed=stream_consumed,
                     output_loop_indices=self.worker_graphs_manager.get_output_loop_indices(request_id),
-                    graph_timings=self.profile_info.per_rid_graph_timings.get(request_id, {})
+                    graph_timings=self.profile_info.per_rid_graph_timings.get(request_id, {}),
+                    rx_info=self.tensor_manager.get_rx_info(request_id),
+                    tx_info=self.tensor_manager.get_tx_info(request_id),
                 ),
             )
             self.communicator.send("conductor", message)
@@ -1658,7 +1661,7 @@ class Worker:
                     range_pop(synchronize=False)
             else:
                 torch.cuda.default_stream().synchronize()
-        
+
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
 

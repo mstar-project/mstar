@@ -1,6 +1,7 @@
 import logging
 import os
 import platform
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext as _nullcontext
@@ -9,6 +10,7 @@ from uuid import uuid4
 
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.special_destinations import EMPTY_DESTINATION
+from mstar.profile.format import RxInfo, TxInfo
 
 try:
     from mooncake.engine import TransferEngine
@@ -31,6 +33,7 @@ class FutureAndPointers:
     future: Future | None
     graph_edges: list[GraphEdge]
     request_id: str = ""
+    rx_time: float | None = None # seconds
 
 
 @dataclass
@@ -149,6 +152,7 @@ class TransferReadInfo:
     local_ptr: int
     remote_ptr: int
     nbytes: int
+    fp: FutureAndPointers | None = None
 
 
 class AsyncMooncakeReader:
@@ -160,8 +164,14 @@ class AsyncMooncakeReader:
     The default stream is never blocked by store writes.
     """
 
-    def __init__(self, engine, device, max_workers: int = 3, max_batch_size=500):
+    def __init__(
+        self, engine, device,
+        max_workers: int = 3,
+        max_batch_size=500,
+        enable_prof: bool=False
+    ):
         self._engine = engine
+        self.enable_prof = enable_prof
         self.max_batch_size = max_batch_size
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._pending: list[Future] = []
@@ -190,6 +200,8 @@ class AsyncMooncakeReader:
         self._copy_stream.wait_event(event)
         self._copy_stream.synchronize()
 
+        start_time = time.perf_counter()
+
         # group read_info by session id for batch read
         grouped_read = {}
         for info in read_info:
@@ -207,6 +219,11 @@ class AsyncMooncakeReader:
                 )
                 if status < 0:
                     raise RuntimeError(f"Mooncake read failed. Status: {status}")
+        end_time = time.perf_counter()
+        if self.enable_prof:
+            for info in read_info:
+                if info.fp is not None:
+                    info.fp.rx_time = (end_time - start_time)
 
     def wait_all(self):
         """Block until all pending writes complete. Re-raises exceptions."""
@@ -320,6 +337,10 @@ class BufferedShards:
         ]
 
 
+EdgeNameToTxInfo = dict[str, TxInfo]
+SourceAndEdgeToRxInfo = dict[tuple[str, str], RxInfo]
+
+
 class TensorCommunicationManager(ABC):
     """Base class for inter-worker tensor transport.
 
@@ -335,15 +356,24 @@ class TensorCommunicationManager(ABC):
         device: str,
         communicator: BaseCommunicator,
         transfer_engine: TensorTransferEngine,
+        enable_prof: bool=False
     ):
         self.my_entity_id = my_entity_id
         self.my_session_id = my_session_id
+        self.enable_prof = enable_prof
         self.device = device
         self.communicator = communicator
         self.transfer_engine = transfer_engine
         self.tensor_store = TensorStore()
         self.pending: list[FutureAndPointers] = []
         self.read_finished: dict[str, set[str]] = {}
+
+        self.req_rx_info: dict[str, SourceAndEdgeToRxInfo] = {}
+        self.req_tx_info: dict[str, EdgeNameToTxInfo] = {}
+        # uuid -> edge/signal name, so register_for_send (which only sees uuids)
+        # can attribute TX bytes/time to the right edge. Only tracked under
+        # ``enable_prof``.
+        self.uuid_to_edge_name: dict[str, str] = {}
 
         # req_id -> cfg
         self.sharding_configs: dict[str, ShardingConfig] = {}
@@ -418,6 +448,8 @@ class TensorCommunicationManager(ABC):
                 )
                 if cfg is not None:
                     self.uuid_to_shard_dim[tensor_uuid] = shard_dim
+                if self.enable_prof:
+                    self.uuid_to_edge_name[tensor_uuid] = name
 
                 logger.debug("Storing tensor name %s uuid %s", name, tensor_uuid)
                 tensor_info[name].append(TensorPointerInfo(
@@ -518,6 +550,8 @@ class TensorCommunicationManager(ABC):
         addresses are shared with peers. Callers must have already synced on
         their own (e.g. before a batched loop) — meant to cut N serialized
         syncs to 1 when registering many uuids in a row.
+
+        If self.enable_prof is set, this should also update self.req_tx_info
         """
         ...
 
@@ -561,6 +595,7 @@ class TensorCommunicationManager(ABC):
 
     def _cleanup_by_uuid(self, request_id: str, uuid: str):
         self.uuid_to_shard_dim.pop(uuid, None)
+        self.uuid_to_edge_name.pop(uuid, None)
 
     # ---- shared: polling & ACKs ----
 
@@ -602,6 +637,7 @@ class TensorCommunicationManager(ABC):
     def get_ready_tensors(self, graph_walk: str | None=None) -> dict[str, list[GraphEdge]]:
         ready: dict[str, list[GraphEdge]] = {}
         still_pending = []
+        uuid_to_time = {}
         for ep in self.pending:
             if ep.future is None or ep.future.done():
                 if ep.future is not None:
@@ -612,6 +648,9 @@ class TensorCommunicationManager(ABC):
                         "Finished reading in %d tensors %s for graph node %s",
                         len(edge.tensor_info), edge.name, edge.next_node
                     )
+                    if self.enable_prof:
+                        for info in edge.tensor_info:
+                            uuid_to_time[info.uuid] = ep.rx_time
             else:
                 still_pending.append(ep)
         self.pending = still_pending
@@ -620,6 +659,7 @@ class TensorCommunicationManager(ABC):
         for req_id, edges in ready.items():
             self._collect_and_send_acks(req_id, edges)
             seen_uuids = self.read_finished.setdefault(req_id, set())
+            rx_infos = self.req_rx_info.setdefault(req_id, {})
             for edge in edges:
                 if not edge.tensor_info:
                     final_ready.setdefault(req_id, []).append(edge)
@@ -629,6 +669,31 @@ class TensorCommunicationManager(ABC):
                 if any(info.uuid in seen_uuids for info in edge.tensor_info):
                     final_ready.setdefault(req_id, []).append(edge)
                     continue
+
+                if self.enable_prof:
+                    # Locally-produced (same-entity) tensors aren't received over
+                    # the wire — skip them. ``rx_time`` is the whole edge's read
+                    # batch, so attribute it once per source (not per tensor).
+                    per_source: dict[str, list[int]] = {}  # source -> [bytes, count]
+                    edge_rx_time = 0.0
+                    for info in edge.tensor_info:
+                        if info.source_entity == self.my_entity_id:
+                            continue
+                        agg = per_source.setdefault(info.source_entity, [0, 0])
+                        agg[0] += info.nbytes
+                        agg[1] += 1
+                        edge_rx_time = uuid_to_time.get(info.uuid) or edge_rx_time
+                    for source_entity, (nbytes, cnt) in per_source.items():
+                        rx_key = (source_entity, edge.name)
+                        if rx_key not in rx_infos:
+                            rx_infos[rx_key] = RxInfo(
+                                edge_name=edge.name,
+                                source_entity=source_entity,
+                                dest_entity=self.my_entity_id,
+                            )
+                        rx_infos[rx_key].update(
+                            num_bytes=nbytes, time=edge_rx_time, count_increment=cnt,
+                        )
 
                 shard_dim = edge._shard_dim
                 if edge.name not in self.buffered_shards.get(req_id, {}):
@@ -692,6 +757,31 @@ class TensorCommunicationManager(ABC):
         self.sharding_configs[request_id] = sharding_config
         self.buffered_shards[request_id] = {}
 
+    # ---- shared: profiling (tx/rx) ----
+
+    def _record_tx(
+        self, request_id: str, uuid: str, num_bytes: int, elapsed: float
+    ):
+        """Record bytes/time spent making ``uuid`` available to remote consumers.
+
+        Keyed by edge name (looked up from ``uuid_to_edge_name``); the sender
+        doesn't know the recipient at register time — and may even register data
+        that is never read — so TX carries no dest and is not per-connection.
+        """
+        edge_name = self.uuid_to_edge_name.get(uuid, "?")
+        tx = self.req_tx_info.setdefault(request_id, {})
+        if edge_name not in tx:
+            tx[edge_name] = TxInfo(
+                edge_name=edge_name, source_entity=self.my_entity_id
+            )
+        tx[edge_name].update(num_bytes=num_bytes, time=elapsed)
+
+    def get_tx_info(self, request_id: str) -> list[TxInfo]:
+        return list(self.req_tx_info.get(request_id, {}).values())
+
+    def get_rx_info(self, request_id: str) -> list[RxInfo]:
+        return list(self.req_rx_info.get(request_id, {}).values())
+
     # ---- shared: TensorStore delegation ----
 
     def get_tensor(self, request_id: str, uuid: str) -> torch.Tensor:
@@ -718,6 +808,8 @@ class TensorCommunicationManager(ABC):
         self.read_finished.pop(request_id, None)
         self.buffered_shards.pop(request_id, None)
         self.sharding_configs.pop(request_id, None)
+        self.req_rx_info.pop(request_id, None)
+        self.req_tx_info.pop(request_id, None)
         for uuid in self.tensor_store.get_all_uuids(request_id):
             self.uuid_to_shard_dim.pop(uuid, None)
             self.tensor_store.set_metadata(request_id, uuid, persist=False)
@@ -750,6 +842,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         protocol: CommProtocol = CommProtocol.RDMA,
         metadata_server: str = "P2PHANDSHAKE",
         tcp_transfer_device: str = "",
+        enable_prof: bool=False
     ):
         engine = MooncakeTransferEngine(
             hostname=hostname,
@@ -763,23 +856,27 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             device=device,
             communicator=communicator,
             transfer_engine=engine,
+            enable_prof=enable_prof
         )
         self.protocol = protocol
         self._async_reader = AsyncMooncakeReader(
-            engine._engine, device=device
+            engine._engine, device=device,
+            enable_prof=enable_prof
         )
 
     def register_for_send(self, request_id, uuids, skip_cuda_sync=False):
         if not skip_cuda_sync:
             torch.cuda.default_stream().synchronize()
         for uuid in uuids:
+            already_registered = self.tensor_store.is_registered(request_id, uuid)
             if self.protocol == CommProtocol.RDMA:
-                if self.tensor_store.is_registered(request_id, uuid):
+                if already_registered:
                     continue
                 logger.debug("Registering %s for send", uuid)
                 tensor = self.tensor_store.get_tensor(
                     request_id=request_id, uuid=uuid
                 )
+                t0 = time.perf_counter()
                 ret_value = self.transfer_engine.register_memory(
                     tensor.data_ptr(), tensor.nbytes
                 )
@@ -787,6 +884,15 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     raise RuntimeError(
                         f"Mooncake memory registration failed for request id {request_id}, uuid {uuid}."
                     )
+                if self.enable_prof:
+                    # RDMA: the receiver does the actual read, so the sender-side
+                    # cost is the memory-pinning (register) time.
+                    self._record_tx(
+                        request_id, uuid, tensor.nbytes, time.perf_counter() - t0
+                    )
+            elif self.enable_prof and not already_registered:
+                tensor = self.tensor_store.get_tensor(request_id, uuid)
+                self._record_tx(request_id, uuid, tensor.nbytes, 0.0)
             self.tensor_store.set_metadata(
                 request_id, uuid, mem_registered=True
             )
@@ -858,15 +964,21 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     nbytes=info.nbytes,
                 ))
                 logger.debug("Started transfer read for uuid %s", info.uuid)
+            # Create the FutureAndPointers before submit and point each read at
+            # it, so the async reader can stamp ``rx_time`` on it when the read
+            # completes (the reader runs on another thread; the object identity
+            # is stable, only ``.future`` is filled in after submit).
+            fp = FutureAndPointers(
+                future=None, graph_edges=[graph_edge], request_id=request_id
+            )
+            if self.enable_prof:
+                for ri in read_info:
+                    ri.fp = fp
             fut = self._async_reader.submit(read_info)
+            fp.future = fut
             if fut is not None:
                 futures.append(fut)
-            self.pending.append(
-                FutureAndPointers(
-                    future=fut, graph_edges=[graph_edge],
-                    request_id=request_id
-                )
-            )
+            self.pending.append(fp)
         return futures
 
 
@@ -919,6 +1031,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         device: str,
         communicator: BaseCommunicator,
         shm_dir: str | None = None,
+        enable_prof: bool=False
     ):
         engine = LocalTransferEngine(hostname=hostname)
         super().__init__(
@@ -927,6 +1040,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
             device=device,
             communicator=communicator,
             transfer_engine=engine,
+            enable_prof=enable_prof
         )
 
         self.shm_dir = shm_dir or _default_shm_dir()
@@ -966,12 +1080,18 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                 if self.tensor_store.is_registered(request_id, uuid):
                     continue
                 tensor = self.tensor_store.get_tensor(request_id, uuid)
+                t0 = time.perf_counter()
                 data = _serialize_tensor(tensor)
                 path = self._shm_path(self.my_entity_id, uuid)
                 with open(path, "wb") as f:
                     f.write(data)
                 self._shm_files[uuid] = path
                 self.tensor_store.set_metadata(request_id, uuid, mem_registered=True)
+                if self.enable_prof:
+                    # SHM: the serialize + file write IS the send work.
+                    self._record_tx(
+                        request_id, uuid, len(data), time.perf_counter() - t0
+                    )
                 logger.debug("SHM: wrote tensor %s to %s (%d bytes)", uuid, path, len(data))
 
     def start_read_tensors(
@@ -995,6 +1115,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     "SHM: starting read of %d tensors %s for graph node %s",
                     len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node,
                 )
+                rx_t0 = time.perf_counter()
                 for info in graph_edge.tensor_info:
                     if info.source_entity == self.my_entity_id:
                         self._slice_existing_tensor(
@@ -1023,6 +1144,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     FutureAndPointers(
                         future=None, graph_edges=[graph_edge],
                         request_id=request_id,
+                        rx_time=time.perf_counter() - rx_t0,
                     )
                 )
         if h2d_did_work and self._h2d_stream is not None:
@@ -1058,6 +1180,7 @@ def create_tensor_communication_manager(
     metadata_server: str = "P2PHANDSHAKE",
     tcp_transfer_device: str = "",
     shm_dir: str | None = None,
+    enable_prof: bool=False
 ) -> TensorCommunicationManager:
     """Select tensor transport backend based on protocol."""
     if protocol == CommProtocol.SHM:
@@ -1067,6 +1190,7 @@ def create_tensor_communication_manager(
             device=device,
             communicator=communicator,
             shm_dir=shm_dir,
+            enable_prof=enable_prof
         )
     return MooncakeCommunicationManager(
         my_entity_id=my_entity_id,
@@ -1076,4 +1200,5 @@ def create_tensor_communication_manager(
         protocol=protocol,
         metadata_server=metadata_server,
         tcp_transfer_device=tcp_transfer_device,
+        enable_prof=enable_prof
     )

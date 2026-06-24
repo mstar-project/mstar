@@ -1,7 +1,7 @@
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-import time
 from typing import Any
 
 import torch

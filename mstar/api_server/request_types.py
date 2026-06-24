@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.profile.format import InputInfo
+from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 
 
@@ -35,6 +35,8 @@ class RequestComplete:
     conductor_ingest_time: float
     conductor_finish_time: float
     graph_timings: GraphTimings = field(default_factory=dict)
+    rx_info: list[RxInfo] = field(default_factory=list)
+    tx_info: list[TxInfo] = field(default_factory=list)
 
 
 @dataclass
@@ -45,12 +47,13 @@ class APIServerMessage:
 
 
 @dataclass
-class PreprocessProfile:
-    """Preprocess-side profiling reported by the data worker back to the API
-    server. Carries the timestamp at which preprocessing finished (and the
-    request was handed to the conductor) plus the per-modality input sizes."""
+class DataWorkerProfile:
+    """Profiling reported by the API-server data worker at preprocess finish:
+    the timestamp at which the request was handed to the conductor and the
+    per-modality sizes of the raw inputs. (The data worker's tx/rx are read
+    directly from its tensor manager at request completion, not via this.)"""
     request_id: str
-    preprocess_finish_time: float  # time.perf_counter
+    preprocess_finish_time: float | None = None  # time.perf_counter
     inputs: list[InputInfo] = field(default_factory=list)
 
 

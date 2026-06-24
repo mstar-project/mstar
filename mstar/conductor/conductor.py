@@ -28,6 +28,7 @@ from mstar.engine.kv_store import KVCacheConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -167,6 +168,11 @@ class RequestData:
     conductor_ingest_time: float = 0.0
     conductor_finish_time: float = 0.0
     graph_timings: GraphTimings = field(default_factory=dict)
+    # Tensor-transport profiling merged across workers. Keyed so repeated
+    # WorkerGraphsDone updates (cumulative per worker) replace rather than
+    # double-count: rx by (source, dest, edge), tx by (source, edge).
+    rx_info: dict[tuple[str, str, str], RxInfo] = field(default_factory=dict)
+    tx_info: dict[tuple[str, str], TxInfo] = field(default_factory=dict)
 
     def remove_persist_signal_uuids(self, uuids: list[str]):
         uuids = set(uuids)
@@ -205,6 +211,7 @@ class Conductor:
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
         self.enable_nvtx = enable_nvtx
+        self.enable_prof = enable_prof
         self.tensor_comm_protocol = tensor_comm_protocol
         self.tcp_transfer_device = tcp_transfer_device
 
@@ -809,6 +816,8 @@ class Conductor:
                     conductor_ingest_time=request_data.conductor_ingest_time,
                     conductor_finish_time=request_data.conductor_finish_time,
                     graph_timings=request_data.graph_timings,
+                    rx_info=list(request_data.rx_info.values()),
+                    tx_info=list(request_data.tx_info.values()),
                 )
             )
         )
@@ -832,7 +841,12 @@ class Conductor:
 
         request_data = self.requests[body.request_id]
         partition_name = body.partition_name
-        request_data.graph_timings.update(body.graph_timings)
+        if self.enable_prof:
+            request_data.graph_timings.update(body.graph_timings)
+            for rx in body.rx_info:
+                request_data.rx_info[(rx.source_entity, rx.dest_entity, rx.edge_name)] = rx
+            for tx in body.tx_info:
+                request_data.tx_info[(tx.source_entity, tx.edge_name)] = tx
 
         pstate = request_data.partition_states.get(partition_name)
         request_data.final_outputs.update(body.output_loop_indices)

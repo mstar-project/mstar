@@ -1,6 +1,7 @@
 
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -16,15 +17,15 @@ except (ImportError, RuntimeError, OSError):
     VideoDecoder = None
 
 from mstar.api_server.request_types import (
+    DataWorkerProfile,
     PreprocessInput,
-    PreprocessProfile,
     ResultChunk,
     ResultTensors,
 )
-from mstar.profile.format import InputInfo
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.model.base import Model
+from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils.ipc_format import (
     AbortRequest,
     ConductorMessage,
@@ -54,6 +55,7 @@ class PreprocessWorker:
         socket_path_prefix: str = "/tmp/mstar",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         tcp_transfer_device="",
+        enable_prof: bool=False
     ):
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -67,6 +69,26 @@ class PreprocessWorker:
         self.per_request_reading_tensors = {}
         self.output_loop_idxs: dict[str, NameToLoopIndices] = {}
 
+        # Build the communicator + tensor manager here (main thread) and hand
+        # them to the worker thread, rather than constructing them inside it.
+        # The socket is only *used* from the worker thread, but owning the
+        # tensor manager here lets the main thread read its tx/rx profiling
+        # directly once a request is done (no cross-thread queue / race).
+        self.communicator = ZMQCommunicator(
+            my_id="api_server_preprocess_worker",
+            push_ids=["conductor"],
+            ipc_socket_path_prefix=socket_path_prefix,
+        )  # only used to send (from the worker thread)
+        self.tensor_manager = create_tensor_communication_manager(
+            protocol=tensor_comm_protocol,
+            my_entity_id="api_server_preprocess_worker",
+            hostname=hostname,
+            device="cpu",
+            communicator=self.communicator,
+            tcp_transfer_device=tcp_transfer_device,
+            enable_prof=enable_prof,
+        )
+
         self.thread = threading.Thread(
             target=_preprocess_loop,
             kwargs=dict(
@@ -78,11 +100,10 @@ class PreprocessWorker:
                 abort_request_queue=self.abort_request_queue,
                 discard_tensor_queue=self.discard_tensor_queue,
                 stop_event=self.stop_event,
-                hostname=hostname,
-                socket_path_prefix=socket_path_prefix,
-                tensor_comm_protocol=tensor_comm_protocol,
+                communicator=self.communicator,
+                tensor_manager=self.tensor_manager,
                 model=model,
-                tcp_transfer_device=tcp_transfer_device
+                enable_prof=enable_prof
             )
         )
         self.thread.start()
@@ -149,12 +170,29 @@ class PreprocessWorker:
             results.append(result)
         return results
 
-    def get_profile_updates(self) -> list[PreprocessProfile]:
+    def get_profile_updates(self) -> list[DataWorkerProfile]:
         """Drain preprocess-side profiling updates emitted by the worker thread."""
         updates = []
         while not self.profile_queue.empty():
             updates.append(self.profile_queue.get())
         return updates
+
+    def get_tx_info(self, request_id: str) -> list[TxInfo]:
+        """Snapshot the data worker's send (tx) profiling for a request.
+
+        Safe to call from the main thread once the request is done: by then the
+        worker thread is no longer mutating this request's tx state, and the
+        caller must read it before ``cleanup_request`` drops it.
+        """
+        return self.tensor_manager.get_tx_info(request_id)
+
+    def get_rx_info(self, request_id: str) -> list[RxInfo]:
+        """Snapshot the data worker's receive (rx) profiling for a request.
+
+        Same safety contract as :meth:`get_tx_info` — read once the request's
+        final chunks have all arrived, before ``cleanup_request``.
+        """
+        return self.tensor_manager.get_rx_info(request_id)
 
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
@@ -178,12 +216,11 @@ class PreprocessWorkerThread:
         abort_request_queue: queue.Queue,
         discard_tensor_queue: queue.Queue,
         stop_event: threading.Event,
-        hostname: str = "localhost",
-        socket_path_prefix: str = "/tmp/mstar",
-        tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
+        communicator: ZMQCommunicator,
+        tensor_manager,
         device: str = "cpu",
         model: Model | None = None,
-        tcp_transfer_device="",
+        enable_prof: bool=False
     ):
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
@@ -196,23 +233,13 @@ class PreprocessWorkerThread:
         self.stop_event = stop_event
         self.device = device
         self.model = model
+        self.enable_prof = enable_prof
 
         self.tensor_uuid_to_metadata_per_request = {}
 
-        self.communicator = ZMQCommunicator(
-            my_id="api_server_preprocess_worker",
-            push_ids=["conductor"],
-            ipc_socket_path_prefix=socket_path_prefix,
-        ) # only used to send
-
-        self.tensor_manager = create_tensor_communication_manager(
-            protocol=tensor_comm_protocol,
-            my_entity_id="api_server_preprocess_worker",
-            hostname=hostname,
-            device=self.device,
-            communicator=self.communicator,
-            tcp_transfer_device=tcp_transfer_device,
-        )
+        # Owned by PreprocessWorker (main thread); used only from this thread.
+        self.communicator = communicator
+        self.tensor_manager = tensor_manager
 
     def _process_input(
         self, input: PreprocessInput
@@ -303,33 +330,43 @@ class PreprocessWorkerThread:
         self.communicator.send("conductor", msg)
 
         # Record preprocess-side profiling: the moment the fully preprocessed
-        # request was handed off to the conductor, and the per-modality sizes of
-        # the input tensors we produced. ``perf_counter`` is consistent here
-        # because the worker runs as a thread inside the API server process.
-        self.profile_queue.put(PreprocessProfile(
-            request_id=input.request_id,
-            preprocess_finish_time=time.perf_counter(),
-            inputs=self._summarize_inputs(tensors),
-        ))
+        # request was handed off to the conductor, plus the per-modality sizes of
+        # the *raw* inputs. ``perf_counter`` is consistent here because the worker
+        # runs as a thread inside the API server process. (tx/rx are snapshotted
+        # directly by the main thread at request completion — see APIServer.)
+        if self.enable_prof:
+            self.profile_queue.put(DataWorkerProfile(
+                request_id=input.request_id,
+                preprocess_finish_time=time.perf_counter(),
+                inputs=self._summarize_inputs(input),
+            ))
 
     @staticmethod
-    def _summarize_inputs(tensors: NameToTensorList) -> list[InputInfo]:
-        """Aggregate the preprocessed input tensors into per-modality sizes.
+    def _summarize_inputs(input: PreprocessInput) -> list[InputInfo]:
+        """Aggregate the *raw* (pre-decoding) inputs into per-modality sizes.
 
-        Keys are the tensor-bundle names (e.g. ``image_inputs``); the trailing
-        ``_inputs`` is stripped to recover the modality label.
+        Reports the bytes the client actually sent — uploaded file sizes on
+        disk and the UTF-8 length of the prompt — rather than the much larger
+        decoded tensors (e.g. a compressed JPEG vs. its raw RGB tensor), so the
+        numbers line up with what a user thinks of as "input size".
         """
         infos = []
-        for name, tensor_list in tensors.items():
-            modality = name[: -len("_inputs")] if name.endswith("_inputs") else name
-            total_bytes = sum(
-                t.numel() * t.element_size()
-                for t in tensor_list
-                if t is not None
-            )
+        if input.text:
+            infos.append(InputInfo(
+                modality="text",
+                count=1,
+                total_bytes=len(input.text.encode("utf-8")),
+            ))
+        for modality, paths in (input.file_paths or {}).items():
+            total_bytes = 0
+            for path in paths:
+                try:
+                    total_bytes += os.path.getsize(path)
+                except OSError:
+                    pass  # file already cleaned up / unreadable — count as 0
             infos.append(InputInfo(
                 modality=modality,
-                count=len(tensor_list),
+                count=len(paths),
                 total_bytes=total_bytes,
             ))
         return infos

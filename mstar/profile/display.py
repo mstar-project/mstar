@@ -20,6 +20,12 @@ def _ms(start: float, end: float) -> str:
     return f"{(end - start) * 1e3:8.1f} ms"
 
 
+def _fmt_ms(seconds: float) -> str:
+    """Milliseconds with 2 decimals under 10ms, 1 decimal otherwise."""
+    ms = seconds * 1e3
+    return f"{ms:.2f}" if ms < 10 else f"{ms:.1f}"
+
+
 def pretty_print_profile(prof: RequestProfile, filename=None):
     """Render a single request's profile.
 
@@ -65,32 +71,90 @@ def pretty_print_profile(prof: RequestProfile, filename=None):
         ("finish", t.finish_time),
     ]
     present = [(label, ts) for label, ts in checkpoints if ts is not None]
+    # Some checkpoints race — e.g. the api server's ``last chunk`` and the
+    # conductor's ``done`` signal arrive in either order — so order segments by
+    # the actual timestamp rather than the nominal sequence. This keeps every
+    # segment non-negative and reflects what really happened.
+    present.sort(key=lambda lt: lt[1])
 
     lines.append(rule)
     if len(present) >= 2:
         lines.append(" Timeline:")
-        for (a_label, a_ts), (b_label, b_ts) in zip(present, present[1:]):
+        for (a_label, a_ts), (b_label, b_ts) in zip(present, present[1:], strict=False):
             lines.append(f"   {a_label + ' → ' + b_label:<40} {_ms(a_ts, b_ts)}")
         # Total spans the first to last recorded checkpoint.
         lines.append(f"   {'total':<40} {_ms(present[0][1], present[-1][1])}")
     else:
         lines.append(" Timeline: (no timing recorded)")
 
-    # ---- per-node graph timings (summed over the request) -----------------
+    # ---- per-node graph timings ------------------------------------------
+    # Grouped by node with aligned columns so values stack and scan vertically.
+    # Each cell is "<total over request> (<avg per exec>)".
     if prof.graph_timings:
+        timings = sorted(prof.graph_timings, key=lambda g: (g.node, g.graph_walk))
+        walk_w = min(max(len(g.graph_walk) for g in timings), 18)
+        prefix_w = 5 + walk_w + 8  # indent + walk + " n=NNNN"
+
+        def _cell(total: float, n: int) -> str:
+            return f"  {_fmt_ms(total):>8} ({_fmt_ms(total / n):>7})"
+
         lines.append(rule)
-        lines.append(" Graph timings (CPU, summed over the request) [ms]:")
-        for gt in sorted(prof.graph_timings, key=lambda g: g.total_time, reverse=True):
-            label = f"{gt.node}:{gt.graph_walk}"
-            if len(label) > 24:
-                label = label[:23] + "…"
+        lines.append(" Graph timings (CPU, ms) — total over request (avg per exec):")
+        lines.append(
+            " " * prefix_w + "".join(f"{c:>20}" for c in ("all", "fwd", "pre", "post*"))
+        )
+        last_node = None
+        for gt in timings:
+            if gt.node != last_node:
+                lines.append(f"   {gt.node}")
+                last_node = gt.node
+            n = max(gt.exec_count, 1)
+            prefix = f"     {gt.graph_walk:<{walk_w}} n={gt.exec_count}"
             lines.append(
-                f"   {label:<24} n={gt.exec_count:<5}"
-                f" tot {gt.total_time * 1e3:7.1f}"
-                f"  fwd {gt.forward_time * 1e3:7.1f}"
-                f"  pre {gt.preprocess_time * 1e3:6.1f}"
-                f"  post {gt.postprocess_time * 1e3:6.1f}"
+                f"{prefix:<{prefix_w}}"
+                + _cell(gt.total_time, n)
+                + _cell(gt.forward_time, n)
+                + _cell(gt.preprocess_time, n)
+                + _cell(gt.postprocess_time, n)
             )
+        lines.append(
+            "   * post overlaps the next step / another in-flight batch under"
+        )
+        lines.append(
+            "     speculative scheduling, so it is not necessarily additive."
+        )
+
+    # ---- tensor transfer (rx / tx) ---------------------------------------
+    if prof.rx_info or prof.tx_info:
+        lines.append(rule)
+        lines.append(" Tensor transfer   size / transport-time / count:")
+        if prof.rx_info:
+            lines.append("   rx (received over the wire), by source → dest:")
+            last = None
+            for rx in sorted(
+                prof.rx_info, key=lambda r: (r.source_entity, r.dest_entity, r.edge_name)
+            ):
+                key = (rx.source_entity, rx.dest_entity)
+                if key != last:
+                    lines.append(f"     {rx.source_entity} → {rx.dest_entity}")
+                    last = key
+                lines.append(
+                    f"       {rx.edge_name:<22} {_human_bytes(rx.num_bytes):>10}"
+                    f"  {_fmt_ms(rx.time):>8} ms  (x{rx.count})"
+                )
+        if prof.tx_info:
+            # No dest: the sender registers/writes data without knowing (a priori)
+            # which worker reads it, and may register data that's never sent.
+            lines.append("   tx (registered/written for send; recipient n/a), by source:")
+            last = None
+            for tx in sorted(prof.tx_info, key=lambda t: (t.source_entity, t.edge_name)):
+                if tx.source_entity != last:
+                    lines.append(f"     {tx.source_entity}")
+                    last = tx.source_entity
+                lines.append(
+                    f"       {tx.edge_name:<22} {_human_bytes(tx.num_bytes):>10}"
+                    f"  {_fmt_ms(tx.time):>8} ms  (x{tx.count})"
+                )
     lines.append(sep)
 
     text = "\n".join(lines) + "\n"

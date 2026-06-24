@@ -3,7 +3,6 @@
 import asyncio
 import base64
 import collections
-from dataclasses import dataclass, field
 import json
 import logging
 import multiprocessing as mp
@@ -12,6 +11,7 @@ import signal
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -191,7 +191,8 @@ class APIServer:
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
-            tcp_transfer_device=tcp_transfer_device
+            tcp_transfer_device=tcp_transfer_device,
+            enable_prof=self.log_stats
         )
 
         # Concurrent request tracking
@@ -316,6 +317,16 @@ class APIServer:
         for rid in stale:
             # only set the event when there are no more pending chunks
             self.pending_requests[rid].event.set()
+            # Snapshot the data worker's tx/rx now: the request is done (all
+            # final chunks received), so the worker thread is no longer mutating
+            # this rid's transport state, and we must read it before
+            # cleanup_request drops it. Extends so it combines with the
+            # conductor's worker-side transfers (set in the request_complete
+            # handler).
+            if self.log_stats:
+                profile = self.pending_requests[rid].profile
+                profile.tx_info.extend(self.preprocess_worker.get_tx_info(rid))
+                profile.rx_info.extend(self.preprocess_worker.get_rx_info(rid))
             self.preprocess_worker.cleanup_request(rid)
             self.recently_completed.pop(rid, None)
 
@@ -354,6 +365,11 @@ class APIServer:
                                 req.profile.timing.conductor_finish_time = \
                                     message.body.conductor_finish_time
                                 req.profile.graph_timings = list(message.body.graph_timings.values())
+                                # Conductor-merged worker-side transfers; extend
+                                # so they combine with the data worker's own
+                                # tx/rx (applied from the profile-update queue).
+                                req.profile.rx_info.extend(message.body.rx_info)
+                                req.profile.tx_info.extend(message.body.tx_info)
                         elif rid in self.recently_completed:
                             logger.debug("Late message for completed %s: %s", rid, message.message_type)
                             if message.message_type == "result_tensors":
@@ -364,8 +380,9 @@ class APIServer:
                             )
                             if message.message_type == "result_tensors":
                                 self.preprocess_worker.discard_result_tensors(message.body)
-                # Apply preprocess-side profiling (preprocess finish time +
-                # input sizes) reported by the data worker for each request.
+                # Apply data-worker profiling: preprocess-finish timestamp + raw
+                # input sizes. (The data worker's own tx/rx are snapshotted
+                # directly in _prune_recently_completed once the request is done.)
                 for update in self.preprocess_worker.get_profile_updates():
                     with self.request_lock:
                         req = self.pending_requests.get(update.request_id)

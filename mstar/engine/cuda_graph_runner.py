@@ -26,7 +26,6 @@ import torch
 from torch import nn
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.profile.worker import ExecTimings
 from mstar.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
 from mstar.engine.cuda_graph_config import (
     BasicBatchedCudaGraphConfig,
@@ -36,6 +35,7 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.kv_store import KVCacheConfig, PagedAllocationManager
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
+from mstar.profile.worker import ExecTimings
 from mstar.utils.profiler import mark, range_pop, range_push
 from mstar.utils.sampling import Sampler, SamplerBuffers, SamplingConfig, make_sampler_from_buffers
 
