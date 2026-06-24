@@ -319,8 +319,8 @@ timestamp, so a stage is never negative even when two checkpoints race (e.g. the
 server's ``last chunk`` and the conductor's ``done`` can arrive in either order). All
 timestamps are ``time.perf_counter()``; they are comparable across the api-server,
 conductor, and worker processes because those run on the **same host** (``perf_counter`` is
-``CLOCK_MONOTONIC``, which is boot-relative and shared). The numbers are not meaningful if
-processes ever run on different hosts.
+``CLOCK_MONOTONIC``, which is boot-relative and shared).
+This implementation will be updated when multi-node support is added.
 
 **Graph timings** — CPU time per ``(node, graph_walk)``, accumulated over the request.
 Each cell shows the **total over the request** and, in parentheses, the **average per
