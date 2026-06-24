@@ -145,7 +145,7 @@ def pretty_print_profile(prof: RequestProfile, filename=None):
         if prof.tx_info:
             # No dest: the sender registers/writes data without knowing (a priori)
             # which worker reads it, and may register data that's never sent.
-            lines.append("\n   tx (registered/written for send; recipient n/a), by source:")
+            lines.append("\n   tx (registered/written for send), by source:")
             last = None
             for tx in sorted(prof.tx_info, key=lambda t: (t.source_entity, t.edge_name)):
                 if tx.source_entity != last:
