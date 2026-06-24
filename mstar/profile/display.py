@@ -101,7 +101,7 @@ def pretty_print_profile(prof: RequestProfile, filename=None):
         lines.append(rule)
         lines.append(" Graph timings (CPU, ms) — total over request (avg per exec):")
         lines.append(
-            " " * prefix_w + "".join(f"{c:>20}" for c in ("all", "fwd", "pre", "post*"))
+            " " * prefix_w + "".join(f"{c:^20}" for c in ("all", "fwd", "pre", "post*"))
         )
         last_node = None
         for gt in timings:
@@ -118,7 +118,7 @@ def pretty_print_profile(prof: RequestProfile, filename=None):
                 + _cell(gt.postprocess_time, n)
             )
         lines.append(
-            "   * post overlaps the next step / another in-flight batch under"
+            "\n   * post overlaps the next step / another in-flight batch under"
         )
         lines.append(
             "     speculative scheduling, so it is not necessarily additive."
@@ -145,7 +145,7 @@ def pretty_print_profile(prof: RequestProfile, filename=None):
         if prof.tx_info:
             # No dest: the sender registers/writes data without knowing (a priori)
             # which worker reads it, and may register data that's never sent.
-            lines.append("   tx (registered/written for send; recipient n/a), by source:")
+            lines.append("\n   tx (registered/written for send; recipient n/a), by source:")
             last = None
             for tx in sorted(prof.tx_info, key=lambda t: (t.source_entity, t.edge_name)):
                 if tx.source_entity != last:
