@@ -185,7 +185,8 @@ class Cosmos3Model(Model):
         # between nodes stay replicated (empty shard_dim) — the sharding is
         # in-module, Megatron-style. The VAE decoder runs un-sharded on one rank.
         return ShardingConfig(
-            groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={}
+            groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={},
+            sp_enabled_nodes={DIT_NODE},
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -709,24 +710,26 @@ class Cosmos3Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None,
+        autocast_dtype: torch.dtype | None = None, sp_group=None,
     ) -> torch.nn.Module | None:
         # autocast_dtype is accepted for interface parity (the engine manager
         # passes it to every model). Cosmos3 already casts the meta module to
         # bf16 before to_empty in _build_transformer, so params are allocated
         # directly in the checkpoint dtype and the hint is redundant here.
+        # sp_group is the DiT's sequence-parallel comm group (trivial unless the
+        # config sets sp_size > 1); it is orthogonal to the tp_group.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group)
+        submodule = self._create_submodule(node_name, device, tp_group, sp_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Cosmos3 submodule for %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str, tp_group=None):
+    def _create_submodule(self, node_name: str, device: str, tp_group=None, sp_group=None):
         if node_name == DIT_NODE:
             return Cosmos3DiTSubmodule(
-                transformer=self._build_transformer(device, tp_group=tp_group),
+                transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
                 config=self.config,
                 scheduler=self._build_scheduler(),
                 vae=self._build_vae(device),
@@ -744,7 +747,7 @@ class Cosmos3Model(Model):
 
         return UniPCMultistepScheduler.from_pretrained(str(self._ensure_repo() / "scheduler"))
 
-    def _build_transformer(self, device: str, tp_group=None):
+    def _build_transformer(self, device: str, tp_group=None, sp_group=None):
         from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
         from mstar.model.cosmos3.loader import load_transformer_weights
 
@@ -756,7 +759,7 @@ class Cosmos3Model(Model):
         # meta default; the engine additionally runs the forward under a bf16
         # autocast (a no-op here).
         with torch.device("meta" if not self.skip_weight_loading else "cpu"):
-            model = Cosmos3OmniTransformer(self.config, comm_group=tp_group)
+            model = Cosmos3OmniTransformer(self.config, comm_group=tp_group, sp_group=sp_group)
         model = model.to(torch.bfloat16)
         if self.skip_weight_loading:
             return model.to_empty(device=device)

@@ -31,6 +31,14 @@ from diffusers.models.embeddings import Timesteps
 from torch import nn
 
 from mstar.distributed.communication import TPCommGroup
+from mstar.model.components.distributed.sequence_parallel import (
+    gather_sequence,
+    scatter_sequence,
+    sp_head_gather,
+    sp_head_slice,
+    sp_seq_split,
+    ulysses_attention,
+)
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -173,20 +181,30 @@ class Cosmos3PackedMoTAttention(nn.Module):
         attention_bias: bool,
         rms_norm_eps: float,
         comm_group: TPCommGroup | None = None,
+        sp_group: TPCommGroup | None = None,
     ):
         super().__init__()
         if comm_group is None:
             comm_group = TPCommGroup.trivial()
+        if sp_group is None:
+            sp_group = TPCommGroup.trivial()
+        self.sp_group = sp_group
         tp_size = comm_group.world_size
-        if num_attention_heads % tp_size or num_key_value_heads % tp_size:
+        sp_size = sp_group.world_size
+        # Ulysses sequence parallelism redistributes heads across the SP group
+        # via an all-to-all around attention, so the attention runs at effective
+        # head-degree tp*sp — both head counts must divide that product.
+        eff_size = tp_size * sp_size
+        if num_attention_heads % eff_size or num_key_value_heads % eff_size:
             raise ValueError(
-                f"TP size {tp_size} must divide both num_attention_heads "
-                f"({num_attention_heads}) and num_key_value_heads "
-                f"({num_key_value_heads})"
+                f"tp_size*sp_size ({tp_size}*{sp_size}={eff_size}) must divide "
+                f"both num_attention_heads ({num_attention_heads}) and "
+                f"num_key_value_heads ({num_key_value_heads})"
             )
         self.head_dim = head_dim
-        # Per-rank head counts: TP shards the head dimension, so the q/k/v
-        # reshapes below operate on this rank's slice of heads.
+        # TP-local (post-projection) head counts: the column-parallel q/k/v
+        # projections shard heads by tp_size, and the SP all-to-all further
+        # splits these to tp*sp heads around the attention kernel.
         self.num_attention_heads = num_attention_heads // tp_size
         self.num_key_value_heads = num_key_value_heads // tp_size
 
@@ -274,17 +292,37 @@ class Cosmos3PackedMoTAttention(nn.Module):
         v = self.to_v(und_seq).view(-1, Hkv, D)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
-        out = cache_handle.run_attention(q=q, k=k, v=v).reshape(-1, H * D)
+        if self.sp_group.world_size > 1:
+            # The UND prefix is replicated across the SP group (small text). Keep
+            # this rank's head-group so the cached prefix K/V lands on the same
+            # head partition the GEN all-to-all produces, then gather heads back
+            # for the row-parallel output projection.
+            q = sp_head_slice(self.sp_group, q)
+            k = sp_head_slice(self.sp_group, k)
+            v = sp_head_slice(self.sp_group, v)
+            out = cache_handle.run_attention(q=q, k=k, v=v)
+            out = sp_head_gather(self.sp_group, out).reshape(-1, H * D)
+        else:
+            out = cache_handle.run_attention(q=q, k=k, v=v).reshape(-1, H * D)
         return self.to_out(out)
 
-    def forward_gen(self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache_handle) -> torch.Tensor:
+    def forward_gen(
+        self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+        cache_handle, seq_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
         H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
         q = self.norm_added_q(self.add_q_proj(gen_seq).view(-1, H, D))
         k = self.norm_added_k(self.add_k_proj(gen_seq).view(-1, Hkv, D))
         v = self.add_v_proj(gen_seq).view(-1, Hkv, D)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
-        out = cache_handle.run_attention(q=q, k=k, v=v).reshape(-1, H * D)
+        # Ulysses all-to-all wraps run_attention: gen_seq is sequence-sharded
+        # across the SP group, so attention runs over the full sequence at
+        # tp*sp head-degree, then the result is re-sharded back. Trivial SP
+        # group -> passthrough (byte-identical to the non-SP path).
+        out = ulysses_attention(
+            self.sp_group, q, k, v, cache_handle.run_attention, seq_sizes,
+        ).reshape(-1, H * D)
         return self.to_add_out(out)
 
 
@@ -301,6 +339,7 @@ class Cosmos3MoTDecoderLayer(nn.Module):
         attention_bias: bool,
         rms_norm_eps: float,
         comm_group: TPCommGroup | None = None,
+        sp_group: TPCommGroup | None = None,
     ):
         super().__init__()
         self.self_attn = Cosmos3PackedMoTAttention(
@@ -311,6 +350,7 @@ class Cosmos3MoTDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             rms_norm_eps=rms_norm_eps,
             comm_group=comm_group,
+            sp_group=sp_group,
         )
         self.mlp = Cosmos3MLP(hidden_size, intermediate_size, comm_group=comm_group)
         self.mlp_moe_gen = Cosmos3MLP(hidden_size, intermediate_size, comm_group=comm_group)
@@ -344,9 +384,12 @@ class Cosmos3MoTDecoderLayer(nn.Module):
         residual = und_seq + attn_out
         return residual + self.mlp(self.post_attention_layernorm(residual))
 
-    def forward_gen(self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache_handle) -> torch.Tensor:
+    def forward_gen(
+        self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+        cache_handle, seq_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
         gen_norm = self.input_layernorm_moe_gen(gen_seq)
-        attn_out = self.self_attn.forward_gen(gen_norm, cos, sin, cache_handle)
+        attn_out = self.self_attn.forward_gen(gen_norm, cos, sin, cache_handle, seq_sizes)
         residual = gen_seq + attn_out
         return residual + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(residual))
 
@@ -386,10 +429,13 @@ class Cosmos3OmniTransformer(nn.Module):
     predicts flow velocity through ``proj_out`` and never decodes text logits.
     """
 
-    def __init__(self, config, comm_group: TPCommGroup | None = None):
+    def __init__(self, config, comm_group: TPCommGroup | None = None, sp_group: TPCommGroup | None = None):
         super().__init__()
         self.config = config
         h = config.hidden_size
+        if sp_group is None:
+            sp_group = TPCommGroup.trivial()
+        self.sp_group = sp_group
 
         self.embed_tokens = nn.Embedding(config.vocab_size, h)
         self.layers = nn.ModuleList(
@@ -402,6 +448,7 @@ class Cosmos3OmniTransformer(nn.Module):
                 attention_bias=config.attention_bias,
                 rms_norm_eps=config.rms_norm_eps,
                 comm_group=comm_group,
+                sp_group=sp_group,
             )
             for _ in range(config.num_hidden_layers)
         )
@@ -744,6 +791,34 @@ class Cosmos3OmniTransformer(nn.Module):
             und_seq = layer.forward_und(und_seq, cos, sin, cache_handle)
         cache_handle.advance_seq_lens()
 
+    def _sp_run_gen_layers(self, gen_seq, cos, sin, cache_handle):
+        """Run the generation layer stack, sequence-parallel-sharded across the
+        SP group when active. ``gen_seq``/``cos``/``sin`` are the FULL sequence
+        (identical on every SP rank); returns the FULL post-layer sequence.
+
+        This is the only sequence-parallel bracket in the denoise path: the
+        prologue (patchify, proj_in, timestep scatter-add, action concat, rotary)
+        and epilogue (final norm, proj_out, unpatchify) all use absolute token
+        indices and must run on the full sequence, so SP shards only the layer
+        stack — where essentially all the compute is. The Ulysses all-to-all
+        inside each layer is a redistribute-and-reconstruct, so a contiguous
+        scatter + rank-order gather preserves the exact token order (including a
+        packed ``[cond | uncond]`` CFG batch)."""
+        sp = self.sp_group
+        if sp.world_size == 1:
+            for i, layer in enumerate(self.layers):
+                cache_handle.set_layer_idx(i)
+                gen_seq = layer.forward_gen(gen_seq, cos, sin, cache_handle)
+            return gen_seq
+        seq_sizes = sp_seq_split(gen_seq.shape[0], sp.world_size)
+        gen_seq = scatter_sequence(sp, gen_seq, seq_sizes)
+        cos = scatter_sequence(sp, cos, seq_sizes)
+        sin = scatter_sequence(sp, sin, seq_sizes)
+        for i, layer in enumerate(self.layers):
+            cache_handle.set_layer_idx(i)
+            gen_seq = layer.forward_gen(gen_seq, cos, sin, cache_handle, seq_sizes)
+        return gather_sequence(sp, gen_seq, seq_sizes)
+
     def denoise_step(
         self,
         latents: torch.Tensor,
@@ -791,9 +866,7 @@ class Cosmos3OmniTransformer(nn.Module):
             gen_seq = torch.cat([gen_seq, action_seq], dim=0)
 
         cos, sin = self._rotary(position_ids, gen_seq.device, gen_seq.dtype)
-        for i, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(i)
-            gen_seq = layer.forward_gen(gen_seq, cos, sin, cache_handle)
+        gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, cache_handle)
         gen_out = self.norm_moe_gen(gen_seq)
         preds_packed = self.proj_out(gen_out[vision_mse_loss_indexes])
         preds = self._unpatchify_and_unpack_latents(
@@ -866,9 +939,7 @@ class Cosmos3OmniTransformer(nn.Module):
         cos = torch.cat([cos_c, cos_u], dim=0)
         sin = torch.cat([sin_c, sin_u], dim=0)
 
-        for i, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(i)
-            gen_seq = layer.forward_gen(gen_seq, cos, sin, cache_handle)
+        gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, cache_handle)
         gen_out = self.norm_moe_gen(gen_seq)
 
         def _decode(out):
@@ -904,6 +975,10 @@ class Cosmos3OmniTransformer(nn.Module):
         Each ``requests`` entry is a dict with: ``latents``, ``vision_timesteps``,
         ``position_ids_cond``, ``position_ids_uncond``, ``vision_token_shapes``,
         ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``."""
+        assert self.sp_group.world_size == 1, (
+            "Sequence parallelism is not supported with multi-request batched "
+            "denoising yet (v1 targets bs=1)."
+        )
         gen_seqs, shapes, cos_cond, sin_cond, cos_uncond, sin_uncond = [], [], [], [], [], []
         for req in requests:
             packed, original_latent_shapes = self._patchify_and_pack_latents([req["latents"]])
@@ -984,6 +1059,10 @@ class Cosmos3OmniTransformer(nn.Module):
         ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``,
         ``action_token_shapes``, ``action_noisy_frame_indexes``,
         ``action_mse_gen_indexes``, ``action_domain_id``."""
+        assert self.sp_group.world_size == 1, (
+            "Sequence parallelism is not supported with multi-request batched "
+            "action denoising yet (v1 targets bs=1)."
+        )
         gen_seqs, shapes, cos_cond, sin_cond, cos_uncond, sin_uncond = [], [], [], [], [], []
         for req in requests:
             packed, original_latent_shapes = self._patchify_and_pack_latents([req["latents"]])
