@@ -1,0 +1,20 @@
+model: "cosmos3"
+# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
+max_seq_len: 8192
+# Per-rank KV pool. Sequence parallelism shards the generation sequence and the
+# attention heads (each rank holds num_kv_heads / sp_size heads), so the cache is
+# lighter than the single-GPU run; 1024 pages leave ample headroom.
+kv_cache:
+  max_num_pages: 1024
+# The DiT runs Ulysses sequence-parallel across four ranks: the generation token
+# sequence is sharded and an all-to-all around attention swaps sequence for heads
+# so each rank attends the full sequence over a quarter of the heads (sp_size 4
+# divides the 8 KV heads -> 2 heads/rank). Weights are replicated (no tensor
+# parallelism). Serve eager (DISABLE_GRAPH=1) — the denoise CUDA-graph does not
+# yet capture the all-to-all.
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1, 2, 3]
+    sp_size: 4
+  - node_names: ["vae_decoder"]
+    ranks: [0]
