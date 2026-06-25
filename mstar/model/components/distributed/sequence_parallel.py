@@ -88,15 +88,29 @@ def ulysses_attention(
     v: torch.Tensor,
     run_attention: Callable[..., torch.Tensor],
     seq_sizes: list[int],
+    prefer_all_gather: bool = False,
 ) -> torch.Tensor:
     """Run attention under Ulysses SP.
 
     ``q``: ``[seq/P, Hq, D]``; ``k``/``v``: ``[seq/P, Hkv, D]`` (this rank's
     tokens, TP-local heads). Returns ``[seq/P, Hq, D]``. The head counts must be
     divisible by ``sp`` (Ulysses shards heads). When the group is trivial this is
-    a passthrough — byte-identical to the non-SP path."""
+    a passthrough — byte-identical to the non-SP path.
+
+    ``prefer_all_gather`` selects the all-gather collective instead of the
+    all-to-all (see :func:`_ulysses_attention_via_all_gather`). The caller sets
+    it on the denoise forward that the CUDA graph captures: the all-to-all is
+    grouped point-to-point send/recv and does not replay from a captured graph,
+    whereas all-gather (a true collective, like the TP all-reduce) does. It must
+    be set consistently across warmup, capture and replay so the all-gather
+    kernels are compiled and autotuned during eager warmup, not mid-capture
+    (autotuning synchronizes, which is illegal while a graph is recording).
+    Eager paths (video, uncaptured resolutions) leave it off for the lighter
+    all-to-all. Both produce identical results."""
     if sp_group.world_size == 1:
         return run_attention(q=q, k=k, v=v)
+    if prefer_all_gather:
+        return _ulysses_attention_via_all_gather(sp_group, q, k, v, run_attention)
     # scatter heads, gather sequence: [seq/P, H, D] -> [seq, H/P, D]
     q = sp_group.all_to_all(q, scatter_dim=1, gather_dim=0, gather_sizes=seq_sizes)
     k = sp_group.all_to_all(k, scatter_dim=1, gather_dim=0, gather_sizes=seq_sizes)
@@ -105,6 +119,38 @@ def ulysses_attention(
     # scatter sequence, gather heads: [seq, H/P, D] -> [seq/P, H, D]
     out = sp_group.all_to_all(out, scatter_dim=0, gather_dim=1, scatter_sizes=seq_sizes)
     return out
+
+
+def _ulysses_attention_via_all_gather(
+    sp_group: TPCommGroup,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    run_attention: Callable[..., torch.Tensor],
+) -> torch.Tensor:
+    """CUDA-graph-capturable Ulysses attention built from all-gather.
+
+    Same result as :func:`ulysses_attention`'s all-to-all, different collective:
+    each rank all-gathers the full sequence and attends over its own head-group,
+    then all-gathers the full heads back and keeps its own sequence shard. The
+    all-to-all would move fewer bytes, but it is grouped send/recv and does not
+    replay from a CUDA graph; all-gather is a true collective and does. Assumes
+    an even sequence split across the group (the captured resolutions guarantee
+    it). Head counts are divisible by the group size (the Ulysses constraint)."""
+    world_size, rank = sp_group.world_size, sp_group.rank
+    # [seq/P, H, D] -> all-gather sequence -> [seq, H, D] -> keep head-group rank
+    q_full = sp_group.all_gather(q, dim=0)
+    k_full = sp_group.all_gather(k, dim=0)
+    v_full = sp_group.all_gather(v, dim=0)
+    hq, hkv = q_full.size(1) // world_size, k_full.size(1) // world_size
+    q = q_full[:, rank * hq:(rank + 1) * hq, :].contiguous()
+    k = k_full[:, rank * hkv:(rank + 1) * hkv, :].contiguous()
+    v = v_full[:, rank * hkv:(rank + 1) * hkv, :].contiguous()
+    out = run_attention(q=q, k=k, v=v)  # [seq, Hq/P, D]
+    # [seq, Hq/P, D] -> all-gather heads -> [seq, Hq, D] -> keep sequence shard rank
+    out = sp_group.all_gather(out, dim=1)
+    sl = out.size(0) // world_size
+    return out[rank * sl:(rank + 1) * sl, :, :].contiguous()
 
 
 def sp_head_slice(sp_group: TPCommGroup, x: torch.Tensor) -> torch.Tensor:

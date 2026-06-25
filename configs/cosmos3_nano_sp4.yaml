@@ -10,8 +10,9 @@ kv_cache:
 # sequence is sharded and an all-to-all around attention swaps sequence for heads
 # so each rank attends the full sequence over a quarter of the heads (sp_size 4
 # divides the 8 KV heads -> 2 heads/rank). Weights are replicated (no tensor
-# parallelism). Serve eager (DISABLE_GRAPH=1) — the denoise CUDA-graph does not
-# yet capture the all-to-all.
+# parallelism). A 4-GPU correctness cross-check. The denoise CUDA-graph captures
+# the image step via the all-gather Ulysses exchange (the all-to-all is
+# point-to-point send/recv, which a CUDA graph cannot replay).
 node_groups:
   - node_names: ["dit"]
     ranks: [0, 1, 2, 3]

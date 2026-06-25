@@ -1265,10 +1265,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         layout = self._capture_layout[tuple(latents.shape[1:])]
         rids = engine_inputs.request_ids
         if latents.shape[0] == 1:
+            # This forward is captured into the denoise CUDA graph. Under SP the
+            # Ulysses exchange must use all-gather, not all-to-all: the latter is
+            # grouped point-to-point send/recv and does not replay from a graph.
+            # The flag holds across warmup, capture and replay (all routed here),
+            # so the all-gather kernels are compiled during eager warmup rather
+            # than mid-capture. No-op without SP.
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents[0], vision_timesteps[0], position_ids_cond[0], position_ids_uncond[0],
                 layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
-                layout["mse_gen_indexes"], cm,
+                layout["mse_gen_indexes"], cm, prefer_all_gather=True,
             )
             return {rids[0]: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
         reqs = [

@@ -12,7 +12,9 @@ kv_cache:
 # attention). The 4 ranks form a [sp_size, tp_size] grid: TP groups {0,1},{2,3};
 # SP groups {0,2},{1,3}. Used to validate TP x SP composition on Nano (the small
 # model fits on one GPU, so this is a correctness cross-check, not a perf config).
-# Serve eager (DISABLE_GRAPH=1).
+# The denoise CUDA-graph captures the image step: the SP Ulysses exchange uses
+# all-gather under capture (the all-to-all is point-to-point send/recv, which a
+# CUDA graph cannot replay); the TP row-parallel projections all-reduce as usual.
 node_groups:
   - node_names: ["dit"]
     ranks: [0, 1, 2, 3]

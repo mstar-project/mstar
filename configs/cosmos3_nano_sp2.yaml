@@ -11,8 +11,10 @@ kv_cache:
 # so each rank attends the full sequence over half the heads. Weights are
 # replicated (no tensor parallelism here). The VAE decoder is small and runs
 # un-sharded on rank 0; the DiT all-gathers its final latents, so the decoder
-# reads them directly. Serve eager (DISABLE_GRAPH=1) — the denoise CUDA-graph
-# does not yet capture the all-to-all.
+# reads them directly. The denoise CUDA-graph captures the image step under SP:
+# during capture the Ulysses exchange switches to all-gather (the all-to-all is
+# point-to-point send/recv, which a CUDA graph cannot replay), so serving
+# graph-on graphs t2i. Video runs eager (dense, uncaptured) on the all-to-all.
 node_groups:
   - node_names: ["dit"]
     ranks: [0, 1]

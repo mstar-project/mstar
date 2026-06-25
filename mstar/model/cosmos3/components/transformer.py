@@ -309,6 +309,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
         cache_handle, seq_sizes: list[int] | None = None,
+        prefer_all_gather: bool = False,
     ) -> torch.Tensor:
         H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
         q = self.norm_added_q(self.add_q_proj(gen_seq).view(-1, H, D))
@@ -319,9 +320,12 @@ class Cosmos3PackedMoTAttention(nn.Module):
         # Ulysses all-to-all wraps run_attention: gen_seq is sequence-sharded
         # across the SP group, so attention runs over the full sequence at
         # tp*sp head-degree, then the result is re-sharded back. Trivial SP
-        # group -> passthrough (byte-identical to the non-SP path).
+        # group -> passthrough (byte-identical to the non-SP path). The captured
+        # denoise forward sets prefer_all_gather (the all-to-all does not replay
+        # from a CUDA graph; all-gather does).
         out = ulysses_attention(
             self.sp_group, q, k, v, cache_handle.run_attention, seq_sizes,
+            prefer_all_gather=prefer_all_gather,
         ).reshape(-1, H * D)
         return self.to_add_out(out)
 
@@ -387,9 +391,12 @@ class Cosmos3MoTDecoderLayer(nn.Module):
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
         cache_handle, seq_sizes: list[int] | None = None,
+        prefer_all_gather: bool = False,
     ) -> torch.Tensor:
         gen_norm = self.input_layernorm_moe_gen(gen_seq)
-        attn_out = self.self_attn.forward_gen(gen_norm, cos, sin, cache_handle, seq_sizes)
+        attn_out = self.self_attn.forward_gen(
+            gen_norm, cos, sin, cache_handle, seq_sizes, prefer_all_gather
+        )
         residual = gen_seq + attn_out
         return residual + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(residual))
 
@@ -791,7 +798,7 @@ class Cosmos3OmniTransformer(nn.Module):
             und_seq = layer.forward_und(und_seq, cos, sin, cache_handle)
         cache_handle.advance_seq_lens()
 
-    def _sp_run_gen_layers(self, gen_seq, cos, sin, cache_handle):
+    def _sp_run_gen_layers(self, gen_seq, cos, sin, cache_handle, prefer_all_gather=False):
         """Run the generation layer stack, sequence-parallel-sharded across the
         SP group when active. ``gen_seq``/``cos``/``sin`` are the FULL sequence
         (identical on every SP rank); returns the FULL post-layer sequence.
@@ -816,7 +823,9 @@ class Cosmos3OmniTransformer(nn.Module):
         sin = scatter_sequence(sp, sin, seq_sizes)
         for i, layer in enumerate(self.layers):
             cache_handle.set_layer_idx(i)
-            gen_seq = layer.forward_gen(gen_seq, cos, sin, cache_handle, seq_sizes)
+            gen_seq = layer.forward_gen(
+                gen_seq, cos, sin, cache_handle, seq_sizes, prefer_all_gather
+            )
         return gather_sequence(sp, gen_seq, seq_sizes)
 
     def denoise_step(
@@ -899,6 +908,7 @@ class Cosmos3OmniTransformer(nn.Module):
         action_mse_gen_indexes: torch.Tensor | None = None,
         action_timesteps: torch.Tensor | None = None,
         action_domain_id: torch.Tensor | None = None,
+        prefer_all_gather: bool = False,
     ):
         """Conditional and unconditional generation in one batched pass.
 
@@ -939,7 +949,9 @@ class Cosmos3OmniTransformer(nn.Module):
         cos = torch.cat([cos_c, cos_u], dim=0)
         sin = torch.cat([sin_c, sin_u], dim=0)
 
-        gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, cache_handle)
+        gen_seq = self._sp_run_gen_layers(
+            gen_seq, cos, sin, cache_handle, prefer_all_gather=prefer_all_gather
+        )
         gen_out = self.norm_moe_gen(gen_seq)
 
         def _decode(out):
