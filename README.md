@@ -12,7 +12,7 @@
   <a href="#quickstart"><b>Quickstart</b></a> &nbsp;·&nbsp;
   <a href="#supported-models"><b>Models</b></a> &nbsp;·&nbsp;
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;·&nbsp;
-  <a href="https://mstar-project.github.io/mstar/"><b>Docs</b></a> &nbsp;·&nbsp;
+  <a href="https://m-star.org/mstar/"><b>Docs</b></a> &nbsp;·&nbsp;
   <a href="https://m-star.org/"><b>Blog</b></a> &nbsp;·&nbsp;
   <a href="https://arxiv.org/abs/2606.12688"><b>Paper</b></a>
 </p>
@@ -21,7 +21,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-7b61ff.svg" alt="License: Apache 2.0"></a>
   <img src="https://img.shields.io/badge/python-3.12-22d3ee.svg" alt="Python 3.12">
   <img src="https://img.shields.io/badge/modalities-text_image_audio_video_action-6a8cff.svg" alt="Modalities">
-  <a href="https://mstar-project.github.io/mstar/"><img src="https://img.shields.io/badge/docs-online-3b82f6.svg" alt="Docs"></a>
+  <a href="https://m-star.org/mstar/"><img src="https://img.shields.io/badge/docs-online-3b82f6.svg" alt="Docs"></a>
   <a href="https://arxiv.org/abs/2606.12688"><img src="https://img.shields.io/badge/paper-arXiv-b31b1b.svg" alt="Paper (arXiv)"></a>
 </p>
 
@@ -32,7 +32,7 @@
 </p>
 
 <p align="center">
-  <em>One runtime that matches or beats state-of-the-art inference systems. Full methodology and current numbers in the <a href="https://mstar-project.github.io/">blog post</a> and <a href="https://arxiv.org/abs/2606.12688">paper</a>.</em>
+  <em>One runtime that matches or beats state-of-the-art inference systems. Full methodology and current numbers in the <a href="https://m-star.org/">blog post</a> and <a href="https://arxiv.org/abs/2606.12688">paper</a>.</em>
 </p>
 
 ## What is M*?
@@ -148,13 +148,13 @@ for audio codecs, and persistent-cache loops for world-model rollouts.
 
 Benchmark numbers shift as systems evolve — ours and everyone else's — so rather than freeze figures here
 that go stale, we keep the current results and full methodology in the
-[blog post](https://mstar-project.github.io/) and the [paper](https://arxiv.org/abs/2606.12688).
+[blog post](https://m-star.org/) and the [paper](https://arxiv.org/abs/2606.12688).
 
 ## Contributing
 
 Issues and pull requests are welcome. Found a bug, or want a model or feature supported?
 **[Open an issue](https://github.com/mstar-project/mstar/issues).** To add a model yourself,
-follow the [Adding a New Model](https://mstar-project.github.io/mstar/adding_models.html) guide.
+follow the [Adding a New Model](https://m-star.org/mstar/adding_models.html) guide.
 PRs to `main` go through review and CI (`ruff`).
 
 ## Citation
