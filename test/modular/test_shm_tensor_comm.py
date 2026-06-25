@@ -16,6 +16,7 @@ from mstar.communication.tensors import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, TensorPointerInfo
+from mstar.utils.ipc_format import WorkerMessageType
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -231,6 +232,66 @@ def test_ack_sent_on_remote_read():
         assert len(comm.sent) == 1
         entity_id, msg = comm.sent[0]
         assert entity_id == "worker_0"
+
+
+def _produce_registered_output(mgr, request_id, name="audio_output"):
+    """Producer stores an output edge bound for the api server and registers it
+    for send, leaving it held by the +1 awaiting-ack ref (returns the uuid)."""
+    edges = [GraphEdge(next_node="api_server", name=name)]
+    mgr.store_and_populate_graph_edges(request_id, {name: [torch.randn(8, 16)]}, edges)
+    uuid = edges[0].tensor_info[0].uuid
+    mgr.register_for_send(request_id, [uuid])
+    return edges, uuid
+
+
+def test_unacked_result_tensors_leak_producer_buffer():
+    """Without an ack, the producer never reclaims the output buffer.
+
+    A result dropped for an already-removed request leaves the producer holding
+    the buffer (ref never released), so even its own cleanup defers it.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        producer = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        _, uuid = _produce_registered_output(producer, "req1")
+
+        shm_path = os.path.join(tmpdir, f"mstar_worker_0_{uuid}")
+        assert os.path.isfile(shm_path)
+        assert not producer.tensor_store.can_gc("req1", uuid)  # held by send ref
+
+        # No ack arrives; the producer's own cleanup must defer the buffer.
+        producer.cleanup_request("req1")
+        assert os.path.isfile(shm_path)  # leaked: still on disk, awaiting an ack
+
+
+def test_ack_unread_tensors_lets_producer_reclaim_buffer():
+    """ack_unread_tensors emits the TENSOR_RECEIVED that frees the producer.
+
+    Acking a result for a removed request (without reading) lets the producing
+    worker reclaim the buffer it holds.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        producer = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        edges, uuid = _produce_registered_output(producer, "req1")
+        shm_path = os.path.join(tmpdir, f"mstar_worker_0_{uuid}")
+        assert os.path.isfile(shm_path)
+
+        # api server never registered "req1" (unknown/removed request) yet still
+        # acks the abandoned tensors back to the producer.
+        api_server = _make_manager(tmpdir, entity_id="api_server_preprocess_worker")
+        api_server.ack_unread_tensors("req1", edges)
+
+        sent = api_server.communicator.sent
+        assert len(sent) == 1
+        entity_id, msg = sent[0]
+        assert entity_id == "worker_0"
+        assert msg.message_type == WorkerMessageType.TENSOR_RECEIVED
+        assert msg.body.successful_tensors == {uuid: 1}
+
+        # Producer applies the ack (mirrors worker._handle_tensor_received) and
+        # reclaims the buffer.
+        for u, n in msg.body.successful_tensors.items():
+            producer.dereference("req1", u, n=n)
+        assert not os.path.isfile(shm_path)  # reclaimed -> no leak
 
 
 # ---------------------------------------------------------------------------

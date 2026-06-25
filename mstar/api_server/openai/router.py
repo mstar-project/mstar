@@ -75,12 +75,12 @@ async def list_models():
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     api, model_name, adapter, err = _resolve("supports_chat")
     if err is not None:
         return err
     try:
-        result = await serving_chat.create_chat_completion(api, model_name, adapter, request)
+        result = await serving_chat.create_chat_completion(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
         return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
     if request.stream:
@@ -91,23 +91,23 @@ async def chat_completions(request: ChatCompletionRequest):
 
 
 @router.post("/v1/audio/speech")
-async def audio_speech(request: SpeechRequest):
+async def audio_speech(request: SpeechRequest, raw_request: Request):
     api, model_name, adapter, err = _resolve("supports_speech")
     if err is not None:
         return err
     try:
-        return await serving_speech.create_speech(api, model_name, adapter, request)
+        return await serving_speech.create_speech(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
 
 
 @router.post("/v1/images/generations")
-async def images_generations(request: ImageGenerationRequest):
+async def images_generations(request: ImageGenerationRequest, raw_request: Request):
     api, model_name, adapter, err = _resolve("supports_images")
     if err is not None:
         return err
     try:
-        result = await serving_images.create_images(api, model_name, adapter, request)
+        result = await serving_images.create_images(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
     return JSONResponse(result)
@@ -144,6 +144,7 @@ async def images_edits(request: Request):
             image_bytes=image_bytes,
             image_filename=getattr(image, "filename", None),
             model_kwargs=extra,
+            raw_request=request,
         )
     except Exception as e:  # noqa: BLE001
         return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")

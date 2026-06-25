@@ -45,7 +45,7 @@ audio = [
 
 bagel = [
     "einops",
-    "flashinfer-python",
+    "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
@@ -62,7 +62,7 @@ qwen3_omni = [
     # prebuilt wheels aren't on PyPI, so a plain install compiles from source
     # (and fails on CUDA 13). Install it separately; see docs/installation.rst.
     "einops",
-    "flashinfer-python",
+    "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
@@ -78,7 +78,7 @@ qwen3_omni = [
 
 orpheus = [
     "einops",
-    "flashinfer-python",
+    "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -86,7 +86,7 @@ orpheus = [
 ]
 
 pi05 = [
-    "flashinfer-python",
+    "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -102,7 +102,7 @@ vjepa2 = [
 ]
 
 vjepa2_ac = [
-    "flashinfer-python",
+    "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -114,7 +114,7 @@ all = [
     "pytest",
     "soundfile",
     "einops",
-    "flashinfer-python",
+    "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",

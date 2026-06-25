@@ -20,6 +20,7 @@ from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.model.base import Model
 from mstar.utils.ipc_format import (
+    AbortRequest,
     ConductorMessage,
     ConductorMessageType,
     NewRequestConductor,
@@ -51,6 +52,8 @@ class PreprocessWorker:
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
+        self.abort_request_queue = queue.Queue()
+        self.discard_tensor_queue = queue.Queue()
         self.output_queue = queue.Queue()
         self.stop_event = threading.Event()
 
@@ -64,6 +67,8 @@ class PreprocessWorker:
                 result_tensor_queue=self.result_tensor_input_queue,
                 out_queue=self.output_queue,
                 cleanup_request_queue=self.cleanup_request_queue,
+                abort_request_queue=self.abort_request_queue,
+                discard_tensor_queue=self.discard_tensor_queue,
                 stop_event=self.stop_event,
                 hostname=hostname,
                 socket_path_prefix=socket_path_prefix,
@@ -79,10 +84,17 @@ class PreprocessWorker:
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
 
+    def abort_request(self, request_id: str):
+        self.abort_request_queue.put(request_id)
+        self.cleanup_request(request_id)
+
     def new_result_tensors(self, input: ResultTensors):
         name = input.graph_edge.name
         if input.request_id not in self.output_loop_idxs:
-            logger.debug("Late result_tensors for cleaned-up request %s, ignoring", input.request_id)
+            # Request was removed while this output was still in flight; ack the
+            # tensors so the producing worker can reclaim them rather than leak.
+            logger.debug("Late result_tensors for cleaned-up request %s, acking and dropping", input.request_id)
+            self.discard_result_tensors(input)
             return
 
         self.output_loop_idxs[input.request_id][name] = input.loop_indices.max(
@@ -95,6 +107,14 @@ class PreprocessWorker:
             input.request_id,  self.per_request_reading_tensors[input.request_id]
         )
         self.result_tensor_input_queue.put(input)
+
+    def discard_result_tensors(self, input: ResultTensors):
+        """Ack and drop result tensors for an already-removed request.
+
+        Routed to the worker thread (which owns the communicator) so the
+        producing worker gets its TENSOR_RECEIVED ack and frees the buffers.
+        """
+        self.discard_tensor_queue.put(input)
 
     def has_pending_tensors(self, request_id: str):
         return self.per_request_reading_tensors.get(request_id, 0) > 0
@@ -123,8 +143,8 @@ class PreprocessWorker:
 
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
-        del self.output_loop_idxs[request_id]
-        del self.per_request_reading_tensors[request_id]
+        self.output_loop_idxs.pop(request_id, None)
+        self.per_request_reading_tensors.pop(request_id, None)
 
     def shutdown(self):
         self.stop_event.set()
@@ -139,6 +159,8 @@ class PreprocessWorkerThread:
         result_tensor_queue: queue.Queue, # for output streaming
         out_queue: queue.Queue,
         cleanup_request_queue: queue.Queue,
+        abort_request_queue: queue.Queue,
+        discard_tensor_queue: queue.Queue,
         stop_event: threading.Event,
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mstar",
@@ -150,6 +172,8 @@ class PreprocessWorkerThread:
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
         self.cleanup_request_queue = cleanup_request_queue
+        self.abort_request_queue = abort_request_queue
+        self.discard_tensor_queue = discard_tensor_queue
         self.out_queue = out_queue
 
         self.stop_event = stop_event
@@ -275,6 +299,16 @@ class PreprocessWorkerThread:
             self.tensor_uuid_to_metadata_per_request[result.request_id][
                 tensor_info.uuid] = result.metadata
 
+    def _discard_result_tensor(
+        self, result: ResultTensors
+    ):
+        # The request is gone, so don't start a read — just ack the tensors back
+        # to the producing worker so it can free the source buffers.
+        self.tensor_manager.ack_unread_tensors(
+            request_id=result.request_id,
+            graph_edges=[result.graph_edge],
+        )
+
     def _process_read_tensors(self):
         did_work = False
         for request_id, graph_edges in self.tensor_manager.get_ready_tensors().items():
@@ -348,6 +382,18 @@ class PreprocessWorkerThread:
                 if not self.result_tensor_queue.empty():
                     did_work = True
                     self._read_result_tensor(self.result_tensor_queue.get())
+                if not self.abort_request_queue.empty():
+                    did_work = True
+                    self.communicator.send(
+                        "conductor",
+                        ConductorMessage(
+                            message_type=ConductorMessageType.ABORT_REQUEST,
+                            body=AbortRequest(request_id=self.abort_request_queue.get()),
+                        ),
+                    )
+                if not self.discard_tensor_queue.empty():
+                    did_work = True
+                    self._discard_result_tensor(self.discard_tensor_queue.get())
                 if not self.cleanup_request_queue.empty():
                     did_work = True
                     req_id = self.cleanup_request_queue.get()

@@ -49,7 +49,7 @@ class _StubAPI:
         self._chunks[kw["request_id"]] = list(self.next_chunks)
         return kw["request_id"]
 
-    def collect_results(self, request_id):
+    async def collect_results(self, request_id, raw_request=None):
         return self._chunks.get(request_id, [])
 
     async def iter_result_chunks(self, request_id):
