@@ -217,6 +217,10 @@ class KVCacheEngine(BaseEngine):
         for node_name, submodule_mgmt in self.submodule_management.items():
             submodule = submodule_mgmt.submodule
 
+            if getattr(submodule, "disable_torch_compile", False):
+                logger.info("KVCacheEngine: torch.compile disabled for %s (submodule opt-out)", node_name)
+                continue
+
             try:
                 submodule.forward = torch.compile(
                     submodule.forward,
@@ -357,7 +361,13 @@ class KVCacheEngine(BaseEngine):
         configs = [
             cfg for cfg in runner.capture_configs \
                 if graph_walk in cfg.replay_graph_walks
+                and getattr(cfg, "caps_eager_batch_size", True)
         ]
+        # Configs that opt out of capping (caps_eager_batch_size=False) capture a
+        # graph only for an acceleration subset of batch sizes; the eager batched
+        # path handles larger batches and the runner gates graph replay by exact
+        # batch size. With no capping config left for this walk, honor the
+        # submodule's max_batch_size instead of the captured-size ceiling.
         if not configs:
             return submod_max_bs
         max_cuda_graph_bs = max([

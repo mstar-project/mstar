@@ -523,6 +523,12 @@ class StatelessEngine(BaseEngine):
                 self._install_piecewise_runner(node_name, submodule)
 
     def _apply_torch_compile(self, node_name: str, submodule: NodeSubmodule) -> None:
+        if getattr(submodule, "disable_torch_compile", False):
+            logger.info(
+                "StatelessEngine[%s]: torch.compile disabled for %s (submodule opt-out)",
+                self.config.name, node_name,
+            )
+            return
         try:
             if hasattr(submodule, "forward"):
                 submodule.forward = torch.compile(

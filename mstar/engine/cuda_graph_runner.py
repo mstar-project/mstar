@@ -548,7 +548,11 @@ class CudaGraphRunner:
                 spec = prepare_slot(slot_idx)
                 dummy_rids_to_free.append(spec.dummy_rids)
 
-                forward = submodule.forward_batched
+                # Usually ``forward_batched`` (the same method the eager batched
+                # path runs). Diffusion walks override this to a velocity-only
+                # method so the non-capturable scheduler tail stays out of the
+                # graph (run later in ``postprocess_captured``).
+                forward = getattr(submodule, config.capture_forward_method)
                 if config.compile:
                     forward = torch.compile(
                         forward,
@@ -780,23 +784,32 @@ class CudaGraphRunner:
     ) -> CudaGraphKey | None:
         if not self.graphs:
             return None
-        config = self._config_for(graph_walk, requires_cfg)
-        if config is None:
-            return None
-        padded_bs = self._get_padded_batch_size(batch_size, config)
-        if padded_bs is None:
-            return None
-        padded_num_tokens = self._get_padded_num_tokens(num_tokens, padded_bs, config)
-        if padded_num_tokens is None:
-            return None
-
-        key = CudaGraphKey(
-            graph_walk=graph_walk,
-            requires_cfg=requires_cfg,
-            bs=padded_bs,
-            num_tokens=padded_num_tokens,
-        )
-        return key if key in self.graphs else None
+        # A walk may have several captures (e.g. one per image resolution, each a
+        # fixed shape with its own token count). Consider every matching config and
+        # pick the tightest captured (bs, num_tokens) bucket that fits this batch,
+        # so a request lands on the graph for its own shape rather than the first
+        # config declared. With a single config this is the same as before.
+        best: CudaGraphKey | None = None
+        for config in self.capture_configs:
+            if graph_walk not in config.replay_graph_walks or config.requires_cfg != requires_cfg:
+                continue
+            padded_bs = self._get_padded_batch_size(batch_size, config)
+            if padded_bs is None:
+                continue
+            padded_num_tokens = self._get_padded_num_tokens(num_tokens, padded_bs, config)
+            if padded_num_tokens is None:
+                continue
+            key = CudaGraphKey(
+                graph_walk=graph_walk,
+                requires_cfg=requires_cfg,
+                bs=padded_bs,
+                num_tokens=padded_num_tokens,
+            )
+            if key in self.graphs and (
+                best is None or (key.num_tokens, key.bs) < (best.num_tokens, best.bs)
+            ):
+                best = key
+        return best
 
     def _config_for(self, graph_walk: str, requires_cfg: bool) -> CudaGraphConfig | None:
         for cfg in self.capture_configs:
@@ -1380,9 +1393,13 @@ class CudaGraphRunner:
                 range_push("gpu_thread.postprocess", synchronize=False)
             if self.enable_nvtx:
                 range_push("cg.advance_seq_lens", synchronize=False)
-            for label in config_labels:
-                static_cm.set_active_label(label)
-                static_cm.advance_seq_lens()
+            # Frozen-prefix denoise walks re-read a fixed prefix and overwrite the
+            # same tail pages every step, so they opt out of the advance (it would
+            # grow the prefix across steps and corrupt attention).
+            if graph_data.config.advance_seq_lens:
+                for label in config_labels:
+                    static_cm.set_active_label(label)
+                    static_cm.advance_seq_lens()
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -1410,6 +1427,18 @@ class CudaGraphRunner:
             )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
+
+            # Eager tail for walks that captured only a velocity/raw forward and
+            # keep a non-capturable step (e.g. a multistep scheduler) out of the
+            # graph. Runs with REAL request ids, the original ``inputs``, and the
+            # cloned captured outputs, so it can finish each request's step.
+            if hasattr(submodule, "postprocess_captured"):
+                outputs = submodule.postprocess_captured(
+                    request_ids=request_ids,
+                    inputs=inputs,
+                    per_request_info=per_request_info,
+                    outputs=outputs,
+                )
 
             success = True
             return outputs
@@ -1597,9 +1626,13 @@ class CudaGraphRunner:
                 range_push("gpu_thread.postprocess", synchronize=False)
             if self.enable_nvtx:
                 range_push("cg.advance_seq_lens", synchronize=False)
-            for label in config_labels:
-                static_cm.set_active_label(label)
-                static_cm.advance_seq_lens()
+            # Frozen-prefix denoise walks re-read a fixed prefix and overwrite the
+            # same tail pages every step, so they opt out of the advance (it would
+            # grow the prefix across steps and corrupt attention).
+            if graph_data.config.advance_seq_lens:
+                for label in config_labels:
+                    static_cm.set_active_label(label)
+                    static_cm.advance_seq_lens()
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -1620,6 +1653,18 @@ class CudaGraphRunner:
             )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
+
+            # Eager tail for walks that captured only a velocity/raw forward and
+            # keep a non-capturable step (e.g. a multistep scheduler) out of the
+            # graph. Runs with REAL request ids, the original ``inputs``, and the
+            # cloned captured outputs, so it can finish each request's step.
+            if hasattr(submodule, "postprocess_captured"):
+                outputs = submodule.postprocess_captured(
+                    request_ids=request_ids,
+                    inputs=inputs,
+                    per_request_info=per_request_info,
+                    outputs=outputs,
+                )
 
             success = True
             return outputs

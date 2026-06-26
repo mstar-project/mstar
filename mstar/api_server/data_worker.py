@@ -162,6 +162,17 @@ class PreprocessWorker:
         results = []
         while not self.output_queue.empty():
             result: ResultChunk = self.output_queue.get()
+            # A request can be cleaned up (its result already returned) while a
+            # late chunk is still in the queue -- common when several requests
+            # complete in the same step. Mirror new_result_tensors' guard and
+            # drop the straggler rather than KeyError, which would otherwise
+            # abort the whole drain and lose the other requests' chunks.
+            if result.request_id not in self.per_request_reading_tensors:
+                logger.debug(
+                    "Late result chunk for cleaned-up request %s, ignoring",
+                    result.request_id,
+                )
+                continue
             self.per_request_reading_tensors[result.request_id] -= 1
             logger.debug(
                 "Data worker reading queue for request %s decreased to length %d",

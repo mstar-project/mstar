@@ -1,0 +1,17 @@
+model: "cosmos3_super"
+# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
+max_seq_len: 8192
+# Per-rank KV pool. Super is 64 layers (vs Nano's 36) but the KV heads (8) shard
+# across the 4 TP ranks, so per-rank KV stays modest; 1024 pages is ample on the
+# 143 GB H200s.
+kv_cache:
+  max_num_pages: 1024
+# Super (64B) is unviable on one GPU (~128 GB in bf16), so the DiT runs
+# tensor-parallel across 4 ranks. The VAE decoder is small and runs un-sharded
+# on rank 0 (the DiT's final latents are replicated, so it reads them directly).
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1, 2, 3]
+    tp_size: 4
+  - node_names: ["vae_decoder"]
+    ranks: [0]
