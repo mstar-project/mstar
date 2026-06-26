@@ -437,6 +437,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.APIServerMessage.message_type"><code class="docutils literal notranslate"><span class="pre">APIServerMessage.message_type</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.DataWorkerProfile"><code class="docutils literal notranslate"><span class="pre">DataWorkerProfile</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.DataWorkerProfile.inputs"><code class="docutils literal notranslate"><span class="pre">DataWorkerProfile.inputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.DataWorkerProfile.preprocess_finish_time"><code class="docutils literal notranslate"><span class="pre">DataWorkerProfile.preprocess_finish_time</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.DataWorkerProfile.request_id"><code class="docutils literal notranslate"><span class="pre">DataWorkerProfile.request_id</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.PreprocessInput"><code class="docutils literal notranslate"><span class="pre">PreprocessInput</span></code></a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.PreprocessInput.file_paths"><code class="docutils literal notranslate"><span class="pre">PreprocessInput.file_paths</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.PreprocessInput.input_modalities"><code class="docutils literal notranslate"><span class="pre">PreprocessInput.input_modalities</span></code></a></li>
@@ -447,8 +453,13 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete"><code class="docutils literal notranslate"><span class="pre">RequestComplete</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.conductor_finish_time"><code class="docutils literal notranslate"><span class="pre">RequestComplete.conductor_finish_time</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.conductor_ingest_time"><code class="docutils literal notranslate"><span class="pre">RequestComplete.conductor_ingest_time</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.final_outputs"><code class="docutils literal notranslate"><span class="pre">RequestComplete.final_outputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.graph_timings"><code class="docutils literal notranslate"><span class="pre">RequestComplete.graph_timings</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.request_id"><code class="docutils literal notranslate"><span class="pre">RequestComplete.request_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.rx_info"><code class="docutils literal notranslate"><span class="pre">RequestComplete.rx_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.tx_info"><code class="docutils literal notranslate"><span class="pre">RequestComplete.tx_info</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.ResultChunk"><code class="docutils literal notranslate"><span class="pre">ResultChunk</span></code></a><ul class="visible nav section-nav flex-column">
@@ -485,16 +496,19 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.request_types.APIServerMessage" title="mstar.api_server.request_types.APIServerMessage"><code class="xref py py-obj docutils literal notranslate"><span class="pre">APIServerMessage</span></code></a>(message_type[, body])</p></td>
 <td><p>Envelope for messages received by the API server.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.request_types.PreprocessInput" title="mstar.api_server.request_types.PreprocessInput"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PreprocessInput</span></code></a>(request_id, text, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.request_types.DataWorkerProfile" title="mstar.api_server.request_types.DataWorkerProfile"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DataWorkerProfile</span></code></a>(request_id[, ...])</p></td>
+<td><p>Profiling reported by the API-server data worker at preprocess finish: the timestamp at which the request was handed to the conductor and the per-modality sizes of the raw inputs.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.request_types.PreprocessInput" title="mstar.api_server.request_types.PreprocessInput"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PreprocessInput</span></code></a>(request_id, text, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.request_types.RequestComplete" title="mstar.api_server.request_types.RequestComplete"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RequestComplete</span></code></a>(request_id, final_outputs)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.request_types.RequestComplete" title="mstar.api_server.request_types.RequestComplete"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RequestComplete</span></code></a>(request_id, final_outputs, ...)</p></td>
 <td><p>Signals that a request has finished processing.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.request_types.ResultChunk" title="mstar.api_server.request_types.ResultChunk"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ResultChunk</span></code></a>(request_id, modality, data[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.request_types.ResultChunk" title="mstar.api_server.request_types.ResultChunk"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ResultChunk</span></code></a>(request_id, modality, data[, ...])</p></td>
 <td><p>One chunk of generated output for a request.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.request_types.ResultTensors" title="mstar.api_server.request_types.ResultTensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ResultTensors</span></code></a>(request_id, modality, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.request_types.ResultTensors" title="mstar.api_server.request_types.ResultTensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ResultTensors</span></code></a>(request_id, modality, ...)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -521,6 +535,40 @@
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.api_server.request_types.APIServerMessage.message_type">
 <span class="sig-name descname"><span class="pre">message_type</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.api_server.request_types.APIServerMessage.message_type" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.DataWorkerProfile">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.request_types.</span></span><span class="sig-name descname"><span class="pre">DataWorkerProfile</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">preprocess_finish_time</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/request_types.html#DataWorkerProfile"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.request_types.DataWorkerProfile" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Profiling reported by the API-server data worker at preprocess finish:
+the timestamp at which the request was handed to the conductor and the
+per-modality sizes of the raw inputs. (The data worker’s tx/rx are read
+directly from its tensor manager at request completion, not via this.)</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>preprocess_finish_time</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><em>InputInfo</em><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.DataWorkerProfile.inputs">
+<span class="sig-name descname"><span class="pre">inputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><span class="pre">InputInfo</span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.api_server.request_types.DataWorkerProfile.inputs" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.DataWorkerProfile.preprocess_finish_time">
+<span class="sig-name descname"><span class="pre">preprocess_finish_time</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.api_server.request_types.DataWorkerProfile.preprocess_finish_time" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.DataWorkerProfile.request_id">
+<span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.api_server.request_types.DataWorkerProfile.request_id" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -575,7 +623,7 @@
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.api_server.request_types.RequestComplete">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.request_types.</span></span><span class="sig-name descname"><span class="pre">RequestComplete</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">final_outputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/request_types.html#RequestComplete"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.request_types.RequestComplete" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.request_types.</span></span><span class="sig-name descname"><span class="pre">RequestComplete</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">final_outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">conductor_ingest_time</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">conductor_finish_time</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_timings</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rx_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tx_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/request_types.html#RequestComplete"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.request_types.RequestComplete" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Signals that a request has finished processing.</p>
 <dl class="field-list simple">
@@ -583,17 +631,47 @@
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>final_outputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices" title="mstar.graph.loop_indices.NestedLoopIndices"><em>NestedLoopIndices</em></a><em>]</em>)</p></li>
+<li><p><strong>conductor_ingest_time</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>conductor_finish_time</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>graph_timings</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>, </em><em>GraphTiming</em><em>]</em>)</p></li>
+<li><p><strong>rx_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><em>RxInfo</em><em>]</em>)</p></li>
+<li><p><strong>tx_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><em>TxInfo</em><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.RequestComplete.conductor_finish_time">
+<span class="sig-name descname"><span class="pre">conductor_finish_time</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><a class="headerlink" href="#mstar.api_server.request_types.RequestComplete.conductor_finish_time" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.RequestComplete.conductor_ingest_time">
+<span class="sig-name descname"><span class="pre">conductor_ingest_time</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><a class="headerlink" href="#mstar.api_server.request_types.RequestComplete.conductor_ingest_time" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.api_server.request_types.RequestComplete.final_outputs">
 <span class="sig-name descname"><span class="pre">final_outputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices" title="mstar.graph.loop_indices.NestedLoopIndices"><span class="pre">NestedLoopIndices</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.api_server.request_types.RequestComplete.final_outputs" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.RequestComplete.graph_timings">
+<span class="sig-name descname"><span class="pre">graph_timings</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">GraphTiming</span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.api_server.request_types.RequestComplete.graph_timings" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.api_server.request_types.RequestComplete.request_id">
 <span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.api_server.request_types.RequestComplete.request_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.RequestComplete.rx_info">
+<span class="sig-name descname"><span class="pre">rx_info</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><span class="pre">RxInfo</span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.api_server.request_types.RequestComplete.rx_info" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.RequestComplete.tx_info">
+<span class="sig-name descname"><span class="pre">tx_info</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><span class="pre">TxInfo</span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.api_server.request_types.RequestComplete.tx_info" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -731,6 +809,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.APIServerMessage.message_type"><code class="docutils literal notranslate"><span class="pre">APIServerMessage.message_type</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.DataWorkerProfile"><code class="docutils literal notranslate"><span class="pre">DataWorkerProfile</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.DataWorkerProfile.inputs"><code class="docutils literal notranslate"><span class="pre">DataWorkerProfile.inputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.DataWorkerProfile.preprocess_finish_time"><code class="docutils literal notranslate"><span class="pre">DataWorkerProfile.preprocess_finish_time</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.DataWorkerProfile.request_id"><code class="docutils literal notranslate"><span class="pre">DataWorkerProfile.request_id</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.PreprocessInput"><code class="docutils literal notranslate"><span class="pre">PreprocessInput</span></code></a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.PreprocessInput.file_paths"><code class="docutils literal notranslate"><span class="pre">PreprocessInput.file_paths</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.PreprocessInput.input_modalities"><code class="docutils literal notranslate"><span class="pre">PreprocessInput.input_modalities</span></code></a></li>
@@ -741,8 +825,13 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete"><code class="docutils literal notranslate"><span class="pre">RequestComplete</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.conductor_finish_time"><code class="docutils literal notranslate"><span class="pre">RequestComplete.conductor_finish_time</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.conductor_ingest_time"><code class="docutils literal notranslate"><span class="pre">RequestComplete.conductor_ingest_time</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.final_outputs"><code class="docutils literal notranslate"><span class="pre">RequestComplete.final_outputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.graph_timings"><code class="docutils literal notranslate"><span class="pre">RequestComplete.graph_timings</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.request_id"><code class="docutils literal notranslate"><span class="pre">RequestComplete.request_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.rx_info"><code class="docutils literal notranslate"><span class="pre">RequestComplete.rx_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.RequestComplete.tx_info"><code class="docutils literal notranslate"><span class="pre">RequestComplete.tx_info</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.ResultChunk"><code class="docutils literal notranslate"><span class="pre">ResultChunk</span></code></a><ul class="visible nav section-nav flex-column">

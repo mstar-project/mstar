@@ -437,6 +437,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#config-files">Config files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-kwargs">model_kwargs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-profiling">Request profiling</a></li>
 </ul>
             </nav>
         </div>
@@ -515,6 +516,16 @@ cache), and then delegates to it.</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">INFO</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">DEBUG</span></code> / <code class="docutils literal notranslate"><span class="pre">INFO</span></code> / <code class="docutils literal notranslate"><span class="pre">WARNING</span></code> / <code class="docutils literal notranslate"><span class="pre">ERROR</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats</span></code></p></td>
+<td><p>off</p></td>
+<td><p>Print a per-request profile when each request finishes (see
+<a class="reference internal" href="#request-profiling"><span class="std std-ref">Request profiling</span></a>).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats-file</span></code></p></td>
+<td><p>stdout</p></td>
+<td><p>Append the per-request profiles to this file instead of stdout
+(implies <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>).</p></td>
 </tr>
 </tbody>
 </table>
@@ -623,6 +634,16 @@ cache), and then delegates to it.</p>
 <td><p>off</p></td>
 <td><p>Emit NVTX markers for profiling.</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats</span></code></p></td>
+<td><p>off</p></td>
+<td><p>Print a per-request profile when each request finishes (see
+<a class="reference internal" href="#request-profiling"><span class="std std-ref">Request profiling</span></a>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats-file</span></code></p></td>
+<td><p>stdout</p></td>
+<td><p>Append the per-request profiles to this file instead of stdout
+(implies <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>).</p></td>
+</tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">INFO</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">DEBUG</span></code> / <code class="docutils literal notranslate"><span class="pre">INFO</span></code> / <code class="docutils literal notranslate"><span class="pre">WARNING</span></code> / <code class="docutils literal notranslate"><span class="pre">ERROR</span></code>.</p></td>
@@ -721,7 +742,7 @@ Pi0.5 DROID variant fixes the action horizon:</p>
 client instead — see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>.</p>
 </section>
 <section id="tensor-transport">
-<h2>Tensor transport<a class="headerlink" href="#tensor-transport" title="Link to this heading">#</a></h2>
+<span id="id2"></span><h2>Tensor transport<a class="headerlink" href="#tensor-transport" title="Link to this heading">#</a></h2>
 <p>Workers route tensors directly to one another using one of three transports, selected with
 <code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span></code>:</p>
 <ul class="simple">
@@ -730,6 +751,90 @@ client instead — see <a class="reference internal" href="clients.html"><span c
 <li><p><code class="docutils literal notranslate"><span class="pre">RDMA</span></code> — lowest latency for multi-GPU / multi-node, via the Mooncake transfer engine
 (requires RDMA-capable networking).</p></li>
 </ul>
+</section>
+<section id="request-profiling">
+<span id="id3"></span><h2>Request profiling<a class="headerlink" href="#request-profiling" title="Link to this heading">#</a></h2>
+<p>Pass <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code> (to either <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> or <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>) to print a per-request
+profile when each request finishes. Add <code class="docutils literal notranslate"><span class="pre">--log-stats-file</span> <span class="pre">&lt;path&gt;</span></code> to append the profiles
+to a file instead of stdout (it implies <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mstar<span class="w"> </span>serve<span class="w"> </span>bagel<span class="w"> </span>--log-stats
+mstar-serve<span class="w"> </span>--config<span class="w"> </span>configs/orpheus_colocated.yaml<span class="w"> </span>--log-stats-file<span class="w"> </span>stats.txt
+</pre></div>
+</div>
+<p>The report has four sections (any that has no data is omitted):</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>============================================================
+ Request profile: 3f9c1e2a-…
+============================================================
+ Inputs:
+   text         x1           72 B
+   image        x1        1.1 MiB
+ Outputs:
+   image        x1        1.1 MiB
+------------------------------------------------------------
+ Timeline:
+   recv → preprocess done                       62.6 ms
+   preprocess done → conductor ingest            2.3 ms
+   conductor ingest → first chunk              133.7 ms
+   first chunk → last chunk                    683.3 ms
+   last chunk → conductor done                   1.5 ms
+   conductor done → finish                       3.1 ms
+   total                                       886.5 ms
+------------------------------------------------------------
+ Graph timings (CPU, ms) — total over request (avg per exec):
+                                 all                 fwd                 pre               post*
+   LLM
+     decode     n=588      3277.9 (   5.57)    2858.0 (   4.86)     243.0 (   0.41)     176.9 (   0.30)
+     prefill    n=1          8.78 (   8.78)      4.24 (   4.24)      3.47 (   3.47)      1.06 (   1.06)
+   * post overlaps the next step / another in-flight batch under
+     speculative scheduling, so it is not necessarily additive.
+------------------------------------------------------------
+ Tensor transfer   size / transport-time / count:
+   rx (received over the wire), by source → dest:
+     worker_0 → worker_1
+       hidden                  106.7 MiB      78.7 ms  (x49)
+   tx (registered/written for send), by source:
+     worker_0
+       hidden                  106.7 MiB       0.90 ms  (x49)
+============================================================
+</pre></div>
+</div>
+<p><strong>Inputs / Outputs</strong> — per-modality count and byte size. Inputs are the <em>raw</em>
+client-supplied bytes (uploaded file sizes on disk, UTF-8 length of the prompt), not the
+much larger decoded tensors, so they line up with what was sent over the wire.</p>
+<p><strong>Timeline</strong> — wall-clock stage boundaries for the request as it flows
+<code class="docutils literal notranslate"><span class="pre">api</span> <span class="pre">server</span> <span class="pre">→</span> <span class="pre">conductor</span> <span class="pre">→</span> <span class="pre">workers</span> <span class="pre">→</span> <span class="pre">api</span> <span class="pre">server</span></code>. Stages are ordered by their actual
+timestamp, so a stage is never negative even when two checkpoints race (e.g. the API
+server’s <code class="docutils literal notranslate"><span class="pre">last</span> <span class="pre">chunk</span></code> and the conductor’s <code class="docutils literal notranslate"><span class="pre">done</span></code> can arrive in either order). All
+timestamps are <code class="docutils literal notranslate"><span class="pre">time.perf_counter()</span></code>; they are comparable across the api-server,
+conductor, and worker processes because those run on the <strong>same host</strong> (<code class="docutils literal notranslate"><span class="pre">perf_counter</span></code> is
+<code class="docutils literal notranslate"><span class="pre">CLOCK_MONOTONIC</span></code>, which is boot-relative and shared).
+This implementation will be updated when multi-node support is added.</p>
+<p><strong>Graph timings</strong> — CPU time per <code class="docutils literal notranslate"><span class="pre">(node,</span> <span class="pre">graph_walk)</span></code>, accumulated over the request.
+Each cell shows the <strong>total over the request</strong> and, in parentheses, the <strong>average per
+execution</strong> (<code class="docutils literal notranslate"><span class="pre">n</span></code> is the execution count, so e.g. one entry covers all <code class="docutils literal notranslate"><span class="pre">588</span></code> decode
+steps). The columns:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">all</span></code> — the full node execution (= <code class="docutils literal notranslate"><span class="pre">pre</span></code> + <code class="docutils literal notranslate"><span class="pre">fwd</span></code> + <code class="docutils literal notranslate"><span class="pre">post</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fwd</span></code> — the GPU forward region. Because execution is asynchronous and <em>not</em> synced
+(a sync would serialize the pipeline), this measures the CPU launch/enqueue span of the
+whole batch, not per-request GPU time.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">pre</span></code> — input preparation / preprocessing before the launch.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">post</span></code> — CPU postprocess after the forward. Marked <code class="docutils literal notranslate"><span class="pre">post*</span></code> because under
+speculative scheduling it can overlap the next step’s forward or another in-flight
+batch, so it is <strong>not necessarily additive</strong>.</p></li>
+</ul>
+<p><strong>Tensor transfer</strong> — bytes moved between entities via the tensor transport
+(<a class="reference internal" href="#tensor-transport"><span class="std std-ref">above</span></a>). <code class="docutils literal notranslate"><span class="pre">rx</span></code> (received) is grouped by <code class="docutils literal notranslate"><span class="pre">source</span> <span class="pre">→</span> <span class="pre">dest</span></code>; <code class="docutils literal notranslate"><span class="pre">tx</span></code>
+(sent) is grouped by source only — the sender registers/writes data without knowing a
+priori which worker will read it (and may register data that is never sent), so there is no
+per-destination breakdown. <code class="docutils literal notranslate"><span class="pre">size</span></code> is total bytes, the time is transport cost (the
+RDMA-read or SHM file-read time on <code class="docutils literal notranslate"><span class="pre">rx</span></code>; the registration / serialize-and-write time on
+<code class="docutils literal notranslate"><span class="pre">tx</span></code>), and <code class="docutils literal notranslate"><span class="pre">count</span></code> is the number of tensors.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Profiling is gated end-to-end on <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>: when it is off, the workers,
+conductor, and data worker skip the timing/transfer bookkeeping entirely.</p>
+</div>
 </section>
 </section>
 
@@ -785,6 +890,7 @@ client instead — see <a class="reference internal" href="clients.html"><span c
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#config-files">Config files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-kwargs">model_kwargs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-profiling">Request profiling</a></li>
 </ul>
   </nav></div>
 

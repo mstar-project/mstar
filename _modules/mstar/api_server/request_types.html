@@ -809,6 +809,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.loop_indices</span><span class="w"> </span><span class="kn">import</span> <span class="n">NestedLoopIndices</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.format</span><span class="w"> </span><span class="kn">import</span> <span class="n">InputInfo</span><span class="p">,</span> <span class="n">RxInfo</span><span class="p">,</span> <span class="n">TxInfo</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphTimings</span>
 
 
 <div class="viewcode-block" id="ResultChunk">
@@ -844,7 +846,12 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Maps output signal name to its final forward pass number.</span>
     <span class="c1"># The API server waits until all entries are received before</span>
     <span class="c1"># completing the request.</span>
-    <span class="n">final_outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NestedLoopIndices</span><span class="p">]</span></div>
+    <span class="n">final_outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NestedLoopIndices</span><span class="p">]</span>
+    <span class="n">conductor_ingest_time</span><span class="p">:</span> <span class="nb">float</span>
+    <span class="n">conductor_finish_time</span><span class="p">:</span> <span class="nb">float</span>
+    <span class="n">graph_timings</span><span class="p">:</span> <span class="n">GraphTimings</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="n">rx_info</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">RxInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">tx_info</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TxInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
 
 
 
@@ -855,6 +862,20 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Envelope for messages received by the API server.&quot;&quot;&quot;</span>
     <span class="n">message_type</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># &quot;result_tensors&quot; | &quot;request_complete&quot; | &quot;setup_done&quot;</span>
     <span class="n">body</span><span class="p">:</span> <span class="n">ResultTensors</span> <span class="o">|</span> <span class="n">RequestComplete</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># None for setup_done message</span></div>
+
+
+
+<div class="viewcode-block" id="DataWorkerProfile">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.DataWorkerProfile">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">DataWorkerProfile</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Profiling reported by the API-server data worker at preprocess finish:</span>
+<span class="sd">    the timestamp at which the request was handed to the conductor and the</span>
+<span class="sd">    per-modality sizes of the raw inputs. (The data worker&#39;s tx/rx are read</span>
+<span class="sd">    directly from its tensor manager at request completion, not via this.)&quot;&quot;&quot;</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">preprocess_finish_time</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># time.perf_counter</span>
+    <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">InputInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
 
 
 

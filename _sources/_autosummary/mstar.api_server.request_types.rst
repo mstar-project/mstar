@@ -18,6 +18,7 @@ mstar.api\_server.request\_types
    .. autosummary::
    
       APIServerMessage
+      DataWorkerProfile
       PreprocessInput
       RequestComplete
       ResultChunk

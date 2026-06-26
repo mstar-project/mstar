@@ -56,6 +56,14 @@ mstar serve
    * - ``--log-level``
      - ``INFO``
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.
+   * - ``--log-stats``
+     - off
+     - Print a per-request profile when each request finishes (see
+       :ref:`request-profiling`).
+   * - ``--log-stats-file``
+     - stdout
+     - Append the per-request profiles to this file instead of stdout
+       (implies ``--log-stats``).
 
 Each model maps to a default config (override with ``--config``):
 
@@ -132,6 +140,14 @@ mstar-serve
    * - ``--enable-nvtx``
      - off
      - Emit NVTX markers for profiling.
+   * - ``--log-stats``
+     - off
+     - Print a per-request profile when each request finishes (see
+       :ref:`request-profiling`).
+   * - ``--log-stats-file``
+     - stdout
+     - Append the per-request profiles to this file instead of stdout
+       (implies ``--log-stats``).
    * - ``--log-level``
      - ``INFO``
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.
@@ -227,6 +243,8 @@ Pi0.5 DROID variant fixes the action horizon:
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`.
 
+.. _tensor-transport:
+
 Tensor transport
 ----------------
 
@@ -237,3 +255,96 @@ Workers route tensors directly to one another using one of three transports, sel
 - ``TCP`` — works anywhere; used for some multi-node setups.
 - ``RDMA`` — lowest latency for multi-GPU / multi-node, via the Mooncake transfer engine
   (requires RDMA-capable networking).
+
+.. _request-profiling:
+
+Request profiling
+-----------------
+
+Pass ``--log-stats`` (to either ``mstar serve`` or ``mstar-serve``) to print a per-request
+profile when each request finishes. Add ``--log-stats-file <path>`` to append the profiles
+to a file instead of stdout (it implies ``--log-stats``):
+
+.. code-block:: bash
+
+   mstar serve bagel --log-stats
+   mstar-serve --config configs/orpheus_colocated.yaml --log-stats-file stats.txt
+
+The report has four sections (any that has no data is omitted):
+
+.. code-block:: text
+
+   ============================================================
+    Request profile: 3f9c1e2a-…
+   ============================================================
+    Inputs:
+      text         x1           72 B
+      image        x1        1.1 MiB
+    Outputs:
+      image        x1        1.1 MiB
+   ------------------------------------------------------------
+    Timeline:
+      recv → preprocess done                       62.6 ms
+      preprocess done → conductor ingest            2.3 ms
+      conductor ingest → first chunk              133.7 ms
+      first chunk → last chunk                    683.3 ms
+      last chunk → conductor done                   1.5 ms
+      conductor done → finish                       3.1 ms
+      total                                       886.5 ms
+   ------------------------------------------------------------
+    Graph timings (CPU, ms) — total over request (avg per exec):
+                                    all                 fwd                 pre               post*
+      LLM
+        decode     n=588      3277.9 (   5.57)    2858.0 (   4.86)     243.0 (   0.41)     176.9 (   0.30)
+        prefill    n=1          8.78 (   8.78)      4.24 (   4.24)      3.47 (   3.47)      1.06 (   1.06)
+      * post overlaps the next step / another in-flight batch under
+        speculative scheduling, so it is not necessarily additive.
+   ------------------------------------------------------------
+    Tensor transfer   size / transport-time / count:
+      rx (received over the wire), by source → dest:
+        worker_0 → worker_1
+          hidden                  106.7 MiB      78.7 ms  (x49)
+      tx (registered/written for send), by source:
+        worker_0
+          hidden                  106.7 MiB       0.90 ms  (x49)
+   ============================================================
+
+**Inputs / Outputs** — per-modality count and byte size. Inputs are the *raw*
+client-supplied bytes (uploaded file sizes on disk, UTF-8 length of the prompt), not the
+much larger decoded tensors, so they line up with what was sent over the wire.
+
+**Timeline** — wall-clock stage boundaries for the request as it flows
+``api server → conductor → workers → api server``. Stages are ordered by their actual
+timestamp, so a stage is never negative even when two checkpoints race (e.g. the API
+server's ``last chunk`` and the conductor's ``done`` can arrive in either order). All
+timestamps are ``time.perf_counter()``; they are comparable across the api-server,
+conductor, and worker processes because those run on the **same host** (``perf_counter`` is
+``CLOCK_MONOTONIC``, which is boot-relative and shared).
+This implementation will be updated when multi-node support is added.
+
+**Graph timings** — CPU time per ``(node, graph_walk)``, accumulated over the request.
+Each cell shows the **total over the request** and, in parentheses, the **average per
+execution** (``n`` is the execution count, so e.g. one entry covers all ``588`` decode
+steps). The columns:
+
+- ``all`` — the full node execution (= ``pre`` + ``fwd`` + ``post``).
+- ``fwd`` — the GPU forward region. Because execution is asynchronous and *not* synced
+  (a sync would serialize the pipeline), this measures the CPU launch/enqueue span of the
+  whole batch, not per-request GPU time.
+- ``pre`` — input preparation / preprocessing before the launch.
+- ``post`` — CPU postprocess after the forward. Marked ``post*`` because under
+  speculative scheduling it can overlap the next step's forward or another in-flight
+  batch, so it is **not necessarily additive**.
+
+**Tensor transfer** — bytes moved between entities via the tensor transport
+(:ref:`above <tensor-transport>`). ``rx`` (received) is grouped by ``source → dest``; ``tx``
+(sent) is grouped by source only — the sender registers/writes data without knowing a
+priori which worker will read it (and may register data that is never sent), so there is no
+per-destination breakdown. ``size`` is total bytes, the time is transport cost (the
+RDMA-read or SHM file-read time on ``rx``; the registration / serialize-and-write time on
+``tx``), and ``count`` is the number of tensors.
+
+.. note::
+
+   Profiling is gated end-to-end on ``--log-stats``: when it is off, the workers,
+   conductor, and data worker skip the timing/transfer bookkeeping entirely.
