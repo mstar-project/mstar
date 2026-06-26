@@ -1,0 +1,11 @@
+A virus and a bacterium are two different types of microorganisms that can cause illness in humans, animals, and plants. Here are some key differences between them:
+
+1. Size: Viruses are much smaller than bacteria. A typical virus is about 20-300 nanometers in size, while a typical bacterium is about 1-5 micrometers in size.
+
+2. Structure: Viruses are not considered living organisms because they cannot reproduce or carry out metabolic processes on their own. They consist of genetic material (DNA or RNA) surrounded by a protein coat. Bacteria, on the other hand, are single-celled organisms with a cell wall, cell membrane, and cytoplasm.
+
+3. Reproduction: Viruses need to infect a host cell to reproduce. Once inside the host cell, they take over the cell's machinery to make more copies of themselves. Bacteria, on the other hand, can reproduce on their own through binary fission.
+
+4. Treatment: Antibiotics are effective against bacterial infections but not viral infections. Antiviral medications can be used to treat some viral infections, but there are no specific antiviral medications for all viruses.
+
+5. Examples: Some common examples of viruses include influenza, HIV,

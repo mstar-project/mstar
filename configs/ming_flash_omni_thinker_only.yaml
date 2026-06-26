@@ -1,0 +1,21 @@
+# Ming-flash-omni-2.0 — thinker-only deploy (text out, no talker).
+#
+# TP=8 across 8 H100s. Per-rank shard_inter = 1024/8 = 128;
+# experts.gate_up_proj is (256, 2*128, 4096) per rank, ~33 GB across
+# 31 MoE layers. With embed + lm_head + attention + dense layer 0 +
+# KV cache, ~40 GB per rank fits the 80 GB H100s comfortably.
+#
+# TP=4 OOMs at ~78.5 / 80 GB per rank even with
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (re-verified
+# 2026-06-08; loader streaming overhead pushes past the 80 GB limit).
+# TP=8 halves the model footprint with plenty of headroom.
+#
+# Audio / vision / talker / image-gen are step 4+; this config is for
+# text-only T2T benchmarking and the first mstar-served Ming forward.
+
+model: "ming_flash_omni"
+max_seq_len: 32768
+node_groups:
+  - node_names: [Thinker]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8

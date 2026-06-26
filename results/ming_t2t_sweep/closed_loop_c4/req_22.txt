@@ -1,0 +1,7 @@
+GPS, or Global Positioning System, is a satellite-based navigation system that provides location and time information anywhere on or near the Earth. It works by using a network of satellites orbiting the Earth to transmit signals to GPS receivers on the ground. Here's a simplified explanation of how it works:
+
+1. **Satellite Network**: The GPS system consists of at least 24 satellites in orbit around the Earth. These satellites are evenly distributed in six orbital planes, each inclined at 55 degrees to the equator. They orbit the Earth at an altitude of about 20,200 kilometers (12,550 miles) and complete two orbits every day.
+
+2. **Signal Transmission**: Each satellite continuously transmits a signal that includes its position and the exact time the signal was sent. This signal travels at the speed of light and is received by GPS receivers on the ground.
+
+3. **Time Difference**: The GPS receiver calculates the distance to each satellite by measuring the time it takes for the signal to travel from the satellite to the receiver. Since the signal travels at the speed of light, the time difference can be converted into a distance. However, because the receiver's clock is not perfectly synchronized with the atomic clocks on the

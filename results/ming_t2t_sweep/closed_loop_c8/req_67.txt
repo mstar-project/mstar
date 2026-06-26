@@ -1,0 +1,7 @@
+A REST API (Representational State Transfer Application Programming Interface) is a set of rules and protocols for building and interacting with web services. It is an architectural style that uses HTTP requests to access and manipulate resources, which are identified by URIs (Uniform Resource Identifiers).
+
+REST APIs are designed to be stateless, meaning that each request from a client to the server must contain all the information necessary to understand and process the request. This makes REST APIs highly scalable and easy to cache, as well as allowing them to handle a large number of concurrent requests.
+
+REST APIs typically use standard HTTP methods such as GET, POST, PUT, DELETE, and PATCH to perform operations on resources. For example, a GET request might be used to retrieve a list of items, while a POST request might be used to create a new item.
+
+REST APIs are widely used in modern web development, as they provide a simple and flexible way to build and consume web services. They are often used in conjunction with JSON (JavaScript Object Notation) or XML (eXtensible Markup Language) data formats, which allow for easy parsing and manipulation of data.

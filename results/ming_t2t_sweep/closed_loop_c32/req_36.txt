@@ -1,0 +1,3 @@
+Recursion is a programming technique where a function calls itself in order to solve a problem. It's like a loop, but instead of using a loop construct like "for" or "while", the function repeats itself by calling itself with different arguments until it reaches a base case that stops the recursion.
+
+Here's a simple example to illustrate recursion: calculating the factorial of a number. The factorial of a number n (denoted as n

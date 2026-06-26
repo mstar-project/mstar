@@ -1,0 +1,18 @@
+Compound interest is a type of interest that is calculated on both the principal amount and any accumulated interest. This means that the interest earned in one period is added to the principal, and then the interest for the next period is calculated on this new, larger principal. This process continues over time, leading to exponential growth of the investment or debt.
+
+The formula for calculating compound interest is:
+
+A = P(1 + r/n)^(nt)
+
+Where:
+- A is the amount of money accumulated after n years, including interest.
+- P is the principal amount (the initial amount of money).
+- r is the annual interest rate (decimal).
+- n is the number of times that interest is compounded per year.
+- t is the time the money is invested or borrowed for, in years.
+
+For example, if you invest $1,000 at an annual interest rate of 5% compounded annually for 10 years, the amount of money accumulated would be:
+
+A = 1000(1 + 0.05/1)^(1*10) = $1,628.89
+
+This means that the initial $1,00

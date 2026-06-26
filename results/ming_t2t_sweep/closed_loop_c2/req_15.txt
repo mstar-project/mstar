@@ -1,0 +1,5 @@
+The time complexity of quicksort can vary depending on the specific implementation and the input data. However, in general, the average-case time complexity of quicksort is O(n log n), where n is the number of elements in the array being sorted. This is because quicksort uses a divide-and-conquer approach, where the array is recursively divided into smaller sub-arrays until each sub-array contains only one element, which is then merged back together in sorted order.
+
+In the worst-case scenario, where the pivot chosen for each partition is the smallest or largest element in the sub-array, the time complexity of quicksort can degrade to O(n^2). However, this can be mitigated by using techniques such as randomization or choosing the median of three elements as the pivot.
+
+Overall, quicksort is considered to be one of the most efficient sorting algorithms for large datasets, due to its average-case time complexity of O(n log n) and its ability to sort in-place without requiring additional memory.

@@ -1,0 +1,11 @@
+=== vllm-omni BAGEL T2I (10 requests) ===
+Request 1: 20712 ms
+Request 2: 20586 ms
+Request 3: 20568 ms
+Request 4: 20556 ms
+Request 5: 20478 ms
+Request 6: 20484 ms
+Request 7: 20559 ms
+Request 8: 20541 ms
+Request 9: 20447 ms
+Request 10: 20587 ms

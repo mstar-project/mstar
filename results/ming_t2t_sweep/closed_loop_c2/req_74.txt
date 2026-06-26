@@ -1,0 +1,5 @@
+A search engine indexes the web by using automated programs called "spiders" or "crawlers" to scan and analyze web pages. These programs follow links from one page to another, collecting information about the content of each page they visit. The information collected includes the text on the page, the page's title, meta tags, headings, and other important elements.
+
+The search engine then stores this information in a massive database, which is used to generate search results when a user enters a query. The search engine uses complex algorithms to determine the relevance and importance of each page in relation to the user's query, and ranks the results accordingly.
+
+To ensure that the search engine has the most up-to-date information, it will periodically revisit and re-index web pages to account for any changes or updates that have been made. This process is known as "re-crawling" and helps to ensure that the search engine's results are as accurate and relevant as possible.

@@ -1,0 +1,9 @@
+TCP (Transmission Control Protocol) and UDP (User Datagram Protocol) are both protocols used for transmitting data over the internet, but they have some key differences:
+
+1. **Reliability**:
+   - **TCP** is a connection-oriented protocol, which means it establishes a connection between the sender and receiver before data transmission. It ensures that all data packets are delivered in the correct order and without errors. If any packet is lost or corrupted during transmission, TCP will retransmit it. This makes TCP reliable for applications where data integrity is crucial, such as web browsing, email, and file transfers.
+   - **UDP** is a connectionless protocol, which means it does not establish a connection before sending data. It sends data packets independently without waiting for an acknowledgment from the receiver. This makes UDP faster but less reliable than TCP. UDP is suitable for applications where speed is more important than reliability, such as streaming audio or video, online gaming, and real-time communication.
+
+2. **Flow Control and Congestion Control**:
+   - **TCP** includes mechanisms for flow control and congestion control to prevent overwhelming the network or the receiver. It adjusts the rate of data transmission based on the network conditions and the receiver's capacity.
+   - **

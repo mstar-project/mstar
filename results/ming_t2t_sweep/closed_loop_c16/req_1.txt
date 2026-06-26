@@ -1,0 +1,5 @@
+Machine learning is a subset of artificial intelligence that involves training algorithms to make predictions or decisions based on data. It uses statistical techniques to enable machines to improve with experience. Machine learning algorithms can be supervised, unsupervised, or semi-supervised, and they can be used for tasks such as classification, regression, clustering, and dimensionality reduction.
+
+Deep learning, on the other hand, is a subset of machine learning that uses neural networks with multiple layers to learn and extract features from data. Deep learning algorithms are designed to mimic the structure and function of the human brain, with layers of interconnected nodes that process information in a hierarchical manner. Deep learning is particularly effective for tasks such as image and speech recognition, natural language processing, and game playing.
+
+In summary, deep learning is a type of machine learning that uses neural networks with multiple layers to learn and extract features from data, while machine learning encompasses a broader range of techniques for training algorithms to make predictions or decisions based on data.
