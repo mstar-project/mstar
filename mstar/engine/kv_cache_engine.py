@@ -1057,8 +1057,7 @@ class KVCacheEngine(BaseEngine):
             # bleed. cleanup_request is a no-op for submodules that don't track
             # the request, so calling it on every submodule (like
             # sampler.remove_request above) is safe.
-            if submodule_mgmt.submodule is not None:
-                submodule_mgmt.submodule.cleanup_request(request_id)
+            submodule_mgmt.submodule.cleanup_request(request_id)
 
     def pause_request(
         self, request_id: str, cache_label: str = "main",

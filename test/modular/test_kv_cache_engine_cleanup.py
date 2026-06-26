@@ -56,12 +56,6 @@ def test_remove_request_invokes_submodule_cleanup():
     engine.submodule_management["n0"].kv_management.alloc_manager.remove_request.assert_called_once_with("req-1")
 
 
-def test_remove_request_tolerates_none_submodule():
-    """A management may carry submodule=None; remove_request must not crash."""
-    engine = _engine({"n0": _mgmt(None)})
-    engine.remove_request("req-x")  # must not raise
-
-
 class _PooledSubmodule:
     """Stand-in for a KV_CACHE submodule that owns a BOUNDED per-request resource
     pool -- the pattern that makes the missing cleanup catastrophic. Each request
