@@ -1047,6 +1047,17 @@ class KVCacheEngine(BaseEngine):
             submodule_mgmt.sampler.remove_request(request_id)
             if submodule_mgmt.cuda_graph_runner is not None:
                 submodule_mgmt.cuda_graph_runner.unregister_request(request_id)
+            # Release the submodule's OWN per-request state. StatelessEngine.
+            # remove_request already invokes this hook; KVCacheEngine omitted it,
+            # so any KV_CACHE submodule that tracks per-request state in
+            # cleanup_request leaked it: per-request bookkeeping sets/dicts grew
+            # without bound, and a submodule managing a bounded resource pool
+            # (a fixed set of decode slots) drained the pool and then silently
+            # reused one slot across concurrent requests -> per-request state
+            # bleed. cleanup_request is a no-op for submodules that don't track
+            # the request, so calling it on every submodule (like
+            # sampler.remove_request above) is safe.
+            submodule_mgmt.submodule.cleanup_request(request_id)
 
     def pause_request(
         self, request_id: str, cache_label: str = "main",
