@@ -1376,6 +1376,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         super().__init__()
         self.vae = vae
         self.config = config
+        self._decode_dtype_cached = None
         # The Wan VAE decode is 3D-conv bound and is not captured into a CUDA
         # graph (it runs once per request at request-specific frame/resolution
         # shapes). torch.compile fuses the pointwise epilogues around those convs;
@@ -1384,10 +1385,10 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # kernels at the cost of a one-time trace per new (frames, height, width)
         # — fine for the few fixed generation tiers (the first request at each
         # shape pays the trace). On by default — it cuts the 189-frame video VAE
-        # decode ~30% (a large share of video latency) and is neutral for the
+        # decode ~20-30% (a large share of video latency) and is neutral for the
         # tiny single-frame image decode; set COSMOS3_COMPILE_VAE=0 to disable
         # (A/B against the eager decode, which is identical bar fp rounding). The
-        # compile wraps the same bf16, autocast-off decode below.
+        # compile wraps the autocast-off decode below.
         self._decode = vae.decode if vae is not None else None
         if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
             "0", "false", "no", "off",
@@ -1398,9 +1399,61 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
 
+    def _decode_dtype(self):
+        # Which dtype the Wan-VAE 3D-conv decode runs fastest in is a property of
+        # the cuDNN build, not of a version string: cuDNN 9.10 (the cu12.8 wheel)
+        # has no fast bf16/fp16 conv3d for these shapes and falls to a slow path
+        # (a 256p-video decode is ~10s in bf16 vs ~1s in fp32/TF32), while cuDNN
+        # 9.19 (cu13) decodes bf16 fast. cuDNN versions don't track the CUDA
+        # toolkit version 1:1, so probe the actual machine once and cache the
+        # faster dtype rather than guessing. COSMOS3_VAE_DECODE_FP32 forces it.
+        if self._decode_dtype_cached is not None:
+            return self._decode_dtype_cached
+        override = os.environ.get("COSMOS3_VAE_DECODE_FP32")
+        if override is not None:
+            on = override.lower() not in ("0", "false", "no", "off")
+            self._decode_dtype_cached = torch.float32 if on else torch.bfloat16
+        else:
+            self._decode_dtype_cached = self._probe_decode_dtype()
+        logger.info("Cosmos3 VAE decode dtype = %s", self._decode_dtype_cached)
+        return self._decode_dtype_cached
+
+    def _probe_decode_dtype(self):
+        # Time one small decode per dtype the way the served decode runs (eager,
+        # autocast off) and keep the faster. fp32 here uses TF32 tensor cores
+        # (allow_tf32 default on) — the fast conv path on cuDNN 9.10; true fp32 is
+        # as slow as bf16, so this measures the path that actually ships.
+        vae = self.vae
+        if vae is None:
+            return torch.bfloat16
+        device = next(vae.parameters()).device
+        c = int(getattr(vae.config, "z_dim", 48))
+        # Small: the dtype gap is decided by conv-kernel availability, not size
+        # (it shows ~16x even at one frame), and a slow-path bf16 probe must stay
+        # cheap since it runs once at the first decode.
+        probe = torch.randn(1, c, 3, 16, 16, device=device)
+        best, best_ms = torch.bfloat16, float("inf")
+        for dt in (torch.float32, torch.bfloat16):
+            try:
+                vae.to(dt)
+                z = probe.to(dt)
+                e0 = torch.cuda.Event(enable_timing=True); e1 = torch.cuda.Event(enable_timing=True)
+                with torch.no_grad(), torch.autocast(device_type="cuda", enabled=False):
+                    vae.decode(z)
+                    torch.cuda.synchronize(); e0.record()
+                    vae.decode(z); vae.decode(z)
+                    e1.record(); torch.cuda.synchronize()
+                ms = e0.elapsed_time(e1) / 2
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Cosmos3 VAE decode probe failed for %s: %s", dt, e)
+                ms = float("inf")
+            if ms < best_ms:
+                best_ms, best = ms, dt
+        return best
+
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
         vae = self.vae
-        vae_dtype = torch.bfloat16
+        vae_dtype = self._decode_dtype()
         if next(vae.parameters()).dtype != vae_dtype:
             vae = vae.to(vae_dtype)
         mean = torch.tensor(vae.config.latents_mean, dtype=vae_dtype, device=latents.device).view(1, -1, 1, 1, 1)
@@ -1412,7 +1465,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         if _prof:
             _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
             _e0.record()
-        decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
+        with torch.autocast(device_type="cuda", enabled=False):
+            decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
         if _prof:
             _e1.record(); torch.cuda.synchronize()
             logger.info("COSMOS3_PROFILE vae_decode %.1f ms out=%s", _e0.elapsed_time(_e1), tuple(decoded.shape))
