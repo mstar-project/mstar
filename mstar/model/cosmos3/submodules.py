@@ -221,10 +221,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         static["mse_gen_indexes"] = static["vision_mse_loss_indexes"] - static["und_len"]
         return static
 
-    def _new_scheduler(self, num_inference_steps: int, device, use_karras_sigma=False, flow_shift=None):
+    def _new_scheduler(self, num_inference_steps: int, device, use_karras_sigma=None, flow_shift=None):
         from diffusers import UniPCMultistepScheduler
 
-        overrides = {"use_karras_sigmas": use_karras_sigma}
+        # The checkpoint scheduler config carries the trained sigma schedule
+        # (karras sigmas); keep it unless the request explicitly overrides a
+        # field. Forcing karras off uses the wrong schedule and corrupts the
+        # larger model's high-resolution text-to-video.
+        overrides = {}
+        if use_karras_sigma is not None:
+            overrides["use_karras_sigmas"] = use_karras_sigma
         if flow_shift is not None:
             overrides["flow_shift"] = flow_shift
 
@@ -295,7 +301,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "guidance_interval": md.get("guidance_interval"),
             "scheduler": self._new_scheduler(
                 steps, device, flow_shift=md.get("flow_shift"),
-                use_karras_sigma=md.get("use_karras_sigma", False)
+                use_karras_sigma=md.get("use_karras_sigma")
             ),
             "num_noisy": cond["num_noisy_vision_tokens"],
             "num_vision": cond["num_vision_tokens"],
@@ -434,7 +440,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "gs": gs,
             "scheduler": self._new_scheduler(
                 steps, device, flow_shift=md.get("flow_shift"),
-                use_karras_sigma=md.get("use_karras_sigma", False)
+                use_karras_sigma=md.get("use_karras_sigma")
             ),
             "num_noisy": cond["num_noisy_vision_tokens"],
             "num_noisy_action": cond["num_noisy_action_tokens"],
@@ -1109,6 +1115,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             capture_batch_sizes = list(self.gen_capture_batch_sizes)
         dtype = self.transformer.proj_in.weight.dtype
+        # The 2D (TP x SP) captured denoise graph hits a CUDA illegal access at
+        # 480p+ in the combined Ulysses all-gather + TP all-reduce path (pure-TP and
+        # pure-SP capture cleanly; only the combination at this scale). For 2D,
+        # capture only the smallest tier; 480p+ runs eager (correct, just no graph).
+        two_d = self.transformer.sp_group.world_size > 1 and self.transformer.comm_group.world_size > 1
         self._capture_layout: dict[tuple, dict] = {}
         configs = []
         for height, width in resolutions:
@@ -1124,6 +1135,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # (240) and 480p (1560) graph; 720p (3600) and video run eager+dense.
             latent_area = latent_shape[3] * latent_shape[4]
             max_area = int(os.environ.get("COSMOS3_GRAPH_MAX_LATENT_AREA", "2000"))
+            if two_d:
+                max_area = min(max_area, 1000)  # 256p latent 240 captures; 480p 1560 does not
             if latent_area > max_area:
                 logger.info(
                     "Cosmos3: skipping CUDA-graph capture for %dx%d (latent H*W "

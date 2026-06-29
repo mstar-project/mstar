@@ -443,6 +443,9 @@ class Cosmos3OmniTransformer(nn.Module):
         if sp_group is None:
             sp_group = TPCommGroup.trivial()
         self.sp_group = sp_group
+        if comm_group is None:
+            comm_group = TPCommGroup.trivial()
+        self.comm_group = comm_group
 
         self.embed_tokens = nn.Embedding(config.vocab_size, h)
         self.layers = nn.ModuleList(
