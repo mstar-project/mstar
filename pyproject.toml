@@ -176,3 +176,27 @@ ignore = [
 quote-style = "double"
 line-ending = "auto"
 docstring-code-format = true
+
+[tool.pytest.ini_options]
+testpaths = ["test/modular", "test/integration", "test/distributed"]
+python_files = ["test_*.py"]
+norecursedirs = [
+    ".git",
+    ".venv",
+    "scratch",
+    "bagel",
+    "orpheus",
+    "qwen3-omni",
+    "pi05",
+    "vjepa2", # we can change these once we are done labelling
+]
+addopts = [
+    "-m",
+    "not gpu and not integration and not weights and not slow",
+]
+markers = [
+    "gpu: requires CUDA; auto-skipped when unavailable (see test/conftest.py)",
+    "integration: full engine",
+    "weights: requires pre-downloaded model weights",
+    "slow: long-running",
+]
