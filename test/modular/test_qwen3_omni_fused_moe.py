@@ -1,10 +1,10 @@
 """Parity tests for the Triton fused MoE dispatch vs the naive path.
 
-Skips automatically when CUDA or ``sgl-kernel`` is unavailable (both are
-required for the fused kernel).  The naive path in
-``_dispatch_experts_fused`` runs on CPU, but we need CUDA bf16 tensors
-to exercise the Triton kernels, so the comparison is done entirely on
-GPU.
+Skips automatically when ``sgl-kernel`` is unavailable (required for the
+fused kernel). CUDA availability is handled by the ``gpu`` marker (see
+``test/conftest.py``). The naive path in ``_dispatch_experts_fused`` runs
+on CPU, but we need CUDA bf16 tensors to exercise the Triton kernels, so
+the comparison is done entirely on GPU.
 
 Problem shapes mirror the live Qwen3-Omni configs:
 
@@ -28,7 +28,7 @@ from mstar.model.components import GatedMLP, SparseMoeBlock, SparseMoeBlockWithS
 from mstar.model.components.moe import dispatch_experts_fused as _dispatch_experts_fused
 from mstar.utils.fused_moe.align import has_sgl_kernel
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="fused MoE requires CUDA")
+pytestmark = [pytest.mark.gpu]
 
 
 def _skip_if_no_sgl_kernel():

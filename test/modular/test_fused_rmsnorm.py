@@ -4,7 +4,10 @@ Test fused_qk_norm_rope against flashinfer's rmsnorm + rope.
 Run: python test_fused_qk_norm_rope.py
 """
 import flashinfer
+import pytest
 import torch
+
+pytestmark = [pytest.mark.gpu, pytest.mark.slow]
 
 from mstar.utils.attention import fused_qk_norm_rope
 

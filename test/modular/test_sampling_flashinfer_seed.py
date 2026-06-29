@@ -20,7 +20,8 @@ tests fail fast on a too-old build and pin the two facts the design depends on:
      illegal during capture. (Pins why the captured path must pass a real
      tensor, not None.)
 
-Skips when CUDA / FlashInfer are unavailable.
+Skips when FlashInfer is unavailable. CUDA availability is handled by the
+``gpu`` marker (see ``test/conftest.py``).
 """
 
 from __future__ import annotations
@@ -32,9 +33,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="FlashInfer sampler requires CUDA"
-)
+pytestmark = [pytest.mark.gpu]
 
 
 def _flashinfer_or_skip():

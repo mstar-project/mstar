@@ -3,7 +3,7 @@
 ``facebook/vjepa2-ac-vitg`` weights.
 
 Skipped automatically when:
-  * CUDA is not available, or
+  * CUDA is not available (``gpu`` marker; see ``test/conftest.py``), or
   * The upstream ``vjepa2`` repo isn't importable (``src.models.*``
     needs to be on ``PYTHONPATH``), or
   * The upstream ``.pt`` hasn't been cached at
@@ -102,7 +102,9 @@ _UPSTREAM_ERR = _upstream_import_error()
 
 
 pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    pytest.mark.gpu,
+    pytest.mark.integration,
+    pytest.mark.weights,
     pytest.mark.skipif(
         _UPSTREAM_ERR is not None,
         reason=(

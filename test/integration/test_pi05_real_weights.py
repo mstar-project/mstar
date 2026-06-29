@@ -2,7 +2,7 @@
 ``lerobot/pi05_base`` (the production Pi0.5 release) on real weights.
 
 This test is skipped automatically when:
-  * CUDA is not available, or
+  * CUDA is not available (``gpu`` marker; see ``test/conftest.py``), or
   * the ``lerobot`` package is not installed, or
   * the ``lerobot/pi05_base`` checkpoint isn't already downloaded to the local
     HF cache (we don't trigger a 14 GB download from CI).
@@ -79,7 +79,10 @@ def _hf_cache_has_pi05() -> bool:
 
 
 pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    pytest.mark.gpu,
+    pytest.mark.integration,
+    pytest.mark.weights,
+    pytest.mark.slow,
     pytest.mark.skipif(
         pytest.importorskip("lerobot", reason="lerobot package not installed") is None,
         reason="lerobot package not installed",

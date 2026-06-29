@@ -3,7 +3,7 @@ HuggingFace Transformers reference on real ``facebook/vjepa2-vitl-fpc64-256``
 weights.
 
 Skipped automatically when:
-  * CUDA is not available, or
+  * CUDA is not available (``gpu`` marker; see ``test/conftest.py``), or
   * ``transformers`` is not installed, or
   * ``facebook/vjepa2-vitl-fpc64-256`` isn't in the local HF cache
     (we avoid triggering a ~1.2 GB download from CI).
@@ -71,14 +71,10 @@ def _hf_cache_has_vjepa2() -> bool:
 
 
 pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    pytest.mark.integration,
     pytest.mark.skipif(
         pytest.importorskip("transformers", reason="transformers not installed") is None,
         reason="transformers not installed",
-    ),
-    pytest.mark.skipif(
-        not _hf_cache_has_vjepa2(),
-        reason=f"{HF_REPO} not in local HF cache; run `huggingface-cli download {HF_REPO}`",
     ),
 ]
 
@@ -165,6 +161,12 @@ def sample_video(our_config, device):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.skipif(
+    not _hf_cache_has_vjepa2(),
+    reason=f"{HF_REPO} not in local HF cache; run `huggingface-cli download {HF_REPO}`",
+)
 def test_encoder_parity(hf_model, our_encoder, sample_video):
     """Our VJEPA2Encoder output matches HF's encoder output exactly (eager
     attention, fp32)."""
@@ -176,6 +178,12 @@ def test_encoder_parity(hf_model, our_encoder, sample_video):
     assert diff < 1e-3, f"encoder max abs diff = {diff}"
 
 
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.skipif(
+    not _hf_cache_has_vjepa2(),
+    reason=f"{HF_REPO} not in local HF cache; run `huggingface-cli download {HF_REPO}`",
+)
 def test_full_model_parity_default_masks(hf_model, our_encoder, our_predictor, sample_video):
     """Encoder + predictor pipeline matches HF VJEPA2Model.forward() with
     default (full-context, full-target) masks."""
@@ -193,6 +201,12 @@ def test_full_model_parity_default_masks(hf_model, our_encoder, our_predictor, s
     assert diff < 1e-3, f"predictor max abs diff = {diff}"
 
 
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.skipif(
+    not _hf_cache_has_vjepa2(),
+    reason=f"{HF_REPO} not in local HF cache; run `huggingface-cli download {HF_REPO}`",
+)
 def test_full_model_parity_partial_mask(hf_model, our_encoder, our_predictor, sample_video):
     """Repeat the parity check with a partial mask (first half context,
     second half target), exercising the sort/unsort path."""
@@ -222,6 +236,12 @@ def test_full_model_parity_partial_mask(hf_model, our_encoder, our_predictor, sa
     assert diff < 1e-3, f"predictor (partial-mask) max abs diff = {diff}"
 
 
+@pytest.mark.gpu
+@pytest.mark.weights
+@pytest.mark.skipif(
+    not _hf_cache_has_vjepa2(),
+    reason=f"{HF_REPO} not in local HF cache; run `huggingface-cli download {HF_REPO}`",
+)
 def test_encoder_only_mode(hf_model, our_encoder, sample_video):
     """HF's ``skip_predictor=True`` fast path returns the encoder output
     directly; our encoder submodule must emit the same tensor."""
@@ -233,6 +253,7 @@ def test_encoder_only_mode(hf_model, our_encoder, sample_video):
     assert diff < 1e-3, f"encoder-only max abs diff = {diff}"
 
 
+@pytest.mark.gpu
 def test_ac_predictor_instantiation_and_forward(device):
     """Lightweight AC sanity: instantiate, ``to_empty``, run a forward.
     Validates the buffer-less attn_mask fix under the production

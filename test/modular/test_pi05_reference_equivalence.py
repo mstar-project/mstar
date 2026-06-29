@@ -56,18 +56,15 @@ from mstar.model.pi05.components.action_expert import (
 from mstar.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mstar.model.pi05.config import Pi05Config
 
-# FlashInfer's rmsnorm requires CUDA, so the mstar-side forwards have to run
-# on a GPU. Tests that need the mstar action expert are skipped when CUDA
-# isn't available.
+# FlashInfer's rmsnorm requires CUDA for the mstar-side forwards. Tests that
+# need the mstar action expert are tagged ``@pytest.mark.gpu``; CUDA
+# availability is handled centrally in ``test/conftest.py``.
 CUDA_AVAILABLE = torch.cuda.is_available()
 DEVICE = torch.device("cuda" if CUDA_AVAILABLE else "cpu")
 # FlashInfer's rmsnorm only dispatches fp16/bf16, so the mstar-side forwards
 # run in bfloat16. Comparisons against the reference are therefore done at
 # bfloat16 precision (tolerances chosen accordingly).
 MSTAR_DTYPE = torch.bfloat16
-requires_cuda = pytest.mark.skipif(
-    not CUDA_AVAILABLE, reason="FlashInfer rmsnorm requires CUDA"
-)
 
 
 # ----------------------------------------------------------------------
@@ -385,7 +382,7 @@ def test_time_mlp_matches_reference_with_shared_weights():
     assert torch.allclose(our_out, ref_out, atol=1e-6)
 
 
-@requires_cuda
+@pytest.mark.gpu
 def test_adarms_norm_matches_reference_with_shared_weights():
     torch.manual_seed(0)
     # Reference runs in float32 for maximum precision; mstar runs in bfloat16
@@ -421,7 +418,7 @@ def test_gated_residual_matches_reference():
     assert torch.allclose(_gated_residual(x, y, None), x + y, atol=1e-6)
 
 
-@requires_cuda
+@pytest.mark.gpu
 def test_action_expert_layer_matches_reference_single_request():
     """One-layer action expert forward through mstar vs reference.
 
@@ -461,7 +458,7 @@ def test_action_expert_layer_matches_reference_single_request():
     )
 
 
-@requires_cuda
+@pytest.mark.gpu
 def test_action_expert_full_stack_matches_reference_against_prefix_kv_cache():
     """Multi-layer action expert denoising step with a prefix KV cache.
 
@@ -588,7 +585,7 @@ def _hf_gemma_apply_rotary(
     return q_out.to(q.dtype), k_out.to(k.dtype)
 
 
-@requires_cuda
+@pytest.mark.gpu
 def test_flashinfer_rope_matches_hf_gemma_formula():
     """``flashinfer.rope.apply_rope_pos_ids_inplace`` vs HF apply_rotary_pos_emb."""
     import flashinfer
@@ -641,7 +638,7 @@ def _vanilla_sdpa(
     return out.transpose(0, 1).to(q.dtype)
 
 
-@requires_cuda
+@pytest.mark.gpu
 def test_flashinfer_paged_prefill_attention_matches_sdpa():
     """``FlashInferPrefillWrapper`` (real paged KV cache, no Mooncake) vs SDPA.
 

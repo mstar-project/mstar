@@ -64,7 +64,10 @@ def _hf_cache_has_qwen3_omni() -> bool:
 
 
 pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    pytest.mark.gpu,
+    pytest.mark.integration,
+    pytest.mark.weights,
+    pytest.mark.slow,
     pytest.mark.skipif(
         not _hf_cache_has_qwen3_omni(),
         reason=f"{QWEN3_OMNI_REPO} not in local HF cache; run "
