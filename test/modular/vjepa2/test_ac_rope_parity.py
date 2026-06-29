@@ -284,5 +284,5 @@ t0 = 5
 q2, k2, v2 = dummy_attn.forward_cached_old(x, t0, h=16, w=16, action_tokens=4)
 q, k, v = dummy_attn.forward_cached(x, t0, h=16, w=16, action_tokens=4)
 print((q - q2).abs().max())
-(print(v - v2).abs().max())
-(print(k - k2).abs().max())
+print((v - v2).abs().max())
+print((k - k2).abs().max())
