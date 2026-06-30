@@ -149,6 +149,7 @@ def _vision_input(processor, device, resize=None):
 @pytest.mark.skipif(not _HAS_FA, reason="flash-attn required")
 def test_audio_single_parity(cfg, processor):
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
+
     from mstar.model.qwen3_omni.components.audio_encoder import NativeQwen3OmniAudioEncoder
     hf, nat = _load(Qwen3OmniMoeAudioEncoder, NativeQwen3OmniAudioEncoder,
                     cfg.thinker_config.audio_config, "thinker.audio_tower")
@@ -169,11 +170,14 @@ def test_audio_batched_parity(cfg, processor):
     # behavior, not a packing bug. Both test clips here are multi-second (>>
     # n_window*2), so they are unaffected.
     from mstar.model.qwen3_omni.components.audio_encoder import (
-        NativeQwen3OmniAudioEncoder, _feat_extract_output_lengths,
+        NativeQwen3OmniAudioEncoder,
+        _feat_extract_output_lengths,
     )
     from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
     nat = NativeQwen3OmniAudioEncoder(cfg.thinker_config.audio_config).to(DEVICE)
-    load_weights_from_hf_shards(repo_dir=CKPT, modules=[ModuleAndPrefix(nat, prefix="thinker.audio_tower")], device=DEVICE)
+    load_weights_from_hf_shards(
+        repo_dir=CKPT, modules=[ModuleAndPrefix(nat, prefix="thinker.audio_tower")], device=DEVICE,
+    )
     nat.eval()
     feat, lens = _audio_input(processor, DEVICE)
     feat2 = feat[:, : feat.shape[1] // 2]
@@ -185,7 +189,7 @@ def test_audio_batched_parity(cfg, processor):
     counts = [int(_feat_extract_output_lengths(l)) for _, l in reqs]
     assert sum(counts) == cat.shape[0]
     off = 0
-    for i, (c, ind) in enumerate(zip(counts, indiv)):
+    for i, (c, ind) in enumerate(zip(counts, indiv, strict=False)):
         _assert_close(cat[off:off + c], ind, f"audio.batched[{i}]")
         off += c
 
@@ -197,6 +201,7 @@ def test_audio_batched_parity(cfg, processor):
 @pytest.mark.parametrize("resize", [None, (448, 448), (672, 672), (336, 504)])
 def test_vision_parity_and_deepstack(cfg, processor, resize):
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeVisionEncoder
+
     from mstar.model.qwen3_omni.components.vision_encoder import NativeQwen3OmniVisionEncoder
     hf, nat = _load(Qwen3OmniMoeVisionEncoder, NativeQwen3OmniVisionEncoder,
                     cfg.thinker_config.vision_config, "thinker.visual")
@@ -210,5 +215,5 @@ def test_vision_parity_and_deepstack(cfg, processor, resize):
     _assert_close(emb_n, emb_hf, f"vision.pooler[{resize}]")
     # EVERY DeepStack level individually (positional splice into Thinker)
     assert len(ds_hf) == len(ds_n)
-    for i, (dh, dn) in enumerate(zip(ds_hf, ds_n)):
+    for i, (dh, dn) in enumerate(zip(ds_hf, ds_n, strict=False)):
         _assert_close(dn, dh, f"vision.deepstack[{i}][{resize}]")

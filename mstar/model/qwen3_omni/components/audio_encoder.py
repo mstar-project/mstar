@@ -9,7 +9,6 @@ SDPA fallback). Frontend helpers replicate HF bit-for-bit (parity-tested).
 from __future__ import annotations
 
 import logging
-import math
 import os
 from collections import namedtuple
 from dataclasses import dataclass
@@ -57,7 +56,7 @@ def _sdpa_varlen_per_segment(q, k, v, cu_seqlens, scale):
     # Mathematically identical to block-diagonal; avoids quadratic cross-segment cost.
     cu = cu_seqlens.tolist()
     out = torch.empty_like(q)
-    for a, b in zip(cu[:-1], cu[1:]):
+    for a, b in zip(cu[:-1], cu[1:], strict=False):
         qs = q[a:b].transpose(0, 1).unsqueeze(0)
         ks = k[a:b].transpose(0, 1).unsqueeze(0)
         vs = v[a:b].transpose(0, 1).unsqueeze(0)
@@ -70,21 +69,23 @@ def _sdpa_varlen_padded(q, k, v, cu_seqlens, scale):
     # Pad-to-max + batched SDPA: one kernel over (n_seg, heads, max_len, head_dim).
     # Best when segments are similar length; wastes work when lengths vary widely.
     cu = cu_seqlens.tolist()
-    lens = [b - a for a, b in zip(cu[:-1], cu[1:])]
+    lens = [b - a for a, b in zip(cu[:-1], cu[1:], strict=False)]
     nseg, max_len = len(lens), max(lens)
     h, d = q.shape[1], q.shape[2]
     qb = q.new_zeros(nseg, max_len, h, d)
     kb = q.new_zeros(nseg, max_len, h, d)
     vb = q.new_zeros(nseg, max_len, h, d)
     mask = torch.zeros(nseg, 1, 1, max_len, device=q.device, dtype=torch.bool)
-    for i, (a, b) in enumerate(zip(cu[:-1], cu[1:])):
+    for i, (a, b) in enumerate(zip(cu[:-1], cu[1:], strict=False)):
         n = b - a
-        qb[i, :n] = q[a:b]; kb[i, :n] = k[a:b]; vb[i, :n] = v[a:b]
+        qb[i, :n] = q[a:b]
+        kb[i, :n] = k[a:b]
+        vb[i, :n] = v[a:b]
         mask[i, 0, 0, :n] = True
     qb, kb, vb = (t.permute(0, 2, 1, 3) for t in (qb, kb, vb))
     o = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=mask, scale=scale).permute(0, 2, 1, 3)
     out = torch.empty_like(q)
-    for i, (a, b) in enumerate(zip(cu[:-1], cu[1:])):
+    for i, (a, b) in enumerate(zip(cu[:-1], cu[1:], strict=False)):
         out[a:b] = o[i, : b - a]
     return out
 
@@ -456,7 +457,9 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
 
         b, c, f, t = padded_embed.size()
         padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
-        pos = self.positional_embedding.positional_embedding[: padded_embed.shape[1], :].unsqueeze(0).to(padded_embed.dtype)
+        pos = self.positional_embedding.positional_embedding[
+            : padded_embed.shape[1], :
+        ].unsqueeze(0).to(padded_embed.dtype)
         padded_embed = padded_embed + pos
         hidden_states = torch.index_select(padded_embed.reshape(-1, padded_embed.shape[-1]), 0, valid_indices)
 

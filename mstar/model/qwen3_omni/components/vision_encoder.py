@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _VisionGraph:
-    """Captured block-loop CUDA graph for one fixed grid layout (cu_seqlens, position_embeddings, fi_state kept alive)."""
+    """Captured block-loop CUDA graph for one grid layout; cu_seqlens/pos_emb/fi_state kept alive."""
     graph: "torch.cuda.CUDAGraph"
     static_x: torch.Tensor
     out_merged: torch.Tensor
@@ -191,7 +191,7 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         return merged, deepstack_features
 
     def _capture_graph(self, key, hidden_states, cu_seqlens, max_seqlen, position_embeddings):
-        """Capture _block_loop_tail for grid-layout key; returns _VisionGraph or None on failure (caller falls back to eager)."""
+        """Capture _block_loop_tail for a grid-layout key; returns _VisionGraph or None (caller runs eager)."""
         import mstar.model.qwen3_omni.components.audio_encoder as AE
         dev = hidden_states.device
         fi_state = AE.make_fi_state(dev)

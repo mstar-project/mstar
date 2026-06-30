@@ -38,6 +38,7 @@ Requires CUDA + the Qwen3-Omni checkpoint (for the real mel filterbank); skips
 otherwise. Point at a checkpoint with MSTAR_QWEN3_OMNI_DIR.
 """
 import os
+
 import numpy as np
 import pytest
 import torch

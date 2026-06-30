@@ -83,6 +83,7 @@ def test_vision_encoder_graph_eager_hf_parity():
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeVisionEncoder,
     )
+
     from mstar.model.qwen3_omni.components.vision_encoder import (
         NativeQwen3OmniVisionEncoder,
     )
@@ -115,6 +116,7 @@ def test_audio_encoder_graph_eager_hf_parity():
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeAudioEncoder,
     )
+
     from mstar.model.qwen3_omni.components.audio_encoder import (
         NativeQwen3OmniAudioEncoder,
     )

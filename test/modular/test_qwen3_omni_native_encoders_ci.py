@@ -126,7 +126,7 @@ def test_vision_structural_parity_cpu():
     cos, rel = _cmp(emb_n, o.pooler_output)
     assert cos > COS_MIN and rel < RELL2_MAX, f"vision pooler: cos={cos:.6f} relL2={rel:.2e}"
     assert len(ds_n) == len(o.deepstack_features)
-    for k, (dn, dh) in enumerate(zip(ds_n, o.deepstack_features)):
+    for k, (dn, dh) in enumerate(zip(ds_n, o.deepstack_features, strict=False)):
         cos, rel = _cmp(dn, dh)
         assert cos > COS_MIN and rel < RELL2_MAX, f"vision deepstack[{k}]: cos={cos:.6f} relL2={rel:.2e}"
 

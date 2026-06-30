@@ -102,7 +102,7 @@ def _load_reference_tokens(prompt_id):
 
 def _longest_common_prefix(a, b):
     n = 0
-    for x, y in zip(a, b):
+    for x, y in zip(a, b, strict=False):
         if x != y:
             break
         n += 1
