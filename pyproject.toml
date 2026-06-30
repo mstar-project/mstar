@@ -127,6 +127,7 @@ all = [
     "safetensors",
     "triton",
     "qwen-omni-utils",
+    "numba>=0.61",
     "sgl-kernel",
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
     # separately, see docs/installation.rst.
