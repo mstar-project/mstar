@@ -1,17 +1,10 @@
 """Native Qwen3-Omni audio encoder (AuT, Whisper-style).
 
-A from-scratch mstar reimplementation of HF's ``Qwen3OmniMoeAudioEncoder`` that
-is decoupled from ``transformers`` at inference time. Submodule attribute names
-mirror the HF module exactly so the existing
-``load_weights_from_hf_shards(..., prefix="thinker.audio_tower")`` loads it with
-no remapping.
-
-Attention is NOT written from scratch: it goes through ``varlen_attention`` (a
-flash-attn varlen call with an SDPA fallback) mirroring
-``mstar/model/bagel/components/vit_encoder.py``.
-
-The deterministic frontend helpers (chunking / valid-index / cu_seqlens / CNN
-output-length) replicate HF's logic bit-for-bit; the parity test guards them.
+Mstar reimplementation of HF's Qwen3OmniMoeAudioEncoder, decoupled from
+transformers at inference time. Weight names mirror HF exactly so
+load_weights_from_hf_shards(..., prefix="thinker.audio_tower") loads with
+no remapping. Attention via varlen_attention (flash-attn / FlashInfer /
+SDPA fallback). Frontend helpers replicate HF bit-for-bit (parity-tested).
 """
 from __future__ import annotations
 
@@ -29,9 +22,7 @@ from transformers.activations import ACT2FN
 
 logger = logging.getLogger(__name__)
 
-# Output container mirroring the field of HF's BaseModelOutput that downstream
-# code reads (``.last_hidden_state``). Defined once at module scope rather than
-# as an ad-hoc class re-created per forward call.
+# Mirrors HF's BaseModelOutput.last_hidden_state; defined at module scope.
 AudioEncoderOutput = namedtuple("AudioEncoderOutput", ["last_hidden_state"])
 
 try:
@@ -47,10 +38,8 @@ except ImportError:  # pragma: no cover
 # varlen attention primitive (mirrors bagel vit_encoder.run_attention)
 # --------------------------------------------------------------------------- #
 def _sdpa_varlen_dense(q, k, v, cu_seqlens, scale):
-    # ORIGINAL fallback: builds a dense (total_len, total_len) block-diagonal
-    # mask, i.e. O(total_tokens^2) memory/compute. At serving batch sizes the
-    # cross-segment terms make encoder TTFT regress (README_qwen3_omni_encoders.md:
-    # native large-batch numbers are SDPA-pessimistic). Kept for A/B + parity.
+    # Block-diagonal mask O(total_tokens^2). Large-batch TTFT is SDPA-pessimistic.
+    # Kept for A/B + parity.
     total_len = q.shape[0]
     seg_ids = torch.zeros(total_len, dtype=torch.int32, device=q.device)
     seg_ids[cu_seqlens[1:-1].long()] = 1
@@ -64,12 +53,8 @@ def _sdpa_varlen_dense(q, k, v, cu_seqlens, scale):
 
 
 def _sdpa_varlen_per_segment(q, k, v, cu_seqlens, scale):
-    # No-flash-attn varlen path that is LINEAR in batch: run a dense SDPA per
-    # image/audio segment (O(sum L_i^2)) instead of one (sum L_i)^2 masked call.
-    # Mathematically identical to the block-diagonal mask (attention never
-    # crosses segments), but removes the quadratic cross-segment compute/memory
-    # that made native large-batch TTFT explode. This is the production varlen
-    # path on hardware without flash-attn (this H200).
+    # One SDPA kernel per segment: O(sum L_i^2) not O((sum L_i)^2).
+    # Mathematically identical to block-diagonal; avoids quadratic cross-segment cost.
     cu = cu_seqlens.tolist()
     out = torch.empty_like(q)
     for a, b in zip(cu[:-1], cu[1:]):
@@ -82,11 +67,8 @@ def _sdpa_varlen_per_segment(q, k, v, cu_seqlens, scale):
 
 
 def _sdpa_varlen_padded(q, k, v, cu_seqlens, scale):
-    # No-flash varlen via pad-to-max + batched SDPA with a key-padding mask: a
-    # SINGLE attention kernel over (n_seg, heads, max_len, head_dim). Best when
-    # segments are similar length (e.g. audio windows, which are mostly equal),
-    # where per-segment's many tiny kernels lose to one batched call. Wastes work
-    # on padding when lengths are very uneven (e.g. mixed-resolution images).
+    # Pad-to-max + batched SDPA: one kernel over (n_seg, heads, max_len, head_dim).
+    # Best when segments are similar length; wastes work when lengths vary widely.
     cu = cu_seqlens.tolist()
     lens = [b - a for a, b in zip(cu[:-1], cu[1:])]
     nseg, max_len = len(lens), max(lens)
@@ -108,27 +90,10 @@ def _sdpa_varlen_padded(q, k, v, cu_seqlens, scale):
 
 
 def _sdpa_varlen_adaptive(q, k, v, cu_seqlens, scale):
-    # SDPA-only fallback selector (reached only when flash_attn is unavailable;
-    # when flash_attn or the flashinfer path is live they are both ~2-7x faster than
-    # any SDPA variant and are used instead — see varlen_attention / the backend
-    # matrix in exp_audioenc/raw.json). Picks dense vs per-segment from segment
-    # STRUCTURE alone (no GPU sync — tensor shapes only).
-    #
-    # The discriminator is MEAN SEGMENT LENGTH, i.e. the per-segment SDPA kernel
-    # regime, NOT total size (the old M = total^2/n_seg metric was inverted: audio
-    # at large batch has HIGH M yet still wants dense, while vision at batch 1 has
-    # LOWER M yet wants per_segment — a single scalar on M cannot separate them):
-    #   * SMALL segments (audio: ~100-tok windows) -> each per-segment SDPA is
-    #     launch-bound, so n_seg tiny kernels lose to ONE dense masked kernel even
-    #     though dense does n_seg x more attention work. Dense wins audio across
-    #     b1..b32 (bench_audio_backend_matrix.py).
-    #   * BIG segments (vision: ~728-tok images) -> each per-segment SDPA is
-    #     compute-bound and efficient, so per_segment wins and dense wastes the
-    #     O(total^2) cross-segment block.
-    # Crossover measured on H200 at fixed total~6k: dense wins seg<=~300, per_segment
-    # wins seg>=~400 -> threshold 350 sits in the gap and cleanly splits audio (104)
-    # from vision (728). A total cap keeps dense's O(total^2) mask from blowing up at
-    # extreme batch (small-seg + huge total -> per_segment is the memory-safe choice).
+    # Selects dense vs per_segment by mean segment length (no GPU sync, shapes only).
+    # Small segs (audio ~100 tok): dense wins — many tiny per-segment launches are overhead-bound.
+    # Large segs (vision ~728 tok): per_segment wins — avoids O(total^2) cross-segment mask.
+    # Threshold=350 splits audio(104) from vision(728); total cap limits dense memory at extreme batch.
     _DENSE_MEAN_SEG = 350
     _DENSE_TOTAL_CAP = 16384
     total = q.shape[0]
@@ -140,13 +105,7 @@ def _sdpa_varlen_adaptive(q, k, v, cu_seqlens, scale):
 
 
 # --------------------------------------------------------------------------- #
-# FlashInfer ragged (no-KV-cache) varlen self-attention.
-# This is the intended fast path that is also CUDA-graph-friendly: FlashInfer
-# splits attention into a host-side ``plan`` (absorbs the variable-length layout
-# from cu_seqlens) and a single fused, branch-free ``run`` kernel — so unlike the
-# SDPA fallbacks there is no data-dependent mask build or per-segment loop, and
-# the cost is ragged-native (~linear), not the O(n^2) dense mask. Mirrors how the
-# rest of M* (Thinker/Talker) already use FlashInfer.
+# FlashInfer ragged varlen self-attention (capture-legal; plan once, run once).
 # --------------------------------------------------------------------------- #
 try:
     import flashinfer as _flashinfer
@@ -155,31 +114,20 @@ except Exception:  # pragma: no cover
     _flashinfer = None
     _FLASHINFER_AVAILABLE = False
 
-# Per-device {workspace, wrapper, last cu_seqlens object} so we plan ONCE per
-# forward (all encoder layers share the same cu_seqlens object) and re-plan only
-# when a new forward arrives.
+# Per-device {workspace, wrapper, last cu_seqlens} — plan once per forward, re-plan only on layout change.
 _FI_STATE: dict = {}
 
 
 def _fi_pad_hd(t, target):
-    # Zero-pad the head_dim. FlashInfer's Hopper prefill kernel hard-asserts
-    # head_dim in {64,128,256}; the Qwen3-Omni encoders use 72 (vision) which is
-    # unsupported. Zero-padding q/k/v to 128 is EXACT: the padded dims contribute
-    # 0 to Q.K^T (zero*zero) and 0 to the output (zero V), so slicing the output
-    # back to the real head_dim recovers identical attention. Cost: ~128/72 more
-    # attention FLOPs, paid to get the fused, graph-capturable FlashInfer path.
+    # FlashInfer Hopper kernel requires head_dim in {64,128,256}; Qwen3-Omni uses 72.
+    # Zero-padding to 128 is exact: padded dims contribute 0 to QK^T and 0 to output.
     return t if t.shape[-1] == target else F.pad(t, (0, target - t.shape[-1]))
 
 
 def make_fi_state(device):
-    """Build a fresh, isolated FlashInfer ragged-prefill wrapper + state dict.
-
-    Each CUDA-graph capture key owns one of these so its wrapper is planned
-    exactly once and never re-planned — re-planning a shared wrapper mutates
-    the buffers a previously-captured graph recorded, silently corrupting that
-    graph's replay. The shared per-device ``_FI_STATE`` is fine for eager use
-    (it re-plans on every layout change) but unsafe to capture against twice.
-    """
+    """Build isolated FlashInfer ragged-prefill wrapper for one CUDA-graph capture key.
+    Each key owns its own wrapper planned exactly once — re-planning a shared wrapper
+    mutates buffers recorded by a prior capture, silently corrupting replay."""
     if not _FLASHINFER_AVAILABLE:
         return None
     ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
@@ -187,10 +135,8 @@ def make_fi_state(device):
     return {"ws": ws, "wrapper": wrapper, "cu_obj": None}
 
 
-# When set (by the vision encoder's CUDA-graph capture), _flashinfer_varlen
-# routes through THIS state instead of the shared per-device _FI_STATE so the
-# capture plans/records a dedicated wrapper. Cleared after capture. Replay never
-# re-enters Python, so this only matters during warmup+capture.
+# During CUDA-graph capture, routes _flashinfer_varlen through a dedicated state
+# instead of _FI_STATE so the capture records a wrapper that is never re-planned.
 _fi_override: dict | None = None
 
 
@@ -225,9 +171,7 @@ def _flashinfer_varlen(q, k, v, cu_seqlens, scale):
     return out[..., :D].contiguous()
 
 
-# Backend selectable via env for A/B benchmarking. Default = flashinfer: it is the
-# only capture-legal varlen backend, so the encoder CUDA graph (default on, see
-# _cuda_graph_enabled) needs it. Falls back gracefully if flashinfer is missing.
+# Default=flashinfer: the only capture-legal varlen backend (SDPA mask builds are not graph-safe).
 # MSTAR_VARLEN_BACKEND in {adaptive, per_segment, dense, padded, flashinfer}.
 _VARLEN_BACKEND = os.environ.get("MSTAR_VARLEN_BACKEND", "flashinfer")
 _VARLEN_FALLBACKS = {"adaptive": _sdpa_varlen_adaptive,
@@ -243,12 +187,8 @@ def _sdpa_varlen(q, k, v, cu_seqlens, scale):
 @torch.compiler.disable
 def varlen_attention(q, k, v, cu_seqlens, max_seqlen, scale):
     """q/k/v: (total_tokens, num_heads, head_dim). Bidirectional, packed by cu_seqlens."""
-    # During encoder CUDA-graph capture the vision/audio encoders install a
-    # FlashInfer override (set_fi_override). flash-attn's varlen custom op is NOT
-    # reliably CUDA-graph-capturable for the production encoder head dims (it
-    # fails capture and the encoder then silently falls back to eager, defeating
-    # the whole point of the graph). While an override is live we MUST take the
-    # capture-legal flashinfer path, regardless of flash-attn availability.
+    # During graph capture _fi_override is set: flash-attn's varlen op is not reliably
+    # capture-safe for production head dims, so we must use the flashinfer path.
     if _fi_override is not None:
         return _flashinfer_varlen(q, k, v, cu_seqlens, scale)
     if _FLASH_ATTN_AVAILABLE:
@@ -272,16 +212,10 @@ def _feat_extract_output_lengths(input_lengths: torch.Tensor) -> torch.Tensor:
 
 
 def chunk_and_pad_features(input_features, feature_lens, n_window):
-    # NOTE (parity): the pad_sequence below pads chunks to the LONGEST chunk in
-    # THIS call, not to a fixed n_window*2. So a sub-chunk clip (len < n_window*2)
-    # gets more zero-padding when batched behind a longer clip than when run
-    # alone, and Conv2d's bias makes that boundary non-zero — i.e. a short clip's
-    # output depends slightly on its batch-mates (~4e-4 fp32). This is NOT a bug
-    # to fix: it is byte-for-byte what HF's chunk_and_pad_features does
-    # (modeling_qwen3_omni_moe.py), and the native encoder is fp32-bit-identical
-    # to HF in every batching mode (test_qwen3_omni_native_encoders_ci.py). Pinning
-    # the pad to n_window*2 would make this clip-padding deterministic but would
-    # DIVERGE from the HF reference — breaking the parity contract, not improving it.
+    # PARITY NOTE: pad_sequence pads to the longest chunk in THIS call, not a fixed n_window*2.
+    # A short clip batched behind a longer one gets extra zero-padding; Conv2d bias makes the
+    # boundary non-zero (~4e-4 fp32 batch-mate dependence). This matches HF exactly —
+    # pinning to n_window*2 would be deterministic but diverge from the HF reference.
     chunk_num = torch.ceil(feature_lens / (n_window * 2)).long()
     chunk_lengths = torch.full((chunk_num.sum(),), n_window * 2, dtype=torch.long,
                                device=feature_lens.device)
@@ -379,9 +313,8 @@ class NativeAudioEncoderLayer(nn.Module):
 
 @dataclass
 class _AudioGraph:
-    """One captured layer-loop graph for a fixed audio-length layout. ``cu_seqlens``
-    is retained so the storage the captured kernels read outlives the graph;
-    ``fi_state`` keeps the dedicated FlashInfer wrapper alive (never re-planned)."""
+    """Captured layer-loop graph for one audio-length layout.
+    cu_seqlens and fi_state kept alive so captured kernels' storage outlives the graph."""
     graph: "torch.cuda.CUDAGraph"
     static_x: torch.Tensor
     out: torch.Tensor
@@ -419,21 +352,15 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
         self.act = ACT2FN[config.activation_function]
         self.proj2 = nn.Linear(d_model, config.output_dim)
 
-        # CUDA-graph capture state for the encoder layer-loop tail. One captured
-        # graph per distinct audio-length layout (keyed on seq_len + cu_seqlens).
-        # Opt-in via MSTAR_ENCODER_CUDA_GRAPH=1; only legal with the FlashInfer
-        # varlen backend (SDPA's data-dependent mask build is not capture-safe).
+        # CUDA-graph cache for the encoder layer-loop tail, keyed on audio-length layout.
+        # Enabled via MSTAR_ENCODER_CUDA_GRAPH=1; requires FlashInfer varlen backend.
         self._cg_cache: dict = {}
         self._cg_max_keys = int(os.environ.get("MSTAR_ENCODER_CG_MAX_KEYS", "16"))
         self._cg_warmed = False
 
     def _maybe_cg_warmup(self, input_features, feature_lens):
-        """Pre-capture graphs for all configured batch sizes BEFORE serving, so
-        lazy capture never lands inside a measured request. Triggered once, on
-        the first forward, when MSTAR_ENCODER_CG_WARMUP is a comma list of batch
-        sizes. Replicates the first clip's per-segment length to each batch size
-        (the graph key is the audio-length layout, identical across clips of the
-        same length)."""
+        """Pre-capture graphs for configured batch sizes before serving (MSTAR_ENCODER_CG_WARMUP).
+        Triggered once on first forward; replicates clip-0 layout to each batch size."""
         if self._cg_warmed:
             return
         self._cg_warmed = True
@@ -476,9 +403,8 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
         return hidden_states
 
     def _capture_graph(self, key, hidden_states, cu_seqlens, max_seqlen):
-        """Capture ``_layer_loop_tail`` for one audio-length ``key`` with a
-        dedicated FlashInfer wrapper (planned once, never re-planned). Returns an
-        ``_AudioGraph`` or None if capture failed (caller then runs eager)."""
+        """Capture _layer_loop_tail for one audio-length key with a dedicated FlashInfer
+        wrapper (planned once, never re-planned). Returns _AudioGraph or None on failure."""
         dev = hidden_states.device
         fi_state = make_fi_state(dev)
         if fi_state is None:
@@ -510,9 +436,7 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
 
     @torch.no_grad()
     def forward(self, input_features, feature_lens=None, return_dict=True, **kwargs):
-        # ``return_dict``/``**kwargs`` accepted for signature-compatibility with
-        # HF's Qwen3OmniMoeAudioEncoder (some callers pass them); the native path
-        # always returns the same AudioEncoderOutput regardless.
+        # return_dict/**kwargs accepted for HF signature compatibility; always returns AudioEncoderOutput.
         assert feature_lens is not None, "native AuT requires feature_lens"
         self._maybe_cg_warmup(input_features, feature_lens)
         param_dtype = self.conv2d1.weight.dtype
@@ -539,9 +463,7 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
         max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
 
         if self._cuda_graph_enabled():
-            # Key on the exact varlen layout: same key => identical cu_seqlens, so
-            # the captured graph is valid. Audio content only enters via
-            # ``hidden_states``, which we copy into the static buffer.
+            # Key on varlen layout: same key => identical cu_seqlens => graph replay valid.
             key = (int(hidden_states.shape[0]), tuple(cu_seqlens.tolist()))
             ag = self._cg_cache.get(key)
             if ag is None and len(self._cg_cache) < self._cg_max_keys:

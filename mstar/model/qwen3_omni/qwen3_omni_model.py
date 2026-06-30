@@ -55,23 +55,11 @@ from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Performance defaults — the benchmarked "canonical" config, ON by default.
-# ---------------------------------------------------------------------------
-# These move work off the TTFT-critical CPU path and are validated against HF to
-# cos>=0.9999 (test_qwen3_omni_gpu_mel_parity.py / gpu_image_parity.py). They
-# default ON so production gets the benchmarked performance out of the box; to run
-# the slower HF-identical baseline (debugging / strict parity) opt OUT explicitly:
-#     MSTAR_GPU_MEL=0              -> CPU WhisperFeatureExtractor mel
-#     MSTAR_GPU_IMAGE_PREPROCESS=0 -> CPU HF image processor
-#     MSTAR_VLLM_PROMPT_LAYOUT=0   -> legacy bare-block prompt layout
-# Native encoders are likewise ON by default; MSTAR_QWEN3_NATIVE_AUDIO_ENCODER=0 /
-# MSTAR_QWEN3_NATIVE_VISION_ENCODER=0 fall back to the HF encoder wrappers.
-# (MSTAR_VLLM_AUDIO_SENTINELS and MSTAR_BATCH_VISION_PREFILL stay opt-in — they
-#  were not part of the benchmarked canonical set.)
-#
-# GPU log-mel: audio mel spectrograms computed on the GPU instead of HF's CPU
-# WhisperFeatureExtractor, off the TTFT-critical host CPU path.
+# Performance defaults (ON), validated vs HF to cos>=0.9999. Opt out for the
+# HF-identical baseline: MSTAR_GPU_MEL=0 / MSTAR_GPU_IMAGE_PREPROCESS=0 /
+# MSTAR_VLLM_PROMPT_LAYOUT=0 / MSTAR_QWEN3_NATIVE_{AUDIO,VISION}_ENCODER=0.
+# (MSTAR_VLLM_AUDIO_SENTINELS, MSTAR_BATCH_VISION_PREFILL stay opt-in.)
+# GPU log-mel: mel spectrograms on GPU instead of HF's CPU WhisperFeatureExtractor.
 _GPU_MEL = os.environ.get("MSTAR_GPU_MEL", "1") in ("1", "true", "True")
 
 
@@ -211,23 +199,10 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
     return str(Path(local_dir))
 
 
-# ---------------------------------------------------------------------------
-# GPU image preprocessing (env-gated, default OFF)
-# ---------------------------------------------------------------------------
-#
-# Qwen3-Omni's image path normally moves each GPU image to CPU
-# (``img.cpu().numpy()``) and hands it to HF's ``Qwen2VLImageProcessor``,
-# which runs smart_resize + rescale + normalize + patchify on CPU.  That CPU
-# round-trip + numpy processing is the single biggest I2T TTFT cost (~175 ms).
-#
-# When ``MSTAR_GPU_IMAGE_PREPROCESS=1`` we run the *identical* algorithm fully
-# on the GPU so the image never leaves the device.  The resize re-uses
-# torchvision's functional ``resize`` (bicubic + antialias) -- the very same
-# kernel HF's torchvision backend calls -- just on a CUDA tensor, so the
-# output matches HF's CPU ``pixel_values`` within fp tolerance (grid_thw is
-# bit-exact; pixel_values cos > 0.9999, max-abs <= ~3 uint8 levels from
-# CPU-vs-GPU bicubic rounding).  ON by default; MSTAR_GPU_IMAGE_PREPROCESS=0
-# restores the byte-identical HF CPU path.
+# GPU image preprocessing: the CPU round-trip to HF's Qwen2VLImageProcessor is the
+# biggest I2T TTFT cost (~175 ms). MSTAR_GPU_IMAGE_PREPROCESS=1 runs the identical
+# algorithm on-GPU (torchvision bicubic resize, same kernel HF calls); grid_thw is
+# bit-exact, pixel_values cos>0.9999. =0 restores the byte-identical HF CPU path.
 
 
 def _gpu_image_preprocess_enabled() -> bool:
@@ -1005,23 +980,11 @@ class Qwen3OmniModel(Model):
                     schedule.append(("prefill_vision", entry))
                     video_idx += 1
 
-        # Robustness guard: ``process_prompt`` ALWAYS emits the full
-        # ChatML-templated ``text_inputs`` (system turn + user turn +
-        # ``<|im_start|>assistant`` generation prompt), but the api_server only
-        # lists ``"text"`` in ``input_modalities`` when the *user* prompt string
-        # was non-empty (entrypoint.py gates it on ``if text:``). An empty user
-        # prompt on a speech request (e.g. greedy T2S/I2S/A2S with no caption)
-        # therefore arrives with ``text_inputs`` present yet ``"text"`` absent
-        # from ``input_modalities``, so the loop above appends no ``prefill_text``
-        # step and the schedule comes back empty. That empties the Thinker
-        # prefill schedule (``schedule[step]`` -> IndexError in
-        # ``_get_thinker_prefill_inputs``) AND makes the Talker expect zero
-        # ``thinker_states`` chunks (``num_thinker_prefill_steps == 0``), so no
-        # audio is ever produced. Guarantee every templated ``text_inputs`` tensor
-        # is prefilled regardless of the ``input_modalities`` listing. For normal
-        # requests ``text_idx`` already equals ``len(texts)`` here, so this is a
-        # no-op; the appended order (text after any audio/vision) matches the
-        # existing ``"audio,text"`` ordering the api_server already sends.
+        # Robustness guard: an empty user prompt (e.g. greedy T2S/I2S/A2S with no
+        # caption) arrives with templated text_inputs present but "text" absent from
+        # input_modalities, so the loop above schedules no prefill_text -> empty
+        # schedule (IndexError) and the Talker expects zero thinker_states. Prefill
+        # every templated text_inputs regardless; a no-op for normal requests.
         while text_idx < len(texts):
             schedule.append(("prefill_text", {"text_inputs": texts[text_idx]}))
             text_idx += 1
@@ -1466,17 +1429,10 @@ class Qwen3OmniModel(Model):
         messages = [
             {"role": "system", "content": system_text},
         ]
-        # FIX 1 (vLLM token parity): the OpenAI adapter's flatten_messages
-        # concatenates ALL message text -- including the client's system
-        # message -- into a single ``prompt`` blob, which we then re-wrap in
-        # our OWN system turn.  That double-counts the system text: M*'s user
-        # turn becomes [duplicated system text][instruction] whereas vLLM's
-        # stock chat template puts the system text ONLY in the system turn and
-        # leaves the user turn = [instruction].  Under MSTAR_VLLM_PROMPT_LAYOUT
-        # we strip a leading copy of the system text (plus the ``\n`` join
-        # flatten_messages inserts) from the prompt so the user turn is
-        # instruction-only and the rendered tokens match vLLM exactly.  Default
-        # OFF path is untouched (byte-identical).
+        # vLLM token parity: flatten_messages folds the system text into the prompt
+        # blob, which we re-wrap in our own system turn -> double-counted system text.
+        # Under MSTAR_VLLM_PROMPT_LAYOUT, strip the leading system-text copy so the
+        # user turn is instruction-only and tokens match vLLM. OFF path untouched.
         user_prompt = prompt
         if vllm_prompt_layout_enabled() and prompt is not None:
             for sep in ("\n", ""):

@@ -606,14 +606,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 device,
                 self.config.thinker.position_id_per_seconds,
             )
-            # FIX 2 (vLLM/HF M-RoPE parity): for AUDIO-ONLY input, HF's
-            # get_rope_index takes its ELSE branch (no vision grid) and assigns
-            # purely SEQUENTIAL position ids in all 3 M-RoPE dims -- so the
-            # audio span's height/width ramp with the temporal component.  M*'s
-            # get_rope_index_audio instead pins h/w to a constant (start_pos+1),
-            # which is the only place M*'s positions diverge from HF/vLLM.
-            # Under MSTAR_VLLM_PROMPT_LAYOUT, set h/w == temporal so the full
-            # 3D position_id tensor is byte-identical to HF get_rope_index.
+            # M-RoPE parity: M* pins audio h/w to a constant, HF ramps them with
+            # temporal. Under MSTAR_VLLM_PROMPT_LAYOUT, set h/w == temporal so the
+            # 3D position_ids are byte-identical to HF get_rope_index.
             from mstar.model.qwen3_omni.qwen3_omni_model import (
                 vllm_prompt_layout_enabled,
             )
@@ -671,11 +666,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
             # Sentinel token positions (text-like).
             start_pos_ids = get_rope_index_text(1, start_pos, device)
-            # Derive end_pos_base from the spatial grid on CPU instead of a GPU
-            # max-reduction over vision_pos_ids (which forces a device sync).
-            # Mirrors get_rope_index_vision: spatial max = max(llm_h-1, llm_w-1)
-            # + vstart; temporal max = vstart (still image) or
-            # (grid_t-1) * seconds_per_grid * position_id_per_seconds (video).
+            # Derive end_pos_base from the CPU grid (avoids a GPU max-reduction sync);
+            # mirrors get_rope_index_vision's spatial/temporal max.
             vstart = start_pos + 1
             sms = self.config.vision.spatial_merge_size
             _grid = grid_thw if grid_thw.dim() == 2 else grid_thw.unsqueeze(0)
@@ -917,14 +909,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
     # today. Costs ~4 captures × persistent FlashInfer wrappers + static
     # buffers for the 30B Thinker; revisit if memory becomes a constraint.
     _PREFILL_VISION_TOKEN_BUCKETS_BASE = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-    # The runner pads a request's vision-token count up to the smallest captured
-    # bucket >= it (cuda_graph_runner._get_padded_num_tokens). With the power-of-2
-    # base set, a single 512x512 image (post spatial-merge: 256 tokens + 2
-    # sentinels = 258) pads all the way to the 512 bucket — the Thinker then runs
-    # ~2x the attention/MLP work it needs for vision prefill. MSTAR_VISION_GRAPH_ALIGN=1
-    # inserts intermediate buckets in the dense low range so common image token
-    # counts pad to a tightly-fitting graph instead. 258 -> 320 (~24% slack)
-    # instead of 258 -> 512 (~99% slack). Costs a few extra bs=1 captures.
+    # Vision-token counts pad up to the smallest captured bucket. MSTAR_VISION_GRAPH_ALIGN=1
+    # adds intermediate low-range buckets so a 258-token image pads to 320 (~24% slack)
+    # instead of 512 (~99%), at the cost of a few extra bs=1 captures.
     _PREFILL_VISION_TOKEN_BUCKETS_ALIGNED = [
         128, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048, 4096, 8192, 16384,
     ]

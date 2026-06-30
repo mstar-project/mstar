@@ -1,5 +1,4 @@
 import logging
-import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -12,9 +11,6 @@ from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import WorkerGraphsManager
 
 logger = logging.getLogger(__name__)
-
-# (encoder-async pipelining was removed — it was opt-in, default-off, flaky, and
-# never used by the benchmarks. See git history if it needs to be revived.)
 
 
 @dataclass
@@ -82,7 +78,6 @@ class MicroScheduler:
     def _select_node_priority(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
     ):
-
         # Pick the node name with highest priority (lowest PRIORITY value)
         best_node_name = None
         best_priority = float("inf")

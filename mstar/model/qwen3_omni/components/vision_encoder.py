@@ -1,21 +1,9 @@
-"""Native Qwen3-Omni vision encoder (SigLIP2-style ViT + spatial merge + DeepStack).
+"""Native mstar reimplementation of Qwen3OmniMoeVisionEncoder (SigLIP2-style ViT + spatial merge + DeepStack).
 
-From-scratch mstar reimplementation of HF's ``Qwen3OmniMoeVisionEncoder`` whose
-submodule names mirror HF exactly, so
-``load_weights_from_hf_shards(..., prefix="thinker.visual")`` loads it unchanged.
-
-Why this exists: HF's vision encoder routes attention through the transformers
-FA2 wrapper, which is ~3.3 s/call for a single 728-patch image on H100 — the
-encoder is the TTFT bottleneck. The native blocks call ``flash_attn_varlen_func``
-directly (mirroring ``mstar/model/bagel/components/vit_encoder.py``), collapsing
-that to tens of ms, and multiple images batch naturally through ``cu_seqlens``.
-
-The deterministic, cheap (~10 ms) frontend index/position/cu_seqlens helpers are
-reused from transformers to guarantee identical patch ordering; the parity test
-checks pooler_output, every DeepStack level, and the post-merge token count.
-
-Output contract matches the HF wrapper's consumer (VisionEncoderSubmodule):
-``forward(...) -> (vision_embeds[merged_tokens, out_hidden], deepstack[list])``.
+Submodule names mirror HF so ``load_weights_from_hf_shards(..., prefix="thinker.visual")`` works unchanged.
+Uses ``flash_attn_varlen_func`` directly instead of the HF FA2 wrapper (~3.3 s/image on H100); multiple
+images batch via ``cu_seqlens``.
+Output: ``forward(...) -> (vision_embeds[merged_tokens, out_hidden], deepstack[list])``.
 """
 from __future__ import annotations
 
@@ -39,10 +27,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _VisionGraph:
-    """One captured block-loop graph for a fixed grid layout. ``cu_seqlens`` and
-    ``position_embeddings`` are retained so the storage the captured kernels read
-    outlives the graph; ``fi_state`` keeps the dedicated FlashInfer wrapper alive
-    (and never re-planned)."""
+    """Captured block-loop CUDA graph for one fixed grid layout (cu_seqlens, position_embeddings, fi_state kept alive)."""
     graph: "torch.cuda.CUDAGraph"
     static_x: torch.Tensor
     out_merged: torch.Tensor
@@ -78,17 +63,9 @@ class VisionRotaryEmbedding(nn.Module):
 
 
 class VisionPatchEmbed(nn.Module):
-    """Patch embedding. Weight is stored as a Conv3d (matching HF's
-    ``patch_embed.proj`` so checkpoints load unchanged), but because
-    kernel==stride==patch size the convolution is exactly a per-patch linear
-    projection. We compute it as an ``F.linear`` matmul instead of nn.Conv3d:
-    cuDNN's *low-precision* Conv3d for this (kernel==stride) shape is
-    pathologically slow — measured ~3.2 s/image bf16 on H100, vs ~0.2 ms for the
-    same conv in fp32 and ~40 us for this matmul — and is the dominant cost of
-    the HF vision encoder. The matmul is exact in fp32; in bf16 it differs from
-    the Conv3d only by accumulation-order rounding (<=~1.6e-2 per element), which
-    the parity test bounds end-to-end (see qwen3_omni_encoder_parity.py for the
-    per-layer profile).
+    """Patch embedding; weight stored as Conv3d to match HF checkpoint layout.
+    F.linear is used instead: cuDNN bf16 Conv3d is ~3.2 s/image on H100 for kernel==stride shapes;
+    the equivalent matmul is ~40 us.
     """
 
     def __init__(self, config):
@@ -101,8 +78,6 @@ class VisionPatchEmbed(nn.Module):
         self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=ks, stride=ks, bias=True)
 
     def forward(self, x):
-        # x: (num_patches, C*tT*pH*pW) already flattened in [C, tT, pH, pW] order,
-        # which matches Conv3d weight flattening exactly.
         w = self.proj.weight.reshape(self.embed_dim, -1)
         x = x.reshape(-1, w.shape[1]).to(w.dtype)
         return torch.nn.functional.linear(x, w, self.proj.bias)
@@ -193,10 +168,7 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
             for _ in range(len(config.deepstack_visual_indexes))
         ])
 
-        # CUDA-graph capture state for the block-loop tail. One captured graph
-        # per distinct grid layout (keyed on seq_len + cu_seqlens). Opt-in via
-        # MSTAR_ENCODER_CUDA_GRAPH=1; only legal with the FlashInfer varlen
-        # backend (SDPA's data-dependent mask build is not capture-safe).
+        # CUDA-graph cache: one graph per grid layout. Requires FlashInfer backend (SDPA not capture-safe).
         self._cg_cache: dict = {}
         self._cg_max_keys = int(os.environ.get("MSTAR_ENCODER_CG_MAX_KEYS", "16"))
         self._cg_warmed = False
@@ -208,10 +180,7 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         return AE._FLASHINFER_AVAILABLE and AE._VARLEN_BACKEND == "flashinfer"
 
     def _block_loop_tail(self, hidden_states, cu_seqlens, max_seqlen, position_embeddings):
-        """The expensive, capture-legal region: block loop + DeepStack mergers +
-        final merger. ``cu_seqlens``/``max_seqlen``/``position_embeddings`` depend
-        only on ``grid_thw`` (the spatial layout), so for a fixed layout they are
-        constants and this whole region is replayable as one CUDA graph."""
+        """Block loop + DeepStack mergers + final merger; constants for a fixed grid_thw, replayable as a CUDA graph."""
         deepstack_features = []
         for i, blk in enumerate(self.blocks):
             hidden_states = blk(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
@@ -222,18 +191,13 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         return merged, deepstack_features
 
     def _capture_graph(self, key, hidden_states, cu_seqlens, max_seqlen, position_embeddings):
-        """Capture ``_block_loop_tail`` for one grid-layout ``key`` with a
-        dedicated FlashInfer wrapper (planned once, never re-planned). Returns a
-        ``_VisionGraph`` or None if capture failed (caller then runs eager)."""
+        """Capture _block_loop_tail for grid-layout key; returns _VisionGraph or None on failure (caller falls back to eager)."""
         import mstar.model.qwen3_omni.components.audio_encoder as AE
         dev = hidden_states.device
         fi_state = AE.make_fi_state(dev)
         if fi_state is None:
             return None
-        # Each captured key gets its OWN private graph pool. Sharing one pool
-        # across lazily-captured keys trips the caching allocator's
-        # ``use_count > 0`` assert because the earlier key's static buffers are
-        # still live in the pool when the next capture_begin runs.
+        # Each key gets its own graph pool; sharing trips the allocator's use_count assert.
         static_x = hidden_states.clone()
         AE.set_fi_override(fi_state)
         graph = torch.cuda.CUDAGraph()
@@ -250,10 +214,7 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         except Exception:
             logger.warning("vision encoder CUDA-graph capture failed for key=%s; "
                            "falling back to eager", key, exc_info=True)
-            # A capture that throws inside capture_begin/capture can leave the
-            # current stream stuck in capture mode (so later eager ops fail with
-            # "Offset increment outside graph capture"). Reset the device's
-            # capture state defensively.
+            # Capture failure can leave the stream in capture mode; synchronize to reset.
             try:
                 torch.cuda.synchronize(dev)
             except Exception:
@@ -261,21 +222,13 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
             return None
         finally:
             AE.set_fi_override(None)
-        # Keep cu_seqlens / position_embeddings alive: the captured kernels read
-        # them, so their storage must outlive the graph.
+        # cu_seqlens/position_embeddings must outlive the graph (captured kernels read them).
         return _VisionGraph(
             graph=graph, static_x=static_x, out_merged=merged, out_deepstack=deepstack,
             cu_seqlens=cu_seqlens, position_embeddings=position_embeddings, fi_state=fi_state)
 
     def _maybe_cg_warmup(self, pixel_values, grid_thw):
-        """Pre-capture graphs for all configured batch sizes BEFORE serving, so
-        lazy capture never lands inside a measured request. Triggered once, on
-        the first forward, when MSTAR_ENCODER_CG_WARMUP is a comma list of batch
-        sizes (e.g. "1,4,8,16,32"). Uses the first image of the current request
-        as the per-image template and replicates it to each batch size -- valid
-        because the graph key is the grid layout, identical across images. The
-        cost (a handful of encoder forwards) is paid once at startup instead of
-        repeatedly in the hot path."""
+        """Pre-capture CUDA graphs for configured batch sizes (MSTAR_ENCODER_CG_WARMUP) on first forward."""
         if self._cg_warmed:
             return
         self._cg_warmed = True
@@ -321,9 +274,7 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
 
         if self._cuda_graph_enabled():
-            # Key on the exact varlen layout: same key => identical cu_seqlens /
-            # position_embeddings, so the captured graph is valid. Pixel values
-            # only enter via ``hidden_states``, which we copy into the static buf.
+            # Same key => identical cu_seqlens/position_embeddings; pixel values enter via hidden_states copy.
             key = (int(seq_len), tuple(cu_seqlens.tolist()))
             vg = self._cg_cache.get(key)
             if vg is None and len(self._cg_cache) < self._cg_max_keys:
