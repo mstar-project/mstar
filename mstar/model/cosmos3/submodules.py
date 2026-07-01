@@ -1445,7 +1445,13 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae_dtype, device=latents.device)).view(
             1, -1, 1, 1, 1
         )
-        z = latents.to(vae_dtype) / inv_std + mean
+        # Force z to the VAE dtype. An outer autocast(enabled=True) context is
+        # active during this forward and promotes the `1.0 / std` division to
+        # fp32, which would silently make z fp32 even though latents/mean/vae_dtype
+        # are all bf16 -> the bf16 VAE conv3d below (run under autocast-off) would
+        # then hit "Input type (float) and bias type (BFloat16)". The explicit cast
+        # is a no-op for the fp32 path (S1) and unblocks bf16 decode (cuDNN >= 9.16).
+        z = (latents.to(vae_dtype) / inv_std + mean).to(vae_dtype)
         _prof = os.environ.get("COSMOS3_PROFILE")
         if _prof:
             _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
