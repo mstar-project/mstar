@@ -168,6 +168,7 @@ class Cosmos3Model(Model):
                 head_dim=self.config.head_dim,
                 max_seq_len=self.config.max_position_embeddings,
                 num_qo_heads=self.config.num_attention_heads,
+                dense_gen_attn=True,
             )
         ]
 
@@ -184,7 +185,8 @@ class Cosmos3Model(Model):
         # between nodes stay replicated (empty shard_dim) — the sharding is
         # in-module, Megatron-style. The VAE decoder runs un-sharded on one rank.
         return ShardingConfig(
-            groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={}
+            groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={},
+            sp_enabled_nodes={DIT_NODE},
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -243,7 +245,7 @@ class Cosmos3Model(Model):
                                 GraphEdge(next_node=DIT_NODE, name="latents"),
                                 GraphEdge(next_node=DIT_NODE, name="time_index"),
                             ],
-                            enable_async_scheduling=False,
+                            enable_async_scheduling=True,
                         ),
                         max_iters=self.config.max_inference_steps,
                         outputs=[
@@ -282,7 +284,7 @@ class Cosmos3Model(Model):
                             GraphEdge(next_node=DIT_NODE, name="action_latents"),
                             GraphEdge(next_node=DIT_NODE, name="time_index"),
                         ],
-                        enable_async_scheduling=False,
+                        enable_async_scheduling=True,
                     ),
                     max_iters=self.config.max_inference_steps,
                     # The loop's terminal output is matched into the section by
@@ -318,7 +320,7 @@ class Cosmos3Model(Model):
                             GraphEdge(next_node=DIT_NODE, name="action_latents"),
                             GraphEdge(next_node=DIT_NODE, name="time_index"),
                         ],
-                        enable_async_scheduling=False,
+                        enable_async_scheduling=True,
                     ),
                     max_iters=self.config.max_inference_steps,
                     outputs=[
@@ -434,49 +436,67 @@ class Cosmos3Model(Model):
             return buf.getvalue()
         if modality == "video":
             import os
-            import tempfile
-
-            from torchvision.io import write_video
+            import time as _time
 
             # The decoder emits 8-bit frames [B, C, T, H, W]; encode all of them as
             # an H.264 mp4. The frames already reflect the request fps (it modulates
             # the temporal positions during generation); the container plays back
             # at the model's default fps.
+            #
+            # CRF 18 keeps the H.264 output near-visually-lossless; libx264
+            # otherwise defaults to 23, which is visibly lossier. The "ultrafast"
+            # preset and multithreading (threads=0) target the same CRF/quality
+            # but encode several times faster than libx264's default "medium"
+            # preset, which otherwise dominates the serving latency for a
+            # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
             x = output[0] if output.ndim == 5 else output  # [C, T, H, W] uint8
             _prof = os.environ.get("COSMOS3_PROFILE")
-            import time as _time
+            fps = self.config.fps
+            preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
             _vt0 = _time.perf_counter()
-            frames = x.permute(1, 2, 3, 0).cpu()  # [T, H, W, C] uint8
-            _vt1 = _time.perf_counter()
-            fd, path = tempfile.mkstemp(suffix=".mp4")
-            os.close(fd)
             try:
-                # CRF 18 keeps the H.264 output near-visually-lossless; libx264
-                # otherwise defaults to 23, which is visibly lossier. The "ultrafast"
-                # preset and multithreading (threads=0) target the same CRF/quality
-                # but encode several times faster than libx264's default "medium"
-                # preset, which otherwise dominates the serving latency for a
-                # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
-                write_video(
-                    path,
-                    frames,
-                    fps=self.config.fps,
-                    video_codec="libx264",
-                    options={
-                        "crf": "18",
-                        "preset": os.environ.get("COSMOS3_X264_PRESET", "ultrafast"),
-                        "threads": "0",
-                    },
+                # Preferred: torchcodec (torchvision >= 0.27 removed write_video).
+                from torchcodec.encoders import VideoEncoder
+
+                frames = x.permute(1, 0, 2, 3).contiguous().cpu()  # [T, C, H, W] uint8
+                _vt1 = _time.perf_counter()
+                encoded = VideoEncoder(frames, frame_rate=fps).to_tensor(
+                    "mp4",
+                    codec="libx264",
+                    crf=18,
+                    preset=preset,
+                    extra_options={"threads": "0"},
                 )
-                with open(path, "rb") as f:
-                    data = f.read()
-                if _prof:
-                    print(f"COSMOS3_PROFILE mp4 d2h={1000 * (_vt1 - _vt0):.1f}ms "
-                          f"encode={1000 * (_time.perf_counter() - _vt1):.1f}ms frames={frames.shape[0]} "
-                          f"bytes={len(data)}", flush=True)
-                return data
-            finally:
-                os.remove(path)
+                data = encoded.numpy().tobytes()
+            except ImportError:
+                # Fallback for environments without torchcodec (or with the
+                # older decode-only torchcodec that lacks VideoEncoder), where
+                # torchvision still ships write_video.
+                import tempfile
+
+                from torchvision.io import write_video
+
+                frames = x.permute(1, 2, 3, 0).cpu()  # [T, H, W, C] uint8
+                _vt1 = _time.perf_counter()
+                fd, path = tempfile.mkstemp(suffix=".mp4")
+                os.close(fd)
+                try:
+                    write_video(
+                        path,
+                        frames,
+                        fps=fps,
+                        video_codec="libx264",
+                        options={"crf": "18", "preset": preset, "threads": "0"},
+                    )
+                    with open(path, "rb") as f:
+                        data = f.read()
+                finally:
+                    os.remove(path)
+            if _prof:
+                print(f"COSMOS3_PROFILE mp4 d2h={1000 * (_vt1 - _vt0):.1f}ms "
+                      f"encode={1000 * (_time.perf_counter() - _vt1):.1f}ms frames={frames.shape[0]} "
+                      f"bytes={len(data)}", flush=True)
+            return data
         if modality == "action":
             # The predicted action latents [1, chunk, action_dim] -> [chunk,
             # action_dim] float32 bytes. Columns beyond the request's
@@ -522,6 +542,7 @@ class Cosmos3Model(Model):
                 width, height = int(sw), int(sh)
             except ValueError:
                 pass
+        
         # A video request without an explicit frame count gets the video default
         # (>1); image requests stay single-frame.
         default_frames = (
@@ -546,6 +567,7 @@ class Cosmos3Model(Model):
             "guidance_scale": float(mk.get("guidance_scale", 6.0)),
             "num_inference_steps": steps,
             "has_image_condition": "image" in (input_modalities or []),
+            "use_karras_sigma": mk.get("use_karras_sigmas"),
         }
         # Text-to-image (single frame, no visual conditioning) follows the
         # reference Cosmos3 t2i recipe: classifier-free guidance only on the
@@ -688,24 +710,26 @@ class Cosmos3Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None,
+        autocast_dtype: torch.dtype | None = None, sp_group=None,
     ) -> torch.nn.Module | None:
         # autocast_dtype is accepted for interface parity (the engine manager
         # passes it to every model). Cosmos3 already casts the meta module to
         # bf16 before to_empty in _build_transformer, so params are allocated
         # directly in the checkpoint dtype and the hint is redundant here.
+        # sp_group is the DiT's sequence-parallel comm group (trivial unless the
+        # config sets sp_size > 1); it is orthogonal to the tp_group.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group)
+        submodule = self._create_submodule(node_name, device, tp_group, sp_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Cosmos3 submodule for %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str, tp_group=None):
+    def _create_submodule(self, node_name: str, device: str, tp_group=None, sp_group=None):
         if node_name == DIT_NODE:
             return Cosmos3DiTSubmodule(
-                transformer=self._build_transformer(device, tp_group=tp_group),
+                transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
                 config=self.config,
                 scheduler=self._build_scheduler(),
                 vae=self._build_vae(device),
@@ -723,7 +747,7 @@ class Cosmos3Model(Model):
 
         return UniPCMultistepScheduler.from_pretrained(str(self._ensure_repo() / "scheduler"))
 
-    def _build_transformer(self, device: str, tp_group=None):
+    def _build_transformer(self, device: str, tp_group=None, sp_group=None):
         from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
         from mstar.model.cosmos3.loader import load_transformer_weights
 
@@ -735,7 +759,7 @@ class Cosmos3Model(Model):
         # meta default; the engine additionally runs the forward under a bf16
         # autocast (a no-op here).
         with torch.device("meta" if not self.skip_weight_loading else "cpu"):
-            model = Cosmos3OmniTransformer(self.config, comm_group=tp_group)
+            model = Cosmos3OmniTransformer(self.config, comm_group=tp_group, sp_group=sp_group)
         model = model.to(torch.bfloat16)
         if self.skip_weight_loading:
             return model.to_empty(device=device)

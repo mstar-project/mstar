@@ -44,23 +44,53 @@ class WorkerGraph:
 
     ranks: list[int] = field(default_factory=list)
     tp_size: int = 1
+    sp_size: int = 1
 
-    # each element of the outer list is a tensor-parallel group; populated
-    # in __post_init__ from ``ranks`` chunked by ``tp_size``.
+    # ``ranks`` form a 2D [sp_size, tp_size] mesh per instance (instances tile
+    # for data parallelism). ``_tp_ranks`` are the mesh rows (tensor-parallel
+    # comm groups: sharded heads/weights, all-reduce); ``_sp_ranks`` are the
+    # columns (sequence-parallel comm groups: Ulysses all-to-all);
+    # ``_instance_ranks`` are the whole instances (the conductor's lockstep
+    # routing unit — every rank of an instance runs a request together). With
+    # sp_size==1 this reduces to the old ``ranks`` chunked by ``tp_size``
+    # (trivial SP groups; instance == TP row). ``tp_size`` is rewritten in
+    # __post_init__ to the instance size (tp*sp) so the conductor — which models
+    # a parallel group as its lockstep unit — routes to the whole instance; the
+    # original per-axis degrees live in ``_tp_comm_size`` and ``sp_size``.
     _tp_ranks: list[list[int]] = field(default_factory=list)
+    _sp_ranks: list[list[int]] = field(default_factory=list)
+    _instance_ranks: list[list[int]] = field(default_factory=list)
+    _tp_comm_size: int = 1
     _group_id: int = field(default=-1)  # original index into config's node_groups
     worker_graph_id: str = field(default_factory=lambda: str(uuid4()))
 
     def __post_init__(self):
-        if self.tp_size > 1 and not self._tp_ranks:
-            assert len(self.ranks) % self.tp_size == 0, (
+        if (self.tp_size > 1 or self.sp_size > 1) and not self._tp_ranks:
+            tp = self.tp_size  # tensor-parallel (row / all-reduce) degree
+            sp = self.sp_size  # sequence-parallel (all-to-all) degree
+            inst = tp * sp
+            assert len(self.ranks) % inst == 0, (
                 f"WorkerGraph {self.worker_graph_id} has {len(self.ranks)} ranks; "
-                f"not divisible by tp_size {self.tp_size}."
+                f"not divisible by tp_size*sp_size ({tp}*{sp}={inst})."
             )
-            self._tp_ranks = [
-                self.ranks[i:i + self.tp_size]
-                for i in range(0, len(self.ranks), self.tp_size)
-            ]
+            tp_ranks: list[list[int]] = []
+            sp_ranks: list[list[int]] = []
+            instance_ranks: list[list[int]] = []
+            for base in range(0, len(self.ranks), inst):
+                block = self.ranks[base:base + inst]
+                instance_ranks.append(block)
+                # row-major [sp][tp] grid over this instance's ranks
+                grid = [block[s * tp:(s + 1) * tp] for s in range(sp)]
+                tp_ranks += grid  # rows: vary tp within fixed sp
+                sp_ranks += [
+                    [grid[s][t] for s in range(sp)] for t in range(tp)
+                ]  # columns: vary sp within fixed tp
+            self._tp_ranks = tp_ranks
+            self._sp_ranks = sp_ranks
+            self._instance_ranks = instance_ranks
+            self._tp_comm_size = tp
+            # Conductor routes to the lockstep unit (the whole instance).
+            self.tp_size = inst
 
 
 def _combine_sections_sequential_or_parallel(
@@ -103,6 +133,7 @@ def _divide_into_worker_graphs(
                 _group_id=group_idx,
                 ranks=ng["ranks"],
                 tp_size=ng.get("tp_size", 1),
+                sp_size=ng.get("sp_size", 1),
             )
         ]
 
@@ -273,24 +304,42 @@ class Model(ABC):
         # the separate "sharding_config" section just holds shard_dim.
         groups: list[ShardingGroup] = []
         for ng in config.get("node_groups", []):
-            if ng.get("tp_size", 1) <= 1:
+            tp = ng.get("tp_size", 1)
+            sp = ng.get("sp_size", 1)
+            instance_size = tp * sp
+            if instance_size <= 1:
                 continue
-            if any(
+            if tp > 1 and any(
                 node not in sharding_config.tp_enabled_nodes
                 for node in ng["node_names"]
             ):
                 raise ValueError(
-                    f"Node group with tp_size {ng['tp_size']} contains "
+                    f"Node group with tp_size {tp} contains "
                     f"nodes not in tp_enabled_nodes {sharding_config.tp_enabled_nodes}: "
                     f"{ng['node_names']}"
                 )
+            if sp > 1 and any(
+                node not in sharding_config.sp_enabled_nodes
+                for node in ng["node_names"]
+            ):
+                raise ValueError(
+                    f"Node group with sp_size {sp} contains "
+                    f"nodes not in sp_enabled_nodes {sharding_config.sp_enabled_nodes}: "
+                    f"{ng['node_names']}"
+                )
+            # The sharding group is the lockstep unit — tp*sp workers routed
+            # together. TP shards weights via shard_dim-driven fanout; SP is
+            # in-module (replicated signals, no shard_dim) but its ranks must
+            # still run each request together, so the group spans the whole
+            # instance.
             groups.append(ShardingGroup(
                 nodes=set(ng["node_names"]),
-                tp_size=ng["tp_size"],
+                tp_size=instance_size,
                 graph_walks=set(ng["graph_walks"]) if "graph_walks" in ng else None,
             ))
 
         sharding_config.groups = groups
+
         sharding_config_yaml = config.get("sharding_config")
         if sharding_config_yaml is not None and "shard_dim" in sharding_config_yaml:
             sharding_config.shard_dim.update(sharding_config_yaml["shard_dim"])
@@ -417,7 +466,7 @@ class Model(ABC):
     @abstractmethod
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None,
+        autocast_dtype: torch.dtype | None = None, sp_group=None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
 
@@ -426,6 +475,12 @@ class Model(ABC):
         Models that support tensor parallelism should forward it to
         parallel-linear constructors so weight shapes are partitioned at
         init time and the weight loaders shard correctly.
+
+        ``sp_group`` is the node's sequence-parallel comm group, orthogonal
+        to ``tp_group``. The engine manager only passes it when the node
+        participates in a non-trivial SP group, so models without SP support
+        never receive it. Models that support SP forward it to their
+        attention so it can all-to-all the sequence around the kernel.
 
         ``autocast_dtype`` is the dtype this node's params should be
         allocated in. Models that build on the meta device must cast the

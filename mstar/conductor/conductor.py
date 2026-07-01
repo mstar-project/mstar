@@ -268,7 +268,11 @@ class Conductor:
                         f"but its sharding group has tp_size {group.tp_size}. "
                         f"node_groups and sharding_config disagree."
                     )
-                    for ranks in wg._tp_ranks:
+                    # tp_rank here is the worker's index within the lockstep
+                    # instance (0..tp*sp-1), used by the replicated-signal fanout
+                    # (so exactly one rank — index 0 — forwards a replicated
+                    # tensor to a downstream node).
+                    for ranks in wg._instance_ranks:
                         for i, r in enumerate(ranks):
                             self.worker_tp_group_to_tp_rank.setdefault(r, {})[group_key] = i
 
@@ -426,11 +430,15 @@ class Conductor:
         group_id_to_replica_idx: dict[int, int] = {}
         result = {}
         for wg_id, wg in self.worker_graphs.items():
-            if wg._tp_ranks:
+            if wg._instance_ranks:
+                # Route to a whole instance (the lockstep unit): every rank of a
+                # tp*sp instance runs the request together, so its TP all-reduce
+                # and SP all-to-all collectives stay in sync. Picking a single TP
+                # row here would desync the SP all-to-all across rows.
                 replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg._tp_ranks)),
+                    wg._group_id, np.random.randint(len(wg._instance_ranks)),
                 )
-                ranks = wg._tp_ranks[replica_idx]
+                ranks = wg._instance_ranks[replica_idx]
                 result[wg_id] = [f"worker_{r}" for r in ranks]
             else:
                 replica_idx = group_id_to_replica_idx.setdefault(

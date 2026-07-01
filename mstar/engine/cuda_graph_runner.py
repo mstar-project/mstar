@@ -81,6 +81,7 @@ class PiecewiseGraphData:
 class CudaGraphData:
     config: CudaGraphConfig
     bs: int
+    index: int
     # One CudaGraphSlot per double-buffer slot. Always length NUM_SLOTS.
     # Each slot has its own captured graph + persistent FlashInfer wrappers
     # so plan(N+1) on slot[(s+1)%2] runs concurrent with replay(N) on slot[s].
@@ -197,6 +198,12 @@ class CudaGraphRunner:
         # the canonical pattern; the cuda_graph memory_pool + largest-first
         # capture order keep the slice views' addresses stable across replays.
         self.shared_static_buffers: dict[tuple[int, str], torch.Tensor] = {}
+        # (config_idx, tensor_key) → the dim that carries the (bucket-varying)
+        # seq length in that tensor's ORIGINAL layout. _intern_static_buffer
+        # brings this dim to the front for storage (so smaller buckets reslice
+        # along dim 0) and inverts the move on return; the replay copy reads it
+        # back to slice the right dim. 0 for the common seq-leading case.
+        self._static_buffer_seq_dims: dict[tuple[int, str], int] = {}
         # Sum of bytes that WOULD have been allocated by per-capture clones
         # (one full tensor per call) — incremented on every _intern_static_buffer
         # call. Compared against the actual shared-buffer footprint at the end
@@ -377,10 +384,23 @@ class CudaGraphRunner:
             for label in config.labels:
                 self.alloc_manager.reset_label(rid, label, free=True)
 
+    @staticmethod
+    def _seq_dim(value: torch.Tensor, seq_len: int) -> int:
+        """Index of the first dim whose size matches ``seq_len``, else 0.
+
+        Used to bring the (bucket-varying) seq dim to the front for shared-buffer
+        interning: most inputs are seq-leading (returns 0), but mrope-style ids
+        carry seq in a later dim (e.g. ``[3, seq]`` → 1)."""
+        for dim, size in enumerate(value.shape):
+            if size == seq_len:
+                return dim
+        return 0
+
     def _intern_static_buffer(
         self, config_idx: int, key: str, value: torch.Tensor,
+        seq_len: int | None = None,
     ) -> torch.Tensor:
-        """Return a leading-dim slice view into the shared buffer for (config_idx, key).
+        """Return a slice view into the shared buffer for (config_idx, key).
 
         Allocates the shared buffer at ``value``'s shape on first encounter
         — relies on ``warmup_and_capture``'s largest-first iteration
@@ -391,28 +411,33 @@ class CudaGraphRunner:
         buckets cost one max-shape allocation per tensor instead of one full
         clone per bucket.
 
-        Trailing dims (everything past dim 0) must match between the shared
-        buffer and ``value`` — the bucket varies the leading dim only. A
-        mismatch is a design-level surprise (a tensor whose shape depends on
-        bs in a non-leading way), so we hard-fail with a precise message.
+        When ``seq_len`` is given and the bucket-varying dim is not already dim 0
+        (e.g. mrope ids ``[3, seq]``), that dim is moved to the front for storage
+        and the returned view is moved back so the captured forward still sees the
+        original layout. The seq dim is recorded so the replay copy slices it too.
+        Trailing dims of the stored (seq-leading) tensor must match the shared
+        buffer — a mismatch is a design-level surprise, so we hard-fail.
         """
         buf_key = (config_idx, key)
+        seq_dim = self._seq_dim(value, seq_len) if seq_len is not None else 0
+        self._static_buffer_seq_dims[buf_key] = seq_dim
+        stored = value.movedim(seq_dim, 0) if seq_dim != 0 else value
         shared = self.shared_static_buffers.get(buf_key)
         if shared is None:
-            shared = torch.empty(value.shape, dtype=value.dtype, device=value.device)
+            shared = torch.empty(stored.shape, dtype=stored.dtype, device=stored.device)
             self.shared_static_buffers[buf_key] = shared
-        self._capture_clone_bytes_naive += value.numel() * value.element_size()
-        leading = value.shape[0]
-        if leading > shared.shape[0] or value.shape[1:] != shared.shape[1:]:
+        self._capture_clone_bytes_naive += stored.numel() * stored.element_size()
+        leading = stored.shape[0]
+        if leading > shared.shape[0] or stored.shape[1:] != shared.shape[1:]:
             raise RuntimeError(
                 f"_intern_static_buffer: capture for key={key!r} (config_idx={config_idx}) "
-                f"requires shape {tuple(value.shape)} but shared buffer is "
+                f"requires (seq-leading) shape {tuple(stored.shape)} but shared buffer is "
                 f"{tuple(shared.shape)} — captures should be ordered largest-first "
                 "by leading dim with matching trailing dims"
             )
         sliced = shared[:leading]
-        sliced.copy_(value)
-        return sliced
+        sliced.copy_(stored)
+        return sliced.movedim(0, seq_dim) if seq_dim != 0 else sliced
 
     def _create_cache_mgr_and_dummy_engine_inputs(
         self, dummy_rids, plan_states,
@@ -464,6 +489,18 @@ class CudaGraphRunner:
         seq_lens[0] += total_tokens % bs
         return seq_lens
 
+    def _split_seq_lens_across_labels(
+        self, bs: int, total_tokens: int, labels: list[str],
+    ) -> dict[str, list[int]]:
+        """Distribute total_tokens across every (label, request) entry so the
+        combined per-label seq_lens sum to total_tokens — the layout a batched-CFG
+        capture needs (one packed sequence covering all labels)."""
+        n = len(labels) * bs
+        per = total_tokens // n
+        seq_lens = {label: [per] * bs for label in labels}
+        seq_lens[labels[0]][0] += total_tokens - per * n
+        return seq_lens
+
     def _build_slot_from_capture(
         self, output, graph, static_inputs, cache_manager,
     ) -> CudaGraphSlot:
@@ -491,6 +528,7 @@ class CudaGraphRunner:
         key: CudaGraphKey,
         config: CudaGraphConfig,
         bs: int,
+        index: int,
         slots: list[CudaGraphSlot],
         applied_penalty_in_graph: bool=False
     ) -> None:
@@ -515,6 +553,7 @@ class CudaGraphRunner:
             self.graphs[lookup_key] = CudaGraphData(
                 config=config,
                 bs=bs,
+                index=index,
                 slots=slots,
                 next_slot=0,
                 applied_penalty_in_graph=applied_penalty_in_graph
@@ -525,6 +564,7 @@ class CudaGraphRunner:
         key: CudaGraphKey,
         config: CudaGraphConfig,
         submodule: ARNodeSubmodule,
+        index: int,
         prepare_slot: Callable[[int], _SlotCaptureSpec],
     ) -> None:
         """Drive the per-slot warmup + capture loop for one (config, bs) bucket.
@@ -604,7 +644,8 @@ class CudaGraphRunner:
 
             self._register_graph_data(
                 key=key, config=config, bs=key.bs, slots=captured_slots,
-                applied_penalty_in_graph=applied_penalty_in_graph
+                applied_penalty_in_graph=applied_penalty_in_graph,
+                index=index
             )
         finally:
             for rids in dummy_rids_to_free:
@@ -625,12 +666,19 @@ class CudaGraphRunner:
         template_dict = config.num_token_to_inputs[key.num_tokens]
         config_idx = self.capture_configs.index(config)
         seq_lens = self._make_dummy_seq_lens(bs, key.num_tokens)
+        # Batched CFG packs all labels into one combined sequence, so the bucket's
+        # num_tokens is the combined (cond+uncond) length — split it back across
+        # (label, request) so the dummy plan's per-label seq_lens sum to it.
+        cfg_seq_lens = (
+            self._split_seq_lens_across_labels(bs, key.num_tokens, config.labels)
+            if config.batched_cfg else None
+        )
 
         def prepare_slot(slot_idx: int) -> _SlotCaptureSpec:
             dummy_rids = self._make_dummy_rids(config, bs, slot_idx)
 
             templates = {
-                k: (self._intern_static_buffer(config_idx, k, v)
+                k: (self._intern_static_buffer(config_idx, k, v, seq_len=key.num_tokens)
                     if isinstance(v, torch.Tensor) else v)
                 for k, v in template_dict.items()
             }
@@ -644,6 +692,22 @@ class CudaGraphRunner:
             cache_manager = engine_inputs.cache_manager
 
             def plan_attention() -> None:
+                if config.batched_cfg:
+                    # One combined plan over all labels (the _cfg_batched plan
+                    # state + wrapper the batched-CFG forward looks up). Mirrors
+                    # the submodule's eager preprocess so capture and replay plan
+                    # the same wrapper.
+                    cache_manager.plan_attention_batched_cfg(
+                        labels=config.labels,
+                        seq_lens=cfg_seq_lens,
+                        is_causal=config.causal_attention,
+                        write_store=False,
+                    )
+                    cache_manager.plan_rope_batched_cfg(
+                        labels=config.labels,
+                        seq_lens=cfg_seq_lens,
+                    )
+                    return
                 for label in config.labels:
                     cache_manager.plan_attention(
                         seq_lens=seq_lens,
@@ -675,6 +739,7 @@ class CudaGraphRunner:
 
         self._capture_slots(
             key=key, config=config, submodule=submodule, prepare_slot=prepare_slot,
+            index=config_idx,
         )
 
 
@@ -758,6 +823,7 @@ class CudaGraphRunner:
 
         self._capture_slots(
             key=key, config=config, submodule=submodule, prepare_slot=prepare_slot,
+            index=config_idx
         )
 
     def can_run(
@@ -1577,12 +1643,17 @@ class CudaGraphRunner:
             # --- Step 3: Copy real packed tensors into static buffers ---
             if self.enable_nvtx:
                 range_push("cg.copy_inputs", synchronize=False)
+            config_idx = self.capture_configs.index(graph_data.config)
             for k in static_input_keys:
                 real_val = real_packed.get(k)
                 if real_val is None or not isinstance(real_val, torch.Tensor):
                     continue
                 static_buf = templates[k]
-                static_buf[:real_val.shape[0]].copy_(real_val)
+                # Slice the same (possibly non-leading) seq dim _intern_static_buffer
+                # recorded for this key, so mrope-style [.., seq, ..] inputs land in
+                # the right axis of the original-layout view.
+                seq_dim = self._static_buffer_seq_dims.get((config_idx, k), 0)
+                static_buf.narrow(seq_dim, 0, real_val.shape[seq_dim]).copy_(real_val)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
                 range_pop(synchronize=False)
@@ -1619,9 +1690,15 @@ class CudaGraphRunner:
             # same tail pages every step, so they opt out of the advance (it would
             # grow the prefix across steps and corrupt attention).
             if graph_data.config.advance_seq_lens:
-                for label in config_labels:
-                    static_cm.set_active_label(label)
+                if graph_data.config.batched_cfg:
+                    # _batched_cfg_info (set by the preprocess plan above) makes a
+                    # single advance_seq_lens walk every label's state; looping
+                    # per label would advance each one once per label.
                     static_cm.advance_seq_lens()
+                else:
+                    for label in config_labels:
+                        static_cm.set_active_label(label)
+                        static_cm.advance_seq_lens()
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 

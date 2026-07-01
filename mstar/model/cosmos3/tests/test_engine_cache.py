@@ -350,8 +350,9 @@ def _check_dense_fa3(num_frames, tag):
     if ctx is None:
         print(f"  (skipped {tag} dense-FA3 parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
-    had = os.environ.pop("COSMOS3_DENSE_FA3", None)
+    had = os.environ.get("COSMOS3_DENSE_FA3")
     try:
+        os.environ["COSMOS3_DENSE_FA3"] = "0"  # paged baseline (cosmos3 config defaults dense on)
         cm = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"])
         lat_paged = _run_cache_once(
             ctx["model"], ctx["dit"], cm, ctx["init"], ctx["cond"], ctx["uncond"],

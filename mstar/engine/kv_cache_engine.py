@@ -118,13 +118,26 @@ class KVCacheEngine(BaseEngine):
             tp_ranks = set([
                 tp_groups.get_tp_config_for_node(node).rank for node in nodes
             ])
-            if len(world_sizes) > 1 or len(tp_ranks) > 1:
+            sp_sizes = set([
+                tp_groups.get_sp_config_for_node(node).world_size for node in nodes
+            ])
+            sp_ranks = set([
+                tp_groups.get_sp_config_for_node(node).rank for node in nodes
+            ])
+            if (
+                len(world_sizes) > 1 or len(tp_ranks) > 1
+                or len(sp_sizes) > 1 or len(sp_ranks) > 1
+            ):
                 raise RuntimeError(
                     "It is disallowed to share a KV cache among colocated nodes "
-                    f"from different TP groups: {nodes}."
+                    f"from different TP/SP groups: {nodes}."
                 )
             tp_size = world_sizes.pop()
-            cfg.shard(tp_size)
+            sp_size = sp_sizes.pop()
+            # Ulysses sequence parallelism makes attention run at effective
+            # head-degree tp*sp (the all-to-all redistributes heads across the
+            # SP group), so each rank's cache holds num_kv_heads / (tp*sp).
+            cfg.shard(tp_size * sp_size)
             num_kv_heads = cfg.num_kv_heads
 
             kv_cache = torch.zeros(
@@ -787,6 +800,7 @@ class KVCacheEngine(BaseEngine):
             range_pop(synchronize=False)
 
         node_inputs: list[ARNodeInputs] = []
+        skipped_rids: set[str] = set()
         if self.enable_nvtx:
             range_push("kv_cache.prepare_inputs")
         for rid in batch.request_ids:
@@ -796,15 +810,26 @@ class KVCacheEngine(BaseEngine):
                     rid, label
                 ).get_pos_info() for label in labels
             }
-            node_inputs.append(
-                submodule.prepare_inputs(
-                    graph_walk=batch.graph_walk,
-                    fwd_info=batch.per_request_info[rid],
-                    inputs=batch.per_request_input_tensors[rid],
-                    pos_info=pos_info,
-                    seen_token_mask=submod_mgmt.sampler.get_token_mask(rid)
-                )
+            req_inputs = submodule.prepare_inputs(
+                graph_walk=batch.graph_walk,
+                fwd_info=batch.per_request_info[rid],
+                inputs=batch.per_request_input_tensors[rid],
+                pos_info=pos_info,
+                seen_token_mask=submod_mgmt.sampler.get_token_mask(rid)
             )
+            if req_inputs is None:
+                skipped_rids.add(rid)
+            else:
+                node_inputs.append(req_inputs)
+        
+        if skipped_rids:
+            batch.request_ids = [rid for rid in batch.request_ids if rid not in skipped_rids]
+            batch.per_request_info = {
+                rid: info
+                for rid, info in batch.per_request_info.items()
+                if rid not in skipped_rids
+            }
+
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
@@ -826,6 +851,10 @@ class KVCacheEngine(BaseEngine):
         node_inputs = planned.node_inputs
         submod_mgmt = planned.prepared.metadata["submod_mgmt"]
         sampler = submod_mgmt.sampler
+
+        if not batch.request_ids:
+            return NodeOutput(per_request_output_tensors={})
+
         submod_mgmt.tp_group.barrier()
 
         if self._can_use_cuda_graph(batch, node_inputs):

@@ -217,13 +217,28 @@ class Worker:
             worker_id=self.worker_id
         )
 
+        # The lockstep unit for a node is its whole instance: the tensor-parallel
+        # row composed with the sequence-parallel column. Exactly one rank per
+        # instance — the one that is rank 0 in BOTH its TP and SP comm groups —
+        # leads scheduling and broadcasts ScheduleTPNode to the rest; every other
+        # instance rank follows. Keying the leader off the TP rank alone would
+        # elect one leader per TP row (e.g. ranks 0 and 2 of a tp2*sp2 instance),
+        # racing the followers and desyncing the per-step graph walk.
         self.tp_rank_zero_nodes = set([
-            node for node in node_names if self.tp_groups.get_tp_config_for_node(node).rank == 0
+            node for node in node_names
+            if self.tp_groups.get_tp_config_for_node(node).rank == 0
+            and self.tp_groups.get_sp_config_for_node(node).rank == 0
         ])
 
-        # v1: disallow multiple TP nodes in the same worker
+        # v1: disallow multiple lockstep-scheduled nodes in the same worker.
+        # A node is lockstep-scheduled when its instance spans more than one rank,
+        # i.e. tp_size * sp_size > 1. Pure sequence-parallel nodes (tp_size 1,
+        # sp_size > 1) need this too: their attention all-to-all requires the
+        # whole instance to step together. Without SP this is just tp_size > 1.
         self.tp_nodes = set([
-            node for node in node_names if self.tp_groups.get_tp_config_for_node(node).world_size > 1
+            node for node in node_names
+            if self.tp_groups.get_tp_config_for_node(node).world_size
+            * self.tp_groups.get_sp_config_for_node(node).world_size > 1
         ])
         if len(self.tp_nodes) > 1:
             raise NotImplementedError(
@@ -1570,14 +1585,15 @@ class Worker:
                         or pending_stop.rid not in batch_N.node_batch.request_ids:
                     continue
                 stopped_rid = pending_stop.rid
-                if stopped_rid not in batch_N.batch.node_objects:
-                    continue
                 output.per_request_output_tensors.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
-                batch_N.batch.node_objects.pop(stopped_rid)
-                batch_N.batch.request_to_worker_graph.pop(stopped_rid)
-                batch_N.node_batch.per_request_info.pop(stopped_rid)
+                batch_N.batch.node_objects.pop(stopped_rid, None)
+                batch_N.batch.request_to_worker_graph.pop(stopped_rid, None)
+                batch_N.node_batch.per_request_info.pop(stopped_rid, None)
         batch_N.node_batch.request_ids = list(valid_rids)
+        if not valid_rids:
+            range_pop(synchronize=False)
+            return
 
         # pending stops are only needed for one iteration, so can be cleared now
         self._pending_loop_stops.clear()

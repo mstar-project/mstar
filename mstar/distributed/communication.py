@@ -101,22 +101,80 @@ class TPCommGroup:
         dist.broadcast(tensor, self.group_members[src], self.device_group)
         return tensor
 
+    def all_to_all(
+        self,
+        input_: torch.Tensor,
+        scatter_dim: int,
+        gather_dim: int,
+        scatter_sizes: list[int] | None = None,
+        gather_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Redistribute ``input_`` across the group: split it into
+        ``world_size`` pieces along ``scatter_dim`` (piece i goes to rank i)
+        and concatenate the pieces received from every rank along
+        ``gather_dim``.
+
+        This is the primitive behind Ulysses sequence parallelism: with
+        ``scatter_dim`` = heads and ``gather_dim`` = sequence it converts a
+        sequence-sharded ``[seq/P, heads, dim]`` tensor into a head-sharded
+        ``[seq, heads/P, dim]`` one (and the reverse with the dims swapped).
+
+        ``scatter_sizes`` / ``gather_sizes`` give per-rank extents for an
+        uneven split / gather (e.g. a sequence length not divisible by the
+        group size); when ``None`` the respective dimension is split evenly
+        (and ``scatter_dim`` must then be divisible by ``world_size``).
+        """
+        if self.world_size == 1:
+            return input_
+        world_size = self.world_size
+        if scatter_sizes is None:
+            assert input_.size(scatter_dim) % world_size == 0, (
+                f"all_to_all: scatter_dim {scatter_dim} size "
+                f"{input_.size(scatter_dim)} not divisible by world_size "
+                f"{world_size}; pass scatter_sizes for an uneven split"
+            )
+            chunk = input_.size(scatter_dim) // world_size
+            scatter_sizes = [chunk] * world_size
+        send = [
+            t.contiguous()
+            for t in torch.split(input_, scatter_sizes, dim=scatter_dim)
+        ]
+        if gather_sizes is None:
+            gather_sizes = [send[self.rank].size(gather_dim)] * world_size
+        base_shape = list(send[self.rank].shape)
+        recv = []
+        for r in range(world_size):
+            shape = list(base_shape)
+            shape[gather_dim] = gather_sizes[r]
+            recv.append(
+                torch.empty(shape, dtype=input_.dtype, device=input_.device)
+            )
+        dist.all_to_all(recv, send, group=self.device_group)
+        return torch.cat(recv, dim=gather_dim).contiguous()
+
 
 @dataclass
 class WorkerTPGroups:
     num_workers: int
     global_rank: int
-    # True iff any worker in the run uses TP. Set by GlobalTPConfig from
+    # True iff any worker in the run uses TP / SP. Set by GlobalTPConfig from
     # the global worker-graph view so all ranks agree.
     any_tp: bool = False
-    # Every distinct TP rank tuple in the run, sorted for stable iteration
-    # order across workers. Set by GlobalTPConfig. ``init_dist`` calls
-    # ``dist.new_group`` once per entry on every rank — including ranks
+    any_sp: bool = False
+    # Every distinct TP (and SP) rank tuple in the run, sorted for stable
+    # iteration order across workers. Set by GlobalTPConfig. ``init_dist``
+    # calls ``dist.new_group`` once per entry on every rank — including ranks
     # that aren't members of the group — because PyTorch assigns an
     # auto-incrementing tag inside ``new_group`` that all ranks must agree
     # on; asymmetric call counts deadlock the participating ranks.
     world_tp_groups: list[tuple[int, ...]] = field(default_factory=list)
+    world_sp_groups: list[tuple[int, ...]] = field(default_factory=list)
+    # Per-node comm groups. Tensor parallelism and sequence parallelism are
+    # orthogonal axes of the same device mesh, so a node may carry one of
+    # each (the SP group all-to-alls around attention; the TP group
+    # all-reduces the row-parallel projections).
     node_to_group: dict[str, TPCommGroup] = field(default_factory=dict)
+    node_to_sp_group: dict[str, TPCommGroup] = field(default_factory=dict)
 
     def add(self, node: str, comm_group: TPCommGroup):
         # disallow colocation of multiple comm groups on the same node
@@ -126,6 +184,15 @@ class WorkerTPGroups:
             )
         if node not in self.node_to_group:
             self.node_to_group[node] = comm_group
+
+    def add_sp(self, node: str, comm_group: TPCommGroup):
+        # SP analogue of ``add`` — the sequence-parallel comm group for a node.
+        if node in self.node_to_sp_group and self.node_to_sp_group[node].group_members != comm_group.group_members:
+            raise RuntimeError(
+                f"Node {node} already has an SP comm group assigned for worker {self.global_rank}"
+            )
+        if node not in self.node_to_sp_group:
+            self.node_to_sp_group[node] = comm_group
 
     def init_dist(
         self, init_method="tcp://127.0.0.1:29500",
@@ -146,7 +213,7 @@ class WorkerTPGroups:
         discard it.
         """
         torch.cuda.set_device(self.global_rank)
-        if not self.any_tp:
+        if not (self.any_tp or self.any_sp):
             return
 
         dist.init_process_group(
@@ -156,12 +223,18 @@ class WorkerTPGroups:
             rank=self.global_rank,
         )
 
+        # One subgroup per distinct rank tuple across BOTH meshes. The union is
+        # sorted so every rank iterates it identically — ``new_group`` is
+        # collective and tag-ordered (see the class docstring). A tuple shared
+        # by a TP and an SP group (degenerate meshes) maps to one subgroup.
         rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
-        for rank_tuple in self.world_tp_groups:
+        for rank_tuple in sorted(set(self.world_tp_groups) | set(self.world_sp_groups)):
             rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
 
         seen: set[int] = set()
-        for comm_group in self.node_to_group.values():
+        for comm_group in (
+            list(self.node_to_group.values()) + list(self.node_to_sp_group.values())
+        ):
             if id(comm_group) in seen:
                 continue
             seen.add(id(comm_group))
@@ -175,6 +248,11 @@ class WorkerTPGroups:
         if node not in self.node_to_group:
             self.node_to_group[node] = TPCommGroup.trivial()
         return self.node_to_group[node]
+
+    def get_sp_config_for_node(self, node: str) -> TPCommGroup:
+        if node not in self.node_to_sp_group:
+            self.node_to_sp_group[node] = TPCommGroup.trivial()
+        return self.node_to_sp_group[node]
 
     def barrier_all(self) -> None:
         """Global barrier across every worker process in the run.
@@ -200,22 +278,31 @@ class GlobalTPConfig:
     ):
         self.num_workers = len(worker_ids)
         any_tp = any(wg.tp_size > 1 for wg in worker_graphs.values())
+        any_sp = any(getattr(wg, "sp_size", 1) > 1 for wg in worker_graphs.values())
         world_tp_groups: list[tuple[int, ...]] = sorted({
             tuple(rank_group)
             for wg in worker_graphs.values()
             for rank_group in wg._tp_ranks
             if len(rank_group) > 1
         })
+        world_sp_groups: list[tuple[int, ...]] = sorted({
+            tuple(rank_group)
+            for wg in worker_graphs.values()
+            for rank_group in getattr(wg, "_sp_ranks", [])
+            if len(rank_group) > 1
+        })
         self.per_worker_config: dict[str, WorkerTPGroups] = {
             wid: WorkerTPGroups(
                 global_rank=i, num_workers=self.num_workers,
-                any_tp=any_tp,
+                any_tp=any_tp, any_sp=any_sp,
                 world_tp_groups=world_tp_groups,
+                world_sp_groups=world_sp_groups,
             ) for i, wid in enumerate(worker_ids)
         }
 
-        # (global rank, (group ranks...)) -> comm group
+        # (global rank, (group ranks...)) -> comm group, for each mesh axis.
         self.comm_groups: dict[tuple[int, tuple], TPCommGroup] = {}
+        self.sp_comm_groups: dict[tuple[int, tuple], TPCommGroup] = {}
         for wg in worker_graphs.values():
             for rank_group in wg._tp_ranks:
                 rank_group_tuple = tuple(rank_group)
@@ -230,5 +317,19 @@ class GlobalTPConfig:
                     for node in wg.section.get_nodes().keys():
                         self.per_worker_config[worker_ids[rank]].add(
                             node,  self.comm_groups[key]
+                        )
+            for rank_group in getattr(wg, "_sp_ranks", []):
+                rank_group_tuple = tuple(rank_group)
+                for i, rank in enumerate(rank_group):
+                    key = (rank, rank_group_tuple)
+                    if key not in self.sp_comm_groups:
+                        self.sp_comm_groups[key] = TPCommGroup(
+                            my_global_rank=rank,
+                            my_group_rank=i,
+                            group_members=rank_group
+                        )
+                    for node in wg.section.get_nodes().keys():
+                        self.per_worker_config[worker_ids[rank]].add_sp(
+                            node, self.sp_comm_groups[key]
                         )
 
