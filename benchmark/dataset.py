@@ -402,12 +402,14 @@ class Food101Dataset(BaseDataset):
         self._num_requests = num_requests
         self.prompts = prompts
 
-        raw = load_dataset(
-            "ethz/food101",
-            split=split,
-            cache_dir=cache_dir,
-            trust_remote_code=True,
-        )
+        # ethz/food101 is now distributed as Parquet; newer `datasets` rejects
+        # `trust_remote_code`, so don't pass it (fall back only on older
+        # `datasets` that still require a loading script).
+        try:
+            raw = load_dataset("ethz/food101", split=split, cache_dir=cache_dir)
+        except (TypeError, ValueError):
+            raw = load_dataset("ethz/food101", split=split, cache_dir=cache_dir,
+                               trust_remote_code=True)
         # Shuffle with a fixed seed so we get class-diverse images while
         # remaining deterministic across runs (so the same N images appear in
         # the same order on every benchmark invocation).
