@@ -26,7 +26,7 @@ from mstar.engine.base import (
     PlannedBatch,
     PreparedBatch,
 )
-from mstar.engine.cuda_graph_runner import StatelessCudaGraphRunner
+from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner, StatelessCudaGraphRunner
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ModelInputsFromEngine,

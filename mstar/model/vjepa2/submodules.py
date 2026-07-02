@@ -21,6 +21,7 @@ branch.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -29,8 +30,6 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.base import NodeBatch
 from mstar.engine.cache_manager import BatchedCacheManager
-from typing import TYPE_CHECKING
-
 from mstar.engine.cuda_graph_config import (
     PiecewiseBatchedConfig,
     PiecewiseCaptureShape,
