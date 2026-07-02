@@ -207,9 +207,12 @@ class KVCacheEngine(BaseEngine):
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
 
-        Uses mode="max-autotune-no-cudagraphs" (SGLang's approach) so compiled
-        code gets baked into CUDA graphs when captured. Must be called BEFORE
-        CUDA graph capture.
+        Compiles each submodule's ``forward`` and ``forward_batched`` with the
+        default mode (fullgraph=False, dynamic=None). Called from ``warmup``
+        after CUDA graph capture. ``max-autotune-no-cudagraphs`` is intentionally
+        not used here: on variable-shape inputs it triggers frequent slow
+        recompiles, so that mode is applied on the CUDA-graph path instead
+        (see ``cuda_graph_runner``).
         """
         if not torch.cuda.is_available():
             return
