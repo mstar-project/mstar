@@ -868,12 +868,12 @@ class Conductor:
         if body.is_first_tp_rank:
             pstate.per_label_seq_info.update(body.per_label_seq_info)
 
-            if body.new_tokens:
-                for name, tokens in body.new_tokens.items():
-                    pstate.num_output_tokens += len(tokens)
+            if body.new_token_counts:
+                for name, count in body.new_token_counts.items():
+                    pstate.num_output_tokens += count
                     for conn in request_data.streaming_connections.values():
                         if conn.from_partition == partition_name and conn.edge_name == name:
-                            conn.token_count += len(tokens)
+                            conn.token_count += count
 
             if body.stream_tokens_consumed:
                 for conn in request_data.streaming_connections.values():

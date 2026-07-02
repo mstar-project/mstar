@@ -948,21 +948,12 @@ class Worker:
         nested_loop_indices: NestedLoopIndices,
         graph_walk: str | None = None,
         partition_name: str | None = None,
-        prematerialized_new_tokens: dict[str, list[int]] | None = None,
         node_speculatively_scheduled: bool=False
     ) -> None:
         """
         Send outputs to other workers and to the conductor.
-        Persist signals are buffered and sent together with the
-        WORKER_GRAPHS_DONE message to avoid race conditions.
-
-        ``prematerialized_new_tokens`` (optional): `{signal_name: [int, ...]}`
-        for this request, where the caller has already done the D→H copy
-        for the new-token tensors. When provided, this function skips the
-        per-tensor ``.cpu()`` call — meaningful when the caller batched
-        multiple requests' new-token transfers into a single D→H to avoid
-        N serialized ``cudaMemcpyAsync`` + ``cudaStreamSynchronize`` per
-        step.
+        Persist signals and new-token counts are buffered and sent together
+        with the WORKER_GRAPHS_DONE message to avoid race conditions.
         """
         if graph_walk is None:
             graph_walk = self.worker_graphs_manager.get_graph_walk(request_id, partition_name)
@@ -985,28 +976,21 @@ class Worker:
             )
 
         if outputs.new_token_outputs:
-            name_to_new_token: dict = {}
+            name_to_count: dict[str, int] = {}
             for signal in outputs.new_token_outputs:
-                if signal.name in name_to_new_token:
-                    continue # don't double-count new tokens
-                if (
-                    prematerialized_new_tokens is not None
-                    and signal.name in prematerialized_new_tokens
-                ):
-                    new_tokens = prematerialized_new_tokens[signal.name]
-                else:
-                    new_tokens = []  # list[int]
-                    for tensor_info in signal.tensor_info:
-                        tensor = self.tensor_manager.get_tensor(
-                            request_id=request_id,
-                            uuid=tensor_info.uuid
-                        )
-                        new_tokens.extend(tensor.cpu().numpy().tolist())
-                name_to_new_token[signal.name] = new_tokens
-
-                self.worker_graphs_manager.buffer_new_tokens(
-                    request_id, name_to_new_token
-                )
+                if signal.name in name_to_count:
+                    continue  # don't double-count new tokens
+                count = 0
+                for tensor_info in signal.tensor_info:
+                    tensor = self.tensor_manager.get_tensor(
+                        request_id=request_id,
+                        uuid=tensor_info.uuid,
+                    )
+                    count += tensor.numel()
+                name_to_count[signal.name] = count
+            self.worker_graphs_manager.buffer_new_token_counts(
+                request_id, name_to_count
+            )
 
         if outputs.emit_to_client:
             self.worker_graphs_manager.buffer_output_signals(
@@ -1073,7 +1057,7 @@ class Worker:
                     worker_graph_ids=outputs.completed_worker_graph_ids,
                     is_first_tp_rank=outputs.is_first_tp_rank,
                     persist_signals=self.worker_graphs_manager.flush_persist_signals(request_id),
-                    new_tokens=self.worker_graphs_manager.flush_new_tokens(request_id),
+                    new_token_counts=self.worker_graphs_manager.flush_new_token_counts(request_id),
                     output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id),
                     per_label_seq_info=self.worker_graphs_manager.get_seq_info(request_id, partition_name),
                     partition_name=partition_name,
@@ -1811,46 +1795,6 @@ class Worker:
             range_pop(synchronize=False)
 
         return routing_per_request
-
-    def _d2h_new_tokens(
-        self,
-        tensors: list[torch.Tensor],
-        completion_event: "torch.cuda.Event | None",
-    ) -> list[int]:
-        """Batched D→H copy of new-token tensors, gated on GPU(N)'s
-        completion event so it does not block on GPU(N+1) (which is queued
-        on default stream behind GPU(N)).
-
-        Falls back to the simple ``torch.cat([...]).cpu()`` when CUDA is
-        unavailable, the tensors are already on CPU, or no completion event
-        was recorded (non-CUDA execution).
-
-        Safety: assumes ``tensors`` are fresh allocations (not views into
-        CUDA-graph static buffers that GPU(N+1) will overwrite). Sampler
-        outputs from FlashInfer's ``top_p_sampling_from_probs`` qualify;
-        if a future change makes the new-token tensor a static-buffer
-        view, this needs an extra clone-on-default-stream-before-event-
-        record step on the GPU thread.
-        """
-        if not tensors:
-            return []
-        first = tensors[0]
-        on_cuda = first.is_cuda and torch.cuda.is_available()
-        if not on_cuda or completion_event is None:
-            return torch.cat([t.flatten() for t in tensors]).cpu().tolist()
-
-        if self._d2h_stream is None:
-            self._d2h_stream = torch.cuda.Stream(device=self.device)
-        side = self._d2h_stream
-        side.wait_event(completion_event)
-        with torch.cuda.stream(side):
-            flat_gpu = torch.cat([t.flatten() for t in tensors])
-            flat_cpu = self._get_pinned_d2h_buffer(
-                "new_tokens", flat_gpu.shape, flat_gpu.dtype,
-            )
-            flat_cpu.copy_(flat_gpu, non_blocking=True)
-        side.synchronize()
-        return flat_cpu.tolist()
 
     def _get_pinned_d2h_buffer(
         self,
