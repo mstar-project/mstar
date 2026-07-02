@@ -2683,8 +2683,13 @@ class PiecewiseCudaGraphRunner:
 
         # --- 4: advance seq_lens (Python-only, post-replay) ---
         # Uses the per-request lengths planned in step 2, so this is correct for
-        # both uniform (BATCHED) and variable (PACKED) sequences.
-        if static_cm is not None and request_ids is not None:
+        # both uniform (BATCHED) and variable (PACKED) sequences. Opt out via
+        # config.advance_seq_lens=False when the caller advances the cache itself.
+        if (
+            self.config.advance_seq_lens
+            and static_cm is not None
+            and request_ids is not None
+        ):
             for label in self.cache_labels:
                 static_cm.set_active_label(label)
                 static_cm.advance_seq_lens()

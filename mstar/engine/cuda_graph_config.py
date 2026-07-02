@@ -180,6 +180,12 @@ class PiecewiseCudaGraphConfig(ABC):
     #     seq_lens for BATCHED, packed indptr for PACKED).
     uses_kv_cache: bool = False
     plan_fn: Callable[["BatchedCacheManager", PiecewiseCaptureShape], None] | None = None
+    # Whether the runner advances cache seq_lens (Python-only, post-replay) after
+    # each ``run``. True suits the common case where the captured region consumes
+    # its planned tokens once per step. Set False when the caller advances the
+    # cache itself (e.g. a custom position-id scheme). No effect when
+    # ``uses_kv_cache`` is False.
+    advance_seq_lens: bool = True
     cache_labels: list[str] = field(default_factory=lambda: ["main"])
     # None => defer to the runner's default batch-size buckets.
     capture_batch_sizes: list[int] | None = None
