@@ -68,6 +68,7 @@ qwen3_omni = [
     "Pillow",
     "regex",
     "qwen-omni-utils",
+    "numba>=0.61",
     "torchvision",
     "torchaudio",
     "torchcodec==0.8.*",
