@@ -29,6 +29,16 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.base import NodeBatch
 from mstar.engine.cache_manager import BatchedCacheManager
+from typing import TYPE_CHECKING
+
+from mstar.engine.cuda_graph_config import (
+    PiecewiseBatchedConfig,
+    PiecewiseCaptureShape,
+    PiecewiseCudaGraphConfig,
+)
+
+if TYPE_CHECKING:
+    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -483,63 +493,16 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         self.num_output_frames = max(int(num_output_frames), config.tubelet_size)
         self.frames_per_second = int(frames_per_second)
         self.anticipation_seconds = float(anticipation_seconds)
-        self._piecewise_runner = None
 
-    def set_piecewise_runner(self, runner) -> None:
-        """Attach a warmed-up PiecewiseCudaGraphRunner for the layer loop."""
-        self._piecewise_runner = runner
-
-    def get_piecewise_runner_config(self) -> dict | None:
-        """Return construction args for PiecewiseCudaGraphRunner.
-
-        Called by StatelessEngine.warmup() (masked predictor uses ENC_DEC).
-        kv_cache_config / alloc_manager / buffer_manager are all None since the
-        masked predictor is stateless — no KV cache between rollout steps.
-
-        The ``position_mask`` buffer is a static [n_seq] float32 tensor holding
-        the sorted position IDs for the rollout config.  For sequential context
-        (arange(n_ctxt)) + skip target, the positions are already sorted so
-        argsort in VJEPA2Predictor.forward is identity; the buffer is filled
-        once in fn_factory and never updated at replay.
-        """
-        # n_ctxt = self.config.grid_depth * self._grid_size ** 2
-        # n_pred = self._n_pred
-        # skip = n_ctxt + self._grid_size ** 2 * self._anticipation_steps
-        # n_seq = n_ctxt + n_pred
-
-        # position_ids = torch.cat([
-        #     torch.arange(n_ctxt, dtype=torch.float32),
-        #     torch.arange(n_pred, dtype=torch.float32) + skip,
-        # ])  # [n_seq], CPU; fn_factory .copy_()s it into the GPU buffer
-
-        # predictor = self.predictor
-
-        # def fn_factory(static_cm, static_pos_bufs):
-        #     static_pos_bufs["position_mask"].copy_(position_ids)
-        #     return predictor.make_layer_loop_fn(static_cm, static_pos_bufs)
-
-        # return {
-        #     "fn_factory": fn_factory,
-        #     "embed_dim": self.config.pred_hidden_size,
-        #     "capture_seq_len": n_seq,
-        #     "capture_batch_sizes": [1, 2, 4, 8],
-        #     "pos_buf_shapes": {"position_mask": (n_seq,)},
-        #     "cache_labels": ["main"],
-        # }
-
-        """Masked predictor rollout does not use piecewise CUDA graphs.
-
-        The non-AC predictor attends over n_ctxt + n_pred ≈ 8448 tokens using
-        plain SDPA (no FlashInfer).  At that sequence length the O(N²) attention
-        computation dominates completely — Python kernel-launch overhead is
-        negligible relative to the ~1.7 GB attention matrix per layer, so CUDA
-        graphs provide no meaningful speedup.  Attempting to capture them also
-        risks OOM on top of the already-loaded ViT-g encoder weights.
-
-        CUDA graphs are only useful for the AC predictor (capture_seq_len=258,
-        FlashInfer per-call overhead worth eliminating).
-        """
-        return None
+    # NOTE: this masked predictor does NOT opt into piecewise CUDA graphs
+    # (``get_piecewise_cuda_graph_configs`` returns the base default of {}).
+    # The non-AC predictor attends over n_ctxt + n_pred ≈ 8448 tokens using
+    # plain SDPA (no FlashInfer). At that sequence length the O(N²) attention
+    # dominates completely — Python kernel-launch overhead is negligible
+    # relative to the ~1.7 GB attention matrix per layer, so CUDA graphs give
+    # no meaningful speedup and capture risks OOM on top of the ViT-g weights.
+    # Piecewise graphs are only worth it for the AC predictor
+    # (capture_seq_len=258, FlashInfer per-call overhead worth eliminating).
 
     # ------------------------------------------------------------------
     # Rollout geometry (derived from config + hyperparams; shape-static)
@@ -637,10 +600,8 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         Returns ``(next_encoder_hidden [B, N, D], predicted [B, n_pred, D])``.
         Shape math is symmetric across B.
 
-        CUDA-graph path (when PiecewiseCudaGraphRunner is set): splits the
-        predictor forward into preamble (embed+sort), captured layer loop,
-        and postamble (layernorm+unsort+proj), with no KV cache involved.
-        Eager path calls predictor.forward end-to-end (unchanged).
+        Runs the predictor forward end-to-end (eager); see the class note on
+        why this predictor does not use piecewise CUDA graphs.
         """
         b, n_ctxt, _ = encoder_hidden.shape
         device = encoder_hidden.device
@@ -654,15 +615,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         skip = n_ctxt + self._grid_size * self._grid_size * self._anticipation_steps
         tgt_positions = (torch.arange(n_pred, device=device) + skip).unsqueeze(0).repeat(b, 1)
 
-        runner = self._piecewise_runner
-        if runner is not None and runner.can_run(b):
-            hidden_states, n_ctxt_out, argsort = self.predictor._run_forward_piecewise(
-                encoder_hidden, [ctxt_positions], [tgt_positions]
-            )
-            hidden_states = runner.run(hidden_states)
-            predicted = self.predictor._finalize_forward_piecewise(hidden_states, n_ctxt_out, argsort)
-        else:
-            predicted = self.predictor(encoder_hidden, [ctxt_positions], [tgt_positions])
+        predicted = self.predictor(encoder_hidden, [ctxt_positions], [tgt_positions])
 
         next_encoder_hidden = torch.cat([encoder_hidden[:, n_pred:, :], predicted], dim=1)
         return next_encoder_hidden, predicted
@@ -901,8 +854,9 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     """Action-conditioned autoregressive rollout.
 
     Optionally uses a PiecewiseCudaGraphRunner to accelerate the inner block
-    loop. Set via set_piecewise_runner() after construction (typically done by
-    the engine after warmup_and_capture).
+    loop. The submodule opts in via ``get_piecewise_cuda_graph_configs`` (label
+    ``"block_loop"``); the engine builds the runner at warmup and passes it in
+    through ``engine_inputs.piecewise_runners``.
 
     **Sliding-window rollout** — diverges from upstream
     ``vjepa2/notebooks/utils/mpc_utils.py::cem`` which uses growing-context
@@ -944,49 +898,67 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         super().__init__()
         self.predictor = predictor
         self.config = config
-        self._piecewise_runner = None   # set via set_piecewise_runner() after warmup
 
-    def set_piecewise_runner(self, runner) -> None:
-        """Attach a warmed-up PiecewiseCudaGraphRunner for the block loop."""
-        self._piecewise_runner = runner
+    def _block_loop_capture(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        static_cm: BatchedCacheManager | None = None,
+        *,
+        cond_tokens: int = 2,
+    ) -> dict[str, torch.Tensor]:
+        """Captured region for the ``block_loop`` piecewise graph.
 
-    def get_piecewise_runner_config(self) -> dict | None:
-        """Return construction args for PiecewiseCudaGraphRunner, or None.
+        Reads the hidden state and RoPE position tensors out of the
+        runner-owned ``static_inputs`` (never reassigns them) so the captured
+        graph replays against the buffers the runner updates via ``.copy_()``
+        before each replay. ``static_cm`` is the runner's persistent cache
+        manager (planned outside the graph).
+        """
+        fn = self.predictor.make_block_loop_fn(static_cm, static_inputs, cond_tokens)
+        return {"x": fn(static_inputs["x"])}
 
-        Called by KVCacheEngine.warmup() to build and install the runner without
-        the engine needing to know the model internals.  The returned dict
-        contains everything PiecewiseCudaGraphRunner.__init__ needs except
-        device/autocast_dtype/memory_pool (those come from the engine).
+    def get_piecewise_cuda_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
+    ) -> dict[str, PiecewiseCudaGraphConfig]:
+        """One BATCHED piecewise graph (``"block_loop"``) for the AC predictor.
 
-        Keys:
-          fn_factory    - (static_cm, static_pos_bufs) -> fn(x) -> x
-          embed_dim     - hidden dim of the intermediate sequence
-          capture_seq_len - tokens per frame (cond_tokens + grid_h * grid_w)
-          pos_buf_shapes  - {name: shape} for per-step position tensors
-          cache_labels    - KV cache labels (always ["main"] here)
+        ``capture_seq_len = cond_tokens + N*N`` is the per-frame token count
+        (one rollout step processes one frame). The block loop reads the
+        FlashInfer KV cache, so ``uses_kv_cache=True``.
         """
         ac = self.config.ac_predictor
         if ac is None:
-            return None
+            return {}
         N = ac.img_size[0] // ac.patch_size   # grid_height (== grid_width for square)
         cond_tokens = 3 if ac.use_extrinsics else 2
-        predictor = self.predictor
+        capture_seq_len = cond_tokens + N * N
+        embed_dim = ac.predictor_embed_dim
 
-        def fn_factory(static_cm, static_pos_bufs):
-            return predictor.make_block_loop_fn(static_cm, static_pos_bufs, cond_tokens)
+        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
+            # Hidden state matches autocast dtype so the replay copy_ is a
+            # same-dtype memcpy; position buffers stay float32 (RoPE frequency
+            # precision matters more than matching the hidden-state dtype).
+            return {
+                "x": torch.zeros(
+                    shape.bs, capture_seq_len, embed_dim,
+                    dtype=autocast_dtype, device=device,
+                ),
+                "d_pos": torch.zeros(N * N, dtype=torch.float32, device=device),
+                "h_pos": torch.zeros(N * N, dtype=torch.float32, device=device),
+                "w_pos": torch.zeros(N * N, dtype=torch.float32, device=device),
+                "time_pos": torch.zeros(cond_tokens, dtype=torch.float32, device=device),
+            }
 
         return {
-            "fn_factory": fn_factory,
-            "embed_dim": ac.predictor_embed_dim,
-            "capture_seq_len": cond_tokens + N * N,
-            "capture_batch_sizes": [1, 2, 4, 8],
-            "pos_buf_shapes": {
-                "d_pos":   (N * N,),
-                "h_pos":   (N * N,),
-                "w_pos":   (N * N,),
-                "time_pos": (cond_tokens,),
-            },
-            "cache_labels": ["main"],
+            "block_loop": PiecewiseBatchedConfig(
+                capture_fn=self._block_loop_capture,
+                make_static_inputs=make_static_inputs,
+                seq_len=capture_seq_len,
+                forward_kwargs={"cond_tokens": cond_tokens},
+                uses_kv_cache=True,
+                cache_labels=["main"],
+                capture_batch_sizes=[1, 2, 4, 8],
+            )
         }
 
     # ------------------------------------------------------------------
@@ -1123,10 +1095,12 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         cache_handle: BatchedCacheManager,
         extrinsics: torch.Tensor | None = None,  # [B, 1, action_embed_dim - 1] or None
         request_ids: list[str] | None = None,    # needed by PiecewiseCudaGraphRunner
+        runner: "PiecewiseCudaGraphRunner | None" = None,
     ) -> torch.Tensor:
         """One AC rollout step using either the CUDA-graph or eager path.
 
-        The CUDA-graph path (when PiecewiseCudaGraphRunner is attached):
+        The CUDA-graph path (when a ``block_loop`` PiecewiseCudaGraphRunner is
+        available on ``engine_inputs``):
           1. Preamble (predictor_embed + action/state concat) runs eagerly.
           2. Position tensors are computed eagerly (hoisted out of the graph).
           3. Block loop replays the captured graph.
@@ -1137,7 +1111,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         """
         p = self.predictor
 
-        runner = self._piecewise_runner
         if runner is not None and runner.can_run(encoder_hidden.size(0)):
             # --- CUDA-graph path ---
             x, cond_tokens, b, t = p._prepare_sequence(
@@ -1146,17 +1119,14 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             d_pos, h_pos, w_pos, time_pos = p._compute_rope_positions(
                 t_0, p.grid_height, p.grid_width, cond_tokens, x.device, x.dtype
             )
-            pos_bufs = {
-                "d_pos": d_pos, "h_pos": h_pos, "w_pos": w_pos,
+            static_inputs = {
+                "x": x, "d_pos": d_pos, "h_pos": h_pos, "w_pos": w_pos,
             }
             if time_pos is not None:
-                pos_bufs["time_pos"] = time_pos
+                static_inputs["time_pos"] = time_pos
 
-            x = runner.run(
-                x=x,
-                pos_bufs=pos_bufs,
-                request_ids=request_ids,
-            )
+            out = runner.run(static_inputs=static_inputs, request_ids=request_ids)
+            x = out["x"]
             # advance_seq_len already called by runner; skip it in _decode_sequence
             new_tg = p._decode_sequence(x, cond_tokens, b, t)
         else:
@@ -1197,6 +1167,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             cache_handle=engine_inputs.cache_manager,
             extrinsics=extrinsics,
             request_ids=engine_inputs.request_ids,
+            runner=engine_inputs.piecewise_runners.get("block_loop"),
         )
 
         logger.info(
