@@ -21,6 +21,9 @@ from mstar.streaming.stream_buffer import StreamBuffer
 
 logger = logging.getLogger(__name__)
 
+# Entity that reads EMIT_TO_CLIENT output tensors (it runs on the head host).
+PREPROCESS_WORKER_ENTITY = "api_server_preprocess_worker"
+
 
 @dataclass
 class NodeOutputRouting:
@@ -33,6 +36,44 @@ class NodeOutputRouting:
     completed_worker_graph_ids: list[str] = field(default_factory=list)
     streaming_to_workers: dict[str, list[GraphEdge]] = field(default_factory=dict)  # streaming edges to other workers
     streaming_local: list[GraphEdge] = field(default_factory=list)  # streaming edges staying on this worker
+
+
+def mark_intra_host_uuids(
+    routing: NodeOutputRouting, same_host_entities: set[str],
+) -> set[str]:
+    """Mark output tensors whose every consumer is co-hosted with this worker.
+
+    Returns the uuids a hybrid tensor manager may send over shared memory,
+    after stamping ``via_shm`` on their pointer infos across all outbound
+    edges. Persisted tensors never qualify — the conductor can hand them to
+    workers on any host in later graph walks. A tensor with both co-hosted
+    and remote consumers stays on the transfer engine: co-hosted consumers
+    can read the engine too, whereas preparing both transports would double
+    the producer-side send work.
+    """
+    persist_uuids = {
+        info.uuid for edge in routing.persist for info in edge.tensor_info
+    }
+    outbound: list[tuple[str, list[GraphEdge]]] = [
+        *routing.to_workers.items(),
+        *routing.streaming_to_workers.items(),
+        (PREPROCESS_WORKER_ENTITY, routing.emit_to_client),
+    ]
+    consumers: dict[str, set[str]] = {}
+    for dest, edges in outbound:
+        for edge in edges:
+            for info in edge.tensor_info:
+                consumers.setdefault(info.uuid, set()).add(dest)
+    intra = {
+        uuid for uuid, dests in consumers.items()
+        if uuid not in persist_uuids and dests <= same_host_entities
+    }
+    for _, edges in outbound:
+        for edge in edges:
+            for info in edge.tensor_info:
+                if info.uuid in intra:
+                    info.via_shm = True
+    return intra
 
 
 @dataclass

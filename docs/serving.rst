@@ -302,6 +302,11 @@ Multi-host notes:
   where the fabric exists, ``TCP`` otherwise. On machines without an active
   RDMA fabric the TCP transfer engine usually needs an explicit
   ``--tcp-transfer-device`` (or per-host ``rdma_device``) value.
+- Transfers between workers on the *same* host still use shared memory: each
+  tensor whose consumers are all co-hosted with its producer goes through
+  tmpfs, and only tensors with a cross-host (or not-yet-known, e.g.
+  persisted) consumer travel through the transfer engine. Set
+  ``MSTAR_NO_INTRA_HOST_SHM=1`` to force everything through the engine.
 - Model weights must be present on every host (shared filesystem or a
   per-host cache); agents construct the model locally rather than receiving
   weights over the network.

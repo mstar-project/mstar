@@ -50,6 +50,7 @@ from mstar.worker.node_manager_utils import (
     NodeOutputRouting,
     WorkerGraphQueues,
     WorkerGraphsManager,
+    mark_intra_host_uuids,
 )
 
 logger = logging.getLogger(__name__)
@@ -135,10 +136,14 @@ class Worker:
         tcp_transfer_device="",
         dist_init_method=None,
         endpoints=None,
+        same_host_entities: set[str] | None = None,
     ):
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = enable_nvtx
+        # Entities co-hosted with this worker; None outside multi-host mode.
+        # Drives per-tensor transport dispatch in ``_register_outputs``.
+        self.same_host_entities = same_host_entities
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
@@ -185,7 +190,8 @@ class Worker:
             device=self.device,
             communicator=self.communicator,
             tcp_transfer_device=tcp_transfer_device,
-            enable_prof=enable_prof
+            enable_prof=enable_prof,
+            same_host_entities=same_host_entities,
         )
 
         node_names = set()
@@ -933,9 +939,15 @@ class Worker:
                 uuids.update([
                     info.uuid for info in edge.tensor_info
                 ])
+            shm_uuids = None
+            if self.same_host_entities is not None:
+                shm_uuids = mark_intra_host_uuids(
+                    routing, self.same_host_entities
+                )
             self.tensor_manager.register_for_send(
                 request_id=request_id, uuids=uuids,
                 skip_cuda_sync=True,
+                shm_uuids=shm_uuids,
             )
 
             for edge in routing.persist:

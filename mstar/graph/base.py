@@ -28,6 +28,10 @@ class TensorPointerInfo:
                     # in tensor parallel configurations)
     source_tp_size: int = 1
     source_tp_rank: int = 0
+    # The producer wrote this tensor to shared memory (same-host tmpfs) instead
+    # of registering it with the transfer engine; consumers must read the shm
+    # file. Only ever set when every consumer is co-hosted with the producer.
+    via_shm: bool = False
 
     _source_node_name: str | None = None
     _source_graph_walk: str | None = None
@@ -45,6 +49,7 @@ class TensorPointerInfo:
             offset=self.offset,
             source_tp_size=self.source_tp_size,
             source_tp_rank=self.source_tp_rank,
+            via_shm=self.via_shm,
             _source_node_name=self._source_node_name,
             _source_graph_walk=self._source_graph_walk
         )

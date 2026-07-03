@@ -57,6 +57,7 @@ class PreprocessWorker:
         tcp_transfer_device="",
         enable_prof: bool=False,
         endpoints=None,
+        same_host_entities: set[str] | None = None,
     ):
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -89,6 +90,7 @@ class PreprocessWorker:
             communicator=self.communicator,
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof,
+            same_host_entities=same_host_entities,
         )
 
         self.thread = threading.Thread(

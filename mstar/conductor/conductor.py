@@ -188,6 +188,7 @@ def _worker_process_target(
     log_level: str = "INFO",
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
+    same_host_entities: set[str] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
     logging.basicConfig(
@@ -223,6 +224,7 @@ def _worker_process_target(
             device=torch.device(device),
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
+            same_host_entities=same_host_entities,
         )
     except BaseException as e:
         logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
@@ -535,6 +537,25 @@ class Conductor:
                 len(cuts),
             )
 
+    def _same_host_entities(self, host_index: int) -> set[str] | None:
+        """Entities co-hosted with workers on ``host_index``.
+
+        None outside multi-host mode (single-host keeps the single-transport
+        managers), and under MSTAR_NO_INTRA_HOST_SHM — the escape hatch that
+        forces every transfer through the transfer engine.
+        """
+        if not self.cluster_spec.is_multi_host():
+            return None
+        if os.environ.get("MSTAR_NO_INTRA_HOST_SHM"):
+            return None
+        entities = {
+            wid for wid, spec in self.worker_specs.items()
+            if spec.host_index == host_index
+        }
+        if host_index == 0:
+            entities |= {"conductor", "api_server", "api_server_preprocess_worker"}
+        return entities
+
     def _worker_spawn_kwargs(self, worker_id: str) -> dict:
         """Keyword arguments for one worker's process target, minus the model.
 
@@ -569,6 +590,7 @@ class Conductor:
                 self.cluster_spec.hosts[spec.host_index].rdma_device
                 or self.tcp_transfer_device
             ),
+            "same_host_entities": self._same_host_entities(spec.host_index),
         }
 
     def _build_launchers(self) -> list["Launcher"]:

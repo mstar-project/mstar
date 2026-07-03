@@ -175,6 +175,7 @@ class APIServer:
         log_stats: bool = False,
         log_stats_file: str | None = None,
         endpoints=None,
+        multi_host: bool = False,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -201,6 +202,17 @@ class APIServer:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=self.log_stats,
             endpoints=endpoints,
+            # The preprocess worker never picks shm for its own sends (a
+            # request's initial tensors can be consumed by workers on any
+            # host), but in multi-host mode it must be able to READ shm
+            # tensors that head-host workers emit to the client. The empty
+            # set enables the hybrid manager without claiming co-hosted
+            # entities.
+            same_host_entities=(
+                set()
+                if multi_host and not os.environ.get("MSTAR_NO_INTRA_HOST_SHM")
+                else None
+            ),
         )
 
         # Concurrent request tracking
@@ -841,6 +853,7 @@ def main(argv: list[str] | None = None):
         tcp_transfer_device=cluster_spec.head.rdma_device or args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
+        multi_host=cluster_spec.is_multi_host(),
     )
 
     # Spawn conductor in a separate process
