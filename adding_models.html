@@ -53,7 +53,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Jul 02, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 03, 2026"/>
   </head>
   
   
@@ -440,7 +440,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#loading-weights">Loading weights</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-5-continuous-batching-and-cuda-graphs">Step 5 — Continuous batching and CUDA graphs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-5-continuous-batching-and-cuda-graphs">Step 5 — Continuous batching and CUDA graphs</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#piecewise-cuda-graphs-capturing-an-inner-loop">Piecewise CUDA graphs (capturing an inner loop)</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-6-choose-engine-types">Step 6 — Choose engine types</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-7-write-a-config-yaml">Step 7 — Write a config YAML</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallelism-sharding">Tensor parallelism (sharding)</a></li>
@@ -812,6 +815,162 @@ a packed <code class="docutils literal notranslate"><span class="pre">prefill</s
     <span class="p">]</span>
 </pre></div>
 </div>
+<section id="piecewise-cuda-graphs-capturing-an-inner-loop">
+<h3>Piecewise CUDA graphs (capturing an inner loop)<a class="headerlink" href="#piecewise-cuda-graphs-capturing-an-inner-loop" title="Link to this heading">#</a></h3>
+<p>The configs above capture a submodule’s <strong>whole</strong> <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>; the engine
+drives the replay, including sampling and output remap. Sometimes you instead want to
+capture only a <strong>hot inner region</strong> of a forward, e.g., a transformer <em>block loop</em>,
+while eager Python runs the preamble (embeddings, sequence assembly) and postamble
+(norm, projection) around it. That is what a <em>piecewise</em> CUDA graph does.</p>
+<p>A submodule opts in by returning one or more configs from:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">get_piecewise_cuda_graph_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PiecewiseCudaGraphConfig</span><span class="p">]</span>
+</pre></div>
+</div>
+<p>The dict key is a <strong>label</strong>, an arbitrary string naming the captured region (multiple
+labels capture multiple independent graphs). The engine builds one
+<code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner</span></code> per label at warmup and threads them into
+<code class="docutils literal notranslate"><span class="pre">engine_inputs.piecewise_runners</span></code>; your forward looks the runner up by label and
+calls it. Nothing is stored on the submodule.</p>
+<p>Two config types live in <code class="docutils literal notranslate"><span class="pre">mstar/engine/cuda_graph_config.py</span></code>, mirroring the
+whole-forward split:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 26.0%" />
+<col style="width: 74.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Config type</p></th>
+<th class="head"><p>When to use / what it captures</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PiecewiseBatchedConfig</span></code></p></td>
+<td><p><strong>Equal-length</strong> batched inputs: the captured region sees <code class="docutils literal notranslate"><span class="pre">[bs,</span> <span class="pre">seq_len,</span> <span class="pre">D]</span></code>
+with every request the same <code class="docutils literal notranslate"><span class="pre">seq_len</span></code>. You pass <code class="docutils literal notranslate"><span class="pre">seq_len</span></code> (tokens per
+request). One graph is captured per batch size.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig</span></code></p></td>
+<td><p><strong>Packed / ragged</strong> inputs: the captured region sees <code class="docutils literal notranslate"><span class="pre">[total_tokens,</span> <span class="pre">D]</span></code> with
+variable-length sequences packed together (FlashInfer-packed style). You pass
+<code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> (a list of token-count buckets). One graph is captured per
+<code class="docutils literal notranslate"><span class="pre">(batch</span> <span class="pre">size,</span> <span class="pre">bucket)</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Both share the base <code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphConfig</span></code> fields:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">capture_fn</span></code>: the callable that gets captured (see the contract below).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">make_static_inputs</span></code>: a factory <code class="docutils literal notranslate"><span class="pre">(shape:</span> <span class="pre">PiecewiseCaptureShape)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">Tensor]</span></code>
+returning the persistent buffers the captured region reads. The runner <strong>owns</strong> these
+buffers; at replay it copies your real tensors into them by name. <code class="docutils literal notranslate"><span class="pre">shape</span></code> carries
+<code class="docutils literal notranslate"><span class="pre">bs</span></code>, <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> and <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> for the bucket being built. Allocate the
+hidden state in <code class="docutils literal notranslate"><span class="pre">autocast_dtype</span></code> so the replay copy is a same-dtype memcpy.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">forward_kwargs</span></code>: static keyword args threaded into <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> every call
+(e.g. a layer count, <code class="docutils literal notranslate"><span class="pre">is_causal</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">uses_kv_cache</span></code>: set <code class="docutils literal notranslate"><span class="pre">True</span></code> if the captured region reads a FlashInfer KV cache.
+The runner then plans attention <strong>outside</strong> the graph before each replay and advances
+seq-lens <strong>after</strong> it (both are Python-only and must never be inside the captured
+region). Requires a <code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code> engine; stateless nodes leave this <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">plan_fn</span></code>: optional <code class="docutils literal notranslate"><span class="pre">(static_cm,</span> <span class="pre">shape)</span> <span class="pre">-&gt;</span> <span class="pre">None</span></code> override for attention planning.
+Leave <code class="docutils literal notranslate"><span class="pre">None</span></code> to get the type-default (uniform <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> for batched, packed
+indptr for packed; <code class="docutils literal notranslate"><span class="pre">is_causal</span></code> read from <code class="docutils literal notranslate"><span class="pre">forward_kwargs</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">advance_seq_lens</span></code>: whether <code class="docutils literal notranslate"><span class="pre">run</span></code> advances cache seq-lens (Python-only,
+post-replay) after each call (default <code class="docutils literal notranslate"><span class="pre">True</span></code>). Set <code class="docutils literal notranslate"><span class="pre">False</span></code> when your forward
+advances the cache itself. No effect when <code class="docutils literal notranslate"><span class="pre">uses_kv_cache</span></code> is <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cache_labels</span></code>: KV-cache labels the region touches (default <code class="docutils literal notranslate"><span class="pre">[&quot;main&quot;]</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">capture_batch_sizes</span></code> — which batch sizes to record (<code class="docutils literal notranslate"><span class="pre">None</span></code> → the runner default).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code>: <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> the <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> before capture (default <code class="docutils literal notranslate"><span class="pre">False</span></code>).</p></li>
+</ul>
+<p><strong>The capture-fn contract.</strong> The captured callable takes the runner-owned buffers as an
+argument and returns a dict:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">capture_fn</span><span class="p">(</span><span class="n">static_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">],</span>
+           <span class="n">static_cm</span><span class="p">:</span> <span class="n">BatchedCacheManager</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+           <span class="o">**</span><span class="n">forward_kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]</span>
+</pre></div>
+</div>
+<p>The one rule that makes it CUDA-graph-safe: <strong>read tensors out of</strong> <code class="docutils literal notranslate"><span class="pre">static_inputs</span></code>
+<strong>and never reassign them.</strong> The runner calls <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> with the <em>same</em> dict object
+at capture and updates those buffers in place before each replay, so a fresh
+<code class="docutils literal notranslate"><span class="pre">static_inputs[&quot;x&quot;]</span> <span class="pre">=</span> <span class="pre">...</span></code> would break the graph. (A bare <code class="docutils literal notranslate"><span class="pre">Tensor</span></code> return is also
+accepted and wrapped as <code class="docutils literal notranslate"><span class="pre">{&quot;x&quot;:</span> <span class="pre">...}</span></code>.)</p>
+<p><strong>Calling the runner.</strong> Look it up by label and hand it your real inputs; it returns a
+<code class="docutils literal notranslate"><span class="pre">PiecewiseOutput</span></code> — a dict-like view where indexing / <code class="docutils literal notranslate"><span class="pre">.get</span></code> return an owned clone
+(safe to keep), and <code class="docutils literal notranslate"><span class="pre">.get_view</span></code> returns a zero-copy view valid only until the next
+<code class="docutils literal notranslate"><span class="pre">run</span></code> (see <code class="docutils literal notranslate"><span class="pre">mstar/engine/cuda_graph_runner.py</span></code>). The runner handles input padding,
+attention planning, replay, seq-len advance, and output slicing.</p>
+<p>A dummy submodule using piecewise cuda graphs for a VJepa2-like world model rollout step,
+with an eager preamble, a captured KV-cached block loop over a fixed per-step sequence,
+and an eager postamble:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">PiecewiseBatchedConfig</span><span class="p">,</span> <span class="n">PiecewiseCaptureShape</span><span class="p">,</span> <span class="n">PiecewiseCudaGraphConfig</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MyRolloutSubmodule</span><span class="p">(</span><span class="n">ARNodeSubmodule</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">blocks</span><span class="p">,</span> <span class="n">embed</span><span class="p">,</span> <span class="n">proj</span><span class="p">,</span> <span class="n">embed_dim</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span> <span class="o">=</span> <span class="n">blocks</span>            <span class="c1"># transformer blocks that read the KV cache</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">embed</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span> <span class="o">=</span> <span class="n">embed</span><span class="p">,</span> <span class="n">proj</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">embed_dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">seq_len</span> <span class="o">=</span> <span class="n">embed_dim</span><span class="p">,</span> <span class="n">seq_len</span>
+
+    <span class="c1"># --- the captured inner region ---</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_block_loop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">static_inputs</span><span class="p">,</span> <span class="n">static_cm</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">n_layers</span><span class="p">):</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">static_inputs</span><span class="p">[</span><span class="s2">&quot;x&quot;</span><span class="p">]</span>          <span class="c1"># READ, never reassign the dict entries</span>
+        <span class="n">pos</span> <span class="o">=</span> <span class="n">static_inputs</span><span class="p">[</span><span class="s2">&quot;pos&quot;</span><span class="p">]</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_layers</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">static_cm</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">static_cm</span><span class="o">.</span><span class="n">set_layer_idx</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">i</span><span class="p">](</span><span class="n">x</span><span class="p">,</span> <span class="n">pos</span><span class="o">=</span><span class="n">pos</span><span class="p">,</span> <span class="n">cache_handle</span><span class="o">=</span><span class="n">static_cm</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;x&quot;</span><span class="p">:</span> <span class="n">x</span><span class="p">}</span>
+
+    <span class="c1"># --- declare the graph ---</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_piecewise_cuda_graph_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">make_static_inputs</span><span class="p">(</span><span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">):</span>
+            <span class="k">return</span> <span class="p">{</span>
+                <span class="s2">&quot;x&quot;</span><span class="p">:</span>   <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">seq_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">embed_dim</span><span class="p">,</span>
+                                   <span class="n">dtype</span><span class="o">=</span><span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+                <span class="s2">&quot;pos&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">seq_len</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+            <span class="p">}</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;block_loop&quot;</span><span class="p">:</span> <span class="n">PiecewiseBatchedConfig</span><span class="p">(</span>
+                <span class="n">capture_fn</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_block_loop</span><span class="p">,</span>
+                <span class="n">make_static_inputs</span><span class="o">=</span><span class="n">make_static_inputs</span><span class="p">,</span>
+                <span class="n">seq_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">seq_len</span><span class="p">,</span>
+                <span class="n">forward_kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;n_layers&quot;</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">)},</span>
+                <span class="n">uses_kv_cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="n">cache_labels</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;main&quot;</span><span class="p">],</span>
+                <span class="n">capture_batch_sizes</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">],</span>
+            <span class="p">)</span>
+        <span class="p">}</span>
+
+    <span class="c1"># --- invoke it inside the forward ---</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">hidden</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embed</span><span class="p">(</span><span class="n">hidden</span><span class="p">)</span>                              <span class="c1"># eager preamble → [B, seq_len, D]</span>
+        <span class="n">pos</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_positions</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>                    <span class="c1"># hoisted out of the graph</span>
+        <span class="n">runner</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">piecewise_runners</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;block_loop&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">runner</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">runner</span><span class="o">.</span><span class="n">can_run</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
+            <span class="n">out</span> <span class="o">=</span> <span class="n">runner</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>                              <span class="c1"># plans + replays + advances</span>
+                <span class="n">static_inputs</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;x&quot;</span><span class="p">:</span> <span class="n">x</span><span class="p">,</span> <span class="s2">&quot;pos&quot;</span><span class="p">:</span> <span class="n">pos</span><span class="p">},</span>
+                <span class="n">request_ids</span><span class="o">=</span><span class="n">engine_inputs</span><span class="o">.</span><span class="n">request_ids</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;x&quot;</span><span class="p">]</span>                                   <span class="c1"># owned clone, [B, seq_len, D]</span>
+        <span class="k">else</span><span class="p">:</span>                                              <span class="c1"># eager fallback (no capture)</span>
+            <span class="n">cm</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">cache_manager</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_block_loop</span><span class="p">({</span><span class="s2">&quot;x&quot;</span><span class="p">:</span> <span class="n">x</span><span class="p">,</span> <span class="s2">&quot;pos&quot;</span><span class="p">:</span> <span class="n">pos</span><span class="p">},</span> <span class="n">cm</span><span class="p">,</span>
+                                 <span class="n">n_layers</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">))[</span><span class="s2">&quot;x&quot;</span><span class="p">]</span>
+            <span class="n">cm</span><span class="o">.</span><span class="n">advance_seq_lens</span><span class="p">()</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;pred&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">x</span><span class="p">)}</span>                      <span class="c1"># eager postamble</span>
+</pre></div>
+</div>
+<p>Notes carried by the example: positions are computed eagerly and passed through
+<code class="docutils literal notranslate"><span class="pre">static_inputs</span></code> (so they are not re-derived inside the captured region); the same
+<code class="docutils literal notranslate"><span class="pre">_block_loop</span></code> serves both the captured and eager paths, so there is one source of
+truth; and on the eager path <em>you</em> own attention planning (typically in <code class="docutils literal notranslate"><span class="pre">preprocess</span></code>)
+and the <code class="docutils literal notranslate"><span class="pre">advance_seq_lens</span></code> call — the runner only performs those on the captured path.
+For a real, KV-cached instance see the V-JEPA2 AC predictor
+(<code class="docutils literal notranslate"><span class="pre">mstar/model/vjepa2/submodules.py</span></code>, label <code class="docutils literal notranslate"><span class="pre">&quot;block_loop&quot;</span></code>).</p>
+</section>
 </section>
 <section id="step-6-choose-engine-types">
 <h2>Step 6 — Choose engine types<a class="headerlink" href="#step-6-choose-engine-types" title="Link to this heading">#</a></h2>
@@ -1192,7 +1351,10 @@ fastest path.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#loading-weights">Loading weights</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-5-continuous-batching-and-cuda-graphs">Step 5 — Continuous batching and CUDA graphs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-5-continuous-batching-and-cuda-graphs">Step 5 — Continuous batching and CUDA graphs</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#piecewise-cuda-graphs-capturing-an-inner-loop">Piecewise CUDA graphs (capturing an inner loop)</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-6-choose-engine-types">Step 6 — Choose engine types</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-7-write-a-config-yaml">Step 7 — Write a config YAML</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallelism-sharding">Tensor parallelism (sharding)</a></li>
@@ -1236,7 +1398,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 02, 2026.
+  Last updated on Jul 03, 2026.
   <br/>
 </p>
   </div>

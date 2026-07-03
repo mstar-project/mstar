@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Jul 02, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 03, 2026"/>
   </head>
   
   
@@ -434,7 +434,6 @@
                 <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.predictor.VJEPA2Predictor"><code class="docutils literal notranslate"><span class="pre">VJEPA2Predictor</span></code></a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.predictor.VJEPA2Predictor.forward"><code class="docutils literal notranslate"><span class="pre">VJEPA2Predictor.forward()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.predictor.VJEPA2Predictor.make_layer_loop_fn"><code class="docutils literal notranslate"><span class="pre">VJEPA2Predictor.make_layer_loop_fn()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.predictor.VJEPA2PredictorEmbeddings"><code class="docutils literal notranslate"><span class="pre">VJEPA2PredictorEmbeddings</span></code></a><ul class="visible nav section-nav flex-column">
@@ -512,29 +511,6 @@ registered hooks while the latter silently ignores them.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.12)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.vjepa2.components.predictor.VJEPA2Predictor.make_layer_loop_fn">
-<span class="sig-name descname"><span class="pre">make_layer_loop_fn</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">static_cm</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">static_pos_bufs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/vjepa2/components/predictor.html#VJEPA2Predictor.make_layer_loop_fn"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.vjepa2.components.predictor.VJEPA2Predictor.make_layer_loop_fn" title="Link to this definition">#</a></dt>
-<dd><p>Return a closure over the layer loop for PiecewiseCudaGraphRunner capture.</p>
-<p><code class="docutils literal notranslate"><span class="pre">static_pos_bufs[&quot;position_mask&quot;]</span></code> must already be filled with the
-static <code class="docutils literal notranslate"><span class="pre">[n_seq]</span></code> position IDs for this rollout config before this
-method is called (the fn_factory in get_piecewise_runner_config does
-this via <code class="docutils literal notranslate"><span class="pre">.copy_()</span></code>).  At replay, the runner never updates this buffer
-(callers pass <code class="docutils literal notranslate"><span class="pre">pos_bufs=None</span></code>), so the captured ops always see the
-same position IDs.</p>
-<p>The <code class="docutils literal notranslate"><span class="pre">unsqueeze(0)</span></code> inside <code class="docutils literal notranslate"><span class="pre">fn</span></code> is a zero-copy view, CUDA-graph
-compatible.  <code class="docutils literal notranslate"><span class="pre">VJEPA2RopeAttention.get_position_ids</span></code> broadcasts
-<code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">H,</span> <span class="pre">N]</span></code> IDs against <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">H,</span> <span class="pre">N,</span> <span class="pre">D]</span></code> Q/K tensors correctly.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>static_pos_bufs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.12)"><em>Tensor</em></a><em>]</em>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a>[[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.12)"><em>Tensor</em></a>], <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.12)"><em>Tensor</em></a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -632,7 +608,6 @@ registered hooks while the latter silently ignores them.</p>
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.predictor.VJEPA2Predictor"><code class="docutils literal notranslate"><span class="pre">VJEPA2Predictor</span></code></a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.predictor.VJEPA2Predictor.forward"><code class="docutils literal notranslate"><span class="pre">VJEPA2Predictor.forward()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.predictor.VJEPA2Predictor.make_layer_loop_fn"><code class="docutils literal notranslate"><span class="pre">VJEPA2Predictor.make_layer_loop_fn()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.predictor.VJEPA2PredictorEmbeddings"><code class="docutils literal notranslate"><span class="pre">VJEPA2PredictorEmbeddings</span></code></a><ul class="visible nav section-nav flex-column">
@@ -672,7 +647,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 02, 2026.
+  Last updated on Jul 03, 2026.
   <br/>
 </p>
   </div>
