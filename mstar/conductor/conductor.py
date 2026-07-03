@@ -1,7 +1,6 @@
 import atexit
 import hashlib
 import logging
-import multiprocessing as mp
 import os
 import socket
 import time
@@ -14,6 +13,7 @@ import yaml
 
 from mstar.api_server.request_types import APIServerMessage, RequestComplete
 from mstar.cluster.endpoints import ControlPlaneEndpoints
+from mstar.cluster.launcher import Launcher, LocalLauncher, NodeAgentLauncher
 from mstar.cluster.spec import ClusterSpec
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.conductor.request_info import (
@@ -33,8 +33,10 @@ from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.ipc_format import (
+    AgentMessage,
     ConductorMessageType,
     InputSignals,
+    LaunchSpec,
     NewRequest,
     NewRequestConductor,
     RemoveRequest,
@@ -63,6 +65,10 @@ def _req_id_to_seed(req_id: str):
     """
     digest = hashlib.md5(req_id.encode("utf-8")).digest()
     return int.from_bytes(digest[:4], "little")
+
+
+class NoLiveReplicaError(RuntimeError):
+    """Every replica that could serve a worker graph contains a dead worker."""
 
 
 def _pick_free_tcp_port() -> int:
@@ -207,7 +213,9 @@ class Conductor:
         enable_prof: bool = False,
         log_level: str = "INFO",
         tensor_comm_protocol=CommProtocol.RDMA,
-        tcp_transfer_device=""
+        tcp_transfer_device="",
+        model_cache_dir: str | None = None,
+        startup_timeout_s: float = 600.0,
     ):
         self.requests: dict[str, RequestData] = {}
         self.model = model
@@ -217,8 +225,9 @@ class Conductor:
         self.enable_prof = enable_prof
         self.tensor_comm_protocol = tensor_comm_protocol
         self.tcp_transfer_device = tcp_transfer_device
+        self.model_cache_dir = model_cache_dir
+        self._startup_timeout_s = startup_timeout_s
 
-        self._worker_processes: list[mp.Process] = []
         self.waiting_queue: list[NewRequestConductor] = []
 
         with open(model_config_file, "r") as f:
@@ -312,14 +321,21 @@ class Conductor:
 
         os.makedirs(socket_path_prefix, exist_ok=True)
         self._derive_worker_info()
-        self._launch_workers()
 
+        # The conductor's inbound socket must exist before any worker or node
+        # agent starts, so their first messages have somewhere to land.
         self.communicator = ZMQCommunicator(
             my_id="conductor",
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
             endpoints=self.control_endpoints,
         )
+
+        self._dead_workers: set[str] = set()
+        self._launchers: list[Launcher] = self._build_launchers()
+        for launcher in self._launchers:
+            launcher.ensure_workers()
+        atexit.register(self.shutdown)
 
     def _get_kv_config(self):
         kv_cache_config = self.model.get_kv_cache_config()
@@ -420,52 +436,140 @@ class Conductor:
             local_devices=[self.worker_specs[wid].local_device for wid in self.worker_ids],
         )
 
-    def _launch_workers(self):
-        """Spawn one process per worker rank using spawn context."""
-        ctx = mp.get_context("spawn")
-        for worker_id in self.worker_ids:
-            spec = self.worker_specs[worker_id]
-            p = ctx.Process(
-                target=_worker_process_target,
-                kwargs={
-                    "worker_id": worker_id,
-                    "worker_ids": self.worker_ids,
-                    "my_worker_graphs": self._per_worker_graphs[worker_id],
-                    "kv_config": self._get_kv_config(),
-                    "model_config": self.model_config,
-                    "all_worker_graph_ids_to_graph_walks": self._all_worker_graph_ids_to_graph_walks,
-                    "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
-                    "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
-                    "sharding_config": self.per_worker_sharding_config[worker_id],
-                    "tp_groups": self.tp_config.per_worker_config[worker_id],
-                    "hostname": spec.addr,
-                    "socket_path_prefix": self.socket_path_prefix,
-                    "endpoints": self.control_endpoints,
-                    "dist_init_method": self._dist_init_method,
-                    "model": self.model,
-                    "enable_nvtx": self.enable_nvtx,
-                    "enable_prof": self.enable_prof,
-                    "device": f"cuda:{spec.local_device}",
-                    "log_level": self.log_level,
-                    "tensor_comm_protocol": self.tensor_comm_protocol,
-                    "tcp_transfer_device": self.tcp_transfer_device
-                },
-                daemon=False,
-            )
-            p.start()
-            self._worker_processes.append(p)
+    def _worker_spawn_kwargs(self, worker_id: str) -> dict:
+        """Keyword arguments for one worker's process target, minus the model.
 
-        atexit.register(self.shutdown)
+        The local launcher adds the in-memory model object; launch specs for
+        remote hosts ship these kwargs as-is and the node agent reconstructs
+        the model there from the registry.
+        """
+        spec = self.worker_specs[worker_id]
+        return {
+            "worker_id": worker_id,
+            "worker_ids": self.worker_ids,
+            "my_worker_graphs": self._per_worker_graphs[worker_id],
+            "kv_config": self._get_kv_config(),
+            "model_config": self.model_config,
+            "all_worker_graph_ids_to_graph_walks": self._all_worker_graph_ids_to_graph_walks,
+            "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
+            "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
+            "sharding_config": self.per_worker_sharding_config[worker_id],
+            "tp_groups": self.tp_config.per_worker_config[worker_id],
+            "hostname": spec.addr,
+            "socket_path_prefix": self.socket_path_prefix,
+            "endpoints": self.control_endpoints,
+            "dist_init_method": self._dist_init_method,
+            "enable_nvtx": self.enable_nvtx,
+            "enable_prof": self.enable_prof,
+            "device": f"cuda:{spec.local_device}",
+            "log_level": self.log_level,
+            "tensor_comm_protocol": self.tensor_comm_protocol,
+            "tcp_transfer_device": self.tcp_transfer_device,
+        }
+
+    def _build_launchers(self) -> list["Launcher"]:
+        local_ids = [
+            wid for wid in self.worker_ids if self.worker_specs[wid].host_index == 0
+        ]
+        launchers: list[Launcher] = []
+        if local_ids:
+            launchers.append(LocalLauncher(
+                worker_ids=local_ids,
+                model=self.model,
+                build_spawn_kwargs=self._worker_spawn_kwargs,
+                target=_worker_process_target,
+            ))
+        remote_nodes = sorted({
+            spec.host_index
+            for spec in self.worker_specs.values()
+            if spec.host_index != 0
+        })
+        if remote_nodes:
+            launchers.append(NodeAgentLauncher(
+                communicator=self.communicator,
+                launch_specs={k: self._build_launch_spec(k) for k in remote_nodes},
+                join_timeout_s=self._startup_timeout_s,
+            ))
+        return launchers
+
+    def _build_launch_spec(self, node_rank: int) -> LaunchSpec:
+        worker_ids = [
+            wid for wid in self.worker_ids
+            if self.worker_specs[wid].host_index == node_rank
+        ]
+        return LaunchSpec(
+            node_rank=node_rank,
+            model_name=self.model_config.get("model", "dummy"),
+            model_kwargs=self.model_config.get("model_kwargs", {}) or {},
+            cache_dir=self.model_cache_dir,
+            log_level=self.log_level,
+            host_env=dict(self.cluster_spec.hosts[node_rank].env),
+            workers=[self._worker_spawn_kwargs(wid) for wid in worker_ids],
+        )
+
+    def _handle_agent_message(self, message: AgentMessage) -> None:
+        for launcher in self._launchers:
+            if isinstance(launcher, NodeAgentLauncher):
+                launcher.handle_agent_message(message)
+                return
+        logger.warning(
+            "Agent message %s received but no node-agent launcher exists",
+            message.message_type,
+        )
+
+    def _poll_launchers(self) -> None:
+        for launcher in self._launchers:
+            for event in launcher.poll():
+                self._on_worker_died(event.worker_id, event.exitcode)
+
+    def _on_worker_died(self, worker_id: str, exitcode: int | None) -> None:
+        if worker_id in self._dead_workers:
+            return
+        self._dead_workers.add(worker_id)
+        logger.error(
+            "Worker %s died (exit %s); failing its in-flight requests and "
+            "masking its replicas", worker_id, exitcode,
+        )
+        affected = [
+            rid for rid, data in self.requests.items()
+            if any(worker_id in ws for ws in data.worker_graph_to_workers.values())
+        ]
+        for rid in affected:
+            self._fail_request(rid, f"worker {worker_id} died (exit {exitcode})")
+
+    def _fail_request(self, request_id: str, error: str) -> None:
+        request_data = self.requests.pop(request_id, None)
+        if request_data is None:
+            return
+        for worker_ids in request_data.worker_graph_to_workers.values():
+            for wid in set(worker_ids) - self._dead_workers:
+                self.communicator.send(
+                    wid,
+                    WorkerMessage(
+                        message_type=WorkerMessageType.REMOVE_REQUEST,
+                        body=RemoveRequest(request_id),
+                    ),
+                )
+        self.communicator.send(
+            "api_server",
+            APIServerMessage(
+                message_type="request_complete",
+                body=RequestComplete(
+                    request_id=request_id,
+                    final_outputs=request_data.final_outputs,
+                    conductor_ingest_time=request_data.conductor_ingest_time,
+                    conductor_finish_time=time.perf_counter(),
+                    error=error,
+                ),
+            ),
+        )
+        logger.error("Request %s failed: %s", request_id, error)
+        self._try_admit_waiting()
 
     def shutdown(self):
         logger.info("Shutting down conductor...")
-        """Terminate and join all worker processes."""
-        for p in self._worker_processes:
-            if p.is_alive():
-                p.terminate()
-        for p in self._worker_processes:
-            p.join(timeout=5)
-        self._worker_processes.clear()
+        for launcher in getattr(self, "_launchers", []):
+            launcher.shutdown()
 
     def _assign_worker_graphs_to_workers(self) -> dict[str, list[str]]:
         """
@@ -483,17 +587,23 @@ class Conductor:
         group_id_to_replica_idx: dict[int, int] = {}
         result = {}
         for wg_id, wg in self.worker_graphs.items():
-            if wg._tp_ranks:
-                replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg._tp_ranks)),
-                )
-                ranks = wg._tp_ranks[replica_idx]
-                result[wg_id] = [f"worker_{r}" for r in ranks]
-            else:
-                replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg.ranks)),
-                )
-                result[wg_id] = [f"worker_{wg.ranks[replica_idx]}"]
+            replicas = wg._tp_ranks if wg._tp_ranks else [[r] for r in wg.ranks]
+            if wg._group_id not in group_id_to_replica_idx:
+                live = [
+                    i for i, ranks in enumerate(replicas)
+                    if not any(f"worker_{r}" in self._dead_workers for r in ranks)
+                ]
+                if not live:
+                    raise NoLiveReplicaError(
+                        f"no live replica remains for nodes "
+                        f"{sorted(wg.section.get_nodes())} "
+                        f"(dead workers: {sorted(self._dead_workers)})"
+                    )
+                group_id_to_replica_idx[wg._group_id] = live[
+                    int(np.random.randint(len(live)))
+                ]
+            replica_idx = group_id_to_replica_idx[wg._group_id]
+            result[wg_id] = [f"worker_{r}" for r in replicas[replica_idx]]
         return result
 
     def _build_request_sharding_config(
@@ -619,7 +729,32 @@ class Conductor:
                 body.request_id, len(self.requests),
                 str(self.max_concurrent_requests),
             )
+            self._safe_ingest(body)
+
+    def _safe_ingest(self, body: NewRequestConductor):
+        """Dispatch a request; reject it cleanly when no live replica exists.
+
+        The replica check runs before any per-request state is created, so a
+        rejected request leaves nothing behind to clean up.
+        """
+        try:
             self._do_ingest_request(body)
+        except NoLiveReplicaError as e:
+            logger.error("Rejecting request %s: %s", body.request_id, e)
+            now = time.perf_counter()
+            self.communicator.send(
+                "api_server",
+                APIServerMessage(
+                    message_type="request_complete",
+                    body=RequestComplete(
+                        request_id=body.request_id,
+                        final_outputs={},
+                        conductor_ingest_time=now,
+                        conductor_finish_time=now,
+                        error=str(e),
+                    ),
+                ),
+            )
 
     def _ingest_request(
         self, body: NewRequestConductor
@@ -639,7 +774,7 @@ class Conductor:
             return
         if self.enable_nvtx:
             range_push("conductor._do_ingest_request")
-        self._do_ingest_request(body)
+        self._safe_ingest(body)
         if self.enable_nvtx:
             range_pop()
 
@@ -1099,15 +1234,32 @@ class Conductor:
         replayed on the first main-loop iteration so it isn't lost.
         """
         pending = set(self.worker_ids)
+        deadline = time.monotonic() + self._startup_timeout_s
         logger.info(
             "Conductor waiting for %d worker(s) to finish setup", len(pending)
         )
         while pending:
             for message in self.communicator.get_all_new_messages():
-                if message.message_type == ConductorMessageType.SETUP_DONE:
+                if isinstance(message, AgentMessage):
+                    self._handle_agent_message(message)
+                elif message.message_type == ConductorMessageType.SETUP_DONE:
                     pending.discard(message.body.worker_id)
                 else:
                     self._startup_message_backlog.append(message)
+            # A worker dying (or an expected node agent never joining) during
+            # startup is fatal: fail fast with a precise message rather than
+            # letting the deployment hang.
+            for launcher in self._launchers:
+                for event in launcher.poll():
+                    raise RuntimeError(
+                        f"worker {event.worker_id} died during startup "
+                        f"(exit {event.exitcode})"
+                    )
+            if pending and time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"startup timed out after {self._startup_timeout_s:.0f}s; "
+                    f"still waiting for: {sorted(pending)}"
+                )
             if pending:
                 time.sleep(0.01)
         logger.info("Conductor: all %d worker(s) ready", len(self.worker_ids))
@@ -1129,9 +1281,14 @@ class Conductor:
             try:
                 done_partition_forwards: list[tuple[str, str, bool]] = []
 
+                self._poll_launchers()
+
                 startup_backlog = self._startup_message_backlog
                 self._startup_message_backlog = []
                 for message in startup_backlog + self.communicator.get_all_new_messages():
+                    if isinstance(message, AgentMessage):
+                        self._handle_agent_message(message)
+                        continue
                     if message.message_type == ConductorMessageType.NEW_REQUEST:
                         self._ingest_request(message.body)
                     elif message.message_type == ConductorMessageType.ABORT_REQUEST:

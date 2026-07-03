@@ -37,6 +37,9 @@ class RequestComplete:
     graph_timings: GraphTimings = field(default_factory=dict)
     rx_info: list[RxInfo] = field(default_factory=list)
     tx_info: list[TxInfo] = field(default_factory=list)
+    # Set when the request was aborted by the server (e.g. a worker died);
+    # the API server surfaces it as an HTTP error instead of empty output.
+    error: str | None = None
 
 
 @dataclass

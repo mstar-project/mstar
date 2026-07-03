@@ -107,7 +107,8 @@ def _conductor_process_target(
         enable_prof=enable_prof,
         log_level=log_level,
         tensor_comm_protocol=tensor_comm_protocol,
-        tcp_transfer_device=tcp_transfer_device
+        tcp_transfer_device=tcp_transfer_device,
+        model_cache_dir=cache_dir,
     )
     try:
         conductor.run()
@@ -123,7 +124,9 @@ def _shutdown_conductor_process(
         return
 
     try:
-        conductor_proc.send_signal(signal.SIGINT)
+        # mp.Process has no send_signal; deliver SIGINT by pid so the
+        # conductor's KeyboardInterrupt path can terminate its workers.
+        os.kill(conductor_proc.pid, signal.SIGINT)
         conductor_proc.join(timeout=timeout)
     except BaseException:
         logger.exception("Failed graceful conductor shutdown")
@@ -153,6 +156,7 @@ class PendingRequest:
     chunks: list[ResultChunk] = field(default_factory=list)
     final_outputs: dict = field(default_factory=dict)
     consumed_chunks: int = 0
+    error: str | None = None  # server-side failure (e.g. a worker died)
 
 
 class APIServer:
@@ -364,6 +368,10 @@ class APIServer:
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
                                 req = self.pending_requests[rid]
+                                # On server-side failure final_outputs is empty,
+                                # so the normal prune path releases the waiter
+                                # on its next tick without special casing.
+                                req.error = message.body.error
                                 req.final_outputs = message.body.final_outputs
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
@@ -468,6 +476,12 @@ class APIServer:
                         self._finalize_profile(finished_req)
                     for chunk in remaining:
                         yield chunk
+                    if finished_req is not None and finished_req.error is not None:
+                        yield ResultChunk(
+                            request_id=request_id,
+                            modality="error",
+                            data=finished_req.error.encode("utf-8"),
+                        )
                     finished = True
                     break
 
@@ -520,6 +534,10 @@ class APIServer:
         # Profiling (incl. the optional file write) runs outside the lock; the
         # popped request is no longer shared with other threads.
         self._finalize_profile(req)
+        if req.error is not None:
+            raise HTTPException(
+                status_code=500, detail=f"request failed: {req.error}"
+            )
         return list(req.chunks)
 
     def _finalize_profile(self, req: PendingRequest) -> None:
