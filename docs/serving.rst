@@ -253,6 +253,65 @@ Workers route tensors directly to one another using one of three transports, sel
 - ``RDMA`` — lowest latency for multi-GPU / multi-node, via the Mooncake transfer engine
   (requires RDMA-capable networking).
 
+Multi-host deployments
+----------------------
+
+A deployment spans several machines when the config carries a ``cluster:``
+section mapping hosts and their GPUs onto the global ranks that
+``node_groups`` already uses:
+
+.. code-block:: yaml
+
+   cluster:
+     hosts:
+       - addr: nodeA            # routable hostname/IP
+         gpus: [0, 1, 2, 3]     # local CUDA indices -> global ranks 0-3
+       - addr: nodeB
+         gpus: [0, 1]           # -> global ranks 4-5
+         env:                   # optional per-host worker env
+           NCCL_SOCKET_IFNAME: eth1
+         rdma_device: mlx5_0    # optional transfer-engine device filter
+
+   node_groups:                 # unchanged; ranks are global
+     - {node_names: [Thinker], ranks: [0, 1, 2, 3], tp_size: 4}
+     - {node_names: [Thinker], ranks: [4, 5], tp_size: 2, graph_walks: [decode]}
+
+The first host is the head: it runs ``mstar-serve`` (API server + conductor)
+plus its own workers, exactly as on a single machine. Every other host runs
+one agent that joins the conductor and spawns that host's workers:
+
+.. code-block:: bash
+
+   nodeA$ mstar-serve --config cfg.yaml --tensor-comm-protocol RDMA
+   nodeB$ mstar-node  --config cfg.yaml --node-rank 1
+
+Start order does not matter (the agent retries until the conductor is up);
+the server binds its HTTP port only once every worker on every host has
+finished loading and warmup, and startup aborts with a precise error if a
+host never joins or a worker dies while loading (``--startup-timeout``
+bounds the wait). If a worker dies at runtime, its in-flight requests fail
+with HTTP 500 and, when data-parallel replicas exist, new requests route
+around the dead worker.
+
+Multi-host notes:
+
+- The control plane switches from ipc sockets to TCP automatically; each
+  host's ports derive from its ``zmq_port_base`` (two logical hosts on one
+  machine — the loopback test rig — just need different bases).
+- ``SHM`` tensor transport is rejected for multi-host clusters; use ``RDMA``
+  where the fabric exists, ``TCP`` otherwise. On machines without an active
+  RDMA fabric the TCP transfer engine usually needs an explicit
+  ``--tcp-transfer-device`` (or per-host ``rdma_device``) value.
+- Model weights must be present on every host (shared filesystem or a
+  per-host cache); agents construct the model locally rather than receiving
+  weights over the network.
+- Keep TP groups within one host unless the hosts share an RDMA-class
+  interconnect — the conductor logs a warning when a group spans hosts.
+
+``test/multinode/`` contains a self-contained two-"host" loopback rig that
+exercises the full path (agent handshake, cross-host prefill→decode KV
+transfer, worker-failure handling) on one machine.
+
 .. _request-profiling:
 
 Request profiling

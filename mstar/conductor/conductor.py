@@ -464,7 +464,12 @@ class Conductor:
             "device": f"cuda:{spec.local_device}",
             "log_level": self.log_level,
             "tensor_comm_protocol": self.tensor_comm_protocol,
-            "tcp_transfer_device": self.tcp_transfer_device,
+            # Per-host transfer-engine device filter wins over the global CLI
+            # value (multi-host clusters can have differently named NICs/HCAs).
+            "tcp_transfer_device": (
+                self.cluster_spec.hosts[spec.host_index].rdma_device
+                or self.tcp_transfer_device
+            ),
         }
 
     def _build_launchers(self) -> list["Launcher"]:

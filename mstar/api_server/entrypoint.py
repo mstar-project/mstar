@@ -838,7 +838,7 @@ def main(argv: list[str] | None = None):
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         model_name=model_name,
-        tcp_transfer_device=args.tcp_transfer_device,
+        tcp_transfer_device=cluster_spec.head.rdma_device or args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
     )

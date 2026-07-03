@@ -260,20 +260,27 @@ class MooncakeTransferEngine(TensorTransferEngine):
                 "Install mooncake-transfer-engine or use SHM protocol."
             )
 
-        if protocol == CommProtocol.RDMA:
-            transfer_device = ""
-        elif protocol == CommProtocol.TCP:
-            transfer_device = tcp_transfer_device
-        else:
+        if protocol not in (CommProtocol.RDMA, CommProtocol.TCP):
             raise NotImplementedError(f"Unknown protocol {protocol} for mooncake")
+        # Device filter for the engine: an HCA name (or comma list) under RDMA,
+        # a segment/interface string under TCP. Empty means auto-discovery.
+        transfer_device = tcp_transfer_device
 
         self._engine = TransferEngine()
-        self._engine.initialize(
+        ret = self._engine.initialize(
             hostname,
             metadata_server,
             protocol.value.lower(),
             transfer_device,
         )
+        if ret != 0:
+            raise RuntimeError(
+                f"Mooncake TransferEngine initialize failed (rc={ret}) for "
+                f"hostname={hostname!r} protocol={protocol.value} "
+                f"device={transfer_device!r}. On hosts without an active RDMA "
+                "fabric, TCP mode typically needs an explicit device/segment "
+                "(e.g. --tcp-transfer-device 0.0.0.0.0)."
+            )
         self._session_id = f"{hostname}:{self._engine.get_rpc_port()}"
 
     def register_memory(self, ptr: int, nbytes: int) -> int:
