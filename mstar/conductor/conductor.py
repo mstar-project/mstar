@@ -71,6 +71,87 @@ class NoLiveReplicaError(RuntimeError):
     """Every replica that could serve a worker graph contains a dead worker."""
 
 
+def assign_worker_graphs(
+    worker_graphs: dict[str, WorkerGraph],
+    cluster_spec: ClusterSpec,
+    dead_workers: set[str],
+) -> dict[str, list[str]]:
+    """Pick a DP replica per node group and map worker graphs to workers.
+
+    Picks are coordinated by ``_group_id`` so all wgs derived from the same
+    node_group land on the same replica's workers. Replicas containing dead
+    workers are skipped. Among live replicas, ones on hosts this request
+    already uses are preferred, so adjacent stages avoid cross-host hops when
+    the placement offers a choice; ties break uniformly at random (on a single
+    host every replica ties, preserving the uniform-random behavior).
+    """
+    group_id_to_replica_idx: dict[int, int] = {}
+    chosen_hosts: set[int] = set()
+    result: dict[str, list[str]] = {}
+    for wg_id, wg in worker_graphs.items():
+        replicas = wg._tp_ranks if wg._tp_ranks else [[r] for r in wg.ranks]
+        if wg._group_id not in group_id_to_replica_idx:
+            live = [
+                i for i, ranks in enumerate(replicas)
+                if not any(f"worker_{r}" in dead_workers for r in ranks)
+            ]
+            if not live:
+                raise NoLiveReplicaError(
+                    f"no live replica remains for nodes "
+                    f"{sorted(wg.section.get_nodes())} "
+                    f"(dead workers: {sorted(dead_workers)})"
+                )
+
+            scores = [
+                len({cluster_spec.host_of_rank(r) for r in replicas[i]} & chosen_hosts)
+                for i in live
+            ]
+            best = max(scores)
+            candidates = [i for i, s in zip(live, scores, strict=True) if s == best]
+            group_id_to_replica_idx[wg._group_id] = candidates[
+                int(np.random.randint(len(candidates)))
+            ]
+        ranks = replicas[group_id_to_replica_idx[wg._group_id]]
+        chosen_hosts.update(cluster_spec.host_of_rank(r) for r in ranks)
+        result[wg_id] = [f"worker_{r}" for r in ranks]
+    return result
+
+
+def find_cross_host_cuts(
+    worker_graphs: dict[str, WorkerGraph],
+    node_walk_to_wg: dict[tuple[str, str], WorkerGraph],
+    cluster_spec: ClusterSpec,
+) -> set[tuple]:
+    """Graph edges that can cross hosts under this placement.
+
+    Returns tuples of (walk, source node, dest node, edge name, source hosts,
+    dest hosts). An edge is a potential cut unless both endpoints resolve to
+    the same single host for every replica.
+    """
+    cuts: set[tuple] = set()
+    for wg in worker_graphs.values():
+        wg_nodes = set(wg.section.get_nodes())
+        src_hosts = tuple(sorted({cluster_spec.host_of_rank(r) for r in wg.ranks}))
+        for walk in wg.graph_walks:
+            for node_name, node in wg.section.get_nodes().items():
+                for edge in node.outputs:
+                    if edge.next_node in wg_nodes:
+                        continue
+                    dest_wg = node_walk_to_wg.get((edge.next_node, walk))
+                    if dest_wg is None:
+                        continue
+                    dst_hosts = tuple(sorted({
+                        cluster_spec.host_of_rank(r) for r in dest_wg.ranks
+                    }))
+                    if src_hosts == dst_hosts and len(src_hosts) == 1:
+                        continue
+                    cuts.add((
+                        walk, node_name, edge.next_node, edge.name,
+                        src_hosts, dst_hosts,
+                    ))
+    return cuts
+
+
 def _pick_free_tcp_port() -> int:
     """Ask the OS for an unused ephemeral TCP port.
 
@@ -436,6 +517,24 @@ class Conductor:
             local_devices=[self.worker_specs[wid].local_device for wid in self.worker_ids],
         )
 
+        if self.cluster_spec.is_multi_host():
+            cuts = find_cross_host_cuts(
+                self.worker_graphs, self.node_walk_to_wg, self.cluster_spec,
+            )
+            proto = getattr(
+                self.tensor_comm_protocol, "value", self.tensor_comm_protocol
+            )
+            for walk, src, dst, edge_name, src_hosts, dst_hosts in sorted(cuts):
+                logger.info(
+                    "Cross-host edge: [%s] %s -> %s (%s), hosts %s -> %s, via %s",
+                    walk, src, dst, edge_name,
+                    list(src_hosts), list(dst_hosts), proto,
+                )
+            logger.info(
+                "%d graph edge(s) may cross hosts under this placement",
+                len(cuts),
+            )
+
     def _worker_spawn_kwargs(self, worker_id: str) -> dict:
         """Keyword arguments for one worker's process target, minus the model.
 
@@ -577,39 +676,9 @@ class Conductor:
             launcher.shutdown()
 
     def _assign_worker_graphs_to_workers(self) -> dict[str, list[str]]:
-        """
-        For a request, assign worker graphs to workers. DP picks are
-        coordinated by ``_group_id`` so all wgs derived from the same
-        node_group land on the same (replica's) workers — without this,
-        two wgs sharing a TP group could end up on different DP replicas
-        and break model topology.
-
-        TODO: smarter assignment that minimizes cross-graph-walk tensor
-        transfer (e.g., bias toward keeping prefill→decode handoff local
-        for the same request).
-        """
-        # _group_id -> chosen DP-replica index within that group's ranks
-        group_id_to_replica_idx: dict[int, int] = {}
-        result = {}
-        for wg_id, wg in self.worker_graphs.items():
-            replicas = wg._tp_ranks if wg._tp_ranks else [[r] for r in wg.ranks]
-            if wg._group_id not in group_id_to_replica_idx:
-                live = [
-                    i for i, ranks in enumerate(replicas)
-                    if not any(f"worker_{r}" in self._dead_workers for r in ranks)
-                ]
-                if not live:
-                    raise NoLiveReplicaError(
-                        f"no live replica remains for nodes "
-                        f"{sorted(wg.section.get_nodes())} "
-                        f"(dead workers: {sorted(self._dead_workers)})"
-                    )
-                group_id_to_replica_idx[wg._group_id] = live[
-                    int(np.random.randint(len(live)))
-                ]
-            replica_idx = group_id_to_replica_idx[wg._group_id]
-            result[wg_id] = [f"worker_{r}" for r in replicas[replica_idx]]
-        return result
+        return assign_worker_graphs(
+            self.worker_graphs, self.cluster_spec, self._dead_workers,
+        )
 
     def _build_request_sharding_config(
         self, worker_graph_to_workers: dict[str, list[str]],
