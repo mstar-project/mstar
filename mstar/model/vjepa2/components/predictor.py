@@ -18,8 +18,6 @@ Weight layout (prefix ``predictor.``):
 
 from __future__ import annotations
 
-from typing import Callable
-
 import torch
 from torch import nn
 
