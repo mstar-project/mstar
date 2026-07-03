@@ -13,6 +13,7 @@ import torch
 import yaml
 
 from mstar.api_server.request_types import APIServerMessage, RequestComplete
+from mstar.cluster.endpoints import ControlPlaneEndpoints
 from mstar.cluster.spec import ClusterSpec
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.conductor.request_info import (
@@ -92,6 +93,7 @@ def _worker_process_target(
     hostname: str,
     socket_path_prefix: str,
     dist_init_method: str,
+    endpoints=None,
     enable_nvtx: bool = False,
     enable_prof: bool = False,
     model: Model | None = None,
@@ -127,6 +129,7 @@ def _worker_process_target(
             tp_groups=tp_groups,
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
+            endpoints=endpoints,
             dist_init_method=dist_init_method,
             enable_nvtx=enable_nvtx,
             enable_prof=enable_prof,
@@ -232,6 +235,7 @@ class Conductor:
         self.cluster_spec = ClusterSpec.from_config(self.model_config)
         self.cluster_spec.validate_protocol(tensor_comm_protocol)
         self.head_addr = hostname if hostname is not None else self.cluster_spec.head_addr
+        self.control_endpoints = ControlPlaneEndpoints(self.cluster_spec)
         logger.info("Cluster: %s", self.cluster_spec.summary())
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
@@ -314,6 +318,7 @@ class Conductor:
             my_id="conductor",
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
+            endpoints=self.control_endpoints,
         )
 
     def _get_kv_config(self):
@@ -357,6 +362,8 @@ class Conductor:
         # placement fails here with a precise message instead of inside a
         # spawned worker.
         self.cluster_spec.validate_ranks(self._sorted_ranks)
+        if self.cluster_spec.is_multi_host():
+            self.control_endpoints.validate_ports(self._sorted_ranks)
         self.worker_specs = {
             worker_id: self.cluster_spec.worker_spec(rank)
             for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True)
@@ -433,6 +440,7 @@ class Conductor:
                     "tp_groups": self.tp_config.per_worker_config[worker_id],
                     "hostname": spec.addr,
                     "socket_path_prefix": self.socket_path_prefix,
+                    "endpoints": self.control_endpoints,
                     "dist_init_method": self._dist_init_method,
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,

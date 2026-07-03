@@ -23,6 +23,7 @@ from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
+from mstar.cluster.endpoints import ControlPlaneEndpoints
 from mstar.cluster.spec import ClusterSpec
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.model.registry import HF_MODELS
@@ -169,6 +170,7 @@ class APIServer:
         model_name: str = "dummy",
         log_stats: bool = False,
         log_stats_file: str | None = None,
+        endpoints=None,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -193,7 +195,8 @@ class APIServer:
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
-            enable_prof=self.log_stats
+            enable_prof=self.log_stats,
+            endpoints=endpoints,
         )
 
         # Concurrent request tracking
@@ -210,6 +213,7 @@ class APIServer:
             my_id="api_server",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
+            endpoints=endpoints,
         )
 
         # Background thread that drains results from the conductor. Started by
@@ -811,6 +815,7 @@ def main(argv: list[str] | None = None):
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
         hostname=cluster_spec.head_addr,
+        endpoints=ControlPlaneEndpoints(cluster_spec),
         timeout_seconds=args.timeout,
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,

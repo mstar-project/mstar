@@ -133,7 +133,8 @@ class Worker:
         enable_nvtx: bool = False,
         enable_prof: bool = False,
         tcp_transfer_device="",
-        dist_init_method=None
+        dist_init_method=None,
+        endpoints=None,
     ):
         self.worker_id = worker_id
         self.device = device
@@ -172,6 +173,7 @@ class Worker:
             my_id=worker_id,
             push_ids=worker_ids + ["conductor", "api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
+            endpoints=endpoints,
         )
         self.wakeup_event = EventWakeup()
         self.communicator.register_event_for_poll(self.wakeup_event)
