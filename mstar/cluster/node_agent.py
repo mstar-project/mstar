@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 class NodeAgent:
     def __init__(self, config_path: str, node_rank: int):
+        self.config_path = config_path
         with open(config_path) as f:
             config = yaml.safe_load(f)
         self.cluster_spec = ClusterSpec.from_config(config)
@@ -141,6 +142,13 @@ class NodeAgent:
             cache_dir=spec.cache_dir,
             **spec.model_kwargs,
         )
+        # Models may specialize themselves from the deployment config (e.g.
+        # BAGEL only registers its CFG-parallel walks when the placement names
+        # those nodes). The conductor's model instance goes through these
+        # calls before its local workers spawn; make the same calls here so
+        # agent-spawned workers build identical graphs.
+        model.get_worker_graphs(self.config_path)
+        model.get_sharding_config(self.config_path)
 
         from mstar.conductor.conductor import _worker_process_target
 
