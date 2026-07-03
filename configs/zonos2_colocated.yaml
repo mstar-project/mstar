@@ -1,0 +1,10 @@
+model: "zonos2"
+max_seq_len: 8192
+# Single-GPU: the LLM (prefill + decode) and the DAC vocoder share rank 0.
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]
+    graph_walks: [prefill, decode]
+  - node_names: [dac_decoder]
+    ranks: [0]
+    graph_walks: [dac_chunk]
