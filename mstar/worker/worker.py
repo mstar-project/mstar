@@ -1598,6 +1598,15 @@ class Worker:
         # pending stops are only needed for one iteration, so can be cleared now
         self._pending_loop_stops.clear()
 
+        # An engine can drop rids that were skipped during execution (a
+        # submodule's prepare_inputs returned None) from node_batch.request_ids,
+        # but it cannot reach the worker-side ScheduledBatch. Reconcile it here so
+        # the routing/output loops below only touch rids that produced outputs.
+        for rid in list(batch_N.batch.request_to_worker_graph):
+            if rid not in valid_rids:
+                batch_N.batch.request_to_worker_graph.pop(rid, None)
+                batch_N.batch.node_objects.pop(rid, None)
+
         per_req_nested_idxs = {
             rid: self.worker_graphs_manager.get_nested_loop_idxs_for_node(
                 rid, batch_N.partition, batch_N.node_name
