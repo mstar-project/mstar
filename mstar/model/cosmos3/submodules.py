@@ -1100,7 +1100,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ``COSMOS3_GEN_CAPTURE_BS`` (e.g. ``"1,4,8"``) to also capture batched
         denoise steps so concurrent requests replay a padded graph instead of
         falling back to the eager path."""
-        if self.transformer is None or os.environ.get("COSMOS3_DISABLE_CUDA_GRAPH"):
+        disable_env = os.environ.get("COSMOS3_DISABLE_CUDA_GRAPH")
+        disabled = bool(disable_env) if disable_env is not None else not self.config.cuda_graph
+        if self.transformer is None or disabled:
             return []
         res_env = os.environ.get("COSMOS3_GEN_CAPTURE_RES")
         if res_env:
@@ -1134,7 +1136,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # capture only below COSMOS3_GRAPH_MAX_LATENT_AREA (latent H*W): 256p
             # (240) and 480p (1560) graph; 720p (3600) and video run eager+dense.
             latent_area = latent_shape[3] * latent_shape[4]
-            max_area = int(os.environ.get("COSMOS3_GRAPH_MAX_LATENT_AREA", "2000"))
+            max_area = int(os.environ.get(
+                "COSMOS3_GRAPH_MAX_LATENT_AREA", self.config.graph_max_latent_area))
             if two_d:
                 max_area = min(max_area, 1000)  # 256p latent 240 captures; 480p 1560 does not
             if latent_area > max_area:

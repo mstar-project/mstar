@@ -10,6 +10,12 @@ max_seq_len: 8192
 # ~19 GB for activations.
 kv_cache:
   max_num_pages: 1024
+# Denoise CUDA-graph capture knobs (serving). cuda_graph=false serves eager;
+# graph_max_latent_area caps which resolutions are captured (latent H*W). The
+# COSMOS3_DISABLE_CUDA_GRAPH / COSMOS3_GRAPH_MAX_LATENT_AREA env vars override.
+model_kwargs:
+  cuda_graph: true
+  graph_max_latent_area: 2000
 node_groups:
   - node_names: ["dit"]
     ranks: [0]
