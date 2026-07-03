@@ -16,7 +16,8 @@ from mstar.engine.kv_store import PositionInfo
 from mstar.utils.sampling import BaseSampler, SeenTokenMask
 
 if TYPE_CHECKING:
-    from mstar.engine.cuda_graph_config import CudaGraphConfig
+    from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
+    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
 
 
 @dataclass
@@ -136,6 +137,11 @@ class ModelInputsFromEngine:
     cache_manager: BatchedCacheManager | None = None
     preallocated_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
     sampler: BaseSampler | None = None
+    # label -> warmed-up PiecewiseCudaGraphRunner for inner-loop capture. Owned
+    # by the engine, spread in at execute time (like ``cache_manager`` /
+    # ``sampler``). Empty when the submodule opts into no piecewise graphs or
+    # capture failed. See ``NodeSubmodule.get_piecewise_cuda_graph_configs``.
+    piecewise_runners: dict[str, "PiecewiseCudaGraphRunner"] = field(default_factory=dict)
 
     @property
     @torch.compiler.disable
@@ -251,6 +257,32 @@ class NodeSubmodule(torch.nn.Module):
     # Note: do not import CudaGraphConfig; it causes a circular import situation
     def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
         return []
+
+    def get_piecewise_cuda_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1
+    ) -> dict[str, PiecewiseCudaGraphConfig]:
+        """Return the piecewise CUDA graph configs this submodule opts into.
+
+        ``autocast_dtype`` is the engine's autocast dtype — passed so a config's
+        ``make_static_inputs`` can allocate the hidden-state buffer in the dtype
+        the captured region runs under (avoids a copy-time upcast at replay).
+
+        A piecewise CUDA graph captures ONE inner callable of this submodule's
+        forward (e.g. a transformer block loop) as a CUDA graph while the
+        surrounding compute stays eager. The engine builds one
+        ``PiecewiseCudaGraphRunner`` per returned label and threads the runners
+        into ``ModelInputsFromEngine.piecewise_runners`` so the submodule's
+        forward can look them up by label:
+
+            runner = engine_inputs.piecewise_runners.get("block_loop")
+            if runner is not None and runner.can_run(bs):
+                out = runner.run(static_inputs={...}, request_ids=..., seq_lens=...)
+
+        Default: no piecewise graphs. Override to return
+        ``{label: PiecewiseCudaGraphConfig}``; multiple labels capture multiple
+        independent graphs (i.e., one per outer function to be graphed).
+        """
+        return {}
 
     def can_use_cuda_graphs(
         self, batch: NodeBatch,

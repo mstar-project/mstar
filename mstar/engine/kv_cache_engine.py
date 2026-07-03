@@ -18,7 +18,11 @@ from mstar.engine.base import (
 )
 from mstar.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
 from mstar.engine.cpu_page_pool import CPUPagePool
-from mstar.engine.cuda_graph_runner import CudaGraphRunner
+from mstar.engine.cuda_graph_runner import (
+    CudaGraphRunner,
+    PiecewiseCudaGraphRunner,
+    build_piecewise_runners,
+)
 from mstar.engine.kv_store import (
     AllocationFailedError,
     KVCacheConfig,
@@ -51,6 +55,9 @@ class SubmoduleManagement:
     default_sampling_config: SamplingConfig
     sampler: Sampler = field(default_factory=Sampler)
     cuda_graph_runner: CudaGraphRunner | None = None
+    # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
+    # ModelInputsFromEngine so the submodule's forward can look them up.
+    piecewise_runners: dict[str, "PiecewiseCudaGraphRunner"] = field(default_factory=dict)
 
 
 class KVCacheEngine(BaseEngine):
@@ -238,11 +245,7 @@ class KVCacheEngine(BaseEngine):
 
     def warmup(self) -> None:
         """Compile submodules and capture CUDA graphs."""
-        from mstar.engine.cuda_graph_runner import (
-            DEFAULT_AR_CAPTURE_BATCH_SIZES,
-            CudaGraphRunner,
-            PiecewiseCudaGraphRunner,
-        )
+        from mstar.engine.cuda_graph_runner import CudaGraphRunner
 
         for node_name, submodule_mgmt in self.submodule_management.items():
             kv_mgmt = submodule_mgmt.kv_management
@@ -268,31 +271,20 @@ class KVCacheEngine(BaseEngine):
                 logger.info("KVCacheEngine: CUDA graphs captured for %s (%d configs)",
                             node_name, len(runner.graphs))
 
-            # Piecewise CUDA graph for transformer block loops (e.g. VJepa2 AC rollout).
-            # Submodules opt in by implementing get_piecewise_runner_config().
-            pcgr_config = getattr(submodule, "get_piecewise_runner_config", lambda: None)()
-            if pcgr_config is not None:
-                pcgr = PiecewiseCudaGraphRunner(
-                    fn_factory=pcgr_config["fn_factory"],
-                    embed_dim=pcgr_config["embed_dim"],
-                    capture_batch_sizes=pcgr_config.get("capture_batch_sizes", DEFAULT_AR_CAPTURE_BATCH_SIZES),
-                    capture_seq_len=pcgr_config["capture_seq_len"],
-                    device=self.device,
-                    autocast_dtype=self.autocast_dtype,
-                    pos_buf_shapes=pcgr_config.get("pos_buf_shapes"),
-                    kv_cache_config=kv_mgmt.kv_cache_config,
-                    alloc_manager=kv_mgmt.alloc_manager,
-                    buffer_manager=kv_mgmt.buffer_manager,
-                    cache_labels=pcgr_config.get("cache_labels", ["main"]),
-                    tp_group=submodule_mgmt.tp_group,
-                )
-                pcgr.warmup_and_capture()
-                if pcgr.graphs:
-                    submodule.set_piecewise_runner(pcgr)
-                    logger.info(
-                        "KVCacheEngine: PiecewiseCudaGraphRunner installed for %s (%d bs buckets)",
-                        node_name, len(pcgr.graphs),
-                    )
+            # Piecewise CUDA graphs for inner-loop capture (e.g. VJepa2 AC
+            # rollout block loop). Submodules opt in via
+            # get_piecewise_cuda_graph_configs; runners are spread into
+            # ModelInputsFromEngine at execute time.
+            submodule_mgmt.piecewise_runners = build_piecewise_runners(
+                submodule=submodule,
+                device=self.device,
+                autocast_dtype=self.autocast_dtype,
+                tp_world_size=submodule_mgmt.tp_group.world_size,
+                tp_group=submodule_mgmt.tp_group,
+                kv_cache_config=kv_mgmt.kv_cache_config,
+                alloc_manager=kv_mgmt.alloc_manager,
+                buffer_manager=kv_mgmt.buffer_manager,
+            )
 
         # torch.compile applied after CUDA graph capture so compiled kernels
         # are baked into the graphs.
@@ -414,7 +406,8 @@ class KVCacheEngine(BaseEngine):
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
             cache_manager=cache_manager,
-            sampler=sampler
+            sampler=sampler,
+            piecewise_runners=self.submodule_management[batch.node_name].piecewise_runners,
         )
         if self.enable_nvtx:
             range_push("ar.batched.preprocess", synchronize=False)
@@ -500,6 +493,7 @@ class KVCacheEngine(BaseEngine):
                 },
                 cache_manager=cache_manager,
                 sampler=sampler,
+                piecewise_runners=self.submodule_management[batch.node_name].piecewise_runners,
             )
 
             if self.enable_nvtx:

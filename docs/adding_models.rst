@@ -375,6 +375,161 @@ a packed ``prefill`` graph:
            ),
        ]
 
+Piecewise CUDA graphs (capturing an inner loop)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The configs above capture a submodule's **whole** ``forward_batched``; the engine
+drives the replay, including sampling and output remap. Sometimes you instead want to
+capture only a **hot inner region** of a forward, e.g., a transformer *block loop*,
+while eager Python runs the preamble (embeddings, sequence assembly) and postamble
+(norm, projection) around it. That is what a *piecewise* CUDA graph does.
+
+A submodule opts in by returning one or more configs from::
+
+   get_piecewise_cuda_graph_configs(self, device, autocast_dtype, tp_world_size=1)
+       -> dict[str, PiecewiseCudaGraphConfig]
+
+The dict key is a **label**, an arbitrary string naming the captured region (multiple
+labels capture multiple independent graphs). The engine builds one
+``PiecewiseCudaGraphRunner`` per label at warmup and threads them into
+``engine_inputs.piecewise_runners``; your forward looks the runner up by label and
+calls it. Nothing is stored on the submodule.
+
+Two config types live in ``mstar/engine/cuda_graph_config.py``, mirroring the
+whole-forward split:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 74
+
+   * - Config type
+     - When to use / what it captures
+   * - ``PiecewiseBatchedConfig``
+     - **Equal-length** batched inputs: the captured region sees ``[bs, seq_len, D]``
+       with every request the same ``seq_len``. You pass ``seq_len`` (tokens per
+       request). One graph is captured per batch size.
+   * - ``PiecewisePackedConfig``
+     - **Packed / ragged** inputs: the captured region sees ``[total_tokens, D]`` with
+       variable-length sequences packed together (FlashInfer-packed style). You pass
+       ``total_tokens`` (a list of token-count buckets). One graph is captured per
+       ``(batch size, bucket)``.
+
+Both share the base ``PiecewiseCudaGraphConfig`` fields:
+
+- ``capture_fn``: the callable that gets captured (see the contract below).
+- ``make_static_inputs``: a factory ``(shape: PiecewiseCaptureShape) -> dict[str, Tensor]``
+  returning the persistent buffers the captured region reads. The runner **owns** these
+  buffers; at replay it copies your real tensors into them by name. ``shape`` carries
+  ``bs``, ``seq_lens`` and ``total_tokens`` for the bucket being built. Allocate the
+  hidden state in ``autocast_dtype`` so the replay copy is a same-dtype memcpy.
+- ``forward_kwargs``: static keyword args threaded into ``capture_fn`` every call
+  (e.g. a layer count, ``is_causal``).
+- ``uses_kv_cache``: set ``True`` if the captured region reads a FlashInfer KV cache.
+  The runner then plans attention **outside** the graph before each replay and advances
+  seq-lens **after** it (both are Python-only and must never be inside the captured
+  region). Requires a ``KV_CACHE`` engine; stateless nodes leave this ``False``.
+- ``plan_fn``: optional ``(static_cm, shape) -> None`` override for attention planning.
+  Leave ``None`` to get the type-default (uniform ``seq_lens`` for batched, packed
+  indptr for packed; ``is_causal`` read from ``forward_kwargs``).
+- ``advance_seq_lens``: whether ``run`` advances cache seq-lens (Python-only,
+  post-replay) after each call (default ``True``). Set ``False`` when your forward
+  advances the cache itself. No effect when ``uses_kv_cache`` is ``False``.
+- ``cache_labels``: KV-cache labels the region touches (default ``["main"]``).
+- ``capture_batch_sizes`` — which batch sizes to record (``None`` → the runner default).
+- ``compile``: ``torch.compile`` the ``capture_fn`` before capture (default ``False``).
+
+**The capture-fn contract.** The captured callable takes the runner-owned buffers as an
+argument and returns a dict::
+
+   capture_fn(static_inputs: dict[str, Tensor],
+              static_cm: BatchedCacheManager | None = None,
+              **forward_kwargs) -> dict[str, Tensor]
+
+The one rule that makes it CUDA-graph-safe: **read tensors out of** ``static_inputs``
+**and never reassign them.** The runner calls ``capture_fn`` with the *same* dict object
+at capture and updates those buffers in place before each replay, so a fresh
+``static_inputs["x"] = ...`` would break the graph. (A bare ``Tensor`` return is also
+accepted and wrapped as ``{"x": ...}``.)
+
+**Calling the runner.** Look it up by label and hand it your real inputs; it returns a
+``PiecewiseOutput`` — a dict-like view where indexing / ``.get`` return an owned clone
+(safe to keep), and ``.get_view`` returns a zero-copy view valid only until the next
+``run`` (see ``mstar/engine/cuda_graph_runner.py``). The runner handles input padding,
+attention planning, replay, seq-len advance, and output slicing.
+
+A dummy submodule using piecewise cuda graphs for a VJepa2-like world model rollout step,
+with an eager preamble, a captured KV-cached block loop over a fixed per-step sequence,
+and an eager postamble:
+
+.. code-block:: python
+
+   from mstar.engine.cuda_graph_config import (
+       PiecewiseBatchedConfig, PiecewiseCaptureShape, PiecewiseCudaGraphConfig,
+   )
+
+   class MyRolloutSubmodule(ARNodeSubmodule):
+       def __init__(self, blocks, embed, proj, embed_dim, seq_len):
+           super().__init__()
+           self.blocks = blocks            # transformer blocks that read the KV cache
+           self.embed, self.proj = embed, proj
+           self.embed_dim, self.seq_len = embed_dim, seq_len
+
+       # --- the captured inner region ---
+       def _block_loop(self, static_inputs, static_cm=None, *, n_layers):
+           x = static_inputs["x"]          # READ, never reassign the dict entries
+           pos = static_inputs["pos"]
+           for i in range(n_layers):
+               if static_cm is not None:
+                   static_cm.set_layer_idx(i)
+               x = self.blocks[i](x, pos=pos, cache_handle=static_cm)
+           return {"x": x}
+
+       # --- declare the graph ---
+       def get_piecewise_cuda_graph_configs(self, device, autocast_dtype, tp_world_size=1):
+           def make_static_inputs(shape: PiecewiseCaptureShape):
+               return {
+                   "x":   torch.zeros(shape.bs, self.seq_len, self.embed_dim,
+                                      dtype=autocast_dtype, device=device),
+                   "pos": torch.zeros(self.seq_len, dtype=torch.float32, device=device),
+               }
+           return {
+               "block_loop": PiecewiseBatchedConfig(
+                   capture_fn=self._block_loop,
+                   make_static_inputs=make_static_inputs,
+                   seq_len=self.seq_len,
+                   forward_kwargs={"n_layers": len(self.blocks)},
+                   uses_kv_cache=True,
+                   cache_labels=["main"],
+                   capture_batch_sizes=[1, 2, 4, 8],
+               )
+           }
+
+       # --- invoke it inside the forward ---
+       def forward(self, graph_walk, engine_inputs, hidden, **kwargs):
+           x = self.embed(hidden)                              # eager preamble → [B, seq_len, D]
+           pos = self._positions(x.device)                    # hoisted out of the graph
+           runner = engine_inputs.piecewise_runners.get("block_loop")
+           if runner is not None and runner.can_run(x.size(0)):
+               out = runner.run(                              # plans + replays + advances
+                   static_inputs={"x": x, "pos": pos},
+                   request_ids=engine_inputs.request_ids,
+               )
+               x = out["x"]                                   # owned clone, [B, seq_len, D]
+           else:                                              # eager fallback (no capture)
+               cm = engine_inputs.cache_manager
+               x = self._block_loop({"x": x, "pos": pos}, cm,
+                                    n_layers=len(self.blocks))["x"]
+               cm.advance_seq_lens()
+           return {"pred": self.proj(x)}                      # eager postamble
+
+Notes carried by the example: positions are computed eagerly and passed through
+``static_inputs`` (so they are not re-derived inside the captured region); the same
+``_block_loop`` serves both the captured and eager paths, so there is one source of
+truth; and on the eager path *you* own attention planning (typically in ``preprocess``)
+and the ``advance_seq_lens`` call — the runner only performs those on the captured path.
+For a real, KV-cached instance see the V-JEPA2 AC predictor
+(``mstar/model/vjepa2/submodules.py``, label ``"block_loop"``).
+
 Step 6 — Choose engine types
 ----------------------------
 

@@ -32,6 +32,9 @@ from mstar.engine.cuda_graph_config import (
     CudaGraphConfig,
     CudaGraphConfigType,
     FlashInferPackedCudaGraphConfig,
+    PiecewiseCaptureShape,
+    PiecewiseConfigType,
+    PiecewiseCudaGraphConfig,
 )
 from mstar.engine.kv_store import KVCacheConfig, PagedAllocationManager
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
@@ -71,13 +74,21 @@ class CudaGraphSlot:
 
 @dataclass
 class PiecewiseGraphData:
+    """One captured piecewise graph + the runner-owned buffers it replays into.
+
+    Keyed by ``(bs, total_tokens)`` in ``PiecewiseCudaGraphRunner.graphs``.
+    ``static_inputs`` holds every buffer the captured region reads (hidden
+    state, position tensors, ...) — the runner copies real inputs into these
+    by name before each replay. ``static_outputs`` are the captured graph's
+    outputs, sliced to the real leading count and returned via
+    ``PiecewiseOutput``.
+    """
     graph: torch.cuda.CUDAGraph
-    static_x: torch.Tensor                          # [bs, seq_len, embed_dim]
-    static_out: torch.Tensor                        # same shape — graph output
-    static_pos_bufs: dict[str, torch.Tensor]        # updated via .copy_() before each replay
+    static_inputs: dict[str, torch.Tensor]
+    static_outputs: dict[str, torch.Tensor]
     static_cache_manager: BatchedCacheManager | None
     dummy_rids: list[str]
-    bs: int
+    shape: PiecewiseCaptureShape
 
 @dataclass
 class CudaGraphData:
@@ -2228,66 +2239,125 @@ class StatelessCudaGraphRunner:
 # PiecewiseCudaGraphRunner
 # ---------------------------------------------------------------------------
 
-class PiecewiseCudaGraphRunner:
-    """Captures a transformer block-loop callable as one CUDA graph per batch-size bucket.
+class PiecewiseOutput:
+    """Dict-like view over a captured piecewise graph's output buffers.
 
-    Designed for the inner block loops of VJepa2 predictors
-    (VisionTransformerPredictorAC with KV cache, and VJEPA2Predictor without).
-    The caller supplies a ``fn_factory`` that builds the capturable
-    ``fn(x) -> x`` closure given a static BatchedCacheManager and a dict of
-    pre-allocated position-tensor buffers.  The runner owns those buffers;
-    callers update them via ``.copy_()`` through the ``pos_bufs`` argument of
-    ``run()``, making per-step position tensors visible to the captured GPU ops
-    without creating new tensors inside the captured region.
+    The runner replays into persistent buffers sized for the padded bucket;
+    only the leading ``real_len`` rows are meaningful (``real_bs`` for BATCHED
+    configs, the real total-token count for PACKED). Indexing and ``get``
+    return an owned CLONE of that leading slice — safe to keep past the next
+    replay. ``get_view`` returns the same slice WITHOUT copying.
+    """
+    __slots__ = ("_outputs", "_real_len")
+
+    def __init__(self, outputs: dict[str, torch.Tensor], real_len: int):
+        self._outputs = outputs
+        self._real_len = real_len
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._outputs
+
+    def keys(self):
+        return self._outputs.keys()
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        return self._outputs[key][:self._real_len].clone()
+
+    def get(self, key: str, default=None):
+        v = self._outputs.get(key)
+        if v is None:
+            return default
+        return v[:self._real_len].clone()
+
+    def get_view(self, key: str, default=None):
+        """Return the leading ``real_len`` slice WITHOUT copying.
+
+        The result is a VIEW aliasing the runner-owned static output buffer:
+        it shares graph memory and is OVERWRITTEN by the next ``run()`` replay.
+        Use it only for immediate reads within the same step; never store it
+        across replays or hand it to code that outlives the step. Use ``get``
+        / indexing when you need an owned tensor.
+        """
+        v = self._outputs.get(key)
+        if v is None:
+            return default
+        return v[:self._real_len]
+
+
+class PiecewiseCudaGraphRunner:
+    """Captures one inner callable of a submodule's forward as a CUDA graph.
+
+    Unlike ``CudaGraphRunner`` (which replays a whole ``forward_batched`` under
+    engine control, with sampling / CFG / double-buffer / output remap), this
+    captures a SUB-REGION of a forward — e.g. a transformer block loop — while
+    the surrounding preamble/postamble stays eager and the submodule itself
+    invokes ``run()``. It is configured entirely by a
+    ``PiecewiseCudaGraphConfig`` (see ``cuda_graph_config.py``):
+
+    - ``config.make_static_inputs(shape)`` allocates the persistent buffers the
+      captured region reads. The runner owns them; ``run`` copies real inputs
+      into them by name before each replay.
+    - ``config.capture_fn(static_inputs, static_cm, **forward_kwargs)`` is the
+      captured callable; it READS from ``static_inputs`` (never reassigns) and
+      returns a ``dict[str, Tensor]``.
+    - ``config.uses_kv_cache`` / ``config.plan_fn`` drive attention planning
+      (BATCHED: uniform seq_lens; PACKED: variable seq_lens via indptr).
+
+    One graph is captured per ``(bs, total_tokens)`` bucket enumerated by
+    ``config.get_capture_shapes``.
 
     Key invariants (matching CudaGraphRunner):
-    - FlashInfer wrappers are PERSISTENT (created once per bs bucket at capture).
+    - FlashInfer wrappers are PERSISTENT (created once per bucket at capture).
     - plan_attention is called OUTSIDE the graph before each replay.
-    - advance_seq_len is called OUTSIDE the graph after each replay.
+    - advance_seq_lens is called OUTSIDE the graph after each replay.
     - KV state is swapped onto dummy slots before replay and restored after.
     """
 
+    DEFAULT_CAPTURE_BATCH_SIZES = DEFAULT_AR_CAPTURE_BATCH_SIZES
+
     def __init__(
         self,
-        fn_factory: Callable[
-            [BatchedCacheManager | None, dict[str, torch.Tensor]],
-            Callable[[torch.Tensor], torch.Tensor],
-        ],
-        embed_dim: int,
-        capture_batch_sizes: list[int],
-        capture_seq_len: int,
+        config: PiecewiseCudaGraphConfig,
         device: torch.device,
         autocast_dtype: torch.dtype,
-        pos_buf_shapes: dict[str, tuple[int, ...]] | None = None,
         kv_cache_config: KVCacheConfig | None = None,
         alloc_manager: PagedAllocationManager | None = None,
         buffer_manager: WorkspaceBufferManager | None = None,
-        cache_labels: list[str] | None = None,
         tp_group=None,
     ):
         from mstar.distributed.communication import TPCommGroup
 
-        self.fn_factory = fn_factory
-        self.embed_dim = embed_dim
-        self.capture_batch_sizes = sorted(capture_batch_sizes)
-        self.capture_seq_len = capture_seq_len
+        self.config = config
         self.device = device
         self.autocast_dtype = autocast_dtype
-        self.pos_buf_shapes: dict[str, tuple[int, ...]] = pos_buf_shapes or {}
         self.kv_cache_config = kv_cache_config
         self.alloc_manager = alloc_manager
         self.buffer_manager = buffer_manager
-        self.cache_labels: list[str] = cache_labels or ["main"]
-        # ``tp_group`` is the per-node TP comm group. Defaults to the
-        # trivial single-rank group so the runner behaves identically for
-        # non-TP submodules (V-JEPA2 today). When ``world_size > 1`` the
-        # captured block-loop closure may include NCCL collectives via
-        # parallel layers — ``warmup_and_capture`` barriers before each
-        # per-bs capture to keep ranks in lockstep (the same race the
-        # standard ``CudaGraphRunner`` guards against).
+        # ``tp_group`` is the per-node TP comm group. Defaults to the trivial
+        # single-rank group so the runner behaves identically for non-TP
+        # submodules. When ``world_size > 1`` the captured region may include
+        # NCCL collectives via parallel layers — ``warmup_and_capture`` barriers
+        # before each capture to keep ranks in lockstep (same race the standard
+        # ``CudaGraphRunner`` guards against).
         self.tp_group: TPCommGroup = tp_group or TPCommGroup.trivial()
 
-        self.graphs: dict[int, PiecewiseGraphData] = {}
+        self.capture_batch_sizes = sorted(
+            config.capture_batch_sizes or self.DEFAULT_CAPTURE_BATCH_SIZES
+        )
+        self.cache_labels: list[str] = config.cache_labels
+
+        if config.uses_kv_cache:
+            assert (
+                kv_cache_config is not None
+                and alloc_manager is not None
+                and buffer_manager is not None
+            ), (
+                "PiecewiseCudaGraphRunner: config.uses_kv_cache=True requires "
+                "kv_cache_config, alloc_manager and buffer_manager"
+            )
+
+        # (bs, total_tokens) -> captured graph data.
+        self.graphs: dict[tuple[int, int], PiecewiseGraphData] = {}
         self.memory_pool = None
 
     # ------------------------------------------------------------------
@@ -2302,107 +2372,109 @@ class PiecewiseCudaGraphRunner:
         torch.cuda.set_device(self.device)
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
 
-        for bs in reversed(self.capture_batch_sizes):
-            # Sync TP ranks before each capture so a faster rank doesn't
-            # enter the warmup forward and issue NCCL while a slower one
-            # is still in pre-capture setup. No-op for trivial groups.
+        shapes = self.config.get_capture_shapes(self.capture_batch_sizes)
+        # Largest bucket first, matching CudaGraphRunner's capture ordering.
+        for shape in sorted(
+            shapes, key=lambda s: (s.bs, s.total_tokens), reverse=True
+        ):
+            # Sync TP ranks before each capture so a faster rank doesn't enter
+            # the warmup forward and issue NCCL while a slower one is still in
+            # pre-capture setup. No-op for trivial groups.
             self.tp_group.barrier()
             try:
-                self._capture_one(bs)
-                logger.info("PiecewiseCudaGraphRunner: captured bs=%d seq_len=%d", bs, self.capture_seq_len)
+                self._capture_one(shape)
+                logger.info(
+                    "PiecewiseCudaGraphRunner: captured bs=%d total_tokens=%d",
+                    shape.bs, shape.total_tokens,
+                )
             except Exception:
                 logger.warning(
-                    "PiecewiseCudaGraphRunner: failed to capture bs=%d", bs, exc_info=True
+                    "PiecewiseCudaGraphRunner: failed to capture bs=%d total_tokens=%d",
+                    shape.bs, shape.total_tokens, exc_info=True,
                 )
 
-    def _capture_one(self, bs: int) -> None:
-        # Match autocast_dtype so copy_() at replay is a same-dtype memcpy
-        # (no silent upcast from bfloat16 → float32 followed by an immediate
-        # cast back inside the first linear).
-        static_x = torch.zeros(
-            bs, self.capture_seq_len, self.embed_dim,
-            dtype=self.autocast_dtype, device=self.device,
-        )
+    def _capture_one(self, shape: PiecewiseCaptureShape) -> None:
+        static_inputs = self.config.make_static_inputs(shape)
+        static_cm, dummy_rids = self._setup_cache_manager(shape)
 
-        # Position buffers stay float32: they hold scalar position indices
-        # (frame id, height id, ...) and RoPE uses them as frequencies, where
-        # float32 precision matters more than matching the hidden state dtype.
-        static_pos_bufs: dict[str, torch.Tensor] = {
-            name: torch.zeros(shape, dtype=torch.float32, device=self.device)
-            for name, shape in self.pos_buf_shapes.items()
-        }
-
-        # KV cache support
-        static_cm: BatchedCacheManager | None = None
-        dummy_rids: list[str] = []
-        if self.kv_cache_config is not None:
-            assert self.alloc_manager is not None and self.buffer_manager is not None
-            dummy_rids = [f"__pcgr_{bs}_{i}__" for i in range(bs)]
-            for rid in dummy_rids:
-                self.alloc_manager.add_request(rid, labels=self.cache_labels)
-
-            plan_states = self._build_persistent_wrappers(bs)
-            static_cm = BatchedCacheManager(
-                request_ids=dummy_rids,
-                active_labels_per_request={rid: self.cache_labels[0] for rid in dummy_rids},
-                kv_cache=self.alloc_manager.kv_cache,
-                alloc_manager=self.alloc_manager,
-                buffer_manager=self.buffer_manager,
-                kv_cache_config=self.kv_cache_config,
-                device=self.device,
-                cuda_graph_plan_states=plan_states,
+        fn = self.config.capture_fn
+        if self.config.compile:
+            fn = torch.compile(
+                fn,
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=False,
+                dynamic=False,
             )
 
-        fn = self.fn_factory(static_cm, static_pos_bufs)
+        def run_fn():
+            return fn(
+                static_inputs=static_inputs,
+                static_cm=static_cm,
+                **self.config.forward_kwargs,
+            )
 
-        def _plan():
+        def plan():
             if static_cm is not None:
-                static_cm.plan_attention(
-                    seq_lens=[self.capture_seq_len] * bs,
-                    is_causal=False,
-                )
+                self._plan(static_cm, shape)
 
-        def _reset_dummy_states():
-            for rid in dummy_rids:
-                for label in self.cache_labels:
-                    state = self.alloc_manager.get_state(rid, label)
-                    state.seq_len = 0
-                    state.position_id_start = 0
+        plan()
 
-        _plan()
-
-        # Warmup — 2 passes
+        # Warmup — 2 passes, resetting dummy state + re-planning between them so
+        # capture starts from a clean state (mirrors CudaGraphRunner).
         torch.cuda.synchronize()
         for _ in range(2):
             with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                fn(static_x)
-            _reset_dummy_states()
-            _plan()
+                run_fn()
+            self._reset_dummy_states(dummy_rids)
+            plan()
         torch.cuda.synchronize()
 
-        # Capture
         graph = torch.cuda.CUDAGraph()
         with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
             with torch.cuda.graph(graph, pool=self.memory_pool):
-                static_out = fn(static_x)
+                static_out = self._normalize_output(run_fn())
         torch.cuda.synchronize()
 
-        # Free dummy KV state so it doesn't accumulate across bs captures
+        # Free dummy KV state so it doesn't accumulate across buckets.
         for rid in dummy_rids:
             for label in self.cache_labels:
                 self.alloc_manager.reset_label(rid, label, free=True)
 
-        self.graphs[bs] = PiecewiseGraphData(
+        self.graphs[(shape.bs, shape.total_tokens)] = PiecewiseGraphData(
             graph=graph,
-            static_x=static_x,
-            static_out=static_out,
-            static_pos_bufs=static_pos_bufs,
+            static_inputs=static_inputs,
+            static_outputs=static_out,
             static_cache_manager=static_cm,
             dummy_rids=dummy_rids,
-            bs=bs,
+            shape=shape,
         )
 
-    def _build_persistent_wrappers(self, bs: int) -> dict:
+    def _setup_cache_manager(
+        self, shape: PiecewiseCaptureShape,
+    ) -> tuple[BatchedCacheManager | None, list[str]]:
+        if not self.config.uses_kv_cache:
+            return None, []
+
+        dummy_rids = [
+            f"__pcgr_{shape.bs}_{shape.total_tokens}_{i}__" for i in range(shape.bs)
+        ]
+        for rid in dummy_rids:
+            self.alloc_manager.add_request(rid, labels=self.cache_labels)
+
+        plan_states = self._build_persistent_wrappers(shape)
+        static_cm = BatchedCacheManager(
+            request_ids=dummy_rids,
+            active_labels_per_request={rid: self.cache_labels[0] for rid in dummy_rids},
+            kv_cache=self.alloc_manager.kv_cache,
+            alloc_manager=self.alloc_manager,
+            buffer_manager=self.buffer_manager,
+            kv_cache_config=self.kv_cache_config,
+            device=self.device,
+            cuda_graph_plan_states=plan_states,
+        )
+        return static_cm, dummy_rids
+
+    def _build_persistent_wrappers(self, shape: PiecewiseCaptureShape) -> dict:
         from mstar.engine.cache_manager import _PlanState
         from mstar.utils.flashinfer_utils import FlashInferPrefillWrapper
 
@@ -2410,13 +2482,15 @@ class PiecewiseCudaGraphRunner:
         plan_states: dict = {}
         for label in self.cache_labels:
             wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=self.buffer_manager.get(f"{label}_pcgr_{bs}"),
+                workspace_buffer=self.buffer_manager.get(
+                    f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
+                ),
                 num_qo_heads=cfg.num_qo_heads,
                 num_kv_heads=cfg.num_kv_heads,
                 head_dim=cfg.head_dim,
                 page_size=cfg.page_size,
-                batch_size=bs,
-                max_total_tokens=bs * self.capture_seq_len,
+                batch_size=shape.bs,
+                max_total_tokens=shape.total_tokens,
                 max_num_pages=cfg.max_num_pages,
                 device=self.device,
                 use_cuda_graph=True,
@@ -2424,12 +2498,63 @@ class PiecewiseCudaGraphRunner:
             plan_states[label] = _PlanState(wrapper=wrapper)
         return plan_states
 
+    def _plan(
+        self,
+        static_cm: BatchedCacheManager,
+        shape: PiecewiseCaptureShape,
+        seq_lens: list[int] | None = None,
+    ) -> None:
+        """Plan attention outside the graph for capture or replay.
+
+        ``seq_lens`` overrides ``shape.seq_lens`` (used at replay to plan the
+        real per-request lengths). A custom ``config.plan_fn`` receives a shape
+        carrying the effective seq_lens; the type-default plans every cache
+        label with those seq_lens (``is_causal`` read from forward_kwargs).
+        """
+        effective = list(seq_lens) if seq_lens is not None else shape.seq_lens
+        if self.config.plan_fn is not None:
+            self.config.plan_fn(
+                static_cm,
+                PiecewiseCaptureShape(
+                    bs=shape.bs, seq_lens=effective, total_tokens=sum(effective),
+                ),
+            )
+            return
+        is_causal = self.config.forward_kwargs.get("is_causal", False)
+        for label in self.cache_labels:
+            static_cm.plan_attention(
+                seq_lens=effective, is_causal=is_causal, label=label,
+            )
+
+    def _reset_dummy_states(self, dummy_rids: list[str]) -> None:
+        for rid in dummy_rids:
+            for label in self.cache_labels:
+                state = self.alloc_manager.get_state(rid, label)
+                state.seq_len = 0
+                state.position_id_start = 0
+
+    @staticmethod
+    def _normalize_output(out) -> dict[str, torch.Tensor]:
+        """Coerce a captured callable's return into a ``{name: Tensor}`` dict.
+
+        The contract is a dict, but a bare tensor is accepted (wrapped under
+        ``"x"``) so a single-output block loop can ``return x`` directly.
+        """
+        if isinstance(out, torch.Tensor):
+            return {"x": out}
+        if isinstance(out, dict):
+            return out
+        raise TypeError(
+            f"PiecewiseCudaGraphRunner: capture_fn must return a Tensor or "
+            f"dict[str, Tensor], got {type(out).__name__}"
+        )
+
     # ------------------------------------------------------------------
     # Runtime
     # ------------------------------------------------------------------
 
-    def can_run(self, batch_size: int) -> bool:
-        return bool(self.graphs) and self._padded_bs(batch_size) is not None
+    def can_run(self, batch_size: int, total_tokens: int | None = None) -> bool:
+        return bool(self.graphs) and self._resolve_key(batch_size, total_tokens) is not None
 
     def _padded_bs(self, batch_size: int) -> int | None:
         idx = bisect.bisect_left(self.capture_batch_sizes, batch_size)
@@ -2437,67 +2562,193 @@ class PiecewiseCudaGraphRunner:
             return None
         return self.capture_batch_sizes[idx]
 
+    def _resolve_key(
+        self, batch_size: int, total_tokens: int | None = None,
+    ) -> tuple[int, int] | None:
+        """Find the captured ``(bs, total_tokens)`` bucket serving this request.
+
+        BATCHED: ``total_tokens`` is determined by ``seq_len * padded_bs``.
+        PACKED: pick the smallest captured token bucket >= ``total_tokens`` for
+        the padded batch size (caller must pass ``total_tokens``).
+        """
+        padded_bs = self._padded_bs(batch_size)
+        if padded_bs is None:
+            return None
+
+        if self.config.get_config_type() == PiecewiseConfigType.BATCHED:
+            key = (padded_bs, self.config.seq_len * padded_bs)
+            return key if key in self.graphs else None
+
+        if total_tokens is None:
+            return None
+        candidates = sorted(tt for (bs, tt) in self.graphs if bs == padded_bs)
+        idx = bisect.bisect_left(candidates, total_tokens)
+        if idx >= len(candidates):
+            return None
+        return (padded_bs, candidates[idx])
+
+    def _replay_seq_lens(
+        self,
+        shape: PiecewiseCaptureShape,
+        seq_lens: list[int] | None,
+        real_bs: int,
+    ) -> list[int]:
+        """Per-request seq_lens to plan at replay, padded to ``shape.bs``.
+
+        BATCHED: uniform ``shape.seq_lens`` (real + padding all capture-length,
+        matching capture). PACKED: real ``seq_lens`` + zero-length padding rows
+        so the planned qo_indptr sums to the real token count and FlashInfer
+        skips the padded tail.
+        """
+        if self.config.get_config_type() == PiecewiseConfigType.BATCHED:
+            return list(shape.seq_lens)
+        if seq_lens is None:
+            raise ValueError(
+                "PiecewiseCudaGraphRunner.run: PACKED config requires seq_lens"
+            )
+        return list(seq_lens) + [0] * (shape.bs - real_bs)
+
     def run(
         self,
-        x: torch.Tensor,                                    # [real_bs, seq_len, D]
-        pos_bufs: dict[str, torch.Tensor] | None = None,   # updated into static buffers
+        static_inputs: dict[str, torch.Tensor],
         request_ids: list[str] | None = None,
-        ) -> torch.Tensor:
-        """Replay the captured graph for the given input.
+        seq_lens: list[int] | None = None,
+        real_bs: int | None = None,
+    ) -> PiecewiseOutput:
+        """Replay the captured graph for the given real inputs.
 
         Steps (mirroring CudaGraphRunner._run_basic_batched):
-          1. Copy real x into static buffer.
-          2. Update position buffers via .copy_().
-          3. Swap real KV states onto dummy slots + plan_attention.
-          4. graph.replay().
-          5. advance_seq_len (Python-only, outside graph).
-          6. Restore dummy states.
-          7. Return static_out[:real_bs].clone().
+          1. Copy each real input tensor into the runner-owned static buffer of
+             the same name (zeroing any padded tail).
+          2. Swap real KV states onto dummy slots + plan_attention (if KV).
+          3. graph.replay().
+          4. advance_seq_lens (Python-only, outside graph).
+          5. Restore dummy states.
+          6. Return a ``PiecewiseOutput`` over the captured output buffers.
+
+        ``real_bs`` is inferred from ``request_ids`` or ``seq_lens`` when not
+        given. PACKED configs require ``seq_lens`` (used for both the token
+        bucket lookup and attention planning).
         """
-        real_bs = x.size(0)
-        padded_bs = self._padded_bs(real_bs)
-        if padded_bs is None:
+        if real_bs is None:
+            if request_ids is not None:
+                real_bs = len(request_ids)
+            elif seq_lens is not None:
+                real_bs = len(seq_lens)
+            else:
+                raise ValueError(
+                    "PiecewiseCudaGraphRunner.run: pass real_bs, request_ids, "
+                    "or seq_lens to determine the batch size"
+                )
+
+        is_packed = self.config.get_config_type() == PiecewiseConfigType.PACKED
+        real_total_tokens = sum(seq_lens) if seq_lens is not None else None
+        key = self._resolve_key(
+            real_bs, real_total_tokens if is_packed else None
+        )
+        if key is None:
             raise RuntimeError(
-                f"PiecewiseCudaGraphRunner: no captured graph for bs={real_bs}"
+                f"PiecewiseCudaGraphRunner: no captured graph for bs={real_bs}, "
+                f"total_tokens={real_total_tokens}"
             )
-        data = self.graphs[padded_bs]
+        data = self.graphs[key]
 
-        # --- 1: copy input ---
-        data.static_x[:real_bs].copy_(x)
-        if real_bs < padded_bs:
-            data.static_x[real_bs:].zero_()
+        # --- 1: copy real inputs into runner-owned static buffers ---
+        for name, val in static_inputs.items():
+            buf = data.static_inputs.get(name)
+            if buf is None or not isinstance(val, torch.Tensor):
+                continue
+            n = val.shape[0]
+            buf[:n].copy_(val)
+            if n < buf.shape[0]:
+                buf[n:].zero_()
 
-        # --- 2: update position buffers ---
-        if pos_bufs:
-            for name, val in pos_bufs.items():
-                if name in data.static_pos_bufs:
-                    data.static_pos_bufs[name].copy_(val)
-
-        # --- 3: KV state swap + plan_attention ---
-        if data.static_cache_manager is not None and request_ids is not None:
+        # --- 2: KV state swap + plan_attention ---
+        static_cm = data.static_cache_manager
+        if static_cm is not None and request_ids is not None:
             for i, rid in enumerate(request_ids):
                 dummy_rid = data.dummy_rids[i]
                 for label in self.cache_labels:
                     real_state = self.alloc_manager.get_state(rid, label)
-                    self.alloc_manager.get_state(dummy_rid, label)   # ensure slot exists
+                    self.alloc_manager.get_state(dummy_rid, label)  # ensure slot exists
                     self.alloc_manager.request_states[dummy_rid][label] = real_state
-            data.static_cache_manager.plan_attention(
-                seq_lens=[self.capture_seq_len] * padded_bs,
-                is_causal=False,
+            self._plan(
+                static_cm,
+                data.shape,
+                seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
             )
 
-        # --- 4: replay ---
+        # --- 3: replay ---
         data.graph.replay()
 
-        # --- 5: advance seq_len (Python-only, post-replay) ---
-        if data.static_cache_manager is not None and request_ids is not None:
-            data.static_cache_manager.advance_seq_len(n=self.capture_seq_len)
+        # --- 4: advance seq_lens (Python-only, post-replay) ---
+        # Uses the per-request lengths planned in step 2, so this is correct for
+        # both uniform (BATCHED) and variable (PACKED) sequences. Opt out via
+        # config.advance_seq_lens=False when the caller advances the cache itself.
+        if (
+            self.config.advance_seq_lens
+            and static_cm is not None
+            and request_ids is not None
+        ):
+            for label in self.cache_labels:
+                static_cm.set_active_label(label)
+                static_cm.advance_seq_lens()
 
-        # --- 6: restore dummy states ---
-        if data.static_cache_manager is not None and request_ids is not None:
+        # --- 5: restore dummy states ---
+        if static_cm is not None and request_ids is not None:
             for i, dummy_rid in enumerate(data.dummy_rids):
                 for label in self.cache_labels:
                     self.alloc_manager.reset_label(dummy_rid, label, free=i >= real_bs)
 
-        # --- 7: return output ---
-        return data.static_out[:real_bs].clone()
+        # --- 6: return output view ---
+        real_len = real_total_tokens if is_packed else real_bs
+        return PiecewiseOutput(data.static_outputs, real_len)
+
+
+def build_piecewise_runners(
+    submodule: NodeSubmodule,
+    device: torch.device,
+    autocast_dtype: torch.dtype,
+    tp_world_size: int = 1,
+    tp_group=None,
+    kv_cache_config: KVCacheConfig | None = None,
+    alloc_manager: PagedAllocationManager | None = None,
+    buffer_manager: WorkspaceBufferManager | None = None,
+) -> dict[str, PiecewiseCudaGraphRunner]:
+    """Build + warm up one ``PiecewiseCudaGraphRunner`` per label a submodule
+    declares via ``get_piecewise_cuda_graph_configs``.
+
+    Shared by ``KVCacheEngine`` and ``StatelessEngine`` so the install logic
+    lives in one place. KV-cache managers are only forwarded to configs whose
+    ``uses_kv_cache`` is True (stateless callers pass ``None`` for all three).
+    Returns only the runners that captured at least one graph; a submodule that
+    opts into none, or whose capture fails, yields an empty dict (eager path).
+    """
+    configs = submodule.get_piecewise_cuda_graph_configs(
+        device, autocast_dtype, tp_world_size
+    )
+    runners: dict[str, PiecewiseCudaGraphRunner] = {}
+    for label, config in configs.items():
+        try:
+            runner = PiecewiseCudaGraphRunner(
+                config=config,
+                device=device,
+                autocast_dtype=autocast_dtype,
+                kv_cache_config=kv_cache_config if config.uses_kv_cache else None,
+                alloc_manager=alloc_manager if config.uses_kv_cache else None,
+                buffer_manager=buffer_manager if config.uses_kv_cache else None,
+                tp_group=tp_group,
+            )
+            runner.warmup_and_capture()
+            if runner.graphs:
+                runners[label] = runner
+                logger.info(
+                    "build_piecewise_runners: installed label=%r for %s (%d buckets)",
+                    label, type(submodule).__name__, len(runner.graphs),
+                )
+        except Exception:
+            logger.warning(
+                "build_piecewise_runners: capture failed for label=%r on %s, "
+                "using eager path", label, type(submodule).__name__, exc_info=True,
+            )
+    return runners
