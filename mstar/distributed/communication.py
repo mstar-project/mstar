@@ -117,6 +117,10 @@ class WorkerTPGroups:
     # on; asymmetric call counts deadlock the participating ranks.
     world_tp_groups: list[tuple[int, ...]] = field(default_factory=list)
     node_to_group: dict[str, TPCommGroup] = field(default_factory=dict)
+    # CUDA device index on this worker's host. This equals the worker's dense
+    # index only when all workers share one host with an identity GPU mapping;
+    # ``None`` falls back to that historical behavior for standalone uses.
+    local_device: int | None = None
 
     def add(self, node: str, comm_group: TPCommGroup):
         # disallow colocation of multiple comm groups on the same node
@@ -145,7 +149,8 @@ class WorkerTPGroups:
         every rank — members keep the returned handle, non-members
         discard it.
         """
-        torch.cuda.set_device(self.global_rank)
+        device_index = self.local_device if self.local_device is not None else self.global_rank
+        torch.cuda.set_device(device_index)
         if not self.any_tp:
             return
 
@@ -196,7 +201,8 @@ class GlobalTPConfig:
     def __init__(
         # leaving type annotation as Any due to circular import
         self, worker_graphs: dict[str, Any],
-        worker_ids: list[str]
+        worker_ids: list[str],
+        local_devices: list[int] | None = None,
     ):
         self.num_workers = len(worker_ids)
         any_tp = any(wg.tp_size > 1 for wg in worker_graphs.values())
@@ -211,6 +217,7 @@ class GlobalTPConfig:
                 global_rank=i, num_workers=self.num_workers,
                 any_tp=any_tp,
                 world_tp_groups=world_tp_groups,
+                local_device=None if local_devices is None else local_devices[i],
             ) for i, wid in enumerate(worker_ids)
         }
 

@@ -131,9 +131,6 @@ mstar-serve
    * - ``--timeout``
      - ``600``
      - Per-request timeout (seconds).
-   * - ``--mooncake-port``
-     - ``8080``
-     - Port for the Mooncake RDMA transfer engine.
    * - ``--tcp-transfer-device``
      - (auto)
      - Network device for TCP tensor transport.

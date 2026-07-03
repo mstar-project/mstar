@@ -13,6 +13,7 @@ import torch
 import yaml
 
 from mstar.api_server.request_types import APIServerMessage, RequestComplete
+from mstar.cluster.spec import ClusterSpec
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -198,7 +199,7 @@ class Conductor:
         model: Model,
         model_config_file: str,
         socket_path_prefix: str = "/tmp/mstar",
-        hostname: str = "localhost",
+        hostname: str | None = None,
         enable_nvtx: bool = False,
         enable_prof: bool = False,
         log_level: str = "INFO",
@@ -207,7 +208,6 @@ class Conductor:
     ):
         self.requests: dict[str, RequestData] = {}
         self.model = model
-        self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
         self.enable_nvtx = enable_nvtx
@@ -225,6 +225,14 @@ class Conductor:
         )
         assert "max_seq_len" in self.model_config
         assert "node_groups" in self.model_config
+
+        # Host topology. Without a ``cluster:`` section this is a single
+        # localhost deployment where global rank == local CUDA device. An
+        # explicit ``hostname`` argument overrides the head address.
+        self.cluster_spec = ClusterSpec.from_config(self.model_config)
+        self.cluster_spec.validate_protocol(tensor_comm_protocol)
+        self.head_addr = hostname if hostname is not None else self.cluster_spec.head_addr
+        logger.info("Cluster: %s", self.cluster_spec.summary())
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
         self.worker_graphs = {
@@ -296,7 +304,7 @@ class Conductor:
         # ``dist_init_method`` so two ``mstar`` instances on the same host
         # don't collide on a hard-coded port.
         self._dist_init_port = _pick_free_tcp_port()
-        self._dist_init_method = f"tcp://{hostname}:{self._dist_init_port}"
+        self._dist_init_method = f"tcp://{self.head_addr}:{self._dist_init_port}"
 
         os.makedirs(socket_path_prefix, exist_ok=True)
         self._derive_worker_info()
@@ -345,6 +353,25 @@ class Conductor:
         self._sorted_ranks = sorted(rank_to_worker_graphs.keys())
         self.worker_ids = [f"worker_{rank}" for rank in self._sorted_ranks]
 
+        # Resolve every rank to its host + local CUDA device up front so a bad
+        # placement fails here with a precise message instead of inside a
+        # spawned worker.
+        self.cluster_spec.validate_ranks(self._sorted_ranks)
+        self.worker_specs = {
+            worker_id: self.cluster_spec.worker_spec(rank)
+            for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True)
+        }
+        for wg in self.worker_graphs.values():
+            for rank_group in wg._tp_ranks:
+                group_hosts = {self.worker_specs[f"worker_{r}"].host_index for r in rank_group}
+                if len(group_hosts) > 1:
+                    logger.warning(
+                        "TP group %s spans hosts %s; its collectives cross the "
+                        "network on every layer, which is slow without an "
+                        "RDMA-class interconnect between those hosts.",
+                        list(rank_group), sorted(group_hosts),
+                    )
+
         # Messages that arrive before all workers report SETUP_DONE; replayed
         # on the first main-loop iteration. See _wait_for_workers_ready.
         self._startup_message_backlog: list = []
@@ -383,12 +410,14 @@ class Conductor:
         self.tp_config = GlobalTPConfig(
             worker_graphs=self.worker_graphs,
             worker_ids=self.worker_ids,
+            local_devices=[self.worker_specs[wid].local_device for wid in self.worker_ids],
         )
 
     def _launch_workers(self):
         """Spawn one process per worker rank using spawn context."""
         ctx = mp.get_context("spawn")
-        for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
+        for worker_id in self.worker_ids:
+            spec = self.worker_specs[worker_id]
             p = ctx.Process(
                 target=_worker_process_target,
                 kwargs={
@@ -402,13 +431,13 @@ class Conductor:
                     "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
                     "sharding_config": self.per_worker_sharding_config[worker_id],
                     "tp_groups": self.tp_config.per_worker_config[worker_id],
-                    "hostname": self.hostname,
+                    "hostname": spec.addr,
                     "socket_path_prefix": self.socket_path_prefix,
                     "dist_init_method": self._dist_init_method,
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,
                     "enable_prof": self.enable_prof,
-                    "device": f"cuda:{rank}",
+                    "device": f"cuda:{spec.local_device}",
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device

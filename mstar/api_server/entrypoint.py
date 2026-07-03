@@ -23,6 +23,7 @@ from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
+from mstar.cluster.spec import ClusterSpec
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
@@ -732,7 +733,6 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--mooncake-port", type=int, default=8080)
     parser.add_argument(
         "--socket-path-prefix", type=str, default="/tmp/mstar",
         help="ZMQ IPC socket path prefix (shared with conductor/workers)",
@@ -787,6 +787,9 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
+    cluster_spec = ClusterSpec.from_config(config)
+    logger.info("Cluster: %s", cluster_spec.summary())
+
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
     # model instance too, so it sees the same Pi05Config (action_horizon, etc.)
@@ -807,6 +810,7 @@ def main(argv: list[str] | None = None):
     api_server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
+        hostname=cluster_spec.head_addr,
         timeout_seconds=args.timeout,
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
