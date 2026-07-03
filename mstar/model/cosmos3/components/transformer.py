@@ -990,10 +990,6 @@ class Cosmos3OmniTransformer(nn.Module):
         Each ``requests`` entry is a dict with: ``latents``, ``vision_timesteps``,
         ``position_ids_cond``, ``position_ids_uncond``, ``vision_token_shapes``,
         ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``."""
-        assert self.sp_group.world_size == 1, (
-            "Sequence parallelism is not supported with multi-request batched "
-            "denoising yet (v1 targets bs=1)."
-        )
         gen_seqs, shapes, cos_cond, sin_cond, cos_uncond, sin_uncond = [], [], [], [], [], []
         for req in requests:
             packed, original_latent_shapes = self._patchify_and_pack_latents([req["latents"]])
@@ -1020,9 +1016,7 @@ class Cosmos3OmniTransformer(nn.Module):
         all_gen = torch.cat(gen_seqs + gen_seqs, dim=0)
         cos = torch.cat(cos_cond + cos_uncond, dim=0)
         sin = torch.cat(sin_cond + sin_uncond, dim=0)
-        for i, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(i)
-            all_gen = layer.forward_gen(all_gen, cos, sin, cache_handle)
+        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, cache_handle)
         gen_out = self.norm_moe_gen(all_gen)
 
         sizes = [g.shape[0] for g in gen_seqs]
@@ -1074,10 +1068,6 @@ class Cosmos3OmniTransformer(nn.Module):
         ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``,
         ``action_token_shapes``, ``action_noisy_frame_indexes``,
         ``action_mse_gen_indexes``, ``action_domain_id``."""
-        assert self.sp_group.world_size == 1, (
-            "Sequence parallelism is not supported with multi-request batched "
-            "action denoising yet (v1 targets bs=1)."
-        )
         gen_seqs, shapes, cos_cond, sin_cond, cos_uncond, sin_uncond = [], [], [], [], [], []
         for req in requests:
             packed, original_latent_shapes = self._patchify_and_pack_latents([req["latents"]])
@@ -1116,9 +1106,7 @@ class Cosmos3OmniTransformer(nn.Module):
             cos = torch.cat(cos_cond, dim=0)
             sin = torch.cat(sin_cond, dim=0)
 
-        for i, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(i)
-            all_gen = layer.forward_gen(all_gen, cos, sin, cache_handle)
+        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, cache_handle)
         gen_out = self.norm_moe_gen(all_gen)
 
         sizes = [g.shape[0] for g in gen_seqs]
