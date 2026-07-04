@@ -126,7 +126,10 @@ def find_cross_host_cuts(
 
     Returns tuples of (walk, source node, dest node, edge name, source hosts,
     dest hosts). An edge is a potential cut unless both endpoints resolve to
-    the same single host for every replica.
+    the same single host for every replica. Cross-walk transfers mediated by
+    persisted signals are not counted: a persist edge ships pointer metadata
+    to the conductor, and the tensor itself moves only when a later walk's
+    consumer — assigned per request — reads it.
     """
     cuts: set[tuple] = set()
     for wg in worker_graphs.values():
@@ -297,6 +300,7 @@ class Conductor:
         log_level: str = "INFO",
         tensor_comm_protocol=CommProtocol.RDMA,
         tcp_transfer_device="",
+        intra_host_tensor_protocol=CommProtocol.SHM,
         model_cache_dir: str | None = None,
         startup_timeout_s: float = 600.0,
     ):
@@ -308,6 +312,7 @@ class Conductor:
         self.enable_prof = enable_prof
         self.tensor_comm_protocol = tensor_comm_protocol
         self.tcp_transfer_device = tcp_transfer_device
+        self.intra_host_tensor_protocol = intra_host_tensor_protocol
         self.model_cache_dir = model_cache_dir
         self._startup_timeout_s = startup_timeout_s
 
@@ -541,12 +546,13 @@ class Conductor:
         """Entities co-hosted with workers on ``host_index``.
 
         None outside multi-host mode (single-host keeps the single-transport
-        managers), and under MSTAR_NO_INTRA_HOST_SHM — the escape hatch that
-        forces every transfer through the transfer engine.
+        managers), and when ``intra_host_tensor_protocol`` is anything but
+        SHM — then co-hosted transfers ride the transfer engine like
+        cross-host ones.
         """
         if not self.cluster_spec.is_multi_host():
             return None
-        if os.environ.get("MSTAR_NO_INTRA_HOST_SHM"):
+        if self.intra_host_tensor_protocol != CommProtocol.SHM:
             return None
         entities = {
             wid for wid, spec in self.worker_specs.items()

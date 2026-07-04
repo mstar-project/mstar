@@ -63,7 +63,8 @@ def _conductor_process_target(
     log_level: str = "INFO",
     cache_dir: str | None = None,
     tensor_comm_protocol=CommProtocol.RDMA,
-    tcp_transfer_device=""
+    tcp_transfer_device="",
+    intra_host_tensor_protocol=CommProtocol.SHM,
 ):
     """Runs DummyConductor.run() in a spawned process."""
     logging.basicConfig(
@@ -108,6 +109,7 @@ def _conductor_process_target(
         log_level=log_level,
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
+        intra_host_tensor_protocol=intra_host_tensor_protocol,
         model_cache_dir=cache_dir,
     )
     try:
@@ -124,8 +126,6 @@ def _shutdown_conductor_process(
         return
 
     try:
-        # mp.Process has no send_signal; deliver SIGINT by pid so the
-        # conductor's KeyboardInterrupt path can terminate its workers.
         os.kill(conductor_proc.pid, signal.SIGINT)
         conductor_proc.join(timeout=timeout)
     except BaseException:
@@ -176,6 +176,7 @@ class APIServer:
         log_stats_file: str | None = None,
         endpoints=None,
         multi_host: bool = False,
+        intra_host_tensor_protocol=CommProtocol.SHM,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -210,7 +211,7 @@ class APIServer:
             # entities.
             same_host_entities=(
                 set()
-                if multi_host and not os.environ.get("MSTAR_NO_INTRA_HOST_SHM")
+                if multi_host and intra_host_tensor_protocol == CommProtocol.SHM
                 else None
             ),
         )
@@ -790,6 +791,16 @@ def main(argv: list[str] | None = None):
         help="Tensor transfer protocol: RDMA, TCP, or SHM (shared memory)"
     )
     parser.add_argument(
+        "--intra-host-tensor-protocol",
+        type=str, default="SHM", choices=["SHM", "RDMA", "TCP"],
+        help=(
+            "Transport for tensors whose producer and consumers share a host in a "
+            "multi-host cluster. SHM (default) uses shared memory; any other value "
+            "routes co-hosted transfers through the transfer engine alongside "
+            "cross-host traffic. Single-host deployments ignore this flag."
+        ),
+    )
+    parser.add_argument(
         "--tcp-transfer-device",
         type=str, default="",
     )
@@ -854,6 +865,7 @@ def main(argv: list[str] | None = None):
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
         multi_host=cluster_spec.is_multi_host(),
+        intra_host_tensor_protocol=CommProtocol(args.intra_host_tensor_protocol),
     )
 
     # Spawn conductor in a separate process
@@ -869,7 +881,8 @@ def main(argv: list[str] | None = None):
             args.log_level,
             args.cache_dir,
             CommProtocol(args.tensor_comm_protocol),
-            args.tcp_transfer_device
+            args.tcp_transfer_device,
+            CommProtocol(args.intra_host_tensor_protocol),
         ),
     )
     conductor_proc.start()

@@ -119,6 +119,10 @@ mstar-serve
    * - ``--tensor-comm-protocol``
      - ``RDMA``
      - ``RDMA``, ``TCP``, or ``SHM``.
+   * - ``--intra-host-tensor-protocol``
+     - ``SHM``
+     - Transport for co-hosted tensor transfers in a multi-host cluster
+       (see :ref:`multi-host-deployments`); ignored on a single host.
    * - ``--cache-dir``
      - HF default
      - HuggingFace weight cache directory.
@@ -253,6 +257,8 @@ Workers route tensors directly to one another using one of three transports, sel
 - ``RDMA`` — lowest latency for multi-GPU / multi-node, via the Mooncake transfer engine
   (requires RDMA-capable networking).
 
+.. _multi-host-deployments:
+
 Multi-host deployments
 ----------------------
 
@@ -302,11 +308,12 @@ Multi-host notes:
   where the fabric exists, ``TCP`` otherwise. On machines without an active
   RDMA fabric the TCP transfer engine usually needs an explicit
   ``--tcp-transfer-device`` (or per-host ``rdma_device``) value.
-- Transfers between workers on the *same* host still use shared memory: each
-  tensor whose consumers are all co-hosted with its producer goes through
-  tmpfs, and only tensors with a cross-host (or not-yet-known, e.g.
-  persisted) consumer travel through the transfer engine. Set
-  ``MSTAR_NO_INTRA_HOST_SHM=1`` to force everything through the engine.
+- ``--intra-host-tensor-protocol`` picks the transport for tensors whose
+  producer and consumers all share a host. The default, ``SHM``, sends them
+  through tmpfs; only tensors with a cross-host (or not-yet-known, e.g.
+  persisted) consumer travel through the transfer engine. Any other value
+  routes co-hosted transfers through the engine as well. Single-host
+  deployments ignore the flag.
 - Model weights must be present on every host (shared filesystem or a
   per-host cache); agents construct the model locally rather than receiving
   weights over the network.

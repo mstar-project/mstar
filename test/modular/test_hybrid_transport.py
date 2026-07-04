@@ -1,10 +1,12 @@
 """Tests for per-tensor transport dispatch in multi-host deployments."""
 
 import os
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from mstar.cluster.spec import ClusterSpec
 from mstar.communication.communicator import CommProtocol
 from mstar.communication.tensors import (
     HybridCommunicationManager,
@@ -12,6 +14,7 @@ from mstar.communication.tensors import (
     SharedMemoryCommunicationManager,
     create_tensor_communication_manager,
 )
+from mstar.conductor.conductor import Conductor
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.worker.node_manager_utils import (
     PREPROCESS_WORKER_ENTITY,
@@ -248,3 +251,43 @@ class TestHybridDataPath:
 
 def _edge_with(info, name, next_node):
     return GraphEdge(next_node=next_node, name=name, tensor_info=[info])
+
+
+# ---------------------------------------------------------------------------
+# conductor gate: when workers get a same-host entity set at all
+# ---------------------------------------------------------------------------
+
+class TestSameHostEntitiesGate:
+    def _conductor_like(self, spec, intra_protocol):
+        return SimpleNamespace(
+            cluster_spec=spec,
+            intra_host_tensor_protocol=intra_protocol,
+            worker_specs={
+                "worker_0": SimpleNamespace(host_index=0),
+                "worker_1": SimpleNamespace(host_index=1),
+            },
+        )
+
+    def _two_host_spec(self):
+        return ClusterSpec.from_config({
+            "cluster": {"hosts": [
+                {"addr": "a", "gpus": [0]},
+                {"addr": "b", "gpus": [0], "zmq_port_base": 19600},
+            ]}
+        })
+
+    def test_single_host_returns_none(self):
+        fake = self._conductor_like(ClusterSpec.single_host(), CommProtocol.SHM)
+        assert Conductor._same_host_entities(fake, 0) is None
+
+    def test_non_shm_intra_protocol_returns_none(self):
+        fake = self._conductor_like(self._two_host_spec(), CommProtocol.RDMA)
+        assert Conductor._same_host_entities(fake, 0) is None
+        assert Conductor._same_host_entities(fake, 1) is None
+
+    def test_shm_intra_protocol_returns_cohosted_entities(self):
+        fake = self._conductor_like(self._two_host_spec(), CommProtocol.SHM)
+        assert Conductor._same_host_entities(fake, 0) == {
+            "worker_0", "conductor", "api_server", "api_server_preprocess_worker",
+        }
+        assert Conductor._same_host_entities(fake, 1) == {"worker_1"}
