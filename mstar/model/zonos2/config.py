@@ -36,6 +36,12 @@ class Zonos2Config:
     eoa_id: int = 1024  # end-of-audio token
     audio_pad_id: int = 1025  # audio padding token
     loss_softcap: float = 15.0  # tanh logit soft-capping (0 disables)
+    # End generation only when the *leading* (undelayed) codebook 0 emits eoa.
+    # Under the inter-codebook delay, cb0 leads the end-of-audio signal, so a
+    # delayed codebook (1..C-1) emitting eoa on its own is spurious and would
+    # truncate the utterance early. True = robust to that (recommended);
+    # False = legacy "any codebook" behaviour (matches the reference).
+    eos_require_leading_codebook: bool = True
 
     # ---- Mixture-of-Experts ----------------------------------------
     # MoE is enabled on layers ``[moe_start_from_layer, num_layers -

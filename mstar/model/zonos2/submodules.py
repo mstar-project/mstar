@@ -48,6 +48,7 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         text_vocab: int,
         eoa_id: int,
         params: TTSSamplingParams,
+        eos_require_leading_codebook: bool = True,
     ):
         super().__init__()
         self.model = model
@@ -55,6 +56,7 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         self.text_vocab = text_vocab
         self.eoa_id = eoa_id
         self.params = params
+        self.eos_require_leading_codebook = eos_require_leading_codebook
 
         # Per-request state.
         self._history: dict[str, torch.Tensor] = {}   # (N, n_codebooks) recent codes
@@ -173,11 +175,20 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
             request_id, {"step": -1, "eos_frame": None, "countdown": 0}
         )
         st["step"] += 1
-        # EOS: any delayed codebook emits eoa_id -> align frame + start countdown.
+        # EOS -> align frame + start countdown. Codebook 0 is undelayed and
+        # leads the end-of-audio signal, so a *delayed* codebook (1..C-1)
+        # emitting eoa on its own is spurious and would end the utterance early
+        # (audio cut before the last word). Gate the stop on the leading
+        # codebook; ``eos_require_leading_codebook=False`` restores the legacy
+        # "any codebook" trigger.
         if not self.params.ignore_eos and st["eos_frame"] is None:
             eos_cols = [i for i in range(self.n_codebooks) if audio[i] == self.eoa_id]
-            if eos_cols:
-                st["eos_frame"] = max(0, st["step"] - max(eos_cols))
+            if self.eos_require_leading_codebook:
+                triggered = audio[0] == self.eoa_id
+            else:
+                triggered = bool(eos_cols)
+            if triggered:
+                st["eos_frame"] = max(0, st["step"] - (max(eos_cols) if eos_cols else 0))
                 st["countdown"] = self.n_codebooks + 1
         if st["eos_frame"] is not None and st["countdown"] > 0:
             st["countdown"] -= 1
