@@ -81,12 +81,14 @@ def assign_worker_graphs(
     Picks are coordinated by ``_group_id`` so all wgs derived from the same
     node_group land on the same replica's workers. Replicas containing dead
     workers are skipped. Among live replicas, ones on hosts this request
-    already uses are preferred, so adjacent stages avoid cross-host hops when
-    the placement offers a choice; ties break uniformly at random (on a single
-    host every replica ties, preserving the uniform-random behavior).
+    already uses are preferred, and among those, ones sharing workers with
+    earlier picks (a same-worker handoff is a zero-copy slice, cheaper than
+    any transport); remaining ties break uniformly at random, so a request's
+    first pick stays uniform across replicas.
     """
     group_id_to_replica_idx: dict[int, int] = {}
     chosen_hosts: set[int] = set()
+    chosen_ranks: set[int] = set()
     result: dict[str, list[str]] = {}
     for wg_id, wg in worker_graphs.items():
         replicas = wg._tp_ranks if wg._tp_ranks else [[r] for r in wg.ranks]
@@ -103,7 +105,10 @@ def assign_worker_graphs(
                 )
 
             scores = [
-                len({cluster_spec.host_of_rank(r) for r in replicas[i]} & chosen_hosts)
+                (
+                    len({cluster_spec.host_of_rank(r) for r in replicas[i]} & chosen_hosts),
+                    len(set(replicas[i]) & chosen_ranks),
+                )
                 for i in live
             ]
             best = max(scores)
@@ -113,6 +118,7 @@ def assign_worker_graphs(
             ]
         ranks = replicas[group_id_to_replica_idx[wg._group_id]]
         chosen_hosts.update(cluster_spec.host_of_rank(r) for r in ranks)
+        chosen_ranks.update(ranks)
         result[wg_id] = [f"worker_{r}" for r in ranks]
     return result
 

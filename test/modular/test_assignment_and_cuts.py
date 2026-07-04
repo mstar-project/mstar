@@ -80,6 +80,42 @@ class TestAssignment:
             )
             assert out[flexible.worker_graph_id] == ["worker_3"]  # host 1, co-located
 
+    def test_rank_tiebreak_prefers_shared_worker(self):
+        spec = ClusterSpec.single_host()
+        anchored = _wg(["A"], ranks=[1], group_id=0)
+        flexible = _wg(["B"], ranks=[0, 1], group_id=1)       # host scores tie
+        for _ in range(20):
+            out = assign_worker_graphs(
+                {anchored.worker_graph_id: anchored, flexible.worker_graph_id: flexible},
+                spec, set(),
+            )
+            assert out[flexible.worker_graph_id] == ["worker_1"]  # same worker as A
+
+    def test_rank_tiebreak_within_host_ties(self):
+        spec = ClusterSpec.from_config({
+            "cluster": {"hosts": [
+                {"addr": "a", "gpus": [0, 1, 2]},             # ranks 0-2 on host 0
+                {"addr": "b", "gpus": [0], "zmq_port_base": 19600},  # rank 3 on host 1
+            ]}
+        })
+        anchored = _wg(["A"], ranks=[1], group_id=0)          # host 0, worker_1
+        flexible = _wg(["B"], ranks=[0, 1], group_id=1)       # both replicas on host 0
+        for _ in range(20):
+            out = assign_worker_graphs(
+                {anchored.worker_graph_id: anchored, flexible.worker_graph_id: flexible},
+                spec, set(),
+            )
+            assert out[flexible.worker_graph_id] == ["worker_1"]
+
+    def test_first_pick_uniform(self):
+        spec = ClusterSpec.single_host()
+        wg = _wg(["A"], ranks=[0, 1], group_id=0)
+        seen = set()
+        for _ in range(40):
+            out = assign_worker_graphs({wg.worker_graph_id: wg}, spec, set())
+            seen.add(out[wg.worker_graph_id][0])
+        assert seen == {"worker_0", "worker_1"}
+
 
 class TestCrossHostCuts:
     def _maps(self, wgs):
