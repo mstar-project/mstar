@@ -524,6 +524,20 @@ class Zonos2ForCausalLM(nn.Module):
                 _copy(m.group(1) + ".down_proj.weight", tensor)
                 continue
 
+            # SonicMoE fused experts: ``experts.w13`` is (num_experts,
+            # 2*inter, hidden) with gate/up *interleaved* along dim 1
+            # (gate = [0::2], up = [1::2]). De-interleave and concat into the
+            # fused ``gate_up_proj`` (gate half first, matching the w1/w3 path).
+            m = re.match(r"(layers\.\d+\.feed_forward\.experts)\.w13$", name)
+            if m and tensor.dim() == 3:
+                base = m.group(1)
+                target = base + ".gate_up_proj"
+                if target in params:
+                    gate_up = torch.cat([tensor[:, 0::2, :], tensor[:, 1::2, :]], dim=1)
+                    params[target].data.copy_(gate_up)
+                    loaded.add(target)
+                continue
+
             m = re.match(r"(layers\.\d+\.feed_forward\.experts)\.(w1|w2|w3)(?:\.weight)?$", name)
             if m:
                 base, which = m.group(1), m.group(2)

@@ -20,10 +20,10 @@ CONFIG="${CONFIG:-configs/zonos2_colocated.yaml}"
 TENSOR_PROTOCOL="${TENSOR_PROTOCOL:-SHM}"
 WHO="${WHO:-$USER}"
 
-if [[ -z "${ZONOS2_MODEL_PATH:-}" ]]; then
-    echo "WARNING: ZONOS2_MODEL_PATH is not set — the LLM will run with random weights."
-    echo "         export ZONOS2_MODEL_PATH=/path/to/checkpoint (dir with params.json + model.pth)"
-fi
+# Defaults to the public HF checkpoint (mirrors mstar.model.registry). Override
+# by exporting ZONOS2_MODEL_PATH=/path/to/checkpoint (dir with params.json + model.pth).
+ZONOS2_MODEL_PATH="${ZONOS2_MODEL_PATH:-Zyphra/ZONOS2}"
+echo "ZONOS2_MODEL_PATH=$ZONOS2_MODEL_PATH"
 
 export ZONOS2_MODEL_PATH  # read by mstar.model.registry for model_path_hf
 
