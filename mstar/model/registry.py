@@ -41,7 +41,7 @@ HF_MODELS: dict[str, dict] = {
     # HF repo id); see ``mstar/model/zonos2/weight_loader.py``. The DAC vocoder
     # additionally needs ``descript-audio-codec`` installed.
     "zonos2": {
-        "model_path_hf": os.environ.get("ZONOS2_MODEL_PATH", ""),
+        "model_path_hf": os.environ.get("ZONOS2_MODEL_PATH", "Zyphra/ZONOS2"),
     },
 }
 
