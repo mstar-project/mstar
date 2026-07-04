@@ -429,6 +429,7 @@ class StatelessEngine(BaseEngine):
         engine_inputs = ModelInputsFromEngine(
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
+            final_stream_rids=batch.final_stream_rids,
         )
 
         if self.enable_nvtx:
@@ -473,6 +474,7 @@ class StatelessEngine(BaseEngine):
             engine_inputs = ModelInputsFromEngine(
                 request_ids=[rid],
                 per_request_info={rid: fwd_info},
+                final_stream_rids=batch.final_stream_rids,
             )
 
             if self.enable_nvtx:

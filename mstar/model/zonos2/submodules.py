@@ -198,10 +198,12 @@ class Zonos2DACSubmodule(NodeSubmodule):
     """Stateless DAC vocoder node.
 
     Consumes streamed frames (per request) and emits int16 PCM chunks. Runs
-    incrementally via :class:`StreamingDacDecoder`; the trailing
-    ``n_codebooks - 1`` alignment frames of each request are not emitted
-    (a simplification vs. the reference's exact eos-frame trimming + OLA
-    crossfade).
+    incrementally via :class:`StreamingDacDecoder`, which re-decodes a few
+    frames of left context and overlap-add crossfades each chunk boundary so
+    the convolutional decoder does not click at chunk edges. On the final
+    chunk (``request_id in engine_inputs.final_stream_rids``) it flushes the
+    withheld crossfade tail; the trailing ``n_codebooks - 1`` shear-alignment
+    frames carry no audio of their own and are dropped.
     """
 
     def __init__(self, decoder: StreamingDacDecoder, n_codebooks: int):
@@ -247,7 +249,8 @@ class Zonos2DACSubmodule(NodeSubmodule):
     ) -> NameToTensorList:
         rid = engine_inputs.request_ids[0]
         audio_codes = frames[:, : self.n_codebooks]
-        pcm = self.decoder.add_frames(rid, audio_codes, is_final=False)
+        is_final = rid in engine_inputs.final_stream_rids
+        pcm = self.decoder.add_frames(rid, audio_codes, is_final=is_final)
         return {"audio_chunk": [pcm]}
 
     def cleanup_request(self, request_id: str):

@@ -60,6 +60,11 @@ class Zonos2Config:
     sample_rate: int = 44100       # DAC output sample rate
     dac_model_type: str = "44khz"  # descript-audio-codec model tag
     dac_chunk_frames: int = 16     # streaming decode chunk (frames per DAC call)
+    dac_hop_length: int = 512      # DAC audio samples per codebook frame (44khz)
+    # Frames of already-decoded left context re-decoded and crossfaded at each
+    # streaming chunk boundary so the convolutional decoder warms up on real
+    # signal (0 disables the crossfade — restores the click at chunk edges).
+    dac_overlap_frames: int = 4
 
     @property
     def audio_vocab(self) -> int:

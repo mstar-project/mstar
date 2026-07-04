@@ -136,6 +136,10 @@ class ModelInputsFromEngine:
     cache_manager: BatchedCacheManager | None = None
     preallocated_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
     sampler: BaseSampler | None = None
+    # Request ids whose consumed streaming input was the final chunk (producer
+    # done, buffer drained). Lets streaming-codec nodes flush per-request tail
+    # state (e.g. a vocoder's withheld crossfade tail) on the last call.
+    final_stream_rids: set[str] = field(default_factory=set)
 
     @property
     @torch.compiler.disable
