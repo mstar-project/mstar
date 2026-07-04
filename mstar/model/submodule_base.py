@@ -199,6 +199,10 @@ class ModelInputsFromEngine:
     # The batch's per-request states, injected by the engine (None on paths
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
     per_request_states: dict[str, PerRequestState] | None = None
+    # Request ids whose consumed streaming input was the final chunk (producer
+    # done, buffer drained). Lets streaming-codec nodes flush per-request tail
+    # state (e.g. a vocoder's withheld crossfade tail) on the last call.
+    final_stream_rids: set[str] = field(default_factory=set)
 
     @property
     @torch.compiler.disable

@@ -385,5 +385,7 @@ class Zonos2Model(Model):
             codebook_size=self.config.codebook_size,
             sample_rate=self.config.sample_rate,
             model_type=self.config.dac_model_type,
+            overlap_frames=self.config.dac_overlap_frames,
+            hop_length=self.config.dac_hop_length,
         )
         return Zonos2DACSubmodule(decoder, self.config.n_codebooks).to(device)

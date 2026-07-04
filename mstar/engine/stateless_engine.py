@@ -442,6 +442,9 @@ class StatelessEngine(BaseEngine):
             per_request_states={
                 rid: submodule.request_state(rid) for rid in batch.request_ids
             },
+            # Forward the final-chunk ids so a streaming-codec submodule (the
+            # Zonos2 vocoder) can flush its per-request tail on the last call.
+            final_stream_rids=batch.final_stream_rids,
         )
 
         if self.enable_nvtx:
@@ -487,6 +490,9 @@ class StatelessEngine(BaseEngine):
                 request_ids=[rid],
                 per_request_info={rid: fwd_info},
                 piecewise_runners=self._piecewise_runners[batch.node_name],
+                # Same as the batched path: carry the final-chunk ids so the
+                # vocoder can flush its per-request tail on the last call.
+                final_stream_rids=batch.final_stream_rids,
             )
 
             if self.enable_nvtx:
