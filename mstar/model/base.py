@@ -443,7 +443,7 @@ class Model(ABC):
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=self.device)
+        decoder = VideoDecoder(filepath, device=device)
         video = torch.stack([frame for frame in decoder]).float() / 255.0
         return TensorAndMetadata(data=video, metadata=asdict(decoder.metadata))
 

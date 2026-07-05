@@ -47,6 +47,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
@@ -66,13 +67,13 @@ VAE_DECODER_NODE = "vae_decoder"
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
-    PREFILL_WALK = "prefill"
-    PREFILL_COND_WALK = "prefill_cond"
-    PREFILL_COND_VIDEO_WALK = "prefill_cond_video"
-    IMAGE_GEN_WALK = "image_gen"
-    VIDEO_GEN_WALK = "video_gen"
-    ACTION_GEN_WALK = "action_gen"
-    ACTION_VIDEO_GEN_WALK = "action_video_gen"
+    PREFILL_WALK = constants.PREFILL_WALK
+    PREFILL_COND_WALK = constants.PREFILL_COND_WALK
+    PREFILL_COND_VIDEO_WALK = constants.PREFILL_COND_VIDEO_WALK
+    IMAGE_GEN_WALK = constants.IMAGE_GEN_WALK
+    VIDEO_GEN_WALK = constants.VIDEO_GEN_WALK
+    ACTION_GEN_WALK = constants.ACTION_GEN_WALK
+    ACTION_VIDEO_GEN_WALK = constants.ACTION_VIDEO_GEN_WALK
 
     def __init__(
         self,
@@ -376,7 +377,7 @@ class Cosmos3Model(Model):
         # tokenized up front; the denoiser reads the second only when guidance is
         # on. Image/video prompts get the chat template + resolution/duration
         # sentences; action prompts are tokenized raw.
-        from mstar.model.cosmos3.packing import tokenize_prompt
+        from mstar.model.cosmos3.components.packing import tokenize_prompt
 
         negative_prompt = kwargs.get("negative_prompt")
         p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
@@ -407,7 +408,6 @@ class Cosmos3Model(Model):
         if modality == "image":
             import io
             import os
-            import time
 
             from PIL import Image
 
@@ -417,10 +417,7 @@ class Cosmos3Model(Model):
                 x = x[0, :, 0]
             elif x.ndim == 4:
                 x = x[0]
-            _prof = os.environ.get("COSMOS3_PROFILE")
-            _t0 = time.perf_counter()
             arr = x.permute(1, 2, 0).cpu().numpy()  # H, W, C uint8
-            _t1 = time.perf_counter()
             buf = io.BytesIO()
             # PNG is lossless at every compression level, so the level only trades
             # encode time for file size. PIL defaults to 6, which spends ~0.75 s on a
@@ -430,13 +427,9 @@ class Cosmos3Model(Model):
             # COSMOS3_PNG_COMPRESS for A/B.
             compress_level = int(os.environ.get("COSMOS3_PNG_COMPRESS", "0"))
             Image.fromarray(arr).save(buf, format="PNG", compress_level=compress_level)
-            if _prof:
-                print(f"COSMOS3_PROFILE png d2h={1000 * (_t1 - _t0):.1f}ms "
-                      f"encode={1000 * (time.perf_counter() - _t1):.1f}ms bytes={buf.tell()}", flush=True)
             return buf.getvalue()
         if modality == "video":
             import os
-            import time as _time
 
             # The decoder emits 8-bit frames [B, C, T, H, W]; encode all of them as
             # an H.264 mp4. The frames already reflect the request fps (it modulates
@@ -450,16 +443,13 @@ class Cosmos3Model(Model):
             # preset, which otherwise dominates the serving latency for a
             # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
             x = output[0] if output.ndim == 5 else output  # [C, T, H, W] uint8
-            _prof = os.environ.get("COSMOS3_PROFILE")
             fps = self.config.fps
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
-            _vt0 = _time.perf_counter()
             try:
                 # Preferred: torchcodec (torchvision >= 0.27 removed write_video).
                 from torchcodec.encoders import VideoEncoder
 
                 frames = x.permute(1, 0, 2, 3).contiguous().cpu()  # [T, C, H, W] uint8
-                _vt1 = _time.perf_counter()
                 encoded = VideoEncoder(frames, frame_rate=fps).to_tensor(
                     "mp4",
                     codec="libx264",
@@ -477,7 +467,6 @@ class Cosmos3Model(Model):
                 from torchvision.io import write_video
 
                 frames = x.permute(1, 2, 3, 0).cpu()  # [T, H, W, C] uint8
-                _vt1 = _time.perf_counter()
                 fd, path = tempfile.mkstemp(suffix=".mp4")
                 os.close(fd)
                 try:
@@ -492,10 +481,6 @@ class Cosmos3Model(Model):
                         data = f.read()
                 finally:
                     os.remove(path)
-            if _prof:
-                print(f"COSMOS3_PROFILE mp4 d2h={1000 * (_vt1 - _vt0):.1f}ms "
-                      f"encode={1000 * (_time.perf_counter() - _vt1):.1f}ms frames={frames.shape[0]} "
-                      f"bytes={len(data)}", flush=True)
             return data
         if modality == "action":
             # The predicted action latents [1, chunk, action_dim] -> [chunk,
@@ -505,22 +490,6 @@ class Cosmos3Model(Model):
             x = output[0] if output.ndim == 3 else output
             return x.detach().to(torch.float32).cpu().numpy().tobytes()
         raise ValueError(f"Unsupported modality for Cosmos3: {modality!r}")
-
-    def load_video(self, filepath: str, device: str):
-        """Decode a conditioning video to ``[T, C, H, W]`` in ``[0, 1]``.
-
-        Overrides the base implementation, which reads ``self.device`` (this model
-        does not set one); the data worker passes the decode device explicitly,
-        exactly as ``load_image`` already receives it."""
-        from dataclasses import asdict
-
-        from torchcodec.decoders import VideoDecoder
-
-        from mstar.model.base import TensorAndMetadata
-
-        decoder = VideoDecoder(filepath, device=device)
-        video = torch.stack([frame for frame in decoder]).float() / 255.0
-        return TensorAndMetadata(data=video, metadata=asdict(decoder.metadata))
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration

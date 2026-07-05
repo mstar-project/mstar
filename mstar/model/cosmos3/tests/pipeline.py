@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import torch
 
-from mstar.model.cosmos3.packing import (
+from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
     build_static_inputs,
