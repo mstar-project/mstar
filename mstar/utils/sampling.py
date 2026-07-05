@@ -303,7 +303,7 @@ class Sampler(BaseSampler):
     # (seeded) sampling draws a fresh number each step — otherwise identical
     # (seed, offset=0) draws repeat forever and stable logits never reach EOS.
     _step_offset: dict[str, int] = field(default_factory=dict)
-    tp_group: "TPCommGroup | None" = None  # noqa: F821
+    tp_group: "CommGroup | None" = None  # noqa: F821
 
     def add_request(self, request_id: str):
         self._sampling_config[request_id] = SamplingConfig()
@@ -593,7 +593,7 @@ class CudaGraphableSampler(BaseSampler):
     # that don't opt into seen-token tracking (then ``apply_penalty`` is a no-op).
     rep_penalty_buf: torch.Tensor | None = None
     seen_tokens_buf: torch.Tensor | None = None  # [bs, V] bool
-    tp_group: "TPCommGroup | None" = None  # noqa: F821
+    tp_group: "CommGroup | None" = None  # noqa: F821
 
     # Set during graph capture, and used by the cuda graph runner to determine
     # whether requests' seen token buffers should be synced post-replay
@@ -780,7 +780,7 @@ class SamplerBuffers:
     # and TP ranks would drift apart on the first tied-logit sample —
     # garbled audio for Talker, premature EOS for Thinker. Defaults to
     # ``None`` for non-TP submodules (trivial broadcast is a cheap no-op).
-    tp_group: "TPCommGroup | None" = None  # noqa: F821
+    tp_group: "CommGroup | None" = None  # noqa: F821
     # Per-request seen-token mask buffer for the repetition penalty. Present
     # only for submodules that opt in by declaring a vocab size (e.g. the
     # Qwen3-Omni Talker). ``None`` => the CUDA-graph path applies no penalty.
@@ -812,7 +812,7 @@ class SamplerBuffers:
         cls,
         max_batch_size: int,
         device: torch.device,
-        tp_group: "TPCommGroup | None" = None,  # noqa: F821
+        tp_group: "CommGroup | None" = None,  # noqa: F821
         vocab_size: int | None = None,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.

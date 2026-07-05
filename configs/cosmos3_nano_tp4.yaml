@@ -1,0 +1,18 @@
+model: "cosmos3"
+# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
+max_seq_len: 8192
+# Per-rank KV pool. Tensor parallelism shards the attention heads (each rank
+# holds num_kv_heads / tp_size heads -> 2 of 8), so the cache is light; 1024
+# pages leave ample headroom.
+kv_cache:
+  max_num_pages: 1024
+# The DiT runs tensor-parallel across four ranks: the attention heads and the
+# row-parallel projections shard, and the projections all-reduce. A pure-TP
+# cross-check at degree 4 (the small model fits on one GPU, so this is a
+# correctness check, not a perf config). Serve eager (DISABLE_GRAPH=1).
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1, 2, 3]
+    tp_size: 4
+  - node_names: ["vae_decoder"]
+    ranks: [0]

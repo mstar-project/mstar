@@ -22,7 +22,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.distributed.communication import GlobalTPConfig, WorkerTPGroups
+from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.base import EngineType
 from mstar.engine.kv_store import KVCacheConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
@@ -85,7 +85,7 @@ def _worker_process_target(
     all_worker_graph_ids_to_nodes: dict[str, set[str]],
     all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
     sharding_config: ShardingConfig,
-    tp_groups: WorkerTPGroups,
+    parallel_groups: WorkerParallelGroups,
     hostname: str,
     socket_path_prefix: str,
     dist_init_method: str,
@@ -120,7 +120,7 @@ def _worker_process_target(
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
             all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
             sharding_config=sharding_config,
-            tp_groups=tp_groups,
+            parallel_groups=parallel_groups,
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
             dist_init_method=dist_init_method,
@@ -218,8 +218,8 @@ class Conductor:
         self.streaming_consumers = set()
         self.node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
 
-        # (worker idx) -> {tp_group_str: tp_rank}
-        self.worker_tp_group_to_tp_rank: dict[int, dict[str, int]] = {}
+        # (worker idx) -> {sharding group key: rank within the lockstep instance}
+        self.worker_group_to_instance_rank: dict[int, dict[str, int]] = {}
 
         graph_walks = set()
         for wg in self.worker_graphs.values():
@@ -268,9 +268,13 @@ class Conductor:
                         f"but its sharding group has tp_size {group.tp_size}. "
                         f"node_groups and sharding_config disagree."
                     )
-                    for ranks in wg._tp_ranks:
+                    # The instance rank is the worker's index within the
+                    # lockstep instance (0..tp*sp-1), used by the
+                    # replicated-signal fanout (so exactly one rank — index 0
+                    # — forwards a replicated tensor to a downstream node).
+                    for ranks in wg._instance_ranks:
                         for i, r in enumerate(ranks):
-                            self.worker_tp_group_to_tp_rank.setdefault(r, {})[group_key] = i
+                            self.worker_group_to_instance_rank.setdefault(r, {})[group_key] = i
 
         # Pick a free TCP port for the NCCL init store. Done once on the
         # conductor and shared with every spawned worker via
@@ -351,17 +355,17 @@ class Conductor:
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
 
-        # set the _tp_rank properly for each worker
+        # set each group's _tp_rank (the worker's instance rank) per worker
         self.per_worker_sharding_config: dict[str, ShardingConfig] = {}
         for i, worker_id in enumerate(self.worker_ids):
             sharding_cfg = self.default_sharding_config.clone_empty()
             for group in sharding_cfg.groups:
                 group_key = group.key_str()
-                if group_key in self.worker_tp_group_to_tp_rank.get(i, {}):
-                    group._tp_rank = self.worker_tp_group_to_tp_rank[i][group_key]
+                if group_key in self.worker_group_to_instance_rank.get(i, {}):
+                    group._tp_rank = self.worker_group_to_instance_rank[i][group_key]
             self.per_worker_sharding_config[worker_id] = sharding_cfg
 
-        self.tp_config = GlobalTPConfig(
+        self.parallel_config = GlobalParallelConfig(
             worker_graphs=self.worker_graphs,
             worker_ids=self.worker_ids,
         )
@@ -382,7 +386,7 @@ class Conductor:
                     "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
                     "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
                     "sharding_config": self.per_worker_sharding_config[worker_id],
-                    "tp_groups": self.tp_config.per_worker_config[worker_id],
+                    "parallel_groups": self.parallel_config.per_worker_config[worker_id],
                     "hostname": self.hostname,
                     "socket_path_prefix": self.socket_path_prefix,
                     "dist_init_method": self._dist_init_method,
@@ -426,11 +430,15 @@ class Conductor:
         group_id_to_replica_idx: dict[int, int] = {}
         result = {}
         for wg_id, wg in self.worker_graphs.items():
-            if wg._tp_ranks:
+            if wg._instance_ranks:
+                # Route to a whole instance (the lockstep unit): every rank of a
+                # tp*sp instance runs the request together, so its TP all-reduce
+                # and SP all-to-all collectives stay in sync. Picking a single TP
+                # row here would desync the SP all-to-all across rows.
                 replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg._tp_ranks)),
+                    wg._group_id, np.random.randint(len(wg._instance_ranks)),
                 )
-                ranks = wg._tp_ranks[replica_idx]
+                ranks = wg._instance_ranks[replica_idx]
                 result[wg_id] = [f"worker_{r}" for r in ranks]
             else:
                 replica_idx = group_id_to_replica_idx.setdefault(
