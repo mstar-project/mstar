@@ -306,11 +306,13 @@ class PreprocessWorkerThread:
                     chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
                         tensor_info.uuid] or {}
                     # Audio is emitted as headerless 16-bit PCM; surface the
-                    # model's output sample rate so clients can wrap it.
+                    # model's output sample rate + channel count so clients can
+                    # wrap it.
                     if modality == "audio" and self.model is not None:
                         chunk_metadata = {
                             **chunk_metadata,
                             "sample_rate": self.model.get_output_sample_rate("audio"),
+                            "num_channels": self.model.get_output_audio_channels("audio"),
                         }
 
                     self.out_queue.put(ResultChunk(
