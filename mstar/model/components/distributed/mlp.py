@@ -17,7 +17,7 @@ from typing import Callable
 import torch
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
@@ -44,13 +44,13 @@ class ParallelGatedMLP(nn.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
-        comm_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
         activation: str | Callable = "silu",
         bias: bool = False,
     ):
         super().__init__()
         if comm_group is None:
-            comm_group = TPCommGroup.trivial()
+            comm_group = CommGroup.trivial()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.act = _resolve_activation(activation)

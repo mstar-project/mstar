@@ -28,7 +28,10 @@ import os
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BasicBatchedCudaGraphConfig
+from mstar.engine.cuda_graph_config import (
+    BasicBatchedCudaGraphConfig,
+    FlashInferPackedCudaGraphConfig,
+)
 from mstar.model.cosmos3.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
@@ -129,6 +132,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # Batch sizes to capture per resolution.
     gen_capture_batch_sizes: tuple[int, ...] = (1,)
 
+    # Understanding-tower (text prefill) CUDA-graph capture. The text length is
+    # prompt-dependent, so capture a few combined (cond+uncond) token buckets and
+    # round up at replay; prompts past the largest bucket fall back to eager.
+    # Targets the small-prompt, non-compute-bound regime where the launch
+    # overhead the graph removes actually matters. Override with
+    # COSMOS3_PREFILL_CAPTURE_TOKENS / COSMOS3_PREFILL_CAPTURE_BS.
+    prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
+    prefill_capture_batch_sizes: tuple[int, ...] = (1,)
+
     def __init__(self, transformer, config, scheduler=None, vae=None):
         super().__init__()
         self.transformer = transformer
@@ -209,13 +221,20 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         static["mse_gen_indexes"] = static["vision_mse_loss_indexes"] - static["und_len"]
         return static
 
-    def _new_scheduler(self, num_inference_steps: int, device, flow_shift=None):
+    def _new_scheduler(self, num_inference_steps: int, device, use_karras_sigma=None, flow_shift=None):
         from diffusers import UniPCMultistepScheduler
 
+        # The checkpoint scheduler config carries the trained sigma schedule
+        # (karras sigmas); keep it unless the request explicitly overrides a
+        # field. Forcing karras off uses the wrong schedule and corrupts the
+        # larger model's high-resolution text-to-video.
+        overrides = {}
+        if use_karras_sigma is not None:
+            overrides["use_karras_sigmas"] = use_karras_sigma
         if flow_shift is not None:
-            scheduler = UniPCMultistepScheduler.from_config(self._scheduler_template.config, flow_shift=flow_shift)
-        else:
-            scheduler = UniPCMultistepScheduler.from_config(self._scheduler_template.config)
+            overrides["flow_shift"] = flow_shift
+
+        scheduler = UniPCMultistepScheduler.from_config(self._scheduler_template.config, **overrides)
         scheduler.set_timesteps(num_inference_steps, device=device)
         return scheduler
 
@@ -280,7 +299,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "uncond": uncond,
             "gs": gs,
             "guidance_interval": md.get("guidance_interval"),
-            "scheduler": self._new_scheduler(steps, device, flow_shift=md.get("flow_shift")),
+            "scheduler": self._new_scheduler(
+                steps, device, flow_shift=md.get("flow_shift"),
+                use_karras_sigma=md.get("use_karras_sigma")
+            ),
             "num_noisy": cond["num_noisy_vision_tokens"],
             "num_vision": cond["num_vision_tokens"],
             "latent_shape": self._latent_shape(height, width, num_frames),
@@ -294,7 +316,25 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 self._req[fwd_info.request_id]["cond_latents"] = self._encode_conditioning(
                     image[0], height, width, num_frames, device, anchor_only=True
                 )
-        return ARNodeInputs(input_seq_len=cond["und_len"])
+
+        return self._get_prefill_node_inputs(cond, uncond)
+
+    def _get_prefill_node_inputs(self, cond, uncond):
+        statics = {COND_LABEL: cond}
+        if uncond is not None:
+            statics[UNCOND_LABEL] = uncond
+        tensor_inputs = {}
+        for label, s in statics.items():
+            tensor_inputs[f"input_ids_{label}"] = s["input_ids"]
+            tensor_inputs[f"text_mrope_ids_{label}"] = s["text_mrope_ids"]
+        return ARNodeInputs(
+            input_seq_len=sum(s["und_len"] for s in statics.values()),
+            tensor_inputs=tensor_inputs,
+            kwargs=dict(
+                cfg=uncond is not None,
+                seq_lens={label: s["und_len"] for label, s in statics.items()},
+            ),
+        )
 
     def _encode_conditioning(self, image, height, width, num_frames, device, anchor_only=False):
         """VAE-encode a conditioning frame into clean anchor latents.
@@ -398,7 +438,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "cond": cond,
             "uncond": uncond,
             "gs": gs,
-            "scheduler": self._new_scheduler(steps, device, flow_shift=md.get("flow_shift")),
+            "scheduler": self._new_scheduler(
+                steps, device, flow_shift=md.get("flow_shift"),
+                use_karras_sigma=md.get("use_karras_sigma")
+            ),
             "num_noisy": cond["num_noisy_vision_tokens"],
             "num_noisy_action": cond["num_noisy_action_tokens"],
             "num_vision": cond["num_vision_tokens"],
@@ -416,7 +459,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "cond_video_latents": cond_latents,
             "clean_action": clean_action,
         }
-        return ARNodeInputs(input_seq_len=cond["und_len"])
+        return self._get_prefill_node_inputs(cond, uncond)
 
     def _encode_conditioning_video(self, video, height, width, num_frames, device):
         """VAE-encode a conditioning video clip into clean anchor latents.
@@ -469,6 +512,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             latents = inputs["latents"][0]
             time_index = inputs["time_index"][0]
+
+        scheduler = st["scheduler"]
+        step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            return None
         tensors = {"latents": latents, "time_index": time_index}
         # The CUDA-graph capture reads the timestep and rotary positions as static
         # buffers (it can't reach the per-request scheduler at replay), so
@@ -516,6 +564,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latents = inputs["latents"][0]
             action_latents = inputs["action_latents"][0]
             time_index = inputs["time_index"][0]
+
+        scheduler = st["scheduler"]
+        step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            return None
         return ARNodeInputs(
             input_seq_len=st["num_vision"] + st["num_action"],
             tensor_inputs={"latents": latents, "action_latents": action_latents, "time_index": time_index},
@@ -566,21 +619,47 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "position_ids_uncond": torch.stack([inp.tensor_inputs["position_ids_uncond"] for inp in inputs]),
         }
 
-    def preprocess(self, graph_walk, engine_inputs: ModelInputsFromEngine, inputs) -> dict:
+    def preprocess(
+        self, graph_walk, engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs]
+    ) -> dict:
         cm = engine_inputs.cache_manager
 
         if graph_walk == IMAGE_GEN_WALK and getattr(cm, "_cuda_graph_mode", False):
             return self._preprocess_image_gen_captured(cm, inputs)
 
-        st = self._req[engine_inputs.request_ids[0]]
-
         if graph_walk in PREFILL_WALKS:
-            cm.plan_attention(seq_lens=[st["cond"]["und_len"]], is_causal=True, label=COND_LABEL, write_store=False)
-            if st["uncond"] is not None:
-                cm.plan_attention(
-                    seq_lens=[st["uncond"]["und_len"]], is_causal=True, label=UNCOND_LABEL, write_store=False
+            has_cfg = inputs[0].kwargs.get("cfg")
+            labels = [COND_LABEL, UNCOND_LABEL] if has_cfg else [COND_LABEL]
+            if has_cfg:
+                cm.plan_attention_batched_cfg(
+                    labels=labels,
+                    seq_lens={
+                        key: [inp.kwargs["seq_lens"][key] for inp in inputs] \
+                            for key in labels
+                    }, is_causal=True, write_store=False
                 )
-            return {}
+            else:
+                cm.plan_attention(
+                    seq_lens=[inp.input_seq_len for inp in inputs],
+                    is_causal=True, label=COND_LABEL,
+                    write_store=False
+                )
+            # Pack label-major (all cond segments, then all uncond) to match the
+            # (label, request) batch order of the plan above.
+            return {
+                "cfg": has_cfg,
+                "input_ids": torch.concat([
+                    inp.tensor_inputs[f"input_ids_{label}"]
+                    for label in labels for inp in inputs
+                ]),
+                "text_mrope_ids": torch.concat([
+                    inp.tensor_inputs[f"text_mrope_ids_{label}"]
+                    for label in labels for inp in inputs
+                ], dim=1),
+            }
+        
+        st = self._req[engine_inputs.request_ids[0]]
 
         if graph_walk in GEN_WALKS:
             rids = engine_inputs.request_ids
@@ -654,25 +733,31 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         cm = engine_inputs.cache_manager
         rid = engine_inputs.request_ids[0]
         if graph_walk in PREFILL_WALKS:
-            return self._forward_prefill(cm, self._req[rid])
+            return self._forward_prefill(cm, **kwargs)
         if graph_walk in GEN_WALKS:
             return self._forward_image_gen(cm, self._req[rid], **kwargs)
         if graph_walk in ACTION_WALKS:
             return self._forward_action_gen(cm, self._req[rid], **kwargs)
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
 
-    def _forward_prefill(self, cm, st) -> dict:
+    def _forward_prefill(
+        self, cm,
+        input_ids: torch.Tensor,
+        text_mrope_ids: torch.Tensor,
+        cfg=False,
+        **kwargs
+    ) -> dict:
         _prof = os.environ.get("COSMOS3_PROFILE")
         if _prof:
             _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
             _e0.record()
-        cond = st["cond"]
-        cm.set_active_label(COND_LABEL)
-        self.transformer.prefill_und(cond["input_ids"], cond["text_mrope_ids"], cm)
-        if st["uncond"] is not None:
-            uncond = st["uncond"]
-            cm.set_active_label(UNCOND_LABEL)
-            self.transformer.prefill_und(uncond["input_ids"], uncond["text_mrope_ids"], cm)
+
+        if cfg:
+            cm.set_active_label(CFG_BATCHED_LABEL)
+        else:
+            cm.set_active_label(COND_LABEL)
+
+        self.transformer.prefill_und(input_ids, text_mrope_ids, cm)
         if _prof:
             _e1.record(); torch.cuda.synchronize()
             logger.info("COSMOS3_PROFILE prefill %.1f ms", _e0.elapsed_time(_e1))
@@ -710,11 +795,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_image_gen(self, cm, st, latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
-        if step_index >= len(scheduler.timesteps):
-            # One extra step past this request's denoise count: the loop has
-            # already been told to stop and this output is discarded. Pass the
-            # finished latents through without touching the (stateful) scheduler.
-            return {"latents": [latents], "time_index": [time_index]}
         t = scheduler.timesteps[step_index]
         vision_timesteps = torch.full((st["num_noisy"],), t.item(), device=latents.device)
 
@@ -795,13 +875,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_action_gen(self, cm, st, latents, action_latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
-        if step_index >= len(scheduler.timesteps):
-            # One extra step past this request's denoise count (discarded output).
-            return {
-                "latents": [latents],
-                "action_latents": [action_latents],
-                "time_index": [time_index],
-            }
         t = scheduler.timesteps[step_index]
         device = latents.device
         vts = torch.full((st["num_noisy"],), t.item(), device=device)
@@ -863,7 +936,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         sts = [self._req.get(rid) for rid in batch.request_ids]
         if any(st is None for st in sts):
             return False
-        if batch.graph_walk in GEN_WALKS:
+        if batch.graph_walk in GEN_WALKS or batch.graph_walk in PREFILL_WALKS:
             # Image/video batch only in the two-branch guidance regime, so one
             # batched-CFG plan covers them.
             return all(st["uncond"] is not None for st in sts)
@@ -886,13 +959,32 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     @torch.autocast(device_type="cuda", enabled=False)
     def forward_batched(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
-        latents, time_index, action_latents=None, **kwargs,
+        latents=None, time_index=None, action_latents=None,
+        input_ids=None, text_mrope_ids=None, **kwargs,
     ):
+        cm = engine_inputs.cache_manager
+        if graph_walk in PREFILL_WALKS:
+            # The synchronize() in the profiling block is illegal while a CUDA
+            # graph is capturing this forward, so skip timing during capture.
+            _prof = os.environ.get("COSMOS3_PROFILE") and not torch.cuda.is_current_stream_capturing()
+            if _prof:
+                _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
+                _e0.record()
+
+            if kwargs.get("cfg"):
+                cm.set_active_label(CFG_BATCHED_LABEL)
+            else:
+                cm.set_active_label(COND_LABEL)
+
+            self.transformer.prefill_und(input_ids, text_mrope_ids, cm)
+            if _prof:
+                _e1.record(); torch.cuda.synchronize()
+                logger.info("COSMOS3_PROFILE prefill %.1f ms", _e0.elapsed_time(_e1))
+            return {}
         if graph_walk in ACTION_WALKS:
             return self._forward_batched_action(engine_inputs, latents, action_latents, time_index)
         if graph_walk not in GEN_WALKS:
             raise ValueError(f"Cosmos3 batched forward only supports generation walks, got {graph_walk!r}")
-        cm = engine_inputs.cache_manager
         cm.set_active_label(CFG_BATCHED_LABEL)
         reqs, meta = [], []
         for rid in engine_inputs.request_ids:
@@ -904,7 +996,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # step) while others in the batch are still running; clamp its
             # timestep so the shared forward can't index past the schedule, and
             # skip its scheduler step below.
-            past_end = step_index >= n_steps
             t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
             reqs.append({
                 "latents": lat,
@@ -915,15 +1006,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 "vision_noisy_frame_indexes": st["cond"]["vision_noisy_frame_indexes"],
                 "vision_mse_loss_indexes": st["cond"]["mse_gen_indexes"],
             })
-            meta.append((rid, st, lat, ti, t, past_end))
+            meta.append((rid, st, lat, ti, t))
 
         results = self.transformer.denoise_step_batched(reqs, cm)
 
         out = {}
-        for (rid, st, lat, ti, t, past_end), (cond_v, uncond_v) in zip(meta, results, strict=True):
-            if past_end:
-                out[rid] = {"latents": [lat], "time_index": [ti]}
-                continue
+        for (rid, st, lat, ti, t), (cond_v, uncond_v) in zip(meta, results, strict=True):
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
             new_latents = st["scheduler"].step(
                 velocity.unsqueeze(0), t, lat.unsqueeze(0), return_dict=False
@@ -951,7 +1039,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # others in the batch are still running; clamp its timestep so the
             # shared forward can't index past the schedule, and skip its scheduler
             # step below.
-            past_end = step_index >= n_steps
             t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
             cond = st["cond"]
             und = cond["und_len"]
@@ -973,15 +1060,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 unc = st["uncond"]
                 req["position_ids_uncond"] = unc["position_ids"][:, unc["und_len"]:]
             reqs.append(req)
-            meta.append((rid, st, lat, act, ti, t, past_end))
+            meta.append((rid, st, lat, act, ti, t))
 
         results = self.transformer.denoise_step_action_batched(reqs, cm, with_cfg)
 
         out = {}
-        for (rid, st, lat, act, ti, t, past_end), branches in zip(meta, results, strict=True):
-            if past_end:
-                out[rid] = {"latents": [lat], "action_latents": [act], "time_index": [ti]}
-                continue
+        for (rid, st, lat, act, ti, t), branches in zip(meta, results, strict=True):
             if with_cfg:
                 (cond_video, cond_action), (uncond_video, uncond_action) = branches
                 video_v = uncond_video + st["gs"] * (cond_video - uncond_video)
@@ -1016,7 +1100,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ``COSMOS3_GEN_CAPTURE_BS`` (e.g. ``"1,4,8"``) to also capture batched
         denoise steps so concurrent requests replay a padded graph instead of
         falling back to the eager path."""
-        if self.transformer is None or os.environ.get("COSMOS3_DISABLE_CUDA_GRAPH"):
+        disable_env = os.environ.get("COSMOS3_DISABLE_CUDA_GRAPH")
+        disabled = bool(disable_env) if disable_env is not None else not self.config.cuda_graph
+        if self.transformer is None or disabled:
             return []
         res_env = os.environ.get("COSMOS3_GEN_CAPTURE_RES")
         if res_env:
@@ -1031,20 +1117,34 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             capture_batch_sizes = list(self.gen_capture_batch_sizes)
         dtype = self.transformer.proj_in.weight.dtype
+        # The 2D (TP x SP) captured denoise graph hits a CUDA illegal access at
+        # 480p+ in the combined Ulysses all-gather + TP all-reduce path (pure-TP and
+        # pure-SP capture cleanly; only the combination at this scale). For 2D,
+        # capture only the smallest tier; 480p+ runs eager (correct, just no graph).
+        two_d = self.transformer.sp_group.world_size > 1 and self.transformer.comm_group.world_size > 1
         self._capture_layout: dict[tuple, dict] = {}
         configs = []
         for height, width in resolutions:
             latent_shape = self._latent_shape(height, width, num_frames=1)
-            # patchify-2 pads an odd latent height/width (e.g. 720p: 720 // 16 =
-            # 45 -> pad to 46), and the captured/replayed padded layout produces
-            # degraded output (clean on the left, scrambled on the right). Skip
-            # capture for such resolutions; they fall back to the eager path,
-            # which is clean and ~as fast at these compute-bound tiers.
-            if latent_shape[3] % 2 or latent_shape[4] % 2:
+            # The denoise CUDA-graph capture is bit-faithful at every resolution
+            # (the rotary outer product is a broadcast multiply, not a batched
+            # matmul over stride-0 views — see Cosmos3RotaryEmbedding; the matmul
+            # form was mis-captured by the graph memory pool at some sequence
+            # lengths). The graph only HELPS the launch-bound tiers, though: its
+            # per-step input copies scale with resolution, so at large latents
+            # (720p+) the graph is net-slower than the eager dense path. So
+            # capture only below COSMOS3_GRAPH_MAX_LATENT_AREA (latent H*W): 256p
+            # (240) and 480p (1560) graph; 720p (3600) and video run eager+dense.
+            latent_area = latent_shape[3] * latent_shape[4]
+            max_area = int(os.environ.get(
+                "COSMOS3_GRAPH_MAX_LATENT_AREA", self.config.graph_max_latent_area))
+            if two_d:
+                max_area = min(max_area, 1000)  # 256p latent 240 captures; 480p 1560 does not
+            if latent_area > max_area:
                 logger.info(
-                    "Cosmos3: skipping CUDA-graph capture for %dx%d "
-                    "(odd latent dim %s -> patchify pad -> eager fallback)",
-                    height, width, tuple(latent_shape[3:]),
+                    "Cosmos3: skipping CUDA-graph capture for %dx%d (latent H*W "
+                    "%d > %d -> graph net-slower than eager dense here -> eager)",
+                    height, width, latent_area, max_area,
                 )
                 continue
             static = self._build_static(
@@ -1084,9 +1184,66 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # max_batch_size to the captured sizes.
                 caps_eager_batch_size=False,
             ))
+
+        # Understanding-tower text prefill: cond+uncond packed into one combined
+        # sequence (batched CFG). The dummy zeros are placeholders — the real
+        # input_ids / mrope ids are copied into the static buffers at replay.
+        if not os.environ.get("COSMOS3_DISABLE_PREFILL_CUDA_GRAPH"):
+            tok_env = os.environ.get("COSMOS3_PREFILL_CAPTURE_TOKENS")
+            prefill_tokens = (
+                [int(x) for x in tok_env.split(",")] if tok_env
+                else list(self.prefill_capture_token_buckets)
+            )
+            bs_env = os.environ.get("COSMOS3_PREFILL_CAPTURE_BS")
+            prefill_bs = (
+                [int(x) for x in bs_env.split(",")] if bs_env
+                else list(self.prefill_capture_batch_sizes)
+            )
+            mrope_dtype = torch.float32 if self.config.enable_fps_modulation else torch.long
+
+            def _prefill_template(n):
+                return {
+                    "input_ids": torch.zeros(n, dtype=torch.long, device=device),
+                    "text_mrope_ids": torch.zeros((3, n), dtype=mrope_dtype, device=device),
+                    "cfg": True,
+                }
+
+            configs.append(FlashInferPackedCudaGraphConfig(
+                capture_graph_walk=PREFILL_WALK,
+                replay_graph_walks=list(PREFILL_WALKS),
+                packed_seq_len_to_inputs={n: _prefill_template(n) for n in prefill_tokens},
+                requires_cfg=False,
+                labels=[COND_LABEL, UNCOND_LABEL],
+                batched_cfg=True,
+                causal_attention=True,
+                compile=False,
+                capture_batch_sizes=prefill_bs,
+                caps_eager_batch_size=False,
+                zero_padding_input=ARNodeInputs(
+                    input_seq_len=0,
+                    tensor_inputs={
+                        "input_ids_" + COND_LABEL: torch.zeros(0, dtype=torch.long, device=device),
+                        "input_ids_" + UNCOND_LABEL: torch.zeros(0, dtype=torch.long, device=device),
+                        "text_mrope_ids_" + COND_LABEL: torch.zeros((3, 0), dtype=mrope_dtype, device=device),
+                        "text_mrope_ids_" + UNCOND_LABEL: torch.zeros((3, 0), dtype=mrope_dtype, device=device),
+                    },
+                    kwargs=dict(
+                        cfg=True,
+                        seq_lens={COND_LABEL: 0, UNCOND_LABEL: 0},
+                    ),
+                ),
+            ))
         return configs
 
     def can_use_cuda_graphs(self, batch, model_inputs) -> bool:
+        # Text prefill is captured only with two-branch guidance (the combined
+        # cond+uncond packed sequence); the runner's can_run picks the token
+        # bucket, so a prompt past the largest bucket falls back to eager here.
+        if batch.graph_walk in PREFILL_WALKS:
+            return all(
+                (st := self._req.get(rid)) is not None and st["uncond"] is not None
+                for rid in batch.request_ids
+            )
         # Only the image denoise step is captured, only with two-branch guidance,
         # and only at a resolution we captured a graph for. A batched capture is a
         # single fixed resolution, so a concurrent batch must be uniform-resolution
@@ -1124,10 +1281,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         layout = self._capture_layout[tuple(latents.shape[1:])]
         rids = engine_inputs.request_ids
         if latents.shape[0] == 1:
+            # This forward is captured into the denoise CUDA graph. Under SP the
+            # Ulysses exchange must use all-gather, not all-to-all: the latter is
+            # grouped point-to-point send/recv and does not replay from a graph.
+            # The flag holds across warmup, capture and replay (all routed here),
+            # so the all-gather kernels are compiled during eager warmup rather
+            # than mid-capture. No-op without SP.
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents[0], vision_timesteps[0], position_ids_cond[0], position_ids_uncond[0],
                 layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
-                layout["mse_gen_indexes"], cm,
+                layout["mse_gen_indexes"], cm, prefer_all_gather=True,
             )
             return {rids[0]: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
         reqs = [
@@ -1148,10 +1311,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             for rid, (cond_v, uncond_v) in zip(rids, results, strict=True)
         }
 
-    def postprocess_captured(self, request_ids, inputs, per_request_info, outputs) -> dict:
+    def postprocess_captured(
+        self, request_ids: list[str],
+        inputs: list,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        outputs: dict
+    ) -> dict:
         """Eager tail run after graph replay: the classifier-free-guidance combine
         and the (Python, multistep) scheduler step the graph can't hold. Mirrors
         the tail of ``_forward_image_gen``."""
+        if per_request_info[request_ids[0]].graph_walk not in GEN_WALKS:
+            return outputs
         for rid, inp in zip(request_ids, inputs, strict=True):
             st = self._req[rid]
             cond_v = outputs[rid]["cond_v"][0]
@@ -1160,8 +1330,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latents = inp.tensor_inputs["latents"]
             time_index = inp.tensor_inputs["time_index"]
             step_index = int(time_index.reshape(-1)[0].item())
-            if step_index >= len(st["scheduler"].timesteps):
-                # Discarded extra step past this request's denoise count.
+            sched = st["scheduler"]
+            sched_idx = sched.step_index
+            if step_index >= len(sched.timesteps) or (
+                sched_idx is not None and sched_idx >= len(sched.timesteps)
+            ):
+                # Discarded extra step past this request's denoise count. Guard on
+                # BOTH the engine step counter and the scheduler's own step_index:
+                # with concurrent (bs>1) requests the batched loop dispatches one
+                # extra step whose engine time_index can lag the scheduler, and
+                # stepping an already-exhausted UniPC scheduler trips
+                # `assert self.this_order > 0`.
                 outputs[rid] = {"latents": [latents], "time_index": [time_index]}
                 continue
             t = st["scheduler"].timesteps[step_index]
@@ -1213,6 +1392,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         super().__init__()
         self.vae = vae
         self.config = config
+        self._decode_dtype_cached = None
         # The Wan VAE decode is 3D-conv bound and is not captured into a CUDA
         # graph (it runs once per request at request-specific frame/resolution
         # shapes). torch.compile fuses the pointwise epilogues around those convs;
@@ -1220,35 +1400,66 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # causal-conv feature cache, and dynamic=False gives the best per-shape
         # kernels at the cost of a one-time trace per new (frames, height, width)
         # — fine for the few fixed generation tiers (the first request at each
-        # shape pays the trace). Off by default; set COSMOS3_COMPILE_VAE=1 to
-        # enable (A/B against the eager decode, which is identical bar fp
-        # rounding). The compile wraps the same fp32, autocast-off decode below.
+        # shape pays the trace). On by default — it cuts the 189-frame video VAE
+        # decode ~20-30% (a large share of video latency) and is neutral for the
+        # tiny single-frame image decode; set COSMOS3_COMPILE_VAE=0 to disable
+        # (A/B against the eager decode, which is identical bar fp rounding). The
+        # compile wraps the autocast-off decode below.
         self._decode = vae.decode if vae is not None else None
-        if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE"):
+        if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
+            "0", "false", "no", "off",
+        ):
             self._decode = torch.compile(vae.decode, fullgraph=False, dynamic=False)
             logger.info("Cosmos3 VAE decode torch.compile enabled")
+        # Resolve + log the decode dtype now (a cheap cuDNN-version read) so the
+        # choice is fixed at startup, not on the first request.
+        self._decode_dtype()
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
 
+    def _decode_dtype(self):
+        # cuDNN ships the fast Hopper bf16 conv3d kernels for the Wan-VAE decode
+        # only from 9.16 on; before that (e.g. the 9.10 cu12.8 wheel) bf16/fp16
+        # fall back and a 256p-video decode is ~10s vs ~1s in fp32/TF32, so use
+        # fp32 there. Measured single-variable (same torch/GPU, swapping only the
+        # cuDNN libs): bf16 vid256 decode 10.3s at 9.13 -> 0.85s at 9.16; fp32/TF32
+        # ~1.1s throughout. Gate on the live cuDNN version (a cuDNN upgrade flips
+        # it automatically); COSMOS3_VAE_DECODE_FP32 overrides.
+        if self._decode_dtype_cached is not None:
+            return self._decode_dtype_cached
+        override = os.environ.get("COSMOS3_VAE_DECODE_FP32")
+        if override is not None:
+            on = override.lower() not in ("0", "false", "no", "off")
+            self._decode_dtype_cached = torch.float32 if on else torch.bfloat16
+        else:
+            ver = torch.backends.cudnn.version() or 0
+            self._decode_dtype_cached = torch.bfloat16 if ver >= 91600 else torch.float32
+        logger.info("Cosmos3 VAE decode dtype = %s (cuDNN %s)",
+                    self._decode_dtype_cached, torch.backends.cudnn.version())
+        return self._decode_dtype_cached
+
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
         vae = self.vae
-        # The Wan VAE's 3D convolutions run several times faster in fp32 (TF32
-        # tensor cores) than in bf16 on this cuDNN, and the reference pipeline
-        # decodes in fp32. The engine casts this submodule to bf16, so restore the
-        # vae to fp32 once and decode outside autocast to keep the fast path.
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
-        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=latents.device)).view(
+        vae_dtype = self._decode_dtype()
+        if next(vae.parameters()).dtype != vae_dtype:
+            vae = vae.to(vae_dtype)
+        mean = torch.tensor(vae.config.latents_mean, dtype=vae_dtype, device=latents.device).view(1, -1, 1, 1, 1)
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae_dtype, device=latents.device)).view(
             1, -1, 1, 1, 1
         )
-        z = latents.float() / inv_std + mean
+        # Force z to the VAE dtype. An outer autocast(enabled=True) context is
+        # active during this forward and promotes the `1.0 / std` division to
+        # fp32, which would silently make z fp32 even though latents/mean/vae_dtype
+        # are all bf16 -> the bf16 VAE conv3d below (run under autocast-off) would
+        # then hit "Input type (float) and bias type (BFloat16)". The explicit cast
+        # is a no-op for the fp32 path (S1) and unblocks bf16 decode (cuDNN >= 9.16).
+        z = (latents.to(vae_dtype) / inv_std + mean).to(vae_dtype)
         _prof = os.environ.get("COSMOS3_PROFILE")
         if _prof:
             _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
             _e0.record()
-        with torch.autocast(device_type=z.device.type, enabled=False):
+        with torch.autocast(device_type="cuda", enabled=False):
             decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
         if _prof:
             _e1.record(); torch.cuda.synchronize()
