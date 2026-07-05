@@ -54,6 +54,8 @@ from mstar.model.cosmos3.submodules import (
     ACTION_VIDEO_GEN_LOOP,
     IMAGE_GEN_LOOP,
     VIDEO_GEN_LOOP,
+    VIDEO_SOUND_GEN_LOOP,
+    Cosmos3AudioDecoderSubmodule,
     Cosmos3DiTSubmodule,
     Cosmos3VAEDecoderSubmodule,
 )
@@ -62,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 DIT_NODE = "dit"
 VAE_DECODER_NODE = "vae_decoder"
+AUDIO_DECODER_NODE = "audio_decoder"
 
 
 class Cosmos3Model(Model):
@@ -72,6 +75,7 @@ class Cosmos3Model(Model):
     PREFILL_COND_VIDEO_WALK = constants.PREFILL_COND_VIDEO_WALK
     IMAGE_GEN_WALK = constants.IMAGE_GEN_WALK
     VIDEO_GEN_WALK = constants.VIDEO_GEN_WALK
+    VIDEO_SOUND_GEN_WALK = constants.VIDEO_SOUND_GEN_WALK
     ACTION_GEN_WALK = constants.ACTION_GEN_WALK
     ACTION_VIDEO_GEN_WALK = constants.ACTION_VIDEO_GEN_WALK
 
@@ -173,11 +177,26 @@ class Cosmos3Model(Model):
             )
         ]
 
+    def _sound_serving_enabled(self) -> bool:
+        """Whether the opt-in sound walk (and its audio_decoder node) is served.
+
+        Requires the model capability (``sound_gen``), the serving knob
+        (``enable_sound``, yaml-overridable), and — with real weights — the
+        checkpoint's ``sound_tokenizer/`` component."""
+        if not (self.config.sound_gen and self.config.enable_sound):
+            return False
+        if self.skip_weight_loading:
+            return True
+        return (self._ensure_repo() / "sound_tokenizer" / "config.json").exists()
+
     def get_node_engine_types(self) -> dict[str, EngineType]:
-        return {
+        types = {
             DIT_NODE: EngineType.KV_CACHE,
             VAE_DECODER_NODE: EngineType.STATELESS,
         }
+        if self._sound_serving_enabled():
+            types[AUDIO_DECODER_NODE] = EngineType.STATELESS
+        return types
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The DiT supports tensor parallelism: per layer the attention heads and
@@ -270,6 +289,62 @@ class Cosmos3Model(Model):
         image_gen = _gen_walk(IMAGE_GEN_LOOP, "image_output", "image")
         video_gen = _gen_walk(VIDEO_GEN_LOOP, "video_output", "video")
 
+        # video_sound_gen (opt-in): the video denoise loop with a jointly
+        # denoised sound band threaded alongside the video latents. On the final
+        # iteration the video latents route to the Wan VAE and the sound latents
+        # to the AVAE audio decoder; the walk emits both a video and an audio
+        # output, which the API layer muxes into one file.
+        video_sound_gen = Sequential(
+            [
+                Loop(
+                    name=VIDEO_SOUND_GEN_LOOP,
+                    section=GraphNode(
+                        name=DIT_NODE,
+                        input_names=["latents", "sound_latents", "time_index"],
+                        outputs=[
+                            GraphEdge(next_node=DIT_NODE, name="latents"),
+                            GraphEdge(next_node=DIT_NODE, name="sound_latents"),
+                            GraphEdge(next_node=DIT_NODE, name="time_index"),
+                        ],
+                        enable_async_scheduling=True,
+                    ),
+                    max_iters=self.config.max_inference_steps,
+                    outputs=[
+                        GraphEdge(next_node=VAE_DECODER_NODE, name="latents"),
+                        GraphEdge(next_node=AUDIO_DECODER_NODE, name="sound_latents"),
+                    ],
+                ),
+                # The two decoders are independent (edge-driven readiness): each
+                # runs as soon as its own latents arrive. Kept as Sequential
+                # members rather than a Parallel section — Parallel's IO
+                # classification treats any edge targeting a member node as
+                # internal, which strips these nodes' loop-fed inputs from the
+                # worker graph and silently drops both emissions.
+                GraphNode(
+                    name=VAE_DECODER_NODE,
+                    input_names=["latents"],
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="video_output",
+                            output_modality="video",
+                        ),
+                    ],
+                ),
+                GraphNode(
+                    name=AUDIO_DECODER_NODE,
+                    input_names=["sound_latents"],
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="audio_output",
+                            output_modality="audio",
+                        ),
+                    ],
+                ),
+            ]
+        )
+
         # action_gen: like image_gen but the loop body jointly denoises the video
         # and action latents (threaded as two self-edges), and the predicted
         # action — not a decoded video — is what the request emits.
@@ -342,7 +417,7 @@ class Cosmos3Model(Model):
             ]
         )
 
-        return {
+        walks = {
             self.PREFILL_WALK: prefill,
             self.PREFILL_COND_WALK: prefill_cond,
             self.PREFILL_COND_VIDEO_WALK: prefill_cond_video,
@@ -351,6 +426,11 @@ class Cosmos3Model(Model):
             self.VIDEO_GEN_WALK: video_gen,
             self.ACTION_GEN_WALK: action_gen,
         }
+        # The sound walk references the audio_decoder node, which only exists
+        # (and only needs a node_groups entry) when sound serving is enabled.
+        if self._sound_serving_enabled():
+            walks[self.VIDEO_SOUND_GEN_WALK] = video_sound_gen
+        return walks
 
     # ------------------------------------------------------------------
     # Model ABC: I/O
@@ -489,7 +569,20 @@ class Cosmos3Model(Model):
             # raw_action_dim, the real action width for its embodiment).
             x = output[0] if output.ndim == 3 else output
             return x.detach().to(torch.float32).cpu().numpy().tobytes()
+        if modality == "audio":
+            # The audio decoder emits a [channels, samples] waveform in [-1, 1];
+            # the serving convention for audio is headerless interleaved 16-bit
+            # PCM (the API layer wraps it with the model's sample rate).
+            x = output[0] if output.ndim == 3 else output
+            pcm = (x.detach().to(torch.float32).clamp(-1, 1) * 32767.0).round().to(torch.int16)
+            return pcm.T.contiguous().cpu().numpy().tobytes()
         raise ValueError(f"Unsupported modality for Cosmos3: {modality!r}")
+
+    def get_output_sample_rate(self, modality: str = "audio") -> int:
+        return int(self.config.sound_sample_rate)
+
+    def get_output_audio_channels(self, modality: str = "audio") -> int:
+        return 2
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration
@@ -561,6 +654,22 @@ class Cosmos3Model(Model):
                   "action_fps", "action"):
             if k in mk:
                 params[k] = mk[k]
+        # Opt-in sound generation: video-only (image and action requests carry
+        # no sound band), and only when the served checkpoint/config enable it.
+        if mk.get("generate_sound") or mk.get("sound_gen"):
+            if num_frames <= 1 or "action_mode" in params:
+                raise ValueError(
+                    "Cosmos3 sound generation is supported only for video requests "
+                    "(num_frames > 1, no action mode)."
+                )
+            if not self._sound_serving_enabled():
+                raise ValueError(
+                    "Cosmos3 sound generation was requested, but sound serving is "
+                    "disabled or the checkpoint has no sound_tokenizer/ component."
+                )
+            params["generate_sound"] = True
+            if mk.get("sound_duration") is not None:
+                params["sound_duration"] = float(mk["sound_duration"])
         return params
 
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
@@ -645,21 +754,25 @@ class Cosmos3Model(Model):
                 metadata.graph_walk = self.ACTION_VIDEO_GEN_WALK
             elif is_action:
                 metadata.graph_walk = self.ACTION_GEN_WALK
+            elif is_video and metadata.kwargs.get("generate_sound"):
+                metadata.graph_walk = self.VIDEO_SOUND_GEN_WALK
             elif is_video:
                 metadata.graph_walk = self.VIDEO_GEN_WALK
             else:
                 metadata.graph_walk = self.IMAGE_GEN_WALK
             # The first denoise iteration's initial noise + step index are
-            # sampled inside the DiT submodule's preprocess. Action walks also
-            # thread the action latents through the loop.
+            # sampled inside the DiT submodule's preprocess. Action and sound
+            # walks also thread their extra latents through the loop.
             inputs = [
                 GraphEdge(next_node=DIT_NODE, name="latents"),
                 GraphEdge(next_node=DIT_NODE, name="time_index"),
             ]
             if joint_action:
                 inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="action_latents"))
+            elif metadata.graph_walk == self.VIDEO_SOUND_GEN_WALK:
+                inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="sound_latents"))
         elif metadata.graph_walk in (
-            self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK,
+            self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK, self.VIDEO_SOUND_GEN_WALK,
             self.ACTION_GEN_WALK, self.ACTION_VIDEO_GEN_WALK,
         ):
             request_done = True
@@ -707,6 +820,10 @@ class Cosmos3Model(Model):
             return Cosmos3VAEDecoderSubmodule(
                 vae=self._build_vae(device), config=self.config
             )
+        if node_name == AUDIO_DECODER_NODE:
+            return Cosmos3AudioDecoderSubmodule(
+                sound_tokenizer=self._build_sound_tokenizer(device), config=self.config
+            )
         return None
 
     def _build_scheduler(self):
@@ -752,3 +869,17 @@ class Cosmos3Model(Model):
         vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
         self._vae = vae.to(device).eval()
         return self._vae
+
+    def _build_sound_tokenizer(self, device: str):
+        if self.skip_weight_loading:
+            return None
+        from mstar.model.cosmos3.components.sound_tokenizer import Cosmos3SoundTokenizer
+
+        tokenizer = Cosmos3SoundTokenizer.from_pretrained(
+            self._ensure_repo(), device=device, dtype=torch.bfloat16
+        )
+        logger.info(
+            "Loaded Cosmos3 sound tokenizer (sr=%d, channels=%d, latent_ch=%d, hop=%d)",
+            tokenizer.sample_rate, tokenizer.audio_channels, tokenizer.latent_ch, tokenizer.hop_size,
+        )
+        return tokenizer

@@ -17,5 +17,5 @@ node_groups:
   - node_names: ["dit"]
     ranks: [0, 1, 2, 3]
     sp_size: 4
-  - node_names: ["vae_decoder"]
+  - node_names: ["vae_decoder", "audio_decoder"]
     ranks: [0]
