@@ -22,13 +22,6 @@ import math
 import os
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-# These checks validate the eager cache-once mechanism's numerical exactness, so
-# run the eager denoise step. The served default torch.compiles it, which fuses
-# pointwise ops and perturbs the latents past the tight bit-exact bounds below
-# without changing image quality (the FlashInfer PSNR checks still pass with
-# compile on — validated over HTTP). Set COSMOS3_DISABLE_COMPILE_DENOISE= (empty)
-# to exercise the compiled path here instead.
-os.environ.setdefault("COSMOS3_DISABLE_COMPILE_DENOISE", "1")
 
 import torch
 import torch.nn.functional as F
@@ -257,10 +250,16 @@ def _load():
         return None
     torch.use_deterministic_algorithms(True, warn_only=True)
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-    from mstar.model.cosmos3.pipeline import Cosmos3Pipeline
+    from mstar.model.cosmos3.tests.pipeline import Cosmos3Pipeline
 
     device, dtype = "cuda:0", torch.bfloat16
     model = Cosmos3Model(model_path_hf=snap)
+    # These checks validate the eager cache-once mechanism's numerical exactness.
+    # The served default compiles the denoise step, which fuses pointwise ops and
+    # perturbs the latents past the tight bit-exact bounds below without changing
+    # image quality (the FlashInfer PSNR checks pass with compile on — validated
+    # over HTTP). Flip to True to exercise the compiled path here instead.
+    model.config.compile_denoise = False
     mpipe = Cosmos3Pipeline.from_model(model, device=device, dtype=dtype)
     dit = model.get_submodule("dit", device=device)  # shares mpipe's transformer
     _SETUP_CACHE["base"] = dict(model=model, mpipe=mpipe, dit=dit, device=device, dtype=dtype)
@@ -277,7 +276,7 @@ def _scenario(num_frames):
     if base is None:
         _SETUP_CACHE[key] = None
         return None
-    from mstar.model.cosmos3.packing import tokenize_prompt
+    from mstar.model.cosmos3.components.packing import tokenize_prompt
 
     device, dtype, mpipe = base["device"], base["dtype"], base["mpipe"]
     cond_ids, uncond_ids = tokenize_prompt(
@@ -527,7 +526,7 @@ def test_cross_request_batch_matches_individual() -> None:
     if base is None:
         print("  (skipped cross-request batch parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
-    from mstar.model.cosmos3.packing import tokenize_prompt
+    from mstar.model.cosmos3.components.packing import tokenize_prompt
 
     model, dit, mpipe = base["model"], base["dit"], base["mpipe"]
     device, dtype = base["device"], base["dtype"]

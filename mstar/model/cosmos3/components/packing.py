@@ -239,28 +239,6 @@ def tokenize_prompt(
     return cond, uncond
 
 
-def tokenize_t2i_prompt(
-    tokenizer,
-    prompt: str,
-    negative_prompt: str | None,
-    height: int,
-    width: int,
-    use_system_prompt: bool = True,
-    add_resolution_template: bool = True,
-) -> tuple[list[int], list[int]]:
-    """Image-mode convenience wrapper around :func:`tokenize_prompt`."""
-    return tokenize_prompt(
-        tokenizer,
-        prompt,
-        negative_prompt,
-        num_frames=1,
-        height=height,
-        width=width,
-        use_system_prompt=use_system_prompt,
-        add_resolution_template=add_resolution_template,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Segment builders + full t2i static-input assembly.
 # ---------------------------------------------------------------------------

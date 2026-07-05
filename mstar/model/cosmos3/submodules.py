@@ -32,11 +32,20 @@ from mstar.engine.cuda_graph_config import (
     BasicBatchedCudaGraphConfig,
     FlashInferPackedCudaGraphConfig,
 )
-from mstar.model.cosmos3.packing import (
+from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
     build_static_inputs,
     vision_condition_frame_indexes,
+)
+from mstar.model.cosmos3.constants import (
+    ACTION_GEN_WALK,
+    ACTION_VIDEO_GEN_WALK,
+    IMAGE_GEN_WALK,
+    PREFILL_COND_VIDEO_WALK,
+    PREFILL_COND_WALK,
+    PREFILL_WALK,
+    VIDEO_GEN_WALK,
 )
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -47,23 +56,6 @@ from mstar.model.submodule_base import (
 )
 
 logger = logging.getLogger(__name__)
-
-PREFILL_WALK = "prefill"
-# Image/video-conditioned generation prefills the same understanding tower, but
-# also VAE-encodes the conditioning frame into a clean anchor latent (see
-# Cosmos3DiTSubmodule._encode_conditioning). It is a separate walk from the
-# text-only prefill because the graph node only fires once all of its declared
-# inputs arrive, so the conditioning image has to be one of them.
-PREFILL_COND_WALK = "prefill_cond"
-# Action inverse-dynamics conditions on a full video rather than a single frame,
-# so it gets its own conditioned prefill that takes the video among its inputs.
-PREFILL_COND_VIDEO_WALK = "prefill_cond_video"
-IMAGE_GEN_WALK = "image_gen"
-VIDEO_GEN_WALK = "video_gen"
-ACTION_GEN_WALK = "action_gen"
-# Forward-dynamics runs the same joint video+action denoise but emits the
-# predicted video (VAE-decoded) instead of the action, so it has its own walk.
-ACTION_VIDEO_GEN_WALK = "action_video_gen"
 
 # image_gen and video_gen run the identical denoise step (the DiT loop is
 # shape-general over the frame count); they differ only in the emitted output
@@ -156,18 +148,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # Per-request denoising state: packed static inputs (cond/uncond),
         # scheduler, guidance scale, latent shape.
         self._req: dict[str, dict] = {}
-        # torch.compile the pure denoise compute (the generation-layer stack +
-        # norms + projections). fullgraph=False leaves the FlashInfer attention an
-        # opaque graph break, so compile fuses the bandwidth-bound pointwise ops
-        # around it; the compiled kernels then bake into the per-resolution image
-        # CUDA graphs (capture's warmup forwards trace them before the graph
-        # records). disable_torch_compile stays True so the engine does not also
-        # compile the data-dependent submodule wrapper. On by default — frees
-        # ~1.2-1.3x per denoise step at the generation tiers with no change in
-        # image/golden quality vs the fused reference (the first request at each
-        # uncaptured shape pays a one-time trace). Set
-        # COSMOS3_DISABLE_COMPILE_DENOISE=1 for the eager step (A/B / debugging).
-        if not os.environ.get("COSMOS3_DISABLE_COMPILE_DENOISE"):
+        # torch.compile the pure denoise compute (~1.2-1.3x per step; the compiled
+        # kernels bake into the per-resolution CUDA graphs at capture).
+        # fullgraph=False leaves the FlashInfer attention an opaque graph break;
+        # disable_torch_compile stays True so the engine does not also compile the
+        # data-dependent submodule wrapper. ``config.compile_denoise=False`` runs
+        # the eager step (the bit-exact parity tests rely on it).
+        if config.compile_denoise and transformer is not None:
             self.transformer.denoise_step = torch.compile(
                 self.transformer.denoise_step, fullgraph=False, dynamic=False,
             )
@@ -177,14 +164,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             logger.info("Cosmos3 denoise compute torch.compile enabled")
 
     def to(self, *args, **kwargs):
-        # The engine casts this submodule to bf16 (worker.engine_manager), which
-        # also casts the timestep embedder. Diffusers keeps that module in fp32
-        # (_keep_in_fp32_modules) and the reference pipeline computes the timestep
-        # embedding in fp32; the multi-step video denoise is sensitive to its
-        # precision (running it in bf16 perturbs the velocity enough to scramble
-        # the latents). Re-assert fp32 after any cast — paired with the
-        # autocast-disabled forward below so it actually runs in fp32. The upcast
-        # is lossless (the checkpoint weights are bf16).
+        # The engine casts this submodule to bf16; the timestep embedder must stay
+        # fp32 (diffusers keeps it in _keep_in_fp32_modules, and the multi-step
+        # video denoise scrambles when it runs in bf16), so re-assert fp32 after
+        # any cast — paired with the autocast-disabled forward below.
         super().to(*args, **kwargs)
         te = getattr(self.transformer, "time_embedder", None)
         if te is not None:
@@ -606,6 +589,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         stacked on a leading batch dim, so one captured graph spans a whole
         concurrent batch (a batch of one for the single-request latency path); the
         replay side copies each request's tensors into these fixed buffers.
+
+        Separate from the eager ``preprocess`` by contract, not just output
+        formation: this path takes pre-derived timestep/rotary buffers with no
+        per-request scheduler state and must always plan both guidance branches
+        (the graph shape is fixed), while the eager path derives its step inputs
+        from ``time_index`` + per-request state and skips the uncond plan on
+        guidance-interval steps.
         """
         seq_lens = [inp.input_seq_len for inp in inputs]
         cm.plan_attention_batched_cfg(
@@ -747,20 +737,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         cfg=False,
         **kwargs
     ) -> dict:
-        _prof = os.environ.get("COSMOS3_PROFILE")
-        if _prof:
-            _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
-            _e0.record()
-
         if cfg:
             cm.set_active_label(CFG_BATCHED_LABEL)
         else:
             cm.set_active_label(COND_LABEL)
 
         self.transformer.prefill_und(input_ids, text_mrope_ids, cm)
-        if _prof:
-            _e1.record(); torch.cuda.synchronize()
-            logger.info("COSMOS3_PROFILE prefill %.1f ms", _e0.elapsed_time(_e1))
         return {}
 
     def _denoise(self, cm, static, latents, vision_timesteps):
@@ -964,22 +946,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     ):
         cm = engine_inputs.cache_manager
         if graph_walk in PREFILL_WALKS:
-            # The synchronize() in the profiling block is illegal while a CUDA
-            # graph is capturing this forward, so skip timing during capture.
-            _prof = os.environ.get("COSMOS3_PROFILE") and not torch.cuda.is_current_stream_capturing()
-            if _prof:
-                _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
-                _e0.record()
-
             if kwargs.get("cfg"):
                 cm.set_active_label(CFG_BATCHED_LABEL)
             else:
                 cm.set_active_label(COND_LABEL)
 
             self.transformer.prefill_und(input_ids, text_mrope_ids, cm)
-            if _prof:
-                _e1.record(); torch.cuda.synchronize()
-                logger.info("COSMOS3_PROFILE prefill %.1f ms", _e0.elapsed_time(_e1))
             return {}
         if graph_walk in ACTION_WALKS:
             return self._forward_batched_action(engine_inputs, latents, action_latents, time_index)
@@ -1455,15 +1427,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # then hit "Input type (float) and bias type (BFloat16)". The explicit cast
         # is a no-op for the fp32 path (S1) and unblocks bf16 decode (cuDNN >= 9.16).
         z = (latents.to(vae_dtype) / inv_std + mean).to(vae_dtype)
-        _prof = os.environ.get("COSMOS3_PROFILE")
-        if _prof:
-            _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
-            _e0.record()
         with torch.autocast(device_type="cuda", enabled=False):
             decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
-        if _prof:
-            _e1.record(); torch.cuda.synchronize()
-            logger.info("COSMOS3_PROFILE vae_decode %.1f ms out=%s", _e0.elapsed_time(_e1), tuple(decoded.shape))
         # Quantize to 8-bit here (the output is an 8-bit image/mp4 either way) so
         # only the uint8 frames cross the SHM edge to the data worker, not a 4x
         # larger fp32 tensor — the decoded video transfer dominates the fixed cost

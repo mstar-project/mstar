@@ -142,6 +142,12 @@ class Cosmos3MLP(nn.Module):
     Tensor-parallel: ``gate_proj``/``up_proj`` are column-sharded along the
     intermediate dim and ``down_proj`` row-shards its input and all-reduces.
     A trivial comm group (world size 1) makes these plain linears.
+
+    Deliberately not ``ParallelGatedMLP``: that class fuses gate/up into one
+    ``MergedColumnParallelLinear`` and needs stacked-parameter loader rules,
+    while the Cosmos3 backbone keeps every projection unfused (attention
+    included) so ``state_dict()`` keys match the published checkpoint
+    one-to-one and the loader stays a plain name-matching stream.
     """
 
     def __init__(
@@ -242,6 +248,10 @@ class Cosmos3PackedMoTAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, enable_gqa=True)
         return out.transpose(1, 2).squeeze(0).flatten(-2, -1)
 
+    # Reference fused-pass attention (both pathways in one call, in-pass K/V
+    # concat): exercised only by the fused test pipeline + parity tests.
+    # Production serving runs the cached variants below (forward_und /
+    # forward_gen) against the paged cache.
     def forward(
         self,
         und_seq: torch.Tensor,
@@ -650,7 +660,9 @@ class Cosmos3OmniTransformer(nn.Module):
         return out.unsqueeze(0)  # [1, T, D]
 
     # ------------------------------------------------------------------
-    # forward: full per-step pass — encode text/vision, run layers, decode velocity.
+    # forward: full per-step pass — encode text/vision, run layers, decode
+    # velocity. Reference path for the fused test pipeline + parity tests;
+    # production serving uses prefill_und + denoise_step* below.
     # ------------------------------------------------------------------
 
     def forward(
@@ -781,6 +793,9 @@ class Cosmos3OmniTransformer(nn.Module):
     # their K/V is step-independent, so caching it once is exact. ``cache_handle``
     # is a paged attention handle (set_layer_idx / run_attention / advance_seq_lens);
     # the attention plan (causal vs not, which label) is configured by the caller.
+    # These entry points pack text + vision (+ action) only: the checkpoint's
+    # sound band is reachable through the reference ``forward`` above but has no
+    # serving path yet, so the cached variants take no sound inputs.
     # ------------------------------------------------------------------
 
     def _rotary(self, position_ids: torch.Tensor, device, dtype):
