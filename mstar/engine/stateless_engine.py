@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.distributed.communication import WorkerTPGroups
+from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.base import (
     BaseEngine,
     EngineType,
@@ -164,7 +164,7 @@ class StatelessEngine(BaseEngine):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
-        tp_groups: WorkerTPGroups,
+        parallel_groups: WorkerParallelGroups,
         device: torch.device,
         **kwargs,
     ) -> None:
@@ -174,7 +174,7 @@ class StatelessEngine(BaseEngine):
         else:
             self.submodules = dict(submodules)
         self.device = device
-        self.tp_groups = tp_groups
+        self.parallel_groups = parallel_groups
 
     def add_request(self, request_id: str, **kwargs) -> None:
         pass  # stateless
@@ -218,7 +218,7 @@ class StatelessEngine(BaseEngine):
                 f"engine.{self.config.name}.{batch.node_name}."
                 f"{batch.graph_walk}.bs{len(batch.request_ids)}"
             )
-        self.tp_groups.get_tp_config_for_node(batch.node_name).barrier()
+        self.parallel_groups.get_tp_config_for_node(batch.node_name).barrier()
         submodule = self.submodules.get(batch.node_name)
         per_submodule_dtype = submodule.get_autocast_dtype() if submodule is not None else None
         try:
@@ -554,7 +554,7 @@ class StatelessEngine(BaseEngine):
                 submodule_name=node_name,
                 submodule=submodule,
                 device=self.device,
-                tp_group=self.tp_groups.get_tp_config_for_node(node_name)
+                tp_group=self.parallel_groups.get_tp_config_for_node(node_name)
             )
             runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()
@@ -600,7 +600,7 @@ class StatelessEngine(BaseEngine):
                 kv_cache_config=None,
                 alloc_manager=None,
                 buffer_manager=None,
-                tp_group=self.tp_groups.get_tp_config_for_node(node_name),
+                tp_group=self.parallel_groups.get_tp_config_for_node(node_name),
             )
             pcgr.warmup_and_capture()
             if pcgr.graphs:

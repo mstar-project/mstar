@@ -11,7 +11,7 @@ exactly as if at tensor-parallel degree ``tp*sp`` — the kernel (``run_attentio
 is unchanged — while every pointwise op (norms, MLP, residuals) runs on the
 ``seq/P`` shard for free.
 
-These helpers take an ``sp_group`` (a :class:`TPCommGroup` over the SP axis of the
+These helpers take an ``sp_group`` (a :class:`CommGroup` over the SP axis of the
 mesh; trivial when ``sp_size == 1``) and are model-independent: any attention that
 projects to ``[tokens, heads, head_dim]`` and calls a ``run_attention(q, k, v)``
 can use :func:`ulysses_attention`. ``seq_sizes`` is the per-rank token count along
@@ -25,7 +25,7 @@ from typing import Callable
 
 import torch
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 
 
 def sp_seq_split(total: int, world_size: int) -> list[int]:
@@ -36,7 +36,7 @@ def sp_seq_split(total: int, world_size: int) -> list[int]:
 
 
 def scatter_sequence(
-    sp_group: TPCommGroup,
+    sp_group: CommGroup,
     x_full: torch.Tensor,
     seq_sizes: list[int],
     dim: int = 0,
@@ -51,7 +51,7 @@ def scatter_sequence(
 
 
 def gather_sequence(
-    sp_group: TPCommGroup,
+    sp_group: CommGroup,
     x_shard: torch.Tensor,
     seq_sizes: list[int],
     dim: int = 0,
@@ -82,7 +82,7 @@ def gather_sequence(
 
 
 def ulysses_attention(
-    sp_group: TPCommGroup,
+    sp_group: CommGroup,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -122,7 +122,7 @@ def ulysses_attention(
 
 
 def _ulysses_attention_via_all_gather(
-    sp_group: TPCommGroup,
+    sp_group: CommGroup,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -153,7 +153,7 @@ def _ulysses_attention_via_all_gather(
     return out[rank * sl:(rank + 1) * sl, :, :].contiguous()
 
 
-def sp_head_slice(sp_group: TPCommGroup, x: torch.Tensor) -> torch.Tensor:
+def sp_head_slice(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
     """Keep this SP rank's contiguous head-group: ``[T, H, D] -> [T, H/P, D]``.
 
     The selected heads ``[rank*H/P : (rank+1)*H/P]`` are exactly those that
@@ -167,7 +167,7 @@ def sp_head_slice(sp_group: TPCommGroup, x: torch.Tensor) -> torch.Tensor:
     return x[:, sp_group.rank * b:(sp_group.rank + 1) * b, :].contiguous()
 
 
-def sp_head_gather(sp_group: TPCommGroup, x: torch.Tensor) -> torch.Tensor:
+def sp_head_gather(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
     """Reassemble full TP-local heads from per-rank head-groups (the inverse of
     :func:`sp_head_slice`): ``[T, H/P, D] -> [T, H, D]`` via an all-gather over
     heads, restoring the layout the row-parallel output projection expects."""

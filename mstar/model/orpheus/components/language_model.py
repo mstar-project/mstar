@@ -15,7 +15,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.engine.kv_cache_engine import BatchedCacheManager
 from mstar.model.components import DecoderLayer, RMSNorm
 from mstar.model.components.distributed import (
@@ -27,7 +27,7 @@ from mstar.model.components.distributed import (
 from mstar.model.orpheus.config import OrpheusModelConfig
 
 
-def _build_decoder_layer(config: OrpheusModelConfig, comm_group: TPCommGroup | None = None) -> DecoderLayer:
+def _build_decoder_layer(config: OrpheusModelConfig, comm_group: CommGroup | None = None) -> DecoderLayer:
     return DecoderLayer(
         self_attn=ParallelAttention(
             comm_group=comm_group,
@@ -53,7 +53,7 @@ def _build_decoder_layer(config: OrpheusModelConfig, comm_group: TPCommGroup | N
 
 
 class OrpheusLanguageModel(nn.Module):
-    def __init__(self, config: OrpheusModelConfig, comm_group: TPCommGroup | None = None):
+    def __init__(self, config: OrpheusModelConfig, comm_group: CommGroup | None = None):
         super().__init__()
         # Vocab-parallel embedding: ``[V, H]`` is row-sharded so each rank
         # holds ``V/tp`` rows. Forward masks + ``all_reduce`` produces a
@@ -84,7 +84,7 @@ class OrpheusLanguageModel(nn.Module):
 
 
 class OrpheusForCausalLM(nn.Module):
-    def __init__(self, config: OrpheusModelConfig, comm_group: TPCommGroup | None = None):
+    def __init__(self, config: OrpheusModelConfig, comm_group: CommGroup | None = None):
         super().__init__()
         self.model = OrpheusLanguageModel(config, comm_group=comm_group)
         # LM head is column-parallel over vocab: each rank computes

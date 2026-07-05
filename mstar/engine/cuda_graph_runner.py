@@ -165,11 +165,11 @@ class CudaGraphRunner:
         default_sampling_config: SamplingConfig,
         tp_group=None,
     ):
-        from mstar.distributed.communication import TPCommGroup
+        from mstar.distributed.communication import CommGroup
 
         self.submodule_name = submodule_name
         self.submodule = submodule
-        self.tp_group: TPCommGroup = tp_group or TPCommGroup.trivial()
+        self.tp_group: CommGroup = tp_group or CommGroup.trivial()
         self.capture_configs: list[CudaGraphConfig] = submodule.get_cuda_graph_configs(
             device, self.tp_group.world_size
         )
@@ -2373,7 +2373,7 @@ class PiecewiseCudaGraphRunner:
         cache_labels: list[str] | None = None,
         tp_group=None,
     ):
-        from mstar.distributed.communication import TPCommGroup
+        from mstar.distributed.communication import CommGroup
 
         self.fn_factory = fn_factory
         self.embed_dim = embed_dim
@@ -2393,7 +2393,7 @@ class PiecewiseCudaGraphRunner:
         # parallel layers — ``warmup_and_capture`` barriers before each
         # per-bs capture to keep ranks in lockstep (the same race the
         # standard ``CudaGraphRunner`` guards against).
-        self.tp_group: TPCommGroup = tp_group or TPCommGroup.trivial()
+        self.tp_group: CommGroup = tp_group or CommGroup.trivial()
 
         self.graphs: dict[int, PiecewiseGraphData] = {}
         self.memory_pool = None

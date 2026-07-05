@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import TPCommGroup, WorkerTPGroups
+from mstar.distributed.communication import CommGroup, WorkerParallelGroups
 from mstar.engine.base import (
     BaseEngine,
     EngineCapabilities,
@@ -46,7 +46,7 @@ class KVManagement:
 class SubmoduleManagement:
     submodule: ARNodeSubmodule
     kv_management: KVManagement
-    tp_group: TPCommGroup
+    tp_group: CommGroup
     default_sampling_config: SamplingConfig
     sampler: Sampler = field(default_factory=Sampler)
     cuda_graph_runner: CudaGraphRunner | None = None
@@ -91,7 +91,7 @@ class KVCacheEngine(BaseEngine):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
-        tp_groups: WorkerTPGroups,
+        parallel_groups: WorkerParallelGroups,
         kv_cache_config: list[KVCacheConfig],
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
@@ -113,16 +113,16 @@ class KVCacheEngine(BaseEngine):
             if not nodes:
                 continue  # skip KV cache configs that don't apply to any loaded submodule
             world_sizes = set([
-                tp_groups.get_tp_config_for_node(node).world_size for node in nodes
+                parallel_groups.get_tp_config_for_node(node).world_size for node in nodes
             ])
             tp_ranks = set([
-                tp_groups.get_tp_config_for_node(node).rank for node in nodes
+                parallel_groups.get_tp_config_for_node(node).rank for node in nodes
             ])
             sp_sizes = set([
-                tp_groups.get_sp_config_for_node(node).world_size for node in nodes
+                parallel_groups.get_sp_config_for_node(node).world_size for node in nodes
             ])
             sp_ranks = set([
-                tp_groups.get_sp_config_for_node(node).rank for node in nodes
+                parallel_groups.get_sp_config_for_node(node).rank for node in nodes
             ])
             if (
                 len(world_sizes) > 1 or len(tp_ranks) > 1
@@ -132,12 +132,14 @@ class KVCacheEngine(BaseEngine):
                     "It is disallowed to share a KV cache among colocated nodes "
                     f"from different TP/SP groups: {nodes}."
                 )
-            tp_size = world_sizes.pop()
-            sp_size = sp_sizes.pop()
             # Ulysses sequence parallelism makes attention run at effective
             # head-degree tp*sp (the all-to-all redistributes heads across the
-            # SP group), so each rank's cache holds num_kv_heads / (tp*sp).
-            cfg.shard(tp_size * sp_size)
+            # SP group), so each rank's cache holds num_kv_heads / (tp*sp) —
+            # the instance world size (all nodes share one instance, validated
+            # above).
+            cfg.shard(
+                parallel_groups.get_instance_world_size_for_node(next(iter(nodes)))
+            )
             num_kv_heads = cfg.num_kv_heads
 
             kv_cache = torch.zeros(
@@ -178,7 +180,7 @@ class KVCacheEngine(BaseEngine):
                 node_to_kv_mgmt[node_name] = kv_mgmt
 
         for node_name, submodule in submodules.items():
-            tp_group = tp_groups.get_tp_config_for_node(node_name)
+            tp_group = parallel_groups.get_tp_config_for_node(node_name)
             self.submodule_management[node_name] = SubmoduleManagement(
                 submodule=submodule,
                 kv_management=node_to_kv_mgmt[node_name],

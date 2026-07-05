@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide, split_tensor_along_last_dim
 
 
@@ -14,7 +14,7 @@ class ColumnParallelLinear(nn.Module):
 
     def __init__(
         self,
-        comm_group: TPCommGroup,
+        comm_group: CommGroup,
         input_size: int,
         output_size: int,
         bias: bool = False,
@@ -119,7 +119,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
     def __init__(
         self,
-        comm_group: TPCommGroup,
+        comm_group: CommGroup,
         input_size: int,
         output_sizes: list[int],
         bias: bool = True,
@@ -191,7 +191,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
     def __init__(
         self,
-        comm_group: TPCommGroup,
+        comm_group: CommGroup,
         hidden_size: int,
         head_size: int,
         total_num_heads: int,
@@ -306,7 +306,7 @@ class RowParallelLinear(nn.Module):
 
     def __init__(
         self,
-        comm_group: TPCommGroup,
+        comm_group: CommGroup,
         input_size: int,
         output_size: int,
         bias: bool = True,

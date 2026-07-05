@@ -470,7 +470,7 @@ class Model(ABC):
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
 
-        ``tp_group`` is the :class:`TPCommGroup` for this node on the
+        ``tp_group`` is the :class:`CommGroup` for this node on the
         calling worker (``None`` when TP is not active for this node).
         Models that support tensor parallelism should forward it to
         parallel-linear constructors so weight shapes are partitioned at

@@ -7,7 +7,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import WorkerTPGroups
+from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.kv_store import KVCacheConfig, StoreWritePolicy
 
 
@@ -143,7 +143,7 @@ class BaseEngine(ABC):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
-        tp_groups: WorkerTPGroups,
+        parallel_groups: WorkerParallelGroups,
         kv_cache_config: list[KVCacheConfig],
         device: torch.device,
         **kwargs

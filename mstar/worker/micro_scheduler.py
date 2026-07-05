@@ -55,15 +55,15 @@ class MicroScheduler:
     def __init__(
         self, engine_manager: EngineManager,
         sched_type=SchedulingType.ROUND_ROBIN,
-        tp_rank_zero_nodes: set[str] | None = None,
+        parallel_leader_nodes: set[str] | None = None,
         max_consec_tp_follower_batches: int = 1,
     ):
         self.engine_manager = engine_manager
         self.batch_number = 0
         self.sched_type = sched_type
 
-        # tensor parallel
-        self.tp_rank_zero_nodes = tp_rank_zero_nodes
+        # lockstep-parallel (TP / SP instance) scheduling
+        self.parallel_leader_nodes = parallel_leader_nodes
         self.tp_batches_pending_schedule = deque()
         self.num_consec_tp_follower_batches = 0
         self.max_consec_tp_follower_batches = max_consec_tp_follower_batches
@@ -230,7 +230,7 @@ class MicroScheduler:
                 if request_id in self.held_until:
                     continue
                 for sname in node_names:
-                    if sname not in self.tp_rank_zero_nodes:
+                    if sname not in self.parallel_leader_nodes:
                         continue # only rank 0 can initiate scheduling!
                     if target_node_name is not None and sname != target_node_name:
                         continue

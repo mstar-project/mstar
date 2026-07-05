@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import Timesteps
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.sequence_parallel import (
     gather_sequence,
     scatter_sequence,
@@ -148,11 +148,11 @@ class Cosmos3MLP(nn.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
-        comm_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
     ):
         super().__init__()
         if comm_group is None:
-            comm_group = TPCommGroup.trivial()
+            comm_group = CommGroup.trivial()
         self.gate_proj = ColumnParallelLinear(comm_group, hidden_size, intermediate_size, bias=False)
         self.up_proj = ColumnParallelLinear(comm_group, hidden_size, intermediate_size, bias=False)
         self.down_proj = RowParallelLinear(comm_group, intermediate_size, hidden_size, bias=False)
@@ -180,14 +180,14 @@ class Cosmos3PackedMoTAttention(nn.Module):
         num_key_value_heads: int,
         attention_bias: bool,
         rms_norm_eps: float,
-        comm_group: TPCommGroup | None = None,
-        sp_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
+        sp_group: CommGroup | None = None,
     ):
         super().__init__()
         if comm_group is None:
-            comm_group = TPCommGroup.trivial()
+            comm_group = CommGroup.trivial()
         if sp_group is None:
-            sp_group = TPCommGroup.trivial()
+            sp_group = CommGroup.trivial()
         self.sp_group = sp_group
         tp_size = comm_group.world_size
         sp_size = sp_group.world_size
@@ -342,8 +342,8 @@ class Cosmos3MoTDecoderLayer(nn.Module):
         intermediate_size: int,
         attention_bias: bool,
         rms_norm_eps: float,
-        comm_group: TPCommGroup | None = None,
-        sp_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
+        sp_group: CommGroup | None = None,
     ):
         super().__init__()
         self.self_attn = Cosmos3PackedMoTAttention(
@@ -436,15 +436,15 @@ class Cosmos3OmniTransformer(nn.Module):
     predicts flow velocity through ``proj_out`` and never decodes text logits.
     """
 
-    def __init__(self, config, comm_group: TPCommGroup | None = None, sp_group: TPCommGroup | None = None):
+    def __init__(self, config, comm_group: CommGroup | None = None, sp_group: CommGroup | None = None):
         super().__init__()
         self.config = config
         h = config.hidden_size
         if sp_group is None:
-            sp_group = TPCommGroup.trivial()
+            sp_group = CommGroup.trivial()
         self.sp_group = sp_group
         if comm_group is None:
-            comm_group = TPCommGroup.trivial()
+            comm_group = CommGroup.trivial()
         self.comm_group = comm_group
 
         self.embed_tokens = nn.Embedding(config.vocab_size, h)

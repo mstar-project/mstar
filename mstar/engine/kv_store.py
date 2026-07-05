@@ -97,12 +97,12 @@ class KVCacheConfig:
             return "ALL_NODES"
         return "///".join(self.nodes)
 
-    def shard(self, tp_size: int):
-        if tp_size >= self.original_num_kv_heads:
+    def shard(self, num_shards: int):
+        if num_shards >= self.original_num_kv_heads:
             self.num_kv_heads = 1
         else:
-            self.num_kv_heads = divide(self.original_num_kv_heads, tp_size)
-        self.num_qo_heads = divide(self.original_num_qo_heads, tp_size)
+            self.num_kv_heads = divide(self.original_num_kv_heads, num_shards)
+        self.num_qo_heads = divide(self.original_num_qo_heads, num_shards)
         self._sharded = True
 
 

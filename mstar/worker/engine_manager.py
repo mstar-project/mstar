@@ -4,7 +4,7 @@ from typing import Callable
 
 import torch
 
-from mstar.distributed.communication import WorkerTPGroups
+from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.base import BaseEngine, EngineType
 from mstar.engine.kv_cache_engine import KVCacheEngine
 from mstar.engine.kv_store import KVCacheConfig, TransferEngineInfo
@@ -65,7 +65,7 @@ class EngineManager:
         device: torch.device,
         kv_config: list[KVCacheConfig],
         model_config: dict,
-        tp_groups: WorkerTPGroups,
+        parallel_groups: WorkerParallelGroups,
         transfer_engine_info: TransferEngineInfo,
         model: Model,
         enable_nvtx: bool = False,
@@ -101,12 +101,12 @@ class EngineManager:
         node_submodules: dict[str, torch.nn.Module | None] = {}
         if model is not None:
             for name in node_names:
-                node_tp_group = tp_groups.get_tp_config_for_node(name)
+                node_tp_group = parallel_groups.get_tp_config_for_node(name)
                 # Sequence parallelism is opt-in per node; only forward the SP
                 # group when this node actually participates in one, so models
                 # that don't support SP keep their existing get_submodule call.
                 extra = {}
-                node_sp_group = tp_groups.get_sp_config_for_node(name)
+                node_sp_group = parallel_groups.get_sp_config_for_node(name)
                 if node_sp_group.world_size > 1:
                     extra["sp_group"] = node_sp_group
                 node_submodules[name] = model.get_submodule(
@@ -150,7 +150,7 @@ class EngineManager:
 
             engine.load_model(
                 submodules,
-                tp_groups=tp_groups,
+                parallel_groups=parallel_groups,
                 kv_cache_config=kv_config,
                 device=device,
                 transfer_engine_info=transfer_engine_info,

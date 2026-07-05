@@ -596,7 +596,7 @@ def _run_cuda_graph_denoise(ctx):
     CudaGraphRunner (one captured forward per step covering both guidance
     branches), returning the final latents."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
-    from mstar.distributed.communication import TPCommGroup
+    from mstar.distributed.communication import CommGroup
     from mstar.engine.cuda_graph_runner import CudaGraphRunner
     from mstar.model.submodule_base import ModelInputsFromEngine
     from mstar.utils.sampling import Sampler, SamplingConfig
@@ -623,9 +623,9 @@ def _run_cuda_graph_denoise(ctx):
 
     runner = CudaGraphRunner(
         submodule_name="dit", submodule=dit, kv_cache_config=shared["cfg"],
-        alloc_manager=shared["alloc"], sampler=Sampler(device=dev, tp_group=TPCommGroup.trivial()),
+        alloc_manager=shared["alloc"], sampler=Sampler(device=dev, tp_group=CommGroup.trivial()),
         buffer_manager=shared["buf"], device=dev, autocast_dtype=dtype,
-        default_sampling_config=SamplingConfig(), tp_group=TPCommGroup.trivial(),
+        default_sampling_config=SamplingConfig(), tp_group=CommGroup.trivial(),
     )
     runner.warmup_and_capture()
     assert runner.graphs, "no CUDA graph captured for cosmos3 image_gen"
