@@ -21,14 +21,14 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
-from mstar.model.cosmos3.config import Cosmos3Config
-from mstar.model.cosmos3.packing import (
+from mstar.model.cosmos3.components.packing import (
     action_condition_frame_indexes,
     build_action_static_inputs,
     get_3d_mrope_ids_action_tokens,
     vision_condition_frame_indexes,
 )
+from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
+from mstar.model.cosmos3.config import Cosmos3Config
 
 
 # --- verbatim vllm-omni references (transformer_cosmos3.py / action.py) ------
@@ -327,11 +327,6 @@ import math  # noqa: E402
 import os  # noqa: E402
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-# The engine-vs-fused check below is a bit-exact mechanism test, so run the eager
-# denoise step; the served default torch.compiles it, which perturbs the latents
-# past the 1e-3 bound without moving the action golden gates (id/fd pass with
-# compile on). Set COSMOS3_DISABLE_COMPILE_DENOISE= (empty) to test compiled.
-os.environ.setdefault("COSMOS3_DISABLE_COMPILE_DENOISE", "1")
 
 _GPU: dict = {}
 
@@ -345,10 +340,15 @@ def _gpu_base():
         return None
     torch.use_deterministic_algorithms(True, warn_only=True)
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-    from mstar.model.cosmos3.pipeline import Cosmos3Pipeline
+    from mstar.model.cosmos3.tests.pipeline import Cosmos3Pipeline
 
     device, dtype = "cuda:0", torch.bfloat16
     model = Cosmos3Model(model_path_hf=snap)
+    # The engine-vs-fused check is a bit-exact mechanism test, so run the eager
+    # denoise step; the served default compiles it, which perturbs the latents
+    # past the 1e-3 bound without moving the action golden gates (id/fd pass
+    # with compile on). Flip to True to test the compiled path.
+    model.config.compile_denoise = False
     mpipe = Cosmos3Pipeline.from_model(model, device=device, dtype=dtype)
     dit = model.get_submodule("dit", device=device)
     _GPU["base"] = dict(model=model, mpipe=mpipe, dit=dit, device=device, dtype=dtype, snap=snap)
@@ -419,7 +419,7 @@ def test_action_engine_matches_fused() -> None:
     a_noise = randn_tensor((1, chunk, dit.transformer.action_dim), generator=gen2, device=device, dtype=dtype)
     a_noise[..., raw:] = 0
 
-    from mstar.model.cosmos3.packing import tokenize_prompt
+    from mstar.model.cosmos3.components.packing import tokenize_prompt
     cond_ids, _ = tokenize_prompt(model.tokenizer, prompt, "", num_frames=nf, height=h, width=w, fps=fps)
     rid = "ra"
     md = {"height": h, "width": w, "num_frames": nf, "fps": fps, "action_fps": fps, "guidance_scale": 1.0,
@@ -460,7 +460,7 @@ def test_action_id_golden_gate() -> None:
     import torchvision
     from PIL import Image
 
-    from mstar.model.cosmos3.packing import tokenize_prompt
+    from mstar.model.cosmos3.components.packing import tokenize_prompt
 
     device, dtype, mpipe, model, snap = (
         base["device"], base["dtype"], base["mpipe"], base["model"], base["snap"])
@@ -510,7 +510,7 @@ def test_action_fd_agibotworld_golden_gate() -> None:
     import torchvision
     from PIL import Image
 
-    from mstar.model.cosmos3.packing import tokenize_prompt
+    from mstar.model.cosmos3.components.packing import tokenize_prompt
 
     device, dtype, mpipe, model, snap = (
         base["device"], base["dtype"], base["mpipe"], base["model"], base["snap"])
@@ -564,7 +564,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
         print("  (skipped action cross-request batch parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
     from mstar.conductor.request_info import CurrentForwardPassInfo
-    from mstar.model.cosmos3.packing import tokenize_prompt
+    from mstar.model.cosmos3.components.packing import tokenize_prompt
     from mstar.model.submodule_base import ModelInputsFromEngine
 
     device, dtype, dit, model = base["device"], base["dtype"], base["dit"], base["model"]

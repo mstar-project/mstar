@@ -17,13 +17,13 @@ from pathlib import Path
 
 import torch
 
-from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
-from mstar.model.cosmos3.config import Cosmos3Config
-from mstar.model.cosmos3.packing import (
+from mstar.model.cosmos3.components.packing import (
     build_t2i_static_inputs,
     get_3d_mrope_ids_text_tokens,
     get_3d_mrope_ids_vae_tokens,
 )
+from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
+from mstar.model.cosmos3.config import Cosmos3Config
 
 
 def _tiny_config() -> Cosmos3Config:

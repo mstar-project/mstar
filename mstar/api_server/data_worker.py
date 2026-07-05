@@ -119,7 +119,7 @@ class PreprocessWorker:
             # drop the straggler rather than KeyError, which would otherwise
             # abort the whole drain and lose the other requests' chunks.
             if result.request_id not in self.per_request_reading_tensors:
-                logger.debug(
+                logger.warning(
                     "Late result chunk for cleaned-up request %s, ignoring",
                     result.request_id,
                 )

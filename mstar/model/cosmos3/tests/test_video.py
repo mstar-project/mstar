@@ -17,13 +17,13 @@ import os
 
 import torch
 
-from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
-from mstar.model.cosmos3.config import Cosmos3Config
-from mstar.model.cosmos3.packing import (
+from mstar.model.cosmos3.components.packing import (
     build_static_inputs,
     get_3d_mrope_ids_vae_tokens,
     tokenize_prompt,
 )
+from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
+from mstar.model.cosmos3.config import Cosmos3Config
 
 
 def _tiny_config() -> Cosmos3Config:
@@ -177,7 +177,7 @@ def _gpu_setup():
         return None
     torch.use_deterministic_algorithms(True, warn_only=True)
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-    from mstar.model.cosmos3.pipeline import Cosmos3Pipeline
+    from mstar.model.cosmos3.tests.pipeline import Cosmos3Pipeline
 
     dev, dtype = "cuda:0", torch.bfloat16
     dpipe = Cosmos3OmniPipeline(

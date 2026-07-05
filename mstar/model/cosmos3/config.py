@@ -155,6 +155,10 @@ class Cosmos3Config:
     # (720p+, video) run eager+dense where the graph is net-slower. The env var
     # COSMOS3_GRAPH_MAX_LATENT_AREA overrides this.
     graph_max_latent_area: int = 2000
+    # torch.compile the denoise compute (the generation-layer stack around the
+    # attention op). Always a win in serving; the parity tests set False to keep
+    # their bit-exact bounds on the eager step.
+    compile_denoise: bool = True
 
     # ----- sub-configs -----
     vae: Cosmos3VAEConfig = field(default_factory=Cosmos3VAEConfig)
