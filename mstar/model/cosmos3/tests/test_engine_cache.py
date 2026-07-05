@@ -58,6 +58,7 @@ class _SdpaCacheHandle:
         self.pending: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.is_causal: dict[str, bool] = {}
         self.batched_labels: list[str] | None = None
+        self.batched_splits: list[int] | None = None
 
     def set_active_label(self, label):
         self.active = label
@@ -71,6 +72,14 @@ class _SdpaCacheHandle:
     def plan_attention_batched_cfg(self, labels, seq_lens, is_causal=False, write_store=False, **kwargs):
         self.batched_labels = list(labels)
         self.is_causal["_cfg_batched"] = is_causal
+        # Per-label token counts of the packed sequence: the prefill plan passes
+        # {label: [lens]} (the two prompts differ in length), the denoise plans a
+        # shared per-request list (both guidance branches carry the same
+        # generation tokens). An even halving is wrong for unequal prompts.
+        if isinstance(seq_lens, dict):
+            self.batched_splits = [int(sum(seq_lens[label])) for label in labels]
+        else:
+            self.batched_splits = [int(sum(seq_lens))] * len(labels)
 
     def plan_rope(self, *args, **kwargs):
         pass
@@ -95,10 +104,10 @@ class _SdpaCacheHandle:
         layer = self.layer if layer_idx is None else layer_idx
         if self.active == "_cfg_batched":
             causal = self.is_causal["_cfg_batched"]
-            n = q.shape[0] // len(self.batched_labels)
-            outs = []
+            outs, off = [], 0
             for bi, label in enumerate(self.batched_labels):
-                sl = slice(bi * n, (bi + 1) * n)
+                sl = slice(off, off + self.batched_splits[bi])
+                off += self.batched_splits[bi]
                 outs.append(self._attend_label(label, layer, q[sl], k[sl], v[sl], causal))
             return torch.cat(outs, 0)
         return self._attend_label(self.active, layer, q, k, v, self.is_causal[self.active])

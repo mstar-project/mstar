@@ -43,6 +43,14 @@ _TF_ACTION_STATIC_FIELDS = (
     "action_noisy_frame_indexes",
 )
 
+# Additional Transformer.forward static kwargs for joint video+sound generation.
+_TF_SOUND_STATIC_FIELDS = (
+    "sound_token_shapes",
+    "sound_sequence_indexes",
+    "sound_mse_loss_indexes",
+    "sound_noisy_frame_indexes",
+)
+
 
 class Cosmos3Pipeline:
     """Fused t2i / t2v / i2v pipeline for Cosmos3-Nano."""
@@ -163,7 +171,13 @@ class Cosmos3Pipeline:
         generator: torch.Generator | None = None,
         latents: torch.Tensor | None = None,
         decode: bool = True,
+        generate_sound: bool = False,
+        sound_duration: float | None = None,
     ):
+        """With ``generate_sound`` a jointly denoised AVAE-latent sound band
+        rides after the vision tokens (video-mode only); returns
+        ``(video_or_latents, sound_latents)`` with the final sound latents
+        ``[1, C, T]`` (decode them with the checkpoint's sound tokenizer)."""
         device, dtype = self.device, self.dtype
         cond_ids, uncond_ids = tokenize_prompt(
             self.tokenizer, prompt, negative_prompt, num_frames=num_frames, height=height, width=width, fps=fps
@@ -174,39 +188,74 @@ class Cosmos3Pipeline:
         )
         latent_shape = tuple(latents.shape)
 
+        # Sound noise is drawn after the video noise from the same generator
+        # (the serving path's RNG order).
+        sound_latents = None
+        sound_frames = None
+        if generate_sound:
+            import math
+
+            from diffusers.utils.torch_utils import randn_tensor
+
+            duration = sound_duration if sound_duration is not None else num_frames / fps
+            duration = max(float(duration), 1.0 / max(fps, 1.0))
+            target = max(1, int(round(duration * self.config.sound_sample_rate)))
+            hop = int(round(self.config.sound_sample_rate / self.config.sound_latent_fps))
+            sound_frames = max(1, math.ceil(target / hop))
+            sound_latents = randn_tensor(
+                (1, self.config.sound_dim, sound_frames), generator=generator, device=device, dtype=dtype
+            )
+
         cond = build_static_inputs(
             cond_ids, latent_shape, self.config, self.vae_scale_temporal, fps, device,
-            has_image_condition=has_image_condition,
+            has_image_condition=has_image_condition, sound_latent_frames=sound_frames,
         )
         uncond = build_static_inputs(
             uncond_ids, latent_shape, self.config, self.vae_scale_temporal, fps, device,
-            has_image_condition=has_image_condition,
+            has_image_condition=has_image_condition, sound_latent_frames=sound_frames,
         )
-        cond_static = {k: cond[k] for k in _TF_STATIC_FIELDS}
-        uncond_static = {k: uncond[k] for k in _TF_STATIC_FIELDS}
+        fields = _TF_STATIC_FIELDS + (_TF_SOUND_STATIC_FIELDS if generate_sound else ())
+        cond_static = {k: cond[k] for k in fields}
+        uncond_static = {k: uncond[k] for k in fields}
         num_noisy = cond["num_noisy_vision_tokens"]
+
+        def _forward(static, vision_tokens, vision_timesteps, t):
+            kwargs = dict(vision_tokens=vision_tokens, vision_timesteps=vision_timesteps, **static)
+            if generate_sound:
+                kwargs["sound_tokens"] = [sound_latents[0].to(dtype)]
+                kwargs["sound_timesteps"] = torch.full((sound_frames,), t.item(), device=device)
+            preds_vision, preds_sound = self.transformer(**kwargs)
+            return preds_vision[0], (preds_sound[0] if generate_sound else None)
 
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         for t in self.scheduler.timesteps:
             vision_tokens = [latents.to(dtype)]
             vision_timesteps = torch.full((num_noisy,), t.item(), device=device)
-            cond_v = self.transformer(
-                vision_tokens=vision_tokens, vision_timesteps=vision_timesteps, **cond_static
-            )[0][0]
+            cond_v, cond_s = _forward(cond_static, vision_tokens, vision_timesteps, t)
             if guidance_scale != 1.0:
-                uncond_v = self.transformer(
-                    vision_tokens=vision_tokens, vision_timesteps=vision_timesteps, **uncond_static
-                )[0][0]
+                uncond_v, uncond_s = _forward(uncond_static, vision_tokens, vision_timesteps, t)
                 velocity = uncond_v + guidance_scale * (cond_v - uncond_v)
+                sound_v = (uncond_s + guidance_scale * (cond_s - uncond_s)) if generate_sound else None
             else:
                 velocity = cond_v
-            latents = self.scheduler.step(
-                velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
-            )[0].squeeze(0)
+                sound_v = cond_s
+            if generate_sound:
+                # Joint [video | sound] scheduler step (one multistep history).
+                nv = velocity.numel()
+                packed = torch.cat([velocity.reshape(1, -1), sound_v.unsqueeze(0).reshape(1, -1)], dim=1)
+                packed_lat = torch.cat([latents.reshape(1, -1), sound_latents.reshape(1, -1)], dim=1)
+                packed_next = self.scheduler.step(packed, t, packed_lat, return_dict=False)[0]
+                latents = packed_next[:, :nv].reshape(latents.shape)
+                sound_latents = packed_next[:, nv:].reshape(sound_latents.shape)
+            else:
+                latents = self.scheduler.step(
+                    velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
+                )[0].squeeze(0)
 
-        if not decode:
-            return latents
-        return self._decode(latents)
+        out = latents if not decode else self._decode(latents)
+        if generate_sound:
+            return out, sound_latents
+        return out
 
     @torch.no_grad()
     def generate_action(

@@ -125,6 +125,14 @@ class Cosmos3Config:
     sound_dim: int | None = 64
     sound_latent_fps: float = 25.0
     temporal_compression_factor_sound: int = 1
+    # Sample rate of the checkpoint's AVAE sound tokenizer. Not in the
+    # transformer config; the tokenizer's own config.json is authoritative and
+    # cross-checked at load (sound_latent_fps == sample_rate / hop_size).
+    sound_sample_rate: int = 48000
+    # Serve opt-in sound generation (the video_sound_gen walk + the
+    # audio_decoder node with its ~1.9 GB AVAE). Requires the checkpoint to ship
+    # sound_tokenizer/; set False to serve video-only and skip loading it.
+    enable_sound: bool = True
     video_temporal_causal: bool = False
     freeze_und: bool = False
 

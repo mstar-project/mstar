@@ -23,6 +23,7 @@ matches running the whole transformer each step.
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 import torch
@@ -46,6 +47,7 @@ from mstar.model.cosmos3.constants import (
     PREFILL_COND_WALK,
     PREFILL_WALK,
     VIDEO_GEN_WALK,
+    VIDEO_SOUND_GEN_WALK,
 )
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -74,12 +76,18 @@ PREFILL_WALKS = (PREFILL_WALK, PREFILL_COND_WALK, PREFILL_COND_VIDEO_WALK)
 # step count.
 IMAGE_GEN_LOOP = "image_gen_loop"
 VIDEO_GEN_LOOP = "video_gen_loop"
+VIDEO_SOUND_GEN_LOOP = "video_sound_gen_loop"
 ACTION_GEN_LOOP = "action_gen_loop"
 ACTION_VIDEO_GEN_LOOP = "action_video_gen_loop"
 
 # Both action walks run the joint video+action denoise loop body; they differ
 # only in what they emit (the predicted action vs the predicted video).
 ACTION_WALKS = (ACTION_GEN_WALK, ACTION_VIDEO_GEN_WALK)
+
+# Opt-in sound generation: the same video denoise loop with an AVAE-latent sound
+# band appended to the generation block, jointly denoised and threaded through
+# the loop next to the video latents.
+SOUND_WALKS = (VIDEO_SOUND_GEN_WALK,)
 
 # Conditional prompt K/V lives under the primary label; the unconditional
 # (negative) prompt's K/V lives under a second label for classifier-free
@@ -193,16 +201,38 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _build_static(
         self, ids: list[int], height: int, width: int, num_frames: int,
         fps: float, has_image_condition: bool, device,
+        sound_latent_frames: int | None = None,
     ) -> dict:
         static = build_static_inputs(
             list(ids), self._latent_shape(height, width, num_frames), self.config,
             self.config.vae.scale_factor_temporal, fps, device,
             has_image_condition=has_image_condition,
+            sound_latent_frames=sound_latent_frames,
         )
         # proj_out runs on the generation token block, so shift the joint-sequence
-        # mse indexes to be relative to the vision tokens.
+        # mse indexes to be relative to the generation tokens.
         static["mse_gen_indexes"] = static["vision_mse_loss_indexes"] - static["und_len"]
+        if sound_latent_frames is not None:
+            static["sound_mse_gen_indexes"] = static["sound_mse_loss_indexes"] - static["und_len"]
         return static
+
+    def _resolve_sound_frames(self, md: dict) -> tuple[int, int]:
+        """Resolve a sound request's target sample count and latent frame count.
+
+        The sound duration defaults to the video duration (``num_frames / fps``,
+        the request's ``sound_duration`` overrides), the target sample count is
+        that duration at the AVAE sample rate, and the latent frame count rounds
+        it up to whole tokenizer hops (the decoded tail past the target is
+        trimmed by the audio decode node)."""
+        num_frames = int(md.get("num_frames", 1))
+        fps = float(md.get("fps", 24.0))
+        duration = md.get("sound_duration")
+        if duration is None:
+            duration = num_frames / fps
+        duration = max(float(duration), 1.0 / max(fps, 1.0))
+        target_samples = max(1, int(round(duration * self.config.sound_sample_rate)))
+        hop = int(round(self.config.sound_sample_rate / self.config.sound_latent_fps))
+        return target_samples, max(1, math.ceil(target_samples / hop))
 
     def _new_scheduler(self, num_inference_steps: int, device, use_karras_sigma=None, flow_shift=None):
         from diffusers import UniPCMultistepScheduler
@@ -247,6 +277,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return self._prepare_prefill(fwd_info, inputs, device)
         if graph_walk in GEN_WALKS:
             return self._prepare_image_gen(fwd_info, inputs, device)
+        if graph_walk in SOUND_WALKS:
+            return self._prepare_video_sound_gen(fwd_info, inputs, device)
         if graph_walk in ACTION_WALKS:
             return self._prepare_action_gen(fwd_info, inputs, device)
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
@@ -272,10 +304,26 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # not denoised. (Text-to-image / text-to-video have no clean anchor.)
         has_image_condition = bool(md.get("has_image_condition", False))
 
-        cond = self._build_static(cond_ids, height, width, num_frames, fps, has_image_condition, device)
+        # Opt-in sound: append a jointly denoised AVAE-latent band to the
+        # generation block. Video-only (single-frame image and action requests
+        # are rejected at request resolution).
+        sound_frames = None
+        target_audio_samples = None
+        if md.get("generate_sound"):
+            if num_frames <= 1:
+                raise ValueError("Cosmos3 sound generation requires a video request (num_frames > 1)")
+            target_audio_samples, sound_frames = self._resolve_sound_frames(md)
+
+        cond = self._build_static(
+            cond_ids, height, width, num_frames, fps, has_image_condition, device,
+            sound_latent_frames=sound_frames,
+        )
         uncond = None
         if uncond_ids is not None:
-            uncond = self._build_static(uncond_ids, height, width, num_frames, fps, has_image_condition, device)
+            uncond = self._build_static(
+                uncond_ids, height, width, num_frames, fps, has_image_condition, device,
+                sound_latent_frames=sound_frames,
+            )
 
         self._req[fwd_info.request_id] = {
             "cond": cond,
@@ -289,6 +337,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "num_noisy": cond["num_noisy_vision_tokens"],
             "num_vision": cond["num_vision_tokens"],
             "latent_shape": self._latent_shape(height, width, num_frames),
+            "num_sound": sound_frames,
+            "target_audio_samples": target_audio_samples,
         }
         # Image-to-video: encode the conditioning frame now (the understanding
         # tower and the VAE encode are both prefill-time, per-request work) and
@@ -521,6 +571,39 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             tensor_inputs=tensors,
         )
 
+    def _prepare_video_sound_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
+        st = self._req[fwd_info.request_id]
+        if "latents" not in inputs or len(inputs["latents"]) == 0:
+            # First iteration: video noise first, then sound noise from the same
+            # generator (the reference pipeline's RNG order), so the video band
+            # of a sound request is bit-identical to the same-seed video-only
+            # request.
+            dtype = self.transformer.proj_in.weight.dtype
+            gen = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
+            latents = torch.randn(st["latent_shape"], generator=gen, device=device, dtype=dtype)
+            cond_latents = st.get("cond_latents")
+            if cond_latents is not None:
+                latents[:, :, 0] = cond_latents[:, :, 0].to(latents.dtype)
+            sound_latents = torch.randn(
+                (1, self.config.sound_dim, st["num_sound"]), generator=gen, device=device, dtype=dtype
+            )
+            time_index = torch.zeros(1, dtype=torch.long, device=device)
+        else:
+            latents = inputs["latents"][0]
+            sound_latents = inputs["sound_latents"][0]
+            time_index = inputs["time_index"][0]
+
+        scheduler = st["scheduler"]
+        step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            return None
+        return ARNodeInputs(
+            input_seq_len=st["num_vision"] + st["num_sound"],
+            tensor_inputs={
+                "latents": latents, "sound_latents": sound_latents, "time_index": time_index,
+            },
+        )
+
     def _prepare_action_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
         st = self._req[fwd_info.request_id]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
@@ -675,6 +758,36 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 "time_index": ti,
             }
 
+        if graph_walk in SOUND_WALKS:
+            rids = engine_inputs.request_ids
+            if len(rids) > 1:
+                # Cross-request batch: one batched plan over every request's
+                # [vision | sound] block (sound requests batch only with sound
+                # requests — batches are per graph walk).
+                cm.plan_attention_batched_cfg(
+                    labels=[COND_LABEL, UNCOND_LABEL],
+                    seq_lens=[self._req[r]["num_vision"] + self._req[r]["num_sound"] for r in rids],
+                    is_causal=False, write_store=False,
+                )
+                return {
+                    "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
+                    "sound_latents": {
+                        r: inp.tensor_inputs["sound_latents"] for r, inp in zip(rids, inputs, strict=True)
+                    },
+                    "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs, strict=True)},
+                }
+            ti = inputs[0].tensor_inputs["time_index"]
+            step_index = int(ti.reshape(-1)[0].item())
+            self._plan_gen(
+                cm, st, st["num_vision"] + st["num_sound"],
+                cfg_active=self._cfg_active(st, step_index),
+            )
+            return {
+                "latents": inputs[0].tensor_inputs["latents"],
+                "sound_latents": inputs[0].tensor_inputs["sound_latents"],
+                "time_index": ti,
+            }
+
         if graph_walk in ACTION_WALKS:
             rids = engine_inputs.request_ids
             if len(rids) > 1:
@@ -726,6 +839,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return self._forward_prefill(cm, **kwargs)
         if graph_walk in GEN_WALKS:
             return self._forward_image_gen(cm, self._req[rid], **kwargs)
+        if graph_walk in SOUND_WALKS:
+            return self._forward_video_sound_gen(cm, self._req[rid], **kwargs)
         if graph_walk in ACTION_WALKS:
             return self._forward_action_gen(cm, self._req[rid], **kwargs)
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
@@ -813,6 +928,86 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
         )[0].squeeze(0)
         return {"latents": [new_latents], "time_index": [time_index + 1]}
+
+    def _sound_kwargs(self, static, sound_latents, sound_ts) -> dict:
+        return dict(
+            sound_latents=sound_latents,
+            sound_token_shapes=static["sound_token_shapes"],
+            sound_noisy_frame_indexes=static["sound_noisy_frame_indexes"],
+            sound_mse_gen_indexes=static["sound_mse_gen_indexes"],
+            sound_timesteps=sound_ts,
+        )
+
+    def _sound_scheduler_step(self, st, latents, sound_latents, video_v, sound_v, t):
+        """One joint [video | sound] scheduler step: flatten both bands into one
+        packed state so the request's scheduler advances them under a single
+        multistep history (the flow update is linear per element), then split
+        back. Every sound frame is noisy, so no clean re-injection is needed on
+        the sound band; the video band's i2v anchor stays clean because its
+        predicted velocity is zero (as in the video-only path)."""
+        nv = video_v.numel()
+        packed = torch.cat([video_v.reshape(1, -1), sound_v.reshape(1, -1)], dim=1)
+        packed_lat = torch.cat([latents.reshape(1, -1), sound_latents.reshape(1, -1)], dim=1)
+        packed_next = st["scheduler"].step(packed, t, packed_lat, return_dict=False)[0]
+        new_latents = packed_next[:, :nv].reshape(latents.shape)
+        new_sound = packed_next[:, nv:].reshape(sound_latents.shape)
+        return new_latents, new_sound
+
+    def _forward_video_sound_gen(self, cm, st, latents, sound_latents, time_index, **kwargs) -> dict:
+        scheduler = st["scheduler"]
+        step_index = int(time_index.reshape(-1)[0].item())
+        t = scheduler.timesteps[step_index]
+        vts = torch.full((st["num_noisy"],), t.item(), device=latents.device)
+        sts = torch.full((st["num_sound"],), t.item(), device=latents.device)
+        cfg_active = self._cfg_active(st, step_index)
+
+        if not cfg_active:
+            cm.set_active_label(COND_LABEL)
+            velocity, sound_v = self.transformer.denoise_step(
+                latents, vts, st["cond"]["position_ids"][:, st["cond"]["und_len"]:],
+                st["cond"]["vision_token_shapes"], st["cond"]["vision_noisy_frame_indexes"],
+                st["cond"]["mse_gen_indexes"], cm,
+                **self._sound_kwargs(st["cond"], sound_latents, sts),
+            )
+        elif self.batched_cfg:
+            cm.set_active_label(CFG_BATCHED_LABEL)
+            (cond_v, s_c), (uncond_v, s_u) = self.transformer.denoise_step_batched_cfg(
+                latents, vts,
+                st["cond"]["position_ids"][:, st["cond"]["und_len"]:],
+                st["uncond"]["position_ids"][:, st["uncond"]["und_len"]:],
+                st["cond"]["vision_token_shapes"],
+                st["cond"]["vision_noisy_frame_indexes"],
+                st["cond"]["mse_gen_indexes"], cm,
+                **self._sound_kwargs(st["cond"], sound_latents, sts),
+            )
+            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            sound_v = s_u + st["gs"] * (s_c - s_u)
+        else:
+            cm.set_active_label(COND_LABEL)
+            cond_v, s_c = self.transformer.denoise_step(
+                latents, vts, st["cond"]["position_ids"][:, st["cond"]["und_len"]:],
+                st["cond"]["vision_token_shapes"], st["cond"]["vision_noisy_frame_indexes"],
+                st["cond"]["mse_gen_indexes"], cm,
+                **self._sound_kwargs(st["cond"], sound_latents, sts),
+            )
+            cm.set_active_label(UNCOND_LABEL)
+            uncond_v, s_u = self.transformer.denoise_step(
+                latents, vts, st["uncond"]["position_ids"][:, st["uncond"]["und_len"]:],
+                st["uncond"]["vision_token_shapes"], st["uncond"]["vision_noisy_frame_indexes"],
+                st["uncond"]["mse_gen_indexes"], cm,
+                **self._sound_kwargs(st["uncond"], sound_latents, sts),
+            )
+            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            sound_v = s_u + st["gs"] * (s_c - s_u)
+
+        new_latents, new_sound = self._sound_scheduler_step(
+            st, latents, sound_latents, velocity, sound_v, t
+        )
+        return {
+            "latents": [new_latents],
+            "sound_latents": [new_sound],
+            "time_index": [time_index + 1],
+        }
 
     def _denoise_action(self, cm, static, latents, action_latents, vts, ats, domain):
         und_len = static["und_len"]
@@ -918,9 +1113,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         sts = [self._req.get(rid) for rid in batch.request_ids]
         if any(st is None for st in sts):
             return False
-        if batch.graph_walk in GEN_WALKS or batch.graph_walk in PREFILL_WALKS:
+        if (
+            batch.graph_walk in GEN_WALKS
+            or batch.graph_walk in SOUND_WALKS
+            or batch.graph_walk in PREFILL_WALKS
+        ):
             # Image/video batch only in the two-branch guidance regime, so one
-            # batched-CFG plan covers them.
+            # batched-CFG plan covers them. (Batches are per graph walk, so
+            # sound requests only ever batch with sound requests.)
             return all(st["uncond"] is not None for st in sts)
         if batch.graph_walk in ACTION_WALKS:
             # Action batches when all requests share the guidance regime (all
@@ -932,7 +1132,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return False
 
     def max_batch_size(self, graph_walk: str):
-        if graph_walk in GEN_WALKS or graph_walk in ACTION_WALKS:
+        if graph_walk in GEN_WALKS or graph_walk in SOUND_WALKS or graph_walk in ACTION_WALKS:
             return self.max_gen_batch_size
         return None
 
@@ -941,7 +1141,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     @torch.autocast(device_type="cuda", enabled=False)
     def forward_batched(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
-        latents=None, time_index=None, action_latents=None,
+        latents=None, time_index=None, action_latents=None, sound_latents=None,
         input_ids=None, text_mrope_ids=None, **kwargs,
     ):
         cm = engine_inputs.cache_manager
@@ -955,6 +1155,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return {}
         if graph_walk in ACTION_WALKS:
             return self._forward_batched_action(engine_inputs, latents, action_latents, time_index)
+        if graph_walk in SOUND_WALKS:
+            return self._forward_batched_sound(engine_inputs, latents, sound_latents, time_index)
         if graph_walk not in GEN_WALKS:
             raise ValueError(f"Cosmos3 batched forward only supports generation walks, got {graph_walk!r}")
         cm.set_active_label(CFG_BATCHED_LABEL)
@@ -989,6 +1191,55 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 velocity.unsqueeze(0), t, lat.unsqueeze(0), return_dict=False
             )[0].squeeze(0)
             out[rid] = {"latents": [new_latents], "time_index": [ti + 1]}
+        return out
+
+    def _forward_batched_sound(self, engine_inputs, latents, sound_latents, time_index):
+        """Run several sound requests' joint [video | sound] denoise step in one
+        forward. Mirrors the image batched path with per-request sound bands:
+        one batched transformer pass, then per request the guidance combine and
+        its own joint [video | sound] scheduler step."""
+        cm = engine_inputs.cache_manager
+        cm.set_active_label(CFG_BATCHED_LABEL)
+        reqs, meta = [], []
+        for rid in engine_inputs.request_ids:
+            st = self._req[rid]
+            lat, snd, ti = latents[rid], sound_latents[rid], time_index[rid]
+            step_index = int(ti.reshape(-1)[0].item())
+            n_steps = len(st["scheduler"].timesteps)
+            # A request may be one (discarded) step past its denoise count while
+            # others in the batch are still running; clamp its timestep so the
+            # shared forward can't index past the schedule, and skip its
+            # scheduler step below.
+            t = st["scheduler"].timesteps[min(step_index, n_steps - 1)]
+            cond, unc = st["cond"], st["uncond"]
+            reqs.append({
+                "latents": lat,
+                "vision_timesteps": torch.full((st["num_noisy"],), t.item(), device=lat.device),
+                "position_ids_cond": cond["position_ids"][:, cond["und_len"]:],
+                "position_ids_uncond": unc["position_ids"][:, unc["und_len"]:],
+                "vision_token_shapes": cond["vision_token_shapes"],
+                "vision_noisy_frame_indexes": cond["vision_noisy_frame_indexes"],
+                "vision_mse_loss_indexes": cond["mse_gen_indexes"],
+                "sound_latents": snd,
+                "sound_timesteps": torch.full((st["num_sound"],), t.item(), device=lat.device),
+                "sound_token_shapes": cond["sound_token_shapes"],
+                "sound_noisy_frame_indexes": cond["sound_noisy_frame_indexes"],
+                "sound_mse_gen_indexes": cond["sound_mse_gen_indexes"],
+            })
+            meta.append((rid, st, lat, snd, ti, t))
+
+        results = self.transformer.denoise_step_batched(reqs, cm)
+
+        out = {}
+        for (rid, st, lat, snd, ti, t), ((cond_v, s_c), (uncond_v, s_u)) in zip(meta, results, strict=True):
+            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            sound_v = s_u + st["gs"] * (s_c - s_u)
+            new_latents, new_sound = self._sound_scheduler_step(st, lat, snd, velocity, sound_v, t)
+            out[rid] = {
+                "latents": [new_latents],
+                "sound_latents": [new_sound],
+                "time_index": [ti + 1],
+            }
         return out
 
     def _forward_batched_action(self, engine_inputs, latents, action_latents, time_index):
@@ -1339,6 +1590,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             ACTION_GEN_WALK: ACTION_GEN_LOOP,
             ACTION_VIDEO_GEN_WALK: ACTION_VIDEO_GEN_LOOP,
             VIDEO_GEN_WALK: VIDEO_GEN_LOOP,
+            VIDEO_SOUND_GEN_WALK: VIDEO_SOUND_GEN_LOOP,
         }.get(request_info.graph_walk, IMAGE_GEN_LOOP)
         iter_idx = request_info.dynamic_loop_iter_counts.get(loop, 0)
         if iter_idx + 1 >= len(st["scheduler"].timesteps):
@@ -1347,6 +1599,53 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def cleanup_request(self, request_id: str):
         self._req.pop(request_id, None)
+
+
+class Cosmos3AudioDecoderSubmodule(NodeSubmodule):
+    """AVAE sound decode node (STATELESS): final denoised sound latents
+    ``[1, C, T]`` -> stereo waveform ``[channels, samples]`` in [-1, 1],
+    trimmed to the request's target sample count.
+
+    The target is re-derived from the request metadata (duration x sample rate)
+    rather than read from the DiT node's per-request state, so this node stays
+    stateless and placeable on any rank."""
+
+    disable_torch_compile = True
+
+    def __init__(self, sound_tokenizer, config):
+        super().__init__()
+        self.sound_tokenizer = sound_tokenizer
+        self.config = config
+        if sound_tokenizer is not None and sound_tokenizer.sample_rate != config.sound_sample_rate:
+            raise ValueError(
+                f"Cosmos3 sound tokenizer sample rate {sound_tokenizer.sample_rate} does not match "
+                f"config.sound_sample_rate {config.sound_sample_rate}; the packed sound band length "
+                "would disagree with the decoded audio length."
+            )
+
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+        md = fwd_info.step_metadata
+        duration = md.get("sound_duration")
+        if duration is None:
+            duration = int(md.get("num_frames", 1)) / float(md.get("fps", 24.0))
+        duration = max(float(duration), 1.0 / max(float(md.get("fps", 24.0)), 1.0))
+        target = max(1, int(round(duration * self.config.sound_sample_rate)))
+        return NodeInputs(tensor_inputs={
+            "sound_latents": inputs["sound_latents"][0],
+            "target_samples": torch.tensor([target], dtype=torch.long),
+        })
+
+    # Native dtype, not the engine autocast (the tokenizer runs in its own bf16;
+    # matching the decode dtype keeps the waveform deterministic across walks).
+    @torch.autocast(device_type="cuda", enabled=False)
+    def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, sound_latents, target_samples, **kwargs):
+        audio = self.sound_tokenizer.decode(sound_latents)  # [1, channels, T * hop]
+        target = int(target_samples.reshape(-1)[0].item())
+        if audio.shape[-1] > target:
+            audio = audio[..., :target]
+        elif audio.shape[-1] < target:
+            audio = torch.nn.functional.pad(audio, (0, target - audio.shape[-1]))
+        return {"audio_output": [audio[0].to(torch.float32)]}
 
 
 class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
@@ -1435,11 +1734,11 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # at higher resolutions.
         image = (decoded / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
         # Route the decoded tensor to the active walk's emit edge: image_gen
-        # emits "image_output" (one frame); video_gen and forward-dynamics
-        # (action_video_gen) emit "video_output".
+        # emits "image_output" (one frame); the video walks (plain, sound,
+        # forward-dynamics) emit "video_output".
         out_name = (
             "video_output"
-            if graph_walk in (VIDEO_GEN_WALK, ACTION_VIDEO_GEN_WALK)
+            if graph_walk in (VIDEO_GEN_WALK, VIDEO_SOUND_GEN_WALK, ACTION_VIDEO_GEN_WALK)
             else "image_output"
         )
         return {out_name: [image]}

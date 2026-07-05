@@ -641,6 +641,47 @@ class Cosmos3OmniTransformer(nn.Module):
             token_shapes=action_token_shapes,
         )
 
+    def _embed_sound(
+        self,
+        sound_latents: torch.Tensor,
+        sound_timesteps: torch.Tensor,
+        sound_token_shapes: list[tuple[int, int, int]],
+        sound_noisy_frame_indexes: list[torch.Tensor],
+        target_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Project sound latents ([1, C, T] or [C, T]) into the hidden space:
+        audio in-projection + the audio modality embedding, then scatter-add the
+        timestep embedding to the noisy sound frames (all of them — sound
+        generation has no clean conditioning tokens). Returns [T, hidden]."""
+        latents = sound_latents[0] if sound_latents.ndim == 3 else sound_latents
+        packed = self._pack_sound_latents([latents], sound_token_shapes).to(target_dtype)
+        packed = self.audio_proj_in(packed) + self.audio_modality_embed
+        ts = sound_timesteps * self.config.timestep_scale
+        ts_embeds = self.time_embedder(self.time_proj(ts)).to(target_dtype)
+        return self._apply_timestep_embeds_to_noisy_tokens(
+            packed_tokens=packed,
+            packed_timestep_embeds=ts_embeds,
+            noisy_frame_indexes=sound_noisy_frame_indexes,
+            token_shapes=sound_token_shapes,
+        )
+
+    def _decode_sound(
+        self,
+        gen_hidden: torch.Tensor,
+        sound_token_shapes: list[tuple[int, int, int]],
+        sound_noisy_frame_indexes: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Audio out-projection of the noisy sound hidden states back to latent
+        space, scattered into a full [1, C, T] tensor (clean frames left zero,
+        mirroring ``_unpack_sound_latents``)."""
+        preds = self.audio_proj_out(gen_hidden)  # [n_noisy, C]
+        t_s = sound_token_shapes[0][0]
+        out = preds.new_zeros((self.config.sound_dim, t_s))
+        noisy = sound_noisy_frame_indexes[0]
+        if noisy.numel() > 0:
+            out[:, noisy] = preds.T
+        return out.unsqueeze(0)  # [1, C, T]
+
     def _decode_action(
         self,
         gen_hidden: torch.Tensor,
@@ -793,9 +834,9 @@ class Cosmos3OmniTransformer(nn.Module):
     # their K/V is step-independent, so caching it once is exact. ``cache_handle``
     # is a paged attention handle (set_layer_idx / run_attention / advance_seq_lens);
     # the attention plan (causal vs not, which label) is configured by the caller.
-    # These entry points pack text + vision (+ action) only: the checkpoint's
-    # sound band is reachable through the reference ``forward`` above but has no
-    # serving path yet, so the cached variants take no sound inputs.
+    # These entry points pack text + vision, plus an optional action or sound
+    # band appended to the generation block (matching the reference ``forward``'s
+    # ``[vision | action | sound]`` order).
     # ------------------------------------------------------------------
 
     def _rotary(self, position_ids: torch.Tensor, device, dtype):
@@ -861,6 +902,11 @@ class Cosmos3OmniTransformer(nn.Module):
         action_mse_gen_indexes: torch.Tensor | None = None,
         action_timesteps: torch.Tensor | None = None,
         action_domain_id: torch.Tensor | None = None,
+        sound_latents: torch.Tensor | None = None,
+        sound_token_shapes: list[tuple[int, int, int]] | None = None,
+        sound_noisy_frame_indexes: list[torch.Tensor] | None = None,
+        sound_mse_gen_indexes: torch.Tensor | None = None,
+        sound_timesteps: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """One generation-tower evaluation against the frozen understanding K/V.
 
@@ -869,11 +915,14 @@ class Cosmos3OmniTransformer(nn.Module):
         the active label's cached understanding K/V plus its own freshly written
         K/V), and decodes the flow velocity. ``position_ids`` are the generation
         segment's 3D mRoPE ids ([3, num_gen]) — the vision band, then the action
-        band when present. ``vision_mse_loss_indexes`` / ``action_mse_gen_indexes``
-        index into the generation token block. With action, the generation
-        sequence is ``[vision tokens | action tokens]`` and the call returns
-        ``(video_velocity, action_velocity)``."""
+        or sound band when present. ``vision_mse_loss_indexes`` /
+        ``action_mse_gen_indexes`` / ``sound_mse_gen_indexes`` index into the
+        generation token block. With an extra band the generation sequence is
+        ``[vision tokens | action or sound tokens]`` and the call returns
+        ``(video_velocity, action_velocity)`` / ``(video_velocity,
+        sound_velocity)``."""
         has_action = action_latents is not None
+        has_sound = sound_latents is not None
         packed, original_latent_shapes = self._patchify_and_pack_latents([latents])
         packed = self.proj_in(packed)
         target_dtype = packed.dtype
@@ -891,6 +940,12 @@ class Cosmos3OmniTransformer(nn.Module):
                 action_token_shapes, action_noisy_frame_indexes, target_dtype,
             )
             gen_seq = torch.cat([gen_seq, action_seq], dim=0)
+        if has_sound:
+            sound_seq = self._embed_sound(
+                sound_latents, sound_timesteps, sound_token_shapes,
+                sound_noisy_frame_indexes, target_dtype,
+            )
+            gen_seq = torch.cat([gen_seq, sound_seq], dim=0)
 
         cos, sin = self._rotary(position_ids, gen_seq.device, gen_seq.dtype)
         gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, cache_handle)
@@ -902,13 +957,17 @@ class Cosmos3OmniTransformer(nn.Module):
             noisy_frame_indexes_vision=vision_noisy_frame_indexes,
             original_latent_shapes=original_latent_shapes,
         )
-        if not has_action:
-            return preds[0]
-        action_pred = self._decode_action(
-            gen_out[action_mse_gen_indexes], action_domain_id,
-            action_token_shapes, action_noisy_frame_indexes,
-        )
-        return preds[0], action_pred
+        outputs: list[torch.Tensor] = [preds[0]]
+        if has_action:
+            outputs.append(self._decode_action(
+                gen_out[action_mse_gen_indexes], action_domain_id,
+                action_token_shapes, action_noisy_frame_indexes,
+            ))
+        if has_sound:
+            outputs.append(self._decode_sound(
+                gen_out[sound_mse_gen_indexes], sound_token_shapes, sound_noisy_frame_indexes,
+            ))
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     def denoise_step_batched_cfg(
         self,
@@ -926,6 +985,11 @@ class Cosmos3OmniTransformer(nn.Module):
         action_mse_gen_indexes: torch.Tensor | None = None,
         action_timesteps: torch.Tensor | None = None,
         action_domain_id: torch.Tensor | None = None,
+        sound_latents: torch.Tensor | None = None,
+        sound_token_shapes: list[tuple[int, int, int]] | None = None,
+        sound_noisy_frame_indexes: list[torch.Tensor] | None = None,
+        sound_mse_gen_indexes: torch.Tensor | None = None,
+        sound_timesteps: torch.Tensor | None = None,
         prefer_all_gather: bool = False,
     ):
         """Conditional and unconditional generation in one batched pass.
@@ -939,9 +1003,10 @@ class Cosmos3OmniTransformer(nn.Module):
         ``[cond tokens | uncond tokens]`` into one sequence carrying per-branch
         positions, and let the handle's batched plan route each branch to its
         own label's pages. Returns the conditional and unconditional results in
-        the same form as ``denoise_step`` (a velocity, or a (video, action)
-        pair when action tokens are present)."""
+        the same form as ``denoise_step`` (a velocity, or a (video, action) /
+        (video, sound) pair when the extra band is present)."""
         has_action = action_latents is not None
+        has_sound = sound_latents is not None
         packed, original_latent_shapes = self._patchify_and_pack_latents([latents])
         packed = self.proj_in(packed)
         target_dtype = packed.dtype
@@ -959,6 +1024,12 @@ class Cosmos3OmniTransformer(nn.Module):
                 action_token_shapes, action_noisy_frame_indexes, target_dtype,
             )
             gen_seq = torch.cat([gen_seq, action_seq], dim=0)
+        if has_sound:
+            sound_seq = self._embed_sound(
+                sound_latents, sound_timesteps, sound_token_shapes,
+                sound_noisy_frame_indexes, target_dtype,
+            )
+            gen_seq = torch.cat([gen_seq, sound_seq], dim=0)
 
         n = gen_seq.shape[0]
         gen_seq = torch.cat([gen_seq, gen_seq], dim=0)
@@ -980,13 +1051,17 @@ class Cosmos3OmniTransformer(nn.Module):
                 noisy_frame_indexes_vision=vision_noisy_frame_indexes,
                 original_latent_shapes=original_latent_shapes,
             )
-            if not has_action:
-                return preds[0]
-            action_pred = self._decode_action(
-                out[action_mse_gen_indexes], action_domain_id,
-                action_token_shapes, action_noisy_frame_indexes,
-            )
-            return preds[0], action_pred
+            outputs: list[torch.Tensor] = [preds[0]]
+            if has_action:
+                outputs.append(self._decode_action(
+                    out[action_mse_gen_indexes], action_domain_id,
+                    action_token_shapes, action_noisy_frame_indexes,
+                ))
+            if has_sound:
+                outputs.append(self._decode_sound(
+                    out[sound_mse_gen_indexes], sound_token_shapes, sound_noisy_frame_indexes,
+                ))
+            return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
         return _decode(gen_out[:n]), _decode(gen_out[n:])
 
@@ -999,12 +1074,16 @@ class Cosmos3OmniTransformer(nn.Module):
         as ``[cond r0 | cond r1 | ... | uncond r0 | uncond r1 | ...]`` to match
         the order the handle's batched plan lays out its entries. The layers run
         once over the whole pack; the cache routes each piece to its own request
-        and guidance label. Returns one ``(cond_velocity, uncond_velocity)`` pair
-        per request, in request order.
+        and guidance label. Returns one ``(cond, uncond)`` pair per request, in
+        request order — each branch a velocity, or a ``(video, sound)`` pair for
+        a request with a sound band.
 
         Each ``requests`` entry is a dict with: ``latents``, ``vision_timesteps``,
         ``position_ids_cond``, ``position_ids_uncond``, ``vision_token_shapes``,
-        ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``."""
+        ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``; sound-band
+        requests additionally carry ``sound_latents``, ``sound_timesteps``,
+        ``sound_token_shapes``, ``sound_noisy_frame_indexes``,
+        ``sound_mse_gen_indexes``."""
         gen_seqs, shapes, cos_cond, sin_cond, cos_uncond, sin_uncond = [], [], [], [], [], []
         for req in requests:
             packed, original_latent_shapes = self._patchify_and_pack_latents([req["latents"]])
@@ -1018,6 +1097,12 @@ class Cosmos3OmniTransformer(nn.Module):
                 noisy_frame_indexes=req["vision_noisy_frame_indexes"],
                 token_shapes=req["vision_token_shapes"],
             )
+            if req.get("sound_latents") is not None:
+                sound_seq = self._embed_sound(
+                    req["sound_latents"], req["sound_timesteps"], req["sound_token_shapes"],
+                    req["sound_noisy_frame_indexes"], packed.dtype,
+                )
+                gen_seq = torch.cat([gen_seq, sound_seq], dim=0)
             gen_seqs.append(gen_seq)
             shapes.append(original_latent_shapes)
             cc, sc = self._rotary(req["position_ids_cond"], gen_seq.device, gen_seq.dtype)
@@ -1046,7 +1131,13 @@ class Cosmos3OmniTransformer(nn.Module):
                 noisy_frame_indexes_vision=req["vision_noisy_frame_indexes"],
                 original_latent_shapes=original_latent_shapes,
             )
-            return preds[0]
+            if req.get("sound_latents") is None:
+                return preds[0]
+            sound_pred = self._decode_sound(
+                out[req["sound_mse_gen_indexes"]], req["sound_token_shapes"],
+                req["sound_noisy_frame_indexes"],
+            )
+            return preds[0], sound_pred
 
         results, off = [], 0
         for i, req in enumerate(requests):

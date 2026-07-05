@@ -509,6 +509,11 @@ class Model(ABC):
         """
         return 24000
 
+    def get_output_audio_channels(self, modality: str = "audio") -> int:
+        """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for
+        audio. Mono default (the speech models); stereo models override."""
+        return 1
+
     # ------------------------------------------------------------------
     # Partition API (optional, backward-compatible defaults)
     # ------------------------------------------------------------------

@@ -318,6 +318,40 @@ def build_vision_segment(
     }
 
 
+def build_sound_segment(
+    sound_latent_frames: int,
+    mrope_offset: int | float,
+    curr: int,
+    config,
+    device,
+) -> dict[str, Any]:
+    """Sound (AVAE-latent) band of the generation sequence: a ``(T, 1, 1)`` grid
+    at the sound tokenizer's latent frame rate, sharing the post-text media
+    temporal offset with the vision band. Every sound frame is noisy/predicted
+    (sound generation has no clean conditioning tokens)."""
+    effective_fps = config.sound_latent_fps if config.enable_fps_modulation else None
+    sound_mrope_ids, _ = get_3d_mrope_ids_vae_tokens(
+        grid_t=sound_latent_frames,
+        grid_h=1,
+        grid_w=1,
+        temporal_offset=mrope_offset,
+        reset_spatial_indices=config.unified_3d_mrope_reset_spatial_ids,
+        fps=effective_fps,
+        base_fps=float(config.base_fps),
+        temporal_compression_factor=config.temporal_compression_factor_sound,
+        base_temporal_compression_factor=config.temporal_compression_factor_sound,
+    )
+    sequence_indexes = torch.arange(curr, curr + sound_latent_frames, dtype=torch.long, device=device)
+    return {
+        "sound_token_shapes": [(sound_latent_frames, 1, 1)],
+        "sound_sequence_indexes": sequence_indexes,
+        "sound_mse_loss_indexes": sequence_indexes.clone(),
+        "sound_noisy_frame_indexes": [torch.arange(sound_latent_frames, dtype=torch.long, device=device)],
+        "sound_mrope_ids": sound_mrope_ids.to(device),
+        "num_sound_tokens": sound_latent_frames,
+    }
+
+
 def build_static_inputs(
     input_ids: list[int],
     latent_shape: tuple[int, int, int, int, int],
@@ -326,13 +360,16 @@ def build_static_inputs(
     fps: float,
     device,
     has_image_condition: bool = False,
+    sound_latent_frames: int | None = None,
 ) -> dict[str, Any]:
     """Assemble the per-prompt static transformer inputs for image/video
     generation. ``latent_shape`` is ``[B, C, T, H, W]`` (``T == 1`` for images;
     ``T == 1 + (num_frames - 1) // temporal_factor`` for video). When
     ``has_image_condition`` is set, latent frame 0 is a clean conditioning anchor
     (image-to-video): it stays in the sequence but is excluded from the noisy /
-    predicted frames. Step-varying fields (``vision_tokens``,
+    predicted frames. ``sound_latent_frames`` appends a jointly denoised sound
+    band after the vision tokens (the generation block becomes
+    ``[vision | sound]``). Step-varying fields (``vision_tokens``,
     ``vision_timesteps``) are spliced in per denoising step by the caller."""
     text = build_text_segment(input_ids, config, device)
     vision = build_vision_segment(
@@ -345,13 +382,25 @@ def build_static_inputs(
         vae_scale_factor_temporal=vae_scale_factor_temporal,
         device=device,
     )
-    position_ids = torch.cat([text["text_mrope_ids"], vision["vision_mrope_ids"]], dim=1)
-    return {
-        **text,
-        **vision,
-        "position_ids": position_ids,
-        "sequence_length": text["und_len"] + vision["num_vision_tokens"],
-    }
+    parts = [text["text_mrope_ids"], vision["vision_mrope_ids"]]
+    static = {**text, **vision}
+    sequence_length = text["und_len"] + vision["num_vision_tokens"]
+    if sound_latent_frames is not None:
+        sound = build_sound_segment(
+            sound_latent_frames=sound_latent_frames,
+            mrope_offset=text["vision_start_temporal_offset"],
+            curr=sequence_length,
+            config=config,
+            device=device,
+        )
+        static.update(sound)
+        parts.append(sound["sound_mrope_ids"])
+        sequence_length += sound["num_sound_tokens"]
+    pos_dtype = torch.float32 if any(p.is_floating_point() for p in parts) else torch.long
+    position_ids = torch.cat([p.to(pos_dtype) for p in parts], dim=1)
+    static["position_ids"] = position_ids
+    static["sequence_length"] = sequence_length
+    return static
 
 
 def build_t2i_static_inputs(

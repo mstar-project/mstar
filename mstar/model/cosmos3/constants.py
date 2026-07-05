@@ -12,6 +12,7 @@ PREFILL_COND_WALK = "prefill_cond"
 PREFILL_COND_VIDEO_WALK = "prefill_cond_video"
 IMAGE_GEN_WALK = "image_gen"
 VIDEO_GEN_WALK = "video_gen"
+VIDEO_SOUND_GEN_WALK = "video_sound_gen"
 ACTION_GEN_WALK = "action_gen"
 # Forward-dynamics runs the same joint video+action denoise but emits the
 # predicted video (VAE-decoded) instead of the action, so it has its own walk.
