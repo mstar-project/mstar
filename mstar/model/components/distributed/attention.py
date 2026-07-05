@@ -23,7 +23,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components.distributed.linear import (
     QKVParallelLinear,
@@ -36,7 +36,7 @@ class ParallelAttention(nn.Module):
     def __init__(
         self,
         *,
-        comm_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -54,7 +54,7 @@ class ParallelAttention(nn.Module):
     ):
         super().__init__()
         if comm_group is None:
-            comm_group = TPCommGroup.trivial()
+            comm_group = CommGroup.trivial()
         self.comm_group = comm_group
         self.hidden_size = hidden_size
         self.input_hidden_size = input_hidden_size or hidden_size

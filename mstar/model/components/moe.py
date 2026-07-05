@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 
 logger = logging.getLogger(__name__)
@@ -332,11 +332,11 @@ class ParallelSparseMoeBlock(nn.Module):
         num_experts_per_tok: int,
         moe_intermediate_size: int,
         norm_topk_prob: bool = True,
-        comm_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__()
         if comm_group is None:
-            comm_group = TPCommGroup.trivial()
+            comm_group = CommGroup.trivial()
         self.comm_group = comm_group
         tp_size = comm_group.world_size
         tp_rank = comm_group.rank
@@ -429,11 +429,11 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         moe_intermediate_size: int,
         shared_expert: nn.Module,
         norm_topk_prob: bool = False,
-        comm_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__()
         if comm_group is None:
-            comm_group = TPCommGroup.trivial()
+            comm_group = CommGroup.trivial()
         self.comm_group = comm_group
         tp_size = comm_group.world_size
         tp_rank = comm_group.rank
