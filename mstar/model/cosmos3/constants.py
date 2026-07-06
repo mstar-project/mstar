@@ -7,6 +7,11 @@ DEFAULT_CONDITION_FRAME_INDEXES_VISION = (0, 1)
 DEFAULT_CONDITION_VIDEO_KEEP = "first"
 V2V_DEFAULT_FLOW_SHIFT = 10.0
 
+# Truncation cap on the prompt token count (before the eos + vision_start
+# markers), matching the reference serving pipeline: it only bounds the UND
+# pathway / GEN cross-attention cost for pathologically long prompts.
+DEFAULT_MAX_SEQUENCE_LENGTH = 4096
+
 PREFILL_WALK = "prefill"
 # Image/video-conditioned generation prefills the same understanding tower, but
 # also VAE-encodes the conditioning frame into a clean anchor latent (see

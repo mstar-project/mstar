@@ -10,10 +10,13 @@ diffusers pipeline's packed t2i inputs byte-for-byte.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 3D interleaved mRoPE position ids (exact ports of the pipeline helpers).
@@ -218,6 +221,7 @@ def tokenize_prompt(
     use_system_prompt: bool = True,
     add_resolution_template: bool = True,
     add_duration_template: bool = True,
+    max_sequence_length: int | None = None,
 ) -> tuple[list[int], list[int]]:
     """Return ``(cond_input_ids, uncond_input_ids)`` for image/video generation.
 
@@ -225,7 +229,9 @@ def tokenize_prompt(
     mode-specific system prompt and metadata sentences (duration for video, then
     resolution), using inverse templates for the negative prompt, then append the
     eos + start-of-generation (``<|vision_start|>``) special tokens. Image mode is
-    ``num_frames == 1``.
+    ``num_frames == 1``. ``max_sequence_length`` caps the chat-template token
+    count BEFORE the two trailing markers (the reference serving pipeline's
+    truncation contract); ``None`` leaves the prompt unbounded.
     """
     is_image = num_frames == 1
     if negative_prompt is None:
@@ -257,7 +263,15 @@ def tokenize_prompt(
         enc = tokenizer.apply_chat_template(
             conversations, tokenize=True, add_generation_prompt=True, add_vision_id=False, return_dict=True
         )
-        return list(enc["input_ids"]) + [eos_id, sog_id]
+        ids = list(enc["input_ids"])
+        if max_sequence_length is not None and len(ids) > max_sequence_length:
+            logger.warning(
+                "Cosmos3 prompt token count truncated to max_sequence_length: "
+                "original_token_count=%d, max_sequence_length=%d, removed_token_count=%d",
+                len(ids), max_sequence_length, len(ids) - max_sequence_length,
+            )
+            ids = ids[:max_sequence_length]
+        return ids + [eos_id, sog_id]
 
     cond = _tokenize(_apply_templates(prompt, is_negative=False))
     uncond = _tokenize(_apply_templates(negative_prompt, is_negative=True))
