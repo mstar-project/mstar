@@ -95,7 +95,7 @@ class _SdpaCache:
         self.is_causal[self.active] = is_causal
 
     # Engine-facing surface (used when the DiT submodule drives the cache).
-    def plan_attention(self, seq_lens=None, dtype=None, is_causal=True, write_store=True, label=None):
+    def plan_attention(self, seq_lens=None, dtype=None, is_causal=True, write_store=True, label=None, **kwargs):
         self.is_causal[label or self.active] = is_causal
 
     def plan_attention_batched_cfg(self, labels, seq_lens, is_causal=False, write_store=False, **kwargs):
@@ -379,10 +379,10 @@ def _flashinfer_action_shared(model, rids, device, dtype):
 
 
 def _mk_action_cm(shared, rids):
-    from mstar.engine.cache_manager import BatchedCacheManager
+    from mstar.engine.cache_manager import create_cache_manager
     from mstar.model.cosmos3.submodules import COND_LABEL
 
-    return BatchedCacheManager(
+    return create_cache_manager(
         request_ids=rids, active_labels_per_request={r: COND_LABEL for r in rids},
         kv_cache=shared["kv_cache"], alloc_manager=shared["alloc"], buffer_manager=shared["buf"],
         kv_cache_config=shared["cfg"], device=shared["device"], auto_write_store=False,

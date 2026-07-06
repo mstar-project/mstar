@@ -167,6 +167,12 @@ class Cosmos3Config:
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
     compile_denoise: bool = True
+    # KV-cache attention backend (a cache_manager.ATTENTION_BACKENDS key).
+    # "dense_gen" (default) runs eager single-request generation attention as
+    # one dense FA3 varlen pass over [frozen text prefix | fresh gen tokens];
+    # captured graphs and multi-request batches fall back to the paged
+    # FlashInfer path. "flashinfer" forces paged everywhere.
+    attention_backend: str = "dense_gen"
 
     # ----- sub-configs -----
     vae: Cosmos3VAEConfig = field(default_factory=Cosmos3VAEConfig)

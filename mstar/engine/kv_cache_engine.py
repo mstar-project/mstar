@@ -16,7 +16,11 @@ from mstar.engine.base import (
     PlannedBatch,
     PreparedBatch,
 )
-from mstar.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
+from mstar.engine.cache_manager import (
+    BatchedCacheManager,
+    WorkspaceBufferManager,
+    create_cache_manager,
+)
 from mstar.engine.cpu_page_pool import CPUPagePool
 from mstar.engine.cuda_graph_runner import (
     CudaGraphRunner,
@@ -214,7 +218,7 @@ class KVCacheEngine(BaseEngine):
         from mstar.engine.kv_store import StoreWritePolicy
         autowrite = (cache_mgmt.alloc_manager.write_policy == StoreWritePolicy.ALWAYS)
 
-        return BatchedCacheManager(
+        return create_cache_manager(
             request_ids=request_ids,
             active_labels_per_request={rid: "main" for rid in request_ids},
             kv_cache=cache_mgmt.kv_cache,
