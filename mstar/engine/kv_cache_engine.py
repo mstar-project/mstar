@@ -437,6 +437,9 @@ class KVCacheEngine(BaseEngine):
             cache_manager=cache_manager,
             sampler=sampler,
             piecewise_runners=self.submodule_management[batch.node_name].piecewise_runners,
+            per_request_states={
+                rid: submodule.request_state(rid) for rid in batch.request_ids
+            },
         )
         if self.enable_nvtx:
             range_push("ar.batched.preprocess", synchronize=False)
@@ -523,6 +526,7 @@ class KVCacheEngine(BaseEngine):
                 cache_manager=cache_manager,
                 sampler=sampler,
                 piecewise_runners=self.submodule_management[batch.node_name].piecewise_runners,
+                per_request_states={rid: submodule.request_state(rid)},
             )
 
             if self.enable_nvtx:
@@ -1095,6 +1099,7 @@ class KVCacheEngine(BaseEngine):
                 cache_mgmt.cpu_page_pool.remove_request(request_id)
             cache_mgmt.alloc_manager.remove_request(request_id)
             submodule_mgmt.sampler.remove_request(request_id)
+            submodule_mgmt.submodule.cleanup_request(request_id)
             if submodule_mgmt.cuda_graph_runner is not None:
                 submodule_mgmt.cuda_graph_runner.unregister_request(request_id)
             # Release the submodule's OWN per-request state. StatelessEngine.
