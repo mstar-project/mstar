@@ -174,6 +174,9 @@ class PreprocessWorkerThread:
         self.model = model
 
         self.tensor_uuid_to_metadata_per_request = {}
+        # The request's model_kwargs, kept so output postprocessing can
+        # honor per-request parameters (e.g. the video container fps).
+        self.request_model_kwargs: dict[str, dict] = {}
 
         self.communicator = ZMQCommunicator(
             my_id="api_server_preprocess_worker",
@@ -265,6 +268,7 @@ class PreprocessWorkerThread:
                 input.request_id, uuid, persist=True
             )
 
+        self.request_model_kwargs[input.request_id] = input.model_kwargs or {}
         msg = ConductorMessage(
             message_type=ConductorMessageType.NEW_REQUEST,
             body=NewRequestConductor(
@@ -306,7 +310,8 @@ class PreprocessWorkerThread:
                         uuid=tensor_info.uuid
                     )
                     postprocessed = self.model.postprocess(
-                        tensor, modality
+                        tensor, modality,
+                        request_kwargs=self.request_model_kwargs.get(request_id),
                     )
 
                     chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
@@ -383,6 +388,7 @@ class PreprocessWorkerThread:
                             metadata={"status": status},
                         ))
                         self.tensor_manager.cleanup_request(pre_input.request_id)
+                        self.request_model_kwargs.pop(pre_input.request_id, None)
                 if not self.result_tensor_queue.empty():
                     did_work = True
                     self._read_result_tensor(self.result_tensor_queue.get())
@@ -392,6 +398,7 @@ class PreprocessWorkerThread:
                     self.tensor_manager.cleanup_request(req_id)
                     if req_id in self.tensor_uuid_to_metadata_per_request:
                         del self.tensor_uuid_to_metadata_per_request[req_id]
+                    self.request_model_kwargs.pop(req_id, None)
                 did_work = did_work or self._process_read_tensors()
             except Exception:
                 logger.exception("PreprocessWorkerThread error")

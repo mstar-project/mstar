@@ -509,7 +509,7 @@ class Cosmos3Model(Model):
             ]
         }
 
-    def postprocess(self, output: torch.Tensor, modality: str) -> bytes:
+    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "image":
             import io
             import os
@@ -538,8 +538,8 @@ class Cosmos3Model(Model):
 
             # The decoder emits 8-bit frames [B, C, T, H, W]; encode all of them as
             # an H.264 mp4. The frames already reflect the request fps (it modulates
-            # the temporal positions during generation); the container plays back
-            # at the model's default fps.
+            # the temporal positions during generation), and the container carries
+            # that same rate so playback runs at the requested speed.
             #
             # CRF 18 keeps the H.264 output near-visually-lossless; libx264
             # otherwise defaults to 23, which is visibly lossier. The "ultrafast"
@@ -548,7 +548,7 @@ class Cosmos3Model(Model):
             # preset, which otherwise dominates the serving latency for a
             # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
             x = output[0] if output.ndim == 5 else output  # [C, T, H, W] uint8
-            fps = self.config.fps
+            fps = float((request_kwargs or {}).get("fps", self.config.fps))
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
             try:
                 # Preferred: torchcodec (torchvision >= 0.27 removed write_video).

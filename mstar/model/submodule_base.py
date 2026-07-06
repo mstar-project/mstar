@@ -366,23 +366,32 @@ class NodeSubmodule(torch.nn.Module):
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
+        inputs: NodeInputs | None = None,
         **kwargs
     ):
         """
-        Metadata-only postprocessing on the submodule outputs.
+        Per-request postprocessing on the submodule outputs.
 
-        Runs on the GPU thread inside ``execute_batch``. **Must not read tensor
-        values** — no ``.item()`` / ``.cpu()`` / ``.tolist()`` etc. — because
-        any sync here blocks the GPU thread and forfeits the worker's async-
-        scheduling overlap. Stop-condition decisions that need token values
-        (e.g. EOS) belong in ``check_stop``.
+        Runs on the GPU thread inside ``execute_batch``, after the forward
+        (eager, batched, or CUDA-graph replay). ``inputs`` is the request's
+        ``prepare_inputs`` result for this step, so a submodule can finish a
+        step the captured graph could not hold (e.g. combine guidance branches
+        and run a Python multistep scheduler against the step's input latents).
+
+        Keep it metadata-only where possible. **Avoid reading tensor values**
+        — ``.item()`` / ``.cpu()`` sync here block the GPU thread and forfeit
+        the worker's async-scheduling overlap; stop-condition decisions that
+        need token values (e.g. EOS) belong in ``check_stop``. A captured-path
+        tail that must read scheduler state is the sanctioned exception — it
+        costs the same sync wherever it runs.
 
         Typical uses:
           - rebind output names for graph routing (``outputs["text_inputs"] =
             outputs["new_token"]``);
           - drop keys on a per-request basis for static-capture submodules
             (e.g. Qwen3-Omni Thinker dropping ``thinker_states`` for requests
-            that don't need audio).
+            that don't need audio);
+          - finish a captured step from ``inputs`` (Cosmos3 denoise tail).
 
         Modifies ``outputs`` in-place; returns nothing.
         """
