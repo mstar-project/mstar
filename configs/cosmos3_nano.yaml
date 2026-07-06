@@ -19,5 +19,5 @@ model_kwargs:
 node_groups:
   - node_names: ["dit"]
     ranks: [0]
-  - node_names: ["vae_decoder", "audio_decoder"]
+  - node_names: ["vae_encoder", "vae_decoder", "audio_decoder"]
     ranks: [0]

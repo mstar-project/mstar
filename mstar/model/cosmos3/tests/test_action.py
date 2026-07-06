@@ -594,6 +594,20 @@ def test_action_cross_request_batch_matches_individual() -> None:
                              use_system_prompt=False, add_resolution_template=False,
                              add_duration_template=False)[0] for p in prompts]
 
+    def _encode(rid):
+        # The vae_encoder node encodes the conditioning clip; the engine hands
+        # its output to the first denoise iteration as the ``cond_latents`` edge.
+        enc = model.get_submodule("vae_encoder", device=device)
+        fwd = CurrentForwardPassInfo(
+            request_id=rid, graph_walk="prefill_cond_video", requires_cfg=False, fwd_index=0,
+            random_seed=seeds[0], max_tokens=0, sampling_config={}, step_metadata=_md())
+        ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd})
+        ni = enc.prepare_inputs("prefill_cond_video", fwd, {"video_inputs": [cond_videos[rid].to(device)]})
+        out = enc.forward("prefill_cond_video", ei, **enc.preprocess("prefill_cond_video", ei, [ni]))
+        return out["cond_latents"][0]
+
+    cond_lat = {}
+
     def _prefill(rid, idx, cm):
         fwd = CurrentForwardPassInfo(
             request_id=rid, graph_walk="prefill", requires_cfg=False, fwd_index=0,
@@ -601,10 +615,11 @@ def test_action_cross_request_batch_matches_individual() -> None:
         ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm)
         ni = dit.prepare_inputs("prefill", fwd, {
             "text_inputs": [torch.tensor(conds[idx], dtype=torch.long, device=device)],
-            "video_inputs": [cond_videos[rid].to(device)],
         })
         dit.forward("prefill", ei, **dit.preprocess("prefill", ei, [ni]))
         fwd.graph_walk = "action_gen"
+        if rid not in cond_lat:
+            cond_lat[rid] = _encode(rid)
         return fwd
 
     def _run_one(rid, idx):
@@ -614,7 +629,8 @@ def test_action_cross_request_batch_matches_individual() -> None:
         ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm)
         lat = act = ti = None
         for _ in range(steps):
-            inp = {} if lat is None else {"latents": [lat], "action_latents": [act], "time_index": [ti]}
+            inp = ({"cond_latents": [cond_lat[rid]]} if lat is None
+                   else {"latents": [lat], "action_latents": [act], "time_index": [ti]})
             ni = dit.prepare_inputs("action_gen", fwd, inp)
             out = dit.forward("action_gen", ei, **dit.preprocess("action_gen", ei, [ni]))
             lat, act, ti = out["latents"][0], out["action_latents"][0], out["time_index"][0]
@@ -634,7 +650,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
         for _ in range(steps):
             inputs = []
             for rid in rids:
-                inp = {} if lat[rid] is None else {
+                inp = {"cond_latents": [cond_lat[rid]]} if lat[rid] is None else {
                     "latents": [lat[rid]], "action_latents": [act[rid]], "time_index": [ti[rid]]}
                 inputs.append(dit.prepare_inputs("action_gen", fwds[rid], inp))
             out = dit.forward_batched("action_gen", eiN, **dit.preprocess("action_gen", eiN, inputs))

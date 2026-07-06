@@ -1,6 +1,6 @@
 """NodeSubmodule wrappers for the Cosmos3 generator nodes.
 
-Two nodes:
+Nodes:
   Cosmos3DiTSubmodule         -- dual-pathway DiT (KV_CACHE). Dispatches by
                                  graph_walk between ``prefill`` (the
                                  understanding tower runs once over the text
@@ -12,6 +12,10 @@ Two nodes:
                                  step). Classifier-free guidance keeps the
                                  conditional and unconditional prompts in two
                                  cache labels and combines their velocities.
+  Cosmos3VAEEncoderSubmodule  -- Wan VAE conditioning encode (STATELESS): the
+                                 request's conditioning image/video to clean
+                                 anchor latents, in parallel with the DiT
+                                 prefill.
   Cosmos3VAEDecoderSubmodule  -- Wan VAE decode (STATELESS): final latents to
                                  pixels.
 
@@ -141,18 +145,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
-    def __init__(self, transformer, config, scheduler=None, vae=None):
+    def __init__(self, transformer, config, scheduler=None):
         super().__init__()
         self.transformer = transformer
         self.config = config
         # Template scheduler; a fresh instance (with its own multistep state) is
         # built per request from this one's config.
         self._scheduler_template = scheduler
-        # Wan VAE (shared with the decoder node) — used to encode the
-        # conditioning frame for image-to-video / action conditioning. None for
-        # text-only generation.
-        self.vae = vae
-        self._video_processor = None
         # Per-request denoising state (packed cond/uncond statics, scheduler,
         # guidance scale, conditioning latents) lives in the engine-managed
         # ``request_states`` store from the NodeSubmodule base.
@@ -348,44 +347,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latent_shape=self._latent_shape(height, width, num_frames),
             num_sound=sound_frames,
         )
-        # Image-to-video: encode the conditioning frame now (the understanding
-        # tower and the VAE encode are both prefill-time, per-request work) and
-        # stash its clean anchor latents for the denoise loop to inject.
-        if has_image_condition:
-            image = (inputs or {}).get("image_inputs")
-            if image:
-                st.add("cond_latents", self._encode_conditioning(
-                    image[0], height, width, num_frames, device, anchor_only=True
-                ))
-
-        # Video-to-video: encode the conditioning video's prefix into clean
-        # latents and pin the requested latent frames (the complement starts
-        # from noise). Only the first max(indexes)*tcf + 1 pixel frames feed
-        # the pinned latent frames (the Wan VAE is temporally causal), taken
-        # from the start or end of the input per ``condition_video_keep``; a
-        # shorter input is padded by repeating its last frame.
+        # Video-to-video: pin the requested latent frames (the complement starts
+        # from noise). Only the pin mask is derived here — the clean latents are
+        # VAE-encoded by the parallel vae_encoder node and reach the denoise
+        # loop as its ``cond_latents`` input edge (see ``_ingest_cond_latents``).
         if condition_indexes:
-            video = (inputs or {}).get("video_inputs")
-            if not video:
-                raise ValueError(
-                    "Cosmos3 video conditioning was requested but no conditioning video arrived."
-                )
-            tcf = self.config.vae.scale_factor_temporal
-            cpf = min(max(condition_indexes) * tcf + 1, num_frames)
-            clip = video[0]
-            clip = clip[-cpf:] if md.get("condition_video_keep") == "last" else clip[:cpf]
-            if clip.shape[0] < cpf:
-                clip = torch.cat([clip, clip[-1:].expand(cpf - clip.shape[0], -1, -1, -1)], dim=0)
-            prefix_latents = self._encode_conditioning_video(clip, height, width, cpf, device)
             latent_shape = st["latent_shape"]
             dtype = self.transformer.proj_in.weight.dtype
             vmask = torch.zeros((1, 1, latent_shape[2], 1, 1), device=device, dtype=dtype)
-            cond_video_latents = torch.zeros(latent_shape, device=device, dtype=dtype)
             for f in condition_indexes:
                 vmask[:, :, f] = 1.0
-                cond_video_latents[:, :, f] = prefix_latents[:, :, f].to(dtype)
             st.add("vmask", vmask)
-            st.add("cond_video_latents", cond_video_latents)
 
         return node_inputs
 
@@ -419,45 +391,30 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             ),
         )
 
-    def _encode_conditioning(self, image, height, width, num_frames, device, anchor_only=False):
-        """VAE-encode a conditioning frame into clean anchor latents.
-
-        Mirrors the fused pipeline's image-to-video latent prep: the frame is
-        resized and normalized to [-1, 1], repeat-padded across the clip, and
-        Wan-VAE encoded with the pipeline-side latent normalization. Latent
-        frame 0 is the clean anchor the denoise loop keeps fixed.
-
-        Image-to-video only consumes latent frame 0, and the Wan VAE encodes
-        frame 0 as a standalone causal anchor, so ``anchor_only`` skips the
-        repeat-pad and encodes the single frame (a bit-identical frame 0)
-        instead of the whole clip — at video lengths the full encode is the
-        bulk of the conditioning cost. The encode runs in fp32 outside autocast:
-        the VAE's 3D convs are far faster in fp32 (TF32) than bf16 on this cuDNN
-        and the reference pipeline encodes in fp32 (matching the decoder)."""
-        from diffusers.video_processor import VideoProcessor
-
-        vae = self.vae
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
-        dtype = self.transformer.proj_in.weight.dtype
-        if self._video_processor is None:
-            self._video_processor = VideoProcessor(
-                vae_scale_factor=self.config.vae.scale_factor_spatial, resample="bilinear"
-            )
-        # load_image gives [C, H, W] in [0, 1]; preprocess -> [1, 3, H, W] in [-1, 1].
-        frame = self._video_processor.preprocess(image, height=height, width=width).to(
-            device=device, dtype=torch.float32
-        )
-        vision = frame.unsqueeze(2)
-        if num_frames > 1 and not anchor_only:
-            vision = vision.expand(-1, -1, num_frames, -1, -1)
-        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device)).view(
-            1, -1, 1, 1, 1
-        )
-        with torch.autocast(device_type=vision.device.type, enabled=False):
-            raw_mu = vae.encode(vision).latent_dist.mode()
-        return ((raw_mu - mean) * inv_std).to(dtype)
+    def _ingest_cond_latents(self, st, inputs, device) -> None:
+        """First denoise iteration: adopt the vae_encoder node's conditioning
+        latents (the gen walk's ``cond_latents`` edge; empty for unconditioned
+        requests). Video/action conditioning stores the full-latent-shape
+        pinned latents under ``cond_video_latents``; image-to-video stores the
+        single-frame anchor under ``cond_latents``. An action request without
+        visual conditioning pins zeros (matching its all-zero clean anchors);
+        a video-conditioned request whose video never arrived cannot serve."""
+        incoming = (inputs or {}).get("cond_latents")
+        latents = incoming[0].to(device) if incoming else None
+        if st.get("vmask") is not None:
+            if latents is not None:
+                st.add("cond_video_latents", latents)
+            elif "action_chunk" in st:
+                st.add("cond_video_latents", torch.zeros(
+                    st["latent_shape"], device=device,
+                    dtype=self.transformer.proj_in.weight.dtype,
+                ))
+            else:
+                raise ValueError(
+                    "Cosmos3 video conditioning was requested but no conditioning video arrived."
+                )
+        elif latents is not None:
+            st.add("cond_latents", latents)
 
     def _prepare_action_prefill(
         self, fwd_info, md, inputs, cond_ids, uncond_ids, height, width, fps, gs, steps, device,
@@ -490,18 +447,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if mode == "forward_dynamics":
             action_clean[:] = 1.0
 
-        # Encode the visual conditioning to clean anchor latents: inverse-dynamics
-        # conditions on the whole video (all frames), forward-dynamics / policy on
-        # a single frame (frame 0). The per-mode vmask above selects which latent
-        # frames are kept clean from these.
-        cond_video = (inputs or {}).get("video_inputs")
-        cond_image = (inputs or {}).get("image_inputs")
-        if cond_video:
-            cond_latents = self._encode_conditioning_video(cond_video[0], height, width, num_frames, device)
-        elif cond_image:
-            cond_latents = self._encode_conditioning(cond_image[0], height, width, num_frames, device)
-        else:
-            cond_latents = torch.zeros(latent_shape, device=device, dtype=dtype)
+        # The visual conditioning (inverse-dynamics: the whole observed video;
+        # forward-dynamics / policy: the conditioning frame) is VAE-encoded by
+        # the parallel vae_encoder node and reaches the denoise loop as its
+        # ``cond_latents`` input edge; the per-mode vmask above selects which
+        # latent frames are kept clean from it.
 
         # Forward-dynamics conditions on a clean action chunk supplied with the
         # request; the other modes predict the action (clean values are zero).
@@ -534,47 +484,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             domain_t=torch.tensor([domain_id], dtype=torch.long, device=device),
             vmask=vmask,
             action_clean_mask=action_clean,
-            cond_video_latents=cond_latents,
             clean_action=clean_action,
         )
         return node_inputs
 
-    def _encode_conditioning_video(self, video, height, width, num_frames, device):
-        """VAE-encode a conditioning video clip into clean anchor latents.
-
-        Used by action inverse-dynamics, which conditions on the whole observed
-        clip. load_video gives [T, C, H, W] in [0, 1]; each frame is resized and
-        normalized to [-1, 1] (matching the fused pipeline) and the clip is
-        Wan-VAE encoded with the pipeline-side latent normalization."""
-        from diffusers.video_processor import VideoProcessor
-
-        vae = self.vae
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
-        dtype = self.transformer.proj_in.weight.dtype
-        if self._video_processor is None:
-            self._video_processor = VideoProcessor(
-                vae_scale_factor=self.config.vae.scale_factor_spatial, resample="bilinear"
-            )
-        clip = video[:num_frames]
-        frames = [
-            self._video_processor.preprocess(clip[i], height=height, width=width).squeeze(0)
-            for i in range(clip.shape[0])
-        ]
-        # fp32 outside autocast: the VAE 3D convs are much faster in fp32 (TF32)
-        # than bf16 on this cuDNN, and the reference pipeline encodes in fp32.
-        vision = torch.stack(frames, dim=1).unsqueeze(0).to(device=device, dtype=torch.float32)  # [1,3,T,H,W]
-        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device)).view(
-            1, -1, 1, 1, 1
-        )
-        with torch.autocast(device_type=vision.device.type, enabled=False):
-            raw_mu = vae.encode(vision).latent_dist.mode()
-        return ((raw_mu - mean) * inv_std).to(dtype)
-
     def _prepare_image_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
         st = self.request_states[fwd_info.request_id]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
+            self._ingest_cond_latents(st, inputs, device)
             gen = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
             latents = torch.randn(
                 st["latent_shape"], generator=gen, device=device, dtype=self.transformer.proj_in.weight.dtype
@@ -623,6 +540,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _prepare_video_sound_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
         st = self.request_states[fwd_info.request_id]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
+            self._ingest_cond_latents(st, inputs, device)
             # First iteration: video noise first, then sound noise from the same
             # generator (the reference pipeline's RNG order), so the video band
             # of a sound request is bit-identical to the same-seed video-only
@@ -658,6 +576,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _prepare_action_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
         st = self.request_states[fwd_info.request_id]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
+            self._ingest_cond_latents(st, inputs, device)
             # First iteration: build the joint [video | action] latents. Per the
             # mode masks, conditioning frames/action are clean and the predicted
             # ones start from noise; the clean anchors are then carried in the
@@ -1714,6 +1633,137 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if iter_idx + 1 >= len(st["scheduler"].timesteps):
             return {loop}
         return set()
+
+
+class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
+    """Wan VAE conditioning-encode node (STATELESS): the request's conditioning
+    image or video -> clean anchor latents for the denoise loop.
+
+    Runs in parallel with the DiT's understanding-tower prefill (the conditioned
+    prefill walks put the two nodes in a ``Parallel`` section) and emits
+    ``cond_latents`` as a persist signal the conductor threads into the
+    generation walk's first iteration. Everything is re-derived from the request
+    metadata so the node stays stateless and placeable on any rank. Per mode:
+      - image-to-video: the single conditioning frame, encoded standalone (the
+        Wan VAE is temporally causal, so frame 0 encodes bit-identically alone);
+      - action policy / forward-dynamics: the frame repeated across the clip,
+        full-clip encoded (mirrors the reference pipelines);
+      - action inverse-dynamics: the whole observed clip;
+      - video-to-video: the ``condition_video_keep`` prefix (short clips padded
+        by repeating the last frame), encoded and scattered into the pinned
+        frames of a full-latent-shape tensor (zeros elsewhere).
+    """
+
+    # One-shot per-request encode at request-specific shapes; nothing to gain
+    # from compiling the submodule wrapper.
+    disable_torch_compile = True
+
+    def __init__(self, vae, config):
+        super().__init__()
+        # Dedicated fp32 instance (not shared with the decoder node): encode
+        # runs in fp32 everywhere — the VAE's 3D convs are far faster in fp32
+        # (TF32) than bf16 on pre-9.16 cuDNN and the reference pipeline encodes
+        # in fp32 — while the decoder's dtype is cuDNN-gated (bf16 from 9.16).
+        # Sharing one instance would re-cast the full VAE weights on every
+        # encode/decode interleave on bf16-decode stacks.
+        self.vae = vae
+        self.config = config
+        self._video_processor = None
+
+    def _latent_t(self, num_frames: int) -> int:
+        return 1 if num_frames == 1 else 1 + (num_frames - 1) // self.config.vae.scale_factor_temporal
+
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+        """Shape the conditioning pixels for the encode: mode-dependent frame
+        selection/padding plus the [-1, 1] resize-normalize, all derived from
+        the request metadata (no per-request state)."""
+        from diffusers.video_processor import VideoProcessor
+
+        md = fwd_info.step_metadata
+        height, width = int(md.get("height", 256)), int(md.get("width", 256))
+        num_frames = int(md.get("num_frames", 1))
+        is_action = bool(md.get("action_mode"))
+        device = self.get_device()
+        if self._video_processor is None:
+            self._video_processor = VideoProcessor(
+                vae_scale_factor=self.config.vae.scale_factor_spatial, resample="bilinear"
+            )
+
+        out_kwargs: dict = {}
+        video = (inputs or {}).get("video_inputs")
+        image = (inputs or {}).get("image_inputs")
+        if video:
+            # load_video gives [T, C, H, W] in [0, 1].
+            clip = video[0]
+            condition_indexes = None if is_action else md.get("condition_frame_indexes_vision")
+            if condition_indexes:
+                # Video-to-video: only the first max(indexes)*tcf + 1 pixel
+                # frames feed the pinned latent frames (the Wan VAE is
+                # temporally causal), taken from the start or end of the input
+                # per ``condition_video_keep``; a shorter input is padded by
+                # repeating its last frame. The forward scatters the encoded
+                # prefix into the pinned frames of the full latent length.
+                tcf = self.config.vae.scale_factor_temporal
+                cpf = min(max(condition_indexes) * tcf + 1, num_frames)
+                clip = clip[-cpf:] if md.get("condition_video_keep") == "last" else clip[:cpf]
+                if clip.shape[0] < cpf:
+                    clip = torch.cat([clip, clip[-1:].expand(cpf - clip.shape[0], -1, -1, -1)], dim=0)
+                s = self.config.vae.scale_factor_spatial
+                out_kwargs = {
+                    "condition_indexes": tuple(condition_indexes),
+                    "latent_shape": (
+                        1, self.config.latent_channel, self._latent_t(num_frames),
+                        height // s, width // s,
+                    ),
+                }
+            else:
+                # Action inverse-dynamics: the whole observed clip.
+                clip = clip[:num_frames]
+            frames = [
+                self._video_processor.preprocess(clip[i], height=height, width=width).squeeze(0)
+                for i in range(clip.shape[0])
+            ]
+            vision = torch.stack(frames, dim=1).unsqueeze(0).to(device=device, dtype=torch.float32)
+        elif image:
+            # load_image gives [C, H, W] in [0, 1]; preprocess -> [1, 3, H, W] in [-1, 1].
+            frame = self._video_processor.preprocess(image[0], height=height, width=width).to(
+                device=device, dtype=torch.float32
+            )
+            vision = frame.unsqueeze(2)
+            if is_action and num_frames > 1:
+                # Policy / forward-dynamics condition on latent frame 0 but the
+                # reference pipelines encode the frame repeated across the whole
+                # clip; keep that math. Image-to-video encodes the single frame
+                # (bit-identical frame 0 under the causal Wan VAE).
+                vision = vision.expand(-1, -1, num_frames, -1, -1)
+        else:
+            raise ValueError("Cosmos3 vae_encoder received neither an image nor a video conditioning input.")
+        return NodeInputs(tensor_inputs={"vision": vision}, kwargs=out_kwargs)
+
+    def forward(
+        self, graph_walk, engine_inputs: ModelInputsFromEngine, vision,
+        condition_indexes=None, latent_shape=None, **kwargs,
+    ):
+        vae = self.vae
+        # The engine may cast the submodule; re-assert the fp32 encode weights.
+        if next(vae.parameters()).dtype != torch.float32:
+            vae.float()
+        device = vision.device
+        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, -1, 1, 1, 1)
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device)).view(
+            1, -1, 1, 1, 1
+        )
+        # fp32 outside autocast; pipeline-side latent normalization; the DiT
+        # consumes the latents in its bf16 checkpoint dtype.
+        with torch.autocast(device_type=device.type, enabled=False):
+            raw_mu = vae.encode(vision).latent_dist.mode()
+        latents = ((raw_mu - mean) * inv_std).to(torch.bfloat16)
+        if condition_indexes:
+            full = torch.zeros(latent_shape, device=device, dtype=latents.dtype)
+            for f in condition_indexes:
+                full[:, :, f] = latents[:, :, f]
+            latents = full
+        return {"cond_latents": [latents]}
 
 
 class Cosmos3AudioDecoderSubmodule(NodeSubmodule):

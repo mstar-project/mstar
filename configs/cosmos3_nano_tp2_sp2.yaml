@@ -20,5 +20,5 @@ node_groups:
     ranks: [0, 1, 2, 3]
     tp_size: 2
     sp_size: 2
-  - node_names: ["vae_decoder", "audio_decoder"]
+  - node_names: ["vae_encoder", "vae_decoder", "audio_decoder"]
     ranks: [0]

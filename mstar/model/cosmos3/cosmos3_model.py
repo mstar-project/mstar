@@ -11,6 +11,9 @@ Nodes (2 for image generation):
                                generation tower runs the denoise loop, reading
                                that frozen K/V each step (it is timestep-
                                independent, so caching it once is exact).
+    vae_encoder  (stateless) - Wan VAE: conditioning image/video -> clean
+                               anchor latents, in parallel with the prefill
+                               (conditioned requests only).
     vae_decoder  (stateless) - Wan VAE: final latents -> pixels.
 
 Graph walks (image generation):
@@ -46,7 +49,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.config import Cosmos3Config
@@ -59,11 +62,13 @@ from mstar.model.cosmos3.submodules import (
     Cosmos3AudioDecoderSubmodule,
     Cosmos3DiTSubmodule,
     Cosmos3VAEDecoderSubmodule,
+    Cosmos3VAEEncoderSubmodule,
 )
 
 logger = logging.getLogger(__name__)
 
 DIT_NODE = "dit"
+VAE_ENCODER_NODE = "vae_encoder"
 VAE_DECODER_NODE = "vae_decoder"
 AUDIO_DECODER_NODE = "audio_decoder"
 
@@ -193,6 +198,7 @@ class Cosmos3Model(Model):
     def get_node_engine_types(self) -> dict[str, EngineType]:
         types = {
             DIT_NODE: EngineType.KV_CACHE,
+            VAE_ENCODER_NODE: EngineType.STATELESS,
             VAE_DECODER_NODE: EngineType.STATELESS,
         }
         if self._sound_serving_enabled():
@@ -220,22 +226,33 @@ class Cosmos3Model(Model):
             outputs=[],
         )
 
-        # prefill_cond: like prefill, but image-to-video also hands the DiT node
-        # the conditioning image, which it VAE-encodes into the clean anchor
-        # latents that seed the denoise loop (stashed on the per-request state).
-        prefill_cond = GraphNode(
-            name=DIT_NODE,
-            input_names=["text_inputs", "image_inputs"],
-            outputs=[],
-        )
+        # prefill_cond: the DiT prefills the text prompt while, in parallel, the
+        # vae_encoder node encodes the conditioning image into the clean anchor
+        # latents that seed the denoise loop. The latents come back to the
+        # conductor as a persist signal and enter the generation walk as its
+        # ``cond_latents`` input edge.
+        def _prefill_cond_walk(cond_input: str) -> Parallel:
+            return Parallel(
+                [
+                    GraphNode(name=DIT_NODE, input_names=["text_inputs"], outputs=[]),
+                    GraphNode(
+                        name=VAE_ENCODER_NODE,
+                        input_names=[cond_input],
+                        outputs=[
+                            GraphEdge(
+                                next_node=EMPTY_DESTINATION,
+                                name="cond_latents",
+                                persist=True,
+                            ),
+                        ],
+                    ),
+                ]
+            )
 
-        # prefill_cond_video: action inverse-dynamics conditions on a whole video,
-        # which the DiT VAE-encodes into the clean anchor latents for the loop.
-        prefill_cond_video = GraphNode(
-            name=DIT_NODE,
-            input_names=["text_inputs", "video_inputs"],
-            outputs=[],
-        )
+        prefill_cond = _prefill_cond_walk("image_inputs")
+        # prefill_cond_video: video conditioning (action inverse-dynamics /
+        # video-to-video) encodes the request video instead.
+        prefill_cond_video = _prefill_cond_walk("video_inputs")
 
         # image_gen: denoising loop -> VAE decode -> emit image. The loop body
         # threads the latents + denoise-step index back to itself each iteration;
@@ -259,9 +276,15 @@ class Cosmos3Model(Model):
                         # ready requests at this node into one batched denoise
                         # step (see can_batch/forward_batched). Mirrors the BAGEL
                         # image-gen loop nodes.
+                        # ``cond_latents`` is the loop's external input (no
+                        # loop-back edge produces it): the vae_encoder node's
+                        # persist signal enters once at the walk transition —
+                        # empty for unconditioned requests — and the loop
+                        # re-presents the same worker-local tensor each
+                        # iteration (no per-step transfer).
                         section=GraphNode(
                             name=DIT_NODE,
-                            input_names=["latents", "time_index"],
+                            input_names=["latents", "time_index", "cond_latents"],
                             outputs=[
                                 GraphEdge(next_node=DIT_NODE, name="latents"),
                                 GraphEdge(next_node=DIT_NODE, name="time_index"),
@@ -301,7 +324,7 @@ class Cosmos3Model(Model):
                     name=VIDEO_SOUND_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "sound_latents", "time_index"],
+                        input_names=["latents", "sound_latents", "time_index", "cond_latents"],
                         outputs=[
                             GraphEdge(next_node=DIT_NODE, name="latents"),
                             GraphEdge(next_node=DIT_NODE, name="sound_latents"),
@@ -355,7 +378,7 @@ class Cosmos3Model(Model):
                     name=ACTION_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "action_latents", "time_index"],
+                        input_names=["latents", "action_latents", "time_index", "cond_latents"],
                         outputs=[
                             GraphEdge(next_node=DIT_NODE, name="latents"),
                             GraphEdge(next_node=DIT_NODE, name="action_latents"),
@@ -391,7 +414,7 @@ class Cosmos3Model(Model):
                     name=ACTION_VIDEO_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "action_latents", "time_index"],
+                        input_names=["latents", "action_latents", "time_index", "cond_latents"],
                         outputs=[
                             GraphEdge(next_node=DIT_NODE, name="latents"),
                             GraphEdge(next_node=DIT_NODE, name="action_latents"),
@@ -749,7 +772,7 @@ class Cosmos3Model(Model):
             inputs.append(edge)
         cond_signal = "video_inputs" if video_cond else ("image_inputs" if image_cond else None)
         if cond_signal:
-            edge = GraphEdge(next_node=DIT_NODE, name=cond_signal)
+            edge = GraphEdge(next_node=VAE_ENCODER_NODE, name=cond_signal)
             edge.tensor_info = input_signals[cond_signal]
             inputs.append(edge)
 
@@ -807,6 +830,12 @@ class Cosmos3Model(Model):
                 inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="action_latents"))
             elif metadata.graph_walk == self.VIDEO_SOUND_GEN_WALK:
                 inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="sound_latents"))
+            # The vae_encoder node's clean conditioning latents (persisted at
+            # the conductor during the prefill walk) seed the loop's first
+            # iteration; unconditioned requests carry an empty edge.
+            cond_edge = GraphEdge(next_node=DIT_NODE, name="cond_latents")
+            cond_edge.tensor_info = persist_signals.get("cond_latents", [])
+            inputs.append(cond_edge)
         elif metadata.graph_walk in (
             self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK, self.VIDEO_SOUND_GEN_WALK,
             self.ACTION_GEN_WALK, self.ACTION_VIDEO_GEN_WALK,
@@ -850,7 +879,10 @@ class Cosmos3Model(Model):
                 transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
                 config=self.config,
                 scheduler=self._build_scheduler(),
-                vae=self._build_vae(device),
+            )
+        if node_name == VAE_ENCODER_NODE:
+            return Cosmos3VAEEncoderSubmodule(
+                vae=self._build_encode_vae(device), config=self.config
             )
         if node_name == VAE_DECODER_NODE:
             return Cosmos3VAEDecoderSubmodule(
@@ -905,6 +937,18 @@ class Cosmos3Model(Model):
         vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
         self._vae = vae.to(device).eval()
         return self._vae
+
+    def _build_encode_vae(self, device: str):
+        # The encoder node keeps its own fp32 instance instead of sharing the
+        # decoder's: encode always runs fp32 while the decode dtype is
+        # cuDNN-gated (bf16 from 9.16), so a shared instance would re-cast the
+        # full VAE weights on every encode/decode interleave.
+        if self.skip_weight_loading:
+            return None
+        from diffusers import AutoencoderKLWan
+
+        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
+        return vae.float().to(device).eval()
 
     def _build_sound_tokenizer(self, device: str):
         if self.skip_weight_loading:
