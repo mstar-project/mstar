@@ -13,14 +13,13 @@ V2V_DEFAULT_FLOW_SHIFT = 10.0
 DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 
 PREFILL_WALK = "prefill"
-# Image/video-conditioned generation prefills the same understanding tower, but
-# also VAE-encodes the conditioning frame into a clean anchor latent (see
-# Cosmos3DiTSubmodule._encode_conditioning). It is a separate walk from the
-# text-only prefill because the graph node only fires once all of its declared
-# inputs arrive, so the conditioning image has to be one of them.
+# Image/video-conditioned generation prefills the same understanding tower
+# while, in parallel, the vae_encoder node encodes the conditioning frame into
+# clean anchor latents (Cosmos3VAEEncoderSubmodule). Separate walks from the
+# text-only prefill because they route the conditioning input to the encoder.
 PREFILL_COND_WALK = "prefill_cond"
-# Action inverse-dynamics conditions on a full video rather than a single frame,
-# so it gets its own conditioned prefill that takes the video among its inputs.
+# Action inverse-dynamics / video-to-video condition on a video rather than a
+# single frame, so they get their own conditioned prefill walk.
 PREFILL_COND_VIDEO_WALK = "prefill_cond_video"
 IMAGE_GEN_WALK = "image_gen"
 VIDEO_GEN_WALK = "video_gen"

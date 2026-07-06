@@ -403,21 +403,43 @@ def test_dense_fa3_video_psnr() -> None:
     _check_dense_fa3(VIDEO_FRAMES, "t2v")
 
 
+def _encode_cond(model, md, media, walk):
+    """Drive the vae_encoder node the way the engine does: metadata +
+    image_inputs/video_inputs in, ``cond_latents`` out."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    enc = model.get_submodule("vae_encoder", device="cuda:0")
+    fwd = CurrentForwardPassInfo(
+        request_id="enc", graph_walk=walk, requires_cfg=False, fwd_index=0,
+        random_seed=0, max_tokens=0, sampling_config={}, step_metadata=md,
+    )
+    ei = ModelInputsFromEngine(request_ids=["enc"], per_request_info={"enc": fwd})
+    ni = enc.prepare_inputs(walk, fwd, media)
+    out = enc.forward(walk, ei, **enc.preprocess(walk, ei, [ni]))
+    return out["cond_latents"][0]
+
+
 @torch.no_grad()
 def test_anchor_encode_matches_full() -> None:
-    """Image-to-video only consumes latent frame 0, and the Wan VAE encodes it as
-    a standalone causal anchor, so encoding the single conditioning frame
-    (anchor_only=True) must give a bit-identical frame 0 to encoding the whole
-    repeat-padded clip — at a fraction of the cost."""
+    """Image-to-video only consumes latent frame 0, and the Wan VAE encodes it
+    as a standalone causal anchor, so the encoder node's single-frame i2v encode
+    must give a bit-identical frame 0 to the repeat-padded full-clip encode it
+    runs for action policy / forward-dynamics — at a fraction of the cost."""
     base = _load()
     if base is None:
         print("  (skipped anchor-encode parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
-    dit, device = base["dit"], base["device"]
+    device = base["device"]
     img = torch.rand(3, H, W, device=device)  # [C, H, W] in [0, 1], like load_image
-    anchor = dit._encode_conditioning(img, H, W, VIDEO_FRAMES, device, anchor_only=True)
-    full = dit._encode_conditioning(img, H, W, VIDEO_FRAMES, device, anchor_only=False)
-    assert anchor.shape[2] == 1, f"anchor_only must encode one latent frame, got T={anchor.shape[2]}"
+    md = {"height": H, "width": W, "num_frames": VIDEO_FRAMES, "has_image_condition": True}
+    anchor = _encode_cond(base["model"], md, {"image_inputs": [img]}, "prefill_cond")
+    full = _encode_cond(
+        base["model"],
+        {**md, "action_mode": "policy", "action_chunk_size": VIDEO_FRAMES - 1},
+        {"image_inputs": [img]}, "prefill_cond",
+    )
+    assert anchor.shape[2] == 1, f"i2v must encode one latent frame, got T={anchor.shape[2]}"
     diff = (anchor[:, :, 0].float() - full[:, :, 0].float()).abs().max().item()
     assert diff < 1e-4, f"anchor frame-0 differs from full-clip frame-0 by {diff:.3e} (> 1e-4)"
     print(f"  anchor-encode 1-frame vs full-clip frame-0 abs-max diff = {diff:.3e}")
