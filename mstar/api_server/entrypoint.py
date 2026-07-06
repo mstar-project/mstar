@@ -360,9 +360,25 @@ class APIServer:
                     )
                     rid = result_chunk.request_id
                     with self.request_lock:
-                        self.pending_requests[rid]["chunks"].append(
-                            result_chunk
-                        )
+                        req = self.pending_requests.get(rid)
+                        if req is None:
+                            # Client already finished (timeout/pop); don't let a
+                            # late chunk KeyError abort the processing tick.
+                            logger.warning(
+                                "Result chunk for %s arrived after the client "
+                                "finished; dropping it", rid,
+                            )
+                            continue
+                        req["chunks"].append(result_chunk)
+                        if result_chunk.modality == "error":
+                            # Preprocessing failed before the request reached
+                            # the conductor; release the waiting client with
+                            # the error instead of letting it time out.
+                            req["error"] = result_chunk.data.decode("utf-8", "replace")
+                            req["error_status"] = int(
+                                (result_chunk.metadata or {}).get("status", 500)
+                            )
+                            req["event"].set()
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
@@ -454,9 +470,12 @@ class APIServer:
             raise HTTPException(status_code=500, detail="Request timed out")
 
         with self.request_lock:
-            chunks = self.pending_requests[request_id]["chunks"][:]
-            self.pending_requests.pop(request_id, None)
-        return chunks
+            req = self.pending_requests.pop(request_id, None) or {}
+        if req.get("error") is not None:
+            raise HTTPException(
+                status_code=req.get("error_status", 500), detail=req["error"]
+            )
+        return list(req.get("chunks", []))
 
     # ----------------------------------------------------------
     # Cleanup
