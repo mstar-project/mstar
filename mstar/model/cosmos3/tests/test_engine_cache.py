@@ -666,6 +666,9 @@ def _run_cuda_graph_denoise(ctx):
             graph_walk="image_gen", requires_cfg=False, request_ids=[rid],
             inputs=[ni], per_request_info={rid: fwd}, submodule=dit,
         )
+        # The engine finishes the captured step (CFG combine + scheduler) in
+        # the submodule's postprocess right after replay; mirror it here.
+        dit.postprocess(rid, fwd, out[rid], inputs=ni)
         latents, time_index = out[rid]["latents"][0], out[rid]["time_index"][0]
     dit.cleanup_request(rid)
     return latents

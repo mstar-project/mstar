@@ -905,11 +905,12 @@ class KVCacheEngine(BaseEngine):
     def postprocess_batch(self, planned: PlannedBatch, output: NodeOutput) -> None:
         batch = planned.batch
         submodule = planned.submodule
-        for rid, info in batch.per_request_info.items():
+        for rid, node_inputs in zip(batch.request_ids, planned.node_inputs, strict=True):
             submodule.postprocess(
                 request_id=rid,
-                request_info=info,
+                request_info=batch.per_request_info[rid],
                 outputs=output.per_request_output_tensors.get(rid, {}),
+                inputs=node_inputs,
             )
 
     def _get_needed_labels(
