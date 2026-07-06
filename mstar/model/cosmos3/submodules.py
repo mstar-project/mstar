@@ -892,6 +892,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_image_gen(self, cm, st, latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            # The loop may dispatch one step past this request's own count
+            # before its stop signal lands; that step is a no-op.
+            return {"latents": [latents], "time_index": [time_index]}
         t = scheduler.timesteps[step_index]
         vision_timesteps = torch.full((st["num_noisy"],), t.item(), device=latents.device)
 
@@ -956,6 +960,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_video_sound_gen(self, cm, st, latents, sound_latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            # One-past-the-end dispatch before the stop signal lands: no-op.
+            return {
+                "latents": [latents],
+                "sound_latents": [sound_latents],
+                "time_index": [time_index],
+            }
         t = scheduler.timesteps[step_index]
         vts = torch.full((st["num_noisy"],), t.item(), device=latents.device)
         sts = torch.full((st["num_sound"],), t.item(), device=latents.device)
@@ -1052,6 +1063,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_action_gen(self, cm, st, latents, action_latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
+        if step_index >= len(scheduler.timesteps):
+            # One-past-the-end dispatch before the stop signal lands: no-op.
+            return {
+                "latents": [latents],
+                "action_latents": [action_latents],
+                "time_index": [time_index],
+            }
         t = scheduler.timesteps[step_index]
         device = latents.device
         vts = torch.full((st["num_noisy"],), t.item(), device=device)

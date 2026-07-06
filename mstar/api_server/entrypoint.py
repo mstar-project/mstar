@@ -277,19 +277,27 @@ class APIServer:
 
     def _prune_recently_completed(self) -> None:
         now = time.time()
-        stale = [
-            rid
-            for rid, ts in self.recently_completed.items()
-            if (
-                (not self.preprocess_worker.has_pending_tensors(rid)) \
-                    and self.preprocess_worker.received_final_chunks(
-                        rid, self.pending_requests[rid]["final_outputs"]
-                    )
-            ) or (now - ts) >= self._recently_completed_ttl
-        ]
+        stale = []
+        for rid, ts in self.recently_completed.items():
+            # The client handler pops pending_requests on its own timeout (and
+            # a streaming client after its final flush), so the entry can be
+            # gone while the rid is still here — clean up immediately then,
+            # instead of KeyError-ing the whole message-processing tick.
+            req = self.pending_requests.get(rid)
+            drained = (
+                req is not None
+                and not self.preprocess_worker.has_pending_tensors(rid)
+                and self.preprocess_worker.received_final_chunks(
+                    rid, req["final_outputs"]
+                )
+            )
+            if drained or req is None or (now - ts) >= self._recently_completed_ttl:
+                stale.append(rid)
         for rid in stale:
             # only set the event when there are no more pending chunks
-            self.pending_requests[rid]["event"].set()
+            req = self.pending_requests.get(rid)
+            if req is not None:
+                req["event"].set()
             self.preprocess_worker.cleanup_request(rid)
             self.recently_completed.pop(rid, None)
 
@@ -321,10 +329,26 @@ class APIServer:
                             elif message.message_type == "request_complete":
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
+                                if not message.body.final_outputs:
+                                    logger.warning(
+                                        "Request %s completed with no reported "
+                                        "outputs; holding for late results "
+                                        "until the cleanup TTL", rid,
+                                    )
                                 self.pending_requests[rid]["final_outputs"] = \
                                     message.body.final_outputs
                         elif rid in self.recently_completed:
-                            logger.debug("Late message for completed %s: %s", rid, message.message_type)
+                            if message.message_type == "result_tensors":
+                                # The client already finished (popped the
+                                # request), so these tensors have no delivery
+                                # path — the completion-vs-results reorder
+                                # window was hit.
+                                logger.warning(
+                                    "Result tensors for %s arrived after the "
+                                    "client finished; dropping them", rid,
+                                )
+                            else:
+                                logger.debug("Late message for completed %s: %s", rid, message.message_type)
                         else:
                             logger.warning(
                                 "Message for unknown request %s: %s", rid, message.message_type
