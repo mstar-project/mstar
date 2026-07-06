@@ -130,12 +130,69 @@ class ARNodeInputs(NodeInputs):
 
 
 @dataclass
+class PerRequestState:
+    """Engine-owned per-request state a submodule persists across forwards.
+
+    Submodules stash whatever a request's later steps need (schedulers,
+    conditioning latents, packing metadata) instead of keeping private
+    ``dict[request_id, ...]`` attributes. The engine owns the lifecycle: it
+    injects the batch's states via ``ModelInputsFromEngine.per_request_states``
+    and drops a request's state when the request is removed — no submodule
+    cleanup code required.
+
+    ``tensors`` vs ``kwargs`` split by value kind: device tensors go in
+    ``tensors``, everything else (numbers, dicts, scheduler objects) in
+    ``kwargs``. ``disag_shared_keys`` is reserved for PD disaggregation —
+    marked keys would travel with the request (tensors via the tensor
+    manager, kwargs with the forward-pass info); no engine implements the
+    transfer yet.
+    """
+
+    tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    disag_shared_keys: set[str] = field(default_factory=set)
+
+    def add(self, key: str, value) -> None:
+        if isinstance(value, torch.Tensor):
+            self.kwargs.pop(key, None)
+            self.tensors[key] = value
+        else:
+            self.tensors.pop(key, None)
+            self.kwargs[key] = value
+
+    def add_all(self, **kwargs) -> None:
+        for key, value in kwargs.items():
+            self.add(key, value)
+
+    def remove(self, keys) -> None:
+        for key in ([keys] if isinstance(keys, str) else keys):
+            self.tensors.pop(key, None)
+            self.kwargs.pop(key, None)
+
+    def get(self, key: str, default=None):
+        if key in self.tensors:
+            return self.tensors[key]
+        return self.kwargs.get(key, default)
+
+    def __getitem__(self, key: str):
+        if key in self.tensors:
+            return self.tensors[key]
+        return self.kwargs[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.tensors or key in self.kwargs
+
+
+@dataclass
 class ModelInputsFromEngine:
     request_ids: list[str]
     per_request_info: dict[str, CurrentForwardPassInfo]
     cache_manager: BatchedCacheManager | None = None
     preallocated_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
     sampler: BaseSampler | None = None
+    # The batch's per-request states, injected by the engine (None on paths
+    # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
+    per_request_states: dict[str, PerRequestState] | None = None
 
     @property
     @torch.compiler.disable
@@ -164,6 +221,22 @@ class NodeSubmodule(torch.nn.Module):
     # forward where the trace cost dwarfs the win. The KV-cache / stateless
     # engines skip compiling such submodules (CUDA-graph capture is unaffected).
     disable_torch_compile: bool = False
+
+    def __init__(self):
+        super().__init__()
+        # Per-request state store. prepare_inputs-time code (no engine inputs
+        # in scope) reaches it via ``request_state``; preprocess/forward read
+        # the engine-injected ``ModelInputsFromEngine.per_request_states`` view
+        # of the same objects. The engine removes a request's entry via
+        # ``cleanup_request`` when the request is removed.
+        self.request_states: dict[str, PerRequestState] = {}
+
+    def request_state(self, request_id: str) -> PerRequestState:
+        """The request's state, created on first access."""
+        state = self.request_states.get(request_id)
+        if state is None:
+            state = self.request_states[request_id] = PerRequestState()
+        return state
 
     def get_device(self):
         return next(self.parameters()).device
@@ -339,8 +412,10 @@ class NodeSubmodule(torch.nn.Module):
         return set()
 
     def cleanup_request(self, request_id: str):
-        """Remove per-request state when a request completes."""
-        return
+        """Remove per-request state when a request completes. The engines call
+        this on request removal; overrides with extra internal state should
+        call super()."""
+        self.request_states.pop(request_id, None)
 
 
 class ARNodeSubmodule(NodeSubmodule):

@@ -146,7 +146,7 @@ def test_dynamic_loop_check_stop_and_wasted_step() -> None:
             self.timesteps = list(range(n))
 
     n = 4
-    dit._req["r"] = {"scheduler": _Sched(n), "raw_action_dim": 2}
+    dit.request_state("r").add_all(scheduler=_Sched(n), raw_action_dim=2)
 
     def info(walk, it):
         return types.SimpleNamespace(
@@ -165,12 +165,12 @@ def test_dynamic_loop_check_stop_and_wasted_step() -> None:
     # touching the transformer or cache manager (both None here).
     lat = torch.zeros(1, 4, 1, 2, 2)
     ti = torch.tensor([n])
-    out = dit._forward_image_gen(None, dit._req["r"], latents=lat, time_index=ti)
+    out = dit._forward_image_gen(None, dit.request_states["r"], latents=lat, time_index=ti)
     assert torch.equal(out["latents"][0], lat) and torch.equal(out["time_index"][0], ti)
 
     act = torch.zeros(1, 3, 5)
     out = dit._forward_action_gen(
-        None, dit._req["r"], latents=lat, action_latents=act, time_index=ti
+        None, dit.request_states["r"], latents=lat, action_latents=act, time_index=ti
     )
     assert torch.equal(out["latents"][0], lat)
     # The action latents (the looped self-edge the loop emits on finish) pass

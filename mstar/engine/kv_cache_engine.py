@@ -438,7 +438,10 @@ class KVCacheEngine(BaseEngine):
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
             cache_manager=cache_manager,
-            sampler=sampler
+            sampler=sampler,
+            per_request_states={
+                rid: submodule.request_state(rid) for rid in batch.request_ids
+            },
         )
         if self.enable_nvtx:
             range_push("ar.batched.preprocess", synchronize=False)
@@ -522,6 +525,7 @@ class KVCacheEngine(BaseEngine):
                 },
                 cache_manager=cache_manager,
                 sampler=sampler,
+                per_request_states={rid: submodule.request_state(rid)},
             )
 
             if self.enable_nvtx:
@@ -1090,6 +1094,7 @@ class KVCacheEngine(BaseEngine):
                 cache_mgmt.cpu_page_pool.remove_request(request_id)
             cache_mgmt.alloc_manager.remove_request(request_id)
             submodule_mgmt.sampler.remove_request(request_id)
+            submodule_mgmt.submodule.cleanup_request(request_id)
             if submodule_mgmt.cuda_graph_runner is not None:
                 submodule_mgmt.cuda_graph_runner.unregister_request(request_id)
 

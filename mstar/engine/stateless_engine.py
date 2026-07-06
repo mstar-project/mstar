@@ -426,6 +426,9 @@ class StatelessEngine(BaseEngine):
         engine_inputs = ModelInputsFromEngine(
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
+            per_request_states={
+                rid: submodule.request_state(rid) for rid in batch.request_ids
+            },
         )
 
         if self.enable_nvtx:
