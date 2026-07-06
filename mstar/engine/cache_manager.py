@@ -1,28 +1,10 @@
-import os
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import torch
 
 from mstar.engine.kv_store import KVCacheConfig, KVRequestState, PagedAllocationManager
 from mstar.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPrefillWrapper
-
-# Run the non-causal generation attention as a dense FlashAttention-3 pass over a
-# contiguous [frozen-prefix | fresh] sequence instead of the paged FlashInfer
-# prefill. Diffusion recomputes every generation K/V each step (only the tiny
-# text prefix is reused), so the paged path's per-step full-buffer K/V write is
-# pure overhead here; a dense pass gathers the small prefix, concatenates it with
-# the freshly projected K/V, and runs one varlen kernel — which is also the
-# faster attention kernel at these shapes. Eager-only (the captured image path
-# keeps the paged wrapper) and single-request only (the launch-overhead it
-# removes is what matters at bs=1; bs>1 amortizes the plan and grows the
-# per-request prefix gather, so it stays on the paged path). Defaults to the
-# model's KVCacheConfig.dense_gen_attn; COSMOS3_DENSE_FA3 overrides per plan for
-# A/B parity ("0"/"false"/"off" forces paged, any other value forces dense).
-def _dense_gen_attn_enabled(config_default: bool) -> bool:
-    env = os.environ.get("COSMOS3_DENSE_FA3")
-    if env:
-        return env.lower() not in ("0", "false", "no", "off")
-    return config_default
 
 
 @dataclass
@@ -54,10 +36,10 @@ class _PlanState:
     seq_lens: list[int] | None = None
     write_store: bool = True
     custom_pos_advance: list[int] | None = None
-    # Set when the dense generation-attention path is active for this label: the
-    # per-segment gather indices + varlen cu_seqlens needed to attend each
-    # generation segment over its contiguous frozen prefix. None on causal
-    # (prefill) plans, which keep the paged path. See _build_dense_gen_plan.
+    # Set when DenseGenCacheManager planned this label dense: the per-segment
+    # gather indices + varlen cu_seqlens needed to attend each generation
+    # segment over its contiguous frozen prefix. None on paged plans, which
+    # keep the FlashInfer path. See DenseGenCacheManager._build_dense_gen_plan.
     dense_gen: dict | None = None
 
 
@@ -82,17 +64,22 @@ class BatchedCfgInfo:
     per_label_seq_len: dict[str, list[int]]
 
 
-class BatchedCacheManager:
-    """Manages batched FlashInfer attention for multiple requests simultaneously.
+class BatchedCacheManager(ABC):
+    """Attention/KV-cache backend interface for batched multi-request forwards.
+
+    Owns the backend-agnostic machinery: per-label plan state, active-label
+    switching, RoPE position planning/application, sequence-length stepping,
+    KV snapshots, store flushes, and the qo_indptr accessor. Concrete backends
+    implement the attention ops (``plan_attention``,
+    ``plan_attention_batched_cfg``, ``run_attention``); ``ATTENTION_BACKENDS``
+    maps ``KVCacheConfig.attention_backend`` names to backend classes and
+    ``create_cache_manager`` instantiates the configured one.
 
     Replaces per-request CacheHandle for decode and simple prefill batches where
-    all requests use the same graph_walk. Constructs batch-level FlashInfer index
-    tensors (qo_indptr, paged_kv_indptr, paged_kv_indices) and issues a single
-    FlashInfer call per layer instead of N separate calls.
-
-    Keep existing CacheHandle for backward compatibility — complex paths like
-    image_gen (3-pass CFG with label switching) continue using per-request
-    CacheHandle.
+    all requests use the same graph_walk. Constructed per batch: one manager
+    serves the whole batch with a single attention call per layer instead of N
+    per-request calls. Complex paths like image_gen (3-pass CFG with label
+    switching) continue using per-request CacheHandle.
     """
 
     def __init__(
@@ -167,6 +154,12 @@ class BatchedCacheManager:
         label = label or self.active_labels.get(request_id, "main")
         return self.alloc_manager.get_state(request_id, label)
 
+    def _active_label(self) -> str:
+        """The single label all requests are currently on (asserts uniformity)."""
+        labels = list(self.active_labels.values())
+        assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
+        return labels[0]
+
     @torch.compiler.disable
     def set_active_labels(self, labels: dict[str, str]) -> None:
         """Switch active cache labels for all requests at once."""
@@ -195,6 +188,7 @@ class BatchedCacheManager:
             return None
         return getattr(ps.wrapper, "_qo_indptr_buf", None)
 
+    @abstractmethod
     def plan_attention(
         self,
         seq_lens: list[int] | None = None,
@@ -202,237 +196,67 @@ class BatchedCacheManager:
         is_causal=True,
         write_store: bool=True,
         label: str | None = None,
+        **kwargs,
     ):
-        """Pre-compute FlashInfer plan and page positions for a cache label.
+        """Pre-compute the attention plan for a cache label.
 
-        Allocates pages, computes page_indices/page_offsets/token_offsets for
-        vectorized KV writes, builds FlashInfer index tensors, and plans the
-        wrapper. All state is stored in _plan_states[label].
-
-        In CUDA graph mode, uses the persistent wrapper from _plan_states
-        (pre-built by CudaGraphRunner) and calls its plan() method which
-        updates static buffers via .copy_(). In eager mode, creates a new
-        wrapper each call.
+        Backend-specific planning hints (e.g. ``DenseGenCacheManager``'s
+        ``dense_gen``) pass through ``**kwargs``; backends ignore hints they
+        don't implement.
 
         Args:
             seq_lens: number of new tokens per request.
-            dtype: query data type for FlashInfer.
+            dtype: query data type.
             is_causal: whether attention is causal.
+            write_store: whether run_attention may flush this label to store.
             label: cache label to plan for. If None, uses the current active label.
         """
-        from mstar.utils.profiler import range_pop, range_push
-        self._batched_cfg_info = None
 
-        if self.enable_nvtx:
-            range_push("cache.plan_attention", synchronize=False)
-        try:
-            effective_label = label
-            if effective_label is None:
-                labels = list(self.active_labels.values())
-                assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
-                effective_label = next(iter(self.active_labels.values()))
-            if effective_label in self._pre_planned_labels:
-                # Fast path: plan was pre-computed by Worker.plan_executor
-                # against the same persistent wrapper. The wrapper's static
-                # buffers and FlashInfer scheduling state are already correct
-                # for this iter's seq_lens. We only need to record ps.seq_lens
-                # / ps.write_store on the matching label so downstream
-                # run_attention sees them.
-                self._pre_planned_labels.discard(effective_label)
-                ps = self._plan_states.get(effective_label)
-                if ps is not None:
-                    ps.seq_lens = seq_lens
-                    ps.write_store = write_store
-                if self.enable_nvtx:
-                    range_push("cache.plan_attention.skipped_pre_planned", synchronize=False)
-                    range_pop(synchronize=False)
-                return
-            if (_dense_gen_attn_enabled(self.kv_cache_config.dense_gen_attn)
-                    and not is_causal and not self._cuda_graph_mode
-                    and len(self.request_ids) == 1):
-                # Lean dense generation-attention path: the gen K/V is never
-                # written to pages and attention is one varlen FA3 over the
-                # frozen prefix + fresh gen, so the whole paged-FlashInfer plan
-                # (per-step page alloc, index tensors, and wrapper.plan()'s
-                # radix-sort/fills) is dead work — _run_dense_gen reads none of
-                # it. Build only the dense gather/varlen plan.
-                ps = self._plan_states.get(effective_label) or _PlanState()
-                self._plan_states[effective_label] = ps
-                ps.seq_lens = seq_lens
-                ps.write_store = write_store
-                ps.dense_gen = self._build_dense_gen_plan([effective_label], seq_lens)
-                return
-            self._plan_attention_impl(
-                seq_lens=seq_lens,
-                dtype=dtype,
-                is_causal=is_causal,
-                write_store=write_store,
-                label=label,
-            )
-        finally:
-            if self.enable_nvtx:
-                range_pop(synchronize=False)
-
-    def _plan_attention_impl(
+    @abstractmethod
+    def plan_attention_batched_cfg(
         self,
-        seq_lens: list[int] | None = None,
-        dtype: torch.dtype | None = None,
-        is_causal=True,
-        write_store: bool=True,
-        label: str | None = None,
+        labels: list[str],
+        seq_lens: list[int] | dict[str, list[int]],
+        is_causal: bool = False,
+        write_store: bool = False,
+        dtype=torch.bfloat16,
+        combined_label: str = "_cfg_batched",
+        **kwargs,
     ):
-        from mstar.utils.profiler import range_pop, range_push
+        """Plan a single attention batch across multiple cache labels.
 
-        assert self.kv_cache is not None
+        Each (label, request_id) pair becomes one entry in the batch. For
+        3-branch CFG with 1 request this creates a 3-entry batch, enabling all
+        CFG branches to execute in a single forward pass. Backend-specific
+        planning hints pass through ``**kwargs`` as in ``plan_attention``.
 
-        # Default the FlashInfer wrapper's dtype to whatever dtype the KV
-        # cache tensor was actually allocated in. Hardcoding bf16 here breaks
-        # any model that runs in fp32 (the wrapper would try to write
-        # bf16-cast K/V into an fp32 cache and torch raises a dtype mismatch
-        # in flashinfer_utils.set_kv_cache).
-        if dtype is None:
-            dtype = self.kv_cache.dtype
+        Args:
+            labels: cache labels to batch (e.g. ["main", "cfg_text", "cfg_img"]).
+            seq_lens: number of new tokens per request (same for all labels),
+                or a per-label dict of such lists.
+            is_causal: whether attention is causal.
+            write_store: whether to write to mooncake store (False for image_gen).
+            combined_label: key for the combined _PlanState.
+        """
 
-        effective_label = label
-        if effective_label is None:
-            labels = list(self.active_labels.values())
-            assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
-            effective_label = next(iter(self.active_labels.values()))
+    @abstractmethod
+    def run_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_idx: int | None=None,
+    ) -> torch.Tensor:
+        """Run the pre-planned attention for the active label.
 
-        cfg = self.kv_cache_config
-        page_size = cfg.page_size
-        num_kv_heads = cfg.num_kv_heads
-        head_dim = cfg.head_dim
-        num_qo_heads = cfg.num_qo_heads
-        device = self.device
-
-        # CPU-side accumulation. The old implementation launched 4-5 tiny GPU
-        # kernels per request (arange, tensor(state.page_indices), indexing,
-        # mod) to build page_indices/page_offsets/token_offsets — all of which
-        # turn out to be unused bookkeeping (grep: no reader in the codebase).
-        # We only need the four int32 tensors the FlashInfer wrapper consumes,
-        # so do the arithmetic in pure Python and send them over in one H2D
-        # each.
-        if self.enable_nvtx:
-            range_push("cache.plan_attention.build_lists", synchronize=False)
-        try:
-            qo_indptr_list = [0]
-            kv_indptr_list = [0]
-            all_page_indices = []
-            kv_last_page_lens = []
-            kv_cache_locations_list = []
-
-            for i, rid in enumerate(self.request_ids):
-                state = self._get_state(rid, effective_label)
-                sl = seq_lens[i]
-                total_len = state.seq_len + sl
-
-                self.alloc_manager.alloc(
-                    rid, label=effective_label, seq_len=total_len
-                )
-
-                qo_indptr_list.append(qo_indptr_list[-1] + sl)
-                all_page_indices.extend(state.page_indices)
-                kv_indptr_list.append(kv_indptr_list[-1] + len(state.page_indices))
-
-                last_page_len = total_len % page_size or page_size
-                kv_last_page_lens.append(last_page_len)
-                if sl == 1:
-                    kv_cache_locations_list.append([state.page_indices[-1], last_page_len - 1])
-        finally:
-            if self.enable_nvtx:
-                range_pop(synchronize=False)
-
-        # Build batched FlashInfer index tensors on CPU so wrapper.plan()
-        # doesn't trigger a synchronous D→H inside its body. FlashInfer
-        # calls ``indptr.to("cpu")`` / ``last_page_len.to("cpu")`` near the
-        # top of ``plan()`` to get host views of those metadata tensors;
-        # if we hand them GPU tensors that ``.to("cpu")`` becomes a
-        # synchronous default-stream sync that waits for the entire
-        # outstanding stream — including the speculatively-queued next
-        # decode step. By creating these on CPU directly, ``.to("cpu")``
-        # is a no-op. FlashInfer later copies the tiny int32 metadata to
-        # the device when it needs it; the source is pageable CPU memory, so
-        # ``non_blocking=True`` does not make that H2D copy asynchronous, but
-        # the tensors are batch-size length and the cost is inconsequential.
-        if self.enable_nvtx:
-            range_push("cache.plan_attention.make_tensors", synchronize=False)
-        try:
-            qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
-            paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
-            paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
-            paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
-            kv_cache_locations = (
-                torch.tensor(kv_cache_locations_list, dtype=torch.long)
-                if len(kv_cache_locations_list) == len(self.request_ids)
-                else None
-            )
-        finally:
-            if self.enable_nvtx:
-                range_pop(synchronize=False)
-
-
-        is_decode = all([sl == 1 for sl in seq_lens])
-        ps = self._plan_states.get(effective_label)
-        if ps is not None and ps.wrapper is not None:
-            wrapper = ps.wrapper
-        elif is_decode:
-            wrapper = FlashInferDecodeWrapper(
-                workspace_buffer=self.buffer_manager.get(effective_label),
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                page_size=page_size,
-                device=self.device,
-                enable_nvtx=self.enable_nvtx,
-            )
-            ps = _PlanState(wrapper=wrapper)
-            self._plan_states[effective_label] = ps
-        else:
-            wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=self.buffer_manager.get(effective_label),
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                page_size=page_size,
-                device=self.device,
-                enable_nvtx=self.enable_nvtx,
-            )
-            ps = _PlanState(wrapper=wrapper)
-            self._plan_states[effective_label] = ps
-
-        if self.enable_nvtx:
-            range_push("cache.plan_attention.wrapper_plan", synchronize=False)
-        try:
-            if isinstance(wrapper, FlashInferDecodeWrapper):
-                wrapper.plan(
-                    paged_kv_indptr=paged_kv_indptr,
-                    paged_kv_indices=paged_kv_indices,
-                    paged_kv_last_page_len=paged_kv_last_page_len,
-                    kv_cache_locations=kv_cache_locations,
-                    dtype=dtype,
-                )
-            else:
-                wrapper.plan(
-                    qo_indptr=qo_indptr,
-                    paged_kv_indptr=paged_kv_indptr,
-                    paged_kv_indices=paged_kv_indices,
-                    paged_kv_last_page_len=paged_kv_last_page_len,
-                    causal=is_causal,
-                    dtype=dtype,
-                )
-        finally:
-            if self.enable_nvtx:
-                range_pop(synchronize=False)
-        # seq_lens is read by the flush_to_store path; write_store by
-        # run_attention. The page_indices / page_offsets / token_offsets /
-        # per_req_page_indices fields were legacy bookkeeping and had no
-        # reader — dropped along with their per-rid GPU construction above.
-        ps.seq_lens = seq_lens
-        ps.write_store = write_store
-        # The lean dense path early-returns in plan_attention before reaching
-        # this impl, so a paged plan always clears any prior dense plan here.
-        ps.dense_gen = None
+        Args:
+            q: [total_tokens, num_q_heads, head_dim]
+            k: [total_tokens, num_kv_heads, head_dim]
+            v: [total_tokens, num_kv_heads, head_dim]
+            layer_idx: transformer layer index
+        Returns:
+            output: [total_tokens, num_q_heads, head_dim]
+        """
 
     def plan_rope(
         self,
@@ -469,11 +293,7 @@ class BatchedCacheManager:
     ):
         from mstar.utils.profiler import range_pop, range_push
 
-        effective_label = label
-        if effective_label is None:
-            labels = list(self.active_labels.values())
-            assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
-            effective_label = next(iter(self.active_labels.values()))
+        effective_label = label if label is not None else self._active_label()
 
         if effective_label not in self._plan_states:
             self._plan_states[effective_label] = _PlanState()
@@ -531,146 +351,6 @@ class BatchedCacheManager:
             ps.pos_ids = computed_pos_ids
 
     @torch.compiler.disable
-    def plan_attention_batched_cfg(
-        self,
-        labels: list[str],
-        seq_lens: list[int] | dict[str, list[int]],
-        is_causal: bool = False,
-        write_store: bool = False,
-        dtype=torch.bfloat16,
-        combined_label: str = "_cfg_batched",
-    ):
-        """Plan a single FlashInfer batch across multiple cache labels.
-
-        Each (label, request_id) pair becomes one entry in the FlashInfer batch.
-        For 3-branch CFG with 1 request this creates a 3-entry batch, enabling
-        all CFG branches to execute in a single LLM forward pass.
-
-        Args:
-            labels: cache labels to batch (e.g. ["main", "cfg_text", "cfg_img"]).
-            seq_lens: number of new tokens per request (same for all labels).
-            is_causal: whether attention is causal.
-            write_store: whether to write to mooncake store (False for image_gen).
-            combined_label: key for the combined _PlanState.
-        """
-        assert self.kv_cache is not None
-        if isinstance(seq_lens, list):
-            seq_lens = {
-                key: seq_lens for key in labels
-            }
-
-        self._batched_cfg_info = BatchedCfgInfo(
-            per_label_seq_len=seq_lens
-        )
-
-        if (_dense_gen_attn_enabled(self.kv_cache_config.dense_gen_attn)
-                and not is_causal and not self._cuda_graph_mode
-                and len(self.request_ids) == 1):
-            # Lean dense generation-attention path (see plan_attention): skip the
-            # paged-FlashInfer plan (per-label page alloc, index tensors, and
-            # wrapper.plan()'s radix-sort/fills) — _run_dense_gen reads none of
-            # it. Build only the per-segment dense gather/varlen plan.
-            ps = self._plan_states.get(combined_label) or _PlanState()
-            self._plan_states[combined_label] = ps
-            ps.seq_lens = seq_lens
-            ps.write_store = write_store
-            ps.dense_gen = self._build_dense_gen_plan(labels, seq_lens)
-            return
-
-        cfg = self.kv_cache_config
-        page_size = cfg.page_size
-        num_kv_heads = cfg.num_kv_heads
-        head_dim = cfg.head_dim
-        num_qo_heads = cfg.num_qo_heads
-        device = self.device
-
-        # CPU-side accumulation (see plan_attention for the same pattern).
-        qo_indptr_list = [0]
-        kv_indptr_list = [0]
-        all_page_indices = []
-        kv_last_page_lens = []
-        combined_seq_lens = []
-
-        for label in labels:
-            for i, rid in enumerate(self.request_ids):
-                state = self._get_state(rid, label)
-                sl = seq_lens[label][i]
-                total_len = state.seq_len + sl
-
-                self.alloc_manager.alloc(rid, label=label, seq_len=total_len)
-
-                qo_indptr_list.append(qo_indptr_list[-1] + sl)
-                all_page_indices.extend(state.page_indices)
-                kv_indptr_list.append(
-                    kv_indptr_list[-1] + len(state.page_indices)
-                )
-
-                last_page_len = total_len % page_size or page_size
-                kv_last_page_lens.append(last_page_len)
-                combined_seq_lens.append(sl)
-
-        # CPU tensors — see comment in ``plan_attention`` above. FlashInfer
-        # async-H2Ds these inside ``plan()``; passing GPU tensors would
-        # trigger a synchronous default-stream sync via the internal
-        # ``.to("cpu")`` call.
-        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
-        paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
-        paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
-        paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
-
-        ps = self._plan_states.get(combined_label)
-        if self._cuda_graph_mode and ps is not None and ps.wrapper is not None:
-            # CUDA-graph mode: reuse the persistent wrapper across denoise steps.
-            # plan() updates its static buffers via .copy_() so the captured
-            # kernel picks up each step's page table without reallocating.
-            wrapper = ps.wrapper
-        elif self._cuda_graph_mode:
-            # First call under capture: build the persistent wrapper sized for the
-            # fixed batch (labels x requests) and token budget.
-            wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=self.buffer_manager.get(combined_label),
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                page_size=page_size,
-                batch_size=len(labels) * len(self.request_ids),
-                max_total_tokens=sum(combined_seq_lens),
-                max_num_pages=cfg.max_num_pages,
-                device=self.device,
-                use_cuda_graph=True,
-                enable_nvtx=self.enable_nvtx,
-            )
-            ps = _PlanState(wrapper=wrapper)
-            self._plan_states[combined_label] = ps
-        else:
-            # Eager mode: a fresh wrapper each call (the cache manager is rebuilt
-            # per forward, so there is nothing persistent to reuse).
-            wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=self.buffer_manager.get(combined_label),
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                page_size=page_size,
-                enable_nvtx=self.enable_nvtx,
-            )
-            ps = _PlanState(wrapper=wrapper)
-            self._plan_states[combined_label] = ps
-
-        wrapper.plan(
-            qo_indptr=qo_indptr,
-            paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
-            paged_kv_last_page_len=paged_kv_last_page_len,
-            causal=is_causal,
-            dtype=dtype,
-        )
-        ps.seq_lens = combined_seq_lens
-        ps.write_store = write_store
-        # The lean dense path early-returns at the top of this method, so a
-        # paged plan always clears any prior dense plan here.
-        ps.dense_gen = None
-
-    @torch.compiler.disable
     def plan_rope_batched_cfg(
         self,
         labels: list[str],
@@ -715,157 +395,6 @@ class BatchedCacheManager:
         self._plan_states[combined_label].pos_ids = combined_pos_ids
 
     @torch.compiler.disable
-    def run_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer_idx: int | None=None,
-    ) -> torch.Tensor:
-        """Run pre-planned FlashInfer attention with KV cache write.
-
-        Uses the active label's plan state (set up by a prior plan_attention
-        call). Writes K and V to the paged KV cache at pre-computed page
-        positions, then runs the FlashInfer wrapper for batched attention.
-
-        In CUDA graph mode, uses wrapper.set_kv_cache() + wrapper.run()
-        which operates on pre-computed token_to_page/token_to_cache or
-        kv_cache_locations tensors (static GPU addresses).
-
-        In eager mode, uses direct fancy indexing for KV writes and
-        the raw FlashInfer wrapper's run().
-
-        Args:
-            q: [total_tokens, num_q_heads, head_dim]
-            k: [total_tokens, num_kv_heads, head_dim]
-            v: [total_tokens, num_kv_heads, head_dim]
-            layer_idx: transformer layer index
-        Returns:
-            output: [total_tokens, num_q_heads, head_dim]
-        """
-        if layer_idx is None:
-            layer_idx = self.layer_idx
-
-        orig_dtype = q.dtype
-
-        labels = list(self.active_labels.values())
-        assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
-        label = next(iter(self.active_labels.values()))
-
-        ps = self._plan_states[label]
-
-        if ps.dense_gen is not None:
-            return self._run_dense_gen(q, k, v, layer_idx, ps.dense_gen).to(orig_dtype)
-
-        assert self.kv_cache is not None and ps.wrapper is not None
-
-        ps.wrapper.set_kv_cache(self.kv_cache[layer_idx], k, v)
-
-        if self.auto_write_store and ps.write_store:
-            for req_id in self.request_ids:
-                self.alloc_manager.flush_to_store(
-                    req_id, label=label, layers=layer_idx
-                )
-
-        return ps.wrapper.run(q, self.kv_cache[layer_idx]).to(orig_dtype)
-
-    def _build_dense_gen_plan(
-        self, labels: list[str],
-        seq_lens: list[int] | dict[str, list[int]]
-    ) -> dict:
-        """Pre-compute the per-segment gather + varlen layout for the dense
-        generation-attention path, in the same (label, request) batch order the
-        generation tokens are packed in. Each segment attends its fresh
-        generation tokens over its frozen text prefix; the prefix lives in the
-        pages written at prefill, so we record the page indices to gather it from
-        (the same across all layers) and the cumulative-sequence-length tensors a
-        single varlen kernel needs. Built once per denoise step, reused by every
-        layer's run_attention."""
-
-        if isinstance(seq_lens, list):
-            seq_lens = {
-                key: seq_lens for key in labels
-            }
-
-        cfg = self.kv_cache_config
-        page_size = cfg.page_size
-        segs = []  # (prefix_page_indices, prefix_len, gen_len)
-        cu_q = [0]
-        cu_k = [0]
-        max_q = 0
-        max_k = 0
-        for label in labels:
-            for i, rid in enumerate(self.request_ids):
-                state = self._get_state(rid, label)
-                prefix_len = state.seq_len
-                gen_len = seq_lens[label][i]
-                n_pages = (prefix_len + page_size - 1) // page_size
-                idx = torch.tensor(
-                    state.page_indices[:n_pages], dtype=torch.long, device=self.device
-                )
-                # Carry the persistent KVRequestState so run_attention can cache
-                # the gathered frozen prefix on it across denoise steps (the
-                # manager itself is rebuilt every forward).
-                segs.append((idx, prefix_len, gen_len, state))
-                cu_q.append(cu_q[-1] + gen_len)
-                cu_k.append(cu_k[-1] + prefix_len + gen_len)
-                max_q = max(max_q, gen_len)
-                max_k = max(max_k, prefix_len + gen_len)
-        return {
-            "segs": segs,
-            "cu_q": torch.tensor(cu_q, dtype=torch.int32, device=self.device),
-            "cu_k": torch.tensor(cu_k, dtype=torch.int32, device=self.device),
-            "max_q": max_q,
-            "max_k": max_k,
-        }
-
-    @torch.compiler.disable
-    def _run_dense_gen(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_idx: int, dg: dict
-    ) -> torch.Tensor:
-        """Dense generation attention: per segment, take the frozen text-prefix
-        K/V, concatenate it with this segment's fresh K/V, and attend
-        non-causally with one FlashAttention-3 varlen kernel. Bypasses the paged
-        write entirely (the generation K/V is recomputed every step, so
-        persisting it is wasted work). The frozen prefix is gathered from the
-        paged cache once per layer and cached on the request state, then reused
-        across denoise steps (it never changes during denoise)."""
-        from fa3_fwd_interface import flash_attn_varlen_func
-
-        cfg = self.kv_cache_config
-        num_kv_heads, head_dim = cfg.num_kv_heads, cfg.head_dim
-        kv_layer = self.kv_cache[layer_idx]  # [max_pages, 2, page_size, num_kv_heads, head_dim]
-
-        k_parts, v_parts = [], []
-        offset = 0
-        for idx, prefix_len, gen_len, state in dg["segs"]:
-            prefix_cache = state.dense_prefix_kv
-            if prefix_cache is None:
-                prefix_cache = state.dense_prefix_kv = {}
-            cached = prefix_cache.get(layer_idx)
-            if cached is None:
-                sub = kv_layer[idx]  # [n_pages, 2, page_size, num_kv_heads, head_dim]
-                k_pref = sub[:, 0].reshape(-1, num_kv_heads, head_dim)[:prefix_len].clone()
-                v_pref = sub[:, 1].reshape(-1, num_kv_heads, head_dim)[:prefix_len].clone()
-                prefix_cache[layer_idx] = (k_pref, v_pref)
-            else:
-                k_pref, v_pref = cached
-            k_parts.append(k_pref)
-            k_parts.append(k[offset:offset + gen_len])
-            v_parts.append(v_pref)
-            v_parts.append(v[offset:offset + gen_len])
-            offset += gen_len
-        key = torch.cat(k_parts, dim=0)
-        val = torch.cat(v_parts, dim=0)
-        if q.dtype != key.dtype:
-            q = q.to(key.dtype)
-
-        out = flash_attn_varlen_func(
-            q, key, val, dg["cu_q"], dg["cu_k"], dg["max_q"], dg["max_k"], causal=False,
-        )
-        return out[0] if isinstance(out, tuple) else out
-
-    @torch.compiler.disable
     def apply_rope(
         self,
         q: torch.Tensor,
@@ -878,10 +407,7 @@ class BatchedCacheManager:
         **kwargs
     ):
         """Apply RoPE using the active label's pre-computed position IDs."""
-        # Assert all active labels are the same
-        labels = list(self.active_labels.values())
-        assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
-        label = next(iter(self.active_labels.values()))
+        label = self._active_label()
 
         ps = self._plan_states[label]
         assert ps.pos_ids is not None
@@ -1059,3 +585,633 @@ class BatchedCacheManager:
                 if ps is None or not ps.write_store:
                     continue
                 self.alloc_manager.flush_to_store(rid, label)
+
+
+class FlashInferCacheManager(BatchedCacheManager):
+    """Paged FlashInfer attention backend (the default).
+
+    Constructs batch-level FlashInfer index tensors (qo_indptr, paged_kv_indptr,
+    paged_kv_indices) and issues a single FlashInfer call per layer instead of
+    N separate calls. K/V for every planned token is written to the paged cache.
+    """
+
+    def plan_attention(
+        self,
+        seq_lens: list[int] | None = None,
+        dtype: torch.dtype | None = None,
+        is_causal=True,
+        write_store: bool=True,
+        label: str | None = None,
+        **kwargs,
+    ):
+        """Pre-compute FlashInfer plan and page positions for a cache label.
+
+        Allocates pages, computes page_indices/page_offsets/token_offsets for
+        vectorized KV writes, builds FlashInfer index tensors, and plans the
+        wrapper. All state is stored in _plan_states[label].
+
+        In CUDA graph mode, uses the persistent wrapper from _plan_states
+        (pre-built by CudaGraphRunner) and calls its plan() method which
+        updates static buffers via .copy_(). In eager mode, creates a new
+        wrapper each call.
+
+        Planning hints for other backends arriving via **kwargs are ignored.
+        """
+        from mstar.utils.profiler import range_pop, range_push
+        self._batched_cfg_info = None
+
+        if self.enable_nvtx:
+            range_push("cache.plan_attention", synchronize=False)
+        try:
+            effective_label = label if label is not None else self._active_label()
+            if effective_label in self._pre_planned_labels:
+                # Fast path: plan was pre-computed by Worker.plan_executor
+                # against the same persistent wrapper. The wrapper's static
+                # buffers and FlashInfer scheduling state are already correct
+                # for this iter's seq_lens. We only need to record ps.seq_lens
+                # / ps.write_store on the matching label so downstream
+                # run_attention sees them.
+                self._pre_planned_labels.discard(effective_label)
+                ps = self._plan_states.get(effective_label)
+                if ps is not None:
+                    ps.seq_lens = seq_lens
+                    ps.write_store = write_store
+                if self.enable_nvtx:
+                    range_push("cache.plan_attention.skipped_pre_planned", synchronize=False)
+                    range_pop(synchronize=False)
+                return
+            self._plan_attention_impl(
+                seq_lens=seq_lens,
+                dtype=dtype,
+                is_causal=is_causal,
+                write_store=write_store,
+                label=label,
+            )
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+
+    def _plan_attention_impl(
+        self,
+        seq_lens: list[int] | None = None,
+        dtype: torch.dtype | None = None,
+        is_causal=True,
+        write_store: bool=True,
+        label: str | None = None,
+    ):
+        from mstar.utils.profiler import range_pop, range_push
+
+        assert self.kv_cache is not None
+
+        # Default the FlashInfer wrapper's dtype to whatever dtype the KV
+        # cache tensor was actually allocated in. Hardcoding bf16 here breaks
+        # any model that runs in fp32 (the wrapper would try to write
+        # bf16-cast K/V into an fp32 cache and torch raises a dtype mismatch
+        # in flashinfer_utils.set_kv_cache).
+        if dtype is None:
+            dtype = self.kv_cache.dtype
+
+        effective_label = label if label is not None else self._active_label()
+
+        cfg = self.kv_cache_config
+        page_size = cfg.page_size
+        num_kv_heads = cfg.num_kv_heads
+        head_dim = cfg.head_dim
+        num_qo_heads = cfg.num_qo_heads
+        device = self.device
+
+        # CPU-side accumulation. The old implementation launched 4-5 tiny GPU
+        # kernels per request (arange, tensor(state.page_indices), indexing,
+        # mod) to build page_indices/page_offsets/token_offsets — all of which
+        # turn out to be unused bookkeeping (grep: no reader in the codebase).
+        # We only need the four int32 tensors the FlashInfer wrapper consumes,
+        # so do the arithmetic in pure Python and send them over in one H2D
+        # each.
+        if self.enable_nvtx:
+            range_push("cache.plan_attention.build_lists", synchronize=False)
+        try:
+            qo_indptr_list = [0]
+            kv_indptr_list = [0]
+            all_page_indices = []
+            kv_last_page_lens = []
+            kv_cache_locations_list = []
+
+            for i, rid in enumerate(self.request_ids):
+                state = self._get_state(rid, effective_label)
+                sl = seq_lens[i]
+                total_len = state.seq_len + sl
+
+                self.alloc_manager.alloc(
+                    rid, label=effective_label, seq_len=total_len
+                )
+
+                qo_indptr_list.append(qo_indptr_list[-1] + sl)
+                all_page_indices.extend(state.page_indices)
+                kv_indptr_list.append(kv_indptr_list[-1] + len(state.page_indices))
+
+                last_page_len = total_len % page_size or page_size
+                kv_last_page_lens.append(last_page_len)
+                if sl == 1:
+                    kv_cache_locations_list.append([state.page_indices[-1], last_page_len - 1])
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+
+        # Build batched FlashInfer index tensors on CPU so wrapper.plan()
+        # doesn't trigger a synchronous D→H inside its body. FlashInfer
+        # calls ``indptr.to("cpu")`` / ``last_page_len.to("cpu")`` near the
+        # top of ``plan()`` to get host views of those metadata tensors;
+        # if we hand them GPU tensors that ``.to("cpu")`` becomes a
+        # synchronous default-stream sync that waits for the entire
+        # outstanding stream — including the speculatively-queued next
+        # decode step. By creating these on CPU directly, ``.to("cpu")``
+        # is a no-op. FlashInfer later copies the tiny int32 metadata to
+        # the device when it needs it; the source is pageable CPU memory, so
+        # ``non_blocking=True`` does not make that H2D copy asynchronous, but
+        # the tensors are batch-size length and the cost is inconsequential.
+        if self.enable_nvtx:
+            range_push("cache.plan_attention.make_tensors", synchronize=False)
+        try:
+            qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
+            paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
+            paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
+            paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
+            kv_cache_locations = (
+                torch.tensor(kv_cache_locations_list, dtype=torch.long)
+                if len(kv_cache_locations_list) == len(self.request_ids)
+                else None
+            )
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+
+
+        is_decode = all([sl == 1 for sl in seq_lens])
+        ps = self._plan_states.get(effective_label)
+        if ps is not None and ps.wrapper is not None:
+            wrapper = ps.wrapper
+        elif is_decode:
+            wrapper = FlashInferDecodeWrapper(
+                workspace_buffer=self.buffer_manager.get(effective_label),
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                device=self.device,
+                enable_nvtx=self.enable_nvtx,
+            )
+            ps = _PlanState(wrapper=wrapper)
+            self._plan_states[effective_label] = ps
+        else:
+            wrapper = FlashInferPrefillWrapper(
+                workspace_buffer=self.buffer_manager.get(effective_label),
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                device=self.device,
+                enable_nvtx=self.enable_nvtx,
+            )
+            ps = _PlanState(wrapper=wrapper)
+            self._plan_states[effective_label] = ps
+
+        if self.enable_nvtx:
+            range_push("cache.plan_attention.wrapper_plan", synchronize=False)
+        try:
+            if isinstance(wrapper, FlashInferDecodeWrapper):
+                wrapper.plan(
+                    paged_kv_indptr=paged_kv_indptr,
+                    paged_kv_indices=paged_kv_indices,
+                    paged_kv_last_page_len=paged_kv_last_page_len,
+                    kv_cache_locations=kv_cache_locations,
+                    dtype=dtype,
+                )
+            else:
+                wrapper.plan(
+                    qo_indptr=qo_indptr,
+                    paged_kv_indptr=paged_kv_indptr,
+                    paged_kv_indices=paged_kv_indices,
+                    paged_kv_last_page_len=paged_kv_last_page_len,
+                    causal=is_causal,
+                    dtype=dtype,
+                )
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+        # seq_lens is read by the flush_to_store path; write_store by
+        # run_attention. The page_indices / page_offsets / token_offsets /
+        # per_req_page_indices fields were legacy bookkeeping and had no
+        # reader — dropped along with their per-rid GPU construction above.
+        ps.seq_lens = seq_lens
+        ps.write_store = write_store
+        # A paged plan clears any prior dense plan (set by DenseGenCacheManager)
+        # so run_attention routes this label back through the wrapper.
+        ps.dense_gen = None
+
+    @torch.compiler.disable
+    def plan_attention_batched_cfg(
+        self,
+        labels: list[str],
+        seq_lens: list[int] | dict[str, list[int]],
+        is_causal: bool = False,
+        write_store: bool = False,
+        dtype=torch.bfloat16,
+        combined_label: str = "_cfg_batched",
+        **kwargs,
+    ):
+        """Plan a single FlashInfer batch across multiple cache labels.
+
+        Planning hints for other backends arriving via **kwargs are ignored.
+        See ``BatchedCacheManager.plan_attention_batched_cfg`` for the argument
+        contract.
+        """
+        assert self.kv_cache is not None
+        if isinstance(seq_lens, list):
+            seq_lens = {
+                key: seq_lens for key in labels
+            }
+
+        self._batched_cfg_info = BatchedCfgInfo(
+            per_label_seq_len=seq_lens
+        )
+
+        cfg = self.kv_cache_config
+        page_size = cfg.page_size
+        num_kv_heads = cfg.num_kv_heads
+        head_dim = cfg.head_dim
+        num_qo_heads = cfg.num_qo_heads
+        device = self.device
+
+        # CPU-side accumulation (see plan_attention for the same pattern).
+        qo_indptr_list = [0]
+        kv_indptr_list = [0]
+        all_page_indices = []
+        kv_last_page_lens = []
+        combined_seq_lens = []
+
+        for label in labels:
+            for i, rid in enumerate(self.request_ids):
+                state = self._get_state(rid, label)
+                sl = seq_lens[label][i]
+                total_len = state.seq_len + sl
+
+                self.alloc_manager.alloc(rid, label=label, seq_len=total_len)
+
+                qo_indptr_list.append(qo_indptr_list[-1] + sl)
+                all_page_indices.extend(state.page_indices)
+                kv_indptr_list.append(
+                    kv_indptr_list[-1] + len(state.page_indices)
+                )
+
+                last_page_len = total_len % page_size or page_size
+                kv_last_page_lens.append(last_page_len)
+                combined_seq_lens.append(sl)
+
+        # CPU tensors — see comment in ``plan_attention`` above. FlashInfer
+        # async-H2Ds these inside ``plan()``; passing GPU tensors would
+        # trigger a synchronous default-stream sync via the internal
+        # ``.to("cpu")`` call.
+        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
+        paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
+        paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
+        paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
+
+        ps = self._plan_states.get(combined_label)
+        if self._cuda_graph_mode and ps is not None and ps.wrapper is not None:
+            # CUDA-graph mode: reuse the persistent wrapper across denoise steps.
+            # plan() updates its static buffers via .copy_() so the captured
+            # kernel picks up each step's page table without reallocating.
+            wrapper = ps.wrapper
+        elif self._cuda_graph_mode:
+            # First call under capture: build the persistent wrapper sized for the
+            # fixed batch (labels x requests) and token budget.
+            wrapper = FlashInferPrefillWrapper(
+                workspace_buffer=self.buffer_manager.get(combined_label),
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                batch_size=len(labels) * len(self.request_ids),
+                max_total_tokens=sum(combined_seq_lens),
+                max_num_pages=cfg.max_num_pages,
+                device=self.device,
+                use_cuda_graph=True,
+                enable_nvtx=self.enable_nvtx,
+            )
+            ps = _PlanState(wrapper=wrapper)
+            self._plan_states[combined_label] = ps
+        else:
+            # Eager mode: a fresh wrapper each call (the cache manager is rebuilt
+            # per forward, so there is nothing persistent to reuse).
+            wrapper = FlashInferPrefillWrapper(
+                workspace_buffer=self.buffer_manager.get(combined_label),
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                enable_nvtx=self.enable_nvtx,
+            )
+            ps = _PlanState(wrapper=wrapper)
+            self._plan_states[combined_label] = ps
+
+        wrapper.plan(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            causal=is_causal,
+            dtype=dtype,
+        )
+        ps.seq_lens = combined_seq_lens
+        ps.write_store = write_store
+        # A paged plan clears any prior dense plan (set by DenseGenCacheManager)
+        # so run_attention routes this label back through the wrapper.
+        ps.dense_gen = None
+
+    @torch.compiler.disable
+    def run_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_idx: int | None=None,
+    ) -> torch.Tensor:
+        """Run pre-planned FlashInfer attention with KV cache write.
+
+        Uses the active label's plan state (set up by a prior plan_attention
+        call). Writes K and V to the paged KV cache at pre-computed page
+        positions, then runs the FlashInfer wrapper for batched attention.
+
+        In CUDA graph mode, uses wrapper.set_kv_cache() + wrapper.run()
+        which operates on pre-computed token_to_page/token_to_cache or
+        kv_cache_locations tensors (static GPU addresses).
+
+        In eager mode, uses direct fancy indexing for KV writes and
+        the raw FlashInfer wrapper's run().
+        """
+        if layer_idx is None:
+            layer_idx = self.layer_idx
+
+        orig_dtype = q.dtype
+
+        label = self._active_label()
+        ps = self._plan_states[label]
+
+        assert self.kv_cache is not None and ps.wrapper is not None
+
+        ps.wrapper.set_kv_cache(self.kv_cache[layer_idx], k, v)
+
+        if self.auto_write_store and ps.write_store:
+            for req_id in self.request_ids:
+                self.alloc_manager.flush_to_store(
+                    req_id, label=label, layers=layer_idx
+                )
+
+        return ps.wrapper.run(q, self.kv_cache[layer_idx]).to(orig_dtype)
+
+
+class DenseGenCacheManager(FlashInferCacheManager):
+    """FlashInfer backend with a dense generation-attention fast path.
+
+    Runs non-causal generation attention (planned with ``dense_gen=True``) as a
+    dense FlashAttention-3 pass over a contiguous [frozen-prefix | fresh]
+    sequence instead of the paged FlashInfer prefill. Diffusion recomputes every
+    generation K/V each step (only the tiny text prefix is reused), so the paged
+    path's per-step full-buffer K/V write is pure overhead here; a dense pass
+    gathers the small prefix, concatenates it with the freshly projected K/V,
+    and runs one varlen kernel — which is also the faster attention kernel at
+    these shapes. Eager-only and single-request only (see ``_dense_gen_applies``);
+    everything else — prefill, captured graphs, multi-request batches — falls
+    through to the inherited paged FlashInfer path.
+    """
+
+    def _dense_gen_applies(self) -> bool:
+        """Dense generation attention is eager-only (captured paths keep the
+        persistent paged wrapper the graph was planned with) and single-request
+        only (the launch overhead it removes is what matters at bs=1; bs>1
+        amortizes the plan and grows the per-request prefix gather, so it stays
+        on the paged path)."""
+        return not self._cuda_graph_mode and len(self.request_ids) == 1
+
+    def plan_attention(
+        self,
+        seq_lens: list[int] | None = None,
+        dtype: torch.dtype | None = None,
+        is_causal=True,
+        write_store: bool=True,
+        label: str | None = None,
+        dense_gen: bool = False,
+        **kwargs,
+    ):
+        """As ``FlashInferCacheManager.plan_attention``, plus ``dense_gen``:
+        the caller's declaration that this plan covers recomputed-every-step
+        generation attention, eligible for the dense path when applicable."""
+        if not (dense_gen and self._dense_gen_applies()):
+            return super().plan_attention(
+                seq_lens=seq_lens,
+                dtype=dtype,
+                is_causal=is_causal,
+                write_store=write_store,
+                label=label,
+                **kwargs,
+            )
+        from mstar.utils.profiler import range_pop, range_push
+        self._batched_cfg_info = None
+
+        if self.enable_nvtx:
+            range_push("cache.plan_attention", synchronize=False)
+        try:
+            # Lean dense generation-attention path: the gen K/V is never
+            # written to pages and attention is one varlen FA3 over the
+            # frozen prefix + fresh gen, so the whole paged-FlashInfer plan
+            # (per-step page alloc, index tensors, and wrapper.plan()'s
+            # radix-sort/fills) is dead work — _run_dense_gen reads none of
+            # it. Build only the dense gather/varlen plan.
+            effective_label = label if label is not None else self._active_label()
+            ps = self._plan_states.get(effective_label) or _PlanState()
+            self._plan_states[effective_label] = ps
+            ps.seq_lens = seq_lens
+            ps.write_store = write_store
+            ps.dense_gen = self._build_dense_gen_plan([effective_label], seq_lens)
+        finally:
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+
+    @torch.compiler.disable
+    def plan_attention_batched_cfg(
+        self,
+        labels: list[str],
+        seq_lens: list[int] | dict[str, list[int]],
+        is_causal: bool = False,
+        write_store: bool = False,
+        dtype=torch.bfloat16,
+        combined_label: str = "_cfg_batched",
+        dense_gen: bool = False,
+        **kwargs,
+    ):
+        """As ``FlashInferCacheManager.plan_attention_batched_cfg``, plus
+        ``dense_gen`` (see ``plan_attention``)."""
+        if not (dense_gen and self._dense_gen_applies()):
+            return super().plan_attention_batched_cfg(
+                labels=labels,
+                seq_lens=seq_lens,
+                is_causal=is_causal,
+                write_store=write_store,
+                dtype=dtype,
+                combined_label=combined_label,
+                **kwargs,
+            )
+        if isinstance(seq_lens, list):
+            seq_lens = {
+                key: seq_lens for key in labels
+            }
+
+        self._batched_cfg_info = BatchedCfgInfo(
+            per_label_seq_len=seq_lens
+        )
+
+        # Lean dense generation-attention path (see plan_attention): skip the
+        # paged-FlashInfer plan (per-label page alloc, index tensors, and
+        # wrapper.plan()'s radix-sort/fills) — _run_dense_gen reads none of
+        # it. Build only the per-segment dense gather/varlen plan.
+        ps = self._plan_states.get(combined_label) or _PlanState()
+        self._plan_states[combined_label] = ps
+        ps.seq_lens = seq_lens
+        ps.write_store = write_store
+        ps.dense_gen = self._build_dense_gen_plan(labels, seq_lens)
+
+    @torch.compiler.disable
+    def run_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_idx: int | None=None,
+    ) -> torch.Tensor:
+        """Route the active label to its dense plan when one was built, else
+        run the inherited paged FlashInfer attention."""
+        label = self._active_label()
+        ps = self._plan_states[label]
+        if ps.dense_gen is not None:
+            if layer_idx is None:
+                layer_idx = self.layer_idx
+            return self._run_dense_gen(q, k, v, layer_idx, ps.dense_gen).to(q.dtype)
+        return super().run_attention(q, k, v, layer_idx=layer_idx)
+
+    def _build_dense_gen_plan(
+        self, labels: list[str],
+        seq_lens: list[int] | dict[str, list[int]]
+    ) -> dict:
+        """Pre-compute the per-segment gather + varlen layout for the dense
+        generation-attention path, in the same (label, request) batch order the
+        generation tokens are packed in. Each segment attends its fresh
+        generation tokens over its frozen text prefix; the prefix lives in the
+        pages written at prefill, so we record the page indices to gather it from
+        (the same across all layers) and the cumulative-sequence-length tensors a
+        single varlen kernel needs. Built once per denoise step, reused by every
+        layer's run_attention."""
+
+        if isinstance(seq_lens, list):
+            seq_lens = {
+                key: seq_lens for key in labels
+            }
+
+        cfg = self.kv_cache_config
+        page_size = cfg.page_size
+        segs = []  # (prefix_page_indices, prefix_len, gen_len)
+        cu_q = [0]
+        cu_k = [0]
+        max_q = 0
+        max_k = 0
+        for label in labels:
+            for i, rid in enumerate(self.request_ids):
+                state = self._get_state(rid, label)
+                prefix_len = state.seq_len
+                gen_len = seq_lens[label][i]
+                n_pages = (prefix_len + page_size - 1) // page_size
+                idx = torch.tensor(
+                    state.page_indices[:n_pages], dtype=torch.long, device=self.device
+                )
+                # Carry the persistent KVRequestState so run_attention can cache
+                # the gathered frozen prefix on it across denoise steps (the
+                # manager itself is rebuilt every forward).
+                segs.append((idx, prefix_len, gen_len, state))
+                cu_q.append(cu_q[-1] + gen_len)
+                cu_k.append(cu_k[-1] + prefix_len + gen_len)
+                max_q = max(max_q, gen_len)
+                max_k = max(max_k, prefix_len + gen_len)
+        return {
+            "segs": segs,
+            "cu_q": torch.tensor(cu_q, dtype=torch.int32, device=self.device),
+            "cu_k": torch.tensor(cu_k, dtype=torch.int32, device=self.device),
+            "max_q": max_q,
+            "max_k": max_k,
+        }
+
+    @torch.compiler.disable
+    def _run_dense_gen(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_idx: int, dg: dict
+    ) -> torch.Tensor:
+        """Dense generation attention: per segment, take the frozen text-prefix
+        K/V, concatenate it with this segment's fresh K/V, and attend
+        non-causally with one FlashAttention-3 varlen kernel. Bypasses the paged
+        write entirely (the generation K/V is recomputed every step, so
+        persisting it is wasted work). The frozen prefix is gathered from the
+        paged cache once per layer and cached on the request state, then reused
+        across denoise steps (it never changes during denoise)."""
+        from fa3_fwd_interface import flash_attn_varlen_func
+
+        cfg = self.kv_cache_config
+        num_kv_heads, head_dim = cfg.num_kv_heads, cfg.head_dim
+        kv_layer = self.kv_cache[layer_idx]  # [max_pages, 2, page_size, num_kv_heads, head_dim]
+
+        k_parts, v_parts = [], []
+        offset = 0
+        for idx, prefix_len, gen_len, state in dg["segs"]:
+            prefix_cache = state.dense_prefix_kv
+            if prefix_cache is None:
+                prefix_cache = state.dense_prefix_kv = {}
+            cached = prefix_cache.get(layer_idx)
+            if cached is None:
+                sub = kv_layer[idx]  # [n_pages, 2, page_size, num_kv_heads, head_dim]
+                k_pref = sub[:, 0].reshape(-1, num_kv_heads, head_dim)[:prefix_len].clone()
+                v_pref = sub[:, 1].reshape(-1, num_kv_heads, head_dim)[:prefix_len].clone()
+                prefix_cache[layer_idx] = (k_pref, v_pref)
+            else:
+                k_pref, v_pref = cached
+            k_parts.append(k_pref)
+            k_parts.append(k[offset:offset + gen_len])
+            v_parts.append(v_pref)
+            v_parts.append(v[offset:offset + gen_len])
+            offset += gen_len
+        key = torch.cat(k_parts, dim=0)
+        val = torch.cat(v_parts, dim=0)
+        if q.dtype != key.dtype:
+            q = q.to(key.dtype)
+
+        out = flash_attn_varlen_func(
+            q, key, val, dg["cu_q"], dg["cu_k"], dg["max_q"], dg["max_k"], causal=False,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+
+# Backend registry: KVCacheConfig.attention_backend names one of these.
+ATTENTION_BACKENDS: dict[str, type[BatchedCacheManager]] = {
+    "flashinfer": FlashInferCacheManager,
+    "dense_gen": DenseGenCacheManager,
+}
+
+
+def create_cache_manager(
+    *, kv_cache_config: KVCacheConfig, **kwargs
+) -> BatchedCacheManager:
+    """Instantiate the cache-manager backend named by
+    ``kv_cache_config.attention_backend``. Takes the same keyword arguments as
+    ``BatchedCacheManager.__init__``."""
+    backend_cls = ATTENTION_BACKENDS.get(kv_cache_config.attention_backend)
+    if backend_cls is None:
+        raise ValueError(
+            f"Unknown attention backend {kv_cache_config.attention_backend!r}; "
+            f"available: {sorted(ATTENTION_BACKENDS)}"
+        )
+    return backend_cls(kv_cache_config=kv_cache_config, **kwargs)

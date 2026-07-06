@@ -174,7 +174,7 @@ class Cosmos3Model(Model):
                 head_dim=self.config.head_dim,
                 max_seq_len=self.config.max_position_embeddings,
                 num_qo_heads=self.config.num_attention_heads,
-                dense_gen_attn=True,
+                attention_backend=self.config.attention_backend,
             )
         ]
 
