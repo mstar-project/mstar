@@ -495,6 +495,84 @@ def test_ingest_cond_latents_routing() -> None:
         dit._ingest_cond_latents(st, {}, "cpu")
 
 
+def test_postprocess_finishes_captured_step() -> None:
+    """The submodule ``postprocess`` finishes a captured denoise step from the
+    step's inputs (CFG combine + scheduler step), passes eager outputs through
+    untouched, and no-ops the discarded extra step past the request's count."""
+    import types
+
+    import torch
+
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+    from mstar.model.submodule_base import ARNodeInputs
+
+    dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
+        model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
+
+    class _Sched:
+        step_index = None
+        timesteps = torch.tensor([900.0, 500.0, 100.0])
+
+        @staticmethod
+        def step(velocity, t, latents, return_dict=False):
+            return (latents + velocity,)
+
+    dit.request_state("r").add_all(gs=2.0, scheduler=_Sched())
+    info = types.SimpleNamespace(graph_walk="image_gen")
+    lat, ti = torch.ones(1, 4), torch.tensor([1])
+    inp = ARNodeInputs(tensor_inputs={"latents": lat, "time_index": ti})
+
+    # Captured shape: velocity = uncond + gs*(cond - uncond) = 3, latents += 3.
+    out = {"cond_v": [torch.full((1, 4), 2.0)], "uncond_v": [torch.ones(1, 4)]}
+    dit.postprocess("r", info, out, inputs=inp)
+    assert set(out) == {"latents", "time_index"}
+    assert torch.equal(out["latents"][0], torch.full((1, 4), 4.0))
+    assert torch.equal(out["time_index"][0], torch.tensor([2]))
+
+    # Discarded extra step: inputs pass through unchanged.
+    out = {"cond_v": [torch.ones(1, 4)], "uncond_v": [torch.ones(1, 4)]}
+    over = ARNodeInputs(tensor_inputs={"latents": lat, "time_index": torch.tensor([3])})
+    dit.postprocess("r", info, out, inputs=over)
+    assert torch.equal(out["latents"][0], lat)
+    assert torch.equal(out["time_index"][0], torch.tensor([3]))
+
+    # Eager shape (already finished) and non-gen walks stay untouched.
+    eager = {"latents": [lat], "time_index": [ti]}
+    dit.postprocess("r", info, eager, inputs=inp)
+    assert eager == {"latents": [lat], "time_index": [ti]}
+    pre = {"cond_v": [lat]}
+    dit.postprocess("r", types.SimpleNamespace(graph_walk="prefill"), pre, inputs=inp)
+    assert pre == {"cond_v": [lat]}
+    dit.cleanup_request("r")
+
+
+def test_video_postprocess_uses_request_fps(tmp_path) -> None:
+    """The mp4 container carries the request's fps (falling back to the model
+    default), so playback runs at the requested rate without a mux-side retime."""
+    import subprocess
+
+    import pytest as _pytest
+    import torch
+
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    frames = torch.zeros(1, 3, 8, 32, 32, dtype=torch.uint8)
+    try:
+        data = model.postprocess(frames, "video", request_kwargs={"fps": 12})
+    except Exception as exc:  # noqa: BLE001 — encoder backend missing on this host
+        _pytest.skip(f"video encoder unavailable: {exc}")
+    out = tmp_path / "v.mp4"
+    out.write_bytes(data)
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0", str(out)],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    if probe.returncode != 0:
+        _pytest.skip("ffprobe unavailable")
+    num, den = probe.stdout.strip().split("/")
+    assert abs(float(num) / float(den) - 12.0) < 1e-3
+
+
 if __name__ == "__main__":
     test_adapter_registered_for_images()
     test_gen_params_and_step_metadata()
@@ -503,6 +581,7 @@ if __name__ == "__main__":
     test_static_inputs_noisy_frames_subset()
     test_vae_encoder_walk_and_signal_wiring()
     test_ingest_cond_latents_routing()
+    test_postprocess_finishes_captured_step()
     if NANO_DIR.exists():
         test_process_prompt_emits_cond_and_uncond()
     print("PASS")

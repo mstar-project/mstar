@@ -452,10 +452,14 @@ class Model(ABC):
         self,
         output: torch.Tensor,
         modality: str,  # text | image | video | audio
+        request_kwargs: dict | None = None,
     ) -> bytes:
         """
         Given an output of a certain modality, encode and return as bytes.
         This will likely need to overridden with model-specific behavior.
+        ``request_kwargs`` is the request's model_kwargs, so encoders can honor
+        per-request parameters (e.g. writing a video container at the request's
+        frame rate).
 
         Modality to expected encoding type:
         - text: utf-8

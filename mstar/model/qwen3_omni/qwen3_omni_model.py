@@ -1150,6 +1150,7 @@ class Qwen3OmniModel(Model):
         self,
         output: torch.Tensor,
         modality: str,
+        request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
             detok = self.tokenizer.decode(output)

@@ -1571,44 +1571,42 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             for rid, (cond_v, uncond_v) in zip(rids, results, strict=True)
         }
 
-    def postprocess_captured(
-        self, request_ids: list[str],
-        inputs: list,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        outputs: dict
-    ) -> dict:
-        """Eager tail run after graph replay: the classifier-free-guidance combine
-        and the (Python, multistep) scheduler step the graph can't hold. Mirrors
-        the tail of ``_forward_image_gen``."""
-        if per_request_info[request_ids[0]].graph_walk not in GEN_WALKS:
-            return outputs
-        for rid, inp in zip(request_ids, inputs, strict=True):
-            st = self.request_states[rid]
-            cond_v = outputs[rid]["cond_v"][0]
-            uncond_v = outputs[rid]["uncond_v"][0]
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
-            latents = inp.tensor_inputs["latents"]
-            time_index = inp.tensor_inputs["time_index"]
-            step_index = int(time_index.reshape(-1)[0].item())
-            sched = st["scheduler"]
-            sched_idx = sched.step_index
-            if step_index >= len(sched.timesteps) or (
-                sched_idx is not None and sched_idx >= len(sched.timesteps)
-            ):
-                # Discarded extra step past this request's denoise count. Guard on
-                # BOTH the engine step counter and the scheduler's own step_index:
-                # with concurrent (bs>1) requests the batched loop dispatches one
-                # extra step whose engine time_index can lag the scheduler, and
-                # stepping an already-exhausted UniPC scheduler trips
-                # `assert self.this_order > 0`.
-                outputs[rid] = {"latents": [latents], "time_index": [time_index]}
-                continue
-            t = st["scheduler"].timesteps[step_index]
-            new_latents = st["scheduler"].step(
-                velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
-            )[0].squeeze(0)
-            outputs[rid] = {"latents": [new_latents], "time_index": [time_index + 1]}
-        return outputs
+    def postprocess(self, request_id, request_info, outputs, inputs=None, **kwargs):
+        """Captured-path tail: the classifier-free-guidance combine and the
+        (Python, multistep) scheduler step the graph can't hold, finished from
+        the step's own ``inputs``. Mirrors the tail of ``_forward_image_gen``.
+        Eager forwards already emit finished ``latents``/``time_index`` and
+        pass through untouched (no ``cond_v`` in their outputs)."""
+        if request_info.graph_walk not in GEN_WALKS or "cond_v" not in outputs:
+            return
+        st = self.request_states[request_id]
+        velocity = outputs["uncond_v"][0] + st["gs"] * (
+            outputs["cond_v"][0] - outputs["uncond_v"][0]
+        )
+        latents = inputs.tensor_inputs["latents"]
+        time_index = inputs.tensor_inputs["time_index"]
+        outputs.clear()
+        step_index = int(time_index.reshape(-1)[0].item())
+        sched = st["scheduler"]
+        sched_idx = sched.step_index
+        if step_index >= len(sched.timesteps) or (
+            sched_idx is not None and sched_idx >= len(sched.timesteps)
+        ):
+            # Discarded extra step past this request's denoise count. Guard on
+            # BOTH the engine step counter and the scheduler's own step_index:
+            # with concurrent (bs>1) requests the batched loop dispatches one
+            # extra step whose engine time_index can lag the scheduler, and
+            # stepping an already-exhausted UniPC scheduler trips
+            # `assert self.this_order > 0`.
+            outputs["latents"] = [latents]
+            outputs["time_index"] = [time_index]
+            return
+        t = sched.timesteps[step_index]
+        new_latents = sched.step(
+            velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
+        )[0].squeeze(0)
+        outputs["latents"] = [new_latents]
+        outputs["time_index"] = [time_index + 1]
 
     def check_stop(self, request_id, request_info, outputs) -> set[str]:
         """Stop this request's denoise loop once it has run its own step count.

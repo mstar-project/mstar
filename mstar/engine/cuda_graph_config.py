@@ -35,8 +35,8 @@ class CudaGraphConfig(ABC):
         # Method on the submodule to capture. Defaults to ``forward_batched`` (the
         # same method the eager batched path uses). Diffusion-style walks that must
         # keep a non-capturable tail (e.g. a multistep scheduler step) out of the
-        # graph capture a velocity-only method here and run the tail in
-        # ``postprocess_captured`` after replay.
+        # graph capture a velocity-only method here and finish the tail in the
+        # submodule ``postprocess`` after replay.
         capture_forward_method: str = "forward_batched",
         # Whether the runner advances KV seq_lens after replay. True for
         # autoregressive walks (each step appends a token). False for frozen-prefix

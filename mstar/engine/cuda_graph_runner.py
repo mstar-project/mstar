@@ -606,7 +606,7 @@ class CudaGraphRunner:
                 # Usually ``forward_batched`` (the same method the eager batched
                 # path runs). Diffusion walks override this to a velocity-only
                 # method so the non-capturable scheduler tail stays out of the
-                # graph (run later in ``postprocess_captured``).
+                # graph (finished in the submodule ``postprocess``).
                 forward = getattr(submodule, config.capture_forward_method)
                 if config.compile:
                     forward = torch.compile(
@@ -1509,18 +1509,10 @@ class CudaGraphRunner:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
-            # Eager tail for walks that captured only a velocity/raw forward and
-            # keep a non-capturable step (e.g. a multistep scheduler) out of the
-            # graph. Runs with REAL request ids, the original ``inputs``, and the
-            # cloned captured outputs, so it can finish each request's step.
-            if hasattr(submodule, "postprocess_captured"):
-                outputs = submodule.postprocess_captured(
-                    request_ids=request_ids,
-                    inputs=inputs,
-                    per_request_info=per_request_info,
-                    outputs=outputs,
-                )
-
+            # Walks that captured only a velocity/raw forward finish their
+            # non-capturable step (e.g. a multistep scheduler) in the
+            # submodule's ``postprocess``, which the engine runs right after
+            # this returns with each request's original inputs.
             success = True
             return outputs
         finally:
@@ -1746,18 +1738,10 @@ class CudaGraphRunner:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
-            # Eager tail for walks that captured only a velocity/raw forward and
-            # keep a non-capturable step (e.g. a multistep scheduler) out of the
-            # graph. Runs with REAL request ids, the original ``inputs``, and the
-            # cloned captured outputs, so it can finish each request's step.
-            if hasattr(submodule, "postprocess_captured"):
-                outputs = submodule.postprocess_captured(
-                    request_ids=request_ids,
-                    inputs=inputs,
-                    per_request_info=per_request_info,
-                    outputs=outputs,
-                )
-
+            # Walks that captured only a velocity/raw forward finish their
+            # non-capturable step (e.g. a multistep scheduler) in the
+            # submodule's ``postprocess``, which the engine runs right after
+            # this returns with each request's original inputs.
             success = True
             return outputs
         finally:

@@ -278,7 +278,9 @@ class StatelessEngine(BaseEngine):
         submodule = planned.submodule
         if submodule is None:
             return
-        for rid in planned.batch.request_ids:
+        for rid, node_inputs in zip(
+            planned.batch.request_ids, planned.node_inputs, strict=True
+        ):
             info = planned.batch.per_request_info.get(rid)
             if info is None:
                 continue
@@ -286,6 +288,7 @@ class StatelessEngine(BaseEngine):
                 request_id=rid,
                 request_info=info,
                 outputs=output.per_request_output_tensors.get(rid, {}),
+                inputs=node_inputs,
             )
 
     # ─── Internals ─────────────────────────────────────────────────────
