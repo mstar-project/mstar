@@ -632,16 +632,45 @@ class Cosmos3Model(Model):
             "has_image_condition": "image" in (input_modalities or []),
             "use_karras_sigma": mk.get("use_karras_sigmas"),
         }
+        # Video-to-video: a non-action video input pins clean conditioning
+        # latent frames taken from the request video (reference recipe defaults:
+        # indexes (0, 1), keep "first", flow_shift 10.0). Validated here so a
+        # malformed request fails at submission rather than mid-denoise.
+        has_video_condition = "video" in (input_modalities or []) and "action_mode" not in mk
+        if has_video_condition:
+            from mstar.model.cosmos3.components.packing import normalize_condition_frame_indexes
+
+            if num_frames <= 1:
+                raise ValueError("Cosmos3 video conditioning requires a video request (num_frames > 1).")
+            indexes = normalize_condition_frame_indexes(
+                mk.get("condition_frame_indexes_vision"),
+                constants.DEFAULT_CONDITION_FRAME_INDEXES_VISION,
+            )
+            latent_frames = 1 + (num_frames - 1) // self.config.vae.scale_factor_temporal
+            if indexes[-1] >= latent_frames:
+                raise ValueError(
+                    f"Cosmos3 condition_frame_indexes_vision {indexes} is outside the latent "
+                    f"video ({latent_frames} latent frames for num_frames={num_frames})."
+                )
+            keep = str(mk.get("condition_video_keep") or constants.DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
+            if keep not in ("first", "last"):
+                raise ValueError("Cosmos3 condition_video_keep must be 'first' or 'last'.")
+            params["has_video_condition"] = True
+            params["condition_frame_indexes_vision"] = indexes
+            params["condition_video_keep"] = keep
         # Text-to-image (single frame, no visual conditioning) follows the
         # reference Cosmos3 t2i recipe: classifier-free guidance only on the
         # timestep interval [400, 1000] (outside it the denoise step runs the
         # conditional branch alone) and flow_shift 3.0. Request kwargs override;
-        # video / image-conditioned paths keep their own defaults (full CFG,
+        # video-to-video defaults to the reference V2V flow_shift; other
+        # image-conditioned / video paths keep their own defaults (full CFG,
         # scheduler-config flow_shift).
         is_t2i = num_frames == 1 and not params["has_image_condition"]
         fs = mk.get("flow_shift")
         if fs is None and is_t2i:
             fs = 3.0
+        if fs is None and has_video_condition:
+            fs = constants.V2V_DEFAULT_FLOW_SHIFT
         if fs is not None:
             params["flow_shift"] = float(fs)
         gi = mk.get("guidance_interval")

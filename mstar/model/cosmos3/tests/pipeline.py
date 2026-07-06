@@ -173,11 +173,18 @@ class Cosmos3Pipeline:
         decode: bool = True,
         generate_sound: bool = False,
         sound_duration: float | None = None,
+        condition_video: torch.Tensor | None = None,
+        condition_frame_indexes: tuple[int, ...] = (0, 1),
     ):
         """With ``generate_sound`` a jointly denoised AVAE-latent sound band
         rides after the vision tokens (video-mode only); returns
         ``(video_or_latents, sound_latents)`` with the final sound latents
-        ``[1, C, T]`` (decode them with the checkpoint's sound tokenizer)."""
+        ``[1, C, T]`` (decode them with the checkpoint's sound tokenizer).
+
+        ``condition_video`` (``[T, C, H, W]`` in [0, 1]) enables video-to-video:
+        the latent frames in ``condition_frame_indexes`` are pinned clean from
+        the video's VAE-encoded causal prefix and re-injected after every
+        scheduler step; the complement is denoised."""
         device, dtype = self.device, self.dtype
         cond_ids, uncond_ids = tokenize_prompt(
             self.tokenizer, prompt, negative_prompt, num_frames=num_frames, height=height, width=width, fps=fps
@@ -187,6 +194,33 @@ class Cosmos3Pipeline:
             image, num_frames, height, width, generator, latents, device, dtype
         )
         latent_shape = tuple(latents.shape)
+
+        vmask = None
+        cond_video_latents = None
+        noisy_frames = None
+        if condition_video is not None:
+            # Video-to-video: only the causal prefix feeding the pinned latent
+            # frames is encoded (max(indexes)*tcf + 1 pixel frames, padded by
+            # repeating the last frame); the complement keeps the noise drawn
+            # above (the serving path's RNG order).
+            cpf = min(max(condition_frame_indexes) * self.vae_scale_temporal + 1, num_frames)
+            clip = condition_video[:cpf]
+            if clip.shape[0] < cpf:
+                clip = torch.cat([clip, clip[-1:].expand(cpf - clip.shape[0], -1, -1, -1)], dim=0)
+            frames = [
+                self.video_processor.preprocess(clip[i], height=height, width=width).squeeze(0)
+                for i in range(clip.shape[0])
+            ]
+            prefix = self._encode_video(
+                torch.stack(frames, dim=1).unsqueeze(0).to(device=device, dtype=dtype)
+            )
+            vmask = torch.zeros((1, 1, latent_shape[2], 1, 1), device=device, dtype=dtype)
+            cond_video_latents = torch.zeros(latent_shape, device=device, dtype=dtype)
+            for f in condition_frame_indexes:
+                vmask[:, :, f] = 1.0
+                cond_video_latents[:, :, f] = prefix[:, :, f].to(dtype)
+            latents = vmask * cond_video_latents + (1.0 - vmask) * latents
+            noisy_frames = [f for f in range(latent_shape[2]) if f not in set(condition_frame_indexes)]
 
         # Sound noise is drawn after the video noise from the same generator
         # (the serving path's RNG order).
@@ -209,10 +243,12 @@ class Cosmos3Pipeline:
         cond = build_static_inputs(
             cond_ids, latent_shape, self.config, self.vae_scale_temporal, fps, device,
             has_image_condition=has_image_condition, sound_latent_frames=sound_frames,
+            noisy_frames=noisy_frames,
         )
         uncond = build_static_inputs(
             uncond_ids, latent_shape, self.config, self.vae_scale_temporal, fps, device,
             has_image_condition=has_image_condition, sound_latent_frames=sound_frames,
+            noisy_frames=noisy_frames,
         )
         fields = _TF_STATIC_FIELDS + (_TF_SOUND_STATIC_FIELDS if generate_sound else ())
         cond_static = {k: cond[k] for k in fields}
@@ -251,6 +287,10 @@ class Cosmos3Pipeline:
                 latents = self.scheduler.step(
                     velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
                 )[0].squeeze(0)
+            if vmask is not None:
+                # Video-to-video: re-inject the clean conditioning frames after
+                # the scheduler step, matching the serving path.
+                latents = (1.0 - vmask) * latents + vmask * cond_video_latents
 
         out = latents if not decode else self._decode(latents)
         if generate_sound:

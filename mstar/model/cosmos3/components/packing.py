@@ -146,6 +146,31 @@ def vision_condition_frame_indexes(mode: str, latent_frames: int) -> list[int]:
     raise ValueError(f"Unknown Cosmos3 action mode: {mode!r}")
 
 
+def normalize_condition_frame_indexes(value, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Normalize a request's video-conditioning latent-frame indexes.
+
+    Accepts an int, a comma-separated string, or an iterable of ints; returns a
+    sorted, de-duplicated tuple. ``None`` falls back to ``default``."""
+    if value is None:
+        return tuple(default)
+    if isinstance(value, str):
+        value = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, int):
+        value = [value]
+    try:
+        indexes = tuple(sorted({int(v) for v in value}))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "condition_frame_indexes_vision must be an int, comma-separated "
+            f"string, or list of ints; got {value!r}"
+        ) from exc
+    if not indexes:
+        raise ValueError("condition_frame_indexes_vision must contain at least one index")
+    if indexes[0] < 0:
+        raise ValueError(f"condition_frame_indexes_vision must be non-negative, got {indexes}")
+    return indexes
+
+
 def action_start_frame_offset(action_length: int, video_length: int) -> int:
     """mRoPE start-frame offset for the action band: action chunks of length
     ``num_frames - 1`` start one frame in (aligned to predicted frames 1..N);
@@ -361,13 +386,16 @@ def build_static_inputs(
     device,
     has_image_condition: bool = False,
     sound_latent_frames: int | None = None,
+    noisy_frames: list[int] | None = None,
 ) -> dict[str, Any]:
     """Assemble the per-prompt static transformer inputs for image/video
     generation. ``latent_shape`` is ``[B, C, T, H, W]`` (``T == 1`` for images;
     ``T == 1 + (num_frames - 1) // temporal_factor`` for video). When
     ``has_image_condition`` is set, latent frame 0 is a clean conditioning anchor
     (image-to-video): it stays in the sequence but is excluded from the noisy /
-    predicted frames. ``sound_latent_frames`` appends a jointly denoised sound
+    predicted frames. ``noisy_frames`` instead lists the predicted latent frames
+    explicitly (video-to-video, where the conditioned frames are the complement).
+    ``sound_latent_frames`` appends a jointly denoised sound
     band after the vision tokens (the generation block becomes
     ``[vision | sound]``). Step-varying fields (``vision_tokens``,
     ``vision_timesteps``) are spliced in per denoising step by the caller."""
@@ -381,6 +409,7 @@ def build_static_inputs(
         config=config,
         vae_scale_factor_temporal=vae_scale_factor_temporal,
         device=device,
+        noisy_frames=noisy_frames,
     )
     parts = [text["text_mrope_ids"], vision["vision_mrope_ids"]]
     static = {**text, **vision}

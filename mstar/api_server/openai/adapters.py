@@ -339,13 +339,29 @@ class Cosmos3Adapter(OpenAIAdapter):
             mk.setdefault("fps", req.fps)
         # Image-to-video: the conditioning frame (URL / data URI) is persisted and
         # loaded by the worker, which VAE-encodes it into the clean frame-0 anchor.
+        # Video-to-video: the conditioning video is persisted the same way; the
+        # worker VAE-encodes its prefix and pins the requested clean latent
+        # frames (condition_frame_indexes_vision / condition_video_keep via
+        # extra_body).
         image = getattr(req, "image", None)
+        video = getattr(req, "video", None)
+        if image and video:
+            raise ValueError("Provide either 'image' or 'video' conditioning, not both.")
         if image:
             _, path = media_io.resolve_media_ref(image, upload_dir)
             return SubmitArgs(
                 text=req.prompt,
                 file_paths={"image": [path]},
                 input_modalities=["image", "text"],
+                output_modalities=["video"],
+                model_kwargs=mk,
+            )
+        if video:
+            _, path = media_io.resolve_media_ref(video, upload_dir)
+            return SubmitArgs(
+                text=req.prompt,
+                file_paths={"video": [path]},
+                input_modalities=["video", "text"],
                 output_modalities=["video"],
                 model_kwargs=mk,
             )
