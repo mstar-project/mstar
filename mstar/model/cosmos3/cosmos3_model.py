@@ -477,6 +477,7 @@ class Cosmos3Model(Model):
             use_system_prompt=allow_templates and bool(kwargs.get("use_system_prompt", False)),
             add_resolution_template=allow_templates and bool(kwargs.get("use_resolution_template", False)),
             add_duration_template=allow_templates and bool(kwargs.get("use_duration_template", False)),
+            max_sequence_length=p["max_sequence_length"],
         )
         return {
             "text_inputs": [
@@ -631,6 +632,11 @@ class Cosmos3Model(Model):
             "num_inference_steps": steps,
             "has_image_condition": "image" in (input_modalities or []),
             "use_karras_sigma": mk.get("use_karras_sigmas"),
+            # Prompt-token truncation cap (reference serving default 4096),
+            # request-overridable; floor 1 so a bad value can't empty the prompt.
+            "max_sequence_length": max(
+                1, int(mk.get("max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH))
+            ),
         }
         # Video-to-video: a non-action video input pins clean conditioning
         # latent frames taken from the request video (reference recipe defaults:
