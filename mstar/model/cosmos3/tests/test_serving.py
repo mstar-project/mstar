@@ -400,12 +400,109 @@ def test_static_inputs_noisy_frames_subset() -> None:
     assert st_i2v["num_noisy_vision_tokens"] == st_eq["num_noisy_vision_tokens"]
 
 
+def test_vae_encoder_walk_and_signal_wiring() -> None:
+    """The conditioned prefill walks run the vae_encoder node in parallel with
+    the DiT prefill and persist ``cond_latents`` to the conductor; the media
+    input routes to the encoder; the gen transition threads the persisted
+    latents (or an empty edge) into the loop's external ``cond_latents`` input."""
+    from mstar.graph.base import Parallel, TensorPointerInfo
+    from mstar.graph.special_destinations import EMPTY_DESTINATION
+    from mstar.model.cosmos3.cosmos3_model import DIT_NODE, VAE_ENCODER_NODE
+
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    walks = model.get_graph_walk_graphs()
+
+    for walk, cond_input in (("prefill_cond", "image_inputs"), ("prefill_cond_video", "video_inputs")):
+        g = walks[walk]
+        assert isinstance(g, Parallel)
+        enc = g.get_nodes()[VAE_ENCODER_NODE]
+        assert enc.input_names == {cond_input}
+        (out,) = enc.outputs
+        assert (out.name, out.next_node, out.persist) == ("cond_latents", EMPTY_DESTINATION, True)
+
+    # Every gen loop takes cond_latents as an external (non-loop-back) input.
+    for walk in ("image_gen", "video_gen", "action_gen", "action_video_gen"):
+        (loop,) = walks[walk].get_loops().values()
+        assert ("cond_latents", DIT_NODE) in loop._external_inputs, walk
+
+    # The conditioning media edge targets the encoder node.
+    fpa = model.get_initial_forward_pass_args(
+        "p0", ["image", "text"], ["video"],
+        {"text_inputs": [], "image_inputs": [TensorPointerInfo(
+            dims=[3, 8, 8], dtype="float32", nbytes=768, address=0, stride=[64, 8, 1],
+            uuid="u-img", source_session_id="s", source_entity="api_server")]},
+    )
+    targets = {(e.name, e.next_node) for e in fpa.inputs}
+    assert ("image_inputs", VAE_ENCODER_NODE) in targets
+
+    # Prefill -> gen: the persisted latents ride the cond_latents edge and are
+    # unpersisted with this pass; without a persist signal the edge is empty.
+    info = TensorPointerInfo(
+        dims=[1], dtype="bfloat16", nbytes=2, address=0, stride=[1],
+        uuid="u-lat", source_session_id="s", source_entity="worker",
+    )
+    fpa2 = model.get_partition_forward_pass_args(
+        "default", fpa.full_metadata, {"cond_latents": [info]},
+    )
+    cond_edges = [e for e in fpa2.inputs if e.name == "cond_latents"]
+    assert len(cond_edges) == 1 and cond_edges[0].tensor_info == [info]
+    assert info in fpa2.unpersist_tensors
+    fpa3 = model.get_initial_forward_pass_args("p1", ["text"], ["image"], {"text_inputs": []})
+    fpa4 = model.get_partition_forward_pass_args("default", fpa3.full_metadata, {})
+    (empty_edge,) = [e for e in fpa4.inputs if e.name == "cond_latents"]
+    assert empty_edge.tensor_info == []
+
+
+def test_ingest_cond_latents_routing() -> None:
+    """Gen-init state adoption: i2v anchors land under ``cond_latents``; masked
+    (video/action) conditioning lands under ``cond_video_latents``; an action
+    request without media pins zeros; V2V without media is an error."""
+    import types
+
+    import torch
+
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+
+    dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
+        model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
+    dit.transformer = types.SimpleNamespace(
+        proj_in=types.SimpleNamespace(weight=torch.zeros(1, dtype=torch.bfloat16))
+    )
+    anchor = torch.ones(1, 16, 1, 2, 2)
+
+    st = dit.request_state("i2v")
+    dit._ingest_cond_latents(st, {"cond_latents": [anchor]}, "cpu")
+    assert torch.equal(st["cond_latents"], anchor) and st.get("cond_video_latents") is None
+
+    st = dit.request_state("t2v")
+    dit._ingest_cond_latents(st, {"cond_latents": []}, "cpu")
+    assert st.get("cond_latents") is None
+
+    st = dit.request_state("v2v")
+    st.add("vmask", torch.ones(1, 1, 1, 1, 1))
+    dit._ingest_cond_latents(st, {"cond_latents": [anchor]}, "cpu")
+    assert torch.equal(st["cond_video_latents"], anchor)
+
+    st = dit.request_state("act")
+    st.add_all(vmask=torch.ones(1, 1, 1, 1, 1), action_chunk=4, latent_shape=(1, 16, 1, 2, 2))
+    dit._ingest_cond_latents(st, {"cond_latents": []}, "cpu")
+    assert st["cond_video_latents"].abs().sum() == 0
+    assert st["cond_video_latents"].dtype == torch.bfloat16
+
+    st = dit.request_state("v2v_missing")
+    st.add("vmask", torch.ones(1, 1, 1, 1, 1))
+    with pytest.raises(ValueError, match="no conditioning video"):
+        dit._ingest_cond_latents(st, {}, "cpu")
+
+
 if __name__ == "__main__":
     test_adapter_registered_for_images()
     test_gen_params_and_step_metadata()
     test_gen_params_v2v()
     test_normalize_condition_frame_indexes()
     test_static_inputs_noisy_frames_subset()
+    test_vae_encoder_walk_and_signal_wiring()
+    test_ingest_cond_latents_routing()
     if NANO_DIR.exists():
         test_process_prompt_emits_cond_and_uncond()
     print("PASS")
