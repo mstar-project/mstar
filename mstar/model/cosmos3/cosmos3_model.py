@@ -42,6 +42,7 @@ from mstar.graph.base import (
     GraphNode,
     GraphSection,
     Loop,
+    Parallel,
     Sequential,
     TensorPointerInfo,
 )
@@ -314,33 +315,33 @@ class Cosmos3Model(Model):
                         GraphEdge(next_node=AUDIO_DECODER_NODE, name="sound_latents"),
                     ],
                 ),
-                # The two decoders are independent (edge-driven readiness): each
-                # runs as soon as its own latents arrive. Kept as Sequential
-                # members rather than a Parallel section — Parallel's IO
-                # classification treats any edge targeting a member node as
-                # internal, which strips these nodes' loop-fed inputs from the
-                # worker graph and silently drops both emissions.
-                GraphNode(
-                    name=VAE_DECODER_NODE,
-                    input_names=["latents"],
-                    outputs=[
-                        GraphEdge(
-                            next_node=EMIT_TO_CLIENT,
-                            name="video_output",
-                            output_modality="video",
+                # The two decoders are independent: each runs as soon as its
+                # own latents arrive from the loop.
+                Parallel(
+                    [
+                        GraphNode(
+                            name=VAE_DECODER_NODE,
+                            input_names=["latents"],
+                            outputs=[
+                                GraphEdge(
+                                    next_node=EMIT_TO_CLIENT,
+                                    name="video_output",
+                                    output_modality="video",
+                                ),
+                            ],
                         ),
-                    ],
-                ),
-                GraphNode(
-                    name=AUDIO_DECODER_NODE,
-                    input_names=["sound_latents"],
-                    outputs=[
-                        GraphEdge(
-                            next_node=EMIT_TO_CLIENT,
-                            name="audio_output",
-                            output_modality="audio",
+                        GraphNode(
+                            name=AUDIO_DECODER_NODE,
+                            input_names=["sound_latents"],
+                            outputs=[
+                                GraphEdge(
+                                    next_node=EMIT_TO_CLIENT,
+                                    name="audio_output",
+                                    output_modality="audio",
+                                ),
+                            ],
                         ),
-                    ],
+                    ]
                 ),
             ]
         )

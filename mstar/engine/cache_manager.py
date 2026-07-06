@@ -430,12 +430,9 @@ class BatchedCacheManager:
         # reader — dropped along with their per-rid GPU construction above.
         ps.seq_lens = seq_lens
         ps.write_store = write_store
-        if (_dense_gen_attn_enabled(self.kv_cache_config.dense_gen_attn)
-                and not is_causal and not self._cuda_graph_mode
-                and len(self.request_ids) == 1):
-            ps.dense_gen = self._build_dense_gen_plan([effective_label], seq_lens)
-        else:
-            ps.dense_gen = None
+        # The lean dense path early-returns in plan_attention before reaching
+        # this impl, so a paged plan always clears any prior dense plan here.
+        ps.dense_gen = None
 
     def plan_rope(
         self,
@@ -669,12 +666,9 @@ class BatchedCacheManager:
         )
         ps.seq_lens = combined_seq_lens
         ps.write_store = write_store
-        if (_dense_gen_attn_enabled(self.kv_cache_config.dense_gen_attn)
-                and not is_causal and not self._cuda_graph_mode
-                and len(self.request_ids) == 1):
-            ps.dense_gen = self._build_dense_gen_plan(labels, seq_lens)
-        else:
-            ps.dense_gen = None
+        # The lean dense path early-returns at the top of this method, so a
+        # paged plan always clears any prior dense plan here.
+        ps.dense_gen = None
 
     @torch.compiler.disable
     def plan_rope_batched_cfg(
