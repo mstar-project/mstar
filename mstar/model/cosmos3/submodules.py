@@ -202,12 +202,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         self, ids: list[int], height: int, width: int, num_frames: int,
         fps: float, has_image_condition: bool, device,
         sound_latent_frames: int | None = None,
+        noisy_frames: list[int] | None = None,
     ) -> dict:
         static = build_static_inputs(
             list(ids), self._latent_shape(height, width, num_frames), self.config,
             self.config.vae.scale_factor_temporal, fps, device,
             has_image_condition=has_image_condition,
             sound_latent_frames=sound_latent_frames,
+            noisy_frames=noisy_frames,
         )
         # proj_out runs on the generation token block, so shift the joint-sequence
         # mse indexes to be relative to the generation tokens.
@@ -303,6 +305,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # in the first denoise step's ``latents``; it stays in the sequence but is
         # not denoised. (Text-to-image / text-to-video have no clean anchor.)
         has_image_condition = bool(md.get("has_image_condition", False))
+        # Video-to-video: the request's condition_frame_indexes_vision pin clean
+        # latent frames from the conditioning video; the complement is predicted.
+        condition_indexes = md.get("condition_frame_indexes_vision")
+        noisy_frames = None
+        if condition_indexes:
+            t_lat = self._latent_shape(height, width, num_frames)[2]
+            noisy_frames = [f for f in range(t_lat) if f not in set(condition_indexes)]
 
         # Opt-in sound: append a jointly denoised AVAE-latent band to the
         # generation block. Video-only (single-frame image and action requests
@@ -316,13 +325,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         cond = self._build_static(
             cond_ids, height, width, num_frames, fps, has_image_condition, device,
-            sound_latent_frames=sound_frames,
+            sound_latent_frames=sound_frames, noisy_frames=noisy_frames,
         )
         uncond = None
         if uncond_ids is not None:
             uncond = self._build_static(
                 uncond_ids, height, width, num_frames, fps, has_image_condition, device,
-                sound_latent_frames=sound_frames,
+                sound_latent_frames=sound_frames, noisy_frames=noisy_frames,
             )
 
         self._req[fwd_info.request_id] = {
@@ -349,6 +358,37 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 self._req[fwd_info.request_id]["cond_latents"] = self._encode_conditioning(
                     image[0], height, width, num_frames, device, anchor_only=True
                 )
+
+        # Video-to-video: encode the conditioning video's prefix into clean
+        # latents and pin the requested latent frames (the complement starts
+        # from noise). Only the first max(indexes)*tcf + 1 pixel frames feed
+        # the pinned latent frames (the Wan VAE is temporally causal), taken
+        # from the start or end of the input per ``condition_video_keep``; a
+        # shorter input is padded by repeating its last frame.
+        if condition_indexes:
+            video = (inputs or {}).get("video_inputs")
+            if not video:
+                raise ValueError(
+                    "Cosmos3 video conditioning was requested but no conditioning video arrived."
+                )
+            tcf = self.config.vae.scale_factor_temporal
+            cpf = min(max(condition_indexes) * tcf + 1, num_frames)
+            clip = video[0]
+            clip = clip[-cpf:] if md.get("condition_video_keep") == "last" else clip[:cpf]
+            if clip.shape[0] < cpf:
+                clip = torch.cat([clip, clip[-1:].expand(cpf - clip.shape[0], -1, -1, -1)], dim=0)
+            prefix_latents = self._encode_conditioning_video(clip, height, width, cpf, device)
+            st = self._req[fwd_info.request_id]
+            latent_shape = st["latent_shape"]
+            dtype = self.transformer.proj_in.weight.dtype
+            vmask = torch.zeros((1, 1, latent_shape[2], 1, 1), device=device, dtype=dtype)
+            cond_video_latents = torch.zeros(latent_shape, device=device, dtype=dtype)
+            for f in condition_indexes:
+                vmask[:, :, f] = 1.0
+                cond_video_latents[:, :, f] = prefix_latents[:, :, f].to(dtype)
+            st["vmask"] = vmask
+            st["velocity_mask"] = 1.0 - vmask
+            st["cond_video_latents"] = cond_video_latents
 
         return self._get_prefill_node_inputs(cond, uncond)
 
@@ -541,6 +581,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # predicted velocity is zero on conditioning frames (unpatchify
                 # only fills the noisy frames), matching the fused pipeline.
                 latents[:, :, 0] = cond_latents[:, :, 0].to(latents.dtype)
+            if st.get("vmask") is not None:
+                # Video-to-video: pinned latent frames start clean, the rest
+                # from the noise drawn above (the reference RNG order).
+                latents = st["vmask"] * st["cond_video_latents"] + st["velocity_mask"] * latents
             time_index = torch.zeros(1, dtype=torch.long, device=device)
         else:
             latents = inputs["latents"][0]
@@ -584,6 +628,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cond_latents = st.get("cond_latents")
             if cond_latents is not None:
                 latents[:, :, 0] = cond_latents[:, :, 0].to(latents.dtype)
+            if st.get("vmask") is not None:
+                latents = st["vmask"] * st["cond_video_latents"] + st["velocity_mask"] * latents
             sound_latents = torch.randn(
                 (1, self.config.sound_dim, st["num_sound"]), generator=gen, device=device, dtype=dtype
             )
@@ -931,6 +977,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         new_latents = scheduler.step(
             velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
         )[0].squeeze(0)
+        if st.get("vmask") is not None:
+            # Video-to-video: re-inject the clean conditioning frames after the
+            # scheduler step (the reference pipeline does the same) so scheduler
+            # rounding can't drift the pinned latents.
+            new_latents = st["velocity_mask"] * new_latents + st["vmask"] * st["cond_video_latents"]
         return {"latents": [new_latents], "time_index": [time_index + 1]}
 
     def _sound_kwargs(self, static, sound_latents, sound_ts) -> dict:
@@ -1014,6 +1065,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         new_latents, new_sound = self._sound_scheduler_step(
             st, latents, sound_latents, velocity, sound_v, t
         )
+        if st.get("vmask") is not None:
+            # Video-to-video: re-inject the clean conditioning frames on the
+            # video band after the joint step (the reference pipeline does the
+            # same); the sound band has no clean frames.
+            new_latents = st["velocity_mask"] * new_latents + st["vmask"] * st["cond_video_latents"]
         return {
             "latents": [new_latents],
             "sound_latents": [new_sound],
@@ -1208,6 +1264,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             new_latents = st["scheduler"].step(
                 velocity.unsqueeze(0), t, lat.unsqueeze(0), return_dict=False
             )[0].squeeze(0)
+            if st.get("vmask") is not None:
+                # Video-to-video: re-inject the clean conditioning frames, as in
+                # the single-request path.
+                new_latents = st["velocity_mask"] * new_latents + st["vmask"] * st["cond_video_latents"]
             out[rid] = {"latents": [new_latents], "time_index": [ti + 1]}
         return out
 
@@ -1253,6 +1313,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
             sound_v = s_u + st["gs"] * (s_c - s_u)
             new_latents, new_sound = self._sound_scheduler_step(st, lat, snd, velocity, sound_v, t)
+            if st.get("vmask") is not None:
+                # Video-to-video: re-inject the clean conditioning frames on the
+                # video band, as in the single-request path.
+                new_latents = st["velocity_mask"] * new_latents + st["vmask"] * st["cond_video_latents"]
             out[rid] = {
                 "latents": [new_latents],
                 "sound_latents": [new_sound],

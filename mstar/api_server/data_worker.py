@@ -483,7 +483,26 @@ class PreprocessWorkerThread:
                 did_work = self._process_messages()
                 if not self.in_queue.empty():
                     did_work = True
-                    self._process_input(self.in_queue.get())
+                    pre_input = self.in_queue.get()
+                    try:
+                        self._process_input(pre_input)
+                    except Exception as exc:  # noqa: BLE001 — any failure must reach the client
+                        # A request whose media load or prompt processing fails
+                        # never reaches the conductor, so nothing downstream
+                        # would ever complete it; surface the failure as an
+                        # error chunk instead of leaving the client to hit the
+                        # server timeout.
+                        logger.exception(
+                            "Preprocessing failed for request %s", pre_input.request_id
+                        )
+                        status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
+                        self.out_queue.put(ResultChunk(
+                            request_id=pre_input.request_id,
+                            modality="error",
+                            data=str(exc).encode("utf-8"),
+                            metadata={"status": status},
+                        ))
+                        self.tensor_manager.cleanup_request(pre_input.request_id)
                 if not self.result_tensor_queue.empty():
                     did_work = True
                     self._read_result_tensor(self.result_tensor_queue.get())

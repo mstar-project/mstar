@@ -1,5 +1,12 @@
 """Graph-walk names shared by the Cosmos3 model graph and its submodules."""
 
+# Video-to-video conditioning defaults (reference pipeline recipe): the request
+# pins these clean latent frames from the conditioning video, keeps the
+# first/last frames of a longer input, and denoises with the V2V flow shift.
+DEFAULT_CONDITION_FRAME_INDEXES_VISION = (0, 1)
+DEFAULT_CONDITION_VIDEO_KEEP = "first"
+V2V_DEFAULT_FLOW_SHIFT = 10.0
+
 PREFILL_WALK = "prefill"
 # Image/video-conditioned generation prefills the same understanding tower, but
 # also VAE-encodes the conditioning frame into a clean anchor latent (see

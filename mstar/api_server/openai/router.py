@@ -127,7 +127,8 @@ async def videos_generations(request: VideoGenerationRequest):
     try:
         result = await serving_videos.create_videos(api, model_name, adapter, request)
     except Exception as e:  # noqa: BLE001
-        return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
     return JSONResponse(result)
 
 

@@ -194,9 +194,132 @@ def test_process_prompt_emits_cond_and_uncond() -> None:
     assert cond != uncond
 
 
+def test_video_adapter_v2v(tmp_path) -> None:
+    from mstar.api_server.openai.adapters import get_adapter
+    from mstar.api_server.openai.protocol import VideoGenerationRequest
+
+    adapter = get_adapter("cosmos3")
+    assert adapter is not None
+
+    # video-to-video: the conditioning video (data URI) is persisted and routed
+    # in as a video input; the conditioning knobs flow through as model kwargs.
+    v2v = adapter.video_to_request(
+        VideoGenerationRequest(
+            prompt="keep going", video="data:video/mp4;base64,AAAA",
+            condition_frame_indexes_vision="0,1", condition_video_keep="last",
+        ),
+        upload_dir=str(tmp_path),
+    )
+    assert v2v.input_modalities == ["video", "text"]
+    assert v2v.output_modalities == ["video"]
+    assert v2v.file_paths and v2v.file_paths["video"]
+    assert v2v.model_kwargs["condition_frame_indexes_vision"] == "0,1"
+    assert v2v.model_kwargs["condition_video_keep"] == "last"
+
+    with pytest.raises(ValueError, match="not both"):
+        adapter.video_to_request(
+            VideoGenerationRequest(
+                prompt="x", image="data:image/png;base64,AAAA", video="data:video/mp4;base64,AAAA",
+            ),
+            upload_dir=str(tmp_path),
+        )
+
+
+def test_gen_params_v2v() -> None:
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+
+    # Defaults follow the reference V2V recipe: pin latent frames (0, 1) from
+    # the start of the input video and denoise with flow_shift 10.
+    p = model._resolve_gen_params({"num_frames": 17}, ["video", "text"], ["video"])
+    assert p["has_video_condition"] is True
+    assert p["condition_frame_indexes_vision"] == (0, 1)
+    assert p["condition_video_keep"] == "first"
+    assert p["flow_shift"] == 10.0
+
+    # Explicit values win: comma-string indexes normalize sorted + deduped.
+    p = model._resolve_gen_params(
+        {"num_frames": 17, "condition_frame_indexes_vision": "2, 0, 2",
+         "condition_video_keep": "LAST", "flow_shift": 4.0},
+        ["video", "text"], ["video"],
+    )
+    assert p["condition_frame_indexes_vision"] == (0, 2)
+    assert p["condition_video_keep"] == "last"
+    assert p["flow_shift"] == 4.0
+
+    # 17 frames -> 5 latent frames, so index 5 is out of range.
+    with pytest.raises(ValueError, match="outside the latent"):
+        model._resolve_gen_params(
+            {"num_frames": 17, "condition_frame_indexes_vision": [0, 5]},
+            ["video", "text"], ["video"],
+        )
+    with pytest.raises(ValueError, match="num_frames > 1"):
+        model._resolve_gen_params({"num_frames": 1}, ["video", "text"], ["video"])
+    with pytest.raises(ValueError, match="'first' or 'last'"):
+        model._resolve_gen_params(
+            {"num_frames": 17, "condition_video_keep": "middle"},
+            ["video", "text"], ["video"],
+        )
+
+    # Action requests own their video input; no V2V params are attached.
+    p = model._resolve_gen_params(
+        {"action_mode": "inverse_dynamics", "action_chunk_size": 8, "raw_action_dim": 7},
+        ["video", "text"], ["action"],
+    )
+    assert "has_video_condition" not in p
+
+
+def test_normalize_condition_frame_indexes() -> None:
+    from mstar.model.cosmos3.components.packing import normalize_condition_frame_indexes
+
+    default = (0, 1)
+    assert normalize_condition_frame_indexes(None, default) == (0, 1)
+    assert normalize_condition_frame_indexes(3, default) == (3,)
+    assert normalize_condition_frame_indexes("2,0, 2", default) == (0, 2)
+    assert normalize_condition_frame_indexes([1, 1, 0], default) == (0, 1)
+    for bad in ("", [], [-1], "a,b", object()):
+        with pytest.raises(ValueError):
+            normalize_condition_frame_indexes(bad, default)
+
+
+def test_static_inputs_noisy_frames_subset() -> None:
+    import torch
+
+    from mstar.model.cosmos3.components.packing import build_static_inputs
+
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    cfg = model.config
+    latent_shape = (1, cfg.latent_channel, 5, 16, 16)
+    tcf = cfg.vae.scale_factor_temporal
+    ids = list(range(12))
+    p = cfg.latent_patch_size
+    stride = -(-16 // p) * -(-16 // p)
+
+    # Pinning latent frames {0, 2} predicts the complement {1, 3, 4}: the noisy
+    # token count shrinks and the mse indexes cover exactly those frame blocks.
+    noisy = [1, 3, 4]
+    st = build_static_inputs(ids, latent_shape, cfg, tcf, 16.0, "cpu", noisy_frames=noisy)
+    assert st["num_vision_tokens"] == 5 * stride
+    assert st["num_noisy_vision_tokens"] == 3 * stride
+    assert st["vision_noisy_frame_indexes"][0].tolist() == noisy
+    expected = [
+        st["und_len"] + f * stride + i for f in noisy for i in range(stride)
+    ]
+    assert st["vision_mse_loss_indexes"].tolist() == expected
+
+    # noisy_frames covering all-but-frame-0 reproduces the i2v layout exactly.
+    st_i2v = build_static_inputs(ids, latent_shape, cfg, tcf, 16.0, "cpu", has_image_condition=True)
+    st_eq = build_static_inputs(ids, latent_shape, cfg, tcf, 16.0, "cpu", noisy_frames=[1, 2, 3, 4])
+    assert torch.equal(st_i2v["vision_mse_loss_indexes"], st_eq["vision_mse_loss_indexes"])
+    assert torch.equal(st_i2v["vision_noisy_frame_indexes"][0], st_eq["vision_noisy_frame_indexes"][0])
+    assert st_i2v["num_noisy_vision_tokens"] == st_eq["num_noisy_vision_tokens"]
+
+
 if __name__ == "__main__":
     test_adapter_registered_for_images()
     test_gen_params_and_step_metadata()
+    test_gen_params_v2v()
+    test_normalize_condition_frame_indexes()
+    test_static_inputs_noisy_frames_subset()
     if NANO_DIR.exists():
         test_process_prompt_emits_cond_and_uncond()
     print("PASS")
