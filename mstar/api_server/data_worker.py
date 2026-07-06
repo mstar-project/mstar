@@ -152,6 +152,12 @@ class PreprocessWorker:
         self, request_id: str,
         final_outputs: dict[str, NestedLoopIndices],
     ):
+        # Every serving walk reports at least one client-facing output, so an
+        # empty dict means the walk emitted nothing (or completion raced ahead
+        # of every result). Report not-done and let the TTL backstop close the
+        # request rather than completing it instantly with zero chunks.
+        if not final_outputs:
+            return False
         return all(
             not loop_iters.label_context_gt( # recv'd loop iters is not less than the final_fwd
                 self.output_loop_idxs[request_id].get(name, None)
