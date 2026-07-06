@@ -66,7 +66,7 @@ class _SdpaCacheHandle:
     def set_layer_idx(self, i):
         self.layer = i
 
-    def plan_attention(self, seq_lens=None, dtype=None, is_causal=True, write_store=True, label=None):
+    def plan_attention(self, seq_lens=None, dtype=None, is_causal=True, write_store=True, label=None, **kwargs):
         self.is_causal[label or self.active] = is_causal
 
     def plan_attention_batched_cfg(self, labels, seq_lens, is_causal=False, write_store=False, **kwargs):
@@ -117,22 +117,24 @@ class _SdpaCacheHandle:
         self.pending = {}
 
 
-def _flashinfer_cache(model, rid, device, dtype):
+def _flashinfer_cache(model, rid, device, dtype, backend=None):
     from mstar.communication.tensors import LocalTransferEngine
-    from mstar.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
+    from mstar.engine.cache_manager import WorkspaceBufferManager, create_cache_manager
     from mstar.engine.kv_store import PagedAllocationManager, TransferEngineInfo
     from mstar.model.cosmos3.submodules import COND_LABEL, UNCOND_LABEL
 
     cfg = model.get_kv_cache_config()[0]
     cfg.max_num_pages = 64
     cfg.shard(1)
+    if backend is not None:
+        cfg.attention_backend = backend
     kv_cache = torch.zeros(
         cfg.num_layers, cfg.max_num_pages, 2, cfg.page_size, cfg.num_kv_heads, cfg.head_dim,
         dtype=dtype, device=device,
     )
     alloc = PagedAllocationManager(cfg, kv_cache, TransferEngineInfo("h", "h", LocalTransferEngine("h")))
     alloc.add_request(rid, [COND_LABEL, UNCOND_LABEL])
-    return BatchedCacheManager(
+    return create_cache_manager(
         request_ids=[rid], active_labels_per_request={rid: COND_LABEL}, kv_cache=kv_cache,
         alloc_manager=alloc, buffer_manager=WorkspaceBufferManager(256 * 1024 * 1024, device),
         kv_cache_config=cfg, device=device, auto_write_store=False,
@@ -193,10 +195,10 @@ def _flashinfer_shared(model, rids, device, dtype):
 
 
 def _mk_cm(shared, rids):
-    from mstar.engine.cache_manager import BatchedCacheManager
+    from mstar.engine.cache_manager import create_cache_manager
     from mstar.model.cosmos3.submodules import COND_LABEL
 
-    return BatchedCacheManager(
+    return create_cache_manager(
         request_ids=rids, active_labels_per_request={r: COND_LABEL for r in rids},
         kv_cache=shared["kv_cache"], alloc_manager=shared["alloc"], buffer_manager=shared["buf"],
         kv_cache_config=shared["cfg"], device=shared["device"], auto_write_store=False,
@@ -358,16 +360,15 @@ def _check_dense_fa3(num_frames, tag):
     if ctx is None:
         print(f"  (skipped {tag} dense-FA3 parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
-    had = os.environ.get("COSMOS3_DENSE_FA3")
     try:
-        os.environ["COSMOS3_DENSE_FA3"] = "0"  # paged baseline (cosmos3 config defaults dense on)
-        cm = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"])
+        # Paged baseline vs the dense backend (cosmos3 config defaults dense on):
+        # the same submodule code runs against each backend class.
+        cm = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"], backend="flashinfer")
         lat_paged = _run_cache_once(
             ctx["model"], ctx["dit"], cm, ctx["init"], ctx["cond"], ctx["uncond"],
             ctx["device"], num_frames,
         )
-        os.environ["COSMOS3_DENSE_FA3"] = "1"
-        cm2 = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"])
+        cm2 = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"], backend="dense_gen")
         lat_dense = _run_cache_once(
             ctx["model"], ctx["dit"], cm2, ctx["init"], ctx["cond"], ctx["uncond"],
             ctx["device"], num_frames,
@@ -375,11 +376,6 @@ def _check_dense_fa3(num_frames, tag):
     except Exception as exc:  # noqa: BLE001
         print(f"  (skipped {tag} dense-FA3 parity: FA3/FlashInfer unavailable: {exc})")
         return
-    finally:
-        if had is None:
-            os.environ.pop("COSMOS3_DENSE_FA3", None)
-        else:
-            os.environ["COSMOS3_DENSE_FA3"] = had
     shape = ctx["lat_fused"].shape
     img_fused = ctx["mpipe"]._decode(ctx["lat_fused"]).squeeze().float().cpu()
     img_paged = ctx["mpipe"]._decode(lat_paged.reshape(shape)).squeeze().float().cpu()

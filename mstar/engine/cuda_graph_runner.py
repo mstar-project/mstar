@@ -26,7 +26,11 @@ import torch
 from torch import nn
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
+from mstar.engine.cache_manager import (
+    BatchedCacheManager,
+    WorkspaceBufferManager,
+    create_cache_manager,
+)
 from mstar.engine.cuda_graph_config import (
     BasicBatchedCudaGraphConfig,
     CudaGraphConfig,
@@ -456,8 +460,8 @@ class CudaGraphRunner:
         self, dummy_rids, plan_states,
         config: CudaGraphConfig
     ):
-        # Create BatchedCacheManager with CUDA graph plan states
-        cache_manager = BatchedCacheManager(
+        # Create the configured cache-manager backend with CUDA graph plan states
+        cache_manager = create_cache_manager(
             request_ids=dummy_rids,
             active_labels_per_request={rid: "main" for rid in dummy_rids},
             kv_cache=self.alloc_manager.kv_cache,

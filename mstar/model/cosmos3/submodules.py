@@ -697,15 +697,24 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         gs==1) plans the conditional branch alone — matching the cond-only
         forward — so an interval step costs no wasted uncond/batched plan."""
         if st["uncond"] is None or not cfg_active:
-            cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=COND_LABEL, write_store=False)
+            cm.plan_attention(
+                seq_lens=[num_gen], is_causal=False, label=COND_LABEL,
+                write_store=False, dense_gen=True,
+            )
         elif self.batched_cfg:
             cm.plan_attention_batched_cfg(
                 labels=[COND_LABEL, UNCOND_LABEL], seq_lens=[num_gen],
-                is_causal=False, write_store=False,
+                is_causal=False, write_store=False, dense_gen=True,
             )
         else:
-            cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=COND_LABEL, write_store=False)
-            cm.plan_attention(seq_lens=[num_gen], is_causal=False, label=UNCOND_LABEL, write_store=False)
+            cm.plan_attention(
+                seq_lens=[num_gen], is_causal=False, label=COND_LABEL,
+                write_store=False, dense_gen=True,
+            )
+            cm.plan_attention(
+                seq_lens=[num_gen], is_causal=False, label=UNCOND_LABEL,
+                write_store=False, dense_gen=True,
+            )
 
     def _preprocess_image_gen_captured(self, cm, inputs) -> dict:
         """Plan a denoise step for the CUDA-graph path.
@@ -729,7 +738,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         seq_lens = [inp.input_seq_len for inp in inputs]
         cm.plan_attention_batched_cfg(
             labels=[COND_LABEL, UNCOND_LABEL], seq_lens=seq_lens,
-            is_causal=False, write_store=False,
+            is_causal=False, write_store=False, dense_gen=True,
         )
         return {
             "latents": torch.stack([inp.tensor_inputs["latents"] for inp in inputs]),
@@ -788,7 +797,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 cm.plan_attention_batched_cfg(
                     labels=[COND_LABEL, UNCOND_LABEL],
                     seq_lens=[self._req[r]["num_vision"] for r in rids],
-                    is_causal=False, write_store=False,
+                    is_causal=False, write_store=False, dense_gen=True,
                 )
                 return {
                     "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
@@ -813,7 +822,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 cm.plan_attention_batched_cfg(
                     labels=[COND_LABEL, UNCOND_LABEL],
                     seq_lens=[self._req[r]["num_vision"] + self._req[r]["num_sound"] for r in rids],
-                    is_causal=False, write_store=False,
+                    is_causal=False, write_store=False, dense_gen=True,
                 )
                 return {
                     "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
@@ -849,7 +858,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 cm.plan_attention_batched_cfg(
                     labels=labels,
                     seq_lens=[s["num_vision"] + s["num_action"] for s in sts],
-                    is_causal=False, write_store=False,
+                    is_causal=False, write_store=False, dense_gen=True,
                 )
                 return {
                     "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
