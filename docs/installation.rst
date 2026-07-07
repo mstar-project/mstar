@@ -35,15 +35,12 @@ console scripts, ``mstar`` and ``mstar-serve``.
 .. important::
 
    **Always pass** ``--torch-backend=auto``. ``mstar`` floors PyTorch at 2.9
-   (``torch>=2.9.1`` / ``torchvision>=0.24.1`` / ``torchaudio>=2.9.1``) and no longer
-   pins it — the MoE alignment kernel is a vendored CUDA source JIT-built against your
-   local toolkit, so it is not tied to a torch ABI. The flag tells ``uv`` to detect your
-   driver's CUDA version and fetch the **matching** torch build — cu128 on a CUDA 12.x
-   box, cu130 on a CUDA 13.x box. This still matters because source-compiled extensions
-   (``flash-attn``) and the JIT-built MoE kernel compile against your *system* CUDA
-   toolkit, whose major version must match torch's. Without the flag ``uv`` installs
-   PyPI's default (cu128) build, which then fails to compile ``flash-attn`` on a CUDA 13
-   machine with a *"detected CUDA version mismatches … PyTorch"* error. You can set it once
+   (``torch>=2.9.1`` / ``torchvision>=0.24.1`` / ``torchaudio>=2.9.1``). The flag tells 
+   ``uv`` to detect your driver's CUDA version and fetch the **matching** torch build
+   — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
+   compiled extensions (``flash-attn``) and the JIT-built MoE kernel for Qwen3-Omni
+   compile against your *system* CUDA toolkit, whose major version must match torch's.
+   Without the flag ``uv`` installs PyPI's default (cu128) build. You can set it once
    with ``export UV_TORCH_BACKEND=auto`` instead of repeating the flag. See `Matching your
    CUDA toolkit`_ for details and the manual fallback.
 
@@ -207,13 +204,6 @@ Three things to get right:
    uv pip install psutil
    FLASH_ATTN_CUDA_ARCHS="90" uv pip install flash-attn==2.8.3.post1 --no-build-isolation
    python -c "import flash_attn; print(flash_attn.__version__)"
-
-.. note::
-
-   FlashAttention **3** does not help here: it ships as a separate ``flash_attn_interface``
-   module built from the repo's ``hopper/`` subdir, not the ``flash_attn`` package this code
-   imports (and transformers' ``flash_attention_2`` path won't route to it). It is also a
-   source build, so it offers no shortcut over building FA2 above.
 
 Matching your CUDA toolkit
 --------------------------
