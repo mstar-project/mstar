@@ -7,8 +7,6 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from starlette.concurrency import run_in_threadpool
-
 from mstar.api_server.openai._util import now, rid
 
 
@@ -40,7 +38,7 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
 
     data = []
     for request_id in request_ids:
-        chunks = await run_in_threadpool(api.collect_results, request_id)
+        chunks = await api.collect_results(request_id, raw_request)
         data.extend(
             {"b64_json": base64.b64encode(c.data).decode("ascii"), "url": None}
             for c in chunks
@@ -71,7 +69,7 @@ async def create_image_edit(api, model_name, adapter, *, prompt, image_bytes, im
         request_id=request_id,
     )
 
-    chunks = await run_in_threadpool(api.collect_results, request_id)
+    chunks = await api.collect_results(request_id)
     data = [
         {"b64_json": base64.b64encode(c.data).decode("ascii"), "url": None}
         for c in chunks
