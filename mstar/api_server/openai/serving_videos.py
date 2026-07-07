@@ -5,8 +5,6 @@ from __future__ import annotations
 import base64
 import logging
 
-from starlette.concurrency import run_in_threadpool
-
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import now, rid
 
@@ -27,7 +25,7 @@ async def create_videos(api, model_name, adapter, req):  # noqa: ARG001
         request_id=request_id,
     )
 
-    chunks = await run_in_threadpool(api.collect_results, request_id)
+    chunks = await api.collect_results(request_id)
     # Each video chunk is an mp4 (H.264); return it base64-encoded, mirroring the
     # image endpoint's b64_json shape. A sound request additionally emits a raw
     # 16-bit PCM audio chunk, which is muxed into the mp4 as an AAC track (one
