@@ -2,10 +2,11 @@
 
 CPU-safe unit tests cover the sound segment packing (mrope band, indexes,
 position ids), the duration -> latent-frame math, the request-level validation
-and walk selection, and a tiny AVAE decoder shape check. GPU tests (gated on
-``COSMOS3_NANO_DIR`` + CUDA) check the engine cache-once [video | sound] loop
-against the fused reference pipeline — bit-tight with the sdpa handle,
-PSNR-level with FlashInfer — and smoke the real checkpoint sound tokenizer.
+and walk selection, a tiny AVAE decoder shape check, and the decoder-subset
+checkpoint load. GPU tests (gated on ``COSMOS3_NANO_DIR`` + CUDA) check the
+engine cache-once [video | sound] loop against the fused reference pipeline —
+bit-tight with the sdpa handle, PSNR-level with FlashInfer — and smoke the
+real checkpoint sound tokenizer.
 
 Run CPU only:  python3 test_sound.py
 Run with GPU:  COSMOS3_NANO_DIR=<snap> python3 test_sound.py
@@ -177,6 +178,49 @@ def test_sound_tokenizer_tiny_decode() -> None:
     assert audio.abs().max().item() <= 1.0
 
 
+def test_sound_tokenizer_load_ignores_encoder_keys() -> None:
+    import json
+    import tempfile
+
+    from safetensors.torch import save_file
+
+    from mstar.model.cosmos3.components.sound_tokenizer import Cosmos3SoundTokenizer
+
+    config = {
+        "sampling_rate": 8, "hop_size": 4, "dec_dim": 4, "dec_c_mults": [1, 2],
+        "dec_strides": [2, 2], "dec_out_channels": 2, "vocoder_input_dim": 3,
+    }
+    decoder_sd = {k: v.clone() for k, v in Cosmos3SoundTokenizer(config).state_dict().items()}
+    # Full-AVAE checkpoints carry encoder tensors on top of the decoder ones.
+    encoder_sd = {
+        "encoder.layers.0.weight_g": torch.randn(4, 1, 1),
+        "encoder.layers.0.weight_v": torch.randn(4, 3, 7),
+        "encoder.layers.1.act.alpha": torch.randn(1, 4, 1),
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        tdir = os.path.join(tmp, "sound_tokenizer")
+        os.makedirs(tdir)
+        with open(os.path.join(tdir, Cosmos3SoundTokenizer.CONFIG_NAME), "w") as f:
+            json.dump(config, f)
+        weights_path = os.path.join(tdir, Cosmos3SoundTokenizer.WEIGHTS_NAME)
+        save_file({**decoder_sd, **encoder_sd}, weights_path)
+        tok = Cosmos3SoundTokenizer.from_pretrained(tmp, dtype=torch.float32)
+        # The encoder tensors are dropped; every decoder weight loads verbatim.
+        loaded = tok.state_dict()
+        assert set(loaded) == set(decoder_sd)
+        assert all((loaded[k] == decoder_sd[k]).all() for k in decoder_sd)
+        # A genuinely missing decoder key must still fail the load.
+        short_sd = dict(decoder_sd)
+        dropped = sorted(short_sd)[0]
+        short_sd.pop(dropped)
+        save_file({**short_sd, **encoder_sd}, weights_path)
+        try:
+            Cosmos3SoundTokenizer.from_pretrained(tmp, dtype=torch.float32)
+            raise AssertionError("expected KeyError for a missing decoder key")
+        except KeyError as exc:
+            assert dropped in str(exc)
+
+
 # ---------------------------------------------------------------------------
 # GPU parity (gated on COSMOS3_NANO_DIR + CUDA). Reuses the engine-cache test
 # harness: same prompt/seed discipline, sdpa handle for bit-tight bounds,
@@ -341,6 +385,7 @@ def _main() -> None:
         ("sound_request_validation", test_sound_request_validation),
         ("sound_forward_smoke_cpu", test_sound_forward_smoke_cpu),
         ("sound_tokenizer_tiny_decode", test_sound_tokenizer_tiny_decode),
+        ("sound_tokenizer_load_ignores_encoder_keys", test_sound_tokenizer_load_ignores_encoder_keys),
         ("sound_cache_once_matches_fused_exact", test_sound_cache_once_matches_fused_exact),
         ("sound_engine_path_flashinfer", test_sound_engine_path_flashinfer),
         ("sound_tokenizer_decode_real", test_sound_tokenizer_decode_real),
