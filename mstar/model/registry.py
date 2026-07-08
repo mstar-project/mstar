@@ -1,21 +1,28 @@
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.base import Model
+from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.model.pi05.pi05_model import Pi05Model
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
+from mstar.model.whisper.whisper_model import WhisperModel
 
 MODEL_REGISTRY: dict[str, type[Model]] = {
     "bagel": BagelModel,
+    "higgs_audio": HiggsAudioModel,
     "orpheus": OrpheusModel,
     "pi05": Pi05Model,
     "qwen3_omni": Qwen3OmniModel,
     "vjepa2": VJepa2Model,
     "vjepa2_ac": VJepa2ACModel,
+    "whisper_large": WhisperModel,
 }
 
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
+    # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
+    # (The v2 checkpoints are TTS/generation models, not ASR.)
+    "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
@@ -32,6 +39,9 @@ HF_MODELS: dict[str, dict] = {
     # ``download_vjepa2_ac_upstream_pt`` — the ``model_path_hf`` string is
     # kept as a logical identifier but isn't resolved against HuggingFace.
     "vjepa2_ac": {"model_path_hf": "vjepa2-ac-vitg"},
+    # Whisper works for any size; the registry key pins large-v3, the
+    # standard ASR-benchmark checkpoint.
+    "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
 }
 
 

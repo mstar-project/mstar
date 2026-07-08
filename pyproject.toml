@@ -110,6 +110,19 @@ vjepa2_ac = [
     "torchcodec==0.8.*",
 ]
 
+# ASR models: Whisper-large-v3, Higgs Audio, Voxtral
+asr = [
+    "einops",
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "mooncake-transfer-engine",
+    "safetensors",
+    "torchcodec==0.8.*",
+    "transformers",
+    "datasets",
+    "jiwer",  # WER computation for asr_eval.py
+]
+
 all = [
     "ruff",
     "pytest",
@@ -132,6 +145,7 @@ all = [
     "sgl-kernel",
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
     # separately, see docs/installation.rst.
+    "jiwer",
 ]
 
 [tool.setuptools.packages.find]

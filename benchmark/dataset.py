@@ -357,6 +357,80 @@ class LibriSpeechDataset(BaseDataset):
         return self.items[idx]
 
 
+class LibriSpeechEvalDataset(LibriSpeechDataset):
+    """LibriSpeech dataset variant that also returns ground-truth transcripts.
+
+    Use this for WER evaluation: `references[i]` pairs with `items[i]`.
+    Defaults to the `test.clean` split so eval results are comparable across
+    models and match standard ASR benchmarks.
+    """
+
+    def __init__(
+        self,
+        local_file_dir: str,
+        num_requests: int = 100,
+        req_type: RequestType = RequestType.A2T,
+        split: str = "test.clean",
+        cache_dir: str | None = None,
+    ):
+        # references are collected before super().__init__ processes items
+        self.references: list[str] = []
+        self._pending_refs: list[str] = []
+
+        from datasets import load_dataset
+
+        os.makedirs(local_file_dir, exist_ok=True)
+
+        self._num_requests = num_requests
+        self.prompt = self.DEFAULT_PROMPT
+        self.local_file_dir = local_file_dir
+
+        # The parquet conversion of openslr/librispeech_asr names its
+        # splits without the config suffix ("test", not "test.clean" —
+        # the config already selects clean vs other).
+        split = {"test.clean": "test", "validation.clean": "validation"}.get(split, split)
+        raw = load_dataset(
+            "openslr/librispeech_asr",
+            "clean",
+            split=split,
+            cache_dir=cache_dir,
+        )
+        raw = raw.select(range(min(num_requests, len(raw))))
+
+        import wave
+
+        import numpy as np
+        from torchcodec.decoders import AudioDecoder
+
+        self.items: list[RequestInput] = []
+
+        for i, row in enumerate(raw):
+            dec: AudioDecoder = row["audio"]
+            frames = dec.get_all_samples()
+            audio_data = frames.data
+            sample_rate = frames.sample_rate
+
+            audio_np = (audio_data.numpy() * 32767).clip(-32768, 32767).astype(np.int16)
+            audio_interleaved = audio_np.T.flatten()
+
+            audio_path = os.path.join(local_file_dir, f"librispeech_eval_{i:05d}.wav")
+            with wave.open(audio_path, "wb") as wf:
+                wf.setnchannels(audio_np.shape[0])
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio_interleaved.tobytes())
+
+            self.items.append(RequestInput(
+                req_type=req_type,
+                prompt=self.prompt,
+                audio_path=audio_path,
+            ))
+            self._pending_refs.append(row["text"].upper())
+
+        self.items = self._resize_data(self.items)
+        self.references = self._pending_refs[: len(self.items)]
+
+
 # ---------------------------------------------------------------------------
 # Image – ethz/food101
 # ---------------------------------------------------------------------------
