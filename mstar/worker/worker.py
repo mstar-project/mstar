@@ -255,7 +255,7 @@ class Worker:
                 "lockstep-parallel node per worker."
             )
 
-        self.is_tp_follower = len(self.tp_nodes - self.tp_rank_zero_nodes) > 0
+        self.is_tp_follower = len(self.parallel_nodes - self.parallel_leader_nodes) > 0
 
         self.scheduler = MicroScheduler(
             self.engine_manager,
