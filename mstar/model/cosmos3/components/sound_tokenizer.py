@@ -3,10 +3,10 @@
 
 The checkpoint is an Oobleck-style 1D decoder (Snake activations, weight-normed
 convs) that turns joint-denoised sound latents ``[B, C=64, T]`` into a waveform
-``[B, channels=2, T * hop_size]`` at 48 kHz. The safetensors file holds only
-``decoder.*`` keys with the classic ``weight_g``/``weight_v`` weight-norm naming,
-which this module reproduces one-to-one so loading is a plain name-matching
-stream with a completeness check (same design as the transformer loader).
+``[B, channels=2, T * hop_size]`` at 48 kHz. The safetensors ``decoder.*`` keys
+use the classic ``weight_g``/``weight_v`` weight-norm naming, which this module
+reproduces one-to-one so loading is a plain name-matching stream with a
+completeness check (same design as the transformer loader).
 """
 
 from __future__ import annotations
@@ -133,9 +133,9 @@ class Cosmos3SoundTokenizer(nn.Module):
 
     Built from the checkpoint's ``sound_tokenizer/config.json`` (Oobleck decoder
     geometry, sample rate, channel count, hop size) and loaded strictly from
-    ``sound_tokenizer/diffusion_pytorch_model.safetensors`` — every module
-    parameter must be filled and every checkpoint key consumed, so a layout
-    drift surfaces as a load error rather than silently wrong audio.
+    ``sound_tokenizer/diffusion_pytorch_model.safetensors`` — every decoder
+    parameter must be filled, so a layout drift surfaces as a load error rather
+    than silently wrong audio.
     """
 
     CONFIG_NAME = "config.json"
@@ -190,13 +190,15 @@ class Cosmos3SoundTokenizer(nn.Module):
         # is unreliable inside freshly spawned worker processes.
         state_dict = load_file(str(tdir / cls.WEIGHTS_NAME))
         expected = set(model.state_dict().keys())
-        got = set(state_dict.keys())
-        if expected != got:
-            missing = sorted(expected - got)[:10]
-            unexpected = sorted(got - expected)[:10]
+        # Published checkpoints ship the full AVAE (encoder + decoder); we build
+        # and run only the decoder (sound is decode-only — there is no
+        # sound-as-input path), so keep the decoder tensors and ignore any
+        # encoder tensors the checkpoint carries.
+        state_dict = {k: v for k, v in state_dict.items() if k in expected}
+        missing = sorted(expected - set(state_dict))
+        if missing:
             raise KeyError(
-                f"Cosmos3 sound tokenizer key mismatch under {tdir}: "
-                f"missing={missing} unexpected={unexpected}"
+                f"Cosmos3 sound tokenizer missing keys under {tdir}: {missing[:10]}"
             )
         model.load_state_dict(state_dict, strict=True)
         model.eval().requires_grad_(False)
