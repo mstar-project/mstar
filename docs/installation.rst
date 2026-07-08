@@ -248,4 +248,31 @@ Verify the install
    mstar --help
    mstar-serve --help
 
+Troubleshooting
+---------------
+
+``CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Symptom — a convolution (or another cuDNN op) aborts with::
+
+   RuntimeError: ... cudnn_status: CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH
+
+This affects **CUDA 12** installs (a ``+cu12x`` torch) running on a host that *also* has a
+**newer system cuDNN (≥ 9.21)** on the default loader path (e.g. ``/usr/lib64``). PyTorch's
+cu12 wheels pin ``nvidia-cudnn-cu12==9.20.0.48``, and that slim wheel omits the
+``libcudnn_engines_tensor_ir`` engine. When cuDNN needs that engine it loads it from the
+system copy instead — and a 9.20 dispatcher paired with a ≥ 9.21 engine is the mismatch.
+Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 installs
+(they use ``nvidia-cudnn-cu13``).
+
+Fix — complete the environment's own cuDNN so it never falls back to the system copy:
+
+.. code-block:: bash
+
+   uv pip install --no-deps -U "nvidia-cudnn-cu12>=9.21"
+
+``--no-deps`` leaves torch in place; pip may print a harmless warning that torch pins
+``9.20.0.48``. cuDNN is ABI-compatible within the v9 series, so the newer patch runs fine.
+
 Next: :doc:`quickstart`.
