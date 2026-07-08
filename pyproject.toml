@@ -55,7 +55,7 @@ bagel = [
     "safetensors",
     "torchvision",
     "torchaudio",
-    "torchcodec==0.8.*",
+    "torchcodec",
     "transformers",
 ]
 
@@ -73,7 +73,7 @@ qwen3_omni = [
     "numba>=0.61",
     "torchvision",
     "torchaudio",
-    "torchcodec==0.8.*",
+    "torchcodec",
     "transformers",
     "datasets",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
@@ -101,7 +101,7 @@ vjepa2 = [
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
-    "torchcodec==0.8.*",
+    "torchcodec",
 ]
 
 vjepa2_ac = [
@@ -109,7 +109,7 @@ vjepa2_ac = [
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
-    "torchcodec==0.8.*",
+    "torchcodec",
 ]
 
 all = [
@@ -125,7 +125,7 @@ all = [
     "safetensors",
     "torchvision",
     "torchaudio",
-    "torchcodec==0.8.*",
+    "torchcodec",
     "transformers",
     "safetensors",
     "triton",
