@@ -16,11 +16,6 @@ dependencies = [
     "pyzmq",
     "python-multipart",
     "requests",
-    # The MoE alignment op is now a vendored CUDA kernel JIT-built against the
-    # local toolkit (mstar/utils/fused_moe/csrc), so torch is no longer pinned
-    # to sgl-kernel's ABI. Floors keep the torch/vision/audio trio matched while
-    # letting pip resolve a set compatible with your CUDA wheel index. See
-    # docs/installation.rst for choosing the build that matches your toolkit.
     "torch>=2.9.1",
     "torchvision>=0.24.1",
     "torchaudio>=2.9.1",
