@@ -1,3 +1,5 @@
+import functools
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -5,6 +7,8 @@ import torch
 
 from mstar.engine.kv_store import KVCacheConfig, KVRequestState, PagedAllocationManager
 from mstar.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPrefillWrapper
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -1202,16 +1206,48 @@ ATTENTION_BACKENDS: dict[str, type[BatchedCacheManager]] = {
 }
 
 
+@functools.cache
+def _fa3_unavailable_reason() -> str | None:
+    """None when the FlashAttention-3 forward kernel (``fa3-fwd``) imports in
+    this environment, else the import failure. The wheel is ABI-tied to the
+    installed torch/CUDA build, so a mismatch fails here rather than at the
+    first attention call."""
+    try:
+        import fa3_fwd_interface  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+@functools.cache
+def _warn_dense_gen_fallback(reason: str) -> None:
+    logger.warning(
+        "Attention backend 'dense_gen' requested but the fa3-fwd kernel is "
+        "unavailable (%s); using the paged 'flashinfer' backend instead.",
+        reason,
+    )
+
+
 def create_cache_manager(
     *, kv_cache_config: KVCacheConfig, **kwargs
 ) -> BatchedCacheManager:
     """Instantiate the cache-manager backend named by
     ``kv_cache_config.attention_backend``. Takes the same keyword arguments as
-    ``BatchedCacheManager.__init__``."""
+    ``BatchedCacheManager.__init__``.
+
+    A dense-gen backend needs the FlashAttention-3 kernel; when that is not
+    importable it degrades to the paged ``flashinfer`` backend (one warning
+    per process) so serving works on environments without a matching
+    ``fa3-fwd`` wheel."""
     backend_cls = ATTENTION_BACKENDS.get(kv_cache_config.attention_backend)
     if backend_cls is None:
         raise ValueError(
             f"Unknown attention backend {kv_cache_config.attention_backend!r}; "
             f"available: {sorted(ATTENTION_BACKENDS)}"
         )
+    if issubclass(backend_cls, DenseGenCacheManager):
+        reason = _fa3_unavailable_reason()
+        if reason is not None:
+            _warn_dense_gen_fallback(reason)
+            backend_cls = FlashInferCacheManager
     return backend_cls(kv_cache_config=kv_cache_config, **kwargs)

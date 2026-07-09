@@ -1,14 +1,18 @@
-"""TP-aware SwiGLU MLP.
+"""TP-aware SwiGLU MLPs (parallel counterparts of
+``mstar.model.components.GatedMLP``).
 
-Mirrors ``mstar.model.components.GatedMLP`` but with the gate/up
-projections fused into a single ``MergedColumnParallelLinear`` (sharded
-along the intermediate dim) and the down projection as a
-``RowParallelLinear`` that all-reduces the partial sums.
-
+``ParallelGatedMLP`` fuses the gate/up projections into a single
+``MergedColumnParallelLinear`` (sharded along the intermediate dim) with a
+``RowParallelLinear`` down projection that all-reduces the partial sums.
 The checkpoint stores ``gate_proj.weight`` and ``up_proj.weight``
 separately; the model's weight loader calls
 ``self.gate_up_proj.weight.weight_loader(loaded_weight,
 loaded_shard_id=0)`` for gate and ``loaded_shard_id=1`` for up.
+
+``ParallelGatedMLPUnfused`` keeps gate/up as separate
+``ColumnParallelLinear`` projections so ``state_dict()`` keys match a
+checkpoint's one-to-one — for loaders that stream weights by name with no
+stacked-parameter rules.
 """
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -79,3 +84,34 @@ class ParallelGatedMLP(nn.Module):
         gate_up = self.gate_up_proj(x)
         gate, up = gate_up.split(self.intermediate_size_per_partition, dim=-1)
         return self.down_proj(self.act(gate) * up)
+
+
+class ParallelGatedMLPUnfused(nn.Module):
+    """SwiGLU MLP with separate (unfused) gate/up column shards.
+
+    Same math and sharding as ``ParallelGatedMLP``, with ``gate_proj`` and
+    ``up_proj`` kept as separate ``ColumnParallelLinear`` projections so the
+    parameter names match a checkpoint's ``gate_proj.weight`` /
+    ``up_proj.weight`` one-to-one (plain name-matched loading, no
+    stacked-parameter loader rules). A trivial comm group (world size 1)
+    makes the projections plain linears.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        comm_group: CommGroup | None = None,
+        activation: str | Callable = "silu",
+        bias: bool = False,
+    ):
+        super().__init__()
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
+        self.act = _resolve_activation(activation)
+        self.gate_proj = ColumnParallelLinear(comm_group, hidden_size, intermediate_size, bias=bias)
+        self.up_proj = ColumnParallelLinear(comm_group, hidden_size, intermediate_size, bias=bias)
+        self.down_proj = RowParallelLinear(comm_group, intermediate_size, hidden_size, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))

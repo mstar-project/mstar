@@ -31,6 +31,11 @@ from diffusers.models.embeddings import Timesteps
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.distributed.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
+from mstar.model.components.distributed.mlp import ParallelGatedMLPUnfused
 from mstar.model.components.distributed.sequence_parallel import (
     gather_sequence,
     scatter_sequence,
@@ -38,10 +43,6 @@ from mstar.model.components.distributed.sequence_parallel import (
     sp_head_slice,
     sp_seq_split,
     ulysses_attention,
-)
-from mstar.model.components.distributed.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
 )
 
 
@@ -134,38 +135,6 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, sample: torch.Tensor) -> torch.Tensor:
         return self.linear_2(self.act(self.linear_1(sample)))
-
-
-class Cosmos3MLP(nn.Module):
-    """SwiGLU feed-forward (``gate_proj``/``up_proj``/``down_proj``, no bias).
-
-    Tensor-parallel: ``gate_proj``/``up_proj`` are column-sharded along the
-    intermediate dim and ``down_proj`` row-shards its input and all-reduces.
-    A trivial comm group (world size 1) makes these plain linears.
-
-    Deliberately not ``ParallelGatedMLP``: that class fuses gate/up into one
-    ``MergedColumnParallelLinear`` and needs stacked-parameter loader rules,
-    while the Cosmos3 backbone keeps every projection unfused (attention
-    included) so ``state_dict()`` keys match the published checkpoint
-    one-to-one and the loader stays a plain name-matching stream.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        comm_group: CommGroup | None = None,
-    ):
-        super().__init__()
-        if comm_group is None:
-            comm_group = CommGroup.trivial()
-        self.gate_proj = ColumnParallelLinear(comm_group, hidden_size, intermediate_size, bias=False)
-        self.up_proj = ColumnParallelLinear(comm_group, hidden_size, intermediate_size, bias=False)
-        self.down_proj = RowParallelLinear(comm_group, intermediate_size, hidden_size, bias=False)
-        self.act_fn = nn.SiLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Cosmos3PackedMoTAttention(nn.Module):
@@ -366,8 +335,10 @@ class Cosmos3MoTDecoderLayer(nn.Module):
             comm_group=comm_group,
             sp_group=sp_group,
         )
-        self.mlp = Cosmos3MLP(hidden_size, intermediate_size, comm_group=comm_group)
-        self.mlp_moe_gen = Cosmos3MLP(hidden_size, intermediate_size, comm_group=comm_group)
+        # Unfused (like every Cosmos3 projection) so state_dict() keys match
+        # the published checkpoint one-to-one and the loader stays name-matched.
+        self.mlp = ParallelGatedMLPUnfused(hidden_size, intermediate_size, comm_group=comm_group)
+        self.mlp_moe_gen = ParallelGatedMLPUnfused(hidden_size, intermediate_size, comm_group=comm_group)
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.input_layernorm_moe_gen = RMSNorm(hidden_size, eps=rms_norm_eps)

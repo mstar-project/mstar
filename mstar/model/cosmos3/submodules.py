@@ -117,31 +117,22 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # set False to fall back to the sequential path.
     batched_cfg = True
 
-    # Cap on how many requests share one batched denoise step. Concurrent
-    # requests at the image-generation walk run their step in a single forward.
+    # Cap on how many concurrent requests share one batched denoise step.
     max_gen_batch_size = 8
 
-    # Image resolutions (height, width) to capture a denoise-step CUDA graph for.
-    # Requests at other resolutions fall back to the eager path. num_frames is
-    # fixed at 1 (text-to-image). The graph accelerates the single-request
-    # (batch size 1) denoise step, where the forward is launch-bound: the win is
-    # large at low resolution (~2.5x at 320x192) and shrinks as the step becomes
-    # compute-bound at higher resolution. Concurrent requests batch via the eager
-    # path regardless. The default covers the three standard generation tiers;
-    # override with COSMOS3_GEN_CAPTURE_RES. The served graph output is identical
-    # to the eager path (compare with COSMOS3_DISABLE_CUDA_GRAPH=1).
+    # t2i (num_frames=1) resolutions to capture a bs=1 denoise-step CUDA graph
+    # for; others run eager. The graph removes launch overhead (biggest at low
+    # resolution) and replays identically to eager. Override with
+    # COSMOS3_GEN_CAPTURE_RES; concurrent requests batch via the eager path.
     gen_capture_resolutions: tuple[tuple[int, int], ...] = (
         (192, 320), (480, 832), (720, 1280),
     )
     # Batch sizes to capture per resolution.
     gen_capture_batch_sizes: tuple[int, ...] = (1,)
 
-    # Understanding-tower (text prefill) CUDA-graph capture. The text length is
-    # prompt-dependent, so capture a few combined (cond+uncond) token buckets and
-    # round up at replay; prompts past the largest bucket fall back to eager.
-    # Targets the small-prompt, non-compute-bound regime where the launch
-    # overhead the graph removes actually matters. Override with
-    # COSMOS3_PREFILL_CAPTURE_TOKENS / COSMOS3_PREFILL_CAPTURE_BS.
+    # Understanding-tower prefill capture: combined cond+uncond token buckets,
+    # rounded up at replay; prompts past the largest bucket run eager. Override
+    # with COSMOS3_PREFILL_CAPTURE_TOKENS / COSMOS3_PREFILL_CAPTURE_BS.
     prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
@@ -152,15 +143,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # Template scheduler; a fresh instance (with its own multistep state) is
         # built per request from this one's config.
         self._scheduler_template = scheduler
-        # Per-request denoising state (packed cond/uncond statics, scheduler,
-        # guidance scale, conditioning latents) lives in the engine-managed
+        # Per-request denoise state lives in the engine-managed
         # ``request_states`` store from the NodeSubmodule base.
-        # torch.compile the pure denoise compute (~1.2-1.3x per step; the compiled
-        # kernels bake into the per-resolution CUDA graphs at capture).
-        # fullgraph=False leaves the FlashInfer attention an opaque graph break;
-        # disable_torch_compile stays True so the engine does not also compile the
-        # data-dependent submodule wrapper. ``config.compile_denoise=False`` runs
-        # the eager step (the bit-exact parity tests rely on it).
+        # Compile the pure denoise compute (~1.2-1.3x/step; the kernels bake
+        # into the CUDA graphs at capture). fullgraph=False breaks at the
+        # attention; ``config.compile_denoise=False`` keeps the eager step for
+        # the bit-exact parity tests.
         if config.compile_denoise and transformer is not None:
             self.transformer.denoise_step = torch.compile(
                 self.transformer.denoise_step, fullgraph=False, dynamic=False,
@@ -811,13 +799,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # forward
     # ------------------------------------------------------------------
 
-    # Run the prefill/denoise in the model's native bf16, NOT under the engine's
-    # autocast. The fused reference pipeline runs the transformer in pure bf16;
-    # autocast keeps normalization in fp32, which perturbs the predicted velocity
-    # by ~1 ULP per step. A single image step stays well within tolerance, but the
-    # multi-step video denoise amplifies that perturbation geometrically into a
-    # scrambled latent. The cache-once engine path must reproduce the reference,
-    # so this submodule opts out of autocast (the VAE decoder does the same).
+    # Run in the model's native bf16, NOT the engine autocast: autocast keeps
+    # norms in fp32, perturbing the velocity ~1 ULP/step — harmless for one
+    # image step but amplified geometrically over the multi-step video denoise.
+    # The reference pipeline runs pure bf16; parity requires matching it.
     @torch.autocast(device_type="cuda", enabled=False)
     def _states(self, engine_inputs: ModelInputsFromEngine) -> dict:
         """The batch's per-request states: the engine-injected view when
@@ -1386,15 +1371,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         configs = []
         for height, width in resolutions:
             latent_shape = self._latent_shape(height, width, num_frames=1)
-            # The denoise CUDA-graph capture is bit-faithful at every resolution
-            # (the rotary outer product is a broadcast multiply, not a batched
-            # matmul over stride-0 views — see Cosmos3RotaryEmbedding; the matmul
-            # form was mis-captured by the graph memory pool at some sequence
-            # lengths). The graph only HELPS the launch-bound tiers, though: its
-            # per-step input copies scale with resolution, so at large latents
-            # (720p+) the graph is net-slower than the eager dense path. So
-            # capture only below COSMOS3_GRAPH_MAX_LATENT_AREA (latent H*W): 256p
-            # (240) and 480p (1560) graph; 720p (3600) and video run eager+dense.
+            # The capture is bit-faithful at every resolution (the rotary uses a
+            # broadcast multiply — see Cosmos3RotaryEmbedding), but only HELPS
+            # the launch-bound tiers: the graph's per-step input copies grow
+            # with resolution and lose to the eager dense path at large latents.
+            # Capture only below COSMOS3_GRAPH_MAX_LATENT_AREA (latent H*W).
             latent_area = latent_shape[3] * latent_shape[4]
             max_area = int(os.environ.get(
                 "COSMOS3_GRAPH_MAX_LATENT_AREA", self.config.graph_max_latent_area))
@@ -1436,12 +1417,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 advance_seq_lens=False,
                 compile=False,
                 capture_batch_sizes=capture_batch_sizes,
-                # The captured sizes (default just bs=1, for single-request
-                # latency; COSMOS3_GEN_CAPTURE_BS adds batched sizes) are an
-                # acceleration subset, not a batch ceiling: a concurrent batch at
-                # an uncaptured size or mixed resolution still runs the eager
-                # batched denoise (forward_batched), so don't let this capture cap
-                # max_batch_size to the captured sizes.
+                # The captured sizes (default bs=1; COSMOS3_GEN_CAPTURE_BS adds
+                # more) are an acceleration subset, not a batch ceiling —
+                # uncaptured sizes / mixed resolutions run the eager batched
+                # denoise, so don't cap max_batch_size to them.
                 caps_eager_batch_size=False,
             ))
 
@@ -1541,12 +1520,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         layout = self._capture_layout[tuple(latents.shape[1:])]
         rids = engine_inputs.request_ids
         if latents.shape[0] == 1:
-            # This forward is captured into the denoise CUDA graph. Under SP the
-            # Ulysses exchange must use all-gather, not all-to-all: the latter is
-            # grouped point-to-point send/recv and does not replay from a graph.
-            # The flag holds across warmup, capture and replay (all routed here),
-            # so the all-gather kernels are compiled during eager warmup rather
-            # than mid-capture. No-op without SP.
+            # Captured into the denoise CUDA graph. Under SP the Ulysses
+            # exchange must be all-gather (all-to-all is grouped p2p send/recv —
+            # not graph-replayable); the flag holds across warmup/capture/replay
+            # so those kernels compile during eager warmup. No-op without SP.
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents[0], vision_timesteps[0], position_ids_cond[0], position_ids_uncond[0],
                 layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
@@ -1586,21 +1563,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         latents = inputs.tensor_inputs["latents"]
         time_index = inputs.tensor_inputs["time_index"]
         outputs.clear()
+        # step_index is in range here: prepare_inputs vetoes the loop's extra
+        # dispatched step and the engine prunes vetoed requests before postprocess.
         step_index = int(time_index.reshape(-1)[0].item())
         sched = st["scheduler"]
-        sched_idx = sched.step_index
-        if step_index >= len(sched.timesteps) or (
-            sched_idx is not None and sched_idx >= len(sched.timesteps)
-        ):
-            # Discarded extra step past this request's denoise count. Guard on
-            # BOTH the engine step counter and the scheduler's own step_index:
-            # with concurrent (bs>1) requests the batched loop dispatches one
-            # extra step whose engine time_index can lag the scheduler, and
-            # stepping an already-exhausted UniPC scheduler trips
-            # `assert self.this_order > 0`.
-            outputs["latents"] = [latents]
-            outputs["time_index"] = [time_index]
-            return
         t = sched.timesteps[step_index]
         new_latents = sched.step(
             velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
@@ -1616,8 +1582,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         its scheduler holds (e.g. image 50, video 35, action 30, distilled policy
         ~4), which can differ between concurrent requests. Runs on the worker's
         slow-postprocess path, so reading the per-request step count is fine. The
-        one extra step the loop dispatches before this stop takes effect is a
-        no-op (see the ``step_index >=`` guards in the forward methods)."""
+        one extra step the loop dispatches before this stop takes effect is
+        vetoed by prepare_inputs (the forwards also guard it for direct
+        callers, e.g. tests)."""
         st = self.request_states.get(request_id)
         if st is None:
             return set()
@@ -1659,11 +1626,9 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
     def __init__(self, vae, config):
         super().__init__()
         # Dedicated fp32 instance (not shared with the decoder node): encode
-        # runs in fp32 everywhere — the VAE's 3D convs are far faster in fp32
-        # (TF32) than bf16 on pre-9.16 cuDNN and the reference pipeline encodes
-        # in fp32 — while the decoder's dtype is cuDNN-gated (bf16 from 9.16).
-        # Sharing one instance would re-cast the full VAE weights on every
-        # encode/decode interleave on bf16-decode stacks.
+        # runs fp32 everywhere (reference behavior; TF32 is the fast conv3d
+        # path pre-9.16 cuDNN) while the decode dtype is cuDNN-gated — sharing
+        # would re-cast the full VAE weights every encode/decode interleave.
         self.vae = vae
         self.config = config
         self._video_processor = None
@@ -1696,11 +1661,9 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
             condition_indexes = None if is_action else md.get("condition_frame_indexes_vision")
             if condition_indexes:
                 # Video-to-video: only the first max(indexes)*tcf + 1 pixel
-                # frames feed the pinned latent frames (the Wan VAE is
-                # temporally causal), taken from the start or end of the input
-                # per ``condition_video_keep``; a shorter input is padded by
-                # repeating its last frame. The forward scatters the encoded
-                # prefix into the pinned frames of the full latent length.
+                # frames feed the pinned latent frames (the Wan VAE is temporally
+                # causal), taken from the start or end per ``condition_video_keep``;
+                # short inputs pad by repeating the last frame.
                 tcf = self.config.vae.scale_factor_temporal
                 cpf = min(max(condition_indexes) * tcf + 1, num_frames)
                 clip = clip[-cpf:] if md.get("condition_video_keep") == "last" else clip[:cpf]
@@ -1827,18 +1790,12 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         self.vae = vae
         self.config = config
         self._decode_dtype_cached = None
-        # The Wan VAE decode is 3D-conv bound and is not captured into a CUDA
-        # graph (it runs once per request at request-specific frame/resolution
-        # shapes). torch.compile fuses the pointwise epilogues around those convs;
-        # fullgraph=False lets dynamo break around the VAE's Python-level
-        # causal-conv feature cache, and dynamic=False gives the best per-shape
-        # kernels at the cost of a one-time trace per new (frames, height, width)
-        # — fine for the few fixed generation tiers (the first request at each
-        # shape pays the trace). On by default — it cuts the 189-frame video VAE
-        # decode ~20-30% (a large share of video latency) and is neutral for the
-        # tiny single-frame image decode; set COSMOS3_COMPILE_VAE=0 to disable
-        # (A/B against the eager decode, which is identical bar fp rounding). The
-        # compile wraps the autocast-off decode below.
+        # The decode is 3D-conv bound, one-shot per request at request-specific
+        # shapes, and not graph-captured; torch.compile fuses its pointwise
+        # epilogues (~20-30% off the 189-frame video decode, neutral for
+        # images) at the cost of one trace per new shape. fullgraph=False
+        # breaks around the VAE's causal-conv feature cache.
+        # COSMOS3_COMPILE_VAE=0 disables (eager is identical bar fp rounding).
         self._decode = vae.decode if vae is not None else None
         if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
             "0", "false", "no", "off",
@@ -1853,13 +1810,10 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
 
     def _decode_dtype(self):
-        # cuDNN ships the fast Hopper bf16 conv3d kernels for the Wan-VAE decode
-        # only from 9.16 on; before that (e.g. the 9.10 cu12.8 wheel) bf16/fp16
-        # fall back and a 256p-video decode is ~10s vs ~1s in fp32/TF32, so use
-        # fp32 there. Measured single-variable (same torch/GPU, swapping only the
-        # cuDNN libs): bf16 vid256 decode 10.3s at 9.13 -> 0.85s at 9.16; fp32/TF32
-        # ~1.1s throughout. Gate on the live cuDNN version (a cuDNN upgrade flips
-        # it automatically); COSMOS3_VAE_DECODE_FP32 overrides.
+        # cuDNN ships fast Hopper bf16 conv3d for the Wan-VAE decode only from
+        # 9.16; before that bf16 is 2-10x slower than fp32/TF32 (measured via a
+        # single-variable cuDNN swap), so gate on the live version — an upgrade
+        # flips it automatically. COSMOS3_VAE_DECODE_FP32 overrides.
         if self._decode_dtype_cached is not None:
             return self._decode_dtype_cached
         override = os.environ.get("COSMOS3_VAE_DECODE_FP32")
@@ -1882,12 +1836,10 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=vae_dtype, device=latents.device)).view(
             1, -1, 1, 1, 1
         )
-        # Force z to the VAE dtype. An outer autocast(enabled=True) context is
-        # active during this forward and promotes the `1.0 / std` division to
-        # fp32, which would silently make z fp32 even though latents/mean/vae_dtype
-        # are all bf16 -> the bf16 VAE conv3d below (run under autocast-off) would
-        # then hit "Input type (float) and bias type (BFloat16)". The explicit cast
-        # is a no-op for the fp32 path (S1) and unblocks bf16 decode (cuDNN >= 9.16).
+        # Force z to the VAE dtype: the engine's outer autocast promotes the
+        # `1.0 / std` division to fp32, and a fp32 z into the autocast-off bf16
+        # conv3d fails ("Input type (float) and bias type (BFloat16)"). No-op
+        # on the fp32-decode path.
         z = (latents.to(vae_dtype) / inv_std + mean).to(vae_dtype)
         with torch.autocast(device_type="cuda", enabled=False):
             decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
