@@ -41,13 +41,24 @@ class ZMQCommunicator(BaseCommunicator):
         push_ids: list[str],
         protocol: CommProtocol=CommProtocol.IPC,
         ipc_socket_path_prefix: str="/tmp/mstar/",
-        # TODO: for TCP
+        endpoints=None,
     ):
+        """``endpoints`` is an optional ControlPlaneEndpoints resolver. When it
+        is provided and reports a multi-host cluster, every socket uses TCP at
+        the resolver's per-entity addresses (env overrides do not apply — the
+        cluster spec is authoritative). Otherwise behavior is unchanged: ipc
+        sockets under ``ipc_socket_path_prefix`` by default, or the legacy
+        single-host TCP mode via MSTAR_ZMQ_* env vars.
+        """
         self.context = zmq.Context.instance()
-        transport = os.getenv("MSTAR_ZMQ_TRANSPORT", protocol.value).upper()
-        self.protocol = CommProtocol(transport)
+        self._resolver = endpoints if (endpoints is not None and endpoints.use_tcp()) else None
+        if self._resolver is not None:
+            self.protocol = CommProtocol.TCP
+        else:
+            transport = os.getenv("MSTAR_ZMQ_TRANSPORT", protocol.value).upper()
+            self.protocol = CommProtocol(transport)
         self.pull_socket = self.context.socket(zmq.PULL)
-        if self.protocol == CommProtocol.IPC:
+        if self._resolver is None and self.protocol == CommProtocol.IPC:
             os.makedirs(ipc_socket_path_prefix, exist_ok=True)
 
         # TODO: maybe only open sockets as we need them, and close sockets
@@ -56,7 +67,17 @@ class ZMQCommunicator(BaseCommunicator):
         self.my_id = my_id
         self.ipc_socket_path_prefix = ipc_socket_path_prefix
 
-        if self.protocol == CommProtocol.IPC:
+        if self._resolver is not None:
+            self.pull_socket.bind(self._resolver.bind_endpoint(my_id))
+            self.pull_socket.setsockopt(zmq.LINGER, 0)
+        elif self.protocol == CommProtocol.IPC:
+            # A socket file left behind by an unclean shutdown must not
+            # survive into this bind: a peer that connects to the stale inode
+            # never reaches the new process, silently black-holing messages.
+            stale = f"{ipc_socket_path_prefix}/{my_id}.ipc"
+            if os.path.exists(stale):
+                logger.warning("Removing stale ipc socket file %s", stale)
+                os.unlink(stale)
             self.pull_socket.bind(self._endpoint(my_id))
             self.pull_socket.setsockopt(zmq.LINGER, 0)
         elif self.protocol == CommProtocol.TCP:
@@ -85,6 +106,8 @@ class ZMQCommunicator(BaseCommunicator):
             self.event.drain()
 
     def _endpoint(self, entity_id: str) -> str:
+        if self._resolver is not None:
+            return self._resolver.connect_endpoint(entity_id)
         if self.protocol == CommProtocol.IPC:
             return f"ipc://{self.ipc_socket_path_prefix}/{entity_id}.ipc"
         if self.protocol == CommProtocol.TCP:
@@ -122,6 +145,13 @@ class ZMQCommunicator(BaseCommunicator):
             sock.setsockopt(zmq.LINGER, 0)
             self.push_sockets[entity_id] = sock
         self.push_sockets[entity_id].send_pyobj(msg)
+
+    def close(self):
+        """Close all sockets. Safe to call more than once."""
+        for sock in self.push_sockets.values():
+            sock.close(linger=0)
+        self.push_sockets.clear()
+        self.pull_socket.close(linger=0)
 
     def get_all_new_messages(self, blocking=False) -> list:
         messages = []

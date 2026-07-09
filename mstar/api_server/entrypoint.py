@@ -23,6 +23,8 @@ from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
+from mstar.cluster.endpoints import ControlPlaneEndpoints
+from mstar.cluster.spec import ClusterSpec
 from mstar.communication.communicator import CommProtocol, ZMQCommunicator
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
@@ -61,7 +63,8 @@ def _conductor_process_target(
     log_level: str = "INFO",
     cache_dir: str | None = None,
     tensor_comm_protocol=CommProtocol.RDMA,
-    tcp_transfer_device=""
+    tcp_transfer_device="",
+    intra_host_tensor_protocol=CommProtocol.SHM,
 ):
     """Runs DummyConductor.run() in a spawned process."""
     logging.basicConfig(
@@ -105,7 +108,9 @@ def _conductor_process_target(
         enable_prof=enable_prof,
         log_level=log_level,
         tensor_comm_protocol=tensor_comm_protocol,
-        tcp_transfer_device=tcp_transfer_device
+        tcp_transfer_device=tcp_transfer_device,
+        intra_host_tensor_protocol=intra_host_tensor_protocol,
+        model_cache_dir=cache_dir,
     )
     try:
         conductor.run()
@@ -121,7 +126,7 @@ def _shutdown_conductor_process(
         return
 
     try:
-        conductor_proc.send_signal(signal.SIGINT)
+        os.kill(conductor_proc.pid, signal.SIGINT)
         conductor_proc.join(timeout=timeout)
     except BaseException:
         logger.exception("Failed graceful conductor shutdown")
@@ -151,6 +156,7 @@ class PendingRequest:
     chunks: list[ResultChunk] = field(default_factory=list)
     final_outputs: dict = field(default_factory=dict)
     consumed_chunks: int = 0
+    error: str | None = None  # server-side failure (e.g. a worker died)
 
 
 class APIServer:
@@ -168,6 +174,9 @@ class APIServer:
         model_name: str = "dummy",
         log_stats: bool = False,
         log_stats_file: str | None = None,
+        endpoints=None,
+        multi_host: bool = False,
+        intra_host_tensor_protocol=CommProtocol.SHM,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -192,7 +201,19 @@ class APIServer:
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
-            enable_prof=self.log_stats
+            enable_prof=self.log_stats,
+            endpoints=endpoints,
+            # The preprocess worker never picks shm for its own sends (a
+            # request's initial tensors can be consumed by workers on any
+            # host), but in multi-host mode it must be able to READ shm
+            # tensors that head-host workers emit to the client. The empty
+            # set enables the hybrid manager without claiming co-hosted
+            # entities.
+            same_host_entities=(
+                set()
+                if multi_host and intra_host_tensor_protocol == CommProtocol.SHM
+                else None
+            ),
         )
 
         # Concurrent request tracking
@@ -209,6 +230,7 @@ class APIServer:
             my_id="api_server",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
+            endpoints=endpoints,
         )
 
         # Background thread that drains results from the conductor. Started by
@@ -359,6 +381,10 @@ class APIServer:
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
                                 req = self.pending_requests[rid]
+                                # On server-side failure final_outputs is empty,
+                                # so the normal prune path releases the waiter
+                                # on its next tick without special casing.
+                                req.error = message.body.error
                                 req.final_outputs = message.body.final_outputs
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
@@ -463,6 +489,12 @@ class APIServer:
                         self._finalize_profile(finished_req)
                     for chunk in remaining:
                         yield chunk
+                    if finished_req is not None and finished_req.error is not None:
+                        yield ResultChunk(
+                            request_id=request_id,
+                            modality="error",
+                            data=finished_req.error.encode("utf-8"),
+                        )
                     finished = True
                     break
 
@@ -515,6 +547,10 @@ class APIServer:
         # Profiling (incl. the optional file write) runs outside the lock; the
         # popped request is no longer shared with other threads.
         self._finalize_profile(req)
+        if req.error is not None:
+            raise HTTPException(
+                status_code=500, detail=f"request failed: {req.error}"
+            )
         return list(req.chunks)
 
     def _finalize_profile(self, req: PendingRequest) -> None:
@@ -732,7 +768,6 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--mooncake-port", type=int, default=8080)
     parser.add_argument(
         "--socket-path-prefix", type=str, default="/tmp/mstar",
         help="ZMQ IPC socket path prefix (shared with conductor/workers)",
@@ -754,6 +789,16 @@ def main(argv: list[str] | None = None):
         "--tensor-comm-protocol",
         type=str, default="RDMA",
         help="Tensor transfer protocol: RDMA, TCP, or SHM (shared memory)"
+    )
+    parser.add_argument(
+        "--intra-host-tensor-protocol",
+        type=str, default="SHM", choices=["SHM", "RDMA", "TCP"],
+        help=(
+            "Transport for tensors whose producer and consumers share a host in a "
+            "multi-host cluster. SHM (default) uses shared memory; any other value "
+            "routes co-hosted transfers through the transfer engine alongside "
+            "cross-host traffic. Single-host deployments ignore this flag."
+        ),
     )
     parser.add_argument(
         "--tcp-transfer-device",
@@ -787,6 +832,9 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
+    cluster_spec = ClusterSpec.from_config(config)
+    logger.info("Cluster: %s", cluster_spec.summary())
+
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
     # model instance too, so it sees the same Pi05Config (action_horizon, etc.)
@@ -807,13 +855,17 @@ def main(argv: list[str] | None = None):
     api_server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
+        hostname=cluster_spec.head_addr,
+        endpoints=ControlPlaneEndpoints(cluster_spec),
         timeout_seconds=args.timeout,
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         model_name=model_name,
-        tcp_transfer_device=args.tcp_transfer_device,
+        tcp_transfer_device=cluster_spec.head.rdma_device or args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
+        multi_host=cluster_spec.is_multi_host(),
+        intra_host_tensor_protocol=CommProtocol(args.intra_host_tensor_protocol),
     )
 
     # Spawn conductor in a separate process
@@ -829,7 +881,8 @@ def main(argv: list[str] | None = None):
             args.log_level,
             args.cache_dir,
             CommProtocol(args.tensor_comm_protocol),
-            args.tcp_transfer_device
+            args.tcp_transfer_device,
+            CommProtocol(args.intra_host_tensor_protocol),
         ),
     )
     conductor_proc.start()

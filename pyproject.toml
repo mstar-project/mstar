@@ -27,6 +27,7 @@ dependencies = [
 [project.scripts]
 mstar = "mstar.cli.main:main"
 mstar-serve = "mstar.api_server.entrypoint:main"
+mstar-node = "mstar.cluster.node_agent:main"
 
 [project.optional-dependencies]
 dev = [

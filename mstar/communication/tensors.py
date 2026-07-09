@@ -260,20 +260,27 @@ class MooncakeTransferEngine(TensorTransferEngine):
                 "Install mooncake-transfer-engine or use SHM protocol."
             )
 
-        if protocol == CommProtocol.RDMA:
-            transfer_device = ""
-        elif protocol == CommProtocol.TCP:
-            transfer_device = tcp_transfer_device
-        else:
+        if protocol not in (CommProtocol.RDMA, CommProtocol.TCP):
             raise NotImplementedError(f"Unknown protocol {protocol} for mooncake")
+        # Device filter for the engine: an HCA name (or comma list) under RDMA,
+        # a segment/interface string under TCP. Empty means auto-discovery.
+        transfer_device = tcp_transfer_device
 
         self._engine = TransferEngine()
-        self._engine.initialize(
+        ret = self._engine.initialize(
             hostname,
             metadata_server,
             protocol.value.lower(),
             transfer_device,
         )
+        if ret != 0:
+            raise RuntimeError(
+                f"Mooncake TransferEngine initialize failed (rc={ret}) for "
+                f"hostname={hostname!r} protocol={protocol.value} "
+                f"device={transfer_device!r}. On hosts without an active RDMA "
+                "fabric, TCP mode typically needs an explicit device/segment "
+                "(e.g. --tcp-transfer-device 0.0.0.0.0)."
+            )
         self._session_id = f"{hostname}:{self._engine.get_rpc_port()}"
 
     def register_memory(self, ptr: int, nbytes: int) -> int:
@@ -542,6 +549,7 @@ class TensorCommunicationManager(ABC):
     def register_for_send(
         self, request_id: str, uuids: list[str],
         skip_cuda_sync: bool = False,
+        shm_uuids: set[str] | None = None,
     ):
         """Mark these uuids ready for remote consumers to RDMA-read.
 
@@ -550,6 +558,11 @@ class TensorCommunicationManager(ABC):
         addresses are shared with peers. Callers must have already synced on
         their own (e.g. before a batched loop) — meant to cut N serialized
         syncs to 1 when registering many uuids in a row.
+
+        ``shm_uuids`` is the subset of ``uuids`` whose consumers are all
+        co-hosted with this entity; a hybrid manager sends those through
+        shared memory instead of the transfer engine. Single-transport
+        managers ignore it (they have exactly one way to send).
 
         If self.enable_prof is set, this should also update self.req_tx_info
         """
@@ -864,7 +877,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             enable_prof=enable_prof
         )
 
-    def register_for_send(self, request_id, uuids, skip_cuda_sync=False):
+    def register_for_send(
+        self, request_id, uuids, skip_cuda_sync=False, shm_uuids=None,
+    ):
         if not skip_cuda_sync:
             torch.cuda.default_stream().synchronize()
         for uuid in uuids:
@@ -1063,6 +1078,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
     def register_for_send(
         self, request_id: str, uuids: list[str],
         skip_cuda_sync: bool = False,
+        shm_uuids: set[str] | None = None,
     ):
         if not skip_cuda_sync and torch.cuda.is_available():
             torch.cuda.default_stream().synchronize()
@@ -1168,6 +1184,186 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
 
 
 # ---------------------------------------------------------------------------
+# HybridCommunicationManager
+# ---------------------------------------------------------------------------
+
+class HybridCommunicationManager(MooncakeCommunicationManager):
+    """Transfer engine for cross-host consumers, shared memory for co-hosted ones.
+
+    One manager, one ``TensorStore``, one pending/ack lifecycle — only the
+    byte movement differs per tensor. The producer decides the transport at
+    registration time (``shm_uuids``: tensors whose every consumer is on this
+    host) and marks it on the ``TensorPointerInfo`` (``via_shm``), so a
+    sharded edge can fan in shards over both transports at once. Tensors sent
+    through shared memory are never engine-registered; the reverse also holds.
+    """
+
+    def __init__(
+        self,
+        my_entity_id: str,
+        hostname: str,
+        device: str,
+        communicator: BaseCommunicator,
+        protocol: CommProtocol = CommProtocol.RDMA,
+        metadata_server: str = "P2PHANDSHAKE",
+        tcp_transfer_device: str = "",
+        shm_dir: str | None = None,
+        enable_prof: bool = False,
+    ):
+        super().__init__(
+            my_entity_id=my_entity_id,
+            hostname=hostname,
+            device=device,
+            communicator=communicator,
+            protocol=protocol,
+            metadata_server=metadata_server,
+            tcp_transfer_device=tcp_transfer_device,
+            enable_prof=enable_prof,
+        )
+        self.shm_dir = shm_dir or _default_shm_dir()
+        os.makedirs(self.shm_dir, exist_ok=True)
+        # uuid → file path; doubles as the "already written" send dedup, so
+        # shm-sent uuids keep ``mem_registered`` False and the engine cleanup
+        # path never tries to unregister memory it never pinned.
+        self._shm_files: dict[str, str] = {}
+        self._d2h_stream: torch.cuda.Stream | None = None
+        self._h2d_stream: torch.cuda.Stream | None = None
+        if torch.cuda.is_available() and str(device) != "cpu":
+            self._d2h_stream = torch.cuda.Stream(device=device)
+            self._h2d_stream = torch.cuda.Stream(device=device)
+
+    def _shm_path(self, entity_id: str, uuid: str) -> str:
+        return os.path.join(self.shm_dir, f"mstar_{entity_id}_{uuid}")
+
+    def register_for_send(
+        self, request_id, uuids, skip_cuda_sync=False, shm_uuids=None,
+    ):
+        shm_uuids = shm_uuids or set()
+        if not skip_cuda_sync and torch.cuda.is_available():
+            torch.cuda.default_stream().synchronize()
+        engine_uuids = [u for u in uuids if u not in shm_uuids]
+        if engine_uuids:
+            super().register_for_send(
+                request_id, engine_uuids, skip_cuda_sync=True,
+            )
+        if not shm_uuids:
+            return
+        ctx = (
+            torch.cuda.stream(self._d2h_stream)
+            if self._d2h_stream is not None
+            else _nullcontext()
+        )
+        with ctx:
+            for uuid in shm_uuids:
+                if uuid in self._shm_files:
+                    continue
+                tensor = self.tensor_store.get_tensor(request_id, uuid)
+                t0 = time.perf_counter()
+                data = _serialize_tensor(tensor)
+                path = self._shm_path(self.my_entity_id, uuid)
+                with open(path, "wb") as f:
+                    f.write(data)
+                self._shm_files[uuid] = path
+                if self.enable_prof:
+                    self._record_tx(
+                        request_id, uuid, len(data), time.perf_counter() - t0
+                    )
+
+    def start_read_tensors(
+        self, request_id: str, graph_edges: list[GraphEdge],
+        graph_walk: str | None = None
+    ) -> list[Future]:
+        futures = []
+        h2d_did_work = False
+        for graph_edge in graph_edges:
+            if len(graph_edge.tensor_info) == 0:
+                continue
+            read_info = []
+            shm_elapsed = 0.0
+            for info in graph_edge.tensor_info:
+                if info.source_entity == self.my_entity_id:
+                    self._slice_existing_tensor(
+                        request_id=request_id, name=graph_edge.name,
+                        next_node=graph_edge.next_node,
+                        graph_walk=graph_walk, info=info
+                    )
+                    self.tensor_store.increment_ref(request_id, info.uuid, 1)
+                    continue
+                if self.tensor_store.check_uuid_presence(request_id, info.uuid):
+                    self.tensor_store.increment_ref(request_id, info.uuid, 1)
+                    continue
+                if info.via_shm:
+                    rx_t0 = time.perf_counter()
+                    path = self._shm_path(info.source_entity, info.uuid)
+                    with open(path, "rb") as f:
+                        f.seek(info.offset)
+                        data = f.read(info.nbytes)
+                    ctx = (
+                        torch.cuda.stream(self._h2d_stream)
+                        if self._h2d_stream is not None
+                        else _nullcontext()
+                    )
+                    with ctx:
+                        tensor = _deserialize_tensor(data, self.device, tensor_info=info)
+                    h2d_did_work = True
+                    shm_elapsed += time.perf_counter() - rx_t0
+                    self.tensor_store.put_tensor(request_id, info.uuid, tensor)
+                    # +1 for transit (released by get_ready_tensors)
+                    # +1 for graph-node usage (released by _cleanup_consumed_inputs)
+                    self.tensor_store.increment_ref(request_id, info.uuid, 2)
+                    continue
+                buffer = torch.empty(
+                    info.dims, dtype=info.dtype, device=self.device
+                ).as_strided(info.dims, stride=info.stride)
+                self.tensor_store.put_tensor(
+                    request_id=request_id, uuid=info.uuid, tensor=buffer
+                )
+                self.tensor_store.set_metadata(
+                    request_id, info.uuid, mem_registered=True
+                )
+                # +1 for transit (released by get_ready_tensors)
+                # +1 for graph-node usage (released by _cleanup_consumed_inputs)
+                self.tensor_store.increment_ref(request_id, info.uuid, 2)
+                if self.protocol == CommProtocol.RDMA:
+                    self.transfer_engine.register_memory(buffer.data_ptr(), info.nbytes)
+                read_info.append(TransferReadInfo(
+                    source_session_id=info.source_session_id,
+                    local_ptr=buffer.data_ptr(),
+                    remote_ptr=info.address + info.offset,
+                    nbytes=info.nbytes,
+                ))
+            # One pending entry per edge regardless of how its tensors
+            # arrived. The shm part completed inline (rx_time pre-set); if an
+            # engine read is also in flight, the async reader re-stamps
+            # rx_time when it finishes and the future gates edge readiness.
+            fp = FutureAndPointers(
+                future=None, graph_edges=[graph_edge], request_id=request_id,
+                rx_time=shm_elapsed or None,
+            )
+            if read_info:
+                if self.enable_prof:
+                    for ri in read_info:
+                        ri.fp = fp
+                fut = self._async_reader.submit(read_info)
+                fp.future = fut
+                if fut is not None:
+                    futures.append(fut)
+            self.pending.append(fp)
+        if h2d_did_work and self._h2d_stream is not None:
+            torch.cuda.default_stream(self.device).wait_stream(self._h2d_stream)
+        return futures
+
+    def _cleanup_by_uuid(self, request_id: str, uuid: str):
+        path = self._shm_files.pop(uuid, None)
+        if path is not None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        super()._cleanup_by_uuid(request_id, uuid)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -1180,9 +1376,17 @@ def create_tensor_communication_manager(
     metadata_server: str = "P2PHANDSHAKE",
     tcp_transfer_device: str = "",
     shm_dir: str | None = None,
-    enable_prof: bool=False
+    enable_prof: bool=False,
+    same_host_entities: set[str] | None = None,
 ) -> TensorCommunicationManager:
-    """Select tensor transport backend based on protocol."""
+    """Select tensor transport backend based on protocol.
+
+    ``same_host_entities`` (the entities co-hosted with this one, supplied
+    only for multi-host deployments) upgrades TCP/RDMA to the hybrid manager:
+    the engine carries cross-host transfers while co-hosted transfers use
+    shared memory. ``None`` keeps the single-transport managers, so
+    single-host deployments behave exactly as before.
+    """
     if protocol == CommProtocol.SHM:
         return SharedMemoryCommunicationManager(
             my_entity_id=my_entity_id,
@@ -1191,6 +1395,18 @@ def create_tensor_communication_manager(
             communicator=communicator,
             shm_dir=shm_dir,
             enable_prof=enable_prof
+        )
+    if same_host_entities is not None:
+        return HybridCommunicationManager(
+            my_entity_id=my_entity_id,
+            hostname=hostname,
+            device=device,
+            communicator=communicator,
+            protocol=protocol,
+            metadata_server=metadata_server,
+            tcp_transfer_device=tcp_transfer_device,
+            shm_dir=shm_dir,
+            enable_prof=enable_prof,
         )
     return MooncakeCommunicationManager(
         my_entity_id=my_entity_id,

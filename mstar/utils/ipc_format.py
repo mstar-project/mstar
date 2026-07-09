@@ -152,3 +152,64 @@ class AbortRequest(MessageBody):
 class ConductorMessage:
     message_type: ConductorMessageType
     body: MessageBody
+
+
+######################################
+# Node-agent control (multi-host launch)
+######################################
+
+class AgentMessageType(Enum):
+    AGENT_JOIN = "agent_join"                  # agent -> conductor
+    AGENT_JOIN_REJECTED = "agent_join_rejected"  # conductor -> agent
+    LAUNCH_SPEC = "launch_spec"                # conductor -> agent
+    AGENT_WORKER_DIED = "agent_worker_died"    # agent -> conductor
+    AGENT_SHUTDOWN = "agent_shutdown"          # conductor -> agent
+
+
+@dataclass
+class AgentJoin(MessageBody):
+    node_rank: int
+    addr: str
+    visible_gpus: int
+    pid: int
+
+
+@dataclass
+class AgentJoinRejected(MessageBody):
+    reason: str
+
+
+@dataclass
+class LaunchSpec(MessageBody):
+    """Everything a node agent needs to spawn its host's workers.
+
+    ``workers`` holds one spawn-kwargs dict per worker — the exact keyword
+    arguments of the worker process target, minus the model object, which the
+    agent reconstructs locally from ``model_name``/``model_kwargs`` so weights
+    load from the host's own cache instead of being pickled across the wire.
+    """
+    node_rank: int
+    model_name: str
+    model_kwargs: dict
+    cache_dir: str | None
+    log_level: str
+    host_env: dict[str, str]
+    workers: list[dict]
+
+
+@dataclass
+class AgentWorkerDied(MessageBody):
+    node_rank: int
+    worker_id: str
+    exitcode: int | None
+
+
+@dataclass
+class AgentShutdown(MessageBody):
+    reason: str = ""
+
+
+@dataclass
+class AgentMessage:
+    message_type: AgentMessageType
+    body: MessageBody

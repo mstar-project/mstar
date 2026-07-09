@@ -1,0 +1,46 @@
+# Two-"host" loopback simulation of BAGEL prefill/decode disaggregation:
+# both logical hosts are this machine (disjoint control-plane port bases),
+# and each maps its single worker to local CUDA device 0 — so the head and
+# the agent can be pinned to GPUs via CUDA_VISIBLE_DEVICES independently.
+# For a real deployment, replace the addrs with routable hostnames and drop
+# the second port base.
+model: "bagel"
+max_seq_len: 32768
+
+cluster:
+  hosts:
+    - addr: 127.0.0.1
+      gpus: [0]
+      zmq_port_base: 24800
+    - addr: 127.0.0.1
+      gpus: [0]
+      zmq_port_base: 25400
+
+node_groups:
+  - node_names:
+      - vit_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - LLM
+    ranks:
+      - 0
+    graph_walks:
+      - prefill_text
+      - prefill_vit
+      - prefill_vae
+
+  - node_names:
+      - LLM
+    ranks:
+      - 1
+    graph_walks:
+      - decode
+      - image_gen
