@@ -16,10 +16,9 @@ Parallel (TP-aware) variants:
 * :class:`ParallelSparseMoeBlock`
 * :class:`ParallelSparseMoeBlockWithSharedExpert`
 
-When the optional ``sgl-kernel`` dependency is installed and inputs are
-on CUDA, dispatch goes through the Triton fused-MoE kernel in
-:mod:`mstar.utils.fused_moe`; otherwise it falls back to the naive
-per-expert loop in :func:`dispatch_experts_fused`.
+When triton is installed and inputs are on CUDA, dispatch goes through
+the Triton fused-MoE kernel in :mod:`mstar.utils.fused_moe`; otherwise it
+falls back to the naive per-expert loop in :func:`dispatch_experts_fused`.
 """
 from __future__ import annotations
 
@@ -35,15 +34,15 @@ from mstar.distributed.utils import divide
 logger = logging.getLogger(__name__)
 
 
-# Optional fused Triton MoE path. Imports succeed only on CUDA boxes
-# with sgl-kernel installed; any import failure (including the final
-# moe_align_block_size call) is treated as "fused path unavailable".
+# Optional fused Triton MoE path. Imports succeed wherever triton is
+# installed; the alignment op JIT-builds a vendored CUDA kernel on first use
+# (or falls back to a torch impl), so no sgl-kernel/vllm dep is needed. The
+# actual kernels only run on CUDA -- guarded by the ``is_cuda`` check below.
 try:
     from mstar.utils.fused_moe import fused_experts as _fused_experts
-    from mstar.utils.fused_moe.align import has_sgl_kernel
 
-    _HAS_FUSED = has_sgl_kernel()
-except Exception as e:  # pragma: no cover -- exercised only when optional dep missing
+    _HAS_FUSED = True
+except Exception as e:  # pragma: no cover -- exercised only when triton missing
     _fused_experts = None
     _HAS_FUSED = False
     logger.warning(f"Could not load fused MoE kernel: {e}")
