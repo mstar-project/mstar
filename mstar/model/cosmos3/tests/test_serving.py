@@ -327,7 +327,7 @@ def test_create_images_n_expands_requests() -> None:
             self.submits.append(kw)
             return kw["request_id"]
 
-        def collect_results(self, request_id):
+        async def collect_results(self, request_id, raw_request=None):
             return [ResultChunk(request_id=request_id, modality="image", data=request_id.encode())]
 
     adapter = get_adapter("cosmos3")
