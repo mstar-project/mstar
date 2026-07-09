@@ -61,17 +61,18 @@ cosmos3 = [
     # The Cosmos3 reference pipeline (used by the parity tests) landed in
     # diffusers 0.39; serving itself uses AutoencoderKLWan and the scheduler.
     "diffusers>=0.39",
+    # bs=1 dense attention fast path. The wheel is ABI-tied to the torch/CUDA
+    # build; on a mismatch the engine logs a warning and falls back to the
+    # paged flashinfer backend. See docs/models.rst.
+    "fa3-fwd",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
     "safetensors",
     "torchvision",
-    "torchcodec==0.8.*",
+    "torchcodec",
     "transformers",
-    # NOTE: the bs=1 dense attention fast path uses the fa3-fwd wheel, which is
-    # ABI-tied to the torch/CUDA build; without it the engine falls back to the
-    # paged flashinfer backend. See docs/models.rst.
 ]
 
 qwen3_omni = [
@@ -133,6 +134,7 @@ all = [
     "soundfile",
     "av",
     "diffusers>=0.39",
+    "fa3-fwd",
     "einops",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
