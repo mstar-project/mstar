@@ -48,7 +48,8 @@ def one(size):
     return dt, b64
 
 
-print(f"=== {args.tag}  port={args.port} model={args.model}  steps={args.steps} gs={args.gs} seed={args.seed} ===", flush=True)
+print(f"=== {args.tag}  port={args.port} model={args.model}  steps={args.steps} "
+      f"gs={args.gs} seed={args.seed} ===", flush=True)
 for size in args.sizes.split(","):
     try:
         for _ in range(args.warmup):

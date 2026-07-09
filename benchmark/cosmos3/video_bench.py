@@ -78,7 +78,7 @@ def gen_vllm(size):
         cmd += ["-F", f"input_reference=@{args.image};type=image/jpeg"]
     cmd += ["-o", out_mp4, "-w", "%{http_code}"]
     t0 = time.perf_counter()
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, check=False)
     dt = time.perf_counter() - t0
     code = res.stdout.strip()[-3:]
     import os
@@ -89,7 +89,8 @@ def gen_vllm(size):
 
 
 gen = gen_ours if args.engine == "ours" else gen_vllm
-print(f"=== {args.engine}  port={args.port}  frames={args.frames} steps={args.steps} gs={args.gs} seed={args.seed} ===", flush=True)
+print(f"=== {args.engine}  port={args.port}  frames={args.frames} steps={args.steps} "
+      f"gs={args.gs} seed={args.seed} ===", flush=True)
 for size in args.tiers.split(","):
     try:
         for _ in range(args.warmup):
@@ -100,7 +101,8 @@ for size in args.tiers.split(","):
             ts.append(dt)
         ts.sort()
         med = ts[len(ts) // 2]
-        print(f"  {size:9s}  median {med:.2f}s  min {ts[0]:.2f}  max {ts[-1]:.2f}  mp4={sz // 1024}KB  (n={args.rounds})", flush=True)
+        print(f"  {size:9s}  median {med:.2f}s  min {ts[0]:.2f}  max {ts[-1]:.2f}  "
+              f"mp4={sz // 1024}KB  (n={args.rounds})", flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"  {size:9s}  ERROR {type(e).__name__}: {str(e)[:140]}", flush=True)
 print("DONE", flush=True)

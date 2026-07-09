@@ -65,6 +65,12 @@ Cosmos3 environment requirements
 - Video-input requests (video-to-video, action inverse-dynamics) decode the
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
+- Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
+  when available (torchcodec >= 0.9), otherwise with ``torchvision``'s
+  ``write_video``, which needs the PyAV (``av``) package.
+- Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
+  ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
+  pip-installable).
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
