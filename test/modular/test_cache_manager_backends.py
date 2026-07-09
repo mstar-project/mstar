@@ -37,12 +37,25 @@ def test_default_backend_is_flashinfer():
     assert type(_make(_cfg())) is FlashInferCacheManager
 
 
-def test_dense_gen_backend_selected_by_config():
+def test_dense_gen_backend_selected_by_config(monkeypatch):
+    import mstar.engine.cache_manager as cm_mod
+
+    monkeypatch.setattr(cm_mod, "_fa3_unavailable_reason", lambda: None)
     cm = _make(_cfg("dense_gen"))
     assert isinstance(cm, DenseGenCacheManager)
     # The dense backend extends the paged one: prefill, captured graphs, and
     # multi-request batches fall through to the inherited FlashInfer paths.
     assert isinstance(cm, FlashInferCacheManager)
+
+
+def test_dense_gen_falls_back_to_paged_without_fa3(monkeypatch):
+    import mstar.engine.cache_manager as cm_mod
+
+    monkeypatch.setattr(
+        cm_mod, "_fa3_unavailable_reason", lambda: "ImportError: mocked"
+    )
+    cm = _make(_cfg("dense_gen"))
+    assert type(cm) is FlashInferCacheManager
 
 
 def test_unknown_backend_rejected():

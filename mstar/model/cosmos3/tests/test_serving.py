@@ -497,8 +497,10 @@ def test_ingest_cond_latents_routing() -> None:
 
 def test_postprocess_finishes_captured_step() -> None:
     """The submodule ``postprocess`` finishes a captured denoise step from the
-    step's inputs (CFG combine + scheduler step), passes eager outputs through
-    untouched, and no-ops the discarded extra step past the request's count."""
+    step's inputs (CFG combine + scheduler step) and passes eager outputs
+    through untouched. Steps past the request's count never reach it:
+    prepare_inputs vetoes the loop's extra dispatched step and the engine
+    prunes vetoed requests before postprocess."""
     import types
 
     import torch
@@ -528,13 +530,6 @@ def test_postprocess_finishes_captured_step() -> None:
     assert set(out) == {"latents", "time_index"}
     assert torch.equal(out["latents"][0], torch.full((1, 4), 4.0))
     assert torch.equal(out["time_index"][0], torch.tensor([2]))
-
-    # Discarded extra step: inputs pass through unchanged.
-    out = {"cond_v": [torch.ones(1, 4)], "uncond_v": [torch.ones(1, 4)]}
-    over = ARNodeInputs(tensor_inputs={"latents": lat, "time_index": torch.tensor([3])})
-    dit.postprocess("r", info, out, inputs=over)
-    assert torch.equal(out["latents"][0], lat)
-    assert torch.equal(out["time_index"][0], torch.tensor([3]))
 
     # Eager shape (already finished) and non-gen walks stay untouched.
     eager = {"latents": [lat], "time_index": [ti]}

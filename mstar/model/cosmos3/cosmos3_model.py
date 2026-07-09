@@ -268,14 +268,10 @@ class Cosmos3Model(Model):
                 [
                     Loop(
                         name=loop_name,
-                        # Disable speculative (async) scheduling on the denoise
-                        # step: with it on, the worker pre-dispatches a single
-                        # request's next step and drains that one request's whole
-                        # loop before others are scheduled, so concurrent requests
-                        # never share a forward. Off, the scheduler groups all
-                        # ready requests at this node into one batched denoise
-                        # step (see can_batch/forward_batched). Mirrors the BAGEL
-                        # image-gen loop nodes.
+                        # Async (speculative) scheduling pre-dispatches each
+                        # request's next denoise step; its yield-away lets other
+                        # ready requests join, so concurrent requests still batch
+                        # into one forward (see can_batch/forward_batched).
                         # ``cond_latents`` is the loop's external input (no
                         # loop-back edge produces it): the vae_encoder node's
                         # persist signal enters once at the walk transition —
