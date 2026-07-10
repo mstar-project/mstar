@@ -61,6 +61,25 @@ class TPCommGroup:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
+    def all_to_all_single(self, input_: torch.Tensor) -> torch.Tensor:
+        """Equal-split all-to-all: rank r's chunk r goes to rank r.
+
+        ``input_`` is ``(world_size * chunk, ...)`` — split evenly into
+        ``world_size`` equal chunks along dim 0; chunk ``i`` is sent to rank
+        ``i`` and replaced by the chunk rank ``i`` sent us. Output has the
+        same shape as input. EQUAL split (no per-rank split sizes) keeps the
+        shape static, which is what makes this CUDA-graph-capturable — the
+        property capacity-padded expert parallelism relies on.
+
+        Used by the EP MoE dispatch/combine: the caller pads its send buffer
+        to a fixed per-rank capacity so the equal split is valid.
+        """
+        if self.world_size == 1:
+            return input_
+        output = torch.empty_like(input_)
+        dist.all_to_all_single(output, input_, group=self.device_group)
+        return output
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.

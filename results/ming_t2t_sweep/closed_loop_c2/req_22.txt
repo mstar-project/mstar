@@ -1,0 +1,9 @@
+GPS, or Global Positioning System, is a satellite-based navigation system that provides location and time information anywhere on or near the Earth. Here's how it works:
+
+1. **Satellites**: The GPS system consists of a network of at least 24 satellites orbiting the Earth. These satellites are constantly transmitting signals that include their position and the exact time the signal was sent.
+
+2. **Receivers**: A GPS receiver, such as a smartphone or a dedicated GPS device, picks up these signals. The receiver needs to receive signals from at least four satellites to determine its position accurately.
+
+3. **Triangulation**: The receiver calculates its distance from each satellite by measuring the time it takes for the signal to travel from the satellite to the receiver. Since the speed of light is known, the distance can be calculated using the formula: distance = speed of light × time. By knowing the distance to at least four satellites, the receiver can use triangulation to determine its position in three dimensions (latitude, longitude, and altitude).
+
+4. **Time Synchronization**: The GPS system relies on precise time synchronization. Each satellite has an atomic clock, which is extremely accurate. The receiver uses the time stamps from the satellites to calculate the

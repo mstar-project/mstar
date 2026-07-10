@@ -1,0 +1,366 @@
+/sgl-workspace/stu/multimodal_inference/mstar/api_server/entrypoint.py:589: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("shutdown")
+Fetching 98 files:   0%|          | 0/98 [00:00<?, ?it/s]Fetching 98 files: 100%|██████████| 98/98 [00:00<00:00, 22686.93it/s]
+WARNING:mstar.model.ming_omni_flash.config:ThinkerLLMConfig: ckpt-supplied video_start_token=157159 matches image_end_token (= </image> per tokenizer). The released inclusionAI/Ming-flash-omni-2.0 config.json mislabels this field; correcting to 157160 (= <video>). If this is intentional, set video_start_token explicitly after construction.
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+2026-06-12 18:40:35,661 INFO [conductor] __mp_main__: yaml /sgl-workspace/stu/multimodal_inference/configs/ming_flash_omni_thinker_only_tp4.yaml has no model_kwargs section; using model defaults
+Fetching 98 files:   0%|          | 0/98 [00:00<?, ?it/s]Fetching 98 files: 100%|██████████| 98/98 [00:00<00:00, 12263.68it/s]
+2026-06-12 18:40:35,867 WARNING [conductor] mstar.model.ming_omni_flash.config: ThinkerLLMConfig: ckpt-supplied video_start_token=157159 matches image_end_token (= </image> per tokenizer). The released inclusionAI/Ming-flash-omni-2.0 config.json mislabels this field; correcting to 157160 (= <video>). If this is intentional, set video_start_token explicitly after construction.
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+2026-06-12 18:40:49,783 ERROR [worker_1] mstar.conductor.conductor: Worker worker_1 failed to initialize: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 1 has a total capacity of 79.18 GiB of which 588.56 MiB is free. Process 497105 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Traceback (most recent call last):
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 112, in _worker_process_target
+    worker = Worker(
+             ^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/worker.py", line 185, in __init__
+    self.engine_manager = EngineManager.build(
+                          ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/engine_manager.py", line 97, in build
+    node_submodules[name] = model.get_submodule(name, device, tp_group=node_tp_group)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/ming_omni_flash_model.py", line 1453, in get_submodule
+    model.to_empty(device=device)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1226, in to_empty
+    return self._apply(
+           ^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/components/moe.py", line 190, in _apply
+    result = super()._apply(fn, recurse=recurse)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 957, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1227, in <lambda>
+    lambda t: torch.empty_like(t, device=device), recurse=recurse
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_prims_common/wrappers.py", line 309, in _fn
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_refs/__init__.py", line 5113, in empty_like
+    return torch.empty_permuted(
+           ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 1 has a total capacity of 79.18 GiB of which 588.56 MiB is free. Process 497105 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Process SpawnProcess-1:2:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 134, in _worker_process_target
+    raise e
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 112, in _worker_process_target
+    worker = Worker(
+             ^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/worker.py", line 185, in __init__
+    self.engine_manager = EngineManager.build(
+                          ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/engine_manager.py", line 97, in build
+    node_submodules[name] = model.get_submodule(name, device, tp_group=node_tp_group)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/ming_omni_flash_model.py", line 1453, in get_submodule
+    model.to_empty(device=device)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1226, in to_empty
+    return self._apply(
+           ^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/components/moe.py", line 190, in _apply
+    result = super()._apply(fn, recurse=recurse)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 957, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1227, in <lambda>
+    lambda t: torch.empty_like(t, device=device), recurse=recurse
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_prims_common/wrappers.py", line 309, in _fn
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_refs/__init__.py", line 5113, in empty_like
+    return torch.empty_permuted(
+           ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 1 has a total capacity of 79.18 GiB of which 588.56 MiB is free. Process 497105 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank1]:[W612 18:40:50.881567667 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())
+2026-06-12 18:40:55,642 ERROR [worker_2] mstar.conductor.conductor: Worker worker_2 failed to initialize: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 2 has a total capacity of 79.18 GiB of which 588.56 MiB is free. Process 497398 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Traceback (most recent call last):
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 112, in _worker_process_target
+    worker = Worker(
+             ^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/worker.py", line 185, in __init__
+    self.engine_manager = EngineManager.build(
+                          ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/engine_manager.py", line 97, in build
+    node_submodules[name] = model.get_submodule(name, device, tp_group=node_tp_group)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/ming_omni_flash_model.py", line 1453, in get_submodule
+    model.to_empty(device=device)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1226, in to_empty
+    return self._apply(
+           ^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/components/moe.py", line 190, in _apply
+    result = super()._apply(fn, recurse=recurse)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 957, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1227, in <lambda>
+    lambda t: torch.empty_like(t, device=device), recurse=recurse
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_prims_common/wrappers.py", line 309, in _fn
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_refs/__init__.py", line 5113, in empty_like
+    return torch.empty_permuted(
+           ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 2 has a total capacity of 79.18 GiB of which 588.56 MiB is free. Process 497398 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Process SpawnProcess-1:3:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 134, in _worker_process_target
+    raise e
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 112, in _worker_process_target
+    worker = Worker(
+             ^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/worker.py", line 185, in __init__
+    self.engine_manager = EngineManager.build(
+                          ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/engine_manager.py", line 97, in build
+    node_submodules[name] = model.get_submodule(name, device, tp_group=node_tp_group)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/ming_omni_flash_model.py", line 1453, in get_submodule
+    model.to_empty(device=device)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1226, in to_empty
+    return self._apply(
+           ^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/components/moe.py", line 190, in _apply
+    result = super()._apply(fn, recurse=recurse)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 957, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1227, in <lambda>
+    lambda t: torch.empty_like(t, device=device), recurse=recurse
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_prims_common/wrappers.py", line 309, in _fn
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_refs/__init__.py", line 5113, in empty_like
+    return torch.empty_permuted(
+           ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 2 has a total capacity of 79.18 GiB of which 588.56 MiB is free. Process 497398 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank2]:[W612 18:40:56.741928180 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())
+2026-06-12 18:41:00,510 INFO [conductor] mstar.conductor.conductor: Conductor waiting for 4 worker(s) to finish setup
+2026-06-12 18:41:01,877 ERROR [worker_3] mstar.conductor.conductor: Worker worker_3 failed to initialize: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 3 has a total capacity of 79.18 GiB of which 588.50 MiB is free. Process 497723 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Traceback (most recent call last):
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 112, in _worker_process_target
+    worker = Worker(
+             ^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/worker.py", line 185, in __init__
+    self.engine_manager = EngineManager.build(
+                          ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/engine_manager.py", line 97, in build
+    node_submodules[name] = model.get_submodule(name, device, tp_group=node_tp_group)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/ming_omni_flash_model.py", line 1453, in get_submodule
+    model.to_empty(device=device)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1226, in to_empty
+    return self._apply(
+           ^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/components/moe.py", line 190, in _apply
+    result = super()._apply(fn, recurse=recurse)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 957, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1227, in <lambda>
+    lambda t: torch.empty_like(t, device=device), recurse=recurse
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_prims_common/wrappers.py", line 309, in _fn
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_refs/__init__.py", line 5113, in empty_like
+    return torch.empty_permuted(
+           ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 3 has a total capacity of 79.18 GiB of which 588.50 MiB is free. Process 497723 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Process SpawnProcess-1:4:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 134, in _worker_process_target
+    raise e
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 112, in _worker_process_target
+    worker = Worker(
+             ^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/worker.py", line 185, in __init__
+    self.engine_manager = EngineManager.build(
+                          ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/engine_manager.py", line 97, in build
+    node_submodules[name] = model.get_submodule(name, device, tp_group=node_tp_group)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/ming_omni_flash_model.py", line 1453, in get_submodule
+    model.to_empty(device=device)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1226, in to_empty
+    return self._apply(
+           ^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/components/moe.py", line 190, in _apply
+    result = super()._apply(fn, recurse=recurse)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 957, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1227, in <lambda>
+    lambda t: torch.empty_like(t, device=device), recurse=recurse
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_prims_common/wrappers.py", line 309, in _fn
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_refs/__init__.py", line 5113, in empty_like
+    return torch.empty_permuted(
+           ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 3 has a total capacity of 79.18 GiB of which 588.50 MiB is free. Process 497723 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-06-12 18:41:01,910 ERROR [worker_0] mstar.conductor.conductor: Worker worker_0 failed to initialize: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 0 has a total capacity of 79.18 GiB of which 588.56 MiB is free. Process 496802 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Traceback (most recent call last):
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 112, in _worker_process_target
+    worker = Worker(
+             ^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/worker.py", line 185, in __init__
+    self.engine_manager = EngineManager.build(
+                          ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/engine_manager.py", line 97, in build
+    node_submodules[name] = model.get_submodule(name, device, tp_group=node_tp_group)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/ming_omni_flash_model.py", line 1453, in get_submodule
+    model.to_empty(device=device)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1226, in to_empty
+    return self._apply(
+           ^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/components/moe.py", line 190, in _apply
+    result = super()._apply(fn, recurse=recurse)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 957, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1227, in <lambda>
+    lambda t: torch.empty_like(t, device=device), recurse=recurse
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_prims_common/wrappers.py", line 309, in _fn
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_refs/__init__.py", line 5113, in empty_like
+    return torch.empty_permuted(
+           ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 0 has a total capacity of 79.18 GiB of which 588.56 MiB is free. Process 496802 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Process SpawnProcess-1:1:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 134, in _worker_process_target
+    raise e
+  File "/sgl-workspace/stu/multimodal_inference/mstar/conductor/conductor.py", line 112, in _worker_process_target
+    worker = Worker(
+             ^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/worker.py", line 185, in __init__
+    self.engine_manager = EngineManager.build(
+                          ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/worker/engine_manager.py", line 97, in build
+    node_submodules[name] = model.get_submodule(name, device, tp_group=node_tp_group)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/ming_omni_flash_model.py", line 1453, in get_submodule
+    model.to_empty(device=device)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1226, in to_empty
+    return self._apply(
+           ^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/sgl-workspace/stu/multimodal_inference/mstar/model/ming_omni_flash/components/moe.py", line 190, in _apply
+    result = super()._apply(fn, recurse=recurse)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    module._apply(fn)
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 957, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1227, in <lambda>
+    lambda t: torch.empty_like(t, device=device), recurse=recurse
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_prims_common/wrappers.py", line 309, in _fn
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/root/venvs/mminf/lib/python3.12/site-packages/torch/_refs/__init__.py", line 5113, in empty_like
+    return torch.empty_permuted(
+           ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 0 has a total capacity of 79.18 GiB of which 588.56 MiB is free. Process 496802 has 78.58 GiB memory in use. Of the allocated memory 77.99 GiB is allocated by PyTorch, and 17.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank0]:[W612 18:41:02.601665324 ProcessGroupNCCL.cpp:1524] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+[rank3]:[W612 18:41:02.955754290 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())
+[rank0]:[W612 18:41:02.988335044 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

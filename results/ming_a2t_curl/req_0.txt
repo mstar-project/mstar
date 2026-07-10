@@ -1,0 +1,4 @@
+--- req 0 (/tmp/ming_repo/data/wavs/speechQA_sample.wav, 0.623s) ---
+你好，我是一个语言模型，名叫百灵-原生多模态。我是由蚂蚁集团研发的，旨在为用户提供有帮助、诚实、无害的回答。请问有什么问题我可以帮助您解答吗？
+
+usage: {'prompt_tokens': 75, 'total_tokens': 112, 'completion_tokens': 37, 'prompt_tokens_details': None}

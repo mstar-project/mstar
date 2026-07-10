@@ -1,0 +1,1 @@
+RAM, or Random Access Memory, is a type of computer memory that stores data and instructions temporarily while the computer is running. It allows the computer to access data quickly and efficiently, as it can be read from and written to at any time. RAM is used to store information such as programs, operating systems, and data that the computer needs to access quickly.

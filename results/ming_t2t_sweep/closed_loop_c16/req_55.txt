@@ -1,0 +1,11 @@
+Wi-Fi is a wireless networking technology that allows devices to connect to the internet without the need for physical cables. It works by using radio waves to transmit data between a wireless router and devices such as computers, smartphones, and tablets.
+
+Here's a simplified explanation of how Wi-Fi works:
+
+1. **Wireless Router**: The central component of a Wi-Fi network is the wireless router. This device connects to your internet service provider (ISP) via a wired connection (such as a cable or DSL line) and then broadcasts a wireless signal.
+
+2. **Radio Waves**: The router sends out radio waves in the form of electromagnetic signals. These signals are transmitted on specific frequencies, typically 2.4 GHz or 5 GHz, which are part of the radio spectrum.
+
+3. **Devices**: Devices with Wi-Fi capabilities, such as laptops, smartphones, and smart TVs, have wireless adapters that can detect and connect to these radio waves. When a device is within range of the router, it can pick up the signal and establish a connection.
+
+4. **Data Transmission**: Once connected, the router and the device can send and receive data. The router acts as a bridge between the wireless network and the wired internet connection, allowing devices

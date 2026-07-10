@@ -1,0 +1,7 @@
+The trolley problem is a thought experiment in ethics that was first introduced by philosopher Philippa Foot in 1967. It is used to explore the moral implications of making decisions that involve sacrificing one life to save others.
+
+The basic scenario of the trolley problem is as follows: A runaway trolley is heading towards five people who are tied up on the tracks and will be killed if the trolley continues on its current path. You are standing next to a lever that can divert the trolley onto another set of tracks, where there is only one person tied up. If you pull the lever, the trolley will switch tracks and kill the one person, but the five people on the original track will be saved. If you do nothing, the trolley will continue on its current path and kill the five people.
+
+The dilemma presented by the trolley problem is whether it is morally permissible to actively intervene and cause the death of one person in order to save the lives of five others. Some argue that it is morally justifiable to pull the lever and sacrifice one life to save five, while others argue that it is wrong to actively cause harm to an innocent person, even if it results in saving more lives.
+
+The trolley problem has been used to explore various ethical theories, including

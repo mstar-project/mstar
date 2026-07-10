@@ -1,0 +1,5 @@
+The Pythagorean theorem is a fundamental principle in Euclidean geometry that states that in a right-angled triangle, the square of the length of the hypotenuse (the side opposite the right angle) is equal to the sum of the squares of the lengths of the other two sides. This can be written as:
+
+a² + b² = c²
+
+where c represents the length of the hypotenuse, and a and b represent the lengths of the other two sides. The theorem is named after the ancient Greek mathematician Pythagoras, who is credited with its discovery, although it was known to other cultures before him. The theorem has numerous applications in mathematics, physics, engineering, and other fields.

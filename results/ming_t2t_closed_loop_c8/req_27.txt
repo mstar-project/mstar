@@ -1,0 +1,1 @@
+The speed of light in a vacuum is approximately 299,792,458 meters per second (m/s), which is often rounded to 300,000 kilometers per second (km/s) for simplicity. This value is a fundamental constant in physics and is denoted by the letter "c". It plays a crucial role in many areas of science, including electromagnetism, relativity, and quantum mechanics.

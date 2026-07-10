@@ -1,0 +1,11 @@
+Wi-Fi is a wireless networking technology that allows devices to connect to the internet without the need for physical cables. It works by using radio waves to transmit data between a device and a wireless access point, which is typically connected to a wired network and the internet.
+
+Here's a simplified explanation of how Wi-Fi works:
+
+1. **Wireless Access Point (WAP):** A WAP, also known as a router, is a device that connects to a wired network and broadcasts a wireless signal. It acts as a bridge between the wired network and the wireless devices.
+
+2. **Radio Waves:** The WAP uses radio waves to transmit data. These waves are part of the electromagnetic spectrum and can travel through the air. Wi-Fi uses specific frequencies within this spectrum, typically 2.4 GHz or 5 GHz, to avoid interference from other devices.
+
+3. **Modulation:** The data is modulated onto the radio waves. Modulation is the process of encoding information onto a carrier wave. In Wi-Fi, this is done using various modulation techniques like OFDM (Orthogonal Frequency-Division Multiplexing) to ensure efficient and reliable data transmission.
+
+4. **Transmission:** The modulated radio waves are transmitted from the W

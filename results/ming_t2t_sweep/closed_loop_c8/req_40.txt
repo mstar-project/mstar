@@ -1,0 +1,5 @@
+1. Ad Hominem: This is a fallacy where the argument attacks the person making the argument rather than addressing the argument itself. For example, if someone says "You can't trust John's opinion on climate change because he drives a gas-guzzling car," they are attacking John's character rather than addressing his argument about climate change.
+
+2. False Dilemma: This is a fallacy where only two options are presented as the only possible choices, when in reality there may be more options available. For example, if someone says "You're either with us or against us," they are presenting a false dilemma by suggesting that there are only two possible positions on an issue.
+
+3. Slippery Slope: This is a fallacy where it is suggested that one event will inevitably lead to a series of negative events, without providing evidence for this chain of events. For example, if someone says "If we allow same-sex marriage, then people will start marrying animals," they are suggesting a slippery slope without providing any evidence to support this claim.

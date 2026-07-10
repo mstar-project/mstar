@@ -1,0 +1,13 @@
+Latitude and longitude are two of the most important concepts in geography and navigation. They are used to pinpoint locations on the Earth's surface. Here's a breakdown of the differences between the two:
+
+1. **Definition:**
+   - **Latitude** refers to the angular distance of a point north or south of the equator. It is measured in degrees, with 0° at the equator and 90° at the poles.
+   - **Longitude** refers to the angular distance of a point east or west of the Prime Meridian, which passes through Greenwich, England. It is also measured in degrees, with 0° at the Prime Meridian and 180° at the International Date Line.
+
+2. **Direction:**
+   - Latitude lines run horizontally around the Earth, parallel to the equator. They are often referred to as parallels.
+   - Longitude lines run vertically from the North Pole to the South Pole. They are often referred to as meridians.
+
+3. **Range:**
+   - Latitude ranges from 0° at the equator to 90° at both the North and South Poles.
+   - Longitude ranges from 0° at the Prime Meridian to 180° east

@@ -1,0 +1,35 @@
+# Ming-flash-omni-2.0 — full omni deploy (text/image/audio/video in, text + speech out).
+#
+# Node→rank mapping for the native mstar port
+# (mstar/model/ming_omni_flash/). The model registers these nodes
+# (see MingFlashOmniModel.get_node_engine_types):
+#
+#   * Thinker        (KV_CACHE, TP)  — Ling-2.0 sparse MoE LLM, the
+#                                      multimodal understanding core.
+#   * vision_encoder (STATELESS)     — Qwen3-MoE ViT + projector.
+#   * audio_encoder  (STATELESS)     — Whisper encoder + projector.
+#   * Talker         (STATELESS)     — CFM talker; the AudioVAE is wrapped
+#                                      INSIDE the Talker submodule (it is
+#                                      NOT a separate graph node).
+#
+# Thinker runs TP=8 across all 8 H100s: TP=4 OOMs at ~78.5/80 GB per rank
+# during ckpt streaming (re-verified 2026-06-08), TP=8 halves the
+# footprint to ~40 GB/rank with plenty of headroom. The stateless
+# encoders + the talker are small (~1.5 GB each) and colocate on rank 0.
+#
+# The Thinker→Talker bridge passes DETOKENIZED TEXT (re-tokenized with
+# the talker's own talker/llm tokenizer), so the talker is a near-
+# standalone TTS partition fed by a streaming connection — see
+# MingFlashOmniModel.get_partition_topology.
+
+model: "ming_flash_omni"
+max_seq_len: 32768
+node_groups:
+  # Stateless encoders + the talker colocate on rank 0.
+  - node_names: [vision_encoder, audio_encoder, Talker]
+    ranks: [0]
+
+  # Thinker sharded across all 8 GPUs.
+  - node_names: [Thinker]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8

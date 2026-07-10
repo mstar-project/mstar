@@ -1,0 +1,9 @@
+Inflation is an economic term used to describe a sustained increase in the general price level of goods and services in an economy over time. It is typically measured as an annual percentage increase. Inflation can erode the purchasing power of money, meaning that each unit of currency buys fewer goods and services than before.
+
+There are several causes of inflation, which can be broadly categorized into demand-pull inflation, cost-push inflation, and built-in inflation:
+
+1. **Demand-Pull Inflation**: This occurs when the demand for goods and services exceeds the supply. When there is too much money chasing too few goods, prices tend to rise. This can happen due to increased consumer spending, government spending, or investment by businesses. If the economy is operating at full capacity, this excess demand can lead to higher prices without a corresponding increase in output.
+
+2. **Cost-Push Inflation**: This type of inflation happens when the costs of production increase, leading to higher prices for goods and services. Factors that can cause cost-push inflation include increases in wages, raw material costs, or taxes. For example, if oil prices rise, the cost of transportation and production increases, which can lead to higher prices for a wide range of products.
+
+3. **Built

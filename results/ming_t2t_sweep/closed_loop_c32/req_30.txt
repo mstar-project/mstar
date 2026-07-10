@@ -1,0 +1,1 @@
+RAM, or Random Access Memory, is a type of computer memory that stores data and instructions temporarily while the computer is running. It is used to store information that the computer needs to access quickly, such as programs, applications, and data. RAM is volatile, meaning that it loses its contents when the power is turned off.

@@ -1,0 +1,5 @@
+1. Ad Hominem: This is a fallacy where the argument attacks the person making the argument rather than the argument itself. It is an attempt to discredit the person making the argument by attacking their character, motives, or other personal attributes.
+
+2. False Dilemma: This is a fallacy where only two options are presented as if they are the only possible choices, when in fact there may be other alternatives. This fallacy is often used to force a decision or to limit the scope of a discussion.
+
+3. Slippery Slope: This is a fallacy where it is assumed that one event will inevitably lead to another, without any evidence to support this assumption. This fallacy is often used to create fear or to discourage action by suggesting that taking one step will lead to a chain of events that will result in a negative outcome.

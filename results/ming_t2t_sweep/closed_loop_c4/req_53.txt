@@ -1,0 +1,11 @@
+Inflation is an economic term used to describe a sustained increase in the general price level of goods and services in an economy over time. It is typically measured as an annual percentage increase. Inflation erodes the purchasing power of money, meaning that each unit of currency buys fewer goods and services than before.
+
+There are several factors that can cause inflation:
+
+1. **Demand-Pull Inflation**: This occurs when the demand for goods and services exceeds the supply. When there is too much money chasing too few goods, prices tend to rise. This can happen due to increased consumer spending, government spending, or investment.
+
+2. **Cost-Push Inflation**: This type of inflation happens when the costs of production increase, leading to higher prices for goods and services. Factors that can lead to cost-push inflation include increases in wages, raw material costs, or taxes.
+
+3. **Built-In Inflation**: Also known as wage-price inflation, this is the idea that workers will expect and demand higher wages to keep up with rising living costs, which in turn leads to higher production costs and prices.
+
+4. **Monetary Inflation**: This is caused by an increase in the money supply. When a country's central bank prints more money, the value
