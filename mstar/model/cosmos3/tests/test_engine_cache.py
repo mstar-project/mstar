@@ -587,7 +587,7 @@ def test_cross_request_batch_matches_individual() -> None:
             for p in prompts
         ]
         bs1 = []
-        for i, rid in enumerate(rids):
+        for i, _rid in enumerate(rids):
             cm = _flashinfer_cache(model, "r0", device, dtype)
             bs1.append(_dec(_run_cache_once(model, dit, cm, init, conds[i], unconds[i], device, 1)))
     except Exception as exc:  # noqa: BLE001

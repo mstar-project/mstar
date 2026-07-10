@@ -625,7 +625,7 @@ class Cosmos3Model(Model):
                 width, height = int(sw), int(sh)
             except ValueError:
                 pass
-        
+
         # A video request without an explicit frame count gets the video default
         # (>1); image requests stay single-frame.
         default_frames = (

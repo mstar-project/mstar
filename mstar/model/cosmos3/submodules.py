@@ -699,7 +699,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     for label in labels for inp in inputs
                 ], dim=1),
             }
-        
+
         states = self._states(engine_inputs)
         st = states[engine_inputs.request_ids[0]]
 
