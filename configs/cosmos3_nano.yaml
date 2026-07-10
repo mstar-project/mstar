@@ -1,0 +1,23 @@
+model: "cosmos3"
+# Sequence-length hint for the scheduler. The conductor only asserts its
+# presence; the real per-request capacity is the KV pool below.
+max_seq_len: 8192
+# KV pool sizing. The default (max_num_pages 2048 x page_size 128) pre-allocates
+# ~38 GB of paged K/V for the 36-layer DiT regardless of the workload, which
+# OOMs larger video on an 80 GB card. A bs=1 720p x 189-frame request needs only
+# ~692 pages across both CFG branches (images take a few dozen), so 1024 pages
+# (~19 GB) cover single-request video at every tier plus image batching and free
+# ~19 GB for activations.
+kv_cache:
+  max_num_pages: 1024
+# Denoise CUDA-graph capture knobs (serving). cuda_graph=false serves eager;
+# graph_max_latent_area caps which resolutions are captured (latent H*W). The
+# COSMOS3_DISABLE_CUDA_GRAPH / COSMOS3_GRAPH_MAX_LATENT_AREA env vars override.
+model_kwargs:
+  cuda_graph: true
+  graph_max_latent_area: 2000
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0]
+  - node_names: ["vae_encoder", "vae_decoder", "audio_decoder"]
+    ranks: [0]

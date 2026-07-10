@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components.distributed import ParallelAttention
 
@@ -41,7 +41,7 @@ class Qwen3OmniAttention(ParallelAttention):
         rope_theta: float = 1_000_000.0,
         rms_norm_eps: float = 1e-6,
         use_mrope: bool = False,
-        comm_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
     ):
         super().__init__(
             comm_group=comm_group,

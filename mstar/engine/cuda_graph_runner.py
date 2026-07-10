@@ -26,7 +26,11 @@ import torch
 from torch import nn
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cache_manager import BatchedCacheManager, WorkspaceBufferManager
+from mstar.engine.cache_manager import (
+    BatchedCacheManager,
+    WorkspaceBufferManager,
+    create_cache_manager,
+)
 from mstar.engine.cuda_graph_config import (
     BasicBatchedCudaGraphConfig,
     CudaGraphConfig,
@@ -94,6 +98,7 @@ class PiecewiseGraphData:
 class CudaGraphData:
     config: CudaGraphConfig
     bs: int
+    index: int
     # One CudaGraphSlot per double-buffer slot. Always length NUM_SLOTS.
     # Each slot has its own captured graph + persistent FlashInfer wrappers
     # so plan(N+1) on slot[(s+1)%2] runs concurrent with replay(N) on slot[s].
@@ -177,11 +182,11 @@ class CudaGraphRunner:
         default_sampling_config: SamplingConfig,
         tp_group=None,
     ):
-        from mstar.distributed.communication import TPCommGroup
+        from mstar.distributed.communication import CommGroup
 
         self.submodule_name = submodule_name
         self.submodule = submodule
-        self.tp_group: TPCommGroup = tp_group or TPCommGroup.trivial()
+        self.tp_group: CommGroup = tp_group or CommGroup.trivial()
         self.capture_configs: list[CudaGraphConfig] = submodule.get_cuda_graph_configs(
             device, self.tp_group.world_size
         )
@@ -210,6 +215,12 @@ class CudaGraphRunner:
         # the canonical pattern; the cuda_graph memory_pool + largest-first
         # capture order keep the slice views' addresses stable across replays.
         self.shared_static_buffers: dict[tuple[int, str], torch.Tensor] = {}
+        # (config_idx, tensor_key) → the dim that carries the (bucket-varying)
+        # seq length in that tensor's ORIGINAL layout. _intern_static_buffer
+        # brings this dim to the front for storage (so smaller buckets reslice
+        # along dim 0) and inverts the move on return; the replay copy reads it
+        # back to slice the right dim. 0 for the common seq-leading case.
+        self._static_buffer_seq_dims: dict[tuple[int, str], int] = {}
         # Sum of bytes that WOULD have been allocated by per-capture clones
         # (one full tensor per call) — incremented on every _intern_static_buffer
         # call. Compared against the actual shared-buffer footprint at the end
@@ -390,10 +401,23 @@ class CudaGraphRunner:
             for label in config.labels:
                 self.alloc_manager.reset_label(rid, label, free=True)
 
+    @staticmethod
+    def _seq_dim(value: torch.Tensor, seq_len: int) -> int:
+        """Index of the first dim whose size matches ``seq_len``, else 0.
+
+        Used to bring the (bucket-varying) seq dim to the front for shared-buffer
+        interning: most inputs are seq-leading (returns 0), but mrope-style ids
+        carry seq in a later dim (e.g. ``[3, seq]`` → 1)."""
+        for dim, size in enumerate(value.shape):
+            if size == seq_len:
+                return dim
+        return 0
+
     def _intern_static_buffer(
         self, config_idx: int, key: str, value: torch.Tensor,
+        seq_len: int | None = None,
     ) -> torch.Tensor:
-        """Return a leading-dim slice view into the shared buffer for (config_idx, key).
+        """Return a slice view into the shared buffer for (config_idx, key).
 
         Allocates the shared buffer at ``value``'s shape on first encounter
         — relies on ``warmup_and_capture``'s largest-first iteration
@@ -404,35 +428,40 @@ class CudaGraphRunner:
         buckets cost one max-shape allocation per tensor instead of one full
         clone per bucket.
 
-        Trailing dims (everything past dim 0) must match between the shared
-        buffer and ``value`` — the bucket varies the leading dim only. A
-        mismatch is a design-level surprise (a tensor whose shape depends on
-        bs in a non-leading way), so we hard-fail with a precise message.
+        When ``seq_len`` is given and the bucket-varying dim is not already dim 0
+        (e.g. mrope ids ``[3, seq]``), that dim is moved to the front for storage
+        and the returned view is moved back so the captured forward still sees the
+        original layout. The seq dim is recorded so the replay copy slices it too.
+        Trailing dims of the stored (seq-leading) tensor must match the shared
+        buffer — a mismatch is a design-level surprise, so we hard-fail.
         """
         buf_key = (config_idx, key)
+        seq_dim = self._seq_dim(value, seq_len) if seq_len is not None else 0
+        self._static_buffer_seq_dims[buf_key] = seq_dim
+        stored = value.movedim(seq_dim, 0) if seq_dim != 0 else value
         shared = self.shared_static_buffers.get(buf_key)
         if shared is None:
-            shared = torch.empty(value.shape, dtype=value.dtype, device=value.device)
+            shared = torch.empty(stored.shape, dtype=stored.dtype, device=stored.device)
             self.shared_static_buffers[buf_key] = shared
-        self._capture_clone_bytes_naive += value.numel() * value.element_size()
-        leading = value.shape[0]
-        if leading > shared.shape[0] or value.shape[1:] != shared.shape[1:]:
+        self._capture_clone_bytes_naive += stored.numel() * stored.element_size()
+        leading = stored.shape[0]
+        if leading > shared.shape[0] or stored.shape[1:] != shared.shape[1:]:
             raise RuntimeError(
                 f"_intern_static_buffer: capture for key={key!r} (config_idx={config_idx}) "
-                f"requires shape {tuple(value.shape)} but shared buffer is "
+                f"requires (seq-leading) shape {tuple(stored.shape)} but shared buffer is "
                 f"{tuple(shared.shape)} — captures should be ordered largest-first "
                 "by leading dim with matching trailing dims"
             )
         sliced = shared[:leading]
-        sliced.copy_(value)
-        return sliced
+        sliced.copy_(stored)
+        return sliced.movedim(0, seq_dim) if seq_dim != 0 else sliced
 
     def _create_cache_mgr_and_dummy_engine_inputs(
         self, dummy_rids, plan_states,
         config: CudaGraphConfig
     ):
-        # Create BatchedCacheManager with CUDA graph plan states
-        cache_manager = BatchedCacheManager(
+        # Create the configured cache-manager backend with CUDA graph plan states
+        cache_manager = create_cache_manager(
             request_ids=dummy_rids,
             active_labels_per_request={rid: "main" for rid in dummy_rids},
             kv_cache=self.alloc_manager.kv_cache,
@@ -477,6 +506,18 @@ class CudaGraphRunner:
         seq_lens[0] += total_tokens % bs
         return seq_lens
 
+    def _split_seq_lens_across_labels(
+        self, bs: int, total_tokens: int, labels: list[str],
+    ) -> dict[str, list[int]]:
+        """Distribute total_tokens across every (label, request) entry so the
+        combined per-label seq_lens sum to total_tokens — the layout a batched-CFG
+        capture needs (one packed sequence covering all labels)."""
+        n = len(labels) * bs
+        per = total_tokens // n
+        seq_lens = {label: [per] * bs for label in labels}
+        seq_lens[labels[0]][0] += total_tokens - per * n
+        return seq_lens
+
     def _build_slot_from_capture(
         self, output, graph, static_inputs, cache_manager,
     ) -> CudaGraphSlot:
@@ -504,6 +545,7 @@ class CudaGraphRunner:
         key: CudaGraphKey,
         config: CudaGraphConfig,
         bs: int,
+        index: int,
         slots: list[CudaGraphSlot],
         applied_penalty_in_graph: bool=False
     ) -> None:
@@ -528,6 +570,7 @@ class CudaGraphRunner:
             self.graphs[lookup_key] = CudaGraphData(
                 config=config,
                 bs=bs,
+                index=index,
                 slots=slots,
                 next_slot=0,
                 applied_penalty_in_graph=applied_penalty_in_graph
@@ -538,6 +581,7 @@ class CudaGraphRunner:
         key: CudaGraphKey,
         config: CudaGraphConfig,
         submodule: ARNodeSubmodule,
+        index: int,
         prepare_slot: Callable[[int], _SlotCaptureSpec],
     ) -> None:
         """Drive the per-slot warmup + capture loop for one (config, bs) bucket.
@@ -559,7 +603,11 @@ class CudaGraphRunner:
                 spec = prepare_slot(slot_idx)
                 dummy_rids_to_free.append(spec.dummy_rids)
 
-                forward = submodule.forward_batched
+                # Usually ``forward_batched`` (the same method the eager batched
+                # path runs). Diffusion walks override this to a velocity-only
+                # method so the non-capturable scheduler tail stays out of the
+                # graph (finished in the submodule ``postprocess``).
+                forward = getattr(submodule, config.capture_forward_method)
                 if config.compile:
                     forward = torch.compile(
                         forward,
@@ -613,7 +661,8 @@ class CudaGraphRunner:
 
             self._register_graph_data(
                 key=key, config=config, bs=key.bs, slots=captured_slots,
-                applied_penalty_in_graph=applied_penalty_in_graph
+                applied_penalty_in_graph=applied_penalty_in_graph,
+                index=index
             )
         finally:
             for rids in dummy_rids_to_free:
@@ -634,12 +683,19 @@ class CudaGraphRunner:
         template_dict = config.num_token_to_inputs[key.num_tokens]
         config_idx = self.capture_configs.index(config)
         seq_lens = self._make_dummy_seq_lens(bs, key.num_tokens)
+        # Batched CFG packs all labels into one combined sequence, so the bucket's
+        # num_tokens is the combined (cond+uncond) length — split it back across
+        # (label, request) so the dummy plan's per-label seq_lens sum to it.
+        cfg_seq_lens = (
+            self._split_seq_lens_across_labels(bs, key.num_tokens, config.labels)
+            if config.batched_cfg else None
+        )
 
         def prepare_slot(slot_idx: int) -> _SlotCaptureSpec:
             dummy_rids = self._make_dummy_rids(config, bs, slot_idx)
 
             templates = {
-                k: (self._intern_static_buffer(config_idx, k, v)
+                k: (self._intern_static_buffer(config_idx, k, v, seq_len=key.num_tokens)
                     if isinstance(v, torch.Tensor) else v)
                 for k, v in template_dict.items()
             }
@@ -653,6 +709,22 @@ class CudaGraphRunner:
             cache_manager = engine_inputs.cache_manager
 
             def plan_attention() -> None:
+                if config.batched_cfg:
+                    # One combined plan over all labels (the _cfg_batched plan
+                    # state + wrapper the batched-CFG forward looks up). Mirrors
+                    # the submodule's eager preprocess so capture and replay plan
+                    # the same wrapper.
+                    cache_manager.plan_attention_batched_cfg(
+                        labels=config.labels,
+                        seq_lens=cfg_seq_lens,
+                        is_causal=config.causal_attention,
+                        write_store=False,
+                    )
+                    cache_manager.plan_rope_batched_cfg(
+                        labels=config.labels,
+                        seq_lens=cfg_seq_lens,
+                    )
+                    return
                 for label in config.labels:
                     cache_manager.plan_attention(
                         seq_lens=seq_lens,
@@ -684,6 +756,7 @@ class CudaGraphRunner:
 
         self._capture_slots(
             key=key, config=config, submodule=submodule, prepare_slot=prepare_slot,
+            index=config_idx,
         )
 
 
@@ -767,6 +840,7 @@ class CudaGraphRunner:
 
         self._capture_slots(
             key=key, config=config, submodule=submodule, prepare_slot=prepare_slot,
+            index=config_idx
         )
 
     def can_run(
@@ -791,23 +865,32 @@ class CudaGraphRunner:
     ) -> CudaGraphKey | None:
         if not self.graphs:
             return None
-        config = self._config_for(graph_walk, requires_cfg)
-        if config is None:
-            return None
-        padded_bs = self._get_padded_batch_size(batch_size, config)
-        if padded_bs is None:
-            return None
-        padded_num_tokens = self._get_padded_num_tokens(num_tokens, padded_bs, config)
-        if padded_num_tokens is None:
-            return None
-
-        key = CudaGraphKey(
-            graph_walk=graph_walk,
-            requires_cfg=requires_cfg,
-            bs=padded_bs,
-            num_tokens=padded_num_tokens,
-        )
-        return key if key in self.graphs else None
+        # A walk may have several captures (e.g. one per image resolution, each a
+        # fixed shape with its own token count). Consider every matching config and
+        # pick the tightest captured (bs, num_tokens) bucket that fits this batch,
+        # so a request lands on the graph for its own shape rather than the first
+        # config declared. With a single config this is the same as before.
+        best: CudaGraphKey | None = None
+        for config in self.capture_configs:
+            if graph_walk not in config.replay_graph_walks or config.requires_cfg != requires_cfg:
+                continue
+            padded_bs = self._get_padded_batch_size(batch_size, config)
+            if padded_bs is None:
+                continue
+            padded_num_tokens = self._get_padded_num_tokens(num_tokens, padded_bs, config)
+            if padded_num_tokens is None:
+                continue
+            key = CudaGraphKey(
+                graph_walk=graph_walk,
+                requires_cfg=requires_cfg,
+                bs=padded_bs,
+                num_tokens=padded_num_tokens,
+            )
+            if key in self.graphs and (
+                best is None or (key.num_tokens, key.bs) < (best.num_tokens, best.bs)
+            ):
+                best = key
+        return best
 
     def _config_for(self, graph_walk: str, requires_cfg: bool) -> CudaGraphConfig | None:
         for cfg in self.capture_configs:
@@ -1391,9 +1474,13 @@ class CudaGraphRunner:
                 range_push("gpu_thread.postprocess", synchronize=False)
             if self.enable_nvtx:
                 range_push("cg.advance_seq_lens", synchronize=False)
-            for label in config_labels:
-                static_cm.set_active_label(label)
-                static_cm.advance_seq_lens()
+            # Frozen-prefix denoise walks re-read a fixed prefix and overwrite the
+            # same tail pages every step, so they opt out of the advance (it would
+            # grow the prefix across steps and corrupt attention).
+            if graph_data.config.advance_seq_lens:
+                for label in config_labels:
+                    static_cm.set_active_label(label)
+                    static_cm.advance_seq_lens()
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -1422,6 +1509,10 @@ class CudaGraphRunner:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
+            # Walks that captured only a velocity/raw forward finish their
+            # non-capturable step (e.g. a multistep scheduler) in the
+            # submodule's ``postprocess``, which the engine runs right after
+            # this returns with each request's original inputs.
             success = True
             return outputs
         finally:
@@ -1568,12 +1659,17 @@ class CudaGraphRunner:
             # --- Step 3: Copy real packed tensors into static buffers ---
             if self.enable_nvtx:
                 range_push("cg.copy_inputs", synchronize=False)
+            config_idx = self.capture_configs.index(graph_data.config)
             for k in static_input_keys:
                 real_val = real_packed.get(k)
                 if real_val is None or not isinstance(real_val, torch.Tensor):
                     continue
                 static_buf = templates[k]
-                static_buf[:real_val.shape[0]].copy_(real_val)
+                # Slice the same (possibly non-leading) seq dim _intern_static_buffer
+                # recorded for this key, so mrope-style [.., seq, ..] inputs land in
+                # the right axis of the original-layout view.
+                seq_dim = self._static_buffer_seq_dims.get((config_idx, k), 0)
+                static_buf.narrow(seq_dim, 0, real_val.shape[seq_dim]).copy_(real_val)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
                 range_pop(synchronize=False)
@@ -1608,9 +1704,19 @@ class CudaGraphRunner:
                 range_push("gpu_thread.postprocess", synchronize=False)
             if self.enable_nvtx:
                 range_push("cg.advance_seq_lens", synchronize=False)
-            for label in config_labels:
-                static_cm.set_active_label(label)
-                static_cm.advance_seq_lens()
+            # Frozen-prefix denoise walks re-read a fixed prefix and overwrite the
+            # same tail pages every step, so they opt out of the advance (it would
+            # grow the prefix across steps and corrupt attention).
+            if graph_data.config.advance_seq_lens:
+                if graph_data.config.batched_cfg:
+                    # _batched_cfg_info (set by the preprocess plan above) makes a
+                    # single advance_seq_lens walk every label's state; looping
+                    # per label would advance each one once per label.
+                    static_cm.advance_seq_lens()
+                else:
+                    for label in config_labels:
+                        static_cm.set_active_label(label)
+                        static_cm.advance_seq_lens()
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -1632,6 +1738,10 @@ class CudaGraphRunner:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
+            # Walks that captured only a velocity/raw forward finish their
+            # non-capturable step (e.g. a multistep scheduler) in the
+            # submodule's ``postprocess``, which the engine runs right after
+            # this returns with each request's original inputs.
             success = True
             return outputs
         finally:
@@ -2325,7 +2435,7 @@ class PiecewiseCudaGraphRunner:
         buffer_manager: WorkspaceBufferManager | None = None,
         tp_group=None,
     ):
-        from mstar.distributed.communication import TPCommGroup
+        from mstar.distributed.communication import CommGroup
 
         self.config = config
         self.device = device
@@ -2339,7 +2449,7 @@ class PiecewiseCudaGraphRunner:
         # NCCL collectives via parallel layers — ``warmup_and_capture`` barriers
         # before each capture to keep ranks in lockstep (same race the standard
         # ``CudaGraphRunner`` guards against).
-        self.tp_group: TPCommGroup = tp_group or TPCommGroup.trivial()
+        self.tp_group: CommGroup = tp_group or CommGroup.trivial()
 
         self.capture_batch_sizes = sorted(
             config.capture_batch_sizes or self.DEFAULT_CAPTURE_BATCH_SIZES

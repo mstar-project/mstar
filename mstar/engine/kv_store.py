@@ -78,6 +78,11 @@ class KVCacheConfig:
     num_qo_heads: int | None = None  # Optional, defaults to num_kv_heads
     cpu_offload_pages: int = 0  # >0 enables CPU offloading with this many CPU pages
     nodes: list[str] = None # defaults to all AR nodes
+    # Which cache-manager backend serves this cache's attention — a key in
+    # cache_manager.ATTENTION_BACKENDS: "flashinfer" (paged, the default) or
+    # "dense_gen" (adds the dense FA3 generation-attention fast path). The
+    # model's get_kv_cache_config sets it; model yaml config may override.
+    attention_backend: str = "flashinfer"
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -92,12 +97,12 @@ class KVCacheConfig:
             return "ALL_NODES"
         return "///".join(self.nodes)
 
-    def shard(self, tp_size: int):
-        if tp_size >= self.original_num_kv_heads:
+    def shard(self, num_shards: int):
+        if num_shards >= self.original_num_kv_heads:
             self.num_kv_heads = 1
         else:
-            self.num_kv_heads = divide(self.original_num_kv_heads, tp_size)
-        self.num_qo_heads = divide(self.original_num_qo_heads, tp_size)
+            self.num_kv_heads = divide(self.original_num_kv_heads, num_shards)
+        self.num_qo_heads = divide(self.original_num_qo_heads, num_shards)
         self._sharded = True
 
 
@@ -119,6 +124,16 @@ class KVRequestState:
 
     # sequence length of the in-distributed-store KV cache
     is_paused: bool = False
+
+    # Lazily-filled {layer_idx: (k_pref, v_pref)} contiguous copies of the frozen
+    # text-prefix K/V, used by the dense generation-attention path. The prefix is
+    # written once at prefill and immutable through denoise (text tokens get no
+    # timestep embedding; the dense path never writes generation K/V to pages), so
+    # it is gathered once and reused across steps rather than re-gathered from the
+    # paged cache every step. Reset to None by _new_state()
+    # (add_request/reset_label/remove_request) — exactly when the prefix pages are
+    # (re)allocated — so it needs no manual invalidation.
+    dense_prefix_kv: dict | None = None
 
     def get_pos_info(self):
         return PositionInfo(

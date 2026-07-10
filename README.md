@@ -45,6 +45,7 @@ LLM serving stacks assume inference is a single autoregressive loop. Composite m
 - Paged attention (FlashInfer) and continuous batching for autoregressive backbones
 - CUDA-graph capture for encoders and decode
 - Classifier-free-guidance parallelism for diffusion / flow
+- Tensor parallelism and Ulysses sequence parallelism, composable as a TP × SP mesh per component
 - Sliding-window chunk streaming for audio codecs
 - Component-level disaggregation with pluggable tensor transport (shared memory, TCP, RDMA)
 
