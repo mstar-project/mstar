@@ -33,4 +33,5 @@ mstar.api\_server.openai
    serving_chat
    serving_images
    serving_speech
+   serving_videos
 

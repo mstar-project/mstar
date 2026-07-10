@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Jul 09, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 10, 2026"/>
   </head>
   
   
@@ -165,6 +165,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
@@ -185,6 +186,14 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -440,6 +449,13 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.BagelAdapter.supports_images"><code class="docutils literal notranslate"><span class="pre">BagelAdapter.supports_images</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.image_to_request"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.image_to_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.supports_images"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.supports_images</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.supports_videos"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.supports_videos</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.video_to_request"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.video_to_request()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.chat_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.chat_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.image_edit_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.image_edit_to_request()</span></code></a></li>
@@ -448,6 +464,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_chat"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_chat</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_images"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_images</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_speech"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_speech</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_videos"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_videos</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.video_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.video_to_request()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OrpheusAdapter"><code class="docutils literal notranslate"><span class="pre">OrpheusAdapter</span></code></a><ul class="visible nav section-nav flex-column">
@@ -522,16 +540,19 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.BagelAdapter" title="mstar.api_server.openai.adapters.BagelAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BagelAdapter</span></code></a>()</p></td>
 <td><p>BAGEL: text chat (text out) + text-to-image / image editing.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Cosmos3Adapter" title="mstar.api_server.openai.adapters.Cosmos3Adapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3Adapter</span></code></a>()</p></td>
+<td><p>NVIDIA Cosmos3: text-to-image and text/image-to-video generation.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a>()</p></td>
 <td><p>Base adapter.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OrpheusAdapter" title="mstar.api_server.openai.adapters.OrpheusAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OrpheusAdapter</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OrpheusAdapter" title="mstar.api_server.openai.adapters.OrpheusAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OrpheusAdapter</span></code></a>()</p></td>
 <td><p>Orpheus: text-to-speech (audio out only).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter" title="mstar.api_server.openai.adapters.Qwen3OmniAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Qwen3OmniAdapter</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter" title="mstar.api_server.openai.adapters.Qwen3OmniAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Qwen3OmniAdapter</span></code></a>()</p></td>
 <td><p>Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SubmitArgs</span></code></a>(text, file_paths, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SubmitArgs</span></code></a>(text, file_paths, ...)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -603,6 +624,58 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 <dt class="sig sig-object py" id="mstar.api_server.openai.adapters.BagelAdapter.supports_images">
 <span class="sig-name descname"><span class="pre">supports_images</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.BagelAdapter.supports_images" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Cosmos3Adapter">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.adapters.</span></span><span class="sig-name descname"><span class="pre">Cosmos3Adapter</span></span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#Cosmos3Adapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.Cosmos3Adapter" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-class docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a></p>
+<p>NVIDIA Cosmos3: text-to-image and text/image-to-video generation.</p>
+<p><code class="docutils literal notranslate"><span class="pre">size</span></code> (“WxH”) maps to the generation resolution; <code class="docutils literal notranslate"><span class="pre">seed</span></code> and any
+extra knobs (<code class="docutils literal notranslate"><span class="pre">guidance_scale</span></code>, <code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">negative_prompt</span></code>,
+and for video <code class="docutils literal notranslate"><span class="pre">num_frames</span></code> / <code class="docutils literal notranslate"><span class="pre">fps</span></code>) pass through via <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Cosmos3Adapter.image_to_request">
+<span class="sig-name descname"><span class="pre">image_to_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#Cosmos3Adapter.image_to_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.image_to_request" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>req</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest" title="mstar.api_server.openai.protocol.ImageGenerationRequest"><em>ImageGenerationRequest</em></a>)</p></li>
+<li><p><strong>upload_dir</strong> (<em>Path</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs">SubmitArgs</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Cosmos3Adapter.supports_images">
+<span class="sig-name descname"><span class="pre">supports_images</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.supports_images" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Cosmos3Adapter.supports_videos">
+<span class="sig-name descname"><span class="pre">supports_videos</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.supports_videos" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Cosmos3Adapter.video_to_request">
+<span class="sig-name descname"><span class="pre">video_to_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#Cosmos3Adapter.video_to_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.video_to_request" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>req</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.VideoGenerationRequest" title="mstar.api_server.openai.protocol.VideoGenerationRequest"><em>VideoGenerationRequest</em></a>)</p></li>
+<li><p><strong>upload_dir</strong> (<em>Path</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs">SubmitArgs</a></p>
+</dd>
+</dl>
+</dd></dl>
 
 </dd></dl>
 
@@ -693,6 +766,27 @@ docstring) and are reached only via <code class="docutils literal notranslate"><
 <dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OpenAIAdapter.supports_speech">
 <span class="sig-name descname"><span class="pre">supports_speech</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_speech" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OpenAIAdapter.supports_videos">
+<span class="sig-name descname"><span class="pre">supports_videos</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_videos" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OpenAIAdapter.video_to_request">
+<span class="sig-name descname"><span class="pre">video_to_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#OpenAIAdapter.video_to_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.OpenAIAdapter.video_to_request" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>req</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.VideoGenerationRequest" title="mstar.api_server.openai.protocol.VideoGenerationRequest"><em>VideoGenerationRequest</em></a>)</p></li>
+<li><p><strong>upload_dir</strong> (<em>Path</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs">SubmitArgs</a></p>
+</dd>
+</dl>
+</dd></dl>
 
 </dd></dl>
 
@@ -912,6 +1006,13 @@ the models here apply their own prompt formatting in <code class="docutils liter
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.BagelAdapter.supports_images"><code class="docutils literal notranslate"><span class="pre">BagelAdapter.supports_images</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.image_to_request"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.image_to_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.supports_images"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.supports_images</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.supports_videos"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.supports_videos</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.video_to_request"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.video_to_request()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.chat_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.chat_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.image_edit_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.image_edit_to_request()</span></code></a></li>
@@ -920,6 +1021,8 @@ the models here apply their own prompt formatting in <code class="docutils liter
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_chat"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_chat</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_images"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_images</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_speech"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_speech</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_videos"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_videos</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.video_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.video_to_request()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OrpheusAdapter"><code class="docutils literal notranslate"><span class="pre">OrpheusAdapter</span></code></a><ul class="visible nav section-nav flex-column">
@@ -977,7 +1080,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 09, 2026.
+  Last updated on Jul 10, 2026.
   <br/>
 </p>
   </div>

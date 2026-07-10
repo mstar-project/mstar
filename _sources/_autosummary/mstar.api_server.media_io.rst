@@ -14,6 +14,7 @@ mstar.api\_server.media\_io
    .. autosummary::
    
       modality_from_mime
+      mux_mp4_with_pcm16
       pcm16_to_container
       pcm16_to_wav_bytes
       png_to_data_url

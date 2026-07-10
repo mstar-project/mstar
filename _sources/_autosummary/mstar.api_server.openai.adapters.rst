@@ -25,6 +25,7 @@ mstar.api\_server.openai.adapters
    .. autosummary::
    
       BagelAdapter
+      Cosmos3Adapter
       OpenAIAdapter
       OrpheusAdapter
       Qwen3OmniAdapter

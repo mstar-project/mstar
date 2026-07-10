@@ -1,0 +1,1545 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mstar.model.cosmos3.components.packing &#8212; M* v0.1.0 Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/styles/sphinx-book-theme.css?v=3c74b3bc" />
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../../../../_static/documentation_options.js?v=a1637f0b"></script>
+    <script src="../../../../../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../../../../../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../../../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../../../../../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
+
+
+
+
+
+const initStyles = () => {
+    const defaultStyle = document.createElement('style');
+    defaultStyle.textContent = `pre.mermaid {
+    /* Same as .mermaid-container > pre */
+    display: block;
+    width: 100%;
+}
+
+pre.mermaid > svg {
+    /* Same as .mermaid-container > pre > svg */
+    height: 500px;
+    width: 100%;
+    max-width: 100% !important;
+}`;
+    document.head.appendChild(defaultStyle);
+
+    const fullscreenStyle = document.createElement('style');
+    fullscreenStyle.textContent = `.mermaid-container {
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+}
+
+.mermaid-container > pre {
+    display: block;
+    width: 100%;
+}
+
+.mermaid-container > pre > svg {
+    height: 500px;
+    width: 100%;
+    max-width: 100% !important;
+}
+
+.mermaid-fullscreen-btn {
+    width: 28px;
+    height: 28px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    font-size: 14px;
+    line-height: 1;
+    padding: 0;
+    color: #333;
+}
+
+.mermaid-fullscreen-btn:hover {
+    opacity: 100% !important;
+    background: rgba(255, 255, 255, 1);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+    transform: scale(1.1);
+}
+
+.mermaid-fullscreen-btn.dark-theme {
+    background: rgba(50, 50, 50, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    color: #e0e0e0;
+}
+
+.mermaid-fullscreen-btn.dark-theme:hover {
+    background: rgba(60, 60, 60, 1);
+    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-fullscreen-modal {
+    display: none;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 95vw;
+    height: 100vh;
+    background: rgba(255, 255, 255, 0.98);
+    z-index: 9999;
+    padding: 20px;
+    overflow: auto;
+}
+
+.mermaid-fullscreen-modal.dark-theme {
+    background: rgba(0, 0, 0, 0.98);
+}
+
+.mermaid-fullscreen-modal.active {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen {
+    position: relative;
+    width: 95vw;
+    height: 90vh;
+    max-width: 95vw;
+    max-height: 90vh;
+    background: white;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+    overflow: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen.dark-theme {
+    background: #1a1a1a;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+}
+
+.mermaid-container-fullscreen pre.mermaid {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen .mermaid svg {
+    height: 100% !important;
+    width: 100% !important;
+    cursor: grab;
+}
+
+.mermaid-fullscreen-close {
+    position: fixed !important;
+    top: 20px !important;
+    right: 20px !important;
+    width: 40px;
+    height: 40px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.2);
+    border-radius: 50%;
+    cursor: pointer;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    transition: all 0.2s;
+    font-size: 24px;
+    line-height: 1;
+    color: #333;
+}
+
+.mermaid-fullscreen-close:hover {
+    background: white;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+    transform: scale(1.1);
+}
+
+.mermaid-fullscreen-close.dark-theme {
+    background: rgba(50, 50, 50, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #e0e0e0;
+}
+
+.mermaid-fullscreen-close.dark-theme:hover {
+    background: rgba(60, 60, 60, 1);
+    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-fullscreen-modal .mermaid-fullscreen-btn {
+    display: none !important;
+}`;
+    document.head.appendChild(fullscreenStyle);
+}
+
+// Detect if page has dark background
+const isDarkTheme = () => {
+    // We use a set of heuristics:
+    // 1. Check for common dark mode classes or attributes
+    // 2. Check computed background color brightness
+    if (document.documentElement.classList.contains('dark') ||
+        document.documentElement.getAttribute('data-theme') === 'dark' ||
+        document.body.classList.contains('dark') ||
+        document.body.getAttribute('data-theme') === 'dark') {
+        // console.log("Dark theme detected via class/attribute");
+        return true;
+    }
+    if (document.documentElement.classList.contains('light') ||
+        document.documentElement.getAttribute('data-theme') === 'light' ||
+        document.body.classList.contains('light') ||
+        document.body.getAttribute('data-theme') === 'light') {
+        // console.log("Light theme detected via class/attribute");
+        return false;
+    }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        // console.log("Dark theme detected via prefers-color-scheme");
+        return true;
+    }
+    const bgColor = window.getComputedStyle(document.body).backgroundColor;
+    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (match) {
+        const r = parseInt(match[1]);
+        const g = parseInt(match[2]);
+        const b = parseInt(match[3]);
+        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+        // console.log("Background color brightness:", brightness);
+        return brightness < 128;
+    }
+    // console.log("No dark or light theme detected, defaulting to light theme");
+    return false;
+};
+
+let darkTheme = isDarkTheme();
+let modal = null;
+let modalContent = null;
+let previousScrollOffset = [window.scrollX, window.scrollY];
+let _lazyObserver = null;
+let _renderQueue = Promise.resolve();
+
+// Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
+// so this is safe to call both for the initial batch and for diagrams that
+// render lazily once they become visible.
+const addZoomToSvgs = (svgs) => {
+    svgs.each(function() {
+        if (this.getAttribute('data-zoom-applied') === 'true') return;
+        var svg = d3.select(this);
+        svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+        var inner = svg.select("g");
+        var zoom = d3.zoom().on("zoom", function(event) {
+            inner.attr("transform", event.transform);
+        });
+        svg.call(zoom);
+        this.setAttribute('data-zoom-applied', 'true');
+    });
+};
+
+const runMermaid = async (rerun) => {
+    console.log("Running mermaid diagrams, rerun =", rerun);
+    // clear all existing mermaid charts
+    let all_mermaids = document.querySelectorAll(".mermaid");
+
+    if (rerun) {
+        // Disconnect any previous lazy rendering observer
+        if (_lazyObserver) {
+            _lazyObserver.disconnect();
+            _lazyObserver = null;
+        }
+
+        all_mermaids.forEach((el) => {
+            el.removeAttribute('data-mermaid-deferred');
+            el.removeAttribute('data-mermaid-render-failed');
+            if(!el.hasAttribute("data-original-code")) {
+                // store original code
+                // console.log(`Storing original code for first run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+            if(el.getAttribute("data-processed") === "true") {
+                // remove and restore original
+                el.removeAttribute("data-processed");
+                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
+                el.innerHTML = el.getAttribute('data-original-code');
+            } else {
+                // store original code
+                // console.log(`Storing original code for re-run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+        });
+
+        // Separate visible and hidden elements. Mermaid's layout engine measures
+        // text dimensions via the DOM, which fails for elements hidden by a parent
+        // (e.g., Reveal.js non-active slides, sphinx-design unopened tabs),
+        // producing broken SVGs. Render visible elements now, defer hidden ones.
+        const visible = [];
+        const hidden = [];
+        all_mermaids.forEach((el) => {
+            // offsetParent is null for display:none ancestors.
+            // getClientRects().length > 0 catches position:fixed elements
+            // (which also have null offsetParent but are still visible).
+            if (el.offsetParent !== null || el.getClientRects().length > 0) {
+                visible.push(el);
+            } else {
+                hidden.push(el);
+                el.setAttribute('data-mermaid-deferred', 'true');
+            }
+        });
+
+        if (visible.length > 0) {
+            try {
+                await mermaid.run({ nodes: visible });
+            } catch (e) {
+                console.error("Mermaid rendering failed:", e);
+            }
+        }
+
+        // Lazily render hidden elements when they become visible.
+        // Uses a promise chain (_renderQueue) to serialize rendering,
+        // since IntersectionObserver may report multiple entries at once
+        // and mermaid.run() is not safe to call concurrently.
+        if (hidden.length > 0) {
+            if (typeof IntersectionObserver === 'undefined') {
+                console.warn("IntersectionObserver not available; hidden mermaid diagrams will not render.");
+            } else {
+                _renderQueue = Promise.resolve();
+                _lazyObserver = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        if (entry.isIntersecting && entry.target.getAttribute("data-processed") !== "true") {
+                            _lazyObserver.unobserve(entry.target);
+                            const el = entry.target;
+                            _renderQueue = _renderQueue.then(async () => {
+                                try {
+                                    await mermaid.run({ nodes: [el] });
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    // Apply zoom to the now-rendered diagram, matching
+                                    // the decoration visible diagrams receive.
+                                    if ("False" === "True") {
+                                        addZoomToSvgs(d3.selectAll(""));
+                                    }
+                                } catch (e) {
+                                    console.error("Mermaid deferred rendering failed:", e);
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    el.setAttribute('data-mermaid-render-failed', 'true');
+                                }
+                            });
+                        }
+                    }
+                });
+                hidden.forEach((el) => _lazyObserver.observe(el));
+            }
+        }
+    }
+
+    all_mermaids = document.querySelectorAll(".mermaid");
+    // Exclude deferred (hidden) and render-failed elements from completion checks
+    const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
+    const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
+
+    if ("False" === "True") {
+        const mermaids_to_add_zoom = -1 === -1 ? mermaids_active.length : -1;
+        if(mermaids_to_add_zoom > 0) {
+            var svgs = d3.selectAll("");
+            // Wait until every active (visible) diagram has rendered. Deferred
+            // diagrams are excluded, so a fixed d3_node_count that counts a
+            // hidden diagram no longer loops forever waiting for its SVG.
+            if(mermaids_active.length !== mermaids_processed.length) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            }
+            addZoomToSvgs(svgs);
+        }
+    } else if(mermaids_active.length !== mermaids_processed.length) {
+        // Wait for mermaid to process all diagrams
+        setTimeout(() => runMermaid(false), 200);
+        return;
+    }
+
+    // Stop here if not adding fullscreen capability
+    if ("True" !== "True") return;
+
+    if (modal !== null ) {
+        // Destroy existing modal
+        modal.remove();
+        modal = null;
+        modalContent = null;
+    }
+
+    modal = document.createElement('div');
+    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
+    modal.innerHTML = `
+        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
+        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modalContent = modal.querySelector('.mermaid-container-fullscreen');
+    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
+
+    const closeModal = () => {
+        modal.classList.remove('active');
+        modalContent.innerHTML = '';
+        document.body.style.overflow = ''
+        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
+    };
+
+    closeBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && modal.classList.contains('active')) {
+            closeModal();
+        }
+    });
+
+    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
+        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
+            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
+            // Already processed, adjust button class if needed
+            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
+            if (existingBtn) {
+                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+            }
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'mermaid-container';
+        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
+        container.appendChild(mermaidDiv);
+
+        const fullscreenBtn = document.createElement('button');
+        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
+        fullscreenBtn.textContent = '⛶';
+        fullscreenBtn.style.opacity = '50%';
+
+        // Calculate dynamic position based on diagram's margin and padding
+        const diagramStyle = window.getComputedStyle(mermaidDiv);
+        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
+        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
+        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
+        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
+        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
+        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
+
+        fullscreenBtn.addEventListener('click', () => {
+            previousScrollOffset = [window.scroll, window.scrollY];
+            const clone = mermaidDiv.cloneNode(true);
+            modalContent.innerHTML = '';
+            modalContent.appendChild(clone);
+
+            const svg = clone.querySelector('svg');
+            if (svg) {
+                svg.removeAttribute('width');
+                svg.removeAttribute('height');
+                svg.style.width = '100%';
+                svg.style.height = 'auto';
+                svg.style.maxWidth = '100%';
+                svg.style.sdisplay = 'block';
+
+                if ("False" === "True") {
+                    setTimeout(() => {
+                        const g = svg.querySelector('g');
+                        if (g) {
+                            var svgD3 = d3.select(svg);
+                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
+                            var inner = svgD3.select("g");
+                            var zoom = d3.zoom().on("zoom", function(event) {
+                                inner.attr("transform", event.transform);
+                            });
+                            svgD3.call(zoom);
+                        }
+                    }, 100);
+                }
+            }
+
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        });
+        container.appendChild(fullscreenBtn);
+    });
+};
+
+const load = async () => {
+    initStyles();
+
+    await runMermaid(true);
+
+    const reRunIfThemeChanges = async () => {
+        const newDarkTheme = isDarkTheme();
+        if (newDarkTheme !== darkTheme) {
+            darkTheme = newDarkTheme;
+            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
+            await mermaid.initialize(
+                {...JSON.parse(
+                    `{"startOnLoad": false}`
+                ),
+                ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+                }
+            );
+            await runMermaid(true);
+        }
+    };
+
+    // Update theme classes when theme changes
+    const themeObserver = new MutationObserver(reRunIfThemeChanges);
+    themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+    themeObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+};
+
+
+
+
+
+console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
+mermaid.initialize(
+    {...JSON.parse(
+        `{"startOnLoad": false}`
+    ),
+    ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+    }
+);
+
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/model/cosmos3/components/packing';</script>
+    <link rel="index" title="Index" href="../../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../../search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.1.0" />
+    <meta name="docbuild:last-update" content="Jul 10, 2026"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../../../index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">M* v0.1.0 Documentation</p>
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../quickstart.html">Quickstart</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../serving.html">Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../clients.html">Using a Server</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../architecture.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../models.html">Supported Models</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.html">mstar.conductor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.html">mstar.engine</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.base.html">mstar.graph.base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.loop_indices.html">mstar.graph.loop_indices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.special_destinations.html">mstar.graph.special_destinations</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.streaming.topology.html">mstar.streaming.topology</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.html">mstar.worker</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../adding_models.html">Adding a New Model</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/model/cosmos3/components/packing.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1></h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <h1>Source code for mstar.model.cosmos3.components.packing</h1><div class="highlight"><pre>
+<span></span><span class="sd">&quot;&quot;&quot;Joint-sequence packing for Cosmos3 generation (ported from the diffusers</span>
+<span class="sd">``Cosmos3OmniPipeline``).</span>
+
+<span class="sd">Pure, stateless primitives that turn a prompt + latent shape into the</span>
+<span class="sd">transformer&#39;s per-step inputs: the 3D interleaved mRoPE position ids, the</span>
+<span class="sd">text/vision segment layouts, and the chat-template tokenization. Shared by the</span>
+<span class="sd">t2i pipeline and the engine submodule&#39;s input preprocessing. Reproduces the</span>
+<span class="sd">diffusers pipeline&#39;s packed t2i inputs byte-for-byte.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># 3D interleaved mRoPE position ids (exact ports of the pipeline helpers).</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="get_3d_mrope_ids_text_tokens">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.get_3d_mrope_ids_text_tokens">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">get_3d_mrope_ids_text_tokens</span><span class="p">(</span>
+    <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">temporal_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">,</span> <span class="n">use_float_positions</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Text tokens: all three axes share the same increasing ids from ``temporal_offset``.&quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">use_float_positions</span><span class="p">:</span>
+        <span class="n">ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">+</span> <span class="n">temporal_offset</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span> <span class="o">+</span> <span class="nb">int</span><span class="p">(</span><span class="n">temporal_offset</span><span class="p">)</span>
+    <span class="n">mrope_ids</span> <span class="o">=</span> <span class="n">ids</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>  <span class="c1"># [3, num_tokens]</span>
+    <span class="k">return</span> <span class="n">mrope_ids</span><span class="p">,</span> <span class="n">temporal_offset</span> <span class="o">+</span> <span class="n">num_tokens</span></div>
+
+
+
+<div class="viewcode-block" id="get_3d_mrope_ids_vae_tokens">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.get_3d_mrope_ids_vae_tokens">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">get_3d_mrope_ids_vae_tokens</span><span class="p">(</span>
+    <span class="n">grid_t</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">grid_h</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">grid_w</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">temporal_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">reset_spatial_indices</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="n">fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">base_fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">24.0</span><span class="p">,</span>
+    <span class="n">temporal_compression_factor</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span><span class="p">,</span>
+    <span class="n">base_temporal_compression_factor</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">start_frame_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Vision/sound (VAE) tokens: (t, h, w) grid ids, with optional fps modulation</span>
+<span class="sd">    of the temporal axis (only when ``fps`` is set and ``grid_t &gt; 1``).&quot;&quot;&quot;</span>
+    <span class="n">fps_modulation_enabled</span> <span class="o">=</span> <span class="n">fps</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">grid_t</span> <span class="o">&gt;</span> <span class="mi">1</span>
+    <span class="n">effective_base_tcf</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="n">base_temporal_compression_factor</span>
+        <span class="k">if</span> <span class="n">base_temporal_compression_factor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="k">else</span> <span class="n">temporal_compression_factor</span>
+    <span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">fps_modulation_enabled</span><span class="p">:</span>
+        <span class="n">tps</span> <span class="o">=</span> <span class="n">fps</span> <span class="o">/</span> <span class="n">temporal_compression_factor</span>
+        <span class="n">base_tps</span> <span class="o">=</span> <span class="n">base_fps</span> <span class="o">/</span> <span class="n">effective_base_tcf</span>
+        <span class="n">frame_indices</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">grid_t</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">scaled_t</span> <span class="o">=</span> <span class="p">(</span><span class="n">frame_indices</span> <span class="o">+</span> <span class="n">start_frame_offset</span><span class="p">)</span> <span class="o">/</span> <span class="n">tps</span> <span class="o">*</span> <span class="n">base_tps</span> <span class="o">+</span> <span class="n">temporal_offset</span>
+        <span class="n">t_index</span> <span class="o">=</span> <span class="n">scaled_t</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">grid_h</span> <span class="o">*</span> <span class="n">grid_w</span><span class="p">)</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">t_index</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">grid_t</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">grid_h</span> <span class="o">*</span> <span class="n">grid_w</span><span class="p">)</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
+            <span class="o">+</span> <span class="nb">int</span><span class="p">(</span><span class="n">temporal_offset</span><span class="p">)</span>
+            <span class="o">+</span> <span class="n">start_frame_offset</span>
+        <span class="p">)</span>
+
+    <span class="n">h_index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">grid_h</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">grid_t</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">grid_w</span><span class="p">)</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
+    <span class="n">w_index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">grid_w</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">grid_t</span><span class="p">,</span> <span class="n">grid_h</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
+
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">reset_spatial_indices</span><span class="p">:</span>
+        <span class="n">spatial_offset</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">temporal_offset</span><span class="p">)</span>
+        <span class="n">h_index</span> <span class="o">=</span> <span class="n">h_index</span> <span class="o">+</span> <span class="n">spatial_offset</span>
+        <span class="n">w_index</span> <span class="o">=</span> <span class="n">w_index</span> <span class="o">+</span> <span class="n">spatial_offset</span>
+
+    <span class="k">if</span> <span class="n">fps_modulation_enabled</span><span class="p">:</span>
+        <span class="n">mrope_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">t_index</span><span class="p">,</span> <span class="n">h_index</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span> <span class="n">w_index</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">mrope_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">t_index</span><span class="p">,</span> <span class="n">h_index</span><span class="p">,</span> <span class="n">w_index</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+    <span class="n">next_temporal_offset</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">mrope_ids</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">())</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="k">return</span> <span class="n">mrope_ids</span><span class="p">,</span> <span class="n">next_temporal_offset</span></div>
+
+
+
+<div class="viewcode-block" id="get_3d_mrope_ids_action_tokens">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.get_3d_mrope_ids_action_tokens">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">get_3d_mrope_ids_action_tokens</span><span class="p">(</span>
+    <span class="n">grid_t</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">temporal_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">action_fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">base_fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">24.0</span><span class="p">,</span>
+    <span class="n">base_temporal_compression_factor</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span><span class="p">,</span>
+    <span class="n">start_frame_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Action tokens: a frame-rate ``(T, 1, 1)`` temporal grid sharing the media</span>
+<span class="sd">    offset with the vision band. The action stream is uncompressed in time</span>
+<span class="sd">    (``temporal_compression_factor=1``) but its rate is expressed in the same</span>
+<span class="sd">    base-fps units as the vision latents (``base_temporal_compression_factor``),</span>
+<span class="sd">    so an action chunk lines up temporally with the conditioning video.&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">get_3d_mrope_ids_vae_tokens</span><span class="p">(</span>
+        <span class="n">grid_t</span><span class="o">=</span><span class="n">grid_t</span><span class="p">,</span>
+        <span class="n">grid_h</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">grid_w</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">temporal_offset</span><span class="o">=</span><span class="n">temporal_offset</span><span class="p">,</span>
+        <span class="n">reset_spatial_indices</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">fps</span><span class="o">=</span><span class="n">action_fps</span><span class="p">,</span>
+        <span class="n">base_fps</span><span class="o">=</span><span class="n">base_fps</span><span class="p">,</span>
+        <span class="n">temporal_compression_factor</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">base_temporal_compression_factor</span><span class="o">=</span><span class="n">base_temporal_compression_factor</span><span class="p">,</span>
+        <span class="n">start_frame_offset</span><span class="o">=</span><span class="n">start_frame_offset</span><span class="p">,</span>
+    <span class="p">)</span></div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Action conditioning layout (ported from vllm-omni ``action.py``). Each mode</span>
+<span class="c1"># fixes which latent video frames and which action tokens are clean context vs</span>
+<span class="c1"># noisy/predicted:</span>
+<span class="c1">#   * forward_dynamics  -- action is the condition (all clean); video frame 0 is</span>
+<span class="c1">#                          clean, the rest are predicted.</span>
+<span class="c1">#   * inverse_dynamics  -- video is the condition (all latent frames clean);</span>
+<span class="c1">#                          every action token is predicted.</span>
+<span class="c1">#   * policy            -- video frame 0 is clean (the rest predicted) and every</span>
+<span class="c1">#                          action token is predicted.</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+<span class="n">ACTION_MODE_FORWARD_DYNAMICS</span> <span class="o">=</span> <span class="s2">&quot;forward_dynamics&quot;</span>
+<span class="n">ACTION_MODE_INVERSE_DYNAMICS</span> <span class="o">=</span> <span class="s2">&quot;inverse_dynamics&quot;</span>
+<span class="n">ACTION_MODE_POLICY</span> <span class="o">=</span> <span class="s2">&quot;policy&quot;</span>
+<span class="n">ACTION_MODES</span> <span class="o">=</span> <span class="p">(</span><span class="n">ACTION_MODE_FORWARD_DYNAMICS</span><span class="p">,</span> <span class="n">ACTION_MODE_INVERSE_DYNAMICS</span><span class="p">,</span> <span class="n">ACTION_MODE_POLICY</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="action_condition_frame_indexes">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.action_condition_frame_indexes">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">action_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">action_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Clean (conditioning) action tokens for ``mode``.&quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="n">ACTION_MODE_FORWARD_DYNAMICS</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">action_length</span><span class="p">))</span>
+    <span class="k">if</span> <span class="n">mode</span> <span class="ow">in</span> <span class="p">(</span><span class="n">ACTION_MODE_INVERSE_DYNAMICS</span><span class="p">,</span> <span class="n">ACTION_MODE_POLICY</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">[]</span>
+    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown Cosmos3 action mode: </span><span class="si">{</span><span class="n">mode</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="vision_condition_frame_indexes">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.vision_condition_frame_indexes">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">vision_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">latent_frames</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Clean (conditioning) latent video frames for ``mode``.&quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">mode</span> <span class="ow">in</span> <span class="p">(</span><span class="n">ACTION_MODE_FORWARD_DYNAMICS</span><span class="p">,</span> <span class="n">ACTION_MODE_POLICY</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="n">ACTION_MODE_INVERSE_DYNAMICS</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">latent_frames</span><span class="p">))</span>
+    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown Cosmos3 action mode: </span><span class="si">{</span><span class="n">mode</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="normalize_condition_frame_indexes">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.normalize_condition_frame_indexes">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">normalize_condition_frame_indexes</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">default</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Normalize a request&#39;s video-conditioning latent-frame indexes.</span>
+
+<span class="sd">    Accepts an int, a comma-separated string, or an iterable of ints; returns a</span>
+<span class="sd">    sorted, de-duplicated tuple. ``None`` falls back to ``default``.&quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">default</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="n">value</span> <span class="o">=</span> <span class="p">[</span><span class="n">item</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">value</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;,&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="n">item</span><span class="o">.</span><span class="n">strip</span><span class="p">()]</span>
+    <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="n">value</span> <span class="o">=</span> <span class="p">[</span><span class="n">value</span><span class="p">]</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">indexes</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="nb">sorted</span><span class="p">({</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">value</span><span class="p">}))</span>
+    <span class="k">except</span> <span class="p">(</span><span class="ne">TypeError</span><span class="p">,</span> <span class="ne">ValueError</span><span class="p">)</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="s2">&quot;condition_frame_indexes_vision must be an int, comma-separated &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;string, or list of ints; got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">&quot;</span>
+        <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">indexes</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;condition_frame_indexes_vision must contain at least one index&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">indexes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;condition_frame_indexes_vision must be non-negative, got </span><span class="si">{</span><span class="n">indexes</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">indexes</span></div>
+
+
+
+<div class="viewcode-block" id="action_start_frame_offset">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.action_start_frame_offset">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">action_start_frame_offset</span><span class="p">(</span><span class="n">action_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">video_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;mRoPE start-frame offset for the action band: action chunks of length</span>
+<span class="sd">    ``num_frames - 1`` start one frame in (aligned to predicted frames 1..N);</span>
+<span class="sd">    a full ``num_frames`` chunk starts at 0.&quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">action_length</span> <span class="o">==</span> <span class="n">video_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mi">1</span>
+    <span class="k">if</span> <span class="n">action_length</span> <span class="o">==</span> <span class="n">video_length</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mi">0</span>
+    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+        <span class="s2">&quot;Cosmos3 action_chunk_size must equal num_frames - 1 or num_frames; &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;got action_chunk_size=</span><span class="si">{</span><span class="n">action_length</span><span class="si">}</span><span class="s2">, num_frames=</span><span class="si">{</span><span class="n">video_length</span><span class="si">}</span><span class="s2">.&quot;</span>
+    <span class="p">)</span></div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Prompt tokenization — ported from pipeline.tokenize_prompt. Image mode</span>
+<span class="c1"># (num_frames == 1) and video mode differ only in the system prompt and the</span>
+<span class="c1"># metadata sentences appended to the prompt (resolution always; duration for</span>
+<span class="c1"># video). Both append the eos + start-of-generation special tokens.</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+<span class="n">SYSTEM_PROMPT_IMAGE</span> <span class="o">=</span> <span class="s2">&quot;You are a helpful assistant who will generate images from a give prompt.&quot;</span>
+<span class="n">SYSTEM_PROMPT_VIDEO</span> <span class="o">=</span> <span class="s2">&quot;You are a helpful assistant who will generate videos from a give prompt.&quot;</span>
+<span class="n">IMAGE_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;This image is of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution.&quot;</span>
+<span class="n">INVERSE_IMAGE_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;This image is not of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution.&quot;</span>
+<span class="n">VIDEO_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;This video is of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution.&quot;</span>
+<span class="n">INVERSE_VIDEO_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;This video is not of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution.&quot;</span>
+<span class="n">DURATION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;The video is </span><span class="si">{duration:.1f}</span><span class="s2"> seconds long and is of </span><span class="si">{fps:.0f}</span><span class="s2"> FPS.&quot;</span>
+<span class="n">INVERSE_DURATION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;The video is not </span><span class="si">{duration:.1f}</span><span class="s2"> seconds long and is not of </span><span class="si">{fps:.0f}</span><span class="s2"> FPS.&quot;</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_append</span><span class="p">(</span><span class="n">base</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">addition</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="n">base</span> <span class="o">=</span> <span class="n">base</span><span class="o">.</span><span class="n">rstrip</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">base</span><span class="si">}</span><span class="s2">. </span><span class="si">{</span><span class="n">addition</span><span class="si">}</span><span class="s2">&quot;</span> <span class="k">if</span> <span class="n">base</span> <span class="k">else</span> <span class="n">addition</span>
+
+
+<div class="viewcode-block" id="tokenize_prompt">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.tokenize_prompt">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">tokenize_prompt</span><span class="p">(</span>
+    <span class="n">tokenizer</span><span class="p">,</span>
+    <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">negative_prompt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">num_frames</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">height</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">24.0</span><span class="p">,</span>
+    <span class="n">use_system_prompt</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="n">add_resolution_template</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="n">add_duration_template</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="n">max_sequence_length</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Return ``(cond_input_ids, uncond_input_ids)`` for image/video generation.</span>
+
+<span class="sd">    Mirrors the diffusers pipeline: apply the Qwen2 chat template with the</span>
+<span class="sd">    mode-specific system prompt and metadata sentences (duration for video, then</span>
+<span class="sd">    resolution), using inverse templates for the negative prompt, then append the</span>
+<span class="sd">    eos + start-of-generation (``&lt;|vision_start|&gt;``) special tokens. Image mode is</span>
+<span class="sd">    ``num_frames == 1``. ``max_sequence_length`` caps the chat-template token</span>
+<span class="sd">    count BEFORE the two trailing markers (the reference serving pipeline&#39;s</span>
+<span class="sd">    truncation contract); ``None`` leaves the prompt unbounded.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">is_image</span> <span class="o">=</span> <span class="n">num_frames</span> <span class="o">==</span> <span class="mi">1</span>
+    <span class="k">if</span> <span class="n">negative_prompt</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">negative_prompt</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">eos_id</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span>
+    <span class="n">sog_id</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">convert_tokens_to_ids</span><span class="p">(</span><span class="s2">&quot;&lt;|vision_start|&gt;&quot;</span><span class="p">)</span>
+
+    <span class="n">resolution_template</span> <span class="o">=</span> <span class="n">IMAGE_RESOLUTION_TEMPLATE</span> <span class="k">if</span> <span class="n">is_image</span> <span class="k">else</span> <span class="n">VIDEO_RESOLUTION_TEMPLATE</span>
+    <span class="n">inverse_resolution_template</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="n">INVERSE_IMAGE_RESOLUTION_TEMPLATE</span> <span class="k">if</span> <span class="n">is_image</span> <span class="k">else</span> <span class="n">INVERSE_VIDEO_RESOLUTION_TEMPLATE</span>
+    <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply_templates</span><span class="p">(</span><span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">is_negative</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">is_image</span> <span class="ow">and</span> <span class="n">add_duration_template</span><span class="p">:</span>
+            <span class="n">tmpl</span> <span class="o">=</span> <span class="n">INVERSE_DURATION_TEMPLATE</span> <span class="k">if</span> <span class="n">is_negative</span> <span class="k">else</span> <span class="n">DURATION_TEMPLATE</span>
+            <span class="n">text</span> <span class="o">=</span> <span class="n">_append</span><span class="p">(</span><span class="n">text</span><span class="p">,</span> <span class="n">tmpl</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">duration</span><span class="o">=</span><span class="n">num_frames</span> <span class="o">/</span> <span class="n">fps</span><span class="p">,</span> <span class="n">fps</span><span class="o">=</span><span class="n">fps</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">add_resolution_template</span><span class="p">:</span>
+            <span class="n">tmpl</span> <span class="o">=</span> <span class="n">inverse_resolution_template</span> <span class="k">if</span> <span class="n">is_negative</span> <span class="k">else</span> <span class="n">resolution_template</span>
+            <span class="n">text</span> <span class="o">=</span> <span class="n">_append</span><span class="p">(</span><span class="n">text</span><span class="p">,</span> <span class="n">tmpl</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">height</span><span class="o">=</span><span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="o">=</span><span class="n">width</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">text</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_tokenize</span><span class="p">(</span><span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="n">conversations</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">if</span> <span class="n">use_system_prompt</span><span class="p">:</span>
+            <span class="n">conversations</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="p">{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="n">SYSTEM_PROMPT_IMAGE</span> <span class="k">if</span> <span class="n">is_image</span> <span class="k">else</span> <span class="n">SYSTEM_PROMPT_VIDEO</span><span class="p">}</span>
+            <span class="p">)</span>
+        <span class="n">conversations</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;user&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="n">text</span><span class="p">})</span>
+        <span class="n">enc</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span>
+            <span class="n">conversations</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">add_vision_id</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">return_dict</span><span class="o">=</span><span class="kc">True</span>
+        <span class="p">)</span>
+        <span class="n">ids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">enc</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">])</span>
+        <span class="k">if</span> <span class="n">max_sequence_length</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">max_sequence_length</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;Cosmos3 prompt token count truncated to max_sequence_length: &quot;</span>
+                <span class="s2">&quot;original_token_count=</span><span class="si">%d</span><span class="s2">, max_sequence_length=</span><span class="si">%d</span><span class="s2">, removed_token_count=</span><span class="si">%d</span><span class="s2">&quot;</span><span class="p">,</span>
+                <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">),</span> <span class="n">max_sequence_length</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span> <span class="o">-</span> <span class="n">max_sequence_length</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="n">ids</span> <span class="o">=</span> <span class="n">ids</span><span class="p">[:</span><span class="n">max_sequence_length</span><span class="p">]</span>
+        <span class="k">return</span> <span class="n">ids</span> <span class="o">+</span> <span class="p">[</span><span class="n">eos_id</span><span class="p">,</span> <span class="n">sog_id</span><span class="p">]</span>
+
+    <span class="n">cond</span> <span class="o">=</span> <span class="n">_tokenize</span><span class="p">(</span><span class="n">_apply_templates</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">is_negative</span><span class="o">=</span><span class="kc">False</span><span class="p">))</span>
+    <span class="n">uncond</span> <span class="o">=</span> <span class="n">_tokenize</span><span class="p">(</span><span class="n">_apply_templates</span><span class="p">(</span><span class="n">negative_prompt</span><span class="p">,</span> <span class="n">is_negative</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">cond</span><span class="p">,</span> <span class="n">uncond</span></div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># Segment builders + full t2i static-input assembly.</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="build_text_segment">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.build_text_segment">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_text_segment</span><span class="p">(</span><span class="n">input_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">config</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+    <span class="n">und_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
+    <span class="n">text_mrope_ids</span><span class="p">,</span> <span class="n">next_off</span> <span class="o">=</span> <span class="n">get_3d_mrope_ids_text_tokens</span><span class="p">(</span>
+        <span class="n">num_tokens</span><span class="o">=</span><span class="n">und_len</span><span class="p">,</span> <span class="n">temporal_offset</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">use_float_positions</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">enable_fps_modulation</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;input_ids&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">&quot;text_indexes&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">und_len</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">&quot;und_len&quot;</span><span class="p">:</span> <span class="n">und_len</span><span class="p">,</span>
+        <span class="s2">&quot;text_mrope_ids&quot;</span><span class="p">:</span> <span class="n">text_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">&quot;vision_start_temporal_offset&quot;</span><span class="p">:</span> <span class="n">next_off</span> <span class="o">+</span> <span class="n">config</span><span class="o">.</span><span class="n">unified_3d_mrope_temporal_modality_margin</span><span class="p">,</span>
+    <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="build_vision_segment">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.build_vision_segment">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_vision_segment</span><span class="p">(</span>
+    <span class="n">latent_shape</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span>
+    <span class="n">has_image_condition</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+    <span class="n">mrope_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">vision_fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">curr</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">config</span><span class="p">,</span>
+    <span class="n">vae_scale_factor_temporal</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">device</span><span class="p">,</span>
+    <span class="n">noisy_frames</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;``latent_shape`` is the vision latent tensor shape ``[B, C, T, H, W]``.</span>
+
+<span class="sd">    ``noisy_frames`` lists the latent frames that are noisy (predicted); the rest</span>
+<span class="sd">    are clean conditioning context. When ``None`` it defaults to frame 0 clean</span>
+<span class="sd">    if ``has_image_condition`` else all frames noisy — i.e. the t2i/t2v/i2v</span>
+<span class="sd">    layouts. Action modes pass an explicit list (e.g. ``[]`` for</span>
+<span class="sd">    inverse-dynamics, where the whole video is conditioning).&quot;&quot;&quot;</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">latent_patch_size</span>
+    <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">latent_t</span><span class="p">,</span> <span class="n">latent_h</span><span class="p">,</span> <span class="n">latent_w</span> <span class="o">=</span> <span class="n">latent_shape</span>
+    <span class="n">patch_h</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">latent_h</span> <span class="o">/</span> <span class="n">p</span><span class="p">)</span>
+    <span class="n">patch_w</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">latent_w</span> <span class="o">/</span> <span class="n">p</span><span class="p">)</span>
+    <span class="n">num_vision_tokens</span> <span class="o">=</span> <span class="n">latent_t</span> <span class="o">*</span> <span class="n">patch_h</span> <span class="o">*</span> <span class="n">patch_w</span>
+
+    <span class="k">if</span> <span class="n">noisy_frames</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">noisy_start</span> <span class="o">=</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">has_image_condition</span> <span class="k">else</span> <span class="mi">0</span>
+        <span class="n">noisy_list</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">noisy_start</span><span class="p">,</span> <span class="n">latent_t</span><span class="p">))</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">noisy_list</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">noisy_frames</span><span class="p">)</span>
+    <span class="n">noisy_frame_indexes</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">noisy_list</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span>
+
+    <span class="n">frame_token_stride</span> <span class="o">=</span> <span class="n">patch_h</span> <span class="o">*</span> <span class="n">patch_w</span>
+    <span class="n">mse_loss_indexes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">frame_idx</span> <span class="ow">in</span> <span class="n">noisy_list</span><span class="p">:</span>
+        <span class="n">frame_start</span> <span class="o">=</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">frame_idx</span> <span class="o">*</span> <span class="n">frame_token_stride</span>
+        <span class="n">mse_loss_indexes</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">frame_start</span><span class="p">,</span> <span class="n">frame_start</span> <span class="o">+</span> <span class="n">frame_token_stride</span><span class="p">))</span>
+
+    <span class="n">effective_fps</span> <span class="o">=</span> <span class="n">vision_fps</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_fps_modulation</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="n">vision_mrope_ids</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">get_3d_mrope_ids_vae_tokens</span><span class="p">(</span>
+        <span class="n">grid_t</span><span class="o">=</span><span class="n">latent_t</span><span class="p">,</span>
+        <span class="n">grid_h</span><span class="o">=</span><span class="n">patch_h</span><span class="p">,</span>
+        <span class="n">grid_w</span><span class="o">=</span><span class="n">patch_w</span><span class="p">,</span>
+        <span class="n">temporal_offset</span><span class="o">=</span><span class="n">mrope_offset</span><span class="p">,</span>
+        <span class="n">reset_spatial_indices</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">unified_3d_mrope_reset_spatial_ids</span><span class="p">,</span>
+        <span class="n">fps</span><span class="o">=</span><span class="n">effective_fps</span><span class="p">,</span>
+        <span class="n">base_fps</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">base_fps</span><span class="p">),</span>
+        <span class="n">temporal_compression_factor</span><span class="o">=</span><span class="n">vae_scale_factor_temporal</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;vision_token_shapes&quot;</span><span class="p">:</span> <span class="p">[(</span><span class="n">latent_t</span><span class="p">,</span> <span class="n">patch_h</span><span class="p">,</span> <span class="n">patch_w</span><span class="p">)],</span>
+        <span class="s2">&quot;vision_sequence_indexes&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">curr</span><span class="p">,</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">num_vision_tokens</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">&quot;vision_mse_loss_indexes&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">mse_loss_indexes</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">&quot;vision_noisy_frame_indexes&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">noisy_frame_indexes</span><span class="p">],</span>
+        <span class="s2">&quot;vision_mrope_ids&quot;</span><span class="p">:</span> <span class="n">vision_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">&quot;num_vision_tokens&quot;</span><span class="p">:</span> <span class="n">num_vision_tokens</span><span class="p">,</span>
+        <span class="s2">&quot;num_noisy_vision_tokens&quot;</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">noisy_list</span><span class="p">)</span> <span class="o">*</span> <span class="n">frame_token_stride</span><span class="p">,</span>
+    <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="build_sound_segment">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.build_sound_segment">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_sound_segment</span><span class="p">(</span>
+    <span class="n">sound_latent_frames</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">mrope_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">curr</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">config</span><span class="p">,</span>
+    <span class="n">device</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Sound (AVAE-latent) band of the generation sequence: a ``(T, 1, 1)`` grid</span>
+<span class="sd">    at the sound tokenizer&#39;s latent frame rate, sharing the post-text media</span>
+<span class="sd">    temporal offset with the vision band. Every sound frame is noisy/predicted</span>
+<span class="sd">    (sound generation has no clean conditioning tokens).&quot;&quot;&quot;</span>
+    <span class="n">effective_fps</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">sound_latent_fps</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_fps_modulation</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="n">sound_mrope_ids</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">get_3d_mrope_ids_vae_tokens</span><span class="p">(</span>
+        <span class="n">grid_t</span><span class="o">=</span><span class="n">sound_latent_frames</span><span class="p">,</span>
+        <span class="n">grid_h</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">grid_w</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">temporal_offset</span><span class="o">=</span><span class="n">mrope_offset</span><span class="p">,</span>
+        <span class="n">reset_spatial_indices</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">unified_3d_mrope_reset_spatial_ids</span><span class="p">,</span>
+        <span class="n">fps</span><span class="o">=</span><span class="n">effective_fps</span><span class="p">,</span>
+        <span class="n">base_fps</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">base_fps</span><span class="p">),</span>
+        <span class="n">temporal_compression_factor</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">temporal_compression_factor_sound</span><span class="p">,</span>
+        <span class="n">base_temporal_compression_factor</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">temporal_compression_factor_sound</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">sequence_indexes</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">curr</span><span class="p">,</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">sound_latent_frames</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;sound_token_shapes&quot;</span><span class="p">:</span> <span class="p">[(</span><span class="n">sound_latent_frames</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)],</span>
+        <span class="s2">&quot;sound_sequence_indexes&quot;</span><span class="p">:</span> <span class="n">sequence_indexes</span><span class="p">,</span>
+        <span class="s2">&quot;sound_mse_loss_indexes&quot;</span><span class="p">:</span> <span class="n">sequence_indexes</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span>
+        <span class="s2">&quot;sound_noisy_frame_indexes&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">sound_latent_frames</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)],</span>
+        <span class="s2">&quot;sound_mrope_ids&quot;</span><span class="p">:</span> <span class="n">sound_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">&quot;num_sound_tokens&quot;</span><span class="p">:</span> <span class="n">sound_latent_frames</span><span class="p">,</span>
+    <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="build_static_inputs">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.build_static_inputs">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_static_inputs</span><span class="p">(</span>
+    <span class="n">input_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+    <span class="n">latent_shape</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span>
+    <span class="n">config</span><span class="p">,</span>
+    <span class="n">vae_scale_factor_temporal</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">fps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">device</span><span class="p">,</span>
+    <span class="n">has_image_condition</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">sound_latent_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">noisy_frames</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Assemble the per-prompt static transformer inputs for image/video</span>
+<span class="sd">    generation. ``latent_shape`` is ``[B, C, T, H, W]`` (``T == 1`` for images;</span>
+<span class="sd">    ``T == 1 + (num_frames - 1) // temporal_factor`` for video). When</span>
+<span class="sd">    ``has_image_condition`` is set, latent frame 0 is a clean conditioning anchor</span>
+<span class="sd">    (image-to-video): it stays in the sequence but is excluded from the noisy /</span>
+<span class="sd">    predicted frames. ``noisy_frames`` instead lists the predicted latent frames</span>
+<span class="sd">    explicitly (video-to-video, where the conditioned frames are the complement).</span>
+<span class="sd">    ``sound_latent_frames`` appends a jointly denoised sound</span>
+<span class="sd">    band after the vision tokens (the generation block becomes</span>
+<span class="sd">    ``[vision | sound]``). Step-varying fields (``vision_tokens``,</span>
+<span class="sd">    ``vision_timesteps``) are spliced in per denoising step by the caller.&quot;&quot;&quot;</span>
+    <span class="n">text</span> <span class="o">=</span> <span class="n">build_text_segment</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+    <span class="n">vision</span> <span class="o">=</span> <span class="n">build_vision_segment</span><span class="p">(</span>
+        <span class="n">latent_shape</span><span class="o">=</span><span class="n">latent_shape</span><span class="p">,</span>
+        <span class="n">has_image_condition</span><span class="o">=</span><span class="n">has_image_condition</span><span class="p">,</span>
+        <span class="n">mrope_offset</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;vision_start_temporal_offset&quot;</span><span class="p">],</span>
+        <span class="n">vision_fps</span><span class="o">=</span><span class="n">fps</span><span class="p">,</span>
+        <span class="n">curr</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;und_len&quot;</span><span class="p">],</span>
+        <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span>
+        <span class="n">vae_scale_factor_temporal</span><span class="o">=</span><span class="n">vae_scale_factor_temporal</span><span class="p">,</span>
+        <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+        <span class="n">noisy_frames</span><span class="o">=</span><span class="n">noisy_frames</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;text_mrope_ids&quot;</span><span class="p">],</span> <span class="n">vision</span><span class="p">[</span><span class="s2">&quot;vision_mrope_ids&quot;</span><span class="p">]]</span>
+    <span class="n">static</span> <span class="o">=</span> <span class="p">{</span><span class="o">**</span><span class="n">text</span><span class="p">,</span> <span class="o">**</span><span class="n">vision</span><span class="p">}</span>
+    <span class="n">sequence_length</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="s2">&quot;und_len&quot;</span><span class="p">]</span> <span class="o">+</span> <span class="n">vision</span><span class="p">[</span><span class="s2">&quot;num_vision_tokens&quot;</span><span class="p">]</span>
+    <span class="k">if</span> <span class="n">sound_latent_frames</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">sound</span> <span class="o">=</span> <span class="n">build_sound_segment</span><span class="p">(</span>
+            <span class="n">sound_latent_frames</span><span class="o">=</span><span class="n">sound_latent_frames</span><span class="p">,</span>
+            <span class="n">mrope_offset</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;vision_start_temporal_offset&quot;</span><span class="p">],</span>
+            <span class="n">curr</span><span class="o">=</span><span class="n">sequence_length</span><span class="p">,</span>
+            <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span>
+            <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">static</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">sound</span><span class="p">)</span>
+        <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">sound</span><span class="p">[</span><span class="s2">&quot;sound_mrope_ids&quot;</span><span class="p">])</span>
+        <span class="n">sequence_length</span> <span class="o">+=</span> <span class="n">sound</span><span class="p">[</span><span class="s2">&quot;num_sound_tokens&quot;</span><span class="p">]</span>
+    <span class="n">pos_dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span> <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">is_floating_point</span><span class="p">()</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">)</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">long</span>
+    <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">p</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pos_dtype</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">static</span><span class="p">[</span><span class="s2">&quot;position_ids&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">position_ids</span>
+    <span class="n">static</span><span class="p">[</span><span class="s2">&quot;sequence_length&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">sequence_length</span>
+    <span class="k">return</span> <span class="n">static</span></div>
+
+
+
+<div class="viewcode-block" id="build_t2i_static_inputs">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.build_t2i_static_inputs">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_t2i_static_inputs</span><span class="p">(</span>
+    <span class="n">input_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+    <span class="n">latent_shape</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span>
+    <span class="n">config</span><span class="p">,</span>
+    <span class="n">vae_scale_factor_temporal</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">fps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">device</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Image-mode convenience wrapper around :func:`build_static_inputs`.&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">build_static_inputs</span><span class="p">(</span>
+        <span class="n">input_ids</span><span class="p">,</span> <span class="n">latent_shape</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">vae_scale_factor_temporal</span><span class="p">,</span> <span class="n">fps</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span>
+        <span class="n">has_image_condition</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="build_action_static_inputs">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.build_action_static_inputs">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_action_static_inputs</span><span class="p">(</span>
+    <span class="n">input_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+    <span class="n">video_latent_shape</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span>
+    <span class="n">action_chunk_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">mode</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">config</span><span class="p">,</span>
+    <span class="n">vae_scale_factor_temporal</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">fps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">action_fps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">action_start_offset</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">device</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Assemble the static transformer inputs for joint video+action generation.</span>
+
+<span class="sd">    The generation sequence is ``[video tokens | action tokens]`` after the text</span>
+<span class="sd">    prefix. Both media bands share the post-text temporal offset (the 15000</span>
+<span class="sd">    margin), with the action band on its own frame-rate grid. Conditioning per</span>
+<span class="sd">    ``mode`` decides which video frames and action tokens are clean context vs</span>
+<span class="sd">    noisy/predicted (see :func:`vision_condition_frame_indexes` /</span>
+<span class="sd">    :func:`action_condition_frame_indexes`).&quot;&quot;&quot;</span>
+    <span class="n">text</span> <span class="o">=</span> <span class="n">build_text_segment</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+    <span class="n">media_offset</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="s2">&quot;vision_start_temporal_offset&quot;</span><span class="p">]</span>
+    <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">latent_t</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">video_latent_shape</span>
+
+    <span class="n">vision_clean</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">vision_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">,</span> <span class="n">latent_t</span><span class="p">))</span>
+    <span class="n">vision_noisy</span> <span class="o">=</span> <span class="p">[</span><span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">latent_t</span><span class="p">)</span> <span class="k">if</span> <span class="n">f</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">vision_clean</span><span class="p">]</span>
+    <span class="n">vision</span> <span class="o">=</span> <span class="n">build_vision_segment</span><span class="p">(</span>
+        <span class="n">latent_shape</span><span class="o">=</span><span class="n">video_latent_shape</span><span class="p">,</span>
+        <span class="n">has_image_condition</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">mrope_offset</span><span class="o">=</span><span class="n">media_offset</span><span class="p">,</span>
+        <span class="n">vision_fps</span><span class="o">=</span><span class="n">fps</span><span class="p">,</span>
+        <span class="n">curr</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;und_len&quot;</span><span class="p">],</span>
+        <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span>
+        <span class="n">vae_scale_factor_temporal</span><span class="o">=</span><span class="n">vae_scale_factor_temporal</span><span class="p">,</span>
+        <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+        <span class="n">noisy_frames</span><span class="o">=</span><span class="n">vision_noisy</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">curr</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="s2">&quot;und_len&quot;</span><span class="p">]</span> <span class="o">+</span> <span class="n">vision</span><span class="p">[</span><span class="s2">&quot;num_vision_tokens&quot;</span><span class="p">]</span>
+    <span class="n">action_clean</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">action_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">,</span> <span class="n">action_chunk_size</span><span class="p">))</span>
+    <span class="n">action_noisy</span> <span class="o">=</span> <span class="p">[</span><span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">action_chunk_size</span><span class="p">)</span> <span class="k">if</span> <span class="n">a</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">action_clean</span><span class="p">]</span>
+    <span class="n">effective_action_fps</span> <span class="o">=</span> <span class="n">action_fps</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_fps_modulation</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="n">action_mrope_ids</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">get_3d_mrope_ids_action_tokens</span><span class="p">(</span>
+        <span class="n">grid_t</span><span class="o">=</span><span class="n">action_chunk_size</span><span class="p">,</span>
+        <span class="n">temporal_offset</span><span class="o">=</span><span class="n">media_offset</span><span class="p">,</span>
+        <span class="n">action_fps</span><span class="o">=</span><span class="n">effective_action_fps</span><span class="p">,</span>
+        <span class="n">base_fps</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">base_fps</span><span class="p">),</span>
+        <span class="n">base_temporal_compression_factor</span><span class="o">=</span><span class="n">vae_scale_factor_temporal</span><span class="p">,</span>
+        <span class="n">start_frame_offset</span><span class="o">=</span><span class="n">action_start_offset</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;text_mrope_ids&quot;</span><span class="p">],</span> <span class="n">vision</span><span class="p">[</span><span class="s2">&quot;vision_mrope_ids&quot;</span><span class="p">],</span> <span class="n">action_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)]</span>
+    <span class="n">pos_dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span> <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">is_floating_point</span><span class="p">()</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">)</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">long</span>
+    <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">p</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pos_dtype</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="o">**</span><span class="n">text</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">vision</span><span class="p">,</span>
+        <span class="s2">&quot;action_token_shapes&quot;</span><span class="p">:</span> <span class="p">[(</span><span class="n">action_chunk_size</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)],</span>
+        <span class="s2">&quot;action_sequence_indexes&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">curr</span><span class="p">,</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">action_chunk_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">&quot;action_noisy_frame_indexes&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">action_noisy</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)],</span>
+        <span class="s2">&quot;action_mse_loss_indexes&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
+            <span class="p">[</span><span class="n">curr</span> <span class="o">+</span> <span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">action_noisy</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span>
+        <span class="p">),</span>
+        <span class="s2">&quot;action_mrope_ids&quot;</span><span class="p">:</span> <span class="n">action_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">&quot;num_action_tokens&quot;</span><span class="p">:</span> <span class="n">action_chunk_size</span><span class="p">,</span>
+        <span class="s2">&quot;num_noisy_action_tokens&quot;</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">action_noisy</span><span class="p">),</span>
+        <span class="s2">&quot;action_mode&quot;</span><span class="p">:</span> <span class="n">mode</span><span class="p">,</span>
+        <span class="s2">&quot;position_ids&quot;</span><span class="p">:</span> <span class="n">position_ids</span><span class="p">,</span>
+        <span class="s2">&quot;sequence_length&quot;</span><span class="p">:</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">action_chunk_size</span><span class="p">,</span>
+    <span class="p">}</span></div>
+
+</pre></div>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By M* Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, M* Team.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Jul 10, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

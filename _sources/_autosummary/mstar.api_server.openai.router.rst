@@ -18,6 +18,7 @@ mstar.api\_server.openai.router
       images_edits
       images_generations
       list_models
+      videos_generations
    
    
 

@@ -29,6 +29,7 @@
 
    base
    components
+   cosmos3
    loader
    orpheus
    pi05

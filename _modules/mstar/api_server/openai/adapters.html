@@ -568,7 +568,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Jul 09, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 10, 2026"/>
   </head>
   
   
@@ -681,6 +681,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
@@ -701,6 +702,14 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -923,6 +932,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">ChatCompletionRequest</span><span class="p">,</span>
         <span class="n">ImageGenerationRequest</span><span class="p">,</span>
         <span class="n">SpeechRequest</span><span class="p">,</span>
+        <span class="n">VideoGenerationRequest</span><span class="p">,</span>
     <span class="p">)</span>
 
 
@@ -1060,6 +1070,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">supports_chat</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>     <span class="c1"># POST /v1/chat/completions</span>
     <span class="n">supports_speech</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># POST /v1/audio/speech</span>
     <span class="n">supports_images</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># POST /v1/images/generations and /v1/images/edits</span>
+    <span class="n">supports_videos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># POST /v1/videos/generations</span>
 
 <div class="viewcode-block" id="OpenAIAdapter.chat_to_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.chat_to_request">[docs]</a>
@@ -1079,6 +1090,12 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.image_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">image_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">ImageGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;image generation is not supported by this model&quot;</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="OpenAIAdapter.video_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.video_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">video_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">VideoGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;video generation is not supported by this model&quot;</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="OpenAIAdapter.image_edit_to_request">
@@ -1233,12 +1250,94 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="Cosmos3Adapter">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Cosmos3Adapter">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3Adapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;NVIDIA Cosmos3: text-to-image and text/image-to-video generation.</span>
+
+<span class="sd">    ``size`` (&quot;WxH&quot;) maps to the generation resolution; ``seed`` and any</span>
+<span class="sd">    extra knobs (``guidance_scale``, ``num_inference_steps``, ``negative_prompt``,</span>
+<span class="sd">    and for video ``num_frames`` / ``fps``) pass through via ``extra_body``.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">supports_images</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">supports_videos</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="Cosmos3Adapter.image_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Cosmos3Adapter.image_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">image_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">ImageGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
+        <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="Cosmos3Adapter.video_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Cosmos3Adapter.video_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">video_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">VideoGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
+        <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+        <span class="c1"># num_frames / fps are first-class video fields (not in extra_body).</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;num_frames&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;num_frames&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">num_frames</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;fps&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;fps&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">fps</span><span class="p">)</span>
+        <span class="c1"># Image-to-video: the conditioning frame (URL / data URI) is persisted and</span>
+        <span class="c1"># loaded by the worker, which VAE-encodes it into the clean frame-0 anchor.</span>
+        <span class="c1"># Video-to-video: the conditioning video is persisted the same way; the</span>
+        <span class="c1"># worker VAE-encodes its prefix and pins the requested clean latent</span>
+        <span class="c1"># frames (condition_frame_indexes_vision / condition_video_keep via</span>
+        <span class="c1"># extra_body).</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">video</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;video&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">image</span> <span class="ow">and</span> <span class="n">video</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Provide either &#39;image&#39; or &#39;video&#39; conditioning, not both.&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">image</span><span class="p">:</span>
+            <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+                <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
+                <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]},</span>
+                <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="s2">&quot;text&quot;</span><span class="p">],</span>
+                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+                <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="n">video</span><span class="p">:</span>
+            <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span><span class="n">video</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+                <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
+                <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;video&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]},</span>
+                <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">,</span> <span class="s2">&quot;text&quot;</span><span class="p">],</span>
+                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+                <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
 <span class="c1"># Only models with an OpenAI-standard surface are registered. Action/world-model</span>
 <span class="c1"># models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.</span>
 <span class="n">ADAPTER_REGISTRY</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">OpenAIAdapter</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
     <span class="s2">&quot;bagel&quot;</span><span class="p">:</span> <span class="n">BagelAdapter</span><span class="p">(),</span>
     <span class="s2">&quot;qwen3_omni&quot;</span><span class="p">:</span> <span class="n">Qwen3OmniAdapter</span><span class="p">(),</span>
     <span class="s2">&quot;orpheus&quot;</span><span class="p">:</span> <span class="n">OrpheusAdapter</span><span class="p">(),</span>
+    <span class="s2">&quot;cosmos3&quot;</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
+    <span class="s2">&quot;cosmos3_super&quot;</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
 <span class="p">}</span>
 
 
@@ -1294,7 +1393,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 09, 2026.
+  Last updated on Jul 10, 2026.
   <br/>
 </p>
   </div>
