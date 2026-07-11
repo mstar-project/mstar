@@ -6,17 +6,10 @@ emits codes with the inter-codebook shear (codebook ``j`` delayed by ``j``
 frames); :func:`shear_up` removes that delay before decoding.
 
 ``StreamingDacDecoder`` keeps a per-request frame buffer and decodes new
-frames incrementally as they arrive. DAC's decoder is a *convolutional*
-network, so decoding each chunk of frames in isolation lets the transposed
-convolutions see zero-padding at the chunk edges instead of the real
-neighbouring frames — every chunk boundary then becomes an audible click
-(a buzz at ``sample_rate / (chunk_frames * hop_length)`` Hz). To avoid this
-the decoder re-decodes ``overlap_frames`` of already-emitted frames as left
-context (so the convolutions warm up on real signal) and overlap-add
-crossfades the seam with the previous chunk's withheld tail, matching the
-reference ``TTSVocoderManager._decode_incremental``. ``dac`` is imported
+frames incrementally as they arrive. ``dac`` is imported
 lazily so the package imports without the optional dependency; install
 ``descript-audio-codec`` to run the vocoder.
+# TODO: We should implement the StreamingDacDecoder a la Qwen Omni encoders. 
 """
 from __future__ import annotations
 
@@ -86,12 +79,8 @@ class StreamingDacDecoder:
     have enough future context for ``shear_up`` (output frame ``i`` needs
     input frames ``i .. i + n_codebooks - 1``).
 
-    To keep DAC's convolutional decoder from seeing zero-padding at chunk
-    boundaries (which produces an audible click at every boundary), each
-    decode also re-decodes the previous ``overlap_frames`` frames as left
-    context and crossfades the overlapping audio with the withheld tail of
-    the previous chunk. Each non-final chunk withholds its last
-    ``overlap_frames * hop_length`` samples; the final flush emits them.
+    Each non-final chunk withholds its last ``overlap_frames * hop_length`` 
+    samples; the final flush emits them.
 
     Crossfading is done in float; the emitted samples are converted to
     int16 PCM on the way out.

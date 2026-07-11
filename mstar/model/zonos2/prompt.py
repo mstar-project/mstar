@@ -5,6 +5,9 @@ default path: UTF-8 byte tokenization + a sheared silence tail; the
 optional speaking-rate / quality / speaker-background conditioning tokens
 are omitted here).
 
+# TODO: add the optional speaking-rate / quality / speaker-background 
+conditioning
+
 A prompt is a 2-D int tensor of shape ``(num_frames, n_codebooks + 1)``.
 For each text/byte token the audio columns are filled with
 ``audio_pad_id`` and the final (text) column carries the byte-token id.

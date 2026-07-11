@@ -14,8 +14,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-EOA_TOKEN = 1024  # end-of-audio
-
 
 @dataclass
 class TTSSamplingParams:

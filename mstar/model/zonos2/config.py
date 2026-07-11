@@ -2,12 +2,7 @@
 
 Ported from the reference ``zonos2.models.config.ModelConfig`` (see
 ``../ZONOS2/python/zonos2/models/config.py``) but flattened into a plain
-dataclass with sensible defaults, mirroring the style of the other
-``mstar`` model configs (e.g. :class:`OrpheusModelConfig`).
-
-The defaults describe a small, representative Zonos2 network; swap in the
-real checkpoint's values (``dim`` -> ``hidden_size``, ``n_layers`` ->
-``num_layers``, etc.) when loading actual weights.
+dataclass.
 """
 from __future__ import annotations
 
@@ -16,7 +11,29 @@ from dataclasses import dataclass
 
 @dataclass
 class Zonos2Config:
-    # ---- Transformer backbone --------------------------------------
+    """Zonos2 model + serving configuration.
+
+    The fields split into two groups along the checkpoint boundary, and the
+    two groups treat their defaults very differently:
+
+    * **Architecture** (backbone / token format / MoE / speaker) describes the
+      trained transformer and varies per checkpoint, so on the real serving
+      path :func:`load_zonos2_config` reads each value from ``params.json`` and
+      passes it explicitly. The defaults below are therefore *never used* when
+      a checkpoint is loaded — they are only a small, representative
+      placeholder network for direct construction (tests, no-checkpoint boot)
+      and are NOT the released model's dimensions. (``moe_balancing_strategy``
+      is the subtle exception: a hand-built config that skips the loader would
+      still apply its default against the checkpoint's balancing biases — see
+      its note below.)
+
+    * **Serving / vocoder** settings are absent from ``params.json`` (the DAC
+      codec is a separate pretrained model; the streaming knobs are deployment
+      policy), so the loader leaves them alone and the defaults below are
+      load-bearing on every run.
+    """
+
+    # ---- Transformer backbone (loaded from params.json; defaults are placeholder) ----
     num_layers: int = 16
     hidden_size: int = 1024
     num_qo_heads: int = 16
@@ -36,40 +53,41 @@ class Zonos2Config:
     eoa_id: int = 1024  # end-of-audio token
     audio_pad_id: int = 1025  # audio padding token
     loss_softcap: float = 15.0  # tanh logit soft-capping (0 disables)
-    # End generation only when the *leading* (undelayed) codebook 0 emits eoa.
-    # Under the inter-codebook delay, cb0 leads the end-of-audio signal, so a
-    # delayed codebook (1..C-1) emitting eoa on its own is spurious and would
-    # truncate the utterance early. True = robust to that (recommended);
-    # False = legacy "any codebook" behaviour (matches the reference).
-    eos_require_leading_codebook: bool = True
 
     # ---- Mixture-of-Experts ----------------------------------------
     # MoE is enabled on layers ``[moe_start_from_layer, num_layers -
     # moe_end_from_layer)``; the rest use the dense SwiGLU feed-forward.
     moe_n_experts: int = 8
-    num_experts_per_tok: int = 2  # top-k routing
+    num_experts_per_tok: int = 2  # top-k routing (default; see special_topk_layers)
+    # Per-layer top-k overrides, e.g. ``{26: 2}`` routes layer 26 to top-2 while
+    # every other MoE layer uses ``num_experts_per_tok``. 
+    special_topk_layers: dict[int, int] | None = None
     moe_router_dim: int = 256  # router bottleneck width
     moe_intermediate_size: int = 0  # 0 -> reuse ``intermediate_size``
     moe_start_from_layer: int = 2
     moe_end_from_layer: int = 2
     norm_topk_prob: bool = False  # Zonos2 does NOT renormalize top-k weights
-    # "quantile" (subtract balancing bias) or "legacy" (add it).
-    moe_balancing_strategy: str = "quantile"
+    # "legacy" adds the balancing bias before top-k, "quantile" subtracts it.
+    # The reference dataclass and the released checkpoint (which omits the
+    # field in params.json) both resolve to "legacy"; matching that here keeps
+    # a checkpoint-less ``Zonos2Config()`` faithful, since the released
+    # ``balancing_biases`` are nonzero and would otherwise flip expert routing.
+    moe_balancing_strategy: str = "legacy"
 
     # ---- Optional speaker conditioning (voice cloning) -------------
-    # Not modeled here; kept for config parity / future use.
+    # When enabled, raw speaker embeddings are projected (optionally via an
+    # LDA reduction) and injected at the speaker token position in the LM
+    # (see ``Zonos2ForCausalLM``).
+    # TODO: Implement this :)
     speaker_enabled: bool = False
     speaker_embedding_dim: int = 128
     speaker_lda_dim: int | None = None
 
-    # ---- Serving / vocoder settings --------------------------------
+    # ---- Serving / vocoder settings (not in params.json; these defaults are live) ----
     sample_rate: int = 44100       # DAC output sample rate
     dac_model_type: str = "44khz"  # descript-audio-codec model tag
     dac_chunk_frames: int = 16     # streaming decode chunk (frames per DAC call)
     dac_hop_length: int = 512      # DAC audio samples per codebook frame (44khz)
-    # Frames of already-decoded left context re-decoded and crossfaded at each
-    # streaming chunk boundary so the convolutional decoder warms up on real
-    # signal (0 disables the crossfade — restores the click at chunk edges).
     dac_overlap_frames: int = 4
 
     @property
@@ -82,11 +100,27 @@ class Zonos2Config:
         """Expert intermediate size, falling back to the dense value."""
         return self.moe_intermediate_size or self.intermediate_size
 
+    def get_num_experts_per_tok(self, layer_id: int) -> int:
+        """Top-k experts routed for ``layer_id``.
+
+        Defaults to ``num_experts_per_tok`` (>=1), overridden per layer by
+        ``special_topk_layers``.
+        """
+        default_topk = self.num_experts_per_tok if self.num_experts_per_tok > 0 else 1
+        special = self.special_topk_layers
+        if special:
+            topk = special.get(layer_id, special.get(str(layer_id), default_topk))
+        else:
+            topk = default_topk
+        topk = int(topk)
+        if topk < 1:
+            raise ValueError(f"top-k for layer {layer_id} must be >= 1, got {topk}")
+        return topk
+
     def is_moe_layer(self, layer_id: int) -> bool:
         """Whether layer ``layer_id`` uses the MoE feed-forward.
-
-        Matches ``TransformerBlock._is_moe_layer`` in the reference: MoE is
-        active only for the middle band of layers.
+        
+        MoE is active only for the middle band of layers.
         """
         if self.moe_n_experts <= 1:
             return False
@@ -107,7 +141,14 @@ _MOE_BALANCING_ALIASES = {
 
 
 def _normalize_moe_balancing_strategy(strategy: str) -> str:
-    return _MOE_BALANCING_ALIASES.get(str(strategy).strip().lower().replace("-", "_"), "quantile")
+    normalized = str(strategy).strip().lower().replace("-", "_")
+    try:
+        return _MOE_BALANCING_ALIASES[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported moe_balancing_strategy={strategy!r}; expected one of "
+            f"{sorted(set(_MOE_BALANCING_ALIASES))}."
+        ) from exc
 
 
 def load_zonos2_config(params: dict, **overrides) -> Zonos2Config:
@@ -115,10 +156,7 @@ def load_zonos2_config(params: dict, **overrides) -> Zonos2Config:
 
     Maps the reference training-format field names (``dim``, ``n_layers``,
     ``ffn_dim_multiplier`` + ``multiple_of``, ``moe_router_topk`` ...) to the
-    inference dims here, mirroring ``ModelConfig.from_zonos2_config`` in
-    ``../ZONOS2/python/zonos2/models/config.py``. ``params`` may be flat or
-    nested under a ``"model"`` key. ``overrides`` (e.g. from a serving YAML's
-    ``model_kwargs``) win over the checkpoint values.
+    inference dims here.
     """
     p = params.get("model", params) if isinstance(params, dict) else params
 
@@ -136,6 +174,18 @@ def load_zonos2_config(params: dict, **overrides) -> Zonos2Config:
     intermediate_size = multiple_of * ((ffn_dim + multiple_of - 1) // multiple_of)
 
     moe_n_experts = int(g("moe_n_experts", 1))
+
+    # Per-layer top-k overrides (JSON stores keys as strings); normalize to
+    # int->int and validate, mirroring reference ``normalize_special_topk_layers``.
+    raw_special = g("special_topk_layers")
+    special_topk_layers: dict[int, int] | None = None
+    if raw_special:
+        special_topk_layers = {}
+        for k, v in raw_special.items():
+            k, v = int(k), int(v)
+            if v < 1:
+                raise ValueError(f"special_topk_layers[{k}] must be >= 1, got {v}")
+            special_topk_layers[k] = v
 
     cfg = Zonos2Config(
         num_layers=int(g("n_layers", 8)),
@@ -155,6 +205,7 @@ def load_zonos2_config(params: dict, **overrides) -> Zonos2Config:
         loss_softcap=float(g("loss_softcap", 15.0)),
         moe_n_experts=moe_n_experts,
         num_experts_per_tok=int(g("moe_router_topk", 1)),
+        special_topk_layers=special_topk_layers,
         moe_router_dim=int(g("moe_router_dim", 128)),
         moe_intermediate_size=0,  # reuse intermediate_size (matches reference)
         moe_start_from_layer=int(g("moe_start_from_layer", 0)),
