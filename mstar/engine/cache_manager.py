@@ -51,6 +51,15 @@ class _PlanState:
     seq_lens: list[int] | None = None
     write_store: bool = True
     custom_pos_advance: list[int] | None = None
+    # Cross-attention plan memo (cross labels only): fingerprint of the last
+    # planned (query lengths, context pages). The context side is immutable
+    # after add_cross_attn_kv, so a step whose fingerprint matches skips the
+    # FlashInfer re-plan. NOTE: only effective where plan states persist
+    # across steps (the CUDA-graph runner's cuda_graph_plan_states); the
+    # eager path rebuilds the cache manager per step, so eager decode still
+    # re-plans — making cross plans persistent eagerly is the known
+    # multi-request throughput follow-up (see PR #161 benchmark notes).
+    cross_plan_key: tuple | None = None
     # Set when DenseGenCacheManager planned this label dense: the per-segment
     # gather indices + varlen cu_seqlens needed to attend each generation
     # segment over its contiguous frozen prefix. None on paged plans, which
@@ -1118,7 +1127,19 @@ class FlashInferCacheManager(BatchedCacheManager):
             kv_indptr_list.append(kv_indptr_list[-1] + len(state.page_indices))
             kv_last_page_lens.append(state.seq_len % page_size or page_size)
 
+        # Skip the re-plan when nothing it depends on changed (the common
+        # decode case: same request set, q_seq_lens all 1, fixed context
+        # pages). Keyed on the page indices themselves so a request id
+        # reused with a new context can't alias a stale plan.
+        plan_key = (
+            tuple(q_seq_lens), tuple(all_page_indices),
+            tuple(kv_last_page_lens), dtype,
+        )
+
         ps = self._plan_states.get(cross_label)
+        if ps is not None and ps.wrapper is not None and ps.cross_plan_key == plan_key:
+            ps.seq_lens = q_seq_lens
+            return
         if ps is None or ps.wrapper is None:
             wrapper = FlashInferPrefillWrapper(
                 workspace_buffer=self.buffer_manager.get(cross_label),
@@ -1142,6 +1163,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         )
         ps.seq_lens = q_seq_lens
         ps.write_store = False
+        ps.cross_plan_key = plan_key
 
     def run_cross_attn(
         self,
