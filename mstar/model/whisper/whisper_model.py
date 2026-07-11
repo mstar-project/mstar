@@ -316,6 +316,7 @@ class WhisperModel(Model):
         self,
         output: torch.Tensor,
         modality: str,
+        **kwargs,
     ) -> bytes:
         if modality == "text":
             return self._detokenizer.to_bytes(output.reshape(-1).tolist())
