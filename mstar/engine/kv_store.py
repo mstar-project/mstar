@@ -67,6 +67,30 @@ class PageAllocator:
         return self.free_pages.qsize()
 
 
+@dataclass(frozen=True)
+class CrossAttnKVConfig:
+    """Config for one cross-attention context KV pool.
+
+    Cross-attention K/V come from an encoder context: written once at
+    encode time, reused (read-only) by every decoder step, and possibly
+    shaped differently from the decoder's self-attention KV. Each entry
+    in ``KVCacheConfig.cross_attn`` describes the pool for one context
+    source; sources with identical configs share a physical pool
+    (deduped by value — hence frozen/hashable).
+
+    ``num_layers`` / ``num_qo_heads`` default to the parent
+    ``KVCacheConfig``'s values when None (one cross-attention block per
+    decoder layer, queried by the decoder's heads).
+    """
+    num_kv_heads: int
+    head_dim: int
+    max_context_len: int  # per-request context capacity (tokens)
+    max_num_pages: int = 256
+    page_size: int = 128
+    num_layers: int | None = None
+    num_qo_heads: int | None = None
+
+
 @dataclass
 class KVCacheConfig:
     num_layers: int
@@ -78,6 +102,9 @@ class KVCacheConfig:
     num_qo_heads: int | None = None  # Optional, defaults to num_kv_heads
     cpu_offload_pages: int = 0  # >0 enables CPU offloading with this many CPU pages
     nodes: list[str] = None # defaults to all AR nodes
+    # Cross-attention context pools, keyed by source name (e.g. "default",
+    # "audio_encoder"). See CrossAttnKVConfig.
+    cross_attn: dict[str, CrossAttnKVConfig] = None
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -390,6 +417,23 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         for fut in self._pending:
             fut.result()
         self._executor.shutdown(wait=True)
+
+
+@dataclass
+class CrossAttnPool:
+    """One physical cross-attention KV pool (possibly shared by several
+    sources whose ``CrossAttnKVConfig`` compare equal).
+
+    ``alloc_config`` is a synthesized ``KVCacheConfig`` carrying the
+    pool's page geometry so ``PagedAllocationManager`` and the FlashInfer
+    wrapper construction can reuse the self-attention code paths
+    unchanged.
+    """
+    config: CrossAttnKVConfig
+    alloc_config: "KVCacheConfig"
+    kv_cache: torch.Tensor
+    alloc_manager: "PagedAllocationManager"
+
 
 class PagedAllocationManager:
     def __init__(

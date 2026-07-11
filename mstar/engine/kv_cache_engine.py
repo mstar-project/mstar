@@ -25,6 +25,8 @@ from mstar.engine.cuda_graph_runner import (
 )
 from mstar.engine.kv_store import (
     AllocationFailedError,
+    CrossAttnKVConfig,
+    CrossAttnPool,
     KVCacheConfig,
     PagedAllocationManager,
     StoreWritePolicy,
@@ -45,6 +47,17 @@ class KVManagement:
     alloc_manager: PagedAllocationManager
     cpu_page_pool: CPUPagePool | None
     buffer_manager: WorkspaceBufferManager
+    # source name -> cross-attention context pool (see KVCacheConfig.cross_attn)
+    cross_pools: dict[str, CrossAttnPool] = field(default_factory=dict)
+
+    def _cross_alloc_managers(self):
+        """Distinct alloc managers across cross pools (pools may be shared
+        between sources; dedupe by identity for lifecycle calls)."""
+        seen = []
+        for pool in self.cross_pools.values():
+            if all(pool.alloc_manager is not m for m in seen):
+                seen.append(pool.alloc_manager)
+        return seen
 
 
 @dataclass
@@ -154,6 +167,42 @@ class KVCacheEngine(BaseEngine):
                     cfg.cpu_offload_pages,
                 )
 
+            # Cross-attention context pools: one physical pool per distinct
+            # CrossAttnKVConfig; sources with equal configs share a pool.
+            cross_pools: dict[str, CrossAttnPool] = {}
+            if cfg.cross_attn:
+                pool_by_config: dict[CrossAttnKVConfig, CrossAttnPool] = {}
+                for source, cross_cfg in cfg.cross_attn.items():
+                    pool = pool_by_config.get(cross_cfg)
+                    if pool is None:
+                        alloc_config = KVCacheConfig(
+                            num_layers=cross_cfg.num_layers or num_layers,
+                            num_kv_heads=cross_cfg.num_kv_heads,
+                            head_dim=cross_cfg.head_dim,
+                            max_seq_len=cross_cfg.max_context_len,
+                            max_num_pages=cross_cfg.max_num_pages,
+                            page_size=cross_cfg.page_size,
+                            num_qo_heads=cross_cfg.num_qo_heads or cfg.num_qo_heads,
+                        )
+                        cross_kv = torch.zeros(
+                            alloc_config.num_layers, alloc_config.max_num_pages, 2,
+                            alloc_config.page_size, alloc_config.num_kv_heads,
+                            alloc_config.head_dim,
+                            dtype=kv_cache_type, device=device,
+                        ).contiguous()
+                        pool = CrossAttnPool(
+                            config=cross_cfg,
+                            alloc_config=alloc_config,
+                            kv_cache=cross_kv,
+                            alloc_manager=PagedAllocationManager(
+                                config=alloc_config,
+                                kv_cache=cross_kv,
+                                transfer_engine_info=transfer_engine_info,
+                            ),
+                        )
+                        pool_by_config[cross_cfg] = pool
+                    cross_pools[source] = pool
+
             kv_mgmt = KVManagement(
                 kv_cache_config=cfg,
                 kv_cache=kv_cache,
@@ -167,6 +216,7 @@ class KVCacheEngine(BaseEngine):
                     int(os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")) * 1024 * 1024,
                     device=device,
                 ),
+                cross_pools=cross_pools,
             )
             self.kv_management[cfg.get_node_str()] = kv_mgmt
 
@@ -209,6 +259,7 @@ class KVCacheEngine(BaseEngine):
             device=self.device,
             auto_write_store=autowrite,
             enable_nvtx=self.enable_nvtx,
+            cross_pools=cache_mgmt.cross_pools,
         )
 
     def _compile_submodules(self) -> None:
@@ -1036,6 +1087,8 @@ class KVCacheEngine(BaseEngine):
     ) -> None:
         for submodule_mgmt in self.submodule_management.values():
             submodule_mgmt.kv_management.alloc_manager.add_request(request_id, cache_labels or ["main"])
+            for cross_mgr in submodule_mgmt.kv_management._cross_alloc_managers():
+                cross_mgr.add_request(request_id)
             submodule_mgmt.sampler.add_request(request_id)
             # Mirror into the cuda-graph runner's master sampler buffers so
             # the per-step path can index_select instead of rebuilding from
@@ -1049,6 +1102,8 @@ class KVCacheEngine(BaseEngine):
             if cache_mgmt.cpu_page_pool is not None:
                 cache_mgmt.cpu_page_pool.remove_request(request_id)
             cache_mgmt.alloc_manager.remove_request(request_id)
+            for cross_mgr in cache_mgmt._cross_alloc_managers():
+                cross_mgr.remove_request(request_id)
             submodule_mgmt.sampler.remove_request(request_id)
             if submodule_mgmt.cuda_graph_runner is not None:
                 submodule_mgmt.cuda_graph_runner.unregister_request(request_id)

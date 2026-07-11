@@ -27,7 +27,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
-from mstar.model.whisper.components.decoder import CrossKV, WhisperDecoderModel
+from mstar.model.whisper.components.decoder import WhisperDecoderModel
 from mstar.model.whisper.config import WhisperModelConfig
 from mstar.utils.sampling import SeenTokenMask
 
@@ -91,21 +91,23 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
     Dispatches on graph_walk:
       - prefill: embed the forced decoder prompt
         (``<|startoftranscript|><|lang|><|task|><|notimestamps|>``),
-        compute per-layer cross-attn K/V from ``encoder_states`` (stored
-        per request — they're static for the whole generation), fill the
-        self-attn KV cache, and emit logits for the first token.
+        compute per-layer cross-attn K/V from ``encoder_states`` and
+        write them into the engine's cross-attention context pool (they
+        are static for the whole generation), fill the self-attn KV
+        cache, and emit logits for the first token.
       - decode: embed the previous token, single-step decode.
 
-    Cross-attn K/V live on the submodule (keyed by request_id), not in
-    the engine's KV cache, so batching and CUDA graphs are disabled for
-    now — requests run one per step.
+    Cross-attn K/V live in the engine's per-source context pool (see
+    ``KVCacheConfig.cross_attn`` / issue #160); the write + plan happen
+    in ``preprocess`` so ``forward`` is pure planned compute. Requests
+    still run one per step (``can_batch`` False) — batching is now an
+    engine-side follow-up rather than blocked on submodule state.
     """
 
     def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig):
         super().__init__()
         self.decoder = decoder
         self.config = config
-        self._cross_kv: dict[str, list[CrossKV]] = {}
         self._suppress_ids: torch.Tensor | None = None
         self._begin_suppress_ids: torch.Tensor | None = None
 
@@ -158,46 +160,47 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         assert len(inputs) == 1, (
-            "WhisperDecoderSubmodule runs one request per step "
-            "(cross-attn K/V are per-request submodule state)."
+            "WhisperDecoderSubmodule runs one request per step."
         )
         cache_manager = engine_inputs.cache_manager
+        seq_lens = [inputs[0].input_seq_len]
         cache_manager.set_active_label("main")
         cache_manager.plan_attention(
-            seq_lens=[inputs[0].input_seq_len], is_causal=True, label="main",
+            seq_lens=seq_lens, is_causal=True, label="main",
         )
         # No plan_rope: Whisper has no RoPE (learned absolute positions).
 
-        out: dict[str, torch.Tensor | Any] = {
-            "input_embeds": inputs[0].input_embeds,
-        }
+        # Prefill: compute per-layer cross-attn K/V from the encoder output
+        # and write them into the engine's context pool — once per request;
+        # they are static for the whole generation.
         encoder_states = inputs[0].tensor_inputs.get("encoder_states")
         if encoder_states is not None:
-            out["encoder_states"] = encoder_states
-        return out
+            device = self.decoder.embed_tokens.weight.device
+            dtype = inputs[0].input_embeds.dtype
+            encoder_states = encoder_states.to(device=device, dtype=dtype)
+            with torch.no_grad():
+                cross_kvs = self.decoder.compute_cross_kv(encoder_states)
+            for layer_idx, (k, v) in enumerate(cross_kvs):
+                cache_manager.add_cross_attn_kv(
+                    engine_inputs.request_ids, k, v,
+                    layer_idx=layer_idx, label="main",
+                )
+
+        # Both prefill and decode attend to the full (fixed) context.
+        cache_manager.plan_cross_attention(q_seq_lens=seq_lens, label="main")
+
+        return {"input_embeds": inputs[0].input_embeds}
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor,
-        encoder_states: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        request_id = engine_inputs.request_ids[0]
-
-        if encoder_states is not None:
-            device = self.decoder.embed_tokens.weight.device
-            dtype = input_embeds.dtype
-            self._cross_kv[request_id] = self.decoder.compute_cross_kv(
-                encoder_states.to(device=device, dtype=dtype)
-            )
-        cross_kvs = self._cross_kv[request_id]
-
         hidden = self.decoder(
             input_embeds=input_embeds,
             cache_handle=engine_inputs.cache_manager,
-            cross_kvs=cross_kvs,
         )
         logits = self.decoder.lm_head(hidden[-1:])
         # The prefill step samples the first generated token.
@@ -236,5 +239,3 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             return {"decode_loop"}
         return set()
 
-    def cleanup_request(self, request_id: str):
-        self._cross_kv.pop(request_id, None)

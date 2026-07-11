@@ -92,6 +92,8 @@ class WhisperModel(Model):
     # -------------------------------------------------------------------
 
     def get_kv_cache_config(self) -> list[KVCacheConfig]:
+        from mstar.engine.kv_store import CrossAttnKVConfig
+
         return [KVCacheConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
@@ -103,6 +105,17 @@ class WhisperModel(Model):
             # request; 128 pages ≈ 32 concurrent requests at ~2.7 GB
             # (vs 43 GB with the 2048-page default).
             max_num_pages=128,
+            # Encoder-context pool for cross-attention (issue #160): the
+            # fixed 30 s window is max_source_positions (1500) tokens = 12
+            # pages per request; 192 pages ≈ 16 concurrent at ~4 GB.
+            cross_attn={
+                "default": CrossAttnKVConfig(
+                    num_kv_heads=self.config.decoder_attention_heads,
+                    head_dim=self.config.head_dim,
+                    max_context_len=self.config.max_source_positions,
+                    max_num_pages=192,
+                ),
+            },
         )]
 
     # -------------------------------------------------------------------

@@ -9,9 +9,10 @@ table added to the token embeddings by the submodule — so the
 self-attention subclass makes ``_apply_rope`` a no-op.
 
 Cross-attention K/V depend only on the (static) encoder output, so they
-are computed once per request at prefill via ``compute_cross_kv`` and
-re-used for every decode step; the engine's KV cache only holds the
-self-attention cache.
+are computed once per request at prefill (``compute_cross_kv``) and
+written into the engine's cross-attention context pool
+(``cache_handle.add_cross_attn_kv``); every step then runs the
+pre-planned ``cache_handle.run_cross_attn`` — see issue #160.
 
 HF checkpoint quirks handled here:
   * ``self_attn.out_proj`` → ``self_attn.o_proj`` (name_remapper in
@@ -42,7 +43,7 @@ class WhisperSelfAttention(Attention):
 
 
 class WhisperCrossAttention(nn.Module):
-    """Multi-head attention over precomputed encoder K/V."""
+    """Multi-head attention over the engine-managed encoder-context KV."""
 
     def __init__(self, hidden_size: int, num_heads: int, head_dim: int):
         super().__init__()
@@ -55,21 +56,19 @@ class WhisperCrossAttention(nn.Module):
         self.out_proj = nn.Linear(inner, hidden_size, bias=True)
 
     def compute_kv(self, encoder_states: torch.Tensor) -> CrossKV:
-        """(enc_len, hidden) -> per-head K/V, each (num_heads, enc_len, head_dim)."""
+        """(enc_len, hidden) -> K/V, each (enc_len, num_heads, head_dim)."""
         enc_len = encoder_states.shape[0]
         k = self.k_proj(encoder_states).view(enc_len, self.num_heads, self.head_dim)
         v = self.v_proj(encoder_states).view(enc_len, self.num_heads, self.head_dim)
-        return k.transpose(0, 1), v.transpose(0, 1)
+        return k, v
 
     def forward(
-        self, hidden_states: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        self, hidden_states: torch.Tensor, cache_handle: BatchedCacheManager,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
-        attn = F.scaled_dot_product_attention(
-            q.transpose(0, 1), k.to(q.dtype), v.to(q.dtype),
-        )  # (num_heads, num_tokens, head_dim)
-        attn = attn.transpose(0, 1).reshape(num_tokens, self.num_heads * self.head_dim)
+        attn = cache_handle.run_cross_attn(q)
+        attn = attn.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.out_proj(attn)
 
 
@@ -99,7 +98,6 @@ class WhisperDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cache_handle: BatchedCacheManager,
-        cross_kv: CrossKV,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -107,7 +105,7 @@ class WhisperDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.encoder_attn_layer_norm(hidden_states)
-        hidden_states = residual + self.encoder_attn(hidden_states, *cross_kv)
+        hidden_states = residual + self.encoder_attn(hidden_states, cache_handle)
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -156,11 +154,10 @@ class WhisperDecoderModel(nn.Module):
         self,
         input_embeds: torch.Tensor,
         cache_handle: BatchedCacheManager,
-        cross_kvs: list[CrossKV],
     ) -> torch.Tensor:
         hidden_states = input_embeds
         for layer_idx, layer in enumerate(self.layers):
             cache_handle.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states, cache_handle, cross_kvs[layer_idx])
+            hidden_states = layer(hidden_states, cache_handle)
         cache_handle.advance_seq_lens()
         return self.layer_norm(hidden_states)
