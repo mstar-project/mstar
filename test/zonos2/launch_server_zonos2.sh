@@ -27,6 +27,27 @@ echo "ZONOS2_MODEL_PATH=$ZONOS2_MODEL_PATH"
 
 export ZONOS2_MODEL_PATH  # read by mstar.model.registry for model_path_hf
 
+SOCKET_DIR="/tmp/mstar_${WHO}/"
+
+# Killed/crashed server runs leave orphaned multiprocessing launchers behind
+# (reparented to init) plus their .ipc socket files. New requests then connect
+# to a dead socket and hang until timeout. Consider implementing this in other scripts
+
+cleanup_stale_server() {
+    local orphans
+    orphans=$(ps -o pid=,ppid=,cmd= -u "$WHO" 2>/dev/null \
+        | awk '$2==1 && /multiprocessing\.(resource_tracker|spawn)/ && /(mstar|ZONOS2)\/\.venv/ {print $1}')
+    if [ -n "$orphans" ]; then
+        echo "Reaping stale mstar orphans:" $orphans
+        kill -9 $orphans 2>/dev/null || true
+    fi
+    if compgen -G "${SOCKET_DIR}*.ipc" > /dev/null; then
+        echo "Purging stale sockets in $SOCKET_DIR"
+        rm -f "${SOCKET_DIR}"*.ipc
+    fi
+}
+cleanup_stale_server
+
 CUDA_VISIBLE_DEVICES="$DEVICES" python mstar/api_server/entrypoint.py \
     --config "$CONFIG" \
     --port "$PORT" \

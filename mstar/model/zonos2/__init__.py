@@ -1,14 +1,12 @@
-"""Zonos2: multi-codebook autoregressive TTS transformer.
+"""Zonos2: multi-codebook autoregressive TTS.
 
-This package implements the Zonos2 model architecture (see
-``ARCHITECTURE.md`` and ``../ZONOS2/docs/tts_architecture.md``) on top of
-the reusable ``mstar.model.components`` building blocks.
+Implements the Zonos2 model architecture, together with the surrounding
+TTS serving stack: the byte tokenizer / prompt builder (``prompt``), the
+multi-codebook sampler (``tts_sampling``), the streaming DAC vocoder
+(``vocoder``), and the ``Model``-ABC graph-walk wiring (``zonos2_model``).
 
-The scope here is the transformer network itself — :class:`Zonos2ForCausalLM`
-maps multi-codebook frame tokens to per-codebook logits. The surrounding
-TTS serving stack (byte tokenizer / prompt builder, TTS sampler, DAC
-vocoder, and the ``Model``-ABC graph-walk wiring) is intentionally out of
-scope for this module.
+:class:`Zonos2ForCausalLM` is the transformer core — it maps multi-codebook
+frame tokens to per-codebook logits.
 """
 from mstar.model.zonos2.config import Zonos2Config
 from mstar.model.zonos2.components.language_model import Zonos2ForCausalLM

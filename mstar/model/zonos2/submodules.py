@@ -9,8 +9,6 @@
 
 * :class:`Zonos2DACSubmodule` — a stateless audio-codec node that consumes
   streamed frames and emits PCM via the DAC vocoder.
-
-Mirrors the structure of ``mstar/model/orpheus/submodules.py`` (LLM + SNAC).
 """
 from __future__ import annotations
 
@@ -48,7 +46,6 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         text_vocab: int,
         eoa_id: int,
         params: TTSSamplingParams,
-        eos_require_leading_codebook: bool = True,
     ):
         super().__init__()
         self.model = model
@@ -56,7 +53,6 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         self.text_vocab = text_vocab
         self.eoa_id = eoa_id
         self.params = params
-        self.eos_require_leading_codebook = eos_require_leading_codebook
 
         # Per-request state.
         self._history: dict[str, torch.Tensor] = {}   # (N, n_codebooks) recent codes
@@ -175,20 +171,15 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
             request_id, {"step": -1, "eos_frame": None, "countdown": 0}
         )
         st["step"] += 1
-        # EOS -> align frame + start countdown. Codebook 0 is undelayed and
-        # leads the end-of-audio signal, so a *delayed* codebook (1..C-1)
-        # emitting eoa on its own is spurious and would end the utterance early
-        # (audio cut before the last word). Gate the stop on the leading
-        # codebook; ``eos_require_leading_codebook=False`` restores the legacy
-        # "any codebook" trigger.
+        # EOS detection matches the reference (zonos2 ``tts/sequence.py``): the
+        # first frame in which *any* codebook emits eoa starts a delayed stop
+        # countdown. The aligned end frame is shifted back by the highest eoa
+        # codebook index (that codebook is delayed by its index under the
+        # inter-codebook shear) and clamped at zero.
         if not self.params.ignore_eos and st["eos_frame"] is None:
             eos_cols = [i for i in range(self.n_codebooks) if audio[i] == self.eoa_id]
-            if self.eos_require_leading_codebook:
-                triggered = audio[0] == self.eoa_id
-            else:
-                triggered = bool(eos_cols)
-            if triggered:
-                st["eos_frame"] = max(0, st["step"] - (max(eos_cols) if eos_cols else 0))
+            if eos_cols:
+                st["eos_frame"] = max(0, st["step"] - max(eos_cols))
                 st["countdown"] = self.n_codebooks + 1
         if st["eos_frame"] is not None and st["countdown"] > 0:
             st["countdown"] -= 1
@@ -209,9 +200,7 @@ class Zonos2DACSubmodule(NodeSubmodule):
     """Stateless DAC vocoder node.
 
     Consumes streamed frames (per request) and emits int16 PCM chunks. Runs
-    incrementally via :class:`StreamingDacDecoder`, which re-decodes a few
-    frames of left context and overlap-add crossfades each chunk boundary so
-    the convolutional decoder does not click at chunk edges. On the final
+    incrementally via :class:`StreamingDacDecoder`. On the final
     chunk (``request_id in engine_inputs.final_stream_rids``) it flushes the
     withheld crossfade tail; the trailing ``n_codebooks - 1`` shear-alignment
     frames carry no audio of their own and are dropped.

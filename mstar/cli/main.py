@@ -83,6 +83,9 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model in ("orpheus", "qwen3_omni"):
         voice = "tara" if model == "orpheus" else "Ethan"
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
+    if model == "zonos2":
+        # Zonos2 has no built-in voices yet (speaker conditioning is disabled).
+        lines.append("    client.tts(\"Hello there\").to_wav(\"out.wav\")")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")

@@ -373,7 +373,6 @@ class Zonos2Model(Model):
             text_vocab=self.config.text_vocab,
             eoa_id=self.config.eoa_id,
             params=self.sampling_params,
-            eos_require_leading_codebook=self.config.eos_require_leading_codebook,
         )
 
     def _create_dac_submodule(self, device):
