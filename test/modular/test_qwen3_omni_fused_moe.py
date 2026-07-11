@@ -1,10 +1,9 @@
 """Parity tests for the Triton fused MoE dispatch vs the naive path.
 
-Skips automatically when CUDA or ``sgl-kernel`` is unavailable (both are
-required for the fused kernel).  The naive path in
-``_dispatch_experts_fused`` runs on CPU, but we need CUDA bf16 tensors
-to exercise the Triton kernels, so the comparison is done entirely on
-GPU.
+Skips automatically when CUDA is unavailable (required for the fused
+kernel).  The naive path in ``_dispatch_experts_fused`` runs on CPU, but
+we need CUDA bf16 tensors to exercise the Triton kernels, so the
+comparison is done entirely on GPU.
 
 Problem shapes mirror the live Qwen3-Omni configs:
 
@@ -26,14 +25,8 @@ import torch
 
 from mstar.model.components import GatedMLP, SparseMoeBlock, SparseMoeBlockWithSharedExpert
 from mstar.model.components.moe import dispatch_experts_fused as _dispatch_experts_fused
-from mstar.utils.fused_moe.align import has_sgl_kernel
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="fused MoE requires CUDA")
-
-
-def _skip_if_no_sgl_kernel():
-    if not has_sgl_kernel():
-        pytest.skip("sgl-kernel not installed; fused MoE path unavailable")
 
 
 def _random_router_output(
@@ -76,7 +69,6 @@ def _seed():
     ],
 )
 def test_fused_experts_numerical_parity(num_tokens, hidden, inter, num_experts, top_k):
-    _skip_if_no_sgl_kernel()
     from mstar.utils.fused_moe import fused_experts
 
     device = torch.device("cuda")
@@ -117,8 +109,6 @@ def test_fused_experts_numerical_parity(num_tokens, hidden, inter, num_experts, 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 16])
 def test_thinker_block_parity(num_tokens):
-    _skip_if_no_sgl_kernel()
-
     hidden = 2048
     inter = 768
     num_experts = 128
@@ -160,8 +150,6 @@ def test_thinker_block_parity(num_tokens):
 def test_talker_block_parity(num_tokens):
     """Talker block adds a shared expert + sigmoid gate on top of the routed
     dispatch.  Both shared and routed halves are exercised end-to-end."""
-    _skip_if_no_sgl_kernel()
-
     hidden = 1024
     inter = 384
     num_experts = 128
@@ -206,13 +194,13 @@ def test_talker_block_parity(num_tokens):
 
 
 # ------------------------------------------------------------------
-# Sanity checks that don't require sgl-kernel
+# Sanity check for the naive dispatch path
 # ------------------------------------------------------------------
 
 
 def test_dispatch_experts_fused_sanity_cuda():
     """The naive path must still work on CUDA so the fallback is viable
-    when sgl-kernel is missing."""
+    when the fused path is unavailable."""
     hidden = 64
     inter = 48
     num_experts = 4

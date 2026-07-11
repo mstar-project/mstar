@@ -579,7 +579,8 @@ class BagelModel(Model):
 
     def postprocess(
         self, output: torch.Tensor,
-        modality: str # text | image | video | audio
+        modality: str, # text | image | video | audio
+        request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
             detok = self.tokenizer.decode(output)

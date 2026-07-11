@@ -5,8 +5,9 @@ Replaces the naive per-expert Python loop in
 grouped-GEMM implementation adapted from sglang's ``fused_moe_triton``.
 
 Only the bf16 / fp16 unquantized path is provided.  The entry point is
-:func:`fused_experts`; if its dependency ``sgl_kernel`` is not installed
-the import fails and callers fall back to the naive dispatch.
+:func:`fused_experts`; if triton is not installed the import fails and
+callers fall back to the naive dispatch.  The token-alignment step uses a
+vendored CUDA kernel (JIT-built on first use) with a torch fallback.
 """
 from __future__ import annotations
 

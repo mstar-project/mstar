@@ -26,7 +26,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components import ParallelSparseMoeBlock, RMSNorm
 from mstar.model.components.distributed import ParallelGatedMLP
@@ -48,7 +48,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
 
     def __init__(
         self, config: Qwen3OmniModelConfig, layer_idx: int,
-        comm_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
     ):
         super().__init__()
         tc = config.thinker_text
@@ -138,7 +138,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
 class Qwen3OmniThinkerTextModel(nn.Module):
     """Inner text model (maps to ``thinker.model.*`` in HF weights)."""
 
-    def __init__(self, config: Qwen3OmniModelConfig, comm_group: TPCommGroup | None = None):
+    def __init__(self, config: Qwen3OmniModelConfig, comm_group: CommGroup | None = None):
         super().__init__()
         tc = config.thinker_text
         self.embed_tokens = nn.Embedding(tc.vocab_size, tc.hidden_size)
@@ -165,7 +165,7 @@ class Qwen3OmniThinkerModel(nn.Module):
     - Layer-N hidden states (``accept_hidden_layer``) for Talker conditioning
     """
 
-    def __init__(self, config: Qwen3OmniModelConfig, comm_group: TPCommGroup | None = None):
+    def __init__(self, config: Qwen3OmniModelConfig, comm_group: CommGroup | None = None):
         super().__init__()
         tc = config.thinker_text
 

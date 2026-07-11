@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.distributed.communication import WorkerTPGroups
+from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.base import (
     BaseEngine,
     EngineType,
@@ -168,7 +168,7 @@ class StatelessEngine(BaseEngine):
     def load_model(
         self,
         submodules: dict[str, torch.nn.Module],
-        tp_groups: WorkerTPGroups,
+        parallel_groups: WorkerParallelGroups,
         device: torch.device,
         **kwargs,
     ) -> None:
@@ -178,7 +178,7 @@ class StatelessEngine(BaseEngine):
         else:
             self.submodules = dict(submodules)
         self.device = device
-        self.tp_groups = tp_groups
+        self.parallel_groups = parallel_groups
         # Default every node to an empty runner map so execute paths can index
         # ``self._piecewise_runners[node_name]`` directly; warmup overwrites
         # entries for nodes that capture piecewise graphs.
@@ -226,7 +226,7 @@ class StatelessEngine(BaseEngine):
                 f"engine.{self.config.name}.{batch.node_name}."
                 f"{batch.graph_walk}.bs{len(batch.request_ids)}"
             )
-        self.tp_groups.get_tp_config_for_node(batch.node_name).barrier()
+        self.parallel_groups.get_tp_config_for_node(batch.node_name).barrier()
         submodule = self.submodules.get(batch.node_name)
         per_submodule_dtype = submodule.get_autocast_dtype() if submodule is not None else None
         try:
@@ -278,7 +278,9 @@ class StatelessEngine(BaseEngine):
         submodule = planned.submodule
         if submodule is None:
             return
-        for rid in planned.batch.request_ids:
+        for rid, node_inputs in zip(
+            planned.batch.request_ids, planned.node_inputs, strict=True
+        ):
             info = planned.batch.per_request_info.get(rid)
             if info is None:
                 continue
@@ -286,6 +288,7 @@ class StatelessEngine(BaseEngine):
                 request_id=rid,
                 request_info=info,
                 outputs=output.per_request_output_tensors.get(rid, {}),
+                inputs=node_inputs,
             )
 
     # ─── Internals ─────────────────────────────────────────────────────
@@ -436,6 +439,9 @@ class StatelessEngine(BaseEngine):
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
             piecewise_runners=self._piecewise_runners[batch.node_name],
+            per_request_states={
+                rid: submodule.request_state(rid) for rid in batch.request_ids
+            },
         )
 
         if self.enable_nvtx:
@@ -531,6 +537,12 @@ class StatelessEngine(BaseEngine):
                 self._install_piecewise_runner(node_name, submodule)
 
     def _apply_torch_compile(self, node_name: str, submodule: NodeSubmodule) -> None:
+        if getattr(submodule, "disable_torch_compile", False):
+            logger.info(
+                "StatelessEngine[%s]: torch.compile disabled for %s (submodule opt-out)",
+                self.config.name, node_name,
+            )
+            return
         try:
             if hasattr(submodule, "forward"):
                 submodule.forward = torch.compile(
@@ -564,7 +576,7 @@ class StatelessEngine(BaseEngine):
                 submodule_name=node_name,
                 submodule=submodule,
                 device=self.device,
-                tp_group=self.tp_groups.get_tp_config_for_node(node_name)
+                tp_group=self.parallel_groups.get_tp_config_for_node(node_name)
             )
             runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()
@@ -590,7 +602,7 @@ class StatelessEngine(BaseEngine):
         # would fail its own assert and be skipped (eager path) by the builder.
         from mstar.engine.cuda_graph_runner import build_piecewise_runners
 
-        tp_config = self.tp_groups.get_tp_config_for_node(node_name)
+        tp_config = self.parallel_groups.get_tp_config_for_node(node_name)
         self._piecewise_runners[node_name] = build_piecewise_runners(
             submodule=submodule,
             device=self.device,

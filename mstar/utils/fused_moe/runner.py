@@ -86,7 +86,7 @@ def fused_experts(
     assert two_inter == 2 * inter, f"w1 dim[1] {two_inter} != 2 * w2 dim[2] {2 * inter}"
 
     top_k = topk_ids.shape[1]
-    # sgl_kernel's moe_align_block_size expects int32; torch.topk returns int64.
+    # moe_align_block_size expects int32; torch.topk returns int64.
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
 
