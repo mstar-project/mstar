@@ -1,4 +1,0 @@
-EMIT_TO_CLIENT = "emit_to_client"
-EMPTY_DESTINATION = ""
-
-SPECIAL_DESTINATIONS = {EMIT_TO_CLIENT, EMPTY_DESTINATION}  # add STREAM variants etc. later
