@@ -425,17 +425,23 @@ class Parallel(GraphSection):
         loop_back: set[NameAndDest] = set()
         ext_outputs: list[GraphEdge] = []
 
-        nodes = set(self.get_nodes().keys())
-        for sec in self.sections:
-            sec_io = sec.get_inputs_outputs()
-
-            sec_io.ext_inputs = set({(name, dest) for name, dest in sec_io.ext_inputs if dest not in nodes})
-            sec_io.loop_back |= set({(name, dest) for name, dest in sec_io.ext_inputs if dest in nodes})
-            sec_io.ext_outputs = [edge for edge in sec_io.ext_outputs  if edge.next_node not in nodes]
-
-            ext_inputs.update(sec_io.ext_inputs)
-            loop_back.update(sec_io.loop_back)
-            ext_outputs.extend(sec_io.ext_outputs)
+        sec_ios = [sec.get_inputs_outputs() for sec in self.sections]
+        # An edge is internal to the Parallel only when one member produces it
+        # and a member consumes it (matched by (name, destination) pair). A
+        # member input fed from outside the Parallel stays external even though
+        # its destination is a member node.
+        produced = {
+            (edge.name, edge.next_node) for io in sec_ios for edge in io.ext_outputs
+        }
+        consumed = {pair for io in sec_ios for pair in io.ext_inputs}
+        internal = produced & consumed
+        for io in sec_ios:
+            loop_back |= io.loop_back
+            ext_inputs |= io.ext_inputs - internal
+            ext_outputs.extend(
+                edge for edge in io.ext_outputs
+                if (edge.name, edge.next_node) not in internal
+            )
         return NodeInputsOutputs(ext_inputs=ext_inputs, ext_outputs=ext_outputs, loop_back=loop_back)
 
 

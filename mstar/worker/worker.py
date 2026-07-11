@@ -18,7 +18,7 @@ from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
-from mstar.distributed.communication import WorkerTPGroups
+from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.base import EngineType, NodeBatch, NodeOutput
 from mstar.engine.kv_store import KVCacheConfig, StoreWritePolicy, TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode
@@ -125,7 +125,7 @@ class Worker:
         all_worker_graph_ids_to_nodes: dict[str, set[str]],
         all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
         sharding_config: ShardingConfig,
-        tp_groups: WorkerTPGroups,
+        parallel_groups: WorkerParallelGroups,
         hostname: str = "localhost",
         socket_path_prefix: str = "/tmp/mstar",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
@@ -153,8 +153,8 @@ class Worker:
         if dist_init_method is None:
             dist_init_method = f"tcp://{hostname}:29500"
 
-        self.tp_groups = tp_groups
-        self.tp_groups.init_dist(init_method=dist_init_method)
+        self.parallel_groups = parallel_groups
+        self.parallel_groups.init_dist(init_method=dist_init_method)
 
         # Build node_to_partition mapping from model's partitions and graph walks
         node_to_partition: dict[str, str] = {}
@@ -195,7 +195,7 @@ class Worker:
             device=device,
             kv_config=kv_config,
             model_config=model_config,
-            tp_groups=self.tp_groups,
+            parallel_groups=self.parallel_groups,
             transfer_engine_info=TransferEngineInfo(
                 my_entity_id=worker_id,
                 my_session_id=self.tensor_manager.my_session_id,
@@ -226,25 +226,40 @@ class Worker:
             worker_id=self.worker_id
         )
 
-        self.tp_rank_zero_nodes = set([
-            node for node in node_names if self.tp_groups.get_tp_config_for_node(node).rank == 0
+        # The lockstep unit for a node is its whole instance: the tensor-parallel
+        # row composed with the sequence-parallel column. Exactly one rank per
+        # instance — instance rank 0, i.e. rank 0 in BOTH its TP and SP comm
+        # groups — leads scheduling and broadcasts ScheduleTPNode to the rest;
+        # every other instance rank follows. Keying the leader off the TP rank
+        # alone would elect one leader per TP row (e.g. ranks 0 and 2 of a
+        # tp2*sp2 instance), racing the followers and desyncing the per-step
+        # graph walk.
+        self.parallel_leader_nodes = set([
+            node for node in node_names
+            if self.parallel_groups.get_instance_rank_for_node(node) == 0
         ])
 
-        # v1: disallow multiple TP nodes in the same worker
-        self.tp_nodes = set([
-            node for node in node_names if self.tp_groups.get_tp_config_for_node(node).world_size > 1
+        # v1: disallow multiple lockstep-scheduled nodes in the same worker.
+        # A node is lockstep-scheduled when its instance spans more than one rank,
+        # i.e. tp_size * sp_size > 1. Pure sequence-parallel nodes (tp_size 1,
+        # sp_size > 1) need this too: their attention all-to-all requires the
+        # whole instance to step together. Without SP this is just tp_size > 1.
+        self.parallel_nodes = set([
+            node for node in node_names
+            if self.parallel_groups.get_instance_world_size_for_node(node) > 1
         ])
-        if len(self.tp_nodes) > 1:
+        if len(self.parallel_nodes) > 1:
             raise NotImplementedError(
-                f"Multiple TP nodes {self.tp_nodes} found in worker {worker_id}; "
-                "current implementation requires at most one TP node per worker."
+                f"Multiple parallel nodes {self.parallel_nodes} found in worker "
+                f"{worker_id}; current implementation requires at most one "
+                "lockstep-parallel node per worker."
             )
 
-        self.is_tp_follower = len(self.tp_nodes - self.tp_rank_zero_nodes) > 0
+        self.is_tp_follower = len(self.parallel_nodes - self.parallel_leader_nodes) > 0
 
         self.scheduler = MicroScheduler(
             self.engine_manager,
-            tp_rank_zero_nodes=self.tp_rank_zero_nodes
+            parallel_leader_nodes=self.parallel_leader_nodes
         )
 
         # Determine store write policy based on worker graph topology
@@ -882,8 +897,8 @@ class Worker:
     def maybe_send_zmq_to_tp_followers(
         self, node_batch: NodeBatch
     ):
-        if node_batch.node_name not in self.tp_nodes or \
-                node_batch.node_name not in self.tp_rank_zero_nodes:
+        if node_batch.node_name not in self.parallel_nodes or \
+                node_batch.node_name not in self.parallel_leader_nodes:
             return
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
@@ -1283,8 +1298,8 @@ class Worker:
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if any(
             not node.enable_async_scheduling for node in batch.node_objects.values()
-        ) or batch.node_name in self.tp_nodes:
-            # disable speculation for TP nodes for now
+        ) or batch.node_name in self.parallel_nodes:
+            # disable speculation for lockstep-parallel nodes for now
             return False
         return True
 
@@ -1347,8 +1362,9 @@ class Worker:
 
         # Filter out destinations that aren't speculation candidates.
         #
-        # * ``info.node_name in self.tp_nodes`` — TP nodes don't support
-        #   speculation in v1 (rank-0 schedules; followers can't initiate).
+        # * ``info.node_name in self.parallel_nodes`` — lockstep-parallel nodes
+        #   don't support speculation in v1 (the instance leader schedules;
+        #   followers can't initiate).
         # * ``not wgio.nodes[info.node_name].enable_async_scheduling`` — the
         #   destination node opts out of async scheduling. Mirrors the
         #   source-side check in ``_can_speculate``; without this, a
@@ -1357,7 +1373,7 @@ class Worker:
         #   then dropped per-rid further down.
         ready_for_spec = [
             info for info in ready_for_spec
-            if info.node_name not in self.tp_nodes
+            if info.node_name not in self.parallel_nodes
             and wgio.nodes[info.node_name].enable_async_scheduling
         ]
 
@@ -1603,17 +1619,27 @@ class Worker:
                         or pending_stop.rid not in batch_N.node_batch.request_ids:
                     continue
                 stopped_rid = pending_stop.rid
-                if stopped_rid not in batch_N.batch.node_objects:
-                    continue
                 output.per_request_output_tensors.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
-                batch_N.batch.node_objects.pop(stopped_rid)
-                batch_N.batch.request_to_worker_graph.pop(stopped_rid)
-                batch_N.node_batch.per_request_info.pop(stopped_rid)
+                batch_N.batch.node_objects.pop(stopped_rid, None)
+                batch_N.batch.request_to_worker_graph.pop(stopped_rid, None)
+                batch_N.node_batch.per_request_info.pop(stopped_rid, None)
         batch_N.node_batch.request_ids = list(valid_rids)
+        if not valid_rids:
+            range_pop(synchronize=False)
+            return
 
         # pending stops are only needed for one iteration, so can be cleared now
         self._pending_loop_stops.clear()
+
+        # An engine can drop rids that were skipped during execution (a
+        # submodule's prepare_inputs returned None) from node_batch.request_ids,
+        # but it cannot reach the worker-side ScheduledBatch. Reconcile it here so
+        # the routing/output loops below only touch rids that produced outputs.
+        for rid in list(batch_N.batch.request_to_worker_graph):
+            if rid not in valid_rids:
+                batch_N.batch.request_to_worker_graph.pop(rid, None)
+                batch_N.batch.node_objects.pop(rid, None)
 
         per_req_nested_idxs = {
             rid: self.worker_graphs_manager.get_nested_loop_idxs_for_node(
@@ -1917,7 +1943,7 @@ class Worker:
         # large multi-tower models. Syncing here means every worker
         # reaches warmup at the same wall-clock instant, so subgroup
         # bootstrap completes within the retry budget.
-        self.tp_groups.barrier_all()
+        self.parallel_groups.barrier_all()
 
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
@@ -1931,7 +1957,7 @@ class Worker:
         # ``ScheduleTPNode`` to a follower that's still inside another
         # engine's ``warmup``. The follower can't service the message
         # yet, but the leader will sit on the first NCCL collective.
-        self.tp_groups.barrier_all()
+        self.parallel_groups.barrier_all()
 
         # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main

@@ -16,12 +16,9 @@ dependencies = [
     "pyzmq",
     "python-multipart",
     "requests",
-    # PyTorch 2.9 is pinned: sgl-kernel (Qwen3-Omni) is built against torch 2.9,
-    # and newer torch defaults to CUDA 13 wheels. See docs/installation.rst for
-    # installing the build that matches your CUDA toolkit (e.g. cu128).
-    "torch==2.9.1",
-    "torchvision==0.24.1",
-    "torchaudio==2.9.1",
+    "torch>=2.9.1",
+    "torchvision>=0.24.1",
+    "torchaudio>=2.9.1",
     "uvicorn",
     "gdown",
     "datasets",
@@ -53,7 +50,28 @@ bagel = [
     "safetensors",
     "torchvision",
     "torchaudio",
-    "torchcodec==0.8.*",
+    "torchcodec",
+    "transformers",
+]
+
+cosmos3 = [
+    # PyAV backs torchvision's write_video, the video-container fallback used
+    # when torchcodec is too old to ship VideoEncoder (< 0.9).
+    "av",
+    # The Cosmos3 reference pipeline (used by the parity tests) landed in
+    # diffusers 0.39; serving itself uses AutoencoderKLWan and the scheduler.
+    "diffusers>=0.39",
+    # bs=1 dense attention fast path. The wheel is ABI-tied to the torch/CUDA
+    # build; on a mismatch the engine logs a warning and falls back to the
+    # paged flashinfer backend. See docs/models.rst.
+    "fa3-fwd",
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "mooncake-transfer-engine",
+    "Pillow",
+    "safetensors",
+    "torchvision",
+    "torchcodec",
     "transformers",
 ]
 
@@ -71,10 +89,10 @@ qwen3_omni = [
     "numba>=0.61",
     "torchvision",
     "torchaudio",
-    "torchcodec==0.8.*",
+    "torchcodec",
     "transformers",
     "datasets",
-    "sgl-kernel",
+    "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
 ]
 
 orpheus = [
@@ -99,7 +117,7 @@ vjepa2 = [
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
-    "torchcodec==0.8.*",
+    "torchcodec",
 ]
 
 vjepa2_ac = [
@@ -107,7 +125,7 @@ vjepa2_ac = [
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
-    "torchcodec==0.8.*",
+    "torchcodec",
 ]
 
 # ASR models: Whisper-large-v3, Higgs Audio, Voxtral
@@ -127,6 +145,9 @@ all = [
     "ruff",
     "pytest",
     "soundfile",
+    "av",
+    "diffusers>=0.39",
+    "fa3-fwd",
     "einops",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
@@ -136,13 +157,13 @@ all = [
     "safetensors",
     "torchvision",
     "torchaudio",
-    "torchcodec==0.8.*",
+    "torchcodec",
     "transformers",
     "safetensors",
     "triton",
     "qwen-omni-utils",
     "numba>=0.61",
-    "sgl-kernel",
+    "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
     # separately, see docs/installation.rst.
     "jiwer",
@@ -152,6 +173,10 @@ all = [
 where = ["."]
 include = ["mstar*"]
 exclude = ["tests*", "benchmark*", "examples*"]
+
+# Ship the vendored CUDA source so it can be JIT-compiled on first use.
+[tool.setuptools.package-data]
+"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
 
 [tool.ruff]
 exclude = [".git", ".ruff_cache", ".venv", "ref"]

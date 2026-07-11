@@ -463,7 +463,7 @@ class Food101Dataset(BaseDataset):
         self,
         num_requests: int = 100,
         req_type: RequestType = RequestType.I2T,
-        prompts: list[str] = FOOD101_IMAGE_PROMPTS,
+        prompts: list[str] | None = None,
         split: str = "validation",
         cache_dir: str | None = None,
     ):
@@ -474,6 +474,15 @@ class Food101Dataset(BaseDataset):
         from datasets import load_dataset
 
         self._num_requests = num_requests
+        # I2I edits the image, so it needs edit instructions; I2T/I2S ask a
+        # question about it. Using the understanding prompts for I2I makes the
+        # model render the "answer" as text onto the output image.
+        if prompts is None:
+            prompts = (
+                FOOD101_IMAGE_GEN_PROMPTS
+                if req_type == RequestType.I2I
+                else FOOD101_IMAGE_PROMPTS
+            )
         self.prompts = prompts
 
         raw = load_dataset(

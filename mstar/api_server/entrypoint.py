@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -151,6 +151,8 @@ class PendingRequest:
     chunks: list[ResultChunk] = field(default_factory=list)
     final_outputs: dict = field(default_factory=dict)
     consumed_chunks: int = 0
+    error: Any | None = None
+    error_status: int = 500
 
 
 class APIServer:
@@ -304,29 +306,37 @@ class APIServer:
 
     def _prune_recently_completed(self) -> None:
         now = time.time()
-        stale = [
-            rid
-            for rid, ts in self.recently_completed.items()
-            if (
-                (not self.preprocess_worker.has_pending_tensors(rid)) \
-                    and self.preprocess_worker.received_final_chunks(
-                        rid, self.pending_requests[rid].final_outputs
-                    )
-            ) or (now - ts) >= self._recently_completed_ttl
-        ]
+        stale = []
+        for rid, ts in self.recently_completed.items():
+            # The client handler pops pending_requests on its own timeout (and
+            # a streaming client after its final flush), so the entry can be
+            # gone while the rid is still here — clean up immediately then,
+            # instead of KeyError-ing the whole message-processing tick.
+            req = self.pending_requests.get(rid)
+            drained = (
+                req is not None
+                and not self.preprocess_worker.has_pending_tensors(rid)
+                and self.preprocess_worker.received_final_chunks(
+                    rid, req.final_outputs
+                )
+            )
+            if drained or req is None or (now - ts) >= self._recently_completed_ttl:
+                stale.append(rid)
         for rid in stale:
             # only set the event when there are no more pending chunks
-            self.pending_requests[rid].event.set()
-            # Snapshot the data worker's tx/rx now: the request is done (all
-            # final chunks received), so the worker thread is no longer mutating
-            # this rid's transport state, and we must read it before
-            # cleanup_request drops it. Extends so it combines with the
-            # conductor's worker-side transfers (set in the request_complete
-            # handler).
-            if self.log_stats:
-                profile = self.pending_requests[rid].profile
-                profile.tx_info.extend(self.preprocess_worker.get_tx_info(rid))
-                profile.rx_info.extend(self.preprocess_worker.get_rx_info(rid))
+            req = self.pending_requests.get(rid)
+            if req is not None:
+                req.event.set()
+                # Snapshot the data worker's tx/rx now: the request is done (all
+                # final chunks received), so the worker thread is no longer mutating
+                # this rid's transport state, and we must read it before
+                # cleanup_request drops it. Extends so it combines with the
+                # conductor's worker-side transfers (set in the request_complete
+                # handler).
+                if self.log_stats:
+                    profile = req.profile
+                    profile.tx_info.extend(self.preprocess_worker.get_tx_info(rid))
+                    profile.rx_info.extend(self.preprocess_worker.get_rx_info(rid))
             self.preprocess_worker.cleanup_request(rid)
             self.recently_completed.pop(rid, None)
 
@@ -358,6 +368,13 @@ class APIServer:
                             elif message.message_type == "request_complete":
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
+
+                                if not message.body.final_outputs:
+                                    logger.warning(
+                                        "Request %s completed with no reported "
+                                        "outputs; holding for late results "
+                                        "until the cleanup TTL", rid,
+                                    )
                                 req = self.pending_requests[rid]
                                 req.final_outputs = message.body.final_outputs
                                 req.profile.timing.conductor_ingest_time = \
@@ -371,9 +388,18 @@ class APIServer:
                                 req.profile.rx_info.extend(message.body.rx_info)
                                 req.profile.tx_info.extend(message.body.tx_info)
                         elif rid in self.recently_completed:
-                            logger.debug("Late message for completed %s: %s", rid, message.message_type)
                             if message.message_type == "result_tensors":
                                 self.preprocess_worker.discard_result_tensors(message.body)
+                                # The client already finished (popped the
+                                # request), so these tensors have no delivery
+                                # path — the completion-vs-results reorder
+                                # window was hit.
+                                logger.warning(
+                                    "Result tensors for %s arrived after the "
+                                    "client finished; dropping them", rid,
+                                )
+                            else:
+                                logger.debug("Late message for completed %s: %s", rid, message.message_type)
                         else:
                             logger.warning(
                                 "Message for unknown request %s: %s", rid, message.message_type
@@ -398,12 +424,30 @@ class APIServer:
                     )
                     rid = result_chunk.request_id
                     with self.request_lock:
-                        req = self.pending_requests[rid]
+                        req = self.pending_requests.get(rid)
+                        if req is None:
+                            # Client already finished (timeout/pop); don't let a
+                            # late chunk KeyError abort the processing tick.
+                            logger.warning(
+                                "Result chunk for %s arrived after the client "
+                                "finished; dropping it", rid,
+                            )
+                            continue
                         now = time.perf_counter()
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
                         req.chunks.append(result_chunk)
+
+                        if result_chunk.modality == "error":
+                            # Preprocessing failed before the request reached
+                            # the conductor; release the waiting client with
+                            # the error instead of letting it time out.
+                            req.error = result_chunk.data.decode("utf-8", "replace")
+                            req.error_status = int(
+                                (result_chunk.metadata or {}).get("status", 500)
+                            )
+                            req.event.set()
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
@@ -512,6 +556,10 @@ class APIServer:
             req = self.pending_requests.pop(request_id, None)
         if req is None:
             return []
+        if req.error is not None:
+            raise HTTPException(
+                status_code=req.error_status, detail=req.error
+            )
         # Profiling (incl. the optional file write) runs outside the lock; the
         # popped request is no longer shared with other threads.
         self._finalize_profile(req)
