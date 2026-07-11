@@ -2,10 +2,19 @@
 
 Ported from ``../ZONOS2/python/zonos2/tts/sampler.py``. The reference
 ``sample_tts`` samples a whole batch and returns Python lists (a device
-sync). Here :func:`sample_frame` is the single-sequence, tensor-returning
-variant used *inside* the LLM submodule's forward (no ``.tolist()`` sync
-on the GPU thread): it maps per-codebook logits ``(1, C, V)`` to a frame
-tensor ``(1, C + 1)`` = the sampled audio codes plus a text placeholder.
+sync). Here :func:`sample_frame` is the tensor-returning variant used
+*inside* the LLM submodule's forward (no ``.tolist()`` sync on the GPU
+thread): it maps per-codebook logits ``(B, C, V)`` to frames ``(B, C + 1)``
+= the sampled audio codes plus a text placeholder, for a batch of ``B``
+requests at once.
+
+Reproducibility under batching is provided by a *stateless* RNG: the
+terminal draw is Gumbel-max over noise keyed purely on
+``(seed, step, codebook, vocab)`` (see :func:`_deterministic_uniform`),
+with no dependence on a request's batch position. This replaces the old
+per-request ``torch.Generator`` (stateful, and — like FlashInfer's seeded
+samplers — position-dependent once vectorised) so a request draws the same
+frame at a given step regardless of which requests it is co-batched with.
 """
 from __future__ import annotations
 
@@ -83,26 +92,77 @@ def apply_repetition_penalty(
     return torch.where(repeated, adjusted, logits)
 
 
+_M32 = 0xFFFFFFFF
+
+
+def _fmix32(h: torch.Tensor) -> torch.Tensor:
+    """MurmurHash3 ``fmix32`` finalizer on uint32 values held in an int64
+    tensor. Every value stays non-negative and ``< 2**32`` except the
+    transient multiply, whose overflow past int64 wraps two's-complement
+    and is immediately masked back to 32 bits — so the result matches the
+    uint32 reference exactly, and the ``>>`` shifts act as logical shifts.
+    """
+    h = h & _M32
+    h = h ^ (h >> 16)
+    h = (h * 0x85EBCA6B) & _M32
+    h = h ^ (h >> 13)
+    h = (h * 0xC2B2AE35) & _M32
+    h = h ^ (h >> 15)
+    return h & _M32
+
+
+def _deterministic_uniform(
+    B: int, C: int, V: int,
+    seed: int, steps: torch.Tensor,
+    device: torch.device, dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Reproducible ``U[0, 1)`` noise of shape ``(B, C, V)``.
+
+    Keyed purely on ``(seed, step, codebook, vocab)`` via a counter-based
+    hash — no dependence on batch position — so the noise for request ``b``
+    at ``steps[b]`` is identical whether it is sampled alone or inside any
+    batch. ``steps`` is a ``(B,)`` per-request step index.
+    """
+    v = torch.arange(V, device=device, dtype=torch.int64).view(1, 1, V)
+    c = torch.arange(C, device=device, dtype=torch.int64).view(1, C, 1)
+    s = steps.to(device=device, dtype=torch.int64).view(B, 1, 1)
+    base = int(seed) & _M32
+    # Chained fmix32 rounds so every field avalanches into the result.
+    h = (v * 0x27D4EB2F) & _M32
+    h = _fmix32(h ^ (c * 0x85EBCA77))
+    h = _fmix32(h ^ (s * 0xC2B2AE3D))
+    h = _fmix32(h ^ base)
+    return (h.to(torch.float64) / 4294967296.0).to(dtype)
+
+
 def sample_frame(
     logits: torch.Tensor,
     params: TTSSamplingParams,
     repetition_token_ids: torch.Tensor | None = None,
     text_placeholder: int = 0,
-    generator: torch.Generator | None = None,
+    seed: int | None = None,
+    steps: torch.Tensor | int | None = None,
 ) -> torch.Tensor:
-    """Sample one frame from per-codebook logits.
+    """Sample one frame per request from per-codebook logits.
 
     Args:
-        logits: ``(1, C, V)`` per-codebook logits for the current step.
-        params: sampling parameters.
-        repetition_token_ids: ``(1, C, W)`` recent tokens, or None.
+        logits: ``(B, C, V)`` per-codebook logits for the current step.
+        params: sampling parameters (shared across the batch).
+        repetition_token_ids: ``(B, C, W)`` recent tokens (``-1`` padded /
+            ignored), or None.
         text_placeholder: value written to the appended text column.
-        generator: optional per-request RNG for deterministic sampling.
+        seed: base RNG seed shared across the batch. ``None`` draws from the
+            global RNG (non-reproducible), matching an unseeded request.
+        steps: ``(B,)`` per-request step index (or an int / None -> 0). With
+            ``seed`` set, ``(seed, step)`` fully determine a request's draw
+            independent of batch position, so batched sampling stays
+            bit-reproducible per request.
 
     Returns:
-        ``(1, C + 1)`` int64 frame: ``[cb0, ..., cb_{C-1}, text_placeholder]``.
+        ``(B, C + 1)`` int64 frames: ``[cb0, ..., cb_{C-1}, text_placeholder]``.
     """
     B, C, V = logits.shape
+    device = logits.device
 
     logits = apply_repetition_penalty(
         logits, repetition_token_ids, params.repetition_penalty
@@ -112,34 +172,48 @@ def sample_frame(
         next_ids = torch.argmax(logits, dim=-1)  # (B, C)
     else:
         logits = logits / max(params.temperature, 1e-8)
-        flat = logits.reshape(B * C, V)
 
         top_k = int(params.topk)
         if 0 < top_k < V:
-            values, _ = torch.topk(flat, top_k, dim=-1)
-            kth = values[..., -1].unsqueeze(-1)
-            flat = flat.masked_fill(flat < kth, float("-inf"))
+            values, _ = torch.topk(logits, top_k, dim=-1)
+            kth = values[..., -1:].clone()
+            logits = logits.masked_fill(logits < kth, float("-inf"))
 
-        probs = F.softmax(flat, dim=-1)
+        probs = F.softmax(logits, dim=-1)
         if 0.0 < params.top_p < 1.0:
             probs = apply_top_p(probs, params.top_p)
         if params.min_p > 0.0:
             probs = apply_min_p(probs, params.min_p)
 
-        # An over-aggressive filter can zero an entire row; fall back to
-        # greedy there so multinomial doesn't fault on an all-zero dist.
-        invalid = probs.sum(dim=-1) <= 0
-        if bool(invalid.any()):
-            greedy = flat.argmax(dim=-1)
-            fallback = torch.zeros_like(probs)
-            fallback.scatter_(-1, greedy.unsqueeze(-1), 1.0)
-            probs = torch.where(invalid.unsqueeze(-1), fallback, probs)
+        # Reproducible Gumbel-max: ``argmax(log p + Gumbel)`` samples
+        # proportional to ``probs`` (equivalent to ``multinomial``) but the
+        # noise is the stateless per-cell RNG above, so it vectorises across
+        # the batch without a per-request Generator.
+        if steps is None:
+            steps_t = torch.zeros(B, dtype=torch.int64, device=device)
+        elif isinstance(steps, int):
+            steps_t = torch.full((B,), steps, dtype=torch.int64, device=device)
+        else:
+            steps_t = steps.to(device=device, dtype=torch.int64).reshape(-1)
 
-        next_ids = torch.multinomial(
-            probs, num_samples=1, generator=generator
-        ).view(B, C)
+        if seed is None:
+            u = torch.rand((B, C, V), device=device, dtype=probs.dtype)
+        else:
+            u = _deterministic_uniform(B, C, V, seed, steps_t, device, probs.dtype)
+
+        eps = 1e-20
+        gumbel = -torch.log(-torch.log(u.clamp(eps, 1.0 - eps)))
+        # log(0)=-inf on filtered tokens -> -inf + finite Gumbel = -inf (never
+        # argmax'd), no NaN.
+        next_ids = torch.argmax(probs.clamp_min(0).log() + gumbel, dim=-1)  # (B, C)
+
+        # An over-aggressive filter can zero a whole row; fall back to greedy
+        # (argmax of the filtered logits) there so the draw stays well-defined.
+        invalid = probs.sum(dim=-1) <= 0  # (B, C)
+        if bool(invalid.any()):
+            next_ids = torch.where(invalid, logits.argmax(dim=-1), next_ids)
 
     text_col = torch.full(
-        (B, 1), text_placeholder, dtype=next_ids.dtype, device=next_ids.device
+        (B, 1), text_placeholder, dtype=next_ids.dtype, device=device
     )
     return torch.cat([next_ids, text_col], dim=-1)  # (B, C + 1)

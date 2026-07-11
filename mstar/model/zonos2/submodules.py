@@ -57,7 +57,6 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         # Per-request state.
         self._history: dict[str, torch.Tensor] = {}   # (N, n_codebooks) recent codes
         self._eos: dict[str, dict] = {}               # EOS countdown tracking
-        self._generators: dict[str, torch.Generator] = {}
 
     # -- input plumbing ------------------------------------------------
     def prepare_inputs(
@@ -86,9 +85,21 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         input_ids = torch.cat([inp.input_ids for inp in inputs], dim=0).to(
             device=self.get_device(), dtype=torch.long
         )
-        return {"input_ids": input_ids}
+        # Per-request last-frame index in the packed sequence — used by the
+        # batched forward to gather each request's final-position logits.
+        # (``get_qo_indptr_buf`` only exists under CUDA-graph capture, so we
+        # thread the offsets through here instead.)
+        last_indices = torch.tensor(
+            seq_lens, device=self.get_device(), dtype=torch.long
+        ).cumsum(0) - 1
+        return {"input_ids": input_ids, "last_indices": last_indices}
 
     # -- forward + sampling --------------------------------------------
+    def can_batch(self, batch, model_inputs) -> bool:
+        # Varlen packing + batched FlashInfer plan is set up in ``preprocess``;
+        # the transformer forward vectorises across the packed batch.
+        return True
+
     def forward(
         self,
         graph_walk: str,
@@ -99,19 +110,90 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         cache_handle: BatchedCacheManager = engine_inputs.cache_manager
         hidden = self.model(input_ids, cache_handle)          # (num_frames, hidden)
         logits = self.model.compute_logits(hidden[-1:])       # (1, C, V)
-
-        rid = engine_inputs.request_ids[0]
-        frame = sample_frame(
-            logits,
-            self.params,
-            repetition_token_ids=self._rep_ids(rid),
-            text_placeholder=self.text_vocab,
-            generator=self._generator(rid, logits.device),
-        )                                                     # (1, C + 1)
-        self._append_history(rid, frame)
+        frame = self._sample(logits, engine_inputs.request_ids)  # (1, C + 1)
         return {"new_token": [frame]}
 
-    # -- repetition history / RNG --------------------------------------
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor,
+        last_indices: torch.Tensor,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        cache_handle: BatchedCacheManager = engine_inputs.cache_manager
+        hidden = self.model(input_ids, cache_handle)          # (total_frames, hidden)
+        last_hidden = hidden.index_select(0, last_indices.to(hidden.device))
+        logits = self.model.compute_logits(last_hidden)       # (B, C, V)
+        frames = self._sample(logits, engine_inputs.request_ids)  # (B, C + 1)
+        return {
+            rid: {"new_token": [frames[i:i + 1]]}
+            for i, rid in enumerate(engine_inputs.request_ids)
+        }
+
+    @torch.compiler.disable
+    def _sample(self, logits: torch.Tensor, rids: list[str]) -> torch.Tensor:
+        """Sample one frame per request and append each to its history.
+
+        Reproducibility is per-request via ``(seed, step)`` where ``step`` is
+        the request's frame count so far — independent of batch position, so
+        batched and sequential execution draw identically.
+
+        ``@torch.compiler.disable``: the engine ``torch.compile``s
+        ``forward``/``forward_batched``, but the host-side sampling here is
+        data-dependent Python (growing rep-penalty windows, list building) that
+        would graph-break and recompile every step. Kept eager like the
+        engine's own ``Sampler.sample``; the transformer forward still compiles.
+        """
+        device = logits.device
+        steps = torch.tensor(
+            [self._step_for(rid) for rid in rids], device=device, dtype=torch.long
+        )
+        frames = sample_frame(
+            logits,
+            self.params,
+            repetition_token_ids=self._rep_ids_batched(rids, device),
+            text_placeholder=self.text_vocab,
+            seed=self.params.seed,
+            steps=steps,
+        )                                                     # (B, C + 1)
+        for i, rid in enumerate(rids):
+            self._append_history(rid, frames[i:i + 1])
+        return frames
+
+    # -- repetition history / step -------------------------------------
+    def _step_for(self, rid: str) -> int:
+        """Frames already produced for ``rid`` = its next step index."""
+        hist = self._history.get(rid)
+        return 0 if hist is None else hist.shape[0]
+
+    def _rep_ids_batched(self, rids: list[str], device) -> torch.Tensor | None:
+        """Stack per-request ``_rep_ids`` into ``(B, C, W_max)``, right-padding
+        shorter windows with ``-1`` (ignored by the penalty). Returns None when
+        no request has an active penalty window.
+        """
+        per = [self._rep_ids(rid) for rid in rids]
+        widths = [p.shape[-1] for p in per if p is not None]
+        if not widths:
+            return None
+        w_max = max(widths)
+        rows = []
+        for p in per:
+            if p is None:
+                rows.append(torch.full(
+                    (1, self.n_codebooks, w_max), -1, dtype=torch.long, device=device
+                ))
+                continue
+            p = p.to(device)
+            if p.shape[-1] < w_max:
+                pad = torch.full(
+                    (1, self.n_codebooks, w_max - p.shape[-1]),
+                    -1, dtype=p.dtype, device=device,
+                )
+                p = torch.cat([p, pad], dim=-1)
+            rows.append(p)
+        return torch.cat(rows, dim=0)                         # (B, C, W_max)
+
     def _rep_ids(self, rid: str) -> torch.Tensor | None:
         hist = self._history.get(rid)
         if (
@@ -132,16 +214,6 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         codes = frame[:, : self.n_codebooks]                 # (1, C)
         prev = self._history.get(rid)
         self._history[rid] = codes if prev is None else torch.cat([prev, codes], dim=0)
-
-    def _generator(self, rid: str, device) -> torch.Generator | None:
-        if self.params.seed is None:
-            return None
-        gen = self._generators.get(rid)
-        if gen is None:
-            gen = torch.Generator(device=device)
-            gen.manual_seed(int(self.params.seed))
-            self._generators[rid] = gen
-        return gen
 
     # -- graph routing + stop ------------------------------------------
     def postprocess(
@@ -193,7 +265,6 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
     def cleanup_request(self, request_id: str):
         self._history.pop(request_id, None)
         self._eos.pop(request_id, None)
-        self._generators.pop(request_id, None)
 
 
 class Zonos2DACSubmodule(NodeSubmodule):
