@@ -16,6 +16,8 @@ dependency; install ``descript-audio-codec`` to run the vocoder.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 # Cached DAC model (loaded lazily on first decode).
@@ -154,10 +156,16 @@ class StreamingDacDecoder:
         audio = decode_dac(codes, self.model_type, self.codebook_size)
         return audio.detach().float()
 
-    def add_frames(self, request_id: str, frames: torch.Tensor, is_final: bool) -> torch.Tensor:
-        """Append ``frames`` ``(num, n_codebooks)`` and decode what can be decoded.
+    def _prep_window(
+        self, request_id: str, frames: torch.Tensor, is_final: bool
+    ) -> tuple[str, Any]:
+        """Append ``frames`` and work out this request's decode window.
 
-        Returns an int16 PCM tensor ``(num_samples,)`` (possibly empty).
+        Returns ``("done", pcm)`` when there's nothing to decode this step (an
+        int16 PCM tensor, possibly empty, e.g. a final tail flush), or
+        ``("decode", plan)`` where ``plan`` carries the de-sheared code window
+        ``(out_count, n_codebooks)`` plus the state needed to finalize it. The
+        actual DAC call is deferred so a batched caller can stack windows.
         """
         buf = self._frames.get(request_id)
         if frames.numel():
@@ -171,7 +179,6 @@ class StreamingDacDecoder:
         self._decoded.setdefault(request_id, 0)
 
         total = buf.shape[0]
-        device = buf.device
         decoded = self._decoded[request_id]
         # Output frames fully covered by shear context: all but the trailing
         # (n_codebooks - 1) frames, which only exist to de-shear earlier
@@ -186,7 +193,7 @@ class StreamingDacDecoder:
         if not should_decode:
             if is_final:
                 self.reset(request_id)
-            return torch.empty(0, dtype=torch.int16)
+            return "done", torch.empty(0, dtype=torch.int16)
 
         # Nothing new to decode but a withheld tail remains (final flush).
         if new_decodable <= 0:
@@ -194,7 +201,7 @@ class StreamingDacDecoder:
             out = to_int16_pcm(tail) if tail is not None else torch.empty(0, dtype=torch.int16)
             if is_final:
                 self.reset(request_id)
-            return out
+            return "done", out
 
         # Re-decode ``overlap`` already-emitted frames as left context so the
         # convolutions warm up on real signal at the chunk boundary.
@@ -204,10 +211,22 @@ class StreamingDacDecoder:
         raw = buf[decode_start:raw_end]                      # (w, C) int64, on device
         codes = shear_up(raw, self.audio_pad_id)
         out_count = target - decode_start  # overlap + new frames
-        codes = codes[:out_count].unsqueeze(0)  # (1, out_count, n_codebooks)
+        codes = codes[:out_count]  # (out_count, n_codebooks), no batch dim
+        return "decode", {
+            "codes": codes,
+            "overlap": overlap,
+            "target": target,
+            "is_final": is_final,
+        }
 
-        audio = self._decode_codes(codes)[0]  # (out_count * hop,) on device
+    def _finalize_chunk(
+        self, request_id: str, audio: torch.Tensor, overlap: int,
+        is_final: bool, target: int,
+    ) -> torch.Tensor:
+        """Crossfade, withhold/emit the overlap tail, and int16-encode.
 
+        ``audio`` is this request's raw ``(out_count * hop,)`` decode. Identical
+        for the single and batched paths, so both stay bit-for-bit in step."""
         # Crossfade the overlap region with the previous chunk's withheld tail.
         # Functional (cat rather than in-place) so it's safe on the decoder's
         # inference-mode output and reads cleanly when batched.
@@ -215,7 +234,7 @@ class StreamingDacDecoder:
         if overlap > 0 and prev_tail is not None:
             k = min(overlap * self.hop_length, prev_tail.numel(), audio.numel())
             if k > 0:
-                fade = self._fade_in(k, device)
+                fade = self._fade_in(k, audio.device)
                 head = (1.0 - fade) * prev_tail[-k:] + fade * audio[:k]
                 audio = torch.cat([head, audio[k:]], dim=0)
 
@@ -238,3 +257,45 @@ class StreamingDacDecoder:
         if is_final:
             self.reset(request_id)
         return pcm
+
+    def add_frames(self, request_id: str, frames: torch.Tensor, is_final: bool) -> torch.Tensor:
+        """Append ``frames`` ``(num, n_codebooks)`` and decode what's ready.
+
+        Returns an int16 PCM tensor ``(num_samples,)`` (possibly empty).
+        """
+        kind, plan = self._prep_window(request_id, frames, is_final)
+        if kind == "done":
+            return plan
+        audio = self._decode_codes(plan["codes"].unsqueeze(0))[0]  # (out_count * hop,)
+        return self._finalize_chunk(
+            request_id, audio, plan["overlap"], is_final, plan["target"]
+        )
+
+    def add_frames_batched(
+        self,
+        request_ids: list[str],
+        frames_list: list[torch.Tensor],
+        finals: list[bool],
+    ) -> dict[str, torch.Tensor]:
+        """Batched :meth:`add_frames` over several requests.
+
+        Each request's window is prepared independently, then windows of the
+        same length are stacked into one DAC call. 
+        """
+        results: dict[str, torch.Tensor] = {}
+        groups: dict[int, list[tuple[str, dict]]] = {}
+        for rid, frames, is_final in zip(request_ids, frames_list, finals):
+            kind, plan = self._prep_window(rid, frames, is_final)
+            if kind == "done":
+                results[rid] = plan
+            else:
+                groups.setdefault(plan["codes"].shape[0], []).append((rid, plan))
+
+        for items in groups.values():
+            batch = torch.stack([plan["codes"] for _, plan in items], dim=0)
+            audios = self._decode_codes(batch)  # (g, out_count * hop)
+            for i, (rid, plan) in enumerate(items):
+                results[rid] = self._finalize_chunk(
+                    rid, audios[i], plan["overlap"], plan["is_final"], plan["target"]
+                )
+        return results
