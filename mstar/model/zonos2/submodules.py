@@ -303,26 +303,46 @@ class Zonos2DACSubmodule(NodeSubmodule):
             frames = streamed[0].reshape(-1, self.frame_width)
         return NodeInputs(tensor_inputs={"frames": frames})
 
+    def can_batch(self, batch, model_inputs) -> bool:
+        # The decoder groups same-length windows into one DAC call (and matches
+        # per-request decoding bit-for-bit), so any co-scheduled set is safe.
+        return True
+
     def preprocess(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        return {"frames": inputs[0].tensor_inputs["frames"]}
+        # Keep each request's frames separate (not concatenated): the streaming
+        # decoder is stateful per request. Order matches ``request_ids``.
+        return {"frames_list": [inp.tensor_inputs["frames"] for inp in inputs]}
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        frames: torch.Tensor,
+        frames_list: list[torch.Tensor],
         **kwargs,
     ) -> NameToTensorList:
         rid = engine_inputs.request_ids[0]
-        audio_codes = frames[:, : self.n_codebooks]
+        audio_codes = frames_list[0][:, : self.n_codebooks]
         is_final = rid in engine_inputs.final_stream_rids
         pcm = self.decoder.add_frames(rid, audio_codes, is_final=is_final)
         return {"audio_chunk": [pcm]}
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        frames_list: list[torch.Tensor],
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        rids = engine_inputs.request_ids
+        finals = [rid in engine_inputs.final_stream_rids for rid in rids]
+        codes = [f[:, : self.n_codebooks] for f in frames_list]
+        out = self.decoder.add_frames_batched(rids, codes, finals)
+        return {rid: {"audio_chunk": [out[rid]]} for rid in rids}
 
     def cleanup_request(self, request_id: str):
         self.decoder.reset(request_id)
