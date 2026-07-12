@@ -5,11 +5,14 @@ Converts multi-codebook audio tokens to PCM via Descript's DAC. The model
 emits codes with the inter-codebook shear (codebook ``j`` delayed by ``j``
 frames); :func:`shear_up` removes that delay before decoding.
 
-``StreamingDacDecoder`` keeps a per-request frame buffer and decodes new
-frames incrementally as they arrive. ``dac`` is imported
-lazily so the package imports without the optional dependency; install
-``descript-audio-codec`` to run the vocoder.
-# TODO: We should implement the StreamingDacDecoder a la Qwen Omni encoders. 
+``StreamingDacDecoder`` keeps per-request state as device tensors (frame
+history, withheld overlap tail, fade windows) and decodes new frames
+incrementally as they arrive without host round-trip. The per-window 
+decode is factored into ``_decode_codes`` so a batched caller can
+stack several requests' windows into one DAC call. 
+
+``dac`` is imported lazily so the package imports without the optional 
+dependency; install ``descript-audio-codec`` to run the vocoder.
 """
 from __future__ import annotations
 
@@ -79,11 +82,14 @@ class StreamingDacDecoder:
     have enough future context for ``shear_up`` (output frame ``i`` needs
     input frames ``i .. i + n_codebooks - 1``).
 
-    Each non-final chunk withholds its last ``overlap_frames * hop_length`` 
-    samples; the final flush emits them.
+    Each non-final chunk withholds its last ``overlap_frames * hop_length``
+    samples; the final flush emits them. Crossfading is done in float; the
+    emitted samples are converted to int16 PCM.
 
-    Crossfading is done in float; the emitted samples are converted to
-    int16 PCM on the way out.
+    State is held as device tensors (frame history (_frames), withheld overlap
+    tails (_overlap_tails), and cached fade windows). The per-window DAC call is
+    isolated in :meth:`_decode_codes` so a batched caller can stack several
+    requests' windows into one decode.
     """
 
     def __init__(
@@ -105,48 +111,67 @@ class StreamingDacDecoder:
         self.overlap_frames = overlap_frames
         self.hop_length = hop_length
         self.min_decode_chunk = max(1, min_decode_chunk)
-        self._buffers: dict[str, list[list[int]]] = {}
+        # Per-request frame history as a single ``(T, n_codebooks)`` int64
+        # tensor on the compute device (grown by ``torch.cat``).
+        self._frames: dict[str, torch.Tensor] = {}
         self._decoded: dict[str, int] = {}
         # Withheld float tails per request (last overlap region of the
-        # previously decoded chunk, not yet emitted — crossfaded into the
+        # previously decoded chunk, not yet emitted: crossfaded into the
         # next chunk's head).
         self._overlap_tails: dict[str, torch.Tensor] = {}
-        # Raised-cosine fade-in windows, cached by length.
-        self._window_cache: dict[int, torch.Tensor] = {}
+        # Raised-cosine fade-in windows, cached by (length, device).
+        self._window_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
 
     def reset(self, request_id: str | None = None) -> None:
         if request_id is None:
-            self._buffers.clear()
+            self._frames.clear()
             self._decoded.clear()
             self._overlap_tails.clear()
         else:
-            self._buffers.pop(request_id, None)
+            self._frames.pop(request_id, None)
             self._decoded.pop(request_id, None)
             self._overlap_tails.pop(request_id, None)
 
-    def _fade_in(self, length: int) -> torch.Tensor:
+    def _fade_in(self, length: int, device: torch.device) -> torch.Tensor:
         """Cached raised-cosine fade-in of ``length`` samples (0 -> 1)."""
-        win = self._window_cache.get(length)
+        key = (length, device)
+        win = self._window_cache.get(key)
         if win is None:
             if length <= 1:
-                win = torch.ones(length, dtype=torch.float32)
+                win = torch.ones(length, dtype=torch.float32, device=device)
             else:
-                t = torch.linspace(0.0, torch.pi, length, dtype=torch.float32)
+                t = torch.linspace(0.0, torch.pi, length, dtype=torch.float32, device=device)
                 win = 0.5 * (1.0 - torch.cos(t))
-            self._window_cache[length] = win
+            self._window_cache[key] = win
         return win
 
+    def _decode_codes(self, codes: torch.Tensor) -> torch.Tensor:
+        """De-sheared code windows ``(B, W, n_codebooks)`` -> ``(B, W * hop)``.
+
+        The batched path for DAC will assemble a padded ``(B, W, C)`` tensor 
+        and call this once.
+        """
+        audio = decode_dac(codes, self.model_type, self.codebook_size)
+        return audio.detach().float()
+
     def add_frames(self, request_id: str, frames: torch.Tensor, is_final: bool) -> torch.Tensor:
-        """Append ``frames`` ``(num, n_codebooks)`` and decode what's ready.
+        """Append ``frames`` ``(num, n_codebooks)`` and decode what can be decoded.
 
         Returns an int16 PCM tensor ``(num_samples,)`` (possibly empty).
         """
-        buf = self._buffers.setdefault(request_id, [])
-        self._decoded.setdefault(request_id, 0)
+        buf = self._frames.get(request_id)
         if frames.numel():
-            buf.extend(frames.tolist())
+            add = frames.to(dtype=torch.int64)
+            buf = add if buf is None else torch.cat([buf, add], dim=0)
+            self._frames[request_id] = buf
+        if buf is None:
+            # No frames ever seen (e.g. an empty final flush before any audio).
+            buf = frames.reshape(0, self.n_codebooks).to(dtype=torch.int64)
+            self._frames[request_id] = buf
+        self._decoded.setdefault(request_id, 0)
 
-        total = len(buf)
+        total = buf.shape[0]
+        device = buf.device
         decoded = self._decoded[request_id]
         # Output frames fully covered by shear context: all but the trailing
         # (n_codebooks - 1) frames, which only exist to de-shear earlier
@@ -176,23 +201,23 @@ class StreamingDacDecoder:
         overlap = min(self.overlap_frames, decoded)
         decode_start = decoded - overlap
         raw_end = min(target + self.n_codebooks - 1, total)  # future frames for shear
-        raw = buf[decode_start:raw_end]
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        codes = torch.tensor(raw, dtype=torch.int64, device=device)
-        codes = shear_up(codes, self.audio_pad_id)
+        raw = buf[decode_start:raw_end]                      # (w, C) int64, on device
+        codes = shear_up(raw, self.audio_pad_id)
         out_count = target - decode_start  # overlap + new frames
         codes = codes[:out_count].unsqueeze(0)  # (1, out_count, n_codebooks)
 
-        audio = decode_dac(codes, self.model_type, self.codebook_size)
-        audio = audio[0].detach().float().cpu()
+        audio = self._decode_codes(codes)[0]  # (out_count * hop,) on device
 
         # Crossfade the overlap region with the previous chunk's withheld tail.
+        # Functional (cat rather than in-place) so it's safe on the decoder's
+        # inference-mode output and reads cleanly when batched.
         prev_tail = self._overlap_tails.get(request_id)
         if overlap > 0 and prev_tail is not None:
             k = min(overlap * self.hop_length, prev_tail.numel(), audio.numel())
             if k > 0:
-                fade = self._fade_in(k)
-                audio[:k] = (1.0 - fade) * prev_tail[-k:] + fade * audio[:k]
+                fade = self._fade_in(k, device)
+                head = (1.0 - fade) * prev_tail[-k:] + fade * audio[:k]
+                audio = torch.cat([head, audio[k:]], dim=0)
 
         if is_final:
             output = audio
