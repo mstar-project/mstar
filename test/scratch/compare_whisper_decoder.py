@@ -16,11 +16,13 @@ MAX_NEW_TOKENS = 60
 
 
 class MockCacheHandle:
-    """Minimal stand-in for BatchedCacheManager: per-layer growing KV +
-    causal SDPA. Single request only."""
+    """Minimal stand-in for BatchedCacheManager: per-layer growing self-attn
+    KV + causal SDPA, plus the issue-#160 cross-attention surface (fixed
+    per-layer context KV + non-causal SDPA). Single request only."""
 
     def __init__(self, num_layers: int):
         self.kv = [None] * num_layers
+        self.cross_kv = [None] * num_layers
         self.layer_idx = 0
 
     def set_layer_idx(self, i):
@@ -38,6 +40,21 @@ class MockCacheHandle:
         out = torch.nn.functional.scaled_dot_product_attention(
             q.transpose(0, 1), fk.transpose(0, 1), fv.transpose(0, 1),
             is_causal=is_prefill,
+        )
+        return out.transpose(0, 1)
+
+    def add_cross_attn_kv(self, request_ids, k, v, layer_idx, **kw):
+        self.cross_kv[layer_idx] = (k, v)
+
+    def plan_cross_attention(self, q_seq_lens, **kw):
+        pass
+
+    def run_cross_attn(self, q, layer_idx=None, source="default"):
+        i = self.layer_idx if layer_idx is None else layer_idx
+        k, v = self.cross_kv[i]
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1), k.transpose(0, 1).to(q.dtype),
+            v.transpose(0, 1).to(q.dtype),
         )
         return out.transpose(0, 1)
 
@@ -78,10 +95,13 @@ def main():
     # --- mstar greedy loop ---
     with torch.no_grad():
         embeds = dec.embed(prompt_ids, 0)
-        out = dec_sub.forward(
-            "prefill", engine_inputs,
-            input_embeds=embeds, encoder_states=encoder_states,
-        )
+        # Mirror preprocess: write per-layer cross K/V into the (mock)
+        # engine context pool once, at prefill.
+        for layer_idx, (k, v) in enumerate(
+            dec.compute_cross_kv(encoder_states.to(embeds.dtype))
+        ):
+            mock.add_cross_attn_kv(["r0"], k, v, layer_idx=layer_idx)
+        out = dec_sub.forward("prefill", engine_inputs, input_embeds=embeds)
         tokens = []
         pos = prompt_ids.shape[0]
         tok = out["logits"][0][-1].argmax().reshape(1)

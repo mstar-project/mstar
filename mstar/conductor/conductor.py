@@ -317,11 +317,25 @@ class Conductor:
         # Apply any KV cache overrides from the YAML config
         yaml_kv_overrides = self.model_config.get("kv_cache", {})
         if yaml_kv_overrides:
-            from dataclasses import fields
+            from dataclasses import fields, replace
+            # cross_attn is a nested {source: CrossAttnKVConfig}; the YAML gives
+            # {source: {field: value}} and we patch each pool's fields (frozen
+            # dataclass -> dataclasses.replace). Everything else is a flat setattr.
+            cross_overrides = yaml_kv_overrides.get("cross_attn", {})
             for kv_cfg in kv_cache_config:
                 for f in fields(kv_cfg):
+                    if f.name == "cross_attn":
+                        continue
                     if f.name in yaml_kv_overrides:
                         setattr(kv_cfg, f.name, yaml_kv_overrides[f.name])
+                if cross_overrides and kv_cfg.cross_attn:
+                    kv_cfg.cross_attn = {
+                        source: (
+                            replace(pool, **cross_overrides[source])
+                            if source in cross_overrides else pool
+                        )
+                        for source, pool in kv_cfg.cross_attn.items()
+                    }
                 logger.info("KV cache config after YAML overrides: %s", kv_cfg)
         return kv_cache_config
 
