@@ -11,6 +11,7 @@ from mstar.model.whisper.whisper_model import WhisperModel
 MODEL_REGISTRY: dict[str, type[Model]] = {
     "bagel": BagelModel,
     "cosmos3": Cosmos3Model,
+    "cosmos3_droid": Cosmos3Model,
     "cosmos3_super": Cosmos3Model,
     "higgs_audio": HiggsAudioModel,
     "orpheus": OrpheusModel,
@@ -25,6 +26,11 @@ HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
     # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
     "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
+    # Cosmos3-Nano-Policy-DROID — Nano-sized action-policy fine-tune for the
+    # DROID robot platform (domain droid_lerobot, 10-dim raw actions). Same
+    # class; the checkpoint's config disables the sound pathway (sound_gen
+    # false, no sound_tokenizer/), so the model self-serves without audio.
+    "cosmos3_droid": {"model_path_hf": "nvidia/Cosmos3-Nano-Policy-DROID"},
     # Cosmos3-Super (64B) — same architecture + class; dims (64 layers / 5120
     # hidden / 25600 intermediate) load from the checkpoint's config.json, so it
     # needs tensor parallelism (it does not fit on one GPU).

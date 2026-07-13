@@ -20,6 +20,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
+   * - ``cosmos3_droid``
+     - ``nvidia/Cosmos3-Nano-Policy-DROID``
+     - Cosmos3 action-policy fine-tune for the DROID platform (``domain_name``
+       ``droid_lerobot``, 10-dim raw actions); no sound pathway. The config
+       serves the released policy sampling defaults (4 steps, guidance 3.0).
    * - ``cosmos3_super``
      - ``nvidia/Cosmos3-Super``
      - Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
