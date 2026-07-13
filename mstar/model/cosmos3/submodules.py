@@ -1795,12 +1795,15 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # epilogues (~20-30% off the 189-frame video decode, neutral for
         # images) at the cost of one trace per new shape. fullgraph=False
         # breaks around the VAE's causal-conv feature cache.
-        # COSMOS3_COMPILE_VAE=0 disables (eager is identical bar fp rounding).
+        # COSMOS3_COMPILE_VAE=0 disables.
         self._decode = vae.decode if vae is not None else None
+        self._decode_compiled = False
+        self._warmed_decode_shapes: set[tuple[int, ...]] = set()
         if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
             "0", "false", "no", "off",
         ):
             self._decode = torch.compile(vae.decode, fullgraph=False, dynamic=False)
+            self._decode_compiled = True
             logger.info("Cosmos3 VAE decode torch.compile enabled")
         # Resolve + log the decode dtype now (a cheap cuDNN-version read) so the
         # choice is fixed at startup, not on the first request.
@@ -1842,6 +1845,20 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # on the fp32-decode path.
         z = (latents.to(vae_dtype) / inv_std + mean).to(vae_dtype)
         with torch.autocast(device_type="cuda", enabled=False):
+            if (
+                self._decode_compiled
+                and vae_dtype == torch.bfloat16
+                and tuple(z.shape) not in self._warmed_decode_shapes
+            ):
+                # A process's first execution of the compiled bf16 decode
+                # returns corrupted frames on some torch/cuDNN stacks — even
+                # when the kernels come from a warm on-disk inductor cache —
+                # while every later call of the same graphs is correct. Decode
+                # once per new latent shape and discard, so served frames
+                # always come from warmed graphs. The fp32 decode does not
+                # exhibit this and skips the warm-up.
+                self._decode(z)
+                self._warmed_decode_shapes.add(tuple(z.shape))
             decoded = self._decode(z).sample  # [1, 3, T, H, W] in [-1, 1]
         # Quantize to 8-bit here (the output is an 8-bit image/mp4 either way) so
         # only the uint8 frames cross the SHM edge to the data worker, not a 4x
