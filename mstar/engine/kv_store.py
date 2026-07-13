@@ -73,22 +73,30 @@ class CrossAttnKVConfig:
 
     Cross-attention K/V come from an encoder context: written once at
     encode time, reused (read-only) by every decoder step, and possibly
-    shaped differently from the decoder's self-attention KV. Each entry
-    in ``KVCacheConfig.cross_attn`` describes the pool for one context
-    source; sources with identical configs share a physical pool
-    (deduped by value — hence frozen/hashable).
+    shaped differently from the decoder's self-attention KV.
 
-    ``num_layers`` / ``num_qo_heads`` default to the parent
-    ``KVCacheConfig``'s values when None (one cross-attention block per
-    decoder layer, queried by the decoder's heads).
+    Only the fields that genuinely differ from the decoder's self-attention
+    are declared here; everything else is inherited from the parent
+    ``KVCacheConfig`` (``page_size``, ``num_layers`` — one cross-attention
+    block per decoder layer, and ``num_qo_heads`` — the decoder queries the
+    context with its own heads).
+
+    Pool sharing: sources whose configs match on everything *except*
+    ``max_num_pages`` (see ``pool_key``) share one physical pool, and that
+    pool's page budget is the **sum** of the sharing sources' ``max_num_pages``.
+    So two sources with identical head geometry asking for 256 pages each
+    get a 512-page shared pool. ``CrossAttnKVConfig`` is frozen/hashable so
+    it can key the dedup map.
     """
     num_kv_heads: int
     head_dim: int
     max_context_len: int  # per-request context capacity (tokens)
     max_num_pages: int = 256
-    page_size: int = 128
-    num_layers: int | None = None
-    num_qo_heads: int | None = None
+
+    def pool_key(self) -> tuple:
+        """Identity for pool sharing: everything except the page budget
+        (pages accumulate across sources that share a pool)."""
+        return (self.num_kv_heads, self.head_dim, self.max_context_len)
 
 
 @dataclass

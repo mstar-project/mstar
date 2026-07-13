@@ -2,6 +2,7 @@ import functools
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -20,6 +21,57 @@ def cross_attn_label(label: str, source: str = "default") -> str:
     """Resolve the cache label under which a cross-attention plan/state for
     ``source`` is stored, relative to the base (self-attention) label."""
     return f"{label}::CROSS_ATTN::{source}"
+
+
+class PagedIndptrs(NamedTuple):
+    """The four int32 index tensors a FlashInfer prefill/decode wrapper's
+    ``plan`` consumes, built on CPU (so wrapper.plan's ``.to("cpu")`` is a
+    no-op — see ``_plan_attention_impl``)."""
+    qo_indptr: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    paged_kv_indices: torch.Tensor
+    paged_kv_last_page_len: torch.Tensor
+
+
+def build_paged_indptrs(
+    q_seq_lens: list[int],
+    page_indices_per_request: list[list[int]],
+    context_lens: list[int],
+    page_size: int,
+) -> PagedIndptrs:
+    """Assemble FlashInfer paged-attention index tensors from per-request
+    query lengths + already-allocated page lists. Shared by the self- and
+    cross-attention plan paths (the difference is only where the pages come
+    from: self grows them per step, cross reads a fixed context)."""
+    qo_indptr = [0]
+    kv_indptr = [0]
+    all_pages: list[int] = []
+    last_page_lens: list[int] = []
+    for q_len, pages, ctx_len in zip(
+        q_seq_lens, page_indices_per_request, context_lens, strict=True,
+    ):
+        qo_indptr.append(qo_indptr[-1] + q_len)
+        all_pages.extend(pages)
+        kv_indptr.append(kv_indptr[-1] + len(pages))
+        last_page_lens.append(ctx_len % page_size or page_size)
+    return PagedIndptrs(
+        qo_indptr=torch.tensor(qo_indptr, dtype=torch.int32),
+        paged_kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
+        paged_kv_indices=torch.tensor(all_pages, dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor(last_page_lens, dtype=torch.int32),
+    )
+
+
+class PlanCacheKey(NamedTuple):
+    """Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged
+    between steps the re-plan is skippable. Used by cross-attention (context
+    pages are immutable after encode); the mechanism is label-generic, so a
+    fixed-shape self-attention label could reuse it (see the field on
+    ``_PlanState``)."""
+    q_seq_lens: tuple
+    page_indices: tuple
+    last_page_lens: tuple
+    dtype: torch.dtype
 
 
 @dataclass
@@ -51,15 +103,16 @@ class _PlanState:
     seq_lens: list[int] | None = None
     write_store: bool = True
     custom_pos_advance: list[int] | None = None
-    # Cross-attention plan memo (cross labels only): fingerprint of the last
-    # planned (query lengths, context pages). The context side is immutable
-    # after add_cross_attn_kv, so a step whose fingerprint matches skips the
-    # FlashInfer re-plan. NOTE: only effective where plan states persist
-    # across steps (the CUDA-graph runner's cuda_graph_plan_states); the
-    # eager path rebuilds the cache manager per step, so eager decode still
-    # re-plans — making cross plans persistent eagerly is the known
-    # multi-request throughput follow-up (see PR #161 benchmark notes).
-    cross_plan_key: tuple | None = None
+    # Plan memo: fingerprint of the last wrapper.plan() inputs for this
+    # label. When it matches, the re-plan is skipped. Label-generic (not
+    # cross-specific); today only the cross-attention path sets it, because
+    # its context pages are immutable after add_cross_attn_kv — a fixed-shape
+    # self-attention label (e.g. diffusion latents) could opt in the same way.
+    # NOTE: only effective where plan states persist across steps (the
+    # CUDA-graph runner's cuda_graph_plan_states); the eager path rebuilds the
+    # cache manager per step, so eager decode still re-plans (see PR #161
+    # benchmark notes — persisting eager plan state is the throughput follow-up).
+    plan_cache_key: "PlanCacheKey | None" = None
     # Set when DenseGenCacheManager planned this label dense: the per-segment
     # gather indices + varlen cu_seqlens needed to attend each generation
     # segment over its contiguous frozen prefix. None on paged plans, which
@@ -1112,32 +1165,34 @@ class FlashInferCacheManager(BatchedCacheManager):
         if dtype is None:
             dtype = pool.kv_cache.dtype
 
-        qo_indptr_list = [0]
-        kv_indptr_list = [0]
-        all_page_indices: list[int] = []
-        kv_last_page_lens: list[int] = []
-        for i, rid in enumerate(self.request_ids):
+        page_indices_per_request: list[list[int]] = []
+        context_lens: list[int] = []
+        for rid in self.request_ids:
             state = pool.alloc_manager.get_state(rid, cross_label)
             assert state.seq_len > 0, (
                 f"plan_cross_attention before add_cross_attn_kv for {rid!r} "
                 f"(source {source!r})"
             )
-            qo_indptr_list.append(qo_indptr_list[-1] + q_seq_lens[i])
-            all_page_indices.extend(state.page_indices)
-            kv_indptr_list.append(kv_indptr_list[-1] + len(state.page_indices))
-            kv_last_page_lens.append(state.seq_len % page_size or page_size)
+            page_indices_per_request.append(state.page_indices)
+            context_lens.append(state.seq_len)
+
+        indptrs = build_paged_indptrs(
+            q_seq_lens, page_indices_per_request, context_lens, page_size,
+        )
 
         # Skip the re-plan when nothing it depends on changed (the common
         # decode case: same request set, q_seq_lens all 1, fixed context
         # pages). Keyed on the page indices themselves so a request id
         # reused with a new context can't alias a stale plan.
-        plan_key = (
-            tuple(q_seq_lens), tuple(all_page_indices),
-            tuple(kv_last_page_lens), dtype,
+        plan_key = PlanCacheKey(
+            q_seq_lens=tuple(q_seq_lens),
+            page_indices=tuple(indptrs.paged_kv_indices.tolist()),
+            last_page_lens=tuple(indptrs.paged_kv_last_page_len.tolist()),
+            dtype=dtype,
         )
 
         ps = self._plan_states.get(cross_label)
-        if ps is not None and ps.wrapper is not None and ps.cross_plan_key == plan_key:
+        if ps is not None and ps.wrapper is not None and ps.plan_cache_key == plan_key:
             ps.seq_lens = q_seq_lens
             return
         if ps is None or ps.wrapper is None:
@@ -1154,16 +1209,16 @@ class FlashInferCacheManager(BatchedCacheManager):
             self._plan_states[cross_label] = ps
 
         ps.wrapper.plan(
-            qo_indptr=torch.tensor(qo_indptr_list, dtype=torch.int32),
-            paged_kv_indptr=torch.tensor(kv_indptr_list, dtype=torch.int32),
-            paged_kv_indices=torch.tensor(all_page_indices, dtype=torch.int32),
-            paged_kv_last_page_len=torch.tensor(kv_last_page_lens, dtype=torch.int32),
+            qo_indptr=indptrs.qo_indptr,
+            paged_kv_indptr=indptrs.paged_kv_indptr,
+            paged_kv_indices=indptrs.paged_kv_indices,
+            paged_kv_last_page_len=indptrs.paged_kv_last_page_len,
             causal=False,
             dtype=dtype,
         )
         ps.seq_lens = q_seq_lens
         ps.write_store = False
-        ps.cross_plan_key = plan_key
+        ps.plan_cache_key = plan_key
 
     def run_cross_attn(
         self,
