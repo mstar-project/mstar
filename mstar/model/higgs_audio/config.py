@@ -8,7 +8,7 @@ from the checkpoint's ``config.json`` (top-level audio fields +
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 
@@ -69,6 +69,21 @@ class HiggsAudioModelConfig:
         after_pool = (after_conv - 2) // 2 + 1
         return (after_pool - 1) // self.projector_temporal_downsample + 1
 
+    # audio_<X> fields sourced from audio_encoder_config[<X>].
+    _ENCODER_FIELDS = {
+        "audio_d_model": "d_model",
+        "audio_encoder_layers": "encoder_layers",
+        "audio_encoder_attention_heads": "encoder_attention_heads",
+        "audio_encoder_ffn_dim": "encoder_ffn_dim",
+        "audio_num_mel_bins": "num_mel_bins",
+        "audio_max_source_positions": "max_source_positions",
+    }
+    # Fields sourced from the top level of config.json by the same name.
+    _TOPLEVEL_FIELDS = (
+        "projector_temporal_downsample", "audio_in_token_idx",
+        "audio_bos_token_id", "audio_eos_token_id", "chunk_size_seconds",
+    )
+
     @classmethod
     def from_pretrained(cls, local_dir: str | Path) -> "HiggsAudioModelConfig":
         local_dir = Path(local_dir)
@@ -76,28 +91,19 @@ class HiggsAudioModelConfig:
             hf = json.load(f)
         tc = hf["text_config"]
         enc = hf["audio_encoder_config"]
+        field_names = {f.name for f in fields(cls)}
 
-        return cls(
-            hidden_size=tc["hidden_size"],
-            num_hidden_layers=tc["num_hidden_layers"],
-            num_attention_heads=tc["num_attention_heads"],
-            num_key_value_heads=tc["num_key_value_heads"],
-            head_dim=tc.get("head_dim", tc["hidden_size"] // tc["num_attention_heads"]),
-            intermediate_size=tc["intermediate_size"],
-            vocab_size=tc["vocab_size"],
-            rms_norm_eps=tc.get("rms_norm_eps", 1e-6),
-            rope_theta=tc.get("rope_theta", 1_000_000.0),
-            max_position_embeddings=tc.get("max_position_embeddings", 32768),
-            audio_d_model=enc["d_model"],
-            audio_encoder_layers=enc["encoder_layers"],
-            audio_encoder_attention_heads=enc["encoder_attention_heads"],
-            audio_encoder_ffn_dim=enc["encoder_ffn_dim"],
-            audio_num_mel_bins=enc["num_mel_bins"],
-            audio_max_source_positions=enc["max_source_positions"],
-            projector_temporal_downsample=hf.get("projector_temporal_downsample", 2),
-            audio_in_token_idx=hf["audio_in_token_idx"],
-            audio_bos_token_id=hf.get("audio_bos_token_id", 151669),
-            audio_eos_token_id=hf.get("audio_eos_token_id", 151670),
-            eos_token_id=hf.get("pad_token_id", 151643),
-            chunk_size_seconds=hf.get("chunk_size_seconds", 4.0),
+        values: dict = {}
+        # 1. text LLM: fields whose name matches a text_config key.
+        values.update({k: tc[k] for k in field_names if k in tc})
+        values["head_dim"] = tc.get(
+            "head_dim", tc["hidden_size"] // tc["num_attention_heads"]
         )
+        # 2. audio encoder: audio_<X> <- audio_encoder_config[<X>].
+        values.update({f: enc[k] for f, k in cls._ENCODER_FIELDS.items() if k in enc})
+        # 3. top-level config.json (+ the pad_token_id -> eos_token_id rename).
+        values.update({k: hf[k] for k in cls._TOPLEVEL_FIELDS if k in hf})
+        if "pad_token_id" in hf:
+            values["eos_token_id"] = hf["pad_token_id"]
+
+        return cls(**values)

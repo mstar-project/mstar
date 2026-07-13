@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.cache_manager import BatchedCacheManager
-from mstar.model.components.attention import Attention
+from mstar.model.components.attention import Attention, CrossAttention
 from mstar.model.whisper.config import WhisperModelConfig
 
 CrossKV = tuple[torch.Tensor, torch.Tensor]
@@ -42,34 +42,9 @@ class WhisperSelfAttention(Attention):
         return q, k
 
 
-class WhisperCrossAttention(nn.Module):
-    """Multi-head attention over the engine-managed encoder-context KV."""
-
-    def __init__(self, hidden_size: int, num_heads: int, head_dim: int):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        inner = num_heads * head_dim
-        self.q_proj = nn.Linear(hidden_size, inner, bias=True)
-        self.k_proj = nn.Linear(hidden_size, inner, bias=False)
-        self.v_proj = nn.Linear(hidden_size, inner, bias=True)
-        self.out_proj = nn.Linear(inner, hidden_size, bias=True)
-
-    def compute_kv(self, encoder_states: torch.Tensor) -> CrossKV:
-        """(enc_len, hidden) -> K/V, each (enc_len, num_heads, head_dim)."""
-        enc_len = encoder_states.shape[0]
-        k = self.k_proj(encoder_states).view(enc_len, self.num_heads, self.head_dim)
-        v = self.v_proj(encoder_states).view(enc_len, self.num_heads, self.head_dim)
-        return k, v
-
-    def forward(
-        self, hidden_states: torch.Tensor, cache_handle: BatchedCacheManager,
-    ) -> torch.Tensor:
-        num_tokens = hidden_states.shape[0]
-        q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
-        attn = cache_handle.run_cross_attn(q)
-        attn = attn.reshape(num_tokens, self.num_heads * self.head_dim)
-        return self.out_proj(attn)
+class WhisperCrossAttention(CrossAttention):
+    """Shared ``CrossAttention`` with Whisper's bias layout (the default:
+    q/v/o biased, k unbiased), attending the single encoder context."""
 
 
 class WhisperDecoderLayer(nn.Module):

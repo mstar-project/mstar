@@ -6,7 +6,7 @@ Values are read from the HF checkpoint's ``config.json`` +
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 
@@ -43,40 +43,35 @@ class WhisperModelConfig:
     def head_dim(self) -> int:
         return self.d_model // self.decoder_attention_heads
 
+    # generation_config.json keys (not in config.json); the rest of the
+    # dataclass fields map 1:1 to config.json keys by name.
+    _GEN_KEYS = (
+        "lang_to_id", "task_to_id", "no_timestamps_token_id",
+        "suppress_tokens", "begin_suppress_tokens",
+    )
+
     @classmethod
     def from_pretrained(cls, local_dir: str | Path) -> "WhisperModelConfig":
         local_dir = Path(local_dir)
         with open(local_dir / "config.json") as f:
             hf = json.load(f)
 
-        cfg = cls(
-            d_model=hf["d_model"],
-            decoder_layers=hf["decoder_layers"],
-            decoder_attention_heads=hf["decoder_attention_heads"],
-            decoder_ffn_dim=hf["decoder_ffn_dim"],
-            encoder_layers=hf["encoder_layers"],
-            num_mel_bins=hf["num_mel_bins"],
-            vocab_size=hf["vocab_size"],
-            max_target_positions=hf["max_target_positions"],
-            max_source_positions=hf["max_source_positions"],
-            activation_function=hf.get("activation_function", "gelu"),
-            scale_embedding=hf.get("scale_embedding", False),
-            decoder_start_token_id=hf["decoder_start_token_id"],
-            eos_token_id=hf["eos_token_id"],
-        )
-
+        gen: dict = {}
         gen_path = local_dir / "generation_config.json"
         if gen_path.exists():
             with open(gen_path) as f:
                 gen = json.load(f)
-            cfg.lang_to_id = gen.get("lang_to_id", {})
-            cfg.task_to_id = gen.get("task_to_id", {})
-            cfg.no_timestamps_token_id = gen.get(
-                "no_timestamps_token_id", cfg.no_timestamps_token_id
-            )
-            cfg.suppress_tokens = gen.get("suppress_tokens", []) or []
-            cfg.begin_suppress_tokens = gen.get("begin_suppress_tokens", []) or []
-        return cfg
+
+        # Every field is named to match its source key; pull from
+        # generation_config.json for the _GEN_KEYS, else config.json. Fields
+        # absent from both keep their dataclass default.
+        names = {f.name for f in fields(cls)}
+        values = {
+            name: (gen if name in cls._GEN_KEYS else hf)[name]
+            for name in names
+            if name in (gen if name in cls._GEN_KEYS else hf)
+        }
+        return cls(**values)
 
     def decoder_prompt_ids(self, language: str = "en", task: str = "transcribe") -> list[int]:
         """``<|startoftranscript|><|{lang}|><|{task}|><|notimestamps|>``."""
