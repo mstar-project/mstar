@@ -26,6 +26,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "bagel": "bagel_single_gpu.yaml",
     "bagel_cfg_parallel": "bagel_cfg_parallel.yaml",
     "cosmos3": "cosmos3_nano.yaml",
+    "cosmos3_droid": "cosmos3_droid.yaml",
     "cosmos3_super": "cosmos3_super_tp2.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
@@ -82,6 +83,11 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model in ("cosmos3", "cosmos3_super"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a red cube on a wooden table\"))")
         lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
+    if model == "cosmos3_droid":
+        lines.append("    res = client.generate(text=\"pick up the banana and place it in the bowl\",")
+        lines.append("                           images=[\"frame.jpg\"], output_modalities=(\"action\",),")
+        lines.append("                           action_mode=\"policy\", domain_name=\"droid_lerobot\",")
+        lines.append("                           raw_action_dim=10, action_chunk_size=16)")
     if model == "qwen3_omni":
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
     if model in ("orpheus", "qwen3_omni"):

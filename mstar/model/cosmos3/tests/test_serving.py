@@ -262,10 +262,130 @@ def test_gen_params_v2v() -> None:
 
     # Action requests own their video input; no V2V params are attached.
     p = model._resolve_gen_params(
-        {"action_mode": "inverse_dynamics", "action_chunk_size": 8, "raw_action_dim": 7},
+        {"action_mode": "inverse_dynamics", "action_chunk_size": 8, "raw_action_dim": 7,
+         "domain_id": 1},
         ["video", "text"], ["action"],
     )
     assert "has_video_condition" not in p
+
+
+def test_gen_params_action_defaults() -> None:
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+
+    # A bare policy request gets the reference action serving defaults: 30
+    # steps, guidance 1.0, flow shift 5.0, chunk 16 (so 17 frames), 480p tier.
+    p = model._resolve_gen_params(
+        {"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 10},
+        ["image", "text"], ["action"],
+    )
+    assert p["action_mode"] == "policy"
+    assert p["num_inference_steps"] == 30
+    assert p["guidance_scale"] == 1.0
+    assert p["flow_shift"] == 5.0
+    assert p["action_chunk_size"] == 16 and p["num_frames"] == 17
+    assert (p["width"], p["height"]) == (832, 480)
+    assert p["domain_id"] == 8
+    assert p["raw_action_dim"] == 10
+    # 1-frame-equivalent action requests never pick up the t2i CFG interval.
+    assert "guidance_interval" not in p
+
+    # Explicit values win over every action default.
+    p = model._resolve_gen_params(
+        {"action_mode": "policy", "domain_id": 3, "raw_action_dim": 9,
+         "num_inference_steps": 8, "guidance_scale": 2.0, "flow_shift": 10.0,
+         "size": "320x192", "action_chunk_size": 60, "num_frames": 61},
+        ["image", "text"], ["action"],
+    )
+    assert p["num_inference_steps"] == 8
+    assert p["guidance_scale"] == 2.0
+    assert p["flow_shift"] == 10.0
+    assert (p["width"], p["height"]) == (320, 192)
+    assert p["domain_id"] == 3  # numeric id wins; no name sent
+    assert p["action_chunk_size"] == 60 and p["num_frames"] == 61
+
+    # The chunk and the frame count default off each other.
+    p = model._resolve_gen_params(
+        {"action_mode": "inverse_dynamics", "num_frames": 33, "domain_id": 1,
+         "raw_action_dim": 9},
+        ["video", "text"], ["action"],
+    )
+    assert p["action_chunk_size"] == 32 and p["num_frames"] == 33
+    p = model._resolve_gen_params(
+        {"action_mode": "policy", "action_chunk_size": 32, "domain_id": 8,
+         "raw_action_dim": 10},
+        ["image", "text"], ["action"],
+    )
+    assert p["num_frames"] == 33
+    with pytest.raises(ValueError, match="num_frames to equal"):
+        model._resolve_gen_params(
+            {"action_mode": "policy", "action_chunk_size": 16, "num_frames": 20,
+             "domain_id": 8, "raw_action_dim": 10},
+            ["image", "text"], ["action"],
+        )
+    with pytest.raises(ValueError, match="must be positive"):
+        model._resolve_gen_params(
+            {"action_mode": "policy", "action_chunk_size": 0, "domain_id": 8,
+             "raw_action_dim": 10},
+            ["image", "text"], ["action"],
+        )
+
+    # The embodiment domain is required and resolves by name or id; numeric
+    # id wins when both are sent.
+    with pytest.raises(ValueError, match="domain_id"):
+        model._resolve_gen_params(
+            {"action_mode": "policy", "raw_action_dim": 10},
+            ["image", "text"], ["action"],
+        )
+    with pytest.raises(ValueError, match="domain_name"):
+        model._resolve_gen_params(
+            {"action_mode": "policy", "domain_name": "not_a_robot", "raw_action_dim": 10},
+            ["image", "text"], ["action"],
+        )
+    p = model._resolve_gen_params(
+        {"action_mode": "policy", "domain_id": 2, "domain_name": "droid_lerobot",
+         "raw_action_dim": 10},
+        ["image", "text"], ["action"],
+    )
+    assert p["domain_id"] == 2
+
+    # raw_action_dim is required (policy/inverse) and bounded by the padded
+    # action dim; forward_dynamics infers it from its conditioning array.
+    with pytest.raises(ValueError, match="raw_action_dim"):
+        model._resolve_gen_params(
+            {"action_mode": "policy", "domain_id": 8}, ["image", "text"], ["action"],
+        )
+    with pytest.raises(ValueError, match=r"\[1, 64\]"):
+        model._resolve_gen_params(
+            {"action_mode": "policy", "domain_id": 8, "raw_action_dim": 65},
+            ["image", "text"], ["action"],
+        )
+    p = model._resolve_gen_params(
+        {"action_mode": "forward_dynamics", "domain_id": 1,
+         "action_chunk_size": 2, "action": [[0.0] * 9, [0.1] * 9]},
+        ["image", "text"], ["video"],
+    )
+    assert p["raw_action_dim"] == 9
+
+    # Unknown modes fail at submission.
+    with pytest.raises(ValueError, match="action_mode"):
+        model._resolve_gen_params(
+            {"action_mode": "teleport", "domain_id": 1, "raw_action_dim": 9},
+            ["image", "text"], ["action"],
+        )
+
+    # Checkpoint yamls override the action sampling defaults (the DROID policy
+    # config serves 4 steps at guidance 3.0).
+    droid_like = Cosmos3Model(
+        model_path_hf="unused", skip_weight_loading=True,
+        num_inference_steps_action=4, guidance_scale_action=3.0,
+    )
+    p = droid_like._resolve_gen_params(
+        {"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 10},
+        ["image", "text"], ["action"],
+    )
+    assert p["num_inference_steps"] == 4
+    assert p["guidance_scale"] == 3.0
+    assert p["flow_shift"] == 5.0
 
 
 def test_gen_params_max_sequence_length() -> None:

@@ -153,6 +153,13 @@ class Cosmos3Config:
     # Default frame count for a video request that doesn't specify ``num_frames``
     # (the Wan VAE downsamples time by 4, so latent frames = 1 + (n - 1) // 4).
     num_frames_video: int = 17
+    # Action-request sampling defaults (all three action modes), following the
+    # reference action serving recipe: 30-step denoise, guidance 1.0, flow
+    # shift 5.0 (the 480p training shift). Checkpoint yamls override — the
+    # released DROID policy serves 4 steps at guidance 3.0.
+    num_inference_steps_action: int = 30
+    guidance_scale_action: float = 1.0
+    flow_shift_action: float = 5.0
 
     # ----- denoise CUDA-graph capture (serving knobs) -----
     # Capture the fixed-shape denoise step as a CUDA graph (the launch-bound-tier
