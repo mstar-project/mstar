@@ -388,6 +388,63 @@ def test_gen_params_action_defaults() -> None:
     assert p["flow_shift"] == 5.0
 
 
+def test_vae_decode_bf16_warmup(monkeypatch) -> None:
+    """The compiled bf16 decode warms each new latent shape with a discarded
+    call (a process's first compiled-bf16 execution returns corrupted frames
+    on some stacks); fp32 and uncompiled decodes run exactly once."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.model.cosmos3.config import Cosmos3Config
+    from mstar.model.cosmos3.submodules import Cosmos3VAEDecoderSubmodule
+
+    class _StubVAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+            self.config = SimpleNamespace(latents_mean=[0.0] * 4, latents_std=[1.0] * 4)
+            self.calls = 0
+
+        def decode(self, z):
+            self.calls += 1
+            t = 1 + (z.shape[2] - 1) * 4
+            return SimpleNamespace(sample=torch.zeros(1, 3, t, 8, 8, dtype=torch.bfloat16))
+
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")  # keep _decode the raw stub
+    vae = _StubVAE()
+    sub = Cosmos3VAEDecoderSubmodule(vae, Cosmos3Config())
+    sub._decode_compiled = True
+    sub._decode_dtype_cached = torch.bfloat16
+
+    z1 = torch.zeros(1, 4, 3, 8, 8, dtype=torch.bfloat16)
+    out = sub.forward("image_gen", None, z1)
+    assert vae.calls == 2  # warm-up + served decode
+    assert out["image_output"][0].dtype == torch.uint8
+
+    sub.forward("image_gen", None, z1)
+    assert vae.calls == 3  # shape already warmed
+
+    z2 = torch.zeros(1, 4, 5, 8, 8, dtype=torch.bfloat16)
+    sub.forward("image_gen", None, z2)
+    assert vae.calls == 5  # new shape warms again
+
+    # fp32 decode never warms.
+    sub._decode_dtype_cached = torch.float32
+    vae.float()
+    z3 = torch.zeros(1, 4, 7, 8, 8, dtype=torch.float32)
+    sub.forward("image_gen", None, z3)
+    assert vae.calls == 6
+
+    # Uncompiled bf16 decode never warms.
+    sub._decode_dtype_cached = torch.bfloat16
+    sub._decode_compiled = False
+    vae.to(torch.bfloat16)
+    z4 = torch.zeros(1, 4, 9, 8, 8, dtype=torch.bfloat16)
+    sub.forward("image_gen", None, z4)
+    assert vae.calls == 7
+
+
 def test_gen_params_max_sequence_length() -> None:
     model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
     assert model._resolve_gen_params({}, ["text"], ["image"])["max_sequence_length"] == 4096
