@@ -37,6 +37,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     # ASR (Beta, un-optimized) — audio in, transcript out.
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
+    "wan22": "wan22.yaml",
 }
 
 
