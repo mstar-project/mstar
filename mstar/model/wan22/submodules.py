@@ -5,10 +5,10 @@
     dit          -> Wan22DitSubmodule         (native 5B DiT + inline UniPC step)
     vae_decoder  -> Wan22VaeDecoderSubmodule  (Wan2.2-VAE decode)
 
-All four run eager (``disable_torch_compile``). The three wrapped nodes have graphs
-that are not compile-clean and run once per request, so a trace has nothing to
-amortize; the dit forward additionally trips Inductor on the UniPC sigma scalar
-(see ``Wan22DitSubmodule``).
+All four set ``disable_torch_compile``, so the engine never wraps their forwards: the
+three wrapped nodes run once per request with no graph to amortize, and the dit's whole
+forward trips Inductor on the CPU-resident UniPC sigma. Instead the dit compiles its inner
+transformer region alone (``config.compile_dit``), leaving the solver eager.
 
 Numerics are governed by the checkpoint dtypes, not by the engine.
 ``Wan22Model.get_autocast_dtype`` returns None so the engine neither autocasts
@@ -41,6 +41,28 @@ logger = logging.getLogger(__name__)
 # Stop signals are registered by loop name, so the model and the stop logic below
 # must agree on this literal.
 DENOISE_LOOP_NAME = "denoise_loop"
+
+# --- VAE-decode tiling gate calibration (Wan22VaeDecoderSubmodule) -----------
+# Untiled AutoencoderKLWan.decode peak scales with output SPATIAL area H*W, nearly
+# flat in frame count (the VAE decodes in causal temporal chunks). Fit:
+# peak_GiB ~= (H*W / 1e6) * (SPATIAL + FRAME * num_frames), fp32 basis scaled by the
+# live decode dtype's element size. Measured on RTX 5090, residual < 3% and biased
+# high; see test/wan22 measurement.
+_DECODE_PEAK_SPATIAL_GIB_PER_MPIX = 21.5   # per output spatial-megapixel, fp32
+_DECODE_PEAK_FRAME_GIB_PER_MPIX = 0.013    # extra per frame, per spatial-Mpix, fp32
+# Free VRAM must clear the estimate by this factor before decoding untiled.
+_DECODE_UNTILED_SAFETY_MARGIN = 1.3
+# Runtime override of config.vae_decode_tiling: "auto" | "tiled" | "untiled".
+_DECODE_TILING_ENV = "WAN22_VAE_DECODE_TILING"
+_DECODE_TILING_MODES = ("auto", "tiled", "untiled")
+
+
+def normalize_decode_tiling_mode(raw: str) -> str:
+    """Canonicalize a tiling-policy string to one of ``_DECODE_TILING_MODES``, else
+    "auto". Shared by the decoder gate and the request config echo so both report the
+    same resolved policy."""
+    mode = (raw or "").lower()
+    return mode if mode in _DECODE_TILING_MODES else "auto"
 
 
 def _no_autocast():
@@ -255,16 +277,13 @@ class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
     # circular import.
     _I2V_WALK = "video_gen_i2v"
 
-    # This node cannot be compiled as one region. The engine compiles the whole
-    # forward, so Inductor fuses the UniPC step's `sample - sigma * output` into a
-    # Triton kernel and passes the 0-dim sigma as a device pointer — which fails,
-    # because that sigma is deliberately CPU-resident ("Pointer argument cannot be
-    # accessed from Triton (cpu tensor?)", surfacing as a CUDA invalid-argument
-    # error on the first call). Moving it to CUDA would fix the launch and break
-    # the numerics: the CPU scalar is what keeps the solver bit-exact against the
-    # reference (components/unipc.py). Numerics win, so this runs eager. The
-    # transformer alone does compile; splitting it into its own region, leaving the
-    # solver eager, is the way to get compile here.
+    # The WHOLE forward cannot be one compiled region: Inductor would fuse the UniPC
+    # step's `sample - sigma * output` and pass the 0-dim CPU-resident sigma as a
+    # device pointer, which fails on the first call. Moving sigma to CUDA would fix
+    # the launch but break bit-exactness against the reference (components/unipc.py).
+    # So the engine wrap stays OFF; instead the inner transformer region alone
+    # (patchify -> blocks -> head) is compiled in __init__ (config.compile_dit),
+    # leaving the solver, CFG combine, and everything touching sigma eager.
     disable_torch_compile = True
 
     def __init__(self, transformer: nn.Module, config: Wan22Config):
@@ -272,6 +291,26 @@ class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
         self.transformer = transformer
         self.config = config
         self._record_fp32_islands()
+        # Feature 2: compile the inner DiT region only. The region takes tensors
+        # (device latents, device per-token timestep grid, device text embeds) and
+        # returns a tensor — nothing CPU-resident crosses it, so Inductor traces it
+        # cleanly. Compile ``forward`` IN PLACE (not by wrapping the module) so
+        # ``self.transformer`` stays the same nn.Module: parameter names, the fp32
+        # islands, ``.dtype`` and ``.to()`` are all untouched, and the reference
+        # tests' transformer-swap trick keeps working. ``dynamic=False`` traces one
+        # graph per input shape, so the FIRST request at a new resolution pauses to
+        # compile (logged in ``_noise_prediction``); later requests reuse the trace.
+        # ``fullgraph=False`` allows a graph break at the SDPA op, matching cosmos3.
+        self._compile_dit = bool(config.compile_dit)
+        self._compiled_shapes: set[tuple[int, ...]] = set()
+        if self._compile_dit and transformer is not None:
+            transformer.forward = torch.compile(
+                transformer.forward, fullgraph=False, dynamic=False,
+            )
+            logger.info(
+                "Wan2.2 DiT: torch.compile enabled on the transformer region "
+                "(fullgraph=False, dynamic=False); UniPC solver stays eager."
+            )
 
     def prepare_inputs(
         self,
@@ -397,6 +436,19 @@ class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
         batch = 2 if do_cfg else 1
         hidden_states = model_input.repeat(batch, 1, 1, 1, 1)
         timestep = temp_ts.unsqueeze(0).expand(batch, -1)
+        # dynamic=False keys the compiled trace on the full input shape (batch
+        # included, so CFG and no-CFG are distinct graphs). Announce the one-time
+        # compile pause the first time a shape is seen, so an operator watching the
+        # log knows why the first request at a new resolution is slow.
+        if self._compile_dit:
+            shape_key = tuple(hidden_states.shape)
+            if shape_key not in self._compiled_shapes:
+                self._compiled_shapes.add(shape_key)
+                logger.info(
+                    "Wan2.2 DiT: first forward at shape %s — torch.compile is tracing "
+                    "this resolution now (one-time pause); later requests reuse it.",
+                    shape_key,
+                )
         encoder_hidden_states = (
             torch.cat([text_embeds_pos, text_embeds_neg], dim=0) if do_cfg else text_embeds_pos
         ).to(self.transformer.dtype)
@@ -450,11 +502,18 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     version (see ``_decode_dtype``) while the I2V encode stays bf16 — one shared
     instance would re-cast the whole VAE whenever the two disagree.
 
-    Decode calls ``tiled_decode`` directly rather than ``enable_tiling``, whose flag
-    is instance state: the encoder's numerics must not depend on which nodes happen
-    to be colocated. Tiling bounds the workspace by tile count rather than frame
-    area — untiled, this decode wants a conv3d workspace big enough to OOM a 32 GiB
-    card. Its seam error is priced by the tiled-vs-untiled test.
+    Decode calls ``tiled_decode`` / ``decode`` directly rather than
+    ``enable_tiling``, whose flag is instance state: the encoder's numerics must not
+    depend on which nodes happen to be colocated. Tiling bounds the workspace by
+    tile count; untiled wants a conv3d workspace that scales with output spatial
+    area (~20 GiB at dense fp32, enough to OOM a 32 GiB card when the DiT is
+    co-resident) but decodes faster with no tile-seam error. So the path is
+    VRAM-gated (Feature 1): decode untiled when free VRAM at decode time comfortably
+    exceeds the estimated untiled peak for the requested size, tile otherwise. The
+    estimate is the calibrated formula above; the decision reads live free memory
+    via ``torch.cuda.mem_get_info``; ``config.vae_decode_tiling`` /
+    ``WAN22_VAE_DECODE_TILING`` force either path; the chosen path is logged per
+    request. The tiled/untiled numeric gap is priced by the tiled-vs-untiled test.
     """
 
     disable_torch_compile = True
@@ -500,6 +559,53 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     ) -> NodeInputs:
         return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
 
+    def _output_size(self, latents: torch.Tensor) -> tuple[int, int, int]:
+        """(height, width, num_frames) the latent grid decodes to — the inverse of
+        the VAE's spatial (/16) and temporal (4k+1) compression."""
+        _, _, t_lat, h_lat, w_lat = latents.shape
+        height = h_lat * self.config.vae_scale_factor_spatial
+        width = w_lat * self.config.vae_scale_factor_spatial
+        num_frames = (t_lat - 1) * self.config.vae_scale_factor_temporal + 1
+        return height, width, num_frames
+
+    @staticmethod
+    def _estimated_untiled_peak_bytes(
+        height: int, width: int, num_frames: int, elt_bytes: int
+    ) -> int:
+        """Estimated untiled-decode peak workspace (bytes) for one output clip,
+        from the spatial-area calibration above. fp32-calibrated, scaled by the
+        decode dtype's element size."""
+        spatial_mpix = height * width / 1e6
+        gib = (elt_bytes / 4) * spatial_mpix * (
+            _DECODE_PEAK_SPATIAL_GIB_PER_MPIX + _DECODE_PEAK_FRAME_GIB_PER_MPIX * num_frames
+        )
+        return int(gib * 2**30)
+
+    @staticmethod
+    def _decode_should_tile(mode: str, free_bytes: int, estimated_peak_bytes: int) -> bool:
+        """Pure tiling decision (True == tile). ``mode`` forces a path
+        ("tiled"/"untiled"); "auto" tiles unless free VRAM clears the estimated
+        untiled peak by the safety margin. Kept side-effect-free so the gate is
+        unit-tested with injected free-memory values."""
+        if mode == "tiled":
+            return True
+        if mode == "untiled":
+            return False
+        return free_bytes < estimated_peak_bytes * _DECODE_UNTILED_SAFETY_MARGIN
+
+    def _resolve_tiling_mode(self) -> str:
+        """config.vae_decode_tiling, overridden by the env var, canonicalized via
+        the shared normalizer. An unknown value falls back to "auto" loudly (warned
+        once here) rather than silently forcing a path."""
+        raw = os.environ.get(_DECODE_TILING_ENV, self.config.vae_decode_tiling)
+        mode = normalize_decode_tiling_mode(raw)
+        if mode != (raw or "").lower():
+            logger.warning(
+                "Wan2.2 VAE decode: unknown tiling mode %r (config.vae_decode_tiling / %s); "
+                "using 'auto'.", raw, _DECODE_TILING_ENV,
+            )
+        return mode
+
     def forward(
         self,
         graph_walk: str,
@@ -512,7 +618,8 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
             vae_dtype = self._decode_dtype()
             if next(vae.parameters()).dtype != vae_dtype:
                 vae = vae.to(vae_dtype)
-            latents = latents.to(device=self.get_device(), dtype=vae_dtype)
+            device = self.get_device()
+            latents = latents.to(device=device, dtype=vae_dtype)
             z_dim = self.config.vae_z_dim
             latents_mean = (
                 torch.tensor(vae.config.latents_mean).view(1, z_dim, 1, 1, 1)
@@ -522,7 +629,24 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            video = vae.tiled_decode(latents, return_dict=False)[0]
+
+            # Feature 1: pick untiled vs tiled from live free VRAM at decode time.
+            height, width, num_frames = self._output_size(latents)
+            elt_bytes = torch.finfo(vae_dtype).bits // 8
+            estimate = self._estimated_untiled_peak_bytes(height, width, num_frames, elt_bytes)
+            mode = self._resolve_tiling_mode()
+            free_bytes, _total = torch.cuda.mem_get_info(device)
+            tiled = self._decode_should_tile(mode, free_bytes, estimate)
+            logger.info(
+                "Wan2.2 VAE decode: %s (%dx%d x%df, est untiled peak %.1f GiB, "
+                "free %.1f GiB, margin %.2f, mode=%s)",
+                "tiled" if tiled else "untiled", height, width, num_frames,
+                estimate / 2**30, free_bytes / 2**30, _DECODE_UNTILED_SAFETY_MARGIN, mode,
+            )
+            if tiled:
+                video = vae.tiled_decode(latents, return_dict=False)[0]
+            else:
+                video = vae.decode(latents, return_dict=False)[0]
             # Quantize to 8-bit at the worker boundary (see class docstring).
             video = (video / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
         return {"video_output": [video]}

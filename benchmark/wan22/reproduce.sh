@@ -44,9 +44,10 @@ serve_mstar() {
   DEVICES="$1" PORT="$2" bash "$MSTAR/test/wan22/launch_server_wan22.sh"
 }
 
-# vllm-omni baseline, accelerations off. Install vllm 0.18.0 (0.20.0+ are cu13-only
-# wheels; 0.24.0 will not load on a cu12 driver). --enforce-eager because its Wan2.2
-# DiT compiles by default. NOT `vllm serve --omni`, which serves no video routes.
+# vllm-omni baseline, accelerations off. Install vllm==0.18.0 + vllm-omni commit 282e0b66
+# (git checkout after clone); newer vllm-omni HEAD needs vllm 0.20 / CUDA 13, which this
+# cu12 box cannot run. --enforce-eager because its Wan2.2 DiT compiles by default.
+# NOT `vllm serve --omni`, which serves no video routes.
 # usage: reproduce.sh serve-vllm <gpu> <port>
 serve_vllm() {
   preflight "$1"

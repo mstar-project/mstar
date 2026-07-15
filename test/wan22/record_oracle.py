@@ -32,10 +32,12 @@ Everything else below is a fact of the reference run. Change one and the
 equivalence suite's thresholds stop describing anything:
 
     prompt / negative prompt  the constants below, recorded verbatim
-    seed                      42, via torch.Generator(device="cpu")
-    size / frames             480 x 832 x 33   (H x W x F)
-    steps / guidance          NOT passed -> the pipeline defaults (50 / 5.0),
-                              resolved and recorded afterwards
+    seed                      42 (--seed), via torch.Generator(device="cpu")
+    size / frames             480 x 832 x 33 (--height/--width/--num-frames)
+    steps / guidance          defaults unless --num-inference-steps / --guidance is
+                              passed; pipeline defaults (50 / 5.0) resolved and
+                              recorded afterwards. --guidance 1.0 records a no-CFG
+                              oracle (one batch-1 forward per step).
     dtype                     bfloat16
     scheduler                 UniPCMultistepScheduler (checkpoint default)
 
@@ -57,6 +59,7 @@ import argparse
 import json
 import platform
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -95,6 +98,19 @@ SEED = 42
 FPS = 24  # Wan2.2-TI2V-5B model-card frame rate
 
 
+@dataclass
+class RunConfig:
+    """Resolved recording knobs. ``guidance`` / ``num_inference_steps`` are None
+    when the pipeline defaults are used (recorded afterwards from the run)."""
+
+    height: int = HEIGHT
+    width: int = WIDTH
+    num_frames: int = NUM_FRAMES
+    seed: int = SEED
+    guidance: float | None = None
+    num_inference_steps: int | None = None
+
+
 def build_pipeline(offload: bool):
     from diffusers import WanPipeline
 
@@ -106,8 +122,8 @@ def build_pipeline(offload: bool):
     return pipe
 
 
-def run(pipe, step_records: list, latents_dir: Path):
-    generator = torch.Generator(device="cpu").manual_seed(SEED)
+def run(pipe, step_records: list, latents_dir: Path, run_cfg: "RunConfig"):
+    generator = torch.Generator(device="cpu").manual_seed(run_cfg.seed)
 
     def save_step_latents(p, i, t, callback_kwargs):
         latents = callback_kwargs["latents"]
@@ -120,18 +136,25 @@ def run(pipe, step_records: list, latents_dir: Path):
         })
         return {}
 
-    # steps + guidance intentionally NOT passed: use the pipeline defaults and
-    # record the resolved values afterwards.
-    return pipe(
+    call_kwargs = dict(
         prompt=PROMPT,
         negative_prompt=NEGATIVE_PROMPT,
-        height=HEIGHT,
-        width=WIDTH,
-        num_frames=NUM_FRAMES,
+        height=run_cfg.height,
+        width=run_cfg.width,
+        num_frames=run_cfg.num_frames,
         generator=generator,
         callback_on_step_end=save_step_latents,
         callback_on_step_end_tensor_inputs=["latents"],
     )
+    # steps + guidance default to the pipeline's own values (recorded afterwards)
+    # unless explicitly overridden. --guidance 1.0 records a no-CFG oracle (the
+    # pipeline skips classifier-free guidance at guidance_scale <= 1), pricing the
+    # dit submodule's batch-1 branch.
+    if run_cfg.guidance is not None:
+        call_kwargs["guidance_scale"] = run_cfg.guidance
+    if run_cfg.num_inference_steps is not None:
+        call_kwargs["num_inference_steps"] = run_cfg.num_inference_steps
+    return pipe(**call_kwargs)
 
 
 def parse_args() -> argparse.Namespace:
@@ -148,6 +171,21 @@ def parse_args() -> argparse.Namespace:
         help="substring the GPU name must contain (e.g. '5090', 'H100'). A recorded "
              "oracle is only valid for the GPU + torch build it was made on, so this "
              "guards against silently re-recording on the wrong device.",
+    )
+    # Recording knobs. The defaults reproduce the canonical CFG oracle exactly;
+    # override them to record a variant (e.g. --guidance 1.0 for the no-CFG oracle).
+    ap.add_argument("--height", type=int, default=HEIGHT)
+    ap.add_argument("--width", type=int, default=WIDTH)
+    ap.add_argument("--num-frames", type=int, default=NUM_FRAMES)
+    ap.add_argument("--seed", type=int, default=SEED)
+    ap.add_argument(
+        "--guidance", type=float, default=None,
+        help="guidance_scale; unset uses the pipeline default (CFG on). Pass 1.0 to "
+             "record a no-CFG oracle (the pipeline runs one batch-1 forward per step).",
+    )
+    ap.add_argument(
+        "--num-inference-steps", type=int, default=None,
+        help="denoise steps; unset uses the pipeline default (50).",
     )
     return ap.parse_args()
 
@@ -168,6 +206,12 @@ def main() -> None:
     if args.expect_gpu and args.expect_gpu not in gpu_name:
         raise SystemExit(f"expected a GPU matching {args.expect_gpu!r}, got {gpu_name!r}")
 
+    run_cfg = RunConfig(
+        height=args.height, width=args.width, num_frames=args.num_frames,
+        seed=args.seed, guidance=args.guidance,
+        num_inference_steps=args.num_inference_steps,
+    )
+
     step_records: list[dict] = []
     torch.cuda.reset_peak_memory_stats()
     t_start = time.perf_counter()
@@ -180,7 +224,7 @@ def main() -> None:
     mode = "full_cuda"
     pipe = build_pipeline(offload=False)
     try:
-        result = run(pipe, step_records, latents_dir)
+        result = run(pipe, step_records, latents_dir, run_cfg)
     except torch.cuda.OutOfMemoryError:
         print("OOM in full-CUDA mode; retrying with enable_model_cpu_offload()")
         mode = "cpu_offload"
@@ -190,7 +234,7 @@ def main() -> None:
         step_records.clear()
         t_start = time.perf_counter()
         pipe = build_pipeline(offload=True)
-        result = run(pipe, step_records, latents_dir)
+        result = run(pipe, step_records, latents_dir, run_cfg)
 
     wall_time = time.perf_counter() - t_start
     peak_vram = torch.cuda.max_memory_allocated()
@@ -201,7 +245,7 @@ def main() -> None:
     final_latents = torch.load(latents_dir / f"step_{final_step:03d}.pt")
     torch.save(final_latents, out_dir / "final_latents.pt")
 
-    video_path = out_dir / "wan22_ti2v5b_t2v_seed42.mp4"
+    video_path = out_dir / f"wan22_ti2v5b_t2v_seed{run_cfg.seed}.mp4"
     export_to_video(result.frames[0], str(video_path), fps=FPS)
 
     tf_cfg = dict(pipe.transformer.config)
@@ -216,11 +260,11 @@ def main() -> None:
             "this run uses the canonical Wan negative prompt from pipeline_wan.py's "
             "EXAMPLE_DOC_STRING, recorded verbatim above."
         ),
-        "height": HEIGHT,
-        "width": WIDTH,
-        "num_frames": NUM_FRAMES,
-        "seed": SEED,
-        "generator": "torch.Generator(device='cpu').manual_seed(42)",
+        "height": run_cfg.height,
+        "width": run_cfg.width,
+        "num_frames": run_cfg.num_frames,
+        "seed": run_cfg.seed,
+        "generator": f"torch.Generator(device='cpu').manual_seed({run_cfg.seed})",
         "fps_export": FPS,
         "torch_dtype": "bfloat16",
         "mode": mode,
