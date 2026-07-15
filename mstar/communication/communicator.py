@@ -10,6 +10,13 @@ from mstar.communication.event import EventWakeup
 logger = logging.getLogger(__name__)
 
 
+class CommProtocol(Enum):
+    IPC = "IPC"
+    TCP = "TCP"
+    RDMA = "RDMA"
+    SHM = "SHM"
+
+
 class BaseCommunicator(ABC):
     @abstractmethod
     def send(self, entity_id: str, msg):
@@ -22,16 +29,35 @@ class BaseCommunicator(ABC):
     def get_all_new_messages(self) -> list:
         pass
 
+    # -- endpoint scheme (shared by every ZMQ-based communicator) ------------
+    # Subclasses set ``self.protocol`` and ``self.ipc_socket_path_prefix``.
+
+    def _endpoint(self, entity_id: str) -> str:
+        if self.protocol == CommProtocol.IPC:
+            return f"ipc://{self.ipc_socket_path_prefix}/{entity_id}.ipc"
+        if self.protocol == CommProtocol.TCP:
+            host = os.getenv("MSTAR_ZMQ_TCP_HOST", "127.0.0.1")
+            return f"tcp://{host}:{self._tcp_port(entity_id)}"
+        raise NotImplementedError(f"Protocol {self.protocol} not yet supported yet")
+
+    @staticmethod
+    def _tcp_port(entity_id: str) -> int:
+        base_port = int(os.getenv("MSTAR_ZMQ_TCP_BASE_PORT", "19000"))
+        if entity_id == "api_server":
+            return base_port
+        if entity_id == "conductor":
+            return base_port + 1
+        if entity_id == "api_server_preprocess_worker":
+            return base_port + 2
+        if entity_id.startswith("worker_"):
+            rank = entity_id.removeprefix("worker_")
+            if rank.isdigit():
+                return base_port + 100 + int(rank)
+        return base_port + 1000 + (sum(entity_id.encode("utf-8")) % 1000)
+
     # @abstractmethod
     # def get_session_id(self) -> str:
     #     pass
-
-
-class CommProtocol(Enum):
-    IPC = "IPC"
-    TCP = "TCP"
-    RDMA = "RDMA"
-    SHM = "SHM"
 
 
 class ZMQCommunicator(BaseCommunicator):
@@ -84,29 +110,6 @@ class ZMQCommunicator(BaseCommunicator):
         if self.event.fd in events:
             self.event.drain()
 
-    def _endpoint(self, entity_id: str) -> str:
-        if self.protocol == CommProtocol.IPC:
-            return f"ipc://{self.ipc_socket_path_prefix}/{entity_id}.ipc"
-        if self.protocol == CommProtocol.TCP:
-            host = os.getenv("MSTAR_ZMQ_TCP_HOST", "127.0.0.1")
-            return f"tcp://{host}:{self._tcp_port(entity_id)}"
-        raise NotImplementedError(f"Protocol {self.protocol} not yet supported yet")
-
-    @staticmethod
-    def _tcp_port(entity_id: str) -> int:
-        base_port = int(os.getenv("MSTAR_ZMQ_TCP_BASE_PORT", "19000"))
-        if entity_id == "api_server":
-            return base_port
-        if entity_id == "conductor":
-            return base_port + 1
-        if entity_id == "api_server_preprocess_worker":
-            return base_port + 2
-        if entity_id.startswith("worker_"):
-            rank = entity_id.removeprefix("worker_")
-            if rank.isdigit():
-                return base_port + 100 + int(rank)
-        return base_port + 1000 + (sum(entity_id.encode("utf-8")) % 1000)
-
     # def get_session_id(self) -> str:
     #     return self.session_id
 
@@ -125,6 +128,14 @@ class ZMQCommunicator(BaseCommunicator):
 
     def get_all_new_messages(self, blocking=False) -> list:
         messages = []
+        if blocking:
+            # Wait until the pull socket is readable before draining. A
+            # registered wakeup event also ends the wait (and is drained
+            # here, exactly as in wait_for_work), so a completed compute
+            # future can interrupt a blocking receive.
+            events = dict(self.poller.poll())
+            if self.event is not None and self.event.fd in events:
+                self.event.drain()
         while True:
             try:
                 # zmq.NOBLOCK means zmq doesn't wait for a new message to be
@@ -146,16 +157,29 @@ class ZMQCommunicator(BaseCommunicator):
 def make_communicator(*args, **kwargs) -> BaseCommunicator:
     """Construct the process's communicator, selecting the transport.
 
-    ``MSTAR_RUST_ZMQ=1`` opts a process into the Rust-backed
-    ``RustZMQCommunicator`` (vendored ``rust/`` extension; see
-    ``communication/rust_communicator.py``). Default is the pyzmq
-    ``ZMQCommunicator``, byte-identical behavior. The two are
-    wire-compatible (same endpoints, same pickle frames), so the flag can
-    be set per-process — one entity at a time — while the rest of the
-    mesh stays on pyzmq.
-    """
-    if os.getenv("MSTAR_RUST_ZMQ", "0") == "1":
-        from mstar.communication.rust_communicator import RustZMQCommunicator
+    ``MSTAR_RUST_ZMQ`` selects it (see ``docs/environment_variables.rst``):
 
-        return RustZMQCommunicator(*args, **kwargs)
+    * ``0`` (default) — the pyzmq ``ZMQCommunicator``.
+    * ``1`` — the Rust-backed ``RustZMQCommunicator`` (vendored ``rust/``
+      extension; see ``communication/rust_communicator.py``); raises if the
+      extension is not installed.
+    * ``AUTO`` — the Rust communicator when the extension imports
+      successfully, pyzmq otherwise.
+
+    The two are wire-compatible (same endpoints, same pickle frames), so the
+    flag can be set per-process — one entity at a time — while the rest of
+    the mesh stays on pyzmq.
+    """
+    choice = os.getenv("MSTAR_RUST_ZMQ", "0").upper()
+    if choice not in ("0", "1", "AUTO"):
+        raise ValueError(f"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got {choice!r}")
+    if choice != "0":
+        try:
+            from mstar.communication.rust_communicator import RustZMQCommunicator
+        except ImportError:
+            if choice == "1":
+                raise
+            logger.debug("MSTAR_RUST_ZMQ=AUTO: mstar_rust not installed, using pyzmq")
+        else:
+            return RustZMQCommunicator(*args, **kwargs)
     return ZMQCommunicator(*args, **kwargs)

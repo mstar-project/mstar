@@ -59,3 +59,29 @@ def test_readiness_poll_never_drops_or_reorders(pair):
     orig.send("rust", "second")
     time.sleep(0.1)
     assert rust.get_all_new_messages() == ["first", "second"]
+
+
+@pytest.mark.parametrize("receiver", ["rust", "orig"])
+def test_blocking_receive_waits_for_a_message(pair, receiver):
+    """get_all_new_messages(blocking=True) waits instead of returning [] —
+    on both communicators (the pyzmq one had the same latent bug)."""
+    orig, rust = pair
+    dst, src = (rust, orig) if receiver == "rust" else (orig, rust)
+    threading.Thread(target=lambda: (time.sleep(0.1),
+                                     src.send(receiver, "late"))).start()
+    assert dst.get_all_new_messages(blocking=True) == ["late"]
+
+
+def test_make_communicator_flag(monkeypatch, tmp_path):
+    from mstar.communication.communicator import make_communicator
+
+    def make(value):
+        monkeypatch.setenv("MSTAR_RUST_ZMQ", value)
+        return make_communicator(
+            f"m_{value}", push_ids=[], ipc_socket_path_prefix=str(tmp_path))
+
+    assert isinstance(make("0"), ZMQCommunicator)
+    assert isinstance(make("1"), RustZMQCommunicator)
+    assert isinstance(make("AUTO"), RustZMQCommunicator)  # extension installed
+    with pytest.raises(ValueError):
+        make("yes")

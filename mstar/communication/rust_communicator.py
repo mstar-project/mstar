@@ -9,9 +9,10 @@ constructor, same methods, same semantics — with the transport moved to Rust:
   (``ipc://{prefix}/{id}.ipc`` / the same TCP host+port scheme), and the
   default codec is pickle — so a wrapped entity talks to unwrapped pyzmq
   entities in both directions. Migration can proceed one process at a time.
-* **encode/decode seam.** ``codec`` is a ``(dumps, loads)`` pair defaulting to
-  pickle (today's wire). Swapping to msgpack later is a codec change on both
-  ends of an edge, never a transport change.
+* **encode/decode seam.** ``codec`` is a :class:`Codec` (mirroring the Rust
+  ``Codec`` trait) defaulting to :class:`PickleCodec` (today's wire).
+  Swapping to msgpack later is a codec change on both ends of an edge,
+  never a transport change.
 * **eventfd wakeup.** ``register_event_for_poll`` forwards the ``EventWakeup``
   fd to the Rust poller (``register_wakeup_fd``): a completed compute future
   wakes ``wait_for_work`` / ``poll_for_messages`` immediately, not on the poll
@@ -23,7 +24,9 @@ constructor, same methods, same semantics — with the transport moved to Rust:
   poll is buffered and handed out by the next ``get_all_new_messages`` — no
   message is ever dropped or reordered.
 
-Requires the vendored extension: ``maturin develop`` (or ``pip install .``) in ``rust/``.
+Requires the vendored extension — from ``rust/``: ``maturin develop --release``
+(or ``pip install .``). Use ``--release``: debug builds cost real latency on
+the hot receive path. See ``docs/installation.rst``.
 """
 
 from __future__ import annotations
@@ -40,10 +43,34 @@ from mstar.communication.event import EventWakeup
 
 logger = logging.getLogger(__name__)
 
-#: The encode/decode seam. Pickle matches today's ``send_pyobj`` wire, so a
-#: wrapped entity interoperates with unwrapped pyzmq entities. Migrate an edge
-#: to msgpack by giving both endpoints a msgpack codec.
-PickleCodec = (pickle.dumps, pickle.loads)
+class Codec:
+    """The encode/decode seam, mirroring the Rust ``Codec`` trait::
+
+        pub trait Codec<M> {
+            fn encode(msg: &M) -> Result<Vec<u8>, CommError>;
+            fn decode(bytes: &[u8]) -> Option<M>;
+        }
+
+    The transport never looks inside the bytes; migrating an edge to another
+    encoding (e.g. msgpack) means giving both endpoints that codec — never a
+    transport change.
+    """
+
+    @staticmethod
+    def encode(msg) -> bytes:
+        raise NotImplementedError
+
+    @staticmethod
+    def decode(data: bytes):
+        raise NotImplementedError
+
+
+class PickleCodec(Codec):
+    """Pickle matches today's ``send_pyobj`` wire, so a wrapped entity
+    interoperates with unwrapped pyzmq entities in both directions."""
+
+    encode = staticmethod(pickle.dumps)
+    decode = staticmethod(pickle.loads)
 
 
 class RustZMQCommunicator(BaseCommunicator):
@@ -55,13 +82,13 @@ class RustZMQCommunicator(BaseCommunicator):
         push_ids: list[str],
         protocol: CommProtocol = CommProtocol.IPC,
         ipc_socket_path_prefix: str = "/tmp/mstar/",
-        codec=PickleCodec,
+        codec: type[Codec] = PickleCodec,
     ):
         transport = os.getenv("MSTAR_ZMQ_TRANSPORT", protocol.value).upper()
         self.protocol = CommProtocol(transport)
         self.my_id = my_id
         self.ipc_socket_path_prefix = ipc_socket_path_prefix
-        self._dumps, self._loads = codec
+        self.codec = codec
         self.event: EventWakeup | None = None
         # Messages consumed by a readiness poll, awaiting get_all_new_messages.
         self._buffered: deque = deque()
@@ -80,28 +107,8 @@ class RustZMQCommunicator(BaseCommunicator):
         else:
             raise NotImplementedError(f"Protocol {protocol} not yet supported yet")
 
-    # -- endpoint scheme (identical to the pyzmq communicator's) ------------
-
-    def _endpoint(self, entity_id: str) -> str:
-        if self.protocol == CommProtocol.IPC:
-            return f"ipc://{self.ipc_socket_path_prefix}/{entity_id}.ipc"
-        host = os.getenv("MSTAR_ZMQ_TCP_HOST", "127.0.0.1")
-        return f"tcp://{host}:{self._tcp_port(entity_id)}"
-
-    @staticmethod
-    def _tcp_port(entity_id: str) -> int:
-        base_port = int(os.getenv("MSTAR_ZMQ_TCP_BASE_PORT", "19000"))
-        if entity_id == "api_server":
-            return base_port
-        if entity_id == "conductor":
-            return base_port + 1
-        if entity_id == "api_server_preprocess_worker":
-            return base_port + 2
-        if entity_id.startswith("worker_"):
-            rank = entity_id.removeprefix("worker_")
-            if rank.isdigit():
-                return base_port + 100 + int(rank)
-        return base_port + 1000 + (sum(entity_id.encode("utf-8")) % 1000)
+    # endpoint scheme: `_endpoint` / `_tcp_port` come from BaseCommunicator
+    # (shared with the pyzmq ZMQCommunicator).
 
     def _register(self, entity_id: str) -> None:
         if entity_id not in self._registered:
@@ -114,14 +121,16 @@ class RustZMQCommunicator(BaseCommunicator):
         self._inner.register_wakeup_fd(event.fd)
         self.event = event
 
-    def _poll_once(self, timeout_ms: int) -> None:
-        """One wake-aware poll. A consumed message goes to the buffer; a
-        wakeup drains the event (same place the pyzmq path drains it)."""
+    def _poll_once(self, timeout_ms: int) -> str:
+        """One wake-aware poll; returns ``"msg"`` / ``"wake"`` / ``"timeout"``.
+        A consumed message goes to the buffer; a wakeup drains the event
+        (same place the pyzmq path drains it)."""
         kind, payload = self._inner.recv_or_wake(timeout_ms)
         if kind == "msg":
             self._buffered.append(payload)
         elif kind == "wake" and self.event is not None:
             self.event.drain()
+        return kind
 
     def wait_for_work(self, timeout_ms: int = 50) -> None:
         if self._buffered:
@@ -129,8 +138,11 @@ class RustZMQCommunicator(BaseCommunicator):
         self._poll_once(timeout_ms)
 
     def poll_for_messages(self, timeout_ms: int = 20) -> bool:
-        """Block up to ``timeout_ms`` for a readable message; True when one is
-        available (buffered here, delivered by ``get_all_new_messages``)."""
+        """Block until a message is readable, a registered wakeup event
+        fires, or ``timeout_ms`` elapses — whichever comes first. True when
+        a message is available (buffered here, delivered by
+        ``get_all_new_messages``); a wakeup ends the poll early with False
+        (the event is drained, exactly as in ``wait_for_work``)."""
         if self._buffered:
             return True
         self._poll_once(timeout_ms)
@@ -140,11 +152,18 @@ class RustZMQCommunicator(BaseCommunicator):
         logger.debug("%s to send a message %s to entity %s", self.my_id, str(msg), entity_id)
         if self.protocol == CommProtocol.TCP:
             self._register(entity_id)
-        self._inner.send(entity_id, self._dumps(msg))
+        self._inner.send(entity_id, self.codec.encode(msg))
 
     def get_all_new_messages(self, blocking: bool = False) -> list:
-        messages = [self._loads(b) for b in self._buffered]
+        if blocking and not self._buffered:
+            # Wait until a message is readable before draining — same
+            # semantics as the pyzmq communicator: a registered wakeup
+            # event also ends the wait, so a completed compute future can
+            # interrupt a blocking receive.
+            while self._poll_once(50) == "timeout":
+                pass
+        messages = [self.codec.decode(b) for b in self._buffered]
         self._buffered.clear()
         while (b := self._inner.try_recv()) is not None:
-            messages.append(self._loads(b))
+            messages.append(self.codec.decode(b))
         return messages
