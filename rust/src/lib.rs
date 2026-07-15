@@ -3,7 +3,7 @@
 //! is the PyO3 surface (`mstar_rust.ZmqCommunicator`) the Python
 //! `RustZMQCommunicator` wrapper drives. Build: `maturin develop` in rust/.
 
-mod communicator;
+pub mod communicator;
 
 use std::time::Duration;
 
