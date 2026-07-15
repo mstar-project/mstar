@@ -35,7 +35,6 @@ Communication
      - ``19000``
      - Base of the deterministic entity-id → TCP port map (``api_server``
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
-<<<<<<< HEAD
    * - ``MSTAR_SHM_ARENA``
      - ``0``
      - SHM tensor-transport implementation. ``0``: per-uuid files.
@@ -99,7 +98,6 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
-=======
 Serving (Rust frontend)
 -----------------------
 
@@ -129,10 +127,17 @@ Read by the ``mstar-server`` binary and its bridge
      - ``0``
      - Allow ``http(s)`` media URLs in requests (fetched server-side,
        30 s timeout). Off by default.
+   * - ``MSTAR_MAX_CONCURRENT_REQUESTS``
+     - ``256``
+     - Admission cap on in-flight generation requests; beyond it clients
+       get an immediate 503 instead of queueing into the request timeout.
+       ``/health`` and ``/v1/models`` bypass the cap.
+   * - ``MSTAR_MAX_BODY_MB``
+     - ``128``
+     - Request body limit (multipart uploads included).
    * - ``MSTAR_TOKENIZER``
      - unset
      - Path to a HuggingFace ``tokenizer.json`` enabling frontend
        tokenization. Leave unset with the Python backend — its preprocess
        worker owns tokenization, and the bridge rejects pre-tokenized
        ingest.
->>>>>>> 018612d (rust frontend: serve HTTP from mstar-server behind --rust-frontend (Step 3))

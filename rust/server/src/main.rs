@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Multipart, State},
+    extract::{DefaultBodyLimit, Multipart, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -115,21 +115,86 @@ async fn main() {
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(list_models))
+    // Admission control: bound concurrent generation requests; past the cap
+    // clients get an immediate 503 instead of queueing into the timeout.
+    // /health and /v1/models bypass it (a saturated server is still alive).
+    let max_concurrent: usize = std::env::var("MSTAR_MAX_CONCURRENT_REQUESTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    // Uploads (audio/video multipart) routinely exceed axum's 2 MB default.
+    let body_limit_mb: usize = std::env::var("MSTAR_MAX_BODY_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
+
+    let api = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/audio/speech", post(audio_speech))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_edits))
         .route("/generate", post(generate))
+        .route_layer(axum::middleware::from_fn_with_state(permits, admission));
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(list_models))
+        .merge(api)
+        .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(cors)
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+/// SIGTERM/SIGINT: stop accepting, drain in-flight requests, exit — with a
+/// hard 30 s cap so a wedged stream can't hold the process forever.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+    #[cfg(unix)]
+    let term = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    eprintln!("mstar-server: shutting down (draining in-flight, 30s cap)");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        eprintln!("mstar-server: drain deadline reached, exiting");
+        std::process::exit(0);
+    });
+}
+
+/// Reject work beyond the concurrency cap with an immediate 503.
+async fn admission(
+    State(permits): State<Arc<tokio::sync::Semaphore>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match permits.clone().try_acquire_owned() {
+        Ok(_permit) => next.run(req).await,
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {
+                "message": "server saturated: too many concurrent requests",
+                "type": "overloaded_error"
+            }})),
+        )
+            .into_response(),
+    }
 }
 
 // ---- shared helpers -------------------------------------------------------
@@ -208,8 +273,21 @@ fn sse_error_event(msg: &str) -> Event {
 
 // ---- GET /health, /v1/models ---------------------------------------------
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "healthy"}))
+/// Deep health: liveness of the whole serving path, not just this process.
+/// With a bridge configured, a ping must round-trip to the Python backend —
+/// so a dead bridge loop or conductor turns the LB check red instead of
+/// letting requests queue into the timeout. Mock mode stays shallow.
+async fn health(State(st): State<AppState>) -> Response {
+    if let Some(bridge) = &st.bridge {
+        if !bridge.ping(std::time::Duration::from_secs(2)).await {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"status": "unhealthy", "reason": "backend bridge unreachable"})),
+            )
+                .into_response();
+        }
+    }
+    Json(json!({"status": "healthy"})).into_response()
 }
 
 async fn list_models(State(st): State<AppState>) -> Json<ModelList> {

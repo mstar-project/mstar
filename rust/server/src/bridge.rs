@@ -125,6 +125,8 @@ impl Bridge {
                 ),
                 "err" => (Some(StreamItem::Error(msg.msg)), true),
                 "done" => (Some(StreamItem::Done), true),
+                // Liveness reply: completes the ping's route like a request.
+                "pong" => (Some(StreamItem::Done), true),
                 _ => (None, false),
             };
             if let Some(item) = item {
@@ -169,6 +171,25 @@ impl Bridge {
         let payload = rmp_serde::to_vec_named(&msg).expect("encode submit");
         let _ = self.mbox.send("conductor", &payload);
         rx
+    }
+
+    /// Liveness round-trip for the deep health check: send `{t:"ping"}` and
+    /// wait for the backend's pong (routed like a completed request). False
+    /// on timeout — the bridge loop or the backend behind it is gone.
+    pub async fn ping(&self, timeout: Duration) -> bool {
+        let rid = format!("ping-{}", uuid::Uuid::new_v4());
+        let (tx, mut rx) = unbounded_channel();
+        self.routes
+            .lock()
+            .expect("routes lock")
+            .insert(rid.clone(), tx);
+        let msg = serde_json::json!({"t": "ping", "rid": rid});
+        if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
+            let _ = self.mbox.send("conductor", &payload);
+        }
+        let ok = tokio::time::timeout(timeout, rx.recv()).await.is_ok();
+        self.routes.lock().expect("routes lock").remove(&rid);
+        ok
     }
 
     /// Abort a request (client disconnected or timed out): tell the conductor

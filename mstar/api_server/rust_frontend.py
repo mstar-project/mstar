@@ -149,6 +149,10 @@ class RustFrontendBridge:
                     self._submit(msg)
                 elif t == "abort":
                     self.server.abort_request(msg["rid"])
+                elif t == "ping":
+                    # Deep-health liveness: the frontend's /health goes red
+                    # unless this loop answers.
+                    self._send({"t": "pong", "rid": msg["rid"]})
                 else:
                     logger.warning("bridge: unknown message type %r", t)
             await asyncio.sleep(0.002)
