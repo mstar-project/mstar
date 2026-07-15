@@ -1,5 +1,5 @@
-"""DRAFT (RFC #130 Step 1): ``ZMQCommunicator`` as a thin wrapper over the
-mstar-rs Rust communicator (``mstar_rs._core.ZmqCommunicator``).
+"""RFC #130 Step 1: ``ZMQCommunicator`` as a thin wrapper over the Rust
+communicator vendored in ``rust/`` (``mstar_rust.ZmqCommunicator``).
 
 Drop-in for :class:`mstar.communication.communicator.ZMQCommunicator` — same
 constructor, same methods, same semantics — with the transport moved to Rust:
