@@ -47,4 +47,7 @@ jobs:
       - name: Interop tests (pyzmq <-> Rust)
         run: |
           pip install pytest pyzmq
+          # the package itself, without its (heavy) deps — the transport
+          # test chain needs only pyzmq + stdlib
+          pip install --no-deps -e .
           pytest test/rust/test_rust_communicator.py -v
