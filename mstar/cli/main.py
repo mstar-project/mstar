@@ -134,6 +134,10 @@ def _serve(args: argparse.Namespace) -> None:
         argv += ["--log-stats"]
     if args.log_stats_file:
         argv += ["--log-stats-file", args.log_stats_file]
+    if args.rust_frontend:
+        argv += ["--rust-frontend"]
+    if args.rust_frontend_bin:
+        argv += ["--rust-frontend-bin", args.rust_frontend_bin]
 
     print(_next_steps(args.model, args.host, args.port), file=sys.stderr)
 
@@ -169,6 +173,16 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--log-stats-file", default=None,
         help="append per-request profiling stats to this file (implies --log-stats)",
+    )
+    serve.add_argument(
+        "--rust-frontend", action="store_true",
+        help="serve HTTP from the Rust mstar-server binary instead of "
+             "uvicorn/FastAPI (see docs: environment variables / installation)",
+    )
+    serve.add_argument(
+        "--rust-frontend-bin", default=None,
+        help="path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
+             "$PATH, then rust/server/target/release)",
     )
     serve.set_defaults(func=_serve)
     return parser

@@ -282,7 +282,8 @@ keeping preprocessing and the conductor protocol. Build and opt in:
 .. code-block:: bash
 
    cargo build --release --manifest-path rust/server/Cargo.toml
-   mstar-serve --config <model.yaml> --rust-frontend
+   mstar serve qwen3_omni --rust-frontend
+   # or, with an explicit config: mstar-serve --config <model.yaml> --rust-frontend
 
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
 ``$PATH`` / the in-repo build. Its knobs are listed in
