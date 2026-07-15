@@ -58,14 +58,23 @@ impl PyZmqCommunicator {
         self.inner.register_wakeup_fd(fd);
     }
 
-    fn send(&self, peer_id: &str, data: &[u8]) -> PyResult<()> {
-        self.inner
-            .send(peer_id, data)
+    /// Released-GIL send: a PUSH send blocks when the peer is at its
+    /// high-water mark, and blocking with the GIL held would freeze every
+    /// Python thread in the process (pyzmq releases it here too).
+    fn send(&self, py: Python<'_>, peer_id: &str, data: &[u8]) -> PyResult<()> {
+        py.allow_threads(|| self.inner.send(peer_id, data))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn try_recv<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
         self.inner.try_recv().map(|b| PyBytes::new(py, &b))
+    }
+
+    /// Drain all currently-queued frames in one call — one GIL round-trip
+    /// per batch instead of one `try_recv` per message.
+    fn drain<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyBytes>> {
+        let frames = py.allow_threads(|| self.inner.drain());
+        frames.iter().map(|b| PyBytes::new(py, b)).collect()
     }
 
     fn recv_timeout<'py>(&self, py: Python<'py>, timeout_ms: u64) -> Option<Bound<'py, PyBytes>> {

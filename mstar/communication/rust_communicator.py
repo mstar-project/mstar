@@ -164,6 +164,6 @@ class RustZMQCommunicator(BaseCommunicator):
                 pass
         messages = [self.codec.decode(b) for b in self._buffered]
         self._buffered.clear()
-        while (b := self._inner.try_recv()) is not None:
-            messages.append(self.codec.decode(b))
+        # One FFI call for the whole queued batch (vs try_recv per message).
+        messages.extend(self.codec.decode(b) for b in self._inner.drain())
         return messages
