@@ -35,3 +35,26 @@ Communication
      - ``19000``
      - Base of the deterministic entity-id → TCP port map (``api_server``
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
+   * - ``MSTAR_SHM_ARENA``
+     - ``0``
+     - SHM tensor-transport implementation. ``0``: per-uuid files.
+       ``1``: the Rust shared-memory arena (requires the ``rust/``
+       extension; raises if missing). ``AUTO``: the arena when the
+       extension imports, files otherwise. Must match across the
+       deployment — arena locations ride in the tensor descriptors.
+   * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
+     - ``256``
+     - Size of each arena segment. The arena grows segment by segment;
+       existing segments never move (registrations stay valid).
+   * - ``MSTAR_SHM_ARENA_MAX_SEGMENTS``
+     - ``32``
+     - Growth cap per producer entity. At the cap, sends backpressure
+       until consumers ACK and space is reclaimed.
+   * - ``MSTAR_SHM_ARENA_FULL_TIMEOUT_S``
+     - ``30``
+     - How long a send backpressures on a full arena before failing.
+   * - ``MSTAR_SHM_ARENA_PIN``
+     - ``1``
+     - ``cudaHostRegister`` each mapped segment (both sides) so D2H/H2D
+       copies through the side streams run at page-locked bandwidth and
+       stay asynchronous. ``0`` disables (pageable copies).
