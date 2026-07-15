@@ -7,13 +7,13 @@
 //!
 //! * [`RawZmqCommunicator`] — the transport. Sends/receives **opaque byte
 //!   frames** (one zmq frame = exactly the payload, no added framing), so a
-//!   Python pickle blob, a msgpack blob, or bincode all pass through
+//!   Python pickle blob or a msgpack blob passes through
 //!   untouched. Also owns the delivery machinery: ipc *and* tcp endpoints,
 //!   lazily-cached PUSH sockets, and **wakeup fds** (poll an eventfd alongside
 //!   the PULL socket so an external event — e.g. a completed compute future —
 //!   wakes the receive loop immediately instead of on the poll timeout).
 //! * [`ZmqCommunicator<M, C>`] — a typed wrapper: `Codec` encodes/decodes `M`
-//!   to bytes ([`BincodeCodec`] by default, matching the previous behavior for
+//!   to bytes ([`MsgpackCodec`] by default — the language-neutral wire for
 //!   Rust-internal messaging).
 //!
 //! Each entity binds one **PULL** inbox (default `ipc://<dir>/<my_id>.ipc`;
@@ -39,7 +39,7 @@ pub enum CommError {
     #[error("zmq: {0}")]
     Zmq(#[from] zmq::Error),
     #[error("serialize: {0}")]
-    Serialize(bincode::Error),
+    Serialize(rmp_serde::encode::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("no endpoint for peer '{0}' (register_peer it, or bind with an ipc dir)")]
@@ -277,28 +277,30 @@ impl Drop for RawZmqCommunicator {
 // ---------------------------------------------------------------------------
 
 /// Message encoding — the seam mstar migrates across (pickle for a
-/// Python-to-Python mesh, msgpack/bincode for language-neutral ones). The
+/// Python-to-Python mesh, msgpack for language-neutral ones). The
 /// transport never looks inside the bytes.
 pub trait Codec<M> {
     fn encode(msg: &M) -> Result<Vec<u8>, CommError>;
     fn decode(bytes: &[u8]) -> Option<M>;
 }
 
-/// The default codec for Rust-internal messaging.
-pub struct BincodeCodec;
+/// The default codec: MessagePack, the language-neutral encoding the
+/// migration standardizes on — Python peers read the same frames with
+/// `msgpack` (`to_vec_named`: maps with field names, like Python dicts).
+pub struct MsgpackCodec;
 
-impl<M: Serialize + DeserializeOwned> Codec<M> for BincodeCodec {
+impl<M: Serialize + DeserializeOwned> Codec<M> for MsgpackCodec {
     fn encode(msg: &M) -> Result<Vec<u8>, CommError> {
-        bincode::serialize(msg).map_err(CommError::Serialize)
+        rmp_serde::to_vec_named(msg).map_err(CommError::Serialize)
     }
     fn decode(bytes: &[u8]) -> Option<M> {
-        bincode::deserialize(bytes).ok()
+        rmp_serde::from_slice(bytes).ok()
     }
 }
 
 /// A typed mailbox: [`RawZmqCommunicator`] + a [`Codec`]. `M` is the entity's
-/// message type; the default codec is bincode (the previous behavior).
-pub struct ZmqCommunicator<M, C = BincodeCodec> {
+/// message type; the default codec is MessagePack.
+pub struct ZmqCommunicator<M, C = MsgpackCodec> {
     raw: RawZmqCommunicator,
     _marker: PhantomData<fn() -> (M, C)>,
 }
