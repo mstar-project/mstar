@@ -12,10 +12,11 @@ arena (persistent mmaps + first-fit allocator, vendored in ``rust/``):
   optional fields ride along.
 * **Consumer** — ``start_read_tensors`` opens the named segment once (lazy,
   cached), views the bytes zero-copy (``torch.frombuffer``), and H2D-copies
-  on the dedicated stream. The H2D stream is synchronized before returning:
-  the producer reclaims the slot on ACK, so the bytes must be device-resident
-  before the ACK can be sent (the file transport got this for free because
-  ``f.read()`` copied).
+  on the dedicated stream. The producer reclaims the slot on ACK, so an edge
+  must not be ACKed until its copies complete (the file transport got this
+  for free because ``f.read()`` copied) — enforced without blocking the
+  host: the edges ride a CUDA-event future that ``get_ready_tensors``'s
+  existing polling checks before ACKing.
 * **Pinning** — each mapped segment is ``cudaHostRegister``-ed once, on both
   sides (``MSTAR_SHM_ARENA_PIN``, default on with CUDA). A registered segment
   reaches page-locked copy bandwidth, and the copies through the side streams
@@ -53,6 +54,24 @@ from mstar.graph.base import GraphEdge, TensorPointerInfo
 logger = logging.getLogger(__name__)
 
 _CUDA_HOST_ALREADY_REGISTERED = 712
+
+
+class _CudaEventFuture:
+    """Future-shaped CUDA event. An edge whose H2D copies ride behind this
+    event reports ready only once the copies have completed on the device —
+    so the ACK that lets the producer reclaim the arena slot is deferred by
+    ``get_ready_tensors``'s existing future polling instead of a blocking
+    host synchronize."""
+
+    def __init__(self, stream):
+        self._event = torch.cuda.Event()
+        self._event.record(stream)
+
+    def done(self) -> bool:
+        return self._event.query()
+
+    def result(self) -> None:
+        self._event.synchronize()
 
 
 def _pin(ptr: int, nbytes: int) -> bool:
@@ -219,6 +238,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         graph_walk: str | None = None,
     ):
         h2d_did_work = False
+        read_edges: list[tuple[GraphEdge, float]] = []
         ctx = (
             torch.cuda.stream(self._h2d_stream)
             if self._h2d_stream is not None
@@ -259,21 +279,27 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     # +1 transit (released by get_ready_tensors), +1 usage
                     # (released by _cleanup_consumed_inputs).
                     self.tensor_store.increment_ref(request_id, info.uuid, 2)
-                self.pending.append(
-                    FutureAndPointers(
-                        future=None, graph_edges=[graph_edge],
-                        request_id=request_id,
-                        rx_time=time.perf_counter() - rx_t0,
-                    )
-                )
+                read_edges.append(
+                    (graph_edge, time.perf_counter() - rx_t0))
+        future = None
         if h2d_did_work and self._h2d_stream is not None:
-            # The producer reclaims the slot when this edge is ACKed, and the
-            # source is its live mapping — the copy must be complete before
-            # any ACK can go out (the file path's f.read() made this
-            # implicit). The H2D still overlapped default-stream work.
-            self._h2d_stream.synchronize()
+            # Downstream kernels see the data (device-side ordering only).
             torch.cuda.default_stream(self.device).wait_stream(
                 self._h2d_stream)
+            # The producer reclaims the slot when an edge is ACKed, and the
+            # source is its live mapping — so the edge must not report ready
+            # until its copies have completed (the file path's f.read() made
+            # this implicit). One event covers the batch: all copies were
+            # queued on the h2d stream in program order. get_ready_tensors
+            # polls it — no host block here.
+            future = _CudaEventFuture(self._h2d_stream)
+        for graph_edge, rx_time in read_edges:
+            self.pending.append(
+                FutureAndPointers(
+                    future=future, graph_edges=[graph_edge],
+                    request_id=request_id, rx_time=rx_time,
+                )
+            )
         return []
 
     def _read_from_arena(self, info: TensorPointerInfo) -> torch.Tensor:
