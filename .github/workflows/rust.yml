@@ -1,0 +1,41 @@
+name: Rust transport
+
+# Builds the vendored rust/ extension and runs its tests — the cargo unit
+# tests (transport semantics: raw frames, tcp endpoints, wakeup-fd polling)
+# and the pyzmq <-> Rust interop pytest (pickle wire both directions,
+# eventfd wake latency, lossless readiness polls). Path-filtered so it only
+# runs when the transport or its wrapper changes.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "rust/**"
+      - "mstar/communication/**"
+      - "test/modular/test_rust_communicator.py"
+      - ".github/workflows/rust.yml"
+
+jobs:
+  rust-transport:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install libzmq
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
+      - name: Cargo tests (transport semantics)
+        working-directory: rust
+        run: cargo test --release
+      - name: Build and install the extension
+        working-directory: rust
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release
+          pip install target/wheels/*.whl
+      - name: Interop tests (pyzmq <-> Rust)
+        run: |
+          pip install pytest pyzmq
+          pytest test/modular/test_rust_communicator.py -v
