@@ -12,7 +12,7 @@ on:
     paths:
       - "rust/**"
       - "mstar/communication/**"
-      - "test/modular/test_rust_communicator.py"
+      - "test/rust/test_rust_communicator.py"
       - ".github/workflows/rust.yml"
 
 jobs:
@@ -38,4 +38,4 @@ jobs:
       - name: Interop tests (pyzmq <-> Rust)
         run: |
           pip install pytest pyzmq
-          pytest test/modular/test_rust_communicator.py -v
+          pytest test/rust/test_rust_communicator.py -v
