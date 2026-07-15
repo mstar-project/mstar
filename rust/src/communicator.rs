@@ -56,17 +56,32 @@ fn sock_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.ipc"))
 }
 
-/// What a wake-aware receive returned.
-#[derive(Debug, PartialEq, Eq)]
+/// What a wake-aware receive returned. `Message` carries the zmq frame
+/// itself (`Deref<Target = [u8]>`), so bytes are copied exactly once —
+/// at the consumer's decode/PyBytes boundary, never in the transport.
+#[derive(Debug)]
 pub enum RecvEvent {
     /// An inbound message frame.
-    Message(Vec<u8>),
+    Message(zmq::Message),
     /// A registered wakeup fd is readable (the registrant reads/clears it —
     /// e.g. `read(2)` on the eventfd — the transport only polls it).
     Wake,
     /// The timeout elapsed with neither.
     Timeout,
 }
+
+impl PartialEq for RecvEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (RecvEvent::Message(a), RecvEvent::Message(b)) => a[..] == b[..],
+            (RecvEvent::Wake, RecvEvent::Wake) => true,
+            (RecvEvent::Timeout, RecvEvent::Timeout) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RecvEvent {}
 
 /// Byte-frame transport: PUSH/PULL mailbox with pluggable endpoints and
 /// wakeup-fd polling. This is the language-neutral seam — payloads are opaque.
@@ -202,21 +217,21 @@ impl RawZmqCommunicator {
     }
 
     /// Non-blocking: next inbound frame, or None.
-    pub fn try_recv(&self) -> Option<Vec<u8>> {
+    pub fn try_recv(&self) -> Option<zmq::Message> {
         let pull = self.pull.lock().expect("pull lock");
-        pull.recv_bytes(zmq::DONTWAIT).ok()
+        pull.recv_msg(zmq::DONTWAIT).ok()
     }
 
     /// Block until the next inbound frame (ignores wakeup fds).
-    pub fn recv(&self) -> Option<Vec<u8>> {
+    pub fn recv(&self) -> Option<zmq::Message> {
         let pull = self.pull.lock().expect("pull lock");
-        pull.recv_bytes(0).ok()
+        pull.recv_msg(0).ok()
     }
 
     /// Block up to `timeout` for the next inbound frame. Wakeup fds cut the
     /// wait short (returns None early); use [`Self::recv_or_wake`] to
     /// distinguish a wake from a timeout.
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<Vec<u8>> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<zmq::Message> {
         match self.recv_or_wake(timeout) {
             RecvEvent::Message(b) => Some(b),
             _ => None,
@@ -241,7 +256,7 @@ impl RawZmqCommunicator {
             return RecvEvent::Timeout;
         }
         if items[0].is_readable() {
-            if let Ok(b) = pull.recv_bytes(zmq::DONTWAIT) {
+            if let Ok(b) = pull.recv_msg(zmq::DONTWAIT) {
                 return RecvEvent::Message(b);
             }
         }
@@ -252,10 +267,10 @@ impl RawZmqCommunicator {
     }
 
     /// Drain all currently-queued inbound frames.
-    pub fn drain(&self) -> Vec<Vec<u8>> {
+    pub fn drain(&self) -> Vec<zmq::Message> {
         let pull = self.pull.lock().expect("pull lock");
         let mut out = Vec::new();
-        while let Ok(b) = pull.recv_bytes(zmq::DONTWAIT) {
+        while let Ok(b) = pull.recv_msg(zmq::DONTWAIT) {
             out.push(b);
         }
         out
@@ -489,7 +504,7 @@ mod tests {
         a.send("b", &blob).unwrap();
         for _ in 0..500 {
             if let Some(got) = b.try_recv() {
-                assert_eq!(got, blob);
+                assert_eq!(&got[..], &blob[..]);
                 return;
             }
             std::thread::sleep(Duration::from_millis(4));
@@ -512,12 +527,12 @@ mod tests {
         a.send("b", b"over tcp").unwrap();
         for _ in 0..500 {
             if let Some(got) = b.try_recv() {
-                assert_eq!(got, b"over tcp");
+                assert_eq!(&got[..], b"over tcp");
                 // and the reverse direction
                 b.send("a", b"ack").unwrap();
                 for _ in 0..500 {
                     if let Some(back) = a.try_recv() {
-                        assert_eq!(back, b"ack");
+                        assert_eq!(&back[..], b"ack");
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(4));
@@ -588,7 +603,7 @@ mod tests {
         for _ in 0..500 {
             match a.recv_or_wake(Duration::from_millis(20)) {
                 RecvEvent::Message(m) => {
-                    assert_eq!(m, b"msg");
+                    assert_eq!(&m[..], b"msg");
                     unsafe { libc::close(efd) };
                     return;
                 }
@@ -622,7 +637,7 @@ mod tests {
         a.send("b", &"hello seam".to_string()).unwrap();
         for _ in 0..500 {
             if let Some(bytes) = b.try_recv() {
-                assert_eq!(bytes, b"hello seam");
+                assert_eq!(&bytes[..], b"hello seam");
                 return;
             }
             std::thread::sleep(Duration::from_millis(4));
