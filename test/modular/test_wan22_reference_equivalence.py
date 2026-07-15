@@ -45,6 +45,11 @@ _ORACLE_ENV = os.environ.get("WAN22_ORACLE_DIR", "")
 # Path("") is PosixPath("."), so test the env string, not the Path.
 ORACLE_DIR = Path(_ORACLE_ENV) if _ORACLE_ENV else None
 
+# A small guidance_scale=1.0 oracle (record_oracle.py --guidance 1.0) for the
+# no-CFG batch-1 trajectory; its test skips when this is unset.
+_NOCFG_ENV = os.environ.get("WAN22_NOCFG_ORACLE_DIR", "")
+NOCFG_ORACLE_DIR = Path(_NOCFG_ENV) if _NOCFG_ENV else None
+
 # ---------------------------------------------------------------------------
 # Thresholds. NEVER loosen one to make a run pass — a regression is a finding.
 # mstar's only deliberate departure is batching the two CFG forwards into one
@@ -71,6 +76,16 @@ DECODE_MIN_PSNR_DB = 22.0
 # ~1.5x observed; the mean bound catches a blend regression that stays under the max.
 TILED_DECODE_MAX_ABS = 0.35
 TILED_DECODE_MEAN_ABS = 3.0e-3
+# Compiled DiT region vs the eager reference, over the full 50-step batched-CFG
+# trajectory. Only the transformer region compiles (the UniPC solver's CPU-resident
+# sigma stays eager); Inductor's fusion reorders fp accumulation, a step-level noise
+# that compounds exactly like the batched-CFG kernel noise (1.6e-3 at step 0 -> 2.66
+# by step 49 on the RTX 5090). Bound = observed max x ~1.3 headroom. The eager path
+# stays the bit-exact reference (SEQ/UNIPC gates); this only prices compile.
+COMPILED_VS_EAGER_MAX_ABS = 3.5
+# No-CFG (guidance_scale <= 1.0) batch-1 path vs a no-CFG oracle. Same discipline
+# as the sequential-CFG trajectory: one batch-1 forward per step, so BIT-EXACT.
+NO_CFG_TRAJECTORY_MAX_ABS = 0.0
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 
@@ -213,9 +228,21 @@ def text_embeds(oracle_meta) -> dict[str, torch.Tensor]:
     return result
 
 
+# The bit-exact gates are defined against the EAGER transformer, so the shared
+# dit_submodule is built with torch.compile OFF. Set WAN22_TEST_COMPILE_DIT=1 to
+# rebuild it compiled and re-run the whole suite once — a "nothing downstream
+# breaks" check: the priced/decode/structural tests still pass, while the bit-exact
+# 0.0 gates (sequential-CFG, no-CFG) then FAIL by exactly the compile fusion delta,
+# which is precisely why the default fixture keeps them on the eager path. The
+# compiled path's own numeric bound is pinned by
+# test_compiled_dit_matches_eager_per_step regardless of this switch.
+_TEST_COMPILE_DIT = os.environ.get("WAN22_TEST_COMPILE_DIT", "0").lower() in ("1", "true", "yes", "on")
+
+
 @pytest.fixture(scope="module")
 def dit_submodule() -> Wan22DitSubmodule:
     model = Wan22Model(model_path_hf=MODEL_REPO)
+    model.config.compile_dit = _TEST_COMPILE_DIT
     submodule = model.get_submodule("dit", device=str(DEVICE))
     return submodule.to(DEVICE)
 
@@ -288,6 +315,7 @@ def t2v_trajectory(oracle_meta, text_embeds, dit_submodule) -> dict:
     dit_submodule.transformer = recorder
     diffs: list[float] = []
     port_diffs: list[float] = []
+    latents_per_step: list[torch.Tensor] = []
     carried: dict[str, list[torch.Tensor]] = {}
     latents = None
     try:
@@ -299,6 +327,7 @@ def t2v_trajectory(oracle_meta, text_embeds, dit_submodule) -> dict:
                     for name in ("latents", "time_index", "unipc_model_outputs", "unipc_last_sample")
                 }
                 latents = outputs["latents"][0]
+                latents_per_step.append(latents.detach().cpu().float())
                 ref = torch.load(ORACLE_DIR / "latents" / f"step_{step:03d}.pt", map_location="cpu")
                 diffs.append((latents.cpu().float() - ref.float()).abs().max().item())
 
@@ -314,6 +343,7 @@ def t2v_trajectory(oracle_meta, text_embeds, dit_submodule) -> dict:
     return {
         "diffs": diffs,
         "port_diffs": port_diffs,
+        "latents_per_step": latents_per_step,
         "final_latents": latents,
         "fwd_info": fwd_info,
     }
@@ -633,7 +663,13 @@ def test_tiled_decode_matches_untiled(oracle_meta):
     meta = _step_metadata(oracle_meta)
     fwd_info = _fwd_info("video_gen", meta, seed=oracle_meta["seed"])
     with torch.no_grad():
-        emitted = _drive(decoder, "video_gen", fwd_info, {"latents": [latent]})["video_output"][0]
+        # Drive the submodule down each forced tiling path (Feature 1's override),
+        # so the emission for each is pinned to that exact decode. The gate would
+        # otherwise pick untiled here (DiT not resident -> lots of free VRAM).
+        decoder.config.vae_decode_tiling = "tiled"
+        emitted_tiled = _drive(decoder, "video_gen", fwd_info, {"latents": [latent]})["video_output"][0]
+        decoder.config.vae_decode_tiling = "untiled"
+        emitted_untiled = _drive(decoder, "video_gen", fwd_info, {"latents": [latent]})["video_output"][0]
 
         # Reference decodes both ways, in floats, matching the submodule's dtype.
         vae = decoder.vae
@@ -646,9 +682,12 @@ def test_tiled_decode_matches_untiled(oracle_meta):
         untiled_raw = vae.decode(z / std + mean, return_dict=False)[0]
         untiled = (untiled_raw / 2 + 0.5).clamp(0, 1).float()
 
-    # The submodule's emission is exactly this tiled decode, boundary-quantized.
-    assert emitted.dtype == torch.uint8
-    assert torch.equal(emitted, (tiled_raw / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8))
+    # Each forced path's emission is exactly that decode, boundary-quantized —
+    # proving the gate routes to tiled_decode / decode and quantizes only at the
+    # worker boundary, nowhere upstream.
+    assert emitted_tiled.dtype == emitted_untiled.dtype == torch.uint8
+    assert torch.equal(emitted_tiled, (tiled_raw / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8))
+    assert torch.equal(emitted_untiled, (untiled_raw / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8))
 
     diff = (tiled - untiled).abs()
     print(f"tiled-vs-untiled decode: max_abs={diff.max().item():.3e} "
@@ -661,4 +700,170 @@ def test_tiled_decode_matches_untiled(oracle_meta):
     assert diff.mean().item() <= TILED_DECODE_MEAN_ABS, (
         f"tiled decode mean error {diff.mean().item():.3e} exceeds bound — "
         "seam blending regressed beyond localized overlap effects"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Compiled DiT region vs eager — Feature 2. Proves compile ENGAGED (no silent
+#    eager fallback) and bounds the compiled trajectory against eager.
+# ---------------------------------------------------------------------------
+
+
+def test_compiled_dit_matches_eager_per_step(oracle_meta, text_embeds, dit_submodule, t2v_trajectory):
+    """torch.compile the inner DiT region only, then run the full batched-CFG
+    trajectory compiled and compare per-step against the eager reference
+    (``t2v_trajectory``'s recorded latents). Two proofs:
+
+      * compile ENGAGED — a counting Inductor backend must be invoked at least
+        once, so a wrong region boundary that silently fell back to eager fails
+        here (it would otherwise "pass" at 0.0);
+      * the compiled trajectory stays within ``COMPILED_VS_EAGER_MAX_ABS`` of
+        eager, a bound derived from the observed per-step max.
+
+    The eager path stays the bit-exact reference (the SEQ/UNIPC gates); this test
+    prices compile and nothing else.
+    """
+    import torch._dynamo
+    from torch._inductor.compile_fx import compile_fx
+
+    if _TEST_COMPILE_DIT:
+        pytest.skip("dit_submodule is already compiled (WAN22_TEST_COMPILE_DIT); this test compiles it itself")
+
+    # An earlier test (final-latents decode) evicts the shared DiT to CPU to make
+    # room for the decode workspace; re-home it before compiling.
+    dit_submodule.to(DEVICE)
+    eager_latents = t2v_trajectory["latents_per_step"]
+    num_steps = oracle_meta["num_inference_steps"]
+    assert len(eager_latents) == num_steps
+    meta = _step_metadata(oracle_meta)
+    fwd_info = _fwd_info("video_gen", meta, seed=oracle_meta["seed"])
+    persisted = {
+        "text_embeds_pos": [text_embeds["ours_pos"]],
+        "text_embeds_neg": [text_embeds["ours_neg"]],
+    }
+
+    compile_calls = {"n": 0}
+
+    def _counting_inductor(gm, example_inputs):
+        compile_calls["n"] += 1
+        return compile_fx(gm, example_inputs)
+
+    transformer = dit_submodule.transformer
+    had_instance_forward = "forward" in transformer.__dict__
+    original_forward = transformer.forward
+    torch._dynamo.reset()
+    dit_submodule._compiled_shapes = set()
+    dit_submodule._compile_dit = True  # let the one-time compile-pause log fire
+    diffs: list[float] = []
+    try:
+        transformer.forward = torch.compile(
+            original_forward, backend=_counting_inductor, fullgraph=False, dynamic=False,
+        )
+        carried: dict[str, list[torch.Tensor]] = {}
+        with torch.no_grad():
+            for step in range(num_steps):
+                outputs = _drive(dit_submodule, "video_gen", fwd_info, {**persisted, **carried})
+                carried = {
+                    name: outputs[name]
+                    for name in ("latents", "time_index", "unipc_model_outputs", "unipc_last_sample")
+                }
+                diffs.append(
+                    (outputs["latents"][0].cpu().float() - eager_latents[step]).abs().max().item()
+                )
+    finally:
+        if had_instance_forward:
+            transformer.forward = original_forward
+        else:
+            del transformer.forward  # restore class-method lookup (eager)
+        dit_submodule._compile_dit = _TEST_COMPILE_DIT
+        torch._dynamo.reset()
+
+    print(f"\ncompile engaged: Inductor backend invoked {compile_calls['n']}x")
+    print(f"compiled-vs-eager per-step max_abs={max(diffs):.3e} at step {diffs.index(max(diffs))}")
+    print(f"growth (every 10th step): {[f'{diffs[i]:.3e}' for i in range(0, len(diffs), 10)]}")
+    # A silent eager fallback (wrong region boundary) never reaches Inductor.
+    assert compile_calls["n"] >= 1, "torch.compile did not engage — Inductor was never invoked"
+    assert max(diffs) <= COMPILED_VS_EAGER_MAX_ABS, (
+        f"compiled trajectory diverged from eager by {max(diffs):.3e} at step "
+        f"{diffs.index(max(diffs))} — beyond the priced compile fusion noise"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. No-CFG batch-1 path — Feature 4. guidance_scale <= 1.0 takes the batch-1
+#    branch no other test exercises; it is bit-exact vs a no-CFG oracle.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    NOCFG_ORACLE_DIR is None or not (NOCFG_ORACLE_DIR / "metadata.json").exists(),
+    reason=(
+        "no no-CFG oracle: set WAN22_NOCFG_ORACLE_DIR to a directory recorded by "
+        "`python test/wan22/record_oracle.py --guidance 1.0 --num-inference-steps 8 "
+        "--height 224 --width 384 --num-frames 9 --out-dir <dir>` (oracle venv, same torch)"
+    ),
+)
+def test_no_cfg_batch1_trajectory_is_bitexact(oracle_meta, text_embeds, dit_submodule):
+    """guidance_scale <= 1.0 runs one batch-1 forward per step (no CFG), the branch
+    no other test covered. Drive the full no-CFG oracle trajectory at guidance 1.0
+    and require BIT-EXACT latents at every step — the same discipline as the
+    sequential-CFG gate, since a no-CFG step is one batch-1 forward exactly like the
+    reference at guidance 1.0. A recorder PROVES the batch-1 branch is taken (the
+    transformer sees batch 1, not the CFG batch-2), so the test cannot pass while
+    silently exercising the wrong path.
+    """
+    with open(NOCFG_ORACLE_DIR / "metadata.json") as f:
+        nocfg_meta = json.load(f)
+    assert nocfg_meta["guidance_scale"] <= 1.0, (
+        f"no-CFG oracle must be recorded with --guidance 1.0; got {nocfg_meta['guidance_scale']}"
+    )
+    assert nocfg_meta["prompt"] == oracle_meta["prompt"], (
+        "no-CFG oracle must use the same prompt as the main oracle so the shared "
+        "positive embeds apply (record_oracle.py uses one PROMPT constant)"
+    )
+    meta = _step_metadata(nocfg_meta)
+    assert meta["guidance_scale"] <= 1.0  # the request is genuinely no-CFG
+    num_steps = nocfg_meta["num_inference_steps"]
+    # An earlier test (final-latents decode) may have evicted the shared DiT to
+    # CPU; re-home it so the batch-1 forward runs entirely on device.
+    dit_submodule.to(DEVICE)
+    fwd_info = _fwd_info("video_gen", meta, seed=nocfg_meta["seed"])
+    persisted = {
+        "text_embeds_pos": [text_embeds["ours_pos"]],
+        "text_embeds_neg": [text_embeds["ours_neg"]],  # unused on the no-CFG path
+    }
+
+    recorder = _RecordingTransformer(dit_submodule.transformer, record_inputs=True)
+    original = dit_submodule.transformer
+    dit_submodule.transformer = recorder
+    diffs: list[float] = []
+    try:
+        carried: dict[str, list[torch.Tensor]] = {}
+        with torch.no_grad():
+            for step in range(num_steps):
+                outputs = _drive(dit_submodule, "video_gen", fwd_info, {**persisted, **carried})
+                carried = {
+                    name: outputs[name]
+                    for name in ("latents", "time_index", "unipc_model_outputs", "unipc_last_sample")
+                }
+                ref = torch.load(NOCFG_ORACLE_DIR / "latents" / f"step_{step:03d}.pt", map_location="cpu")
+                diffs.append((outputs["latents"][0].cpu().float() - ref.float()).abs().max().item())
+    finally:
+        dit_submodule.transformer = original
+
+    # PROVE the batch-1 branch ran at every step (guidance<=1.0 => no CFG batch-2).
+    assert len(recorder.calls) == num_steps
+    for step, (hidden_states, _ts) in enumerate(recorder.calls):
+        assert hidden_states.shape[0] == 1, (
+            f"step {step}: transformer batch {hidden_states.shape[0]} != 1 — the CFG "
+            "batch-2 path was taken, so this test would not be exercising no-CFG"
+        )
+
+    nonzero = [(i, d) for i, d in enumerate(diffs) if d > 0]
+    print(f"no-CFG batch-1 trajectory vs oracle: max_abs={max(diffs):.3e}, "
+          f"first nonzero step={nonzero[0] if nonzero else None}")
+    assert max(diffs) <= NO_CFG_TRAJECTORY_MAX_ABS, (
+        f"no-CFG trajectory diverged from the oracle: first nonzero step "
+        f"{nonzero[0][0]} (max_abs {nonzero[0][1]:.3e}) — the batch-1 path is not "
+        "bit-exact against the reference"
     )

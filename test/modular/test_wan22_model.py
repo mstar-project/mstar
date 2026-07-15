@@ -7,6 +7,8 @@ walk transitions, and the check_stop boundary math. The model is built via
 seam is never exercised.
 """
 
+import logging
+import math
 import sys
 
 sys.path.insert(0, ".")
@@ -21,7 +23,14 @@ from mstar.engine.base import EngineType
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
-from mstar.model.wan22.submodules import DENOISE_LOOP_NAME, Wan22DitSubmodule
+from mstar.model.wan22.submodules import (
+    _DECODE_TILING_ENV,
+    _DECODE_UNTILED_SAFETY_MARGIN,
+    DENOISE_LOOP_NAME,
+    Wan22DitSubmodule,
+    Wan22VaeDecoderSubmodule,
+    normalize_decode_tiling_mode,
+)
 from mstar.model.wan22.wan22_model import Wan22Model
 
 CONFIG_PATH = str(
@@ -681,3 +690,165 @@ def test_wan22_postprocess_rejects_non_video_modality():
     model = _make_model()
     with pytest.raises(ValueError):
         model.postprocess(torch.zeros(1), modality="text")
+
+
+# ----------------------------------------------------------------------
+# Feature 3: config echo — one resolved-settings line per request at generation
+# start. No weights/GPU needed; the line is emitted from get_initial_forward_pass_args.
+# ----------------------------------------------------------------------
+
+
+def test_wan22_config_echo_logs_resolved_settings(caplog):
+    model = _make_model()
+    with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
+        model.get_initial_forward_pass_args(
+            partition_name="default",
+            input_modalities=["text"],
+            output_modalities=["video"],
+            input_signals={"text_inputs": [_tensor_info("text")]},
+            model_kwargs={
+                "height": 480, "width": 832, "num_frames": 33,
+                "num_inference_steps": 20, "guidance_scale": 5.0, "seed": 7,
+                "negative_prompt": "blurry", "fps": 30,
+            },
+        )
+    echoes = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:")]
+    assert len(echoes) == 1, f"expected exactly one config echo, got {echoes}"
+    line = echoes[0]
+    # Every resolved knob is carried verbatim.
+    for token in (
+        "height=480", "width=832", "frames=33", "steps=20", "guidance=5.0",
+        "seed=7", "negative_prompt=present", "fps=30", "decode=auto", "compile=on",
+    ):
+        assert token in line, f"config echo missing {token!r}: {line}"
+
+
+def test_wan22_config_echo_marks_absent_negative_and_auto_seed(caplog):
+    # No seed and an empty negative prompt: seed reads "auto", negative "absent",
+    # and steps reflect the clamped/defaulted value.
+    model = _make_model()
+    with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
+        model.get_initial_forward_pass_args(
+            partition_name="default",
+            input_modalities=["text"],
+            output_modalities=["video"],
+            input_signals={"text_inputs": [_tensor_info("text")]},
+            model_kwargs={"num_inference_steps": 10_000},  # clamps to max_denoise_steps
+        )
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
+    assert "seed=auto" in line
+    assert "negative_prompt=absent" in line
+    assert f"steps={model.config.max_denoise_steps}" in line
+    assert f"height={model.config.default_height}" in line
+
+
+def test_wan22_config_echo_reflects_compile_off(caplog):
+    model = _make_model()
+    model.config.compile_dit = False
+    with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
+        model.get_initial_forward_pass_args(
+            partition_name="default",
+            input_modalities=["text"],
+            output_modalities=["video"],
+            input_signals={"text_inputs": [_tensor_info("text")]},
+        )
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
+    assert "compile=off" in line
+
+
+# ----------------------------------------------------------------------
+# Feature 1: VRAM-gated VAE-decode tiling. The decision and the peak estimate are
+# pure (no CUDA), so the gate is exercised with injected free-memory values.
+# ----------------------------------------------------------------------
+
+
+def _make_decoder(tiling_mode: str = "auto") -> Wan22VaeDecoderSubmodule:
+    """A decoder shell with just the config the gate reads — no VAE, no GPU."""
+    decoder = object.__new__(Wan22VaeDecoderSubmodule)
+    decoder.config = Wan22Config(vae_decode_tiling=tiling_mode)
+    return decoder
+
+
+def test_wan22_decode_output_size_inverts_vae_compression():
+    decoder = _make_decoder()
+    # dense latent grid (704x1280x81) and the oracle tier (480x832x33).
+    assert decoder._output_size(torch.empty(1, 48, 21, 44, 80)) == (704, 1280, 81)
+    assert decoder._output_size(torch.empty(1, 48, 9, 30, 52)) == (480, 832, 33)
+
+
+def test_wan22_decode_peak_estimate_tracks_spatial_area_and_dtype():
+    est = Wan22VaeDecoderSubmodule._estimated_untiled_peak_bytes
+    gib = 2**30
+    # fp32 (4 bytes) near the measured points: headline ~8.56, dense ~19.78 GiB.
+    headline = est(480, 832, 33, 4) / gib
+    dense = est(704, 1280, 81, 4) / gib
+    assert 8.0 < headline < 10.0, headline
+    assert 19.0 < dense < 22.0, dense
+    # bf16 halves the workspace.
+    assert est(480, 832, 33, 2) == est(480, 832, 33, 4) // 2
+    # Larger spatial area and more frames both raise the estimate.
+    assert est(704, 1280, 33, 4) > est(480, 832, 33, 4)
+    assert est(480, 832, 81, 4) > est(480, 832, 33, 4)
+
+
+def test_wan22_decode_gate_auto_respects_margin_boundary():
+    should_tile = Wan22VaeDecoderSubmodule._decode_should_tile
+    est = 8 * 2**30
+    threshold = est * _DECODE_UNTILED_SAFETY_MARGIN  # free must clear this to go untiled
+    # Comfortably above the margin -> untiled; below -> tiled.
+    assert should_tile("auto", math.ceil(threshold) + 1, est) is False
+    assert should_tile("auto", math.floor(threshold) - 1, est) is True
+    # A margin of exactly 1.0 would flip the low case; assert the cushion is real.
+    assert _DECODE_UNTILED_SAFETY_MARGIN > 1.0
+    assert should_tile("auto", est, est) is True  # free == peak, no margin -> tile
+
+
+def test_wan22_decode_gate_forced_modes_ignore_free_memory():
+    should_tile = Wan22VaeDecoderSubmodule._decode_should_tile
+    est = 8 * 2**30
+    # Forced tiled tiles even with a whole card free; forced untiled never tiles.
+    assert should_tile("tiled", 10**15, est) is True
+    assert should_tile("untiled", 0, est) is False
+
+
+def test_wan22_decode_tiling_mode_env_overrides_config(monkeypatch):
+    decoder = _make_decoder(tiling_mode="auto")
+    assert decoder._resolve_tiling_mode() == "auto"
+    monkeypatch.setenv(_DECODE_TILING_ENV, "tiled")
+    assert decoder._resolve_tiling_mode() == "tiled"
+    monkeypatch.setenv(_DECODE_TILING_ENV, "UNTILED")  # case-insensitive
+    assert decoder._resolve_tiling_mode() == "untiled"
+
+
+def test_wan22_decode_tiling_mode_unknown_falls_back_to_auto(monkeypatch, caplog):
+    decoder = _make_decoder(tiling_mode="auto")
+    monkeypatch.setenv(_DECODE_TILING_ENV, "sometimes")
+    with caplog.at_level(logging.WARNING, logger="mstar.model.wan22.submodules"):
+        assert decoder._resolve_tiling_mode() == "auto"
+    assert any("unknown tiling mode" in r.getMessage() for r in caplog.records)
+
+
+def test_wan22_normalize_decode_tiling_mode():
+    # The shared normalizer the decoder gate and the config echo both use.
+    assert normalize_decode_tiling_mode("auto") == "auto"
+    assert normalize_decode_tiling_mode("TILED") == "tiled"  # case-insensitive
+    assert normalize_decode_tiling_mode("untiled") == "untiled"
+    for bogus in ("sometimes", "", None):
+        assert normalize_decode_tiling_mode(bogus) == "auto"
+
+
+def test_wan22_config_echo_normalizes_bogus_decode_override(monkeypatch, caplog):
+    # A bogus WAN22_VAE_DECODE_TILING must echo the resolved policy ("auto"), the
+    # same path the decoder gate takes — never the raw garbage value.
+    monkeypatch.setenv(_DECODE_TILING_ENV, "banana")
+    model = _make_model()
+    with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
+        model.get_initial_forward_pass_args(
+            partition_name="default",
+            input_modalities=["text"],
+            output_modalities=["video"],
+            input_signals={"text_inputs": [_tensor_info("text")]},
+        )
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
+    assert "decode=auto" in line
+    assert "banana" not in line

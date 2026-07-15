@@ -28,6 +28,7 @@ request's ``num_inference_steps`` stops it via ``Wan22DitSubmodule.check_stop``.
 import html
 import io
 import logging
+import os
 import re
 from fractions import Fraction
 
@@ -58,6 +59,7 @@ from mstar.model.wan22.submodules import (
     Wan22TextEncoderSubmodule,
     Wan22VaeDecoderSubmodule,
     Wan22VaeEncoderSubmodule,
+    normalize_decode_tiling_mode,
 )
 
 logger = logging.getLogger(__name__)
@@ -458,6 +460,33 @@ class Wan22Model(Model):
             "num_frames": kw["num_frames"],
         }
 
+    def _log_config_echo(self, model_kwargs: dict, resolved: dict) -> None:
+        """Emit one vllm-style line per request at generation start, echoing every
+        resolved setting so an operator can read back exactly what ran instead of
+        asserting the knobs. ``decode`` is the configured tiling POLICY
+        (auto/tiled/untiled, resolved from config + env); the actual per-request
+        untiled-vs-tiled decision is logged separately at decode time by the
+        vae_decoder. ``compile`` reflects ``config.compile_dit``.
+        """
+        negative = model_kwargs.get("negative_prompt", self.config.default_negative_prompt) or ""
+        raw_fps = model_kwargs.get("fps")
+        fps = raw_fps if raw_fps is not None else self.config.video_fps
+        seed = model_kwargs.get("seed")
+        # Same normalizer the decoder gate uses, so the echoed policy matches the
+        # path the decoder will actually resolve (a bogus override echoes "auto").
+        decode_policy = normalize_decode_tiling_mode(
+            os.environ.get("WAN22_VAE_DECODE_TILING", self.config.vae_decode_tiling)
+        )
+        logger.info(
+            "Wan2.2 request: height=%d width=%d frames=%d steps=%d guidance=%s seed=%s "
+            "negative_prompt=%s fps=%s decode=%s compile=%s",
+            resolved["height"], resolved["width"], resolved["num_frames"],
+            resolved["num_inference_steps"], resolved["guidance_scale"],
+            seed if seed is not None else "auto",
+            "present" if negative.strip() else "absent", fps, decode_policy,
+            "on" if self.config.compile_dit else "off",
+        )
+
     def get_initial_forward_pass_args(
         self,
         partition_name: str,
@@ -513,6 +542,7 @@ class Wan22Model(Model):
             "width": int(model_kwargs.get("width", self.config.default_width)),
             "num_frames": int(model_kwargs.get("num_frames", self.config.default_num_frames)),
         }
+        self._log_config_echo(model_kwargs, kwargs)
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,

@@ -68,6 +68,17 @@ class Wan22Config:
     # Ceiling on the denoise loop; the per-request step count is clamped to it.
     max_denoise_steps: int = 100
 
+    # torch.compile the inner DiT region (patchify -> blocks -> head). The UniPC
+    # solver stays eager — its CPU-resident sigma trips Inductor (see
+    # Wan22DitSubmodule). Default ON in serving; the reference-equivalence gates
+    # build with this False so the eager path stays the bit-exact reference.
+    compile_dit: bool = True
+
+    # VAE-decode tiling policy: "auto" decodes untiled when free VRAM comfortably
+    # exceeds the estimated untiled peak for the output size and tiles otherwise;
+    # "tiled"/"untiled" force a path. WAN22_VAE_DECODE_TILING overrides at runtime.
+    vae_decode_tiling: str = "auto"
+
     @property
     def hidden_size(self) -> int:
         """DiT hidden width (num_attention_heads * attention_head_dim)."""
