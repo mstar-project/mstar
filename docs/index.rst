@@ -39,6 +39,7 @@ vision-language-action policies, and world models — through a **Python SDK**, 
    architecture
    models
    api
+   environment_variables
 
 .. toctree::
    :maxdepth: 2
