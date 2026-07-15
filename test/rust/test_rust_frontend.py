@@ -71,6 +71,18 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _wait_healthy(port, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/health", timeout=3)
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
 @pytest.fixture()
 def stack():
     port = _free_port()
@@ -82,22 +94,15 @@ def stack():
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
     thread.start()
-    # health gate
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        try:
-            urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/health", timeout=1)
-            break
-        except OSError:
-            time.sleep(0.1)
-    else:
+    # /health is DEEP: passing this gate proves the ping/pong round-trip.
+    if not _wait_healthy(port):
         proc.terminate()
         raise RuntimeError("server never became healthy")
-    yield port, stub
+    yield port, stub, bridge, proc
     bridge.stop()
-    proc.terminate()
-    proc.wait(timeout=10)
+    if proc.poll() is None:
+        proc.terminate()
+        proc.wait(timeout=10)
 
 
 def _chat(port, content, timeout=30):
@@ -112,7 +117,7 @@ def _chat(port, content, timeout=30):
 
 
 def test_chat_roundtrip(stack):
-    port, stub = stack
+    port, stub, _bridge, _proc = stack
     out = _chat(port, "Say hello.")
     assert out["choices"][0]["message"]["content"] == "Hello world"
     (sub,) = stub.submitted
@@ -121,10 +126,54 @@ def test_chat_roundtrip(stack):
 
 
 def test_ingest_failure_is_a_500_not_a_hang(stack):
-    port, stub = stack
+    port, stub, _bridge, _proc = stack
     with pytest.raises(urllib.error.HTTPError) as e:
         _chat(port, "boom", timeout=15)
     assert e.value.code == 500
     # and the server keeps serving afterwards
     assert _chat(port, "again")["choices"][0]["message"]["content"] == \
         "Hello world"
+
+
+def test_health_goes_red_when_the_bridge_dies(stack):
+    port, _stub, bridge, _proc = stack
+    bridge.stop()
+    time.sleep(0.1)  # let the loop exit
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10)
+    assert e.value.code == 503
+
+
+def test_sigterm_drains_and_exits(stack):
+    import signal
+
+    port, _stub, _bridge, proc = stack
+    assert _chat(port, "warm")["choices"][0]["message"]["content"]
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=15) is not None
+
+
+def test_admission_control_returns_503_when_saturated():
+    import os
+    import subprocess
+
+    port = _free_port()
+    bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_sat_")
+    upload_dir = tempfile.mkdtemp(prefix="mstar_rf_satup_")
+    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="0")
+    proc = subprocess.Popen(
+        [BINARY, "qwen3_omni", str(port), bridge_dir, upload_dir], env=env)
+    stub = _StubAPIServer()
+    bridge = RustFrontendBridge(stub, bridge_dir)
+    thread = threading.Thread(target=bridge.run, daemon=True)
+    thread.start()
+    try:
+        # health bypasses admission: alive even at zero capacity
+        assert _wait_healthy(port)
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _chat(port, "hi", timeout=10)
+        assert e.value.code == 503
+    finally:
+        bridge.stop()
+        proc.terminate()
+        proc.wait(timeout=10)
