@@ -27,7 +27,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
+          workspaces: |
+            rust
+            rust/server
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -36,16 +38,19 @@ jobs:
       - name: Cargo tests (transport semantics)
         working-directory: rust
         run: cargo test --release
+      - name: Build the Rust frontend (mstar-server)
+        working-directory: rust/server
+        run: cargo build --release
       - name: Build and install the extension
         working-directory: rust
         run: |
           python -m pip install --upgrade pip maturin
           maturin build --release
           pip install target/wheels/*.whl
-      - name: Interop tests (pyzmq <-> Rust)
+      - name: Interop tests (transport, frontend)
         run: |
-          pip install pytest pyzmq
-          # the package itself, without its (heavy) deps — the transport
-          # test chain needs only pyzmq + stdlib
+          pip install pytest pyzmq msgpack
+          # the package itself, without its (heavy) deps — these test
+          # chains need only pyzmq + msgpack + stdlib
           pip install --no-deps -e .
           pytest test/rust/test_rust_communicator.py -v

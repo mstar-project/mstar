@@ -272,6 +272,22 @@ costs real latency on the hot receive path. Verify with:
    python -c "import mstar_rust; print('mstar_rust OK')"
    pytest test/rust/test_rust_communicator.py
 
+Optional: the Rust HTTP frontend
+--------------------------------
+
+``mstar-server`` (``rust/server/``) serves the HTTP surface — routes, OpenAI
+translation, SSE streaming, uploads — from Rust, with the Python process
+keeping preprocessing and the conductor protocol. Build and opt in:
+
+.. code-block:: bash
+
+   cargo build --release --manifest-path rust/server/Cargo.toml
+   mstar-serve --config <model.yaml> --rust-frontend
+
+The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
+``$PATH`` / the in-repo build. Its knobs are listed in
+:doc:`environment_variables`.
+
 Troubleshooting
 ---------------
 

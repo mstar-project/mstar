@@ -824,6 +824,17 @@ def main(argv: list[str] | None = None):
         "--log-stats-file", type=str, default=None,
         help="Append per-request profiling stats to this file (implies --log-stats)",
     )
+    parser.add_argument(
+        "--rust-frontend", action="store_true",
+        help="Serve HTTP from the Rust mstar-server binary instead of "
+             "uvicorn/FastAPI (RFC #130 Step 3); the Python process keeps "
+             "preprocessing and the conductor protocol",
+    )
+    parser.add_argument(
+        "--rust-frontend-bin", type=str, default=None,
+        help="Path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
+             "$PATH, then rust/server/target/release)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -883,15 +894,35 @@ def main(argv: list[str] | None = None):
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
 
+    rust_proc = None
     try:
         # Block until all workers have finished setup, so the server only binds
         # (and logs "Starting…") once it can actually serve requests.
         api_server.finalize_setup()
-        logger.info("Starting mstar API server on %s:%s", args.host, args.port)
-        uvicorn.run(app, host=args.host, port=args.port, access_log=False)
+        if args.rust_frontend:
+            import tempfile
+
+            from mstar.api_server.rust_frontend import (
+                RustFrontendBridge,
+                find_server_binary,
+                launch_rust_server,
+            )
+
+            bridge_dir = tempfile.mkdtemp(prefix="mstar_rust_frontend_")
+            rust_proc = launch_rust_server(
+                find_server_binary(args.rust_frontend_bin), model_name,
+                args.port, bridge_dir, args.upload_dir)
+            logger.info("Starting mstar API server (Rust frontend) on port %s",
+                        args.port)
+            RustFrontendBridge(api_server, bridge_dir).run()
+        else:
+            logger.info("Starting mstar API server on %s:%s", args.host, args.port)
+            uvicorn.run(app, host=args.host, port=args.port, access_log=False)
     except KeyboardInterrupt:
         pass
     finally:
+        if rust_proc is not None:
+            rust_proc.terminate()
         if api_server is not None:
             api_server.cleanup()
         _shutdown_conductor_process(conductor_proc)
