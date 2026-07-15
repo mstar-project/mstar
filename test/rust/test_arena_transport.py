@@ -100,6 +100,33 @@ def test_arena_grows_then_backpressures(tmp_path):
         del os.environ["MSTAR_SHM_ARENA_FULL_TIMEOUT_S"]
 
 
+def test_transport_mismatch_fails_loudly(tmp_path):
+    """A mixed deployment (arena producer + file consumer, or the reverse)
+    must fail with an explicit MSTAR_SHM_ARENA message in BOTH directions,
+    not a FileNotFoundError or a hang."""
+    arena_prod = _manager("mx0", tmp_path)
+    file_cons = SharedMemoryCommunicationManager(
+        my_entity_id="mx1", hostname="localhost", device="cpu",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+    infos = arena_prod.store_and_return_tensor_info(
+        "rm", {"x": [torch.randn(4)]})
+    arena_prod.register_for_send("rm", [infos["x"][0].uuid])
+    edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
+    with pytest.raises(RuntimeError, match="MSTAR_SHM_ARENA"):
+        file_cons.start_read_tensors("rm", [edge])
+
+    file_prod = SharedMemoryCommunicationManager(
+        my_entity_id="mx2", hostname="localhost", device="cpu",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+    arena_cons = _manager("mx3", tmp_path)
+    infos = file_prod.store_and_return_tensor_info(
+        "rm2", {"y": [torch.randn(4)]})
+    file_prod.register_for_send("rm2", [infos["y"][0].uuid])
+    edge = GraphEdge(next_node="B", name="y", tensor_info=infos["y"])
+    with pytest.raises(RuntimeError, match="MSTAR_SHM_ARENA"):
+        arena_cons.start_read_tensors("rm2", [edge])
+
+
 def test_factory_flag(tmp_path, monkeypatch):
     def make(value):
         monkeypatch.setenv("MSTAR_SHM_ARENA", value)
