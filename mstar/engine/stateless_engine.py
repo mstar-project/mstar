@@ -545,9 +545,12 @@ class StatelessEngine(BaseEngine):
             return
         try:
             if hasattr(submodule, "forward"):
+                from mstar.engine import RECOMPILE_LIMIT
+
                 submodule.forward = torch.compile(
                     submodule.forward,
                     fullgraph=False,
+                    recompile_limit=RECOMPILE_LIMIT,
                 )
                 logger.info(
                     "StatelessEngine[%s]: torch.compile applied to %s.forward",

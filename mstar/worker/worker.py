@@ -19,6 +19,7 @@ from mstar.communication.tensors import NameToTensorList, create_tensor_communic
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine import apply_dynamo_config
 from mstar.engine.base import EngineType, NodeBatch, NodeOutput
 from mstar.engine.kv_store import KVCacheConfig, StoreWritePolicy, TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode
@@ -1974,8 +1975,12 @@ class Worker:
         # the main loop can overlap queue/tensor polling and post-processing
         # with GPU execution. Run the engine unconditionally on a dedicated
         # 1-worker GPU thread.
+        # initializer re-applies dynamo config on the GPU thread — ConfigModule
+        # overrides are thread-local (ContextVar) as of torch 2.13+ (#167).
         gpu_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"mstar-gpu-{self.worker_id}"
+            max_workers=1,
+            thread_name_prefix=f"mstar-gpu-{self.worker_id}",
+            initializer=apply_dynamo_config,
         )
         logger.info(
             "Worker %s: engine runs on dedicated GPU thread",
