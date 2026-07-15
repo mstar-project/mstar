@@ -12,6 +12,7 @@ name = "mstar_rust"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1.3"
 thiserror = "2"
