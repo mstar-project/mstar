@@ -1132,6 +1132,12 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     if self.tensor_store.check_uuid_presence(request_id, info.uuid):
                         self.tensor_store.increment_ref(request_id, info.uuid, 1)
                         continue
+                    if info.shm_segment is not None:
+                        raise RuntimeError(
+                            f"tensor {info.uuid} from {info.source_entity} "
+                            "was staged in an SHM arena but this consumer "
+                            "runs the file transport — MSTAR_SHM_ARENA must "
+                            "match across the deployment")
                     path = self._shm_path(info.source_entity, info.uuid)
                     with open(path, "rb") as f:
                         f.seek(info.offset)
