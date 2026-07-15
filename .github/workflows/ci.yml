@@ -18,10 +18,8 @@ jobs:
       - name: Run Ruff
         # Use GitHub’s annotation format so lint errors show inline
         run: ruff check --output-format=github .
-  # Vendored Rust transport: cargo tests (raw frames, tcp endpoints,
-  # wakeup-fd polling), then build the mstar_rust extension and run the
-  # pyzmq <-> Rust interop pytest against it. Cargo caching keeps this to
-  # ~a minute on warm runs.
+  # Vendored Rust transport (rust/): cargo tests, then the pyzmq interop
+  # pytest against a freshly built extension.
   rust-transport:
     runs-on: ubuntu-latest
     steps:
