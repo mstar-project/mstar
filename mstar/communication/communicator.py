@@ -141,3 +141,21 @@ class ZMQCommunicator(BaseCommunicator):
                 # zmq.Again actually means no messages left to read
                 break
         return messages
+
+
+def make_communicator(*args, **kwargs) -> BaseCommunicator:
+    """Construct the process's communicator, selecting the transport.
+
+    ``MSTAR_RUST_ZMQ=1`` opts a process into the Rust-backed
+    ``RustZMQCommunicator`` (vendored ``rust/`` extension; see
+    ``communication/rust_communicator.py``). Default is the pyzmq
+    ``ZMQCommunicator``, byte-identical behavior. The two are
+    wire-compatible (same endpoints, same pickle frames), so the flag can
+    be set per-process — one entity at a time — while the rest of the
+    mesh stays on pyzmq.
+    """
+    if os.getenv("MSTAR_RUST_ZMQ", "0") == "1":
+        from mstar.communication.rust_communicator import RustZMQCommunicator
+
+        return RustZMQCommunicator(*args, **kwargs)
+    return ZMQCommunicator(*args, **kwargs)
