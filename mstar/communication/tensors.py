@@ -1186,8 +1186,40 @@ def create_tensor_communication_manager(
     shm_dir: str | None = None,
     enable_prof: bool=False
 ) -> TensorCommunicationManager:
-    """Select tensor transport backend based on protocol."""
+    """Select tensor transport backend based on protocol.
+
+    For the SHM protocol, ``MSTAR_SHM_ARENA`` selects the implementation
+    (see ``docs/environment_variables.rst``): ``0`` (default) — per-uuid
+    files; ``1`` — the Rust shared-memory arena (raises if the
+    ``mstar_rust`` extension is missing); ``AUTO`` — the arena when the
+    extension imports, files otherwise. The flag must match across the
+    deployment: the arena location rides in the tensor descriptors, so a
+    file-transport consumer cannot read an arena producer.
+    """
     if protocol == CommProtocol.SHM:
+        choice = os.getenv("MSTAR_SHM_ARENA", "0").upper()
+        if choice not in ("0", "1", "AUTO"):
+            raise ValueError(
+                f"MSTAR_SHM_ARENA must be 0, 1, or AUTO; got {choice!r}")
+        if choice != "0":
+            try:
+                from mstar.communication.arena import (
+                    ArenaShmCommunicationManager,
+                )
+            except ImportError:
+                if choice == "1":
+                    raise
+                logger.debug("MSTAR_SHM_ARENA=AUTO: mstar_rust not "
+                             "installed, using the file transport")
+            else:
+                return ArenaShmCommunicationManager(
+                    my_entity_id=my_entity_id,
+                    hostname=hostname,
+                    device=device,
+                    communicator=communicator,
+                    shm_dir=shm_dir,
+                    enable_prof=enable_prof
+                )
         return SharedMemoryCommunicationManager(
             my_entity_id=my_entity_id,
             hostname=hostname,
