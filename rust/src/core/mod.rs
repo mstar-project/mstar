@@ -1,4 +1,4 @@
-//! The graph/walk core (RFC #130 Steps 4-5): compiled walk graphs and the
+//! The graph/walk core  compiled walk graphs and the
 //! per-request walk state machine — the Rust port of the runtime behavior of
 //! `mstar/graph/base.py`'s `GraphNode`/`Loop` registries and
 //! `WorkerGraphIO`. Parity is asserted by `test/rust/test_walk_parity.py`,

@@ -1,4 +1,4 @@
-"""Step-5 scheduler parity: the Rust MicroScheduler vs mstar's, driven with
+"""Scheduler parity: the Rust MicroScheduler vs mstar's, driven with
 identical ready-work and event sequences. mstar's scheduler reads live
 manager/engine objects and pops queues itself; the Rust one takes a snapshot
 and leaves pops to the caller — the harness bridges the two and asserts the
