@@ -366,6 +366,17 @@ class _NodeView:
         self.ready_next_iter = _Slot()
 
 
+class _PureRegistryShim:
+    __slots__ = ("_io",)
+
+    def __init__(self, io):
+        self._io = io
+
+    @property
+    def is_done(self):
+        return self._io._rs.is_done()
+
+
 class PureRustWorkerGraphIO:
     """`WorkerGraphIO` with the Rust core as the ONLY state machine.
 
@@ -400,8 +411,11 @@ class PureRustWorkerGraphIO:
         # (node, input) -> FIFO of pending ingested edges
         self._pending: dict[tuple[str, str], list[GraphEdge]] = {}
         self._scheduled: set[str] = set()
-        # externals per loop: re-emitted on each advance (mstar's contract)
-        self._loop_externals: dict[str, list[GraphEdge]] = {}
+        # externals per loop, keyed by (node, input): re-emitted on each
+        # advance (mstar's contract). Keyed — not appended — because the
+        # re-emitted edges come back through ingest_input; appending would
+        # double the list every iteration.
+        self._loop_externals: dict[str, dict[tuple, GraphEdge]] = {}
         self._loop_members = {
             ln: set(lp.section.get_nodes().keys())
             for ln, lp in self.loops.items()
@@ -411,6 +425,7 @@ class PureRustWorkerGraphIO:
             for g in self._graph_nodes.values() for e in g.outputs
         }
         self.ready_for_streaming: set = set()
+        self._registry_shim = _PureRegistryShim(self)
         self._tm = None
         self._rid = None
 
@@ -424,13 +439,7 @@ class PureRustWorkerGraphIO:
 
     @property
     def wg_state_registry(self):
-        io = self
-
-        class _R:
-            @property
-            def is_done(self):
-                return io._rs.is_done()
-        return _R()
+        return self._registry_shim
 
     def get_loop_indices(self):
         return dict(self._rs.loop_iters())
@@ -471,7 +480,8 @@ class PureRustWorkerGraphIO:
         if pair not in self._internal:
             for ln, members in self._loop_members.items():
                 if edge.next_node in members:
-                    self._loop_externals.setdefault(ln, []).append(edge)
+                    self._loop_externals.setdefault(ln, {})[
+                        (edge.next_node, edge.name)] = edge
         return True
 
     def mark_node_complete(self, node_name):
@@ -506,7 +516,7 @@ class PureRustWorkerGraphIO:
                     completion.output_edges.append(lo)
             elif a_i > b_i:  # advanced: re-emit external inputs
                 completion.output_edges.extend(
-                    self._loop_externals.get(ln, []))
+                    self._loop_externals.get(ln, {}).values())
         return completion
 
     def register_loop_finish_signal(self, loop_name):
