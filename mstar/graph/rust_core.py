@@ -507,8 +507,11 @@ class PureRustWorkerGraphIO:
         view = self.nodes[node_name]
         # Return the declared edge objects themselves — mstar's registries do
         # the same (the worker overwrites tensor_info each pass); fresh uuids
-        # keep the Rust-side value identity per iteration.
-        out_edges = view.outputs
+        # keep the Rust-side value identity per iteration. COPY the list
+        # (sharing the objects): the loop-advance path extends the
+        # completion's list, and sharing it would grow the node's declared
+        # outputs every iteration.
+        out_edges = list(view.outputs)
         outputs = []
         for e in out_edges:
             uuid = next(self._uuid)
