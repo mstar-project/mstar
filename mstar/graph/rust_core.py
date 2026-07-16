@@ -426,6 +426,16 @@ class PureRustWorkerGraphIO:
         }
         self.ready_for_streaming: set = set()
         self._registry_shim = _PureRegistryShim(self)
+        # complete_full return values cached between completions; ingest and
+        # schedule dirty the ready cache (recomputed lazily).
+        self._loop_cache = {n: (i, t) for n, i, t in self._rs.loop_states()}
+        self._ready_cache: list | None = []
+        self._done_cache = False
+        # ids of edges WE re-emitted on the last loop advance: Rust already
+        # re-injected those values internally, so their re-ingest must only
+        # refill the Python FIFO views — re-seeding Rust would append to the
+        # loop's external_inputs every iteration (quadratic complete cost).
+        self._reemitted_ids: set[int] = set()
         self._tm = None
         self._rid = None
 
@@ -433,8 +443,10 @@ class PureRustWorkerGraphIO:
 
     @property
     def ready_node_names(self):
+        if self._ready_cache is None:
+            self._ready_cache = self._rs.ready_nodes()
         return _RustReadyView(
-            (n for n in self._rs.ready_nodes() if n not in self._scheduled),
+            (n for n in self._ready_cache if n not in self._scheduled),
             self)
 
     @property
@@ -471,10 +483,14 @@ class PureRustWorkerGraphIO:
             return False
         if edge.name not in self.nodes[edge.next_node].input_names:
             return False
-        uuid = next(self._uuid)
-        self._store[uuid] = edge
         self._pending.setdefault((edge.next_node, edge.name), []).append(edge)
-        self._rs.seed_with([(edge.next_node, edge.name, uuid)])
+        if id(edge) in self._reemitted_ids:
+            self._reemitted_ids.discard(id(edge))
+        else:
+            uuid = next(self._uuid)
+            self._store[uuid] = edge
+            self._rs.seed_with([(edge.next_node, edge.name, uuid)])
+        self._ready_cache = None  # readiness may have changed
         # track loop externals for re-emission on advance
         pair = (edge.name, edge.next_node)
         if pair not in self._internal:
@@ -485,7 +501,7 @@ class PureRustWorkerGraphIO:
         return True
 
     def mark_node_complete(self, node_name):
-        before = {n: (i, t) for n, i, t in self._rs.loop_states()}
+        before = self._loop_cache
         self._mark_scheduled(node_name)  # idempotent
         self._scheduled.discard(node_name)
         view = self.nodes[node_name]
@@ -495,8 +511,12 @@ class PureRustWorkerGraphIO:
             uuid = next(self._uuid)
             self._store[uuid] = e
             outputs.append((e.name, [uuid]))
-        events, _done = self._rs.complete_with(node_name, outputs)
-        after = {n: (i, t) for n, i, t in self._rs.loop_states()}
+        events, done, ready, loop_states = self._rs.complete_full(
+            node_name, outputs)
+        self._ready_cache = ready
+        self._done_cache = done
+        after = {n: (i, t) for n, i, t in loop_states}
+        self._loop_cache = after
 
         completion = NodeCompletionOutput(output_edges=out_edges)
         for ln in self.loops:
@@ -515,8 +535,9 @@ class PureRustWorkerGraphIO:
                         lo._src_edge = src[0]
                     completion.output_edges.append(lo)
             elif a_i > b_i:  # advanced: re-emit external inputs
-                completion.output_edges.extend(
-                    self._loop_externals.get(ln, {}).values())
+                reemit = list(self._loop_externals.get(ln, {}).values())
+                self._reemitted_ids.update(id(e) for e in reemit)
+                completion.output_edges.extend(reemit)
         return completion
 
     def register_loop_finish_signal(self, loop_name):
