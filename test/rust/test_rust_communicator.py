@@ -92,3 +92,14 @@ def test_make_communicator_flag(monkeypatch, tmp_path):
         make_communicator("m_default", push_ids=[],
                           ipc_socket_path_prefix=str(tmp_path)),
         RustZMQCommunicator)
+
+
+@pytest.mark.parametrize("receiver", ["rust", "orig"])
+def test_blocking_receive_timeout_bounds_the_wait(pair, receiver):
+    import time as _t
+
+    orig, rust = pair
+    dst = rust if receiver == "rust" else orig
+    t0 = _t.monotonic()
+    assert dst.get_all_new_messages(blocking=True, timeout_s=0.15) == []
+    assert 0.1 < _t.monotonic() - t0 < 2.0

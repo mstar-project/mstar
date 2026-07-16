@@ -1,39 +1,19 @@
-"""RFC #130 Step 1: ``ZMQCommunicator`` as a thin wrapper over the Rust
-communicator vendored in ``rust/`` (``mstar_rust.ZmqCommunicator``).
-
-Drop-in for :class:`mstar.communication.communicator.ZMQCommunicator` — same
-constructor, same methods, same semantics — with the transport moved to Rust:
-
-* **Wire-compatible with the existing pyzmq communicator.** The Rust transport
-  moves opaque byte frames (no added framing) over the same endpoints
-  (``ipc://{prefix}/{id}.ipc`` / the same TCP host+port scheme), and the
-  default codec is pickle — so a wrapped entity talks to unwrapped pyzmq
-  entities in both directions. Migration can proceed one process at a time.
-* **encode/decode seam.** ``codec`` is a :class:`Codec` (mirroring the Rust
-  ``Codec`` trait) defaulting to :class:`PickleCodec` (today's wire).
-  Swapping to msgpack later is a codec change on both ends of an edge,
-  never a transport change.
-* **eventfd wakeup.** ``register_event_for_poll`` forwards the ``EventWakeup``
-  fd to the Rust poller (``register_wakeup_fd``): a completed compute future
-  wakes ``wait_for_work`` / ``poll_for_messages`` immediately, not on the poll
-  timeout. Drain semantics are identical (the event is drained here, in
-  Python, exactly as before).
-* **Readiness without consumption.** The pyzmq poller reports "a message is
-  readable" without receiving it; the Rust ``recv_or_wake`` consumes. The
-  wrapper bridges the two with an internal deque: a message consumed during a
-  poll is buffered and handed out by the next ``get_all_new_messages`` — no
-  message is ever dropped or reordered.
-
-Requires the vendored extension — from ``rust/``: ``maturin develop --release``
-(or ``pip install .``). Use ``--release``: debug builds cost real latency on
-the hot receive path. See ``docs/installation.rst``.
-"""
+"""RFC #130 Step 1: ``ZMQCommunicator`` over the Rust transport vendored in
+``rust/`` (``mstar_rust.ZmqCommunicator``) — drop-in for the pyzmq class:
+same constructor, methods, endpoints, and pickle wire, so wrapped and
+unwrapped entities interoperate and migration can proceed one process at a
+time. The codec is a :class:`Codec` (pickle default; msgpack for
+cross-language edges); ``register_event_for_poll`` forwards the eventfd to
+the Rust poller; a readiness poll buffers any consumed message so nothing is
+dropped or reordered. Build: ``maturin develop --release`` in ``rust/``
+(see ``docs/installation.rst``)."""
 
 from __future__ import annotations
 
 import logging
 import os
 import pickle
+import time
 from collections import deque
 
 from mstar_rust import ZmqCommunicator as _RustZmq
@@ -71,6 +51,24 @@ class PickleCodec(Codec):
 
     encode = staticmethod(pickle.dumps)
     decode = staticmethod(pickle.loads)
+
+
+class MsgpackCodec(Codec):
+    """msgpack is language-neutral: edges using it can terminate in (future)
+    Rust processes — the migration's target wire. Both endpoints of an edge
+    must use the same codec. Requires the ``msgpack`` package."""
+
+    @staticmethod
+    def encode(msg) -> bytes:
+        import msgpack
+
+        return msgpack.packb(msg, default=str)
+
+    @staticmethod
+    def decode(data: bytes):
+        import msgpack
+
+        return msgpack.unpackb(data, raw=False)
 
 
 class RustZMQCommunicator(BaseCommunicator):
@@ -154,14 +152,20 @@ class RustZMQCommunicator(BaseCommunicator):
             self._register(entity_id)
         self._inner.send(entity_id, self.codec.encode(msg))
 
-    def get_all_new_messages(self, blocking: bool = False) -> list:
+    def get_all_new_messages(
+        self, blocking: bool = False, timeout_s: float | None = None,
+    ) -> list:
         if blocking and not self._buffered:
             # Wait until a message is readable before draining — same
             # semantics as the pyzmq communicator: a registered wakeup
             # event also ends the wait, so a completed compute future can
-            # interrupt a blocking receive.
+            # interrupt a blocking receive. `timeout_s` bounds the wait
+            # (None = wait indefinitely); on expiry, drain whatever is there.
+            deadline = None if timeout_s is None else (
+                time.monotonic() + timeout_s)
             while self._poll_once(50) == "timeout":
-                pass
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
         messages = [self.codec.decode(b) for b in self._buffered]
         self._buffered.clear()
         # One FFI call for the whole queued batch (vs try_recv per message).

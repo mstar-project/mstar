@@ -126,14 +126,16 @@ class ZMQCommunicator(BaseCommunicator):
             self.push_sockets[entity_id] = sock
         self.push_sockets[entity_id].send_pyobj(msg)
 
-    def get_all_new_messages(self, blocking=False) -> list:
+    def get_all_new_messages(self, blocking=False, timeout_s=None) -> list:
         messages = []
         if blocking:
             # Wait until the pull socket is readable before draining. A
             # registered wakeup event also ends the wait (and is drained
             # here, exactly as in wait_for_work), so a completed compute
-            # future can interrupt a blocking receive.
-            events = dict(self.poller.poll())
+            # future can interrupt a blocking receive. `timeout_s` bounds
+            # the wait (None = indefinitely); on expiry, drain what's there.
+            timeout_ms = None if timeout_s is None else int(timeout_s * 1000)
+            events = dict(self.poller.poll(timeout=timeout_ms))
             if self.event is not None and self.event.fd in events:
                 self.event.drain()
         while True:
