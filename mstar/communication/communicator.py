@@ -159,18 +159,17 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
 
     ``MSTAR_RUST_ZMQ`` selects it (see ``docs/environment_variables.rst``):
 
-    * ``0`` (default) — the pyzmq ``ZMQCommunicator``.
-    * ``1`` — the Rust-backed ``RustZMQCommunicator`` (vendored ``rust/``
-      extension; see ``communication/rust_communicator.py``); raises if the
-      extension is not installed.
-    * ``AUTO`` — the Rust communicator when the extension imports
-      successfully, pyzmq otherwise.
+    * ``AUTO`` (default) — the Rust-backed ``RustZMQCommunicator`` (vendored
+      ``rust/`` extension; see ``communication/rust_communicator.py``) when
+      the extension imports successfully, pyzmq otherwise.
+    * ``1`` — the Rust communicator; raises if the extension is missing.
+    * ``0`` — always the pyzmq ``ZMQCommunicator``.
 
     The two are wire-compatible (same endpoints, same pickle frames), so the
     flag can be set per-process — one entity at a time — while the rest of
     the mesh stays on pyzmq.
     """
-    choice = os.getenv("MSTAR_RUST_ZMQ", "0").upper()
+    choice = os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper()
     if choice not in ("0", "1", "AUTO"):
         raise ValueError(f"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got {choice!r}")
     if choice != "0":

@@ -15,15 +15,15 @@ Communication
      - Default
      - Meaning
    * - ``MSTAR_RUST_ZMQ``
-     - ``0``
+     - ``AUTO``
      - Transport selection for the ZeroMQ control mesh (see
        :func:`mstar.communication.communicator.make_communicator`).
-       ``0``: the pyzmq ``ZMQCommunicator``. ``1``: the Rust-backed
-       ``RustZMQCommunicator`` (requires the vendored ``rust/`` extension;
-       raises if it is not installed). ``AUTO``: Rust when the extension
-       imports successfully, pyzmq otherwise. The two transports are
-       wire-compatible, so this can be set per-process while the rest of
-       the mesh stays on pyzmq.
+       ``AUTO``: the Rust-backed ``RustZMQCommunicator`` when the vendored
+       ``rust/`` extension imports successfully, pyzmq otherwise.
+       ``1``: the Rust communicator, raising if the extension is missing.
+       ``0``: always pyzmq. The two transports are wire-compatible, so
+       this can be set per-process while the rest of the mesh stays on
+       pyzmq.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a

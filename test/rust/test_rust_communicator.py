@@ -86,3 +86,9 @@ def test_make_communicator_flag(monkeypatch, tmp_path):
     assert isinstance(make("AUTO"), RustZMQCommunicator)  # extension installed
     with pytest.raises(ValueError):
         make("yes")
+    # default is AUTO: with the extension installed, unset -> Rust
+    monkeypatch.delenv("MSTAR_RUST_ZMQ", raising=False)
+    assert isinstance(
+        make_communicator("m_default", push_ids=[],
+                          ipc_socket_path_prefix=str(tmp_path)),
+        RustZMQCommunicator)
