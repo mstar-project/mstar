@@ -149,7 +149,12 @@ def _dispatch(
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Pick fused-Triton if available, otherwise the naive loop."""
+    """Pick fused-Triton if available, otherwise the naive loop.
+
+    The fused kernel requires a bf16/fp16, CUDA ``hidden_states`` (see
+    :func:`mstar.utils.fused_moe.fused_experts`); the ``is_cuda`` guard here
+    covers device, and callers are expected to run in an autocast dtype.
+    """
     if _HAS_FUSED and hidden_states.is_cuda:
         return _fused_experts(
             hidden_states, gate_up_proj, down_proj,
@@ -159,6 +164,17 @@ def _dispatch(
         hidden_states, gate_up_proj, down_proj,
         num_experts, selected_experts, routing_weights,
     )
+
+
+# Public alias: the fused-preferring dispatch is the entry point external
+# blocks (e.g. Zonos2's MoE) should call, so they pick up the Triton kernel
+# when available and only fall back to the naive loop otherwise. Kept as an
+# alias of the module-internal ``_dispatch`` used by the blocks below.
+#
+# The fused kernel autotunes (and syncs on the host) the first time it sees a
+# new key ``(M, E, N, K, top_k)``; that happens during the CUDA-graph runner's
+# eager warmup forwards, before capture, so no dedicated warmup hook is needed.
+dispatch_experts = _dispatch
 
 
 class SparseMoeBlock(nn.Module):

@@ -19,6 +19,7 @@ from mstar.model.components.moe import (
     SparseMoeBlock,
     SparseMoeBlockWithSharedExpert,
     TopKRouter,
+    dispatch_experts,
     dispatch_experts_fused,
 )
 from mstar.model.components.norm import AdaRMSNorm, RMSNorm
@@ -36,6 +37,7 @@ __all__ = [
     "SparseMoeBlock",
     "SparseMoeBlockWithSharedExpert",
     "TopKRouter",
+    "dispatch_experts",
     "dispatch_experts_fused",
     "AdaRMSNorm",
     "RMSNorm",
