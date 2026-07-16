@@ -1,4 +1,4 @@
-"""RFC #130 Step 1: ``ZMQCommunicator`` over the Rust transport vendored in
+"""``ZMQCommunicator`` over the Rust transport vendored in
 ``rust/`` (``mstar_rust.ZmqCommunicator``) — drop-in for the pyzmq class:
 same constructor, methods, endpoints, and pickle wire, so wrapped and
 unwrapped entities interoperate and migration can proceed one process at a

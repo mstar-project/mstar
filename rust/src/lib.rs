@@ -1,4 +1,4 @@
-//! mstar's Rust transport (RFC #130 Step 1): the ZMQ PUSH/PULL mesh.
+//! mstar's Rust transport: the ZMQ PUSH/PULL control mesh.
 //! `communicator.rs` is the transport + codec split; this file is the PyO3
 //! surface (`mstar_rust.ZmqCommunicator`) the Python `RustZMQCommunicator`
 //! wrapper drives. Build: `maturin develop --release` in rust/.
