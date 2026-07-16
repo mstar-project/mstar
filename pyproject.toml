@@ -128,7 +128,7 @@ vjepa2_ac = [
     "torchcodec",
 ]
 
-# ASR models: Whisper-large-v3, Higgs Audio, Voxtral
+# ASR models: Whisper-large-v3, Higgs Audio
 asr = [
     "einops",
     "flashinfer-python>=0.6.4",

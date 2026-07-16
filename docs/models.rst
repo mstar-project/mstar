@@ -38,10 +38,18 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``vjepa2_ac``
      - ``vjepa2-ac-vitg``
      - V-JEPA 2-AC encoder + action-conditioned predictor.
+   * - ``whisper_large`` *(Beta)*
+     - ``openai/whisper-large-v3``
+     - Encoder-decoder ASR (audio in, transcript out). Beta / un-optimized.
+   * - ``higgs_audio`` *(Beta)*
+     - ``bosonai/higgs-audio-v3-stt``
+     - Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.
 
 Notes
 -----
 
+- Models marked *(Beta)* are functionally supported but not yet
+  performance-optimized; treat their throughput/latency as provisional.
 - The IDs above are representative. You may use local paths or compatible variants.
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.

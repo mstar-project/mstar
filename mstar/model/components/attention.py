@@ -173,6 +173,11 @@ class CrossAttention(nn.Module):
     override projection details (bias flags, a ``compute_kv`` that reshapes
     for a model-specific pool layout) as needed; the default matches
     Whisper (q/v/o biased, k unbiased).
+
+    TODO(#160): the projections are plain ``nn.Linear`` — this module is not
+    yet TP/SP-compatible (no column/row-parallel splits over heads). A
+    tensor-parallel cross-attention variant is needed to serve the decoder
+    under TP alongside the self-attention path.
     """
 
     def __init__(

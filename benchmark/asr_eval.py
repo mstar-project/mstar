@@ -1,8 +1,7 @@
 """ASR evaluation script: compute Word Error Rate (WER) on LibriSpeech test-clean.
 
 Runs inference against a running mstar server and compares transcription output
-against ground-truth transcripts.  Supports Whisper-large-v3, Higgs Audio, and
-Voxtral.
+against ground-truth transcripts.  Supports Whisper-large-v3 and Higgs Audio.
 
 Usage:
     python -m benchmark.asr_eval \\
@@ -28,7 +27,7 @@ from benchmark.base import Model, ModelType, RequestType
 from benchmark.dataset import LibriSpeechEvalDataset
 from benchmark.request import RequestInput
 
-_ASR_MODELS = {ModelType.WHISPER_LARGE, ModelType.HIGGS_AUDIO, ModelType.VOXTRAL}
+_ASR_MODELS = {ModelType.WHISPER_LARGE, ModelType.HIGGS_AUDIO}
 
 
 async def _transcribe(

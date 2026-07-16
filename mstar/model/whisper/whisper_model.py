@@ -357,7 +357,6 @@ class WhisperModel(Model):
 
         from mstar.model.utils import (
             ModuleAndPrefix,
-            load_weights_from_file,
             load_weights_from_hf_shards,
         )
 
@@ -366,18 +365,9 @@ class WhisperModel(Model):
             hf_config, attn_implementation="sdpa",
         )
         modules = [ModuleAndPrefix(audio_encoder, prefix="model.encoder")]
-        # whisper-large-v3 ships a single unsharded model.safetensors
-        # (no index file), unlike the sharded checkpoints elsewhere.
-        index_path = Path(self.local_dir) / "model.safetensors.index.json"
-        if index_path.exists():
-            load_weights_from_hf_shards(
-                repo_dir=self.local_dir, modules=modules, device=device,
-            )
-        else:
-            load_weights_from_file(
-                str(Path(self.local_dir) / "model.safetensors"),
-                modules=modules, device=device,
-            )
+        load_weights_from_hf_shards(
+            repo_dir=self.local_dir, modules=modules, device=device,
+        )
         audio_encoder.eval()
 
         from mstar.model.whisper.submodules import WhisperEncoderSubmodule

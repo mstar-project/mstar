@@ -313,21 +313,6 @@ class HiggsAudio(Model):
         }
 
 
-class Voxtral(Model):
-    def get_hf_url(self):
-        return "mistralai/Voxtral-Mini-3B-2507"
-
-    def get_supported_modalities(self):
-        return {RequestType.A2T}
-
-    def get_model_kwargs(self, request_type: RequestType):
-        return {
-            "temperature": 0.0,
-            "max_tokens": 448,
-            "max_output_tokens": 448,
-        }
-
-
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
@@ -336,7 +321,6 @@ class ModelType(Enum):
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
     HIGGS_AUDIO = "higgs_audio"
-    VOXTRAL = "voxtral"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -353,6 +337,4 @@ class ModelType(Enum):
             return WhisperLarge(**kwargs)
         if self == ModelType.HIGGS_AUDIO:
             return HiggsAudio(**kwargs)
-        if self == ModelType.VOXTRAL:
-            return Voxtral(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")

@@ -245,16 +245,27 @@ def load_weights_from_hf_shards(
     device: str = "cpu",
     conv: list[WeightConverter] | None=None
 ):
-    """Load weights from a sharded HuggingFace checkpoint (multiple safetensors files).
+    """Load weights from a HuggingFace safetensors checkpoint.
 
     Reads model.safetensors.index.json to find which shard each key lives in,
-    then loads from each shard file.
+    then loads from each shard file. Checkpoints that ship a single unsharded
+    ``model.safetensors`` (no index — e.g. whisper-large-v3) are handled by
+    treating that one file as the whole weight map.
     """
     repo_dir = Path(repo_dir)
     index_path = repo_dir / "model.safetensors.index.json"
-    with open(index_path) as f:
-        index = json.load(f)
-    weight_map = index["weight_map"]
+    if index_path.exists():
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+    else:
+        single = repo_dir / "model.safetensors"
+        if not single.exists():
+            raise FileNotFoundError(
+                f"No model.safetensors.index.json or model.safetensors in {repo_dir}"
+            )
+        with safe_open(str(single), framework="pt", device="cpu") as f:
+            weight_map = {k: "model.safetensors" for k in f.keys()}
 
     mod_key_to_hf_keys = _apply_key_pattern(weight_map.keys(), conv)
     mod_key_to_idx = {}

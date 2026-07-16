@@ -103,15 +103,11 @@ class _PlanState:
     seq_lens: list[int] | None = None
     write_store: bool = True
     custom_pos_advance: list[int] | None = None
-    # Plan memo: fingerprint of the last wrapper.plan() inputs for this
-    # label. When it matches, the re-plan is skipped. Label-generic (not
-    # cross-specific); today only the cross-attention path sets it, because
-    # its context pages are immutable after add_cross_attn_kv — a fixed-shape
-    # self-attention label (e.g. diffusion latents) could opt in the same way.
-    # NOTE: only effective where plan states persist across steps (the
-    # CUDA-graph runner's cuda_graph_plan_states); the eager path rebuilds the
-    # cache manager per step, so eager decode still re-plans (see PR #161
-    # benchmark notes — persisting eager plan state is the throughput follow-up).
+    # Plan memo: fingerprint of the last wrapper.plan() inputs for this label;
+    # when it matches, the re-plan is skipped. Only the cross-attention path
+    # sets it today (its context pages are immutable after add_cross_attn_kv),
+    # and only where plan states persist across steps (the CUDA-graph runner);
+    # the eager path rebuilds the cache manager per step and still re-plans.
     plan_cache_key: "PlanCacheKey | None" = None
     # Set when DenseGenCacheManager planned this label dense: the per-segment
     # gather indices + varlen cu_seqlens needed to attend each generation
@@ -1180,10 +1176,9 @@ class FlashInferCacheManager(BatchedCacheManager):
             q_seq_lens, page_indices_per_request, context_lens, page_size,
         )
 
-        # Skip the re-plan when nothing it depends on changed (the common
-        # decode case: same request set, q_seq_lens all 1, fixed context
-        # pages). Keyed on the page indices themselves so a request id
-        # reused with a new context can't alias a stale plan.
+        # Skip the re-plan when its inputs are unchanged (common decode case).
+        # Keyed on the page indices so a reused request id with a new context
+        # can't alias a stale plan.
         plan_key = PlanCacheKey(
             q_seq_lens=tuple(q_seq_lens),
             page_indices=tuple(indptrs.paged_kv_indices.tolist()),
@@ -1193,7 +1188,8 @@ class FlashInferCacheManager(BatchedCacheManager):
 
         ps = self._plan_states.get(cross_label)
         if ps is not None and ps.wrapper is not None and ps.plan_cache_key == plan_key:
-            ps.seq_lens = q_seq_lens
+            # plan_key carries q_seq_lens, so a match means ps.seq_lens (set at
+            # plan time below) already equals the current q_seq_lens.
             return
         if ps is None or ps.wrapper is None:
             wrapper = FlashInferPrefillWrapper(

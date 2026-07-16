@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ASR benchmark script: throughput and latency for Whisper-large-v3, Higgs Audio, Voxtral.
+# ASR benchmark script: throughput and latency for Whisper-large-v3 and Higgs Audio.
 #
 # Usage:
 #   ./benchmark/run_asr_benchmark.sh --url http://localhost:8000 [options]
@@ -11,7 +11,7 @@
 #   --url  <base_url>       mstar server base URL
 #
 # Optional:
-#   --model  <name>         Run only this model (whisper_large|higgs_audio|voxtral)
+#   --model  <name>         Run only this model (whisper_large|higgs_audio)
 #   --num-requests  <n>     Total requests per model (default: 100)
 #   --batch-size  <b>       Batch size for offline profiling (default: 4)
 #   --max-concurrency <c>   Concurrency cap for closed-loop profiling (default: 4)
@@ -52,7 +52,7 @@ if [[ -z "$URL" ]]; then
   exit 1
 fi
 
-ASR_MODELS=(whisper_large higgs_audio voxtral)
+ASR_MODELS=(whisper_large higgs_audio)
 
 if [[ -n "$MODEL" ]]; then
   ASR_MODELS=("$MODEL")
@@ -108,7 +108,7 @@ if [[ -z "$MODEL" ]] && command -v python &>/dev/null; then
 import json, os, sys
 
 output_dir = os.environ.get("_ASR_OUTPUT_DIR", "./asr_benchmark_results")
-models = ["whisper_large", "higgs_audio", "voxtral"]
+models = ["whisper_large", "higgs_audio"]
 
 rows = []
 for m in models:
