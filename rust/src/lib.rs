@@ -231,7 +231,7 @@ impl PyShmSegment {
     unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
 }
 
-/// Grow-by-segments producer arena + uuid reclaim (RFC #130 Step 2 surface).
+/// Grow-by-segments producer arena with uuid-grouped reclaim.
 /// `reserve(n) -> (segment_idx, offset)`; descriptors carry
 /// `segment_name(idx)` so consumers keep opening plain `ShmArena`s by name.
 /// Segments are created once and never move — registration-friendly.
