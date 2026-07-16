@@ -32,24 +32,16 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import msgpack
-
 from mstar.communication.communicator import CommProtocol
-from mstar.communication.rust_communicator import Codec, RustZMQCommunicator
+from mstar.communication.rust_communicator import (
+    MsgpackCodec,
+    RustZMQCommunicator,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class MsgpackCodec(Codec):
-    """The frontend speaks msgpack (``rmp_serde::to_vec_named``)."""
 
-    @staticmethod
-    def encode(msg) -> bytes:
-        return msgpack.packb(msg, default=str)
-
-    @staticmethod
-    def decode(data: bytes):
-        return msgpack.unpackb(data, raw=False)
 
 
 def find_server_binary(explicit: str | None = None) -> str:
