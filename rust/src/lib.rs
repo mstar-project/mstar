@@ -8,6 +8,7 @@
 //! Build: `maturin develop --release` in rust/.
 
 pub mod communicator;
+pub mod core;
 pub mod shm;
 
 use std::os::raw::{c_int, c_void};
@@ -19,6 +20,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use communicator::{RawZmqCommunicator, RecvEvent};
+use core::graph::CompiledWalk;
+use core::tensor::TensorRef;
+use core::walk::{IncomingInput, RouteEvent, WalkState};
+use core::WalkSet;
 use shm::{SegmentedShmArena, ShmArena};
 
 /// Opaque byte frames over ZMQ PUSH/PULL: ipc or tcp endpoints, lazily-cached
@@ -297,6 +302,149 @@ impl PySegmentedShmArena {
     }
 }
 
+/// A model's compiled walk graphs, built from the JSON spec the Python
+/// translator (`mstar/graph/rust_core.py`) produces from `GraphSection`s.
+#[pyclass(name = "WalkSet")]
+struct PyWalkSet {
+    inner: WalkSet,
+}
+
+#[pymethods]
+impl PyWalkSet {
+    #[staticmethod]
+    fn from_json(spec: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: WalkSet::from_json(spec).map_err(|e| PyValueError::new_err(e.to_string()))?,
+        })
+    }
+
+    #[getter]
+    fn walk_names(&self) -> Vec<String> {
+        self.inner.walks.keys().cloned().collect()
+    }
+
+    /// Fresh per-request walk state over the named walk.
+    fn state(&self, walk: &str) -> PyResult<PyWalkState> {
+        let graph = self
+            .inner
+            .get(walk)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyWalkState {
+            inner: WalkState::new(graph.clone()),
+            graph,
+            next_uuid: 1,
+        })
+    }
+}
+
+/// Per-request walk state machine — the Rust `WorkerGraphIO`. Tensor payloads
+/// stay on the Python data plane; here every value is an opaque uuid.
+#[pyclass(name = "WalkState")]
+struct PyWalkState {
+    inner: WalkState,
+    graph: std::sync::Arc<CompiledWalk>,
+    next_uuid: u64,
+}
+
+impl PyWalkState {
+    fn fresh_ref(&mut self) -> TensorRef {
+        let u = self.next_uuid;
+        self.next_uuid += 1;
+        TensorRef::new(u, vec![], "opaque")
+    }
+}
+
+#[pymethods]
+impl PyWalkState {
+    /// Inject external inputs: [(node, input_name), ...].
+    fn seed(&mut self, inputs: Vec<(String, String)>) -> PyResult<()> {
+        let seeded = inputs
+            .into_iter()
+            .map(|(node, name)| {
+                let t = self.fresh_ref();
+                IncomingInput {
+                    node,
+                    name,
+                    tensors: vec![t],
+                }
+            })
+            .collect();
+        self.inner
+            .seed(seeded)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn ready_nodes(&self) -> Vec<String> {
+        self.inner.ready_nodes()
+    }
+
+    /// Claim a ready node for execution (mstar's pop from the ready queue).
+    fn schedule(&mut self, node: &str) -> PyResult<()> {
+        self.inner
+            .take_node_inputs(node)
+            .map(|_| ())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Complete a scheduled node, producing a value for each of its declared
+    /// output edge names. Returns (route_events, walk_done); route_events are
+    /// (kind, name, target) with kind in {"emission", "persist", "stream"} —
+    /// internal edges route inside the state machine.
+    fn complete(&mut self, node: &str) -> PyResult<(Vec<(String, String, String)>, bool)> {
+        let names: Vec<String> = self
+            .graph
+            .nodes
+            .get(node)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("unknown node {node:?}")))?
+            .outputs
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        let mut outputs = std::collections::BTreeMap::new();
+        for name in names {
+            let t = self.fresh_ref();
+            outputs.insert(name, vec![t]);
+        }
+        let result = self
+            .inner
+            .complete_node(node, outputs)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let events = result
+            .events
+            .into_iter()
+            .map(|ev| match ev {
+                RouteEvent::Emission { name, modality, .. } => (
+                    "emission".to_string(),
+                    name,
+                    modality.unwrap_or_default(),
+                ),
+                RouteEvent::Persist { name, .. } => ("persist".to_string(), name, String::new()),
+                RouteEvent::Stream {
+                    name,
+                    target_partition,
+                    ..
+                } => ("stream".to_string(), name, target_partition),
+            })
+            .collect();
+        Ok((events, result.walk_done))
+    }
+
+    /// External loop-termination signal (mstar's stop_loops / EOS).
+    fn signal_loop_finish(&mut self, loop_name: &str) -> PyResult<()> {
+        self.inner
+            .signal_loop_finish(loop_name)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn loop_iters(&self) -> Vec<(String, u32)> {
+        self.inner.loop_iters()
+    }
+
+    fn is_done(&self) -> bool {
+        self.inner.is_done()
+    }
+}
+
 #[pymodule]
 fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -304,5 +452,7 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShmArena>()?;
     m.add_class::<PyShmSegment>()?;
     m.add_class::<PySegmentedShmArena>()?;
+    m.add_class::<PyWalkSet>()?;
+    m.add_class::<PyWalkState>()?;
     Ok(())
 }
