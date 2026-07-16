@@ -430,6 +430,59 @@ impl PyWalkState {
         Ok((events, result.walk_done))
     }
 
+    /// Pure-mode seed: caller-supplied uuids so the Python side can key its
+    /// own uuid -> tensor-descriptor store (the mstar value-map pattern).
+    fn seed_with(&mut self, inputs: Vec<(String, String, u64)>) -> PyResult<()> {
+        let seeded = inputs
+            .into_iter()
+            .map(|(node, name, uuid)| IncomingInput {
+                node,
+                name,
+                tensors: vec![TensorRef::new(uuid, vec![], "opaque")],
+            })
+            .collect();
+        self.inner
+            .seed(seeded)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Pure-mode complete: caller-supplied uuids per output name; route
+    /// events return (kind, name, target, uuids) so loop outputs can be
+    /// reconstructed with real tensor descriptors at termination.
+    fn complete_with(
+        &mut self,
+        node: &str,
+        outputs: Vec<(String, Vec<u64>)>,
+    ) -> PyResult<(Vec<(String, String, String, Vec<u64>)>, bool)> {
+        let mut map = std::collections::BTreeMap::new();
+        for (name, uuids) in outputs {
+            let refs = uuids
+                .into_iter()
+                .map(|u| TensorRef::new(u, vec![], "opaque"))
+                .collect();
+            map.insert(name, refs);
+        }
+        let result = self
+            .inner
+            .complete_node(node, map)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let uu = |ts: Vec<TensorRef>| ts.into_iter().map(|t| t.uuid).collect::<Vec<u64>>();
+        let events = result
+            .events
+            .into_iter()
+            .map(|ev| match ev {
+                RouteEvent::Emission { name, modality, tensors } => (
+                    "emission".to_string(), name,
+                    modality.unwrap_or_default(), uu(tensors)),
+                RouteEvent::Persist { name, tensors } => (
+                    "persist".to_string(), name, String::new(), uu(tensors)),
+                RouteEvent::Stream { name, target_partition, tensors } => (
+                    "stream".to_string(), name, target_partition, uu(tensors)),
+            })
+            .collect();
+        Ok((events, result.walk_done))
+    }
+
     /// External loop-termination signal (mstar's stop_loops / EOS).
     fn signal_loop_finish(&mut self, loop_name: &str) -> PyResult<()> {
         self.inner
