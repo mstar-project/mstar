@@ -123,13 +123,24 @@ class _PackedMultiHeadAttention(nn.Module):
             logger.warning("flash-attn not available — falling back to manual attention.")
         self.use_flash_attn = use_flash_attn and _FLASH_ATTN_VARLEN is not None
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | None = None,
+    ) -> torch.Tensor:
         """Packed-sequence attention.
 
         Args:
             x:          (total_tokens, n_state) packed tensor.
             cu_seqlens: (num_seqs + 1,) cumulative seq lengths,
                         e.g. [0, len1, len1+len2, ...]. int32.
+            max_seqlen: longest clip length. Constant across the encoder's
+                        blocks, so the caller (``MingAudioEncoder.forward``)
+                        computes it once from the Python length list and
+                        threads it down — avoids a per-block GPU→CPU
+                        ``.item()`` sync. Falls back to computing it from
+                        ``cu_seqlens`` when ``None`` (direct callers).
         """
         q = self.query(x)
         k = self.key(x)
@@ -142,7 +153,8 @@ class _PackedMultiHeadAttention(nn.Module):
         v = v.view(n_tokens, self.n_head, head_dim)
 
         if self.use_flash_attn and q.dtype in (torch.float16, torch.bfloat16):
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+            if max_seqlen is None:
+                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
             attn_output = _FLASH_ATTN_VARLEN(
                 q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
             )
@@ -222,8 +234,13 @@ class _ResidualAttentionBlock(nn.Module):
         )
         self.mlp_ln = nn.LayerNorm(n_state)
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_ln(x), cu_seqlens=cu_seqlens)
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | None = None,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.attn_ln(x), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         x = x + self.mlp(self.mlp_ln(x))
         return x
 
@@ -289,28 +306,59 @@ class MingAudioEncoder(nn.Module):
                             into the projector.
         """
         target_dtype = self.conv1.weight.dtype
+        device = x_list[0].device
+
+        # Batch the conv stem across clips instead of looping one at a time
+        # (one kernel launch, not one per clip). Right-pad each mel to the
+        # max clip length; the padded tail is zeroed after conv1 (below) and
+        # sliced off after conv2, so each clip's real region matches the
+        # per-clip path exactly (verified bit-identical in bf16 — the encoder
+        # runtime dtype — in test_audio_encoder_batched_conv_stem_matches_per_clip).
+        mels = [m.to(target_dtype) for m in x_list]
+        in_lens = [m.shape[-1] for m in mels]
+        max_in = max(in_lens)
+        batched = torch.zeros(
+            len(mels), self.n_mels, max_in, dtype=target_dtype, device=device,
+        )
+        for i, m in enumerate(mels):
+            batched[i, :, : in_lens[i]] = m
+
+        x = F.gelu(self.conv1(batched))                   # (B, n_state, max_in)
+        # conv1 has a bias, so its output over the zero-padded tail is
+        # gelu(bias) != 0. Zero that tail before conv2 (stride 2) so each
+        # clip's last output frame doesn't read a neighbour clip's padding
+        # — this is what keeps the batched stem bit-exact vs the per-clip
+        # path (conv2's own boundary padding is zeros).
+        length_mask = (
+            torch.arange(max_in, device=device)[None, :]
+            < torch.tensor(in_lens, device=device)[:, None]
+        )                                                 # (B, max_in)
+        x = x * length_mask.unsqueeze(1).to(x.dtype)
+        x = F.gelu(self.conv2(x))                         # (B, n_state, T'_max)
+        x = x.transpose(1, 2)                             # (B, T'_max, n_state)
 
         encoded = []
         encoded_lens: list[int] = []
-        for mel in x_list:
-            mel = mel.to(target_dtype)
-            x = mel.unsqueeze(0)                          # (1, n_mels, T)
-            x = F.gelu(self.conv1(x))
-            x = F.gelu(self.conv2(x))
-            x = x.squeeze(0).transpose(0, 1)              # (T', n_state)
-
-            seq_len = x.shape[0]
-            x = (x + self.positional_embedding[:seq_len, :]).to(x.dtype)
-            encoded.append(x)
-            encoded_lens.append(seq_len)
+        for i, in_len in enumerate(in_lens):
+            # conv1 (stride 1) preserves length; conv2 (stride 2, pad 1,
+            # kernel 3) maps T -> (T - 1) // 2 + 1.
+            out_len = (in_len - 1) // 2 + 1
+            xi = x[i, :out_len]                            # (T'_i, n_state)
+            xi = (xi + self.positional_embedding[:out_len, :]).to(xi.dtype)
+            encoded.append(xi)
+            encoded_lens.append(out_len)
 
         packed = torch.cat(encoded, dim=0)                # (sum T', n_state)
         cu_seqlens = torch.tensor(
             list(accumulate(encoded_lens, func=operator.add, initial=0)),
             device=packed.device, dtype=torch.int32,
         )
+        # max_seqlen is constant across blocks; compute it once here from the
+        # Python length list (no GPU sync) and thread it into each block's
+        # attention (see _PackedMultiHeadAttention.forward).
+        max_seqlen = max(encoded_lens)
         for block in self.blocks:
-            packed = block(packed, cu_seqlens=cu_seqlens)
+            packed = block(packed, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         packed = self.ln_post(packed)
         return packed, cu_seqlens
 

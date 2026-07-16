@@ -388,6 +388,51 @@ def test_audio_encoder_forward_packed_shape_no_flash_attn() -> None:
     assert torch.isfinite(out).all()
 
 
+def test_audio_encoder_batched_conv_stem_matches_per_clip() -> None:
+    """The batched conv stem is bit-identical to per-clip encoding in bf16.
+
+    ``MingAudioEncoder.forward`` runs conv1/conv2 over a zero-padded batch of
+    clips (one kernel launch instead of one per clip) and threads a single
+    ``max_seqlen`` into every block's attention (no per-block ``.item()``
+    sync). Both are perf-only refactors: this pins that the packed output
+    equals a reference that encodes each clip separately, at the encoder's
+    runtime dtype (bf16).
+    """
+    import torch.nn.functional as F
+
+    from mstar.model.ming_omni_flash.components.audio_encoder import MingAudioEncoder
+
+    torch.manual_seed(0)
+    enc = MingAudioEncoder(
+        n_mels=8, n_ctx=64, n_state=16, n_head=2, n_layer=3, use_flash_attn=False,
+    ).to(torch.bfloat16).eval()
+    x_list = [torch.randn(8, t).to(torch.bfloat16) for t in (7, 20, 13, 1)]
+
+    # Reference: the pre-optimization per-clip conv stem, then the (unchanged)
+    # block stack + ln_post.
+    with torch.no_grad():
+        encoded, lens = [], []
+        for mel in x_list:
+            x = mel.to(enc.conv1.weight.dtype).unsqueeze(0)
+            x = F.gelu(enc.conv1(x))
+            x = F.gelu(enc.conv2(x)).squeeze(0).transpose(0, 1)
+            x = (x + enc.positional_embedding[: x.shape[0], :]).to(x.dtype)
+            encoded.append(x)
+            lens.append(x.shape[0])
+        ref = torch.cat(encoded, dim=0)
+        cu = torch.tensor(
+            [0, *list(__import__("itertools").accumulate(lens))], dtype=torch.int32,
+        )
+        for block in enc.blocks:
+            ref = block(ref, cu_seqlens=cu, max_seqlen=max(lens))
+        ref = enc.ln_post(ref)
+
+        out, cu_out = enc(x_list)
+
+    assert cu_out.tolist() == cu.tolist()
+    assert torch.equal(out, ref)
+
+
 def test_audio_encoder_build_from_config() -> None:
     """``build_audio_encoder`` reads dims off AudioEncoderConfig.
 
