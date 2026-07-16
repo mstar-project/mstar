@@ -27,7 +27,7 @@ from mstar.model.components.distributed import (
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from mstar.model.components.moe import dispatch_experts_fused
+from mstar.model.components.moe import dispatch_experts
 from mstar.model.zonos2.config import Zonos2Config
 
 # QK-norm epsilon is hardcoded in the reference attention (F.rms_norm(..., eps=1e-6)).
@@ -276,7 +276,9 @@ class Zonos2MoEFeedForward(nn.Module):
     :class:`SparseMoeBlock`:
       - ``experts.gate_up_proj``: (num_experts, 2 * inter, hidden)  # w1 || w3
       - ``experts.down_proj``:    (num_experts, hidden, inter)      # w2
-    Dispatch reuses :func:`dispatch_experts_fused` (per-expert SwiGLU).
+    Dispatch reuses :func:`dispatch_experts`, which prefers the fused Triton
+    grouped-GEMM kernel when available and falls back to the naive per-expert
+    SwiGLU loop otherwise.
     """
 
     def __init__(self, config: Zonos2Config, layer_id: int):
@@ -302,7 +304,7 @@ class Zonos2MoEFeedForward(nn.Module):
         router_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         route_prob, expert_choice, router_states_next = self.router(x, router_states)
-        out = dispatch_experts_fused(
+        out = dispatch_experts(
             x,
             self.experts.gate_up_proj,
             self.experts.down_proj,

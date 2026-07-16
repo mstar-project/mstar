@@ -64,6 +64,16 @@ def test_router_topk_honors_special_layers():
     assert Zonos2Router(cfg_str, layer_id=2).top_k == 3
 
 
+def test_router_topk_is_static_int():
+    # CUDA-graph safety: ``top_k`` must be a plain int fixed at construction,
+    # not a tensor / callable / per-token value. A future config change that
+    # made routing count data-dependent would silently reintroduce dynamic
+    # shapes into the (to-be-captured) MoE dispatch — this pins it.
+    router = Zonos2Router(_moe_cfg(num_experts_per_tok=2), layer_id=0)
+    assert isinstance(router.top_k, int)
+    assert router.top_k == 2
+
+
 # -- speaker conditioning injection ----------------------------------------
 def _speaker_model(**kw) -> Zonos2ForCausalLM:
     cfg = Zonos2Config(
