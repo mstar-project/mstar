@@ -101,6 +101,11 @@ class WorkerGraphQueues:
         queue.register_communication_info(
             self.tensor_manager, request_id
         )
+        # MSTAR_RUST_WALK=shadow: run the Rust walk core in lockstep with
+        # this io on real traffic (Python authoritative, divergence loud).
+        from mstar.graph.rust_core import wrap_worker_graph_io
+        queue = wrap_worker_graph_io(
+            queue, self.worker_graph.section, self.worker_graph_id)
         self.per_request_queues[request_id] = queue
 
     def remove_request(self, request_id: str):
