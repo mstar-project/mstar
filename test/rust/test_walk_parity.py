@@ -247,3 +247,37 @@ def test_authority_mode_rust_drives(monkeypatch):
         steps += 1
         assert steps < 20
     assert io2._suspended is not None  # fell back, and the walk finished
+
+
+def test_pure_mode_no_python_registries(monkeypatch):
+    """MSTAR_RUST_WALK=pure: the Rust state is the only walk machine; the
+    adapter serves node views whose ready_inputs carry the REAL ingested
+    edges (the worker's tensor path), completion re-emits loop externals and
+    emits loop outputs at termination, and the walk finishes."""
+    from mstar.graph.rust_core import PureRustWorkerGraphIO
+
+    monkeypatch.setenv("MSTAR_RUST_WALK", "pure")
+    section = _loop_graph(3)
+    io = PureRustWorkerGraphIO(section, "wg-pure")
+
+    seed = GraphEdge(next_node="L", name="seed")
+    fb0 = GraphEdge(next_node="L", name="fb")
+    assert io.ingest_input(seed) and io.ingest_input(fb0)
+
+    completions = 0
+    while not io.wg_state_registry.is_done:
+        name = sorted(io.ready_node_names)[0]
+        io.ready_node_names.discard(name)  # -> schedule + slot fill
+        view = io.nodes[name]
+        # the worker's execution read: real edges, right names
+        assert set(view.ready_signals.ready_inputs) == view.input_names
+        if completions == 0 and name == "L":
+            assert view.ready_signals.ready_inputs["seed"] is seed
+        completion = io.mark_node_complete(name)
+        for edge in completion.output_edges:
+            if edge.next_node in io.nodes:
+                io.ingest_input(edge)
+        completions += 1
+        assert completions < 20
+    assert io.get_loop_indices() == {"dec": 2}
+    assert completions == 4  # 3 loop iters + post
