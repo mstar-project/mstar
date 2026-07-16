@@ -990,7 +990,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 def _serialize_tensor(tensor: torch.Tensor) -> bytes:
     """Serialize a tensor to bytes: header + contiguous raw data."""
     t = tensor.detach().contiguous().cpu()
-    return t.view(torch.uint8).numpy().tobytes()
+    # reshape(-1) so 0-dim (scalar) tensors can be byte-viewed: PyTorch
+    # disallows viewing a 0-dim tensor to a dtype with a different element size.
+    return t.reshape(-1).view(torch.uint8).numpy().tobytes()
 
 
 def _deserialize_tensor(
