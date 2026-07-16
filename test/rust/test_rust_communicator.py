@@ -1,4 +1,5 @@
-"""RustZMQCommunicator interop with the pyzmq ZMQCommunicator: same mesh, pickle wire, eventfd wakeup, lossless readiness polls.
+"""RustZMQCommunicator interop with the pyzmq ZMQCommunicator: same
+mesh, pickle wire, eventfd wakeup, lossless readiness polls.
 Skipped unless the ``mstar_rust`` extension (built from ``rust/``) is
 installed."""
 import os
