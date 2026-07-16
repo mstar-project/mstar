@@ -115,7 +115,11 @@ Graph / scheduler core
        per-request ``WorkerGraphIO`` on real traffic — Python stays
        authoritative; ready-set / doneness / loop-counter divergence is
        logged as an error (events the core does not model yet suspend
-       comparison for that request with a logged reason). ``0``: off.
+       comparison for that request with a logged reason). ``1``: Rust
+       decisions (ready set, doneness, loop indices) are authoritative —
+       Python keeps executing values, comparison stays on, and divergence
+       or an unmodeled event falls the request back to Python with an
+       error logged. ``0``: off.
    * - ``MSTAR_RUST_WALK_STRICT``
      - ``0``
      - With shadow mode, raise on divergence instead of logging (CI /
