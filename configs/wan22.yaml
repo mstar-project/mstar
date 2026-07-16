@@ -1,0 +1,23 @@
+model: "wan22"
+
+# All wan22 nodes are STATELESS (no KV cache); max_seq_len only satisfies the
+# conductor's config check and matches the UMT5 text length (512 tokens).
+max_seq_len: 512
+
+# Wan2.2-TI2V-5B single-GPU colocated: all four nodes on rank 0.
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - dit
+    ranks:
+      - 0

@@ -32,6 +32,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
+    "wan22": "wan22.yaml",
 }
 
 

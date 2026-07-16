@@ -5,10 +5,13 @@
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-uv pip install vllm==0.19.0 --torch-backend=auto
+uv pip install vllm==0.18.0 --torch-backend=auto
 
+# vllm-omni HEAD migrated to vllm 0.20 / CUDA 13 on 2026-05-06; pin the last commit
+# that still pairs with the cu12 vllm above.
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
+git checkout 282e0b66
 uv pip install -e .
 ```
 

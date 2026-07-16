@@ -120,6 +120,21 @@ vjepa2 = [
     "torchcodec",
 ]
 
+wan22 = [
+    # 0.39 is the diffusers release the Wan2.2 golden-reference oracle ran on;
+    # the wrapped AutoencoderKLWan/UMT5 components are equivalence-tested
+    # against it (floor only — an upper cap would block installs without
+    # preventing breakage). accelerate is required by the HF loaders
+    # (transformers' UMT5 path) to honor _keep_in_fp32_modules at load.
+    "accelerate",
+    "diffusers>=0.39",
+    "huggingface-hub",
+    "transformers",
+    # mp4 encode for the video output. PyAV bundles its own FFmpeg libs;
+    # torchcodec is unusable here without a system FFmpeg install.
+    "av",
+]
+
 vjepa2_ac = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
@@ -151,6 +166,8 @@ all = [
     "qwen-omni-utils",
     "numba>=0.61",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
+    # wan22 (see the [wan22] extra for the rationale; av / diffusers already above)
+    "accelerate",
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
     # separately, see docs/installation.rst.
 ]
