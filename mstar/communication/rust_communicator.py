@@ -23,6 +23,12 @@ from mstar.communication.event import EventWakeup
 
 logger = logging.getLogger(__name__)
 
+#: Slice bound for indefinite blocking waits. Events (message / wakeup) end a
+#: slice immediately, so this is not a latency knob — it bounds how long one
+#: FFI poll can hold the thread, keeping Python signal handling and the
+#: ``timeout_s`` deadline check responsive. Matches ``wait_for_work``'s tick.
+BLOCKING_POLL_SLICE_MS = 50
+
 class Codec:
     """The encode/decode seam, mirroring the Rust ``Codec`` trait::
 
@@ -163,7 +169,7 @@ class RustZMQCommunicator(BaseCommunicator):
             # (None = wait indefinitely); on expiry, drain whatever is there.
             deadline = None if timeout_s is None else (
                 time.monotonic() + timeout_s)
-            while self._poll_once(50) == "timeout":
+            while self._poll_once(BLOCKING_POLL_SLICE_MS) == "timeout":
                 if deadline is not None and time.monotonic() >= deadline:
                     break
         messages = [self.codec.decode(b) for b in self._buffered]
