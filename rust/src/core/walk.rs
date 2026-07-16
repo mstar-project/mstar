@@ -237,11 +237,13 @@ impl WalkState {
         node: &str,
         outputs: BTreeMap<String, Vec<TensorRef>>,
     ) -> Result<CompletionResult> {
-        let spec = self
-            .graph
+        // Arc-clone the compiled graph (refcount bump) so the spec can be
+        // borrowed while node/loop state is mutated — no per-complete clone
+        // of the NodeSpec and its edge strings.
+        let graph = self.graph.clone();
+        let spec = graph
             .nodes
             .get(node)
-            .cloned()
             .ok_or_else(|| CoreError::UnknownNode(node.to_string(), self.graph.name.clone()))?;
         {
             let st = self.nodes.get_mut(node).expect("node validated");

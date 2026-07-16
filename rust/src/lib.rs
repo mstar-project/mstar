@@ -483,6 +483,24 @@ impl PyWalkState {
         Ok((events, result.walk_done))
     }
 
+    /// One-crossing completion for the pure adapter: events + walk-done +
+    /// the post-completion ready set + loop states, replacing four separate
+    /// calls per step.
+    #[allow(clippy::type_complexity)]
+    fn complete_full(
+        &mut self,
+        node: &str,
+        outputs: Vec<(String, Vec<u64>)>,
+    ) -> PyResult<(
+        Vec<(String, String, String, Vec<u64>)>,
+        bool,
+        Vec<String>,
+        Vec<(String, u32, bool)>,
+    )> {
+        let (events, done) = self.complete_with(node, outputs)?;
+        Ok((events, done, self.inner.ready_nodes(), self.inner.loop_states()))
+    }
+
     /// External loop-termination signal (mstar's stop_loops / EOS).
     fn signal_loop_finish(&mut self, loop_name: &str) -> PyResult<()> {
         self.inner
