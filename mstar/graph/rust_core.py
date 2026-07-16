@@ -505,7 +505,10 @@ class PureRustWorkerGraphIO:
         self._mark_scheduled(node_name)  # idempotent
         self._scheduled.discard(node_name)
         view = self.nodes[node_name]
-        out_edges = [e.clone() for e in view.outputs]
+        # Return the declared edge objects themselves — mstar's registries do
+        # the same (the worker overwrites tensor_info each pass); fresh uuids
+        # keep the Rust-side value identity per iteration.
+        out_edges = view.outputs
         outputs = []
         for e in out_edges:
             uuid = next(self._uuid)
@@ -536,8 +539,15 @@ class PureRustWorkerGraphIO:
                     completion.output_edges.append(lo)
             elif a_i > b_i:  # advanced: re-emit external inputs
                 reemit = list(self._loop_externals.get(ln, {}).values())
-                self._reemitted_ids.update(id(e) for e in reemit)
                 completion.output_edges.extend(reemit)
+        # EVERY locally-destined edge in this completion was already routed
+        # (or re-injected) inside the Rust complete — their re-ingest by the
+        # worker must only refill the Python FIFO views, never re-seed Rust
+        # (a seed of a loop-member input appends to the loop's
+        # external_inputs, growing every iteration).
+        self._reemitted_ids.update(
+            id(e) for e in completion.output_edges
+            if e.next_node in self.nodes)
         return completion
 
     def register_loop_finish_signal(self, loop_name):
