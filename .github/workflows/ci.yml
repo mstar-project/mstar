@@ -44,7 +44,7 @@ jobs:
           pip install target/wheels/*.whl
       - name: Interop tests (transport + arena)
         run: |
-          pip install pytest pyzmq numpy
+          pip install pytest pyzmq numpy pyyaml
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
           pip install torch --index-url https://download.pytorch.org/whl/cpu
