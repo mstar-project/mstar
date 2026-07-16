@@ -21,6 +21,7 @@ use pyo3::types::PyBytes;
 
 use communicator::{RawZmqCommunicator, RecvEvent};
 use core::graph::CompiledWalk;
+use core::sched::{BatchFilter, MicroScheduler, ReadyEntry, SchedulingType};
 use core::tensor::TensorRef;
 use core::walk::{IncomingInput, RouteEvent, WalkState};
 use core::WalkSet;
@@ -445,6 +446,111 @@ impl PyWalkState {
     }
 }
 
+/// The worker's batch-decision engine (`mstar/worker/micro_scheduler.py` in
+/// Rust). Decide-vs-mutate seam: takes a snapshot of ready work as tuples
+/// `(node, walk, rid, worker_graph_id, engine_ready, priority, leader)` plus
+/// an explicit monotonic time; returns the batch to run. Queue pops and
+/// execution stay with the caller.
+#[pyclass(name = "MicroScheduler")]
+struct PyMicroScheduler {
+    inner: MicroScheduler,
+}
+
+type PyReady = (String, String, String, String, bool, u32, bool);
+
+fn to_entries(ready: Vec<PyReady>) -> Vec<ReadyEntry> {
+    ready
+        .into_iter()
+        .map(|(node, walk, request_id, worker_graph_id, engine_ready, priority, leader)| {
+            ReadyEntry {
+                node,
+                walk,
+                request_id,
+                worker_graph_id,
+                engine_ready,
+                priority,
+                leader,
+            }
+        })
+        .collect()
+}
+
+#[pymethods]
+impl PyMicroScheduler {
+    #[new]
+    #[pyo3(signature = (sched_type = "round_robin", max_consec_tp_follower_batches = 1))]
+    fn new(sched_type: &str, max_consec_tp_follower_batches: u32) -> PyResult<Self> {
+        let st = match sched_type {
+            "priority" => SchedulingType::Priority,
+            "round_robin" => SchedulingType::RoundRobin,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "sched_type must be 'priority' or 'round_robin', got {other:?}"
+                )))
+            }
+        };
+        Ok(Self {
+            inner: MicroScheduler::new(st, max_consec_tp_follower_batches),
+        })
+    }
+
+    fn hold_requests(&mut self, request_ids: Vec<String>, now_ms: u64) {
+        self.inner.hold_requests(&request_ids, now_ms);
+    }
+
+    fn add_pending_remove(&mut self, request_id: &str) {
+        self.inner.add_pending_remove(request_id);
+    }
+
+    fn clear_pending_remove(&mut self, request_id: &str) {
+        self.inner.clear_pending_remove(request_id);
+    }
+
+    fn register_tp_follow(&mut self, node: String, walk: String, request_ids: Vec<String>) {
+        self.inner.register_tp_follow(node, walk, request_ids);
+    }
+
+    #[pyo3(signature = (ready, exclude, now_ms))]
+    fn has_ready_excluding(
+        &self,
+        ready: Vec<PyReady>,
+        exclude: Option<(String, String)>,
+        now_ms: u64,
+    ) -> bool {
+        let entries = to_entries(ready);
+        self.inner.has_ready_excluding(
+            &entries,
+            exclude.as_ref().map(|(n, w)| (n.as_str(), w.as_str())),
+            now_ms,
+        )
+    }
+
+    /// -> None or (node, walk, request_ids, worker_graph_ids, tp_follow).
+    #[pyo3(signature = (ready, now_ms, max_batch_size = None, target_node = None,
+                        target_walk = None, exclude_target = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn get_next_batch(
+        &mut self,
+        ready: Vec<PyReady>,
+        now_ms: u64,
+        max_batch_size: Option<usize>,
+        target_node: Option<String>,
+        target_walk: Option<String>,
+        exclude_target: Option<(String, String)>,
+    ) -> Option<(String, String, Vec<String>, Vec<String>, bool)> {
+        let entries = to_entries(ready);
+        let filter = BatchFilter {
+            max_batch_size,
+            target_node,
+            target_walk,
+            exclude_target,
+        };
+        self.inner
+            .get_next_batch(&entries, &filter, now_ms)
+            .map(|b| (b.node, b.walk, b.request_ids, b.worker_graph_ids, b.tp_follow))
+    }
+}
+
 #[pymodule]
 fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -454,5 +560,6 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySegmentedShmArena>()?;
     m.add_class::<PyWalkSet>()?;
     m.add_class::<PyWalkState>()?;
+    m.add_class::<PyMicroScheduler>()?;
     Ok(())
 }
