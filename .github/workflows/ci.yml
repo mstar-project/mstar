@@ -52,3 +52,5 @@ jobs:
           # the package itself, without its remaining (heavy) deps
           pip install --no-deps -e .
           pytest test/rust/ -v
+      - name: Walk-layer A/B (informational)
+        run: python test/rust/bench_walk_ab.py
