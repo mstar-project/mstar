@@ -1,4 +1,4 @@
-"""Wire-contract test for the Rust frontend (RFC #130 Step 3): the real
+"""Wire-contract test for the Rust frontend: the real
 ``mstar-server`` binary + the real ``RustFrontendBridge``, with ``APIServer``
 stubbed — proves the HTTP surface, the msgpack bridge protocol, and the
 error path end to end without GPUs. Skipped unless the ``mstar_rust``
