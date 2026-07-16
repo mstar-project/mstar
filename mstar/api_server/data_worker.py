@@ -323,17 +323,17 @@ class PreprocessWorkerThread:
             request_id=input.request_id,
             tensors=tensors # dict(modality_input: list[tensors])
         )
-        all_uuids = sum([
-            [info.uuid for info in infos] for infos in initial_signals.values()
-        ], start=[])
+        all_infos = sum(
+            [infos for infos in initial_signals.values()], start=[]
+        )
         self.tensor_manager.register_for_send(
             request_id=input.request_id,
-            uuids=all_uuids
+            tensor_infos=all_infos,
         )
         # also persist all of the input signals
-        for uuid in all_uuids:
+        for info in all_infos:
             self.tensor_manager.set_persist(
-                input.request_id, uuid, persist=True
+                input.request_id, info.uuid, persist=True
             )
 
         self.request_model_kwargs[input.request_id] = input.model_kwargs or {}
