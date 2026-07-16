@@ -1,4 +1,4 @@
-"""ArenaShmCommunicationManager (RFC #130 Step 2): producer stages tensors
+"""ArenaShmCommunicationManager: producer stages tensors
 into the Rust shared-memory arena, the location rides the TensorPointerInfo,
 a separate consumer manager reads them zero-copy, and reclaim frees the
 arena slots. Skipped unless the ``mstar_rust`` extension is installed."""

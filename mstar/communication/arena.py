@@ -1,4 +1,4 @@
-"""RFC #130 Step 2: tensor transport over a shared-memory arena.
+"""Tensor transport over a shared-memory arena.
 
 ``ArenaShmCommunicationManager`` replaces ``SharedMemoryCommunicationManager``'s
 per-tensor file open/write/read/unlink with the Rust segmented ``/dev/shm``
