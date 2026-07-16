@@ -25,7 +25,7 @@ import time
 import aiohttp
 
 from benchmark.asr_eval import _compute_wer
-from benchmark.base import Model, ModelType, RequestType
+from benchmark.base import ModelType, RequestType
 from benchmark.dataset import LibriSpeechEvalDataset
 
 
