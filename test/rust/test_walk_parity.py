@@ -203,3 +203,47 @@ def test_shadow_mode_mirrors_and_detects(monkeypatch, caplog):
         for edge in completion.output_edges:
             if edge.next_node in io2.nodes:
                 io2.ingest_input(edge)
+
+
+def test_authority_mode_rust_drives(monkeypatch):
+    """MSTAR_RUST_WALK=1: ready set / doneness / loop indices come from the
+    Rust state; a full loop walk completes, and a forced divergence falls
+    back to Python instead of breaking the request."""
+    from mstar.graph.rust_core import wrap_worker_graph_io
+
+    monkeypatch.setenv("MSTAR_RUST_WALK", "1")
+    section = _loop_graph(3)
+    io = wrap_worker_graph_io(
+        WorkerGraphIO(deepcopy(section), wg_id="wg"), section, "wg")
+    io.ingest_input(GraphEdge(next_node="L", name="seed"))
+    io.ingest_input(GraphEdge(next_node="L", name="fb"))
+    steps = 0
+    while not io.wg_state_registry.is_done:
+        name = sorted(io.ready_node_names)[0]
+        io.ready_node_names.discard(name)  # -> rust schedule
+        completion = io.mark_node_complete(name)
+        for edge in completion.output_edges:
+            if edge.next_node in io.nodes:
+                io.ingest_input(edge)
+        steps += 1
+        assert steps < 20
+    assert io._suspended is None
+    assert io.get_loop_indices() == {"dec": 2}
+
+    # Divergence -> per-request fallback to Python, request still completes.
+    io2 = wrap_worker_graph_io(
+        WorkerGraphIO(deepcopy(section), wg_id="wg2"), section, "wg2")
+    io2.ingest_input(GraphEdge(next_node="L", name="seed"))
+    io2.ingest_input(GraphEdge(next_node="L", name="fb"))
+    io2._rs.signal_loop_finish("dec")  # force desync
+    steps = 0
+    while not io2.wg_state_registry.is_done:
+        name = sorted(io2.ready_node_names)[0]
+        io2.ready_node_names.discard(name)
+        completion = io2.mark_node_complete(name)
+        for edge in completion.output_edges:
+            if edge.next_node in io2.nodes:
+                io2.ingest_input(edge)
+        steps += 1
+        assert steps < 20
+    assert io2._suspended is not None  # fell back, and the walk finished

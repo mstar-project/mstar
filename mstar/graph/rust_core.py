@@ -89,11 +89,48 @@ _WALKSET_CACHE: dict[int, tuple] = {}  # id(section) -> (section ref, WalkSet)
 
 
 def rust_walk_mode() -> str:
-    """``MSTAR_RUST_WALK``: ``0`` (default, off) or ``shadow``."""
+    """``MSTAR_RUST_WALK``: ``0`` (default, off), ``shadow`` (mirror +
+    compare, Python authoritative), or ``1`` (Rust decisions authoritative;
+    Python keeps executing values; divergence falls back per-request)."""
     mode = os.getenv("MSTAR_RUST_WALK", "0").lower()
-    if mode not in ("0", "shadow"):
-        raise ValueError(f"MSTAR_RUST_WALK must be 0 or shadow; got {mode!r}")
+    if mode not in ("0", "shadow", "1"):
+        raise ValueError(
+            f"MSTAR_RUST_WALK must be 0, shadow, or 1; got {mode!r}")
     return mode
+
+
+class _RustReadyView(set):
+    """The ready set served from the Rust state in authority mode. Callers
+    mutate it (``pop_ready_nodes`` discards; OOM push-back adds) — discard
+    marks the node scheduled in Rust; add cannot be modeled (no unschedule),
+    so it falls the request back to Python."""
+
+    def __init__(self, names, owner):
+        super().__init__(names)
+        self._owner = owner
+
+    def discard(self, name):
+        if name in self:
+            self._owner._mark_scheduled(name)
+        super().discard(name)
+
+    def add(self, name):
+        self._owner._suspend("ready push-back (OOM hold) not modeled")
+        super().add(name)
+
+
+class _RegistryShim:
+    """`wg_state_registry.is_done` view honoring the current authority."""
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    @property
+    def is_done(self):
+        return self._owner._done()
+
+    def __getattr__(self, name):
+        return getattr(self._owner._io.wg_state_registry, name)
 
 
 class ShadowedWorkerGraphIO:
@@ -107,10 +144,14 @@ class ShadowedWorkerGraphIO:
     request with a single logged reason rather than false-positive.
     """
 
-    def __init__(self, io, section, wg_id):
+    def __init__(self, io, section, wg_id, authority: bool = False):
         from mstar_rust import WalkSet
 
         self._io = io
+        self._authority = authority
+        self._scheduled: set[str] = set()
+        if authority:
+            self.wg_state_registry = _RegistryShim(self)
         entry = _WALKSET_CACHE.get(id(section))
         if entry is None:
             walkset = WalkSet.from_json(walks_to_json({"walk": section}))
@@ -142,6 +183,37 @@ class ShadowedWorkerGraphIO:
 
     def __getattr__(self, name):
         return getattr(self._io, name)
+
+    # -- authority views ------------------------------------------------------
+
+    def _rust_drives(self) -> bool:
+        return self._authority and self._suspended is None
+
+    @property
+    def ready_node_names(self):
+        if self._rust_drives():
+            return _RustReadyView(self._rs.ready_nodes(), self)
+        return self._io.ready_node_names
+
+    def _done(self) -> bool:
+        if self._rust_drives():
+            return self._rs.is_done()
+        return self._io.wg_state_registry.is_done
+
+    def get_loop_indices(self):
+        if self._rust_drives():
+            return dict(self._rs.loop_iters())
+        return self._io.get_loop_indices()
+
+    def _mark_scheduled(self, name: str) -> None:
+        if self._suspended is None and name not in self._scheduled:
+            try:
+                self._rs.schedule(name)
+                self._scheduled.add(name)
+            except Exception as e:  # noqa: BLE001
+                self._suspend(f"schedule rejected: {e!r}")
+        # keep the Python io in step (it stays the value store)
+        self._io.ready_node_names.discard(name)
 
     # -- mirroring -----------------------------------------------------------
 
@@ -194,7 +266,9 @@ class ShadowedWorkerGraphIO:
         completion = self._io.mark_node_complete(node_name)
         if self._suspended is None:
             try:
-                self._rs.schedule(node_name)
+                if node_name not in self._scheduled:
+                    self._rs.schedule(node_name)
+                self._scheduled.discard(node_name)
                 self._rs.complete(node_name)
             except Exception as e:  # noqa: BLE001
                 self._suspend(f"complete rejected: {e!r}")
@@ -234,7 +308,13 @@ class ShadowedWorkerGraphIO:
 
 def wrap_worker_graph_io(io, section, wg_id):
     """The adoption seam: wrap a fresh per-request WorkerGraphIO according to
-    ``MSTAR_RUST_WALK``. ``0`` returns it untouched."""
-    if rust_walk_mode() == "shadow":
-        return ShadowedWorkerGraphIO(io, section, wg_id)
+    ``MSTAR_RUST_WALK``. ``0`` returns it untouched; ``shadow`` mirrors with
+    Python authoritative; ``1`` serves decisions (ready set, doneness, loop
+    indices) from the Rust state — Python keeps executing values, comparison
+    stays on, and any divergence or unmodeled event falls the request back
+    to Python with an error logged."""
+    mode = rust_walk_mode()
+    if mode in ("shadow", "1"):
+        return ShadowedWorkerGraphIO(io, section, wg_id,
+                                     authority=(mode == "1"))
     return io
