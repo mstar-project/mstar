@@ -102,7 +102,7 @@ class MicroScheduler:
             walk_counts[e.graph_walk] = walk_counts.get(e.graph_walk, 0) + 1
         graph_walk = max(walk_counts, key=walk_counts.get)
 
-        return node_name, graph_walk
+        return best_node_name, graph_walk
 
     def _select_node_rr(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
