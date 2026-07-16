@@ -233,7 +233,7 @@ impl Drop for ShmArena {
 }
 
 // ---------------------------------------------------------------------------
-// Segmented arena: grow-by-segments + uuid reclaim (RFC #130 Step 2)
+// Segmented arena: grow-by-segments + uuid-grouped reclaim
 // ---------------------------------------------------------------------------
 
 /// A producer arena that grows by adding fixed-size segments instead of
