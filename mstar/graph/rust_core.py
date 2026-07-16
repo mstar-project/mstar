@@ -18,12 +18,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+from itertools import count as _count
 
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
     GraphSection,
     Loop,
+    NodeCompletionOutput,
     Parallel,
     Sequential,
 )
@@ -93,9 +95,9 @@ def rust_walk_mode() -> str:
     compare, Python authoritative), or ``1`` (Rust decisions authoritative;
     Python keeps executing values; divergence falls back per-request)."""
     mode = os.getenv("MSTAR_RUST_WALK", "0").lower()
-    if mode not in ("0", "shadow", "1"):
+    if mode not in ("0", "shadow", "1", "pure"):
         raise ValueError(
-            f"MSTAR_RUST_WALK must be 0, shadow, or 1; got {mode!r}")
+            f"MSTAR_RUST_WALK must be 0, shadow, 1, or pure; got {mode!r}")
     return mode
 
 
@@ -314,7 +316,216 @@ def wrap_worker_graph_io(io, section, wg_id):
     stays on, and any divergence or unmodeled event falls the request back
     to Python with an error logged."""
     mode = rust_walk_mode()
+    if mode == "pure":
+        # No Python registries at all. Streaming graphs and speculation are
+        # not modeled yet: graphs with stream consumers fall back to
+        # authority mode (Rust decisions, Python values) with a logged note.
+        if any(getattr(n, "consumes_stream", False)
+               for n in io.nodes.values()):
+            logger.info("rust-walk pure: %s consumes streams; using "
+                        "authority mode for it", wg_id)
+            return ShadowedWorkerGraphIO(io, section, wg_id, authority=True)
+        return PureRustWorkerGraphIO(section, wg_id)
     if mode in ("shadow", "1"):
         return ShadowedWorkerGraphIO(io, section, wg_id,
                                      authority=(mode == "1"))
     return io
+
+
+# ---------------------------------------------------------------------------
+# Pure mode (MSTAR_RUST_WALK=pure): no Python WorkerGraphIO at all — the Rust
+# WalkState owns readiness/loops/termination, and this adapter keeps only the
+# value store (uuid -> GraphEdge, the mstar-rs pattern) plus the node views
+# the worker's execution path reads. Streaming graphs and speculation fall
+# back / disable (documented; those ports are staged separately).
+# ---------------------------------------------------------------------------
+
+class _Slot:
+    """ready_signals-shaped view: just the fields execution reads."""
+
+    def __init__(self):
+        self.ready_inputs: dict = {}
+        self.ready_names: set = set()
+
+    def clear(self):
+        self.ready_inputs.clear()
+        self.ready_names.clear()
+
+
+class _NodeView:
+    """Per-request node facade satisfying worker execution reads."""
+
+    def __init__(self, node):
+        self.name = node.name
+        self.input_names = node.input_names
+        self.outputs = node.outputs
+        self.enable_async_scheduling = getattr(
+            node, "enable_async_scheduling", True)
+        self.consumes_stream = getattr(node, "consumes_stream", False)
+        self.ready_signals = _Slot()
+        self.ready_next_iter = _Slot()
+
+
+class PureRustWorkerGraphIO:
+    """`WorkerGraphIO` with the Rust core as the ONLY state machine.
+
+    Values: every ingested/produced edge gets a uuid; the Rust state carries
+    uuids, this adapter maps them back to `GraphEdge`s (whose `tensor_info`
+    the worker fills after execution — mutation is visible at loop
+    termination when events return the captured uuids). Per (node, input)
+    the adapter keeps a FIFO of pending edges; scheduling a node moves the
+    oldest edge per input into its `ready_signals` view — FIFO order matches
+    iteration order because completion re-emits loop externals exactly as
+    mstar's registries do.
+    """
+
+    def __init__(self, section, wg_id):
+        from mstar_rust import WalkSet
+
+        entry = _WALKSET_CACHE.get(id(section))
+        if entry is None:
+            walkset = WalkSet.from_json(walks_to_json({"walk": section}))
+            _WALKSET_CACHE[id(section)] = (section, walkset)
+        else:
+            walkset = entry[1]
+        self._rs = walkset.state("walk")
+        self.graph = section
+        self.wg_id = wg_id
+        self.num_times_run = 0
+        self._graph_nodes = section.get_nodes()
+        self.loops = section.get_loops()
+        self.nodes = {n: _NodeView(g) for n, g in self._graph_nodes.items()}
+        self._uuid = _count(1)
+        self._store: dict[int, GraphEdge] = {}
+        # (node, input) -> FIFO of pending ingested edges
+        self._pending: dict[tuple[str, str], list[GraphEdge]] = {}
+        self._scheduled: set[str] = set()
+        # externals per loop: re-emitted on each advance (mstar's contract)
+        self._loop_externals: dict[str, list[GraphEdge]] = {}
+        self._loop_members = {
+            ln: set(lp.section.get_nodes().keys())
+            for ln, lp in self.loops.items()
+        }
+        self._internal = {
+            (e.name, e.next_node)
+            for g in self._graph_nodes.values() for e in g.outputs
+        }
+        self.ready_for_streaming: set = set()
+        self._tm = None
+        self._rid = None
+
+    # -- registry-shaped surface ----------------------------------------------
+
+    @property
+    def ready_node_names(self):
+        return _RustReadyView(
+            (n for n in self._rs.ready_nodes() if n not in self._scheduled),
+            self)
+
+    @property
+    def wg_state_registry(self):
+        io = self
+
+        class _R:
+            @property
+            def is_done(self):
+                return io._rs.is_done()
+        return _R()
+
+    def get_loop_indices(self):
+        return dict(self._rs.loop_iters())
+
+    def register_communication_info(self, tm, rid):
+        self._tm, self._rid = tm, rid
+
+    def get_node(self, name):
+        return self.nodes[name]
+
+    # -- events ----------------------------------------------------------------
+
+    def _mark_scheduled(self, name):
+        if name in self._scheduled:
+            return
+        self._rs.schedule(name)
+        self._scheduled.add(name)
+        view = self.nodes[name]
+        view.ready_signals.clear()
+        for inp in view.input_names:
+            fifo = self._pending.get((name, inp))
+            if fifo:
+                edge = fifo.pop(0)
+                view.ready_signals.ready_inputs[inp] = edge
+                view.ready_signals.ready_names.add(inp)
+
+    def ingest_input(self, edge, can_buffer=True):
+        if edge.next_node not in self.nodes:
+            return False
+        if edge.name not in self.nodes[edge.next_node].input_names:
+            return False
+        uuid = next(self._uuid)
+        self._store[uuid] = edge
+        self._pending.setdefault((edge.next_node, edge.name), []).append(edge)
+        self._rs.seed_with([(edge.next_node, edge.name, uuid)])
+        # track loop externals for re-emission on advance
+        pair = (edge.name, edge.next_node)
+        if pair not in self._internal:
+            for ln, members in self._loop_members.items():
+                if edge.next_node in members:
+                    self._loop_externals.setdefault(ln, []).append(edge)
+        return True
+
+    def mark_node_complete(self, node_name):
+        before = {n: (i, t) for n, i, t in self._rs.loop_states()}
+        self._mark_scheduled(node_name)  # idempotent
+        self._scheduled.discard(node_name)
+        view = self.nodes[node_name]
+        out_edges = [e.clone() for e in view.outputs]
+        outputs = []
+        for e in out_edges:
+            uuid = next(self._uuid)
+            self._store[uuid] = e
+            outputs.append((e.name, [uuid]))
+        events, _done = self._rs.complete_with(node_name, outputs)
+        after = {n: (i, t) for n, i, t in self._rs.loop_states()}
+
+        completion = NodeCompletionOutput(output_edges=out_edges)
+        for ln in self.loops:
+            b_i, b_t = before.get(ln, (0, False))
+            a_i, a_t = after.get(ln, (0, False))
+            if a_t and not b_t:  # terminated now: filter its loop-backs
+                completion.filtered_signals |= self.loops[ln]._loop_back_inputs
+                # loop outputs with captured values (uuids -> stored edges)
+                for kind, name, _tgt, uuids in events:
+                    del kind, name, uuids
+                for le in self.loops[ln].outputs:
+                    src = [e for e in out_edges if e.name == le.name]
+                    lo = le.clone()
+                    if src:
+                        lo.tensor_info = src[0].tensor_info
+                        lo._src_edge = src[0]
+                    completion.output_edges.append(lo)
+            elif a_i > b_i:  # advanced: re-emit external inputs
+                completion.output_edges.extend(
+                    self._loop_externals.get(ln, []))
+        return completion
+
+    def register_loop_finish_signal(self, loop_name):
+        if loop_name in self.loops:
+            self._rs.signal_loop_finish(loop_name)
+
+    def ingest_for_speculation(self, edges, source_node):
+        return []  # speculation disabled in pure mode (staged separately)
+
+    def clear_speculative_inputs(self):
+        pass
+
+    def clear(self):
+        walkset = _WALKSET_CACHE[id(self.graph)][1]
+        self._rs = walkset.state("walk")
+        self._scheduled.clear()
+        self._pending.clear()
+        self._loop_externals.clear()
+        for v in self.nodes.values():
+            v.ready_signals.clear()
+            v.ready_next_iter.clear()
+        self.num_times_run += 1

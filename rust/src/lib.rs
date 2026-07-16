@@ -494,6 +494,11 @@ impl PyWalkState {
         self.inner.loop_iters()
     }
 
+    /// (name, curr_iter, terminated) per loop.
+    fn loop_states(&self) -> Vec<(String, u32, bool)> {
+        self.inner.loop_states()
+    }
+
     fn is_done(&self) -> bool {
         self.inner.is_done()
     }

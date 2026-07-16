@@ -509,6 +509,19 @@ impl WalkState {
             .collect()
     }
 
+    /// (name, curr_iter, terminated) per loop — the adapter uses the
+    /// terminated flag flips to compute filtered loop-back signals and the
+    /// curr_iter bumps to re-emit external inputs, mirroring mstar's
+    /// completion contract without duplicating loop mechanics.
+    pub fn loop_states(&self) -> Vec<(String, u32, bool)> {
+        self.graph
+            .loops
+            .iter()
+            .zip(self.loops.iter())
+            .map(|(spec, st)| (spec.name.clone(), st.curr_iter, st.terminated))
+            .collect()
+    }
+
     pub fn is_done(&self) -> bool {
         self.graph
             .loops
