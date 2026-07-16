@@ -1,4 +1,4 @@
-//! The micro-scheduler (RFC #130 Step 5): the Rust port of
+//! The micro-scheduler  the Rust port of
 //! `mstar/worker/micro_scheduler.py`'s decision logic.
 //!
 //! The seam is decide-vs-mutate: the caller hands a SNAPSHOT of ready work

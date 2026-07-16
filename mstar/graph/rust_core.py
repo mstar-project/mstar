@@ -1,4 +1,4 @@
-"""RFC #130 Steps 4-5 seam: translate ``GraphSection`` trees into the Rust
+"""The graph-core translation seam: translate ``GraphSection`` trees into the Rust
 walk core's spec.
 
 ``walks_to_json`` produces the JSON that ``mstar_rust.WalkSet.from_json``

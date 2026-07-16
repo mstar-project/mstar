@@ -1,4 +1,4 @@
-"""Steps 4-5 parity: the Rust walk core vs mstar's ``WorkerGraphIO``, driven
+"""Walk-core parity: the Rust walk core vs mstar's ``WorkerGraphIO``, driven
 with identical event sequences over the same graphs. At every step the ready
 sets must match; at the end, loop iteration counts and doneness must match.
 Skipped unless the ``mstar_rust`` extension is installed."""
