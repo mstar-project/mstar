@@ -1,4 +1,4 @@
-"""RFC #130 Step 3: the Rust axum frontend in front of ``APIServer``.
+"""The Rust axum frontend in front of ``APIServer``.
 
 ``mstar-server`` (``rust/server/``) owns the HTTP surface — routes, OpenAI
 translation, SSE/NDJSON streaming, uploads, CORS — and speaks a flattened
