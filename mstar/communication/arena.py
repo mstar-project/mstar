@@ -1,45 +1,38 @@
 """Tensor transport over a shared-memory arena.
 
-``ArenaShmCommunicationManager`` replaces ``SharedMemoryCommunicationManager``'s
-per-tensor file open/write/read/unlink with the Rust segmented ``/dev/shm``
-arena (persistent mmaps + first-fit allocator, vendored in ``rust/``):
+``ArenaShmCommunicationManager`` replaces the file transport's per-tensor
+open/write/read/unlink with a Rust segmented ``/dev/shm`` arena (persistent
+mmaps + first-fit coalescing allocator, vendored in ``rust/``). Producer:
+``register_for_send`` reserves a slot and D2H-copies into the segment on the
+copy stream; the ``(segment, offset)`` rides the existing descriptors.
+Consumer: ``start_read_tensors`` maps the named segment once, reads
+zero-copy, H2D-copies on the copy stream; the producer reclaims on ACK,
+gated by a CUDA-event future so an edge is never ACKed before its copies
+land. Segments are mapped once and never move, so the one-time
+``cudaHostRegister`` per segment (within ``MSTAR_SHM_ARENA_PIN_MAX_MB``)
+holds for its lifetime and keeps the side-stream copies truly async.
 
-* **Producer** — ``register_for_send`` reserves ``(segment, offset)`` per
-  tensor and D2H-copies straight into the segment's buffer view on the
-  dedicated copy stream. The location is stamped onto the tensor's
-  ``TensorPointerInfo`` (``shm_segment``/``shm_offset``), which ships to the
-  consumer on the existing control mesh — the wire shape is unchanged, two
-  optional fields ride along.
-* **Consumer** — ``start_read_tensors`` opens the named segment once (lazy,
-  cached), views the bytes zero-copy (``torch.frombuffer``), and H2D-copies
-  on the dedicated stream. The producer reclaims the slot on ACK, so an edge
-  must not be ACKed until its copies complete (the file transport got this
-  for free because ``f.read()`` copied) — enforced without blocking the
-  host: the edges ride a CUDA-event future that ``get_ready_tensors``'s
-  existing polling checks before ACKing.
-* **Pinning** — each mapped segment is ``cudaHostRegister``-ed once, on both
-  sides (``MSTAR_SHM_ARENA_PIN``, default on with CUDA). A registered segment
-  reaches page-locked copy bandwidth, and the copies through the side streams
-  stay truly asynchronous — a plain pageable mmap would silently synchronize
-  the host and defeat the D2H/H2D overlap. Segments are created once and
-  never move, so a registration holds for the segment's lifetime.
-* **Capacity** — the arena grows segment by segment up to
-  ``MSTAR_SHM_ARENA_MAX_SEGMENTS`` (existing mappings never move — that is
-  what keeps registrations and open consumer views valid; oversized tensors
-  get a dedicated segment). At the cap, ``register_for_send`` backpressures:
-  it waits for consumers to ACK and retries, failing loudly after
-  ``MSTAR_SHM_ARENA_FULL_TIMEOUT_S``.
+Capacity degrades in layers: grow by segments up to
+``MSTAR_SHM_ARENA_MAX_SEGMENTS``; at the cap, briefly backpressure for
+consumer ACKs; then spill the tensor to the per-uuid file protocol
+(``MSTAR_SHM_ARENA_SPILL``, default on) — slower, never fails, like the old
+transport at saturation. ``stats()`` exposes occupancy and the fragmentation
+gauge (largest contiguous free block).
 
-Selection: ``create_tensor_communication_manager`` picks this manager for the
-SHM protocol when ``MSTAR_SHM_ARENA`` is ``1`` (require) or ``AUTO`` (use if
-the ``mstar_rust`` extension imports); default ``0`` keeps the file transport.
+Selection: ``create_tensor_communication_manager`` picks this manager for
+the SHM protocol when ``MSTAR_SHM_ARENA`` is ``1`` (require) or ``AUTO``
+(use if the ``mstar_rust`` extension imports); default ``0`` keeps the file
+transport. See :doc:`environment_variables` for all knobs.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import queue
+import threading
 import time
+from concurrent.futures import Future
 
 import torch
 
@@ -47,7 +40,9 @@ from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import (
     FutureAndPointers,
     SharedMemoryCommunicationManager,
+    _deserialize_tensor,
     _nullcontext,
+    _serialize_tensor,
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 
@@ -114,6 +109,29 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             os.getenv("MSTAR_SHM_ARENA_PIN", "1") == "1"
             and torch.cuda.is_available() and str(device) != "cpu"
         )
+        # Pinned host memory is a system-wide resource (pages come out of the
+        # OS's pageable pool), so it gets its own budget, distinct from the
+        # segment cap. Segments past the budget stay unpinned — copies still
+        # work, they just lose async overlap. Oversized dedicated segments
+        # (single allocations larger than a segment) are never pinned: a
+        # one-shot transfer doesn't amortize the registration cost.
+        self._pin_budget = int(
+            os.getenv("MSTAR_SHM_ARENA_PIN_MAX_MB", "4096")) << 20
+        self._pinned_bytes = 0
+        self._pin_budget_warned = False
+        self._segment_bytes = segment_mb << 20
+        # Arena saturation spills to the per-uuid file transport (the old
+        # protocol) instead of failing: bursty or oversized workloads degrade
+        # to file-copy speed, matching the prior manager's "slower, never
+        # fails" behavior. MSTAR_SHM_ARENA_SPILL=0 restores strict
+        # backpressure + timeout.
+        self._spill = os.getenv("MSTAR_SHM_ARENA_SPILL", "1") == "1"
+        self._spill_after_s = float(
+            os.getenv("MSTAR_SHM_ARENA_SPILL_AFTER_S", "0.05"))
+        self._frag_warned = False
+        # h2d completion watcher: turns a CUDA event into a real Future so
+        # the worker's eventfd wakes the moment reads finish (no 10 ms tick).
+        self._wake_q: queue.Queue | None = None
         self._arena = SegmentedShmArena.create(
             f"mstar_arena_{my_entity_id}", segment_mb << 20, max_segments)
         # Producer-side segment views (memoryviews are stable: segments
@@ -132,36 +150,94 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
 
     # -- segments --------------------------------------------------------
 
+    def _maybe_pin(self, ptr: int, nbytes: int) -> None:
+        if not self._pin_segments:
+            return
+        if nbytes > self._segment_bytes:
+            logger.info(
+                "ARENA: leaving oversized segment unpinned (%d MiB): a "
+                "one-shot transfer doesn't amortize cudaHostRegister",
+                nbytes >> 20)
+            return
+        if self._pinned_bytes + nbytes > self._pin_budget:
+            if not self._pin_budget_warned:
+                logger.warning(
+                    "ARENA: pinned-memory budget reached (%d MiB, "
+                    "MSTAR_SHM_ARENA_PIN_MAX_MB); further segments stay "
+                    "unpinned — copies work but lose async overlap",
+                    self._pin_budget >> 20)
+                self._pin_budget_warned = True
+            return
+        if _pin(ptr, nbytes):
+            self._pinned_bytes += nbytes
+            self._pinned_segments += 1
+
     def _sync_segments(self) -> None:
+        grew = False
         while len(self._seg_views) < self._arena.num_segments:
             seg = self._arena.segment(len(self._seg_views))
             self._seg_views.append(memoryview(seg))
-            if self._pin_segments:
-                _pin(*seg.ptr_len())
-                self._pinned_segments += 1
+            self._maybe_pin(*seg.ptr_len())
+            grew = True
+        if grew:
+            total, free, largest = self._arena.stats()
+            logger.info(
+                "ARENA: grew to %d segments (%d MiB total, %d MiB free, "
+                "largest free block %d MiB, %d MiB pinned)",
+                self._arena.num_segments, total >> 20, free >> 20,
+                largest >> 20, self._pinned_bytes >> 20)
+
+    def stats(self) -> dict:
+        """Occupancy/fragmentation snapshot for periodic stats logging.
+        The fragmentation signature is `largest_free_block` collapsing while
+        `free_bytes` stays high."""
+        total, free, largest = self._arena.stats()
+        return {
+            "segments": self._arena.num_segments,
+            "total_bytes": total,
+            "free_bytes": free,
+            "largest_free_block": largest,
+            "pinned_bytes": self._pinned_bytes,
+        }
 
     def _peer_view(self, segment_name: str) -> memoryview:
         entry = self._peer_segments.get(segment_name)
         if entry is None:
             arena = self._ShmArena.open(segment_name)
-            if self._pin_segments:
-                _pin(*arena.ptr_len())
+            self._maybe_pin(*arena.ptr_len())
             entry = self._peer_segments[segment_name] = (
                 arena, memoryview(arena))
         return entry[1]
 
     # -- producer ---------------------------------------------------------
 
-    def _reserve(self, nbytes: int) -> tuple[int, int]:
-        """Reserve with backpressure: at the segment cap, wait for consumer
-        ACKs to free space instead of failing outright."""
-        deadline = time.monotonic() + self._full_timeout_s
+    def _reserve(self, nbytes: int) -> tuple[int, int] | None:
+        """Reserve with layered degradation. At the segment cap: wait
+        briefly for consumer ACKs to free space; then (default) return None
+        so the caller SPILLS this tensor to the per-uuid file transport —
+        slower, never fails, exactly the old manager's saturation behavior.
+        MSTAR_SHM_ARENA_SPILL=0 keeps strict backpressure for the full
+        timeout, then raises."""
+        grace = self._spill_after_s if self._spill else self._full_timeout_s
+        deadline = time.monotonic() + grace
         warned = False
         while True:
             try:
                 seg, off = self._arena.reserve(max(nbytes, 1))
             except RuntimeError:
+                total, free, largest = self._arena.stats()
+                if free >= nbytes and not self._frag_warned:
+                    # The fragmentation signature: enough TOTAL free space,
+                    # but no contiguous block large enough.
+                    logger.warning(
+                        "ARENA: fragmentation — need %d bytes with %d free "
+                        "but largest free block is %d (of %d total). "
+                        "Consider larger MSTAR_SHM_ARENA_SEGMENT_MB.",
+                        nbytes, free, largest, total)
+                    self._frag_warned = True
                 if time.monotonic() > deadline:
+                    if self._spill:
+                        return None
                     raise RuntimeError(
                         f"SHM arena full for >{self._full_timeout_s}s "
                         f"({self._arena.num_segments} segments); raise "
@@ -170,7 +246,8 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 if not warned:
                     logger.warning(
                         "SHM arena at capacity; backpressuring sends until "
-                        "consumers ACK")
+                        "consumers ACK%s",
+                        " (then spilling to file)" if self._spill else "")
                     warned = True
                 time.sleep(0.002)
                 continue
@@ -204,7 +281,25 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 t0 = time.perf_counter()
                 t = tensor.detach().contiguous()
                 nbytes = t.numel() * t.element_size()
-                seg, off = self._reserve(nbytes)
+                loc = self._reserve(nbytes)
+                if loc is None:
+                    # Arena saturated: spill THIS tensor to the per-uuid file
+                    # protocol (infos keep shm_segment=None — the consumer
+                    # falls back to the file read for exactly those).
+                    data = _serialize_tensor(t)
+                    path = self._shm_path(self.my_entity_id, uuid)
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    self._shm_files[uuid] = path
+                    self.tensor_store.set_metadata(
+                        request_id, uuid, mem_registered=True)
+                    if self.enable_prof:
+                        self._record_tx(request_id, uuid, len(data),
+                                        time.perf_counter() - t0)
+                    logger.debug("ARENA: spilled %s to %s (%d bytes)",
+                                 uuid, path, len(data))
+                    continue
+                seg, off = loc
                 if nbytes:
                     host = torch.frombuffer(
                         self._seg_views[seg][off:off + nbytes],
@@ -265,12 +360,16 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                             request_id, info.uuid, 1)
                         continue
                     if info.shm_segment is None:
-                        raise RuntimeError(
-                            f"tensor {info.uuid} from {info.source_entity} "
-                            "has no arena location: the producer is not "
-                            "running the arena transport (MSTAR_SHM_ARENA "
-                            "must match across the deployment)")
-                    tensor = self._read_from_arena(info)
+                        # Spilled at the producer (arena saturated): read the
+                        # per-uuid file, the old protocol's path.
+                        path = self._shm_path(info.source_entity, info.uuid)
+                        with open(path, "rb") as f:
+                            f.seek(info.offset)
+                            data = f.read(info.nbytes)
+                        tensor = _deserialize_tensor(
+                            data, self.device, tensor_info=info)
+                    else:
+                        tensor = self._read_from_arena(info)
                     h2d_did_work = h2d_did_work or tensor.numel() > 0
                     self.tensor_store.put_tensor(
                         request_id, info.uuid, tensor)
@@ -300,7 +399,34 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     request_id=request_id, rx_time=rx_time,
                 )
             )
-        return []
+        if future is None:
+            return []
+        # A real Future for the worker's eventfd (EventWakeup.register_
+        # futures needs add_done_callback): completed by the watcher thread
+        # the moment the h2d copies finish, so an otherwise-idle worker
+        # re-checks get_ready_tensors immediately instead of on its next
+        # poll tick.
+        return [self._wake_when_done(future)]
+
+    def _wake_when_done(self, cuda_future) -> Future:
+        if self._wake_q is None:
+            self._wake_q = queue.Queue()
+            threading.Thread(
+                target=self._watch_wakes, daemon=True,
+                name=f"arena-h2d-wake-{self.my_entity_id}").start()
+        fut: Future = Future()
+        self._wake_q.put((cuda_future, fut))
+        return fut
+
+    def _watch_wakes(self) -> None:
+        # Events are queued in stream order, so sequential waits are exact.
+        while True:
+            cuda_future, fut = self._wake_q.get()
+            try:
+                cuda_future.result()   # event.synchronize (GIL released)
+            except Exception:          # noqa: BLE001 — wake regardless
+                pass
+            fut.set_result(None)
 
     def _read_from_arena(self, info: TensorPointerInfo) -> torch.Tensor:
         if info.nbytes == 0:
@@ -326,6 +452,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         if (loc := self._arena_locs.pop(uuid, None)) is not None:
             self._arena.free(*loc)
             logger.debug("ARENA: freed %s at %s", uuid, loc)
+        if (path := self._shm_files.pop(uuid, None)) is not None:
+            try:
+                os.unlink(path)   # spilled tensor: reclaim the file
+            except FileNotFoundError:
+                pass
         if not self.tensor_store.check_uuid_presence(request_id, uuid):
             return
         self.tensor_store.remove_tensor(request_id, uuid)
