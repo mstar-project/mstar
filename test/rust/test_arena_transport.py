@@ -123,6 +123,56 @@ def test_arena_grows_then_spills(tmp_path):
         del os.environ["MSTAR_SHM_ARENA_SPILL_AFTER_S"]
 
 
+def test_mixed_edge_and_fragmentation_signature(tmp_path, caplog):
+    """One edge can mix arena-staged and spilled tensors (the consumer
+    dispatches per descriptor), and a reserve that fails while TOTAL free
+    space covers it logs the fragmentation signature (largest free block
+    collapsed) before spilling."""
+    import logging
+
+    os.environ["MSTAR_SHM_ARENA_SPILL_AFTER_S"] = "0.05"
+    try:
+        prod = _manager("w6", tmp_path)
+        # Fill to the 4-segment cap with 12 x 300 KB...
+        fill = prod.store_and_return_tensor_info(
+            "r6", {"fill": [torch.zeros(300_000, dtype=torch.uint8)
+                            for _ in range(12)]})
+        prod.register_for_send("r6", [i.uuid for i in fill["fill"]])
+        # ...then free ALTERNATE allocations: ~1.2 MB total free, but no
+        # contiguous block larger than ~300 KB.
+        for info in fill["fill"][::2]:
+            prod._cleanup_by_uuid("r6", info.uuid)
+        st = prod.stats()
+        assert st["free_bytes"] > 500_000 > st["largest_free_block"]
+
+        # A small tensor fits a hole (arena); a 500 KB one has the total
+        # free space but no block -> fragmentation warning, then spill.
+        small = torch.arange(1000, dtype=torch.uint8)
+        big = torch.full((500_000,), 7, dtype=torch.uint8)
+        mixed = prod.store_and_return_tensor_info(
+            "r6", {"mixed": [small, big]})
+        with caplog.at_level(logging.WARNING,
+                             logger="mstar.communication.arena"):
+            prod.register_for_send("r6", [i.uuid for i in mixed["mixed"]])
+        s_info, b_info = mixed["mixed"]
+        assert s_info.shm_segment is not None      # staged in a hole
+        assert b_info.shm_segment is None          # spilled
+        assert any("fragmentation" in r.message for r in caplog.records)
+
+        # The consumer reads the MIXED edge: one from the arena, one from
+        # the spill file, in a single start_read_tensors call.
+        cons = _manager("w7", tmp_path)
+        edge = GraphEdge(next_node="B", name="mixed",
+                         tensor_info=mixed["mixed"])
+        cons.start_read_tensors("r6", [edge])
+        assert torch.equal(
+            cons.tensor_store.get_tensor("r6", s_info.uuid), small)
+        assert torch.equal(
+            cons.tensor_store.get_tensor("r6", b_info.uuid), big)
+    finally:
+        del os.environ["MSTAR_SHM_ARENA_SPILL_AFTER_S"]
+
+
 def test_strict_mode_backpressures_then_fails(tmp_path):
     """MSTAR_SHM_ARENA_SPILL=0 restores the strict contract: backpressure
     at the cap, then a loud arena-full error."""
