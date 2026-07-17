@@ -78,8 +78,12 @@ def test_reclaim_frees_arena_slots(tmp_path):
     assert not prod._infos_by_uuid
 
 
-def test_arena_grows_then_backpressures(tmp_path):
-    os.environ["MSTAR_SHM_ARENA_FULL_TIMEOUT_S"] = "0.2"
+def test_arena_grows_then_spills(tmp_path):
+    """Past the segment cap the producer SPILLS to the per-uuid file
+    protocol (slower, never fails — the old manager's saturation behavior);
+    the consumer reads spilled tensors through the file fallback; reclaim
+    unlinks the files. Stats expose the fragmentation gauge."""
+    os.environ["MSTAR_SHM_ARENA_SPILL_AFTER_S"] = "0.05"
     try:
         prod = _manager("w3", tmp_path)
         # 1 MiB segments, cap 4: filling ~3.5 MiB grows the arena...
@@ -89,21 +93,62 @@ def test_arena_grows_then_backpressures(tmp_path):
         uuids = [i.uuid for i in infos["big"]]
         prod.register_for_send("r3", uuids)
         assert prod._arena.num_segments > 1
-        # ...and past the cap, register_for_send backpressures then fails
-        # loudly instead of hanging.
+        st = prod.stats()
+        assert st["segments"] == prod._arena.num_segments
+        assert 0 < st["largest_free_block"] <= st["free_bytes"]
+        # ...and past the cap, further tensors spill to files instead of
+        # failing: shm_segment stays None and a per-uuid file appears.
+        vals = [torch.full((300_000,), i, dtype=torch.uint8)
+                for i in range(6)]
+        more = prod.store_and_return_tensor_info("r3", {"more": vals})
+        prod.register_for_send("r3", [i.uuid for i in more["more"]])
+        spilled = [i for i in more["more"] if i.shm_segment is None]
+        assert spilled, "expected at least one spill past the cap"
+        assert all(u in prod._shm_files for u in
+                   (i.uuid for i in spilled))
+        # The consumer round-trips spilled tensors via the file fallback.
+        cons = _manager("w4", tmp_path)
+        edge = GraphEdge(next_node="B", name="more",
+                         tensor_info=more["more"])
+        cons.start_read_tensors("r3", [edge])
+        for val, info in zip(vals, more["more"], strict=True):
+            got = cons.tensor_store.get_tensor("r3", info.uuid)
+            assert torch.equal(got, val)
+        # Reclaim unlinks the spilled files.
+        for info in spilled:
+            path = prod._shm_files[info.uuid]
+            prod._cleanup_by_uuid("r3", info.uuid)
+            assert not os.path.exists(path)
+    finally:
+        del os.environ["MSTAR_SHM_ARENA_SPILL_AFTER_S"]
+
+
+def test_strict_mode_backpressures_then_fails(tmp_path):
+    """MSTAR_SHM_ARENA_SPILL=0 restores the strict contract: backpressure
+    at the cap, then a loud arena-full error."""
+    os.environ["MSTAR_SHM_ARENA_SPILL"] = "0"
+    os.environ["MSTAR_SHM_ARENA_FULL_TIMEOUT_S"] = "0.2"
+    try:
+        prod = _manager("w5", tmp_path)
+        infos = prod.store_and_return_tensor_info(
+            "r5", {"big": [torch.zeros(300_000, dtype=torch.uint8)
+                           for _ in range(12)]})
+        prod.register_for_send("r5", [i.uuid for i in infos["big"]])
         more = prod.store_and_return_tensor_info(
-            "r3", {"more": [torch.zeros(300_000, dtype=torch.uint8)
+            "r5", {"more": [torch.zeros(300_000, dtype=torch.uint8)
                             for _ in range(6)]})
         with pytest.raises(RuntimeError, match="arena full"):
-            prod.register_for_send("r3", [i.uuid for i in more["more"]])
+            prod.register_for_send("r5", [i.uuid for i in more["more"]])
     finally:
+        del os.environ["MSTAR_SHM_ARENA_SPILL"]
         del os.environ["MSTAR_SHM_ARENA_FULL_TIMEOUT_S"]
 
 
 def test_transport_mismatch_fails_loudly(tmp_path):
     """A mixed deployment (arena producer + file consumer, or the reverse)
-    must fail with an explicit MSTAR_SHM_ARENA message in BOTH directions,
-    not a FileNotFoundError or a hang."""
+    fails with an explicit MSTAR_SHM_ARENA message where data would be
+    unreachable (arena producer -> file consumer); the reverse direction
+    interops via the arena consumer's file fallback."""
     arena_prod = _manager("mx0", tmp_path)
     file_cons = SharedMemoryCommunicationManager(
         my_entity_id="mx1", hostname="localhost", device="cpu",
@@ -115,16 +160,20 @@ def test_transport_mismatch_fails_loudly(tmp_path):
     with pytest.raises(RuntimeError, match="MSTAR_SHM_ARENA"):
         file_cons.start_read_tensors("rm", [edge])
 
+    # The reverse direction now INTEROPS: a file-producer's tensors carry
+    # no arena location, which is exactly the spill wire shape — the arena
+    # consumer reads them through its file fallback.
     file_prod = SharedMemoryCommunicationManager(
         my_entity_id="mx2", hostname="localhost", device="cpu",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path))
     arena_cons = _manager("mx3", tmp_path)
-    infos = file_prod.store_and_return_tensor_info(
-        "rm2", {"y": [torch.randn(4)]})
+    y = torch.randn(4)
+    infos = file_prod.store_and_return_tensor_info("rm2", {"y": [y]})
     file_prod.register_for_send("rm2", [infos["y"][0].uuid])
     edge = GraphEdge(next_node="B", name="y", tensor_info=infos["y"])
-    with pytest.raises(RuntimeError, match="MSTAR_SHM_ARENA"):
-        arena_cons.start_read_tensors("rm2", [edge])
+    arena_cons.start_read_tensors("rm2", [edge])
+    got = arena_cons.tensor_store.get_tensor("rm2", infos["y"][0].uuid)
+    assert torch.equal(got, y)
 
 
 def test_factory_flag(tmp_path, monkeypatch):

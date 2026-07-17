@@ -52,9 +52,27 @@ Communication
        until consumers ACK and space is reclaimed.
    * - ``MSTAR_SHM_ARENA_FULL_TIMEOUT_S``
      - ``30``
-     - How long a send backpressures on a full arena before failing.
+     - Strict mode only (``MSTAR_SHM_ARENA_SPILL=0``): how long a send
+       backpressures on a full arena before failing.
+   * - ``MSTAR_SHM_ARENA_SPILL``
+     - ``1``
+     - Degrade gracefully at the segment cap: after a short backpressure
+       grace (``MSTAR_SHM_ARENA_SPILL_AFTER_S``, default ``0.05``), stage
+       the tensor through the per-uuid file protocol instead — slower,
+       never fails, matching the file transport's saturation behavior.
+       ``0`` restores strict backpressure + timeout.
+   * - ``MSTAR_SHM_ARENA_SPILL_AFTER_S``
+     - ``0.05``
+     - How long a send waits for consumer ACKs before spilling.
    * - ``MSTAR_SHM_ARENA_PIN``
      - ``1``
      - ``cudaHostRegister`` each mapped segment (both sides) so D2H/H2D
        copies through the side streams run at page-locked bandwidth and
        stay asynchronous. ``0`` disables (pageable copies).
+   * - ``MSTAR_SHM_ARENA_PIN_MAX_MB``
+     - ``4096``
+     - Budget for TOTAL pinned host memory, distinct from the segment cap
+       (pinned pages come out of the OS's pageable pool system-wide).
+       Segments past the budget — and oversized dedicated segments, whose
+       one-shot transfer doesn't amortize the registration — stay
+       unpinned: copies work, without async overlap.

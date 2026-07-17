@@ -102,6 +102,13 @@ impl Allocator {
     fn bytes_free(&self) -> usize {
         self.free.iter().map(|b| b.1).sum()
     }
+
+    /// The fragmentation gauge: the biggest single allocation that can
+    /// currently succeed. Collapsing toward zero while `bytes_free` stays
+    /// high is the telltale of fragmentation.
+    fn largest_free_block(&self) -> usize {
+        self.free.iter().map(|&(_, l)| l).max().unwrap_or(0)
+    }
 }
 
 /// A named shared-memory arena. The producer owns it (unlinks on drop); a
@@ -200,6 +207,11 @@ impl ShmArena {
 
     pub fn bytes_free(&self) -> usize {
         self.alloc.lock().expect("alloc lock").bytes_free()
+    }
+
+    /// Largest single contiguous free block (see `Allocator::largest_free_block`).
+    pub fn largest_free_block(&self) -> usize {
+        self.alloc.lock().expect("alloc lock").largest_free_block()
     }
 
     /// Base pointer of the arena — used by the `mstar-py` buffer-protocol view
@@ -353,6 +365,23 @@ impl SegmentedShmArena {
 
     pub fn num_segments(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Occupancy + fragmentation snapshot across all segments:
+    /// `(total_bytes, free_bytes, largest_free_block)`. The fragmentation
+    /// signature is `largest_free_block` collapsing while `free_bytes` stays
+    /// high — allocations then fail (or force segment growth) even though
+    /// total free space looks healthy.
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let total = self.segments.iter().map(|s| s.size()).sum();
+        let free = self.segments.iter().map(|s| s.bytes_free()).sum();
+        let largest = self
+            .segments
+            .iter()
+            .map(|s| s.largest_free_block())
+            .max()
+            .unwrap_or(0);
+        (total, free, largest)
     }
 
     /// The `{base}.seg{i}` arena name — what descriptors carry, and what a
