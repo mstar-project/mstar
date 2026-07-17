@@ -277,13 +277,13 @@ impl RawZmqCommunicator {
                 return RecvEvent::Message(b);
             }
         }
-        // A closed/invalid wakeup fd makes poll return POLLNVAL instantly:
-        // without this check every blocking wait would degrade into a
-        // silent 100%-CPU spin. Fail loudly instead.
+        // A closed/invalid wakeup fd makes poll return instantly with an
+        // error event: without this check every blocking wait would degrade
+        // into a silent 100%-CPU spin. libzmq folds a raw fd's POLLNVAL and
+        // POLLERR into ZMQ_POLLERR, so this one flag covers both.
         if items[1..]
             .iter()
-            .any(|it| it.get_revents().intersects(
-                zmq::POLLERR | zmq::PollEvents::from_bits_truncate(0x20)))
+            .any(|it| it.get_revents().contains(zmq::POLLERR))
         {
             return RecvEvent::WakeFdError;
         }
