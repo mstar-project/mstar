@@ -252,22 +252,26 @@ impl PySegmentedShmArena {
 
     /// -> (segment_idx, offset); grows by one segment when full (dedicated
     /// segment for oversized allocations), errors at the max_segments cap.
-    fn reserve(&mut self, nbytes: usize) -> PyResult<(usize, usize)> {
-        self.arena
-            .reserve(nbytes)
+    /// GIL released: the growth path creates + maps a new shm segment
+    /// (file create, ftruncate, mmap — milliseconds), which must not stall
+    /// other Python threads (the serve loop, stream relays).
+    fn reserve(&mut self, py: Python<'_>, nbytes: usize) -> PyResult<(usize, usize)> {
+        py.allow_threads(|| self.arena.reserve(nbytes))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Reserve and record under `uuid` (uuid-grouped reclaim).
-    fn reserve_for(&mut self, uuid: u64, nbytes: usize) -> PyResult<(usize, usize)> {
-        self.arena
-            .reserve_for(uuid, nbytes)
+    /// Reserve and record under `uuid` (uuid-grouped reclaim). GIL released
+    /// (same growth path as `reserve`).
+    fn reserve_for(&mut self, py: Python<'_>, uuid: u64, nbytes: usize) -> PyResult<(usize, usize)> {
+        py.allow_threads(|| self.arena.reserve_for(uuid, nbytes))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Free everything held by `uuid` (idempotent); returns count released.
-    fn free_uuid(&self, uuid: u64) -> usize {
-        self.arena.free_uuid(uuid)
+    /// GIL released: one uuid can hold many allocations (multi-tensor
+    /// requests), each a lock + free-list merge.
+    fn free_uuid(&self, py: Python<'_>, uuid: u64) -> usize {
+        py.allow_threads(|| self.arena.free_uuid(uuid))
     }
 
     fn free(&self, segment: usize, offset: usize) -> bool {
@@ -277,6 +281,14 @@ impl PySegmentedShmArena {
     #[getter]
     fn num_segments(&self) -> usize {
         self.arena.num_segments()
+    }
+
+    /// `(total_bytes, free_bytes, largest_free_block)` across all segments.
+    /// `largest_free_block` collapsing while `free_bytes` stays high is the
+    /// fragmentation signature (allocations fail / segments grow despite
+    /// healthy total free space).
+    fn stats(&self) -> (usize, usize, usize) {
+        self.arena.stats()
     }
 
     fn segment_name(&self, i: usize) -> String {
