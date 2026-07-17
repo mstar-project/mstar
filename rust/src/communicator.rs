@@ -44,6 +44,9 @@ pub enum CommError {
     Io(#[from] std::io::Error),
     #[error("no endpoint for peer '{0}' (register_peer it, or bind with an ipc dir)")]
     UnknownPeer(String),
+    #[error("decode failed on a {len}-byte frame: {detail} — codec/version \
+             mismatch with the peer?")]
+    Decode { len: usize, detail: String },
 }
 
 /// The default ipc endpoint an entity binds/connects to.
@@ -66,6 +69,10 @@ pub enum RecvEvent {
     /// A registered wakeup fd is readable (the registrant reads/clears it —
     /// e.g. `read(2)` on the eventfd — the transport only polls it).
     Wake,
+    /// A registered wakeup fd is closed/invalid (POLLERR/POLLNVAL): the
+    /// registrant's bug — surfaced loudly instead of degrading every
+    /// blocking wait into an instant-timeout CPU spin.
+    WakeFdError,
     /// The timeout elapsed with neither.
     Timeout,
 }
@@ -75,6 +82,7 @@ impl PartialEq for RecvEvent {
         match (self, other) {
             (RecvEvent::Message(a), RecvEvent::Message(b)) => a[..] == b[..],
             (RecvEvent::Wake, RecvEvent::Wake) => true,
+            (RecvEvent::WakeFdError, RecvEvent::WakeFdError) => true,
             (RecvEvent::Timeout, RecvEvent::Timeout) => true,
             _ => false,
         }
@@ -97,7 +105,12 @@ pub struct RawZmqCommunicator {
     // used from one thread at a time); the drive loop is the single consumer.
     pull: Mutex<zmq::Socket>,
     // peer id -> connected PUSH socket (created on first send to that peer).
-    peers: Mutex<HashMap<String, zmq::Socket>>,
+    // Arc<Mutex<Socket>> so the MAP lock is held only for lookup/insert:
+    // a PUSH send blocks at the peer's high-water mark, and holding the map
+    // across it would let one stalled peer freeze sends to every other peer
+    // (and registration) process-wide. The per-socket lock serializes sends
+    // to one peer (a zmq socket is single-user), preserving per-peer FIFO.
+    peers: Mutex<HashMap<String, std::sync::Arc<Mutex<zmq::Socket>>>>,
     // peer id -> explicit endpoint (tcp or ipc), overriding the dir scheme.
     peer_endpoints: Mutex<HashMap<String, String>>,
     // External fds polled alongside the PULL socket (mstar's worker registers
@@ -201,18 +214,22 @@ impl RawZmqCommunicator {
     /// Send one opaque byte frame to `peer_id` (fire-and-forget). Queues if
     /// the peer isn't bound yet and reconnects transparently if it restarted.
     pub fn send(&self, peer_id: &str, payload: &[u8]) -> Result<(), CommError> {
-        let mut peers = self.peers.lock().expect("peers lock");
-        if !peers.contains_key(peer_id) {
-            let endpoint = self.resolve(peer_id)?;
-            let push = self.ctx.socket(zmq::PUSH)?;
-            push.set_linger(0)?;
-            push.connect(&endpoint)?;
-            peers.insert(peer_id.to_string(), push);
-        }
-        peers
-            .get(peer_id)
-            .expect("just inserted")
-            .send(payload, 0)?;
+        let socket = {
+            let mut peers = self.peers.lock().expect("peers lock");
+            match peers.get(peer_id) {
+                Some(s) => s.clone(),
+                None => {
+                    let endpoint = self.resolve(peer_id)?;
+                    let push = self.ctx.socket(zmq::PUSH)?;
+                    push.set_linger(0)?;
+                    push.connect(&endpoint)?;
+                    let s = std::sync::Arc::new(Mutex::new(push));
+                    peers.insert(peer_id.to_string(), s.clone());
+                    s
+                }
+            }
+        }; // map lock dropped: an HWM-blocked send stalls only THIS peer
+        socket.lock().expect("peer socket lock").send(payload, 0)?;
         Ok(())
     }
 
@@ -260,6 +277,16 @@ impl RawZmqCommunicator {
                 return RecvEvent::Message(b);
             }
         }
+        // A closed/invalid wakeup fd makes poll return POLLNVAL instantly:
+        // without this check every blocking wait would degrade into a
+        // silent 100%-CPU spin. Fail loudly instead.
+        if items[1..]
+            .iter()
+            .any(|it| it.get_revents().intersects(
+                zmq::POLLERR | zmq::PollEvents::from_bits_truncate(0x20)))
+        {
+            return RecvEvent::WakeFdError;
+        }
         if items[1..].iter().any(|it| it.is_readable()) {
             return RecvEvent::Wake;
         }
@@ -296,7 +323,11 @@ impl Drop for RawZmqCommunicator {
 /// transport never looks inside the bytes.
 pub trait Codec<M> {
     fn encode(msg: &M) -> Result<Vec<u8>, CommError>;
-    fn decode(bytes: &[u8]) -> Option<M>;
+    /// Errors are LOUD by contract: a frame that fails to decode is a
+    /// codec/version mismatch with the peer, and silently dropping it turns
+    /// into requests that hang with no log line. The typed receive methods
+    /// propagate the error instead of conflating it with "no message".
+    fn decode(bytes: &[u8]) -> Result<M, CommError>;
 }
 
 /// The default codec: MessagePack, the language-neutral encoding the
@@ -308,8 +339,11 @@ impl<M: Serialize + DeserializeOwned> Codec<M> for MsgpackCodec {
     fn encode(msg: &M) -> Result<Vec<u8>, CommError> {
         rmp_serde::to_vec_named(msg).map_err(CommError::Serialize)
     }
-    fn decode(bytes: &[u8]) -> Option<M> {
-        rmp_serde::from_slice(bytes).ok()
+    fn decode(bytes: &[u8]) -> Result<M, CommError> {
+        rmp_serde::from_slice(bytes).map_err(|e| CommError::Decode {
+            len: bytes.len(),
+            detail: e.to_string(),
+        })
     }
 }
 
@@ -355,28 +389,32 @@ where
         self.raw.send(peer_id, &C::encode(msg)?)
     }
 
-    /// Non-blocking: next inbound message, or None.
-    pub fn try_recv(&self) -> Option<M> {
-        self.raw.try_recv().and_then(|b| C::decode(&b))
+    /// Non-blocking: next inbound message. `Ok(None)` = nothing queued;
+    /// `Err` = a frame arrived but failed to decode (codec/version skew).
+    pub fn try_recv(&self) -> Result<Option<M>, CommError> {
+        self.raw.try_recv().map(|b| C::decode(&b)).transpose()
     }
 
     /// Block until the next inbound message.
-    pub fn recv(&self) -> Option<M> {
-        self.raw.recv().and_then(|b| C::decode(&b))
+    pub fn recv(&self) -> Result<Option<M>, CommError> {
+        self.raw.recv().map(|b| C::decode(&b)).transpose()
     }
 
     /// Block up to `timeout` for the next inbound message (a wakeup fd cuts
     /// the wait short — see [`RawZmqCommunicator::recv_or_wake`]).
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<M> {
-        self.raw.recv_timeout(timeout).and_then(|b| C::decode(&b))
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<M>, CommError> {
+        self.raw
+            .recv_timeout(timeout)
+            .map(|b| C::decode(&b))
+            .transpose()
     }
 
     /// Drain all currently-queued inbound messages.
-    pub fn drain(&self) -> Vec<M> {
+    pub fn drain(&self) -> Result<Vec<M>, CommError> {
         self.raw
             .drain()
             .into_iter()
-            .filter_map(|b| C::decode(&b))
+            .map(|b| C::decode(&b))
             .collect()
     }
 }
@@ -429,11 +467,11 @@ mod tests {
                 node: "LLM".into(),
             })
             .unwrap();
-        let got = wait_for(&worker, |w| w.try_recv());
+        let got = wait_for(&worker, |w| w.try_recv().unwrap());
         assert_eq!(got, Msg::Batch { id: 1, node: "LLM".into() });
 
         worker.send("conductor", &Msg::Hello("done".into())).unwrap();
-        let got = wait_for(&conductor, |c| c.try_recv());
+        let got = wait_for(&conductor, |c| c.try_recv().unwrap());
         assert_eq!(got, Msg::Hello("done".into()));
     }
 
@@ -448,7 +486,7 @@ mod tests {
         // PUSH->PULL over one connection preserves FIFO order.
         let mut seen = 0u64;
         for _ in 0..1000 {
-            for m in b.drain() {
+            for m in b.drain().unwrap() {
                 if let Msg::Batch { id, .. } = m {
                     assert_eq!(id, seen);
                     seen += 1;
@@ -470,7 +508,7 @@ mod tests {
         let a: ZmqCommunicator<Msg> = ZmqCommunicator::bind("a", &dir).unwrap();
         a.send("late", &Msg::Hello("queued".into())).unwrap(); // no peer yet — no error
         let late: ZmqCommunicator<Msg> = ZmqCommunicator::bind("late", &dir).unwrap();
-        let got = wait_for(&late, |m| m.try_recv());
+        let got = wait_for(&late, |m| m.try_recv().unwrap());
         assert_eq!(got, Msg::Hello("queued".into()));
     }
 
@@ -481,13 +519,13 @@ mod tests {
         {
             let b: ZmqCommunicator<Msg> = ZmqCommunicator::bind("b", &dir).unwrap();
             a.send("b", &Msg::Hello("1".into())).unwrap();
-            wait_for(&b, |b| b.try_recv());
+            wait_for(&b, |b| b.try_recv().unwrap());
         } // b drops; zmq unlinks its inbox
         std::thread::sleep(Duration::from_millis(20));
         // New b at the same id: a's cached PUSH auto-reconnects to it.
         let b2: ZmqCommunicator<Msg> = ZmqCommunicator::bind("b", &dir).unwrap();
         a.send("b", &Msg::Hello("2".into())).unwrap();
-        let got = wait_for(&b2, |b| b.try_recv());
+        let got = wait_for(&b2, |b| b.try_recv().unwrap());
         assert_eq!(got, Msg::Hello("2".into()));
     }
 
@@ -622,9 +660,34 @@ mod tests {
         fn encode(msg: &String) -> Result<Vec<u8>, CommError> {
             Ok(msg.as_bytes().to_vec())
         }
-        fn decode(bytes: &[u8]) -> Option<String> {
-            String::from_utf8(bytes.to_vec()).ok()
+        fn decode(bytes: &[u8]) -> Result<String, CommError> {
+            String::from_utf8(bytes.to_vec()).map_err(|e| CommError::Decode {
+                len: bytes.len(),
+                detail: e.to_string(),
+            })
         }
+    }
+
+    #[test]
+    fn decode_failure_is_loud_not_silent() {
+        // A mis-codec'd frame must surface as Err (codec/version skew with
+        // the peer), never be conflated with "no message".
+        let dir = tmpdir("badframe");
+        let a = RawZmqCommunicator::bind("a", &dir).unwrap();
+        let b: ZmqCommunicator<Msg> = ZmqCommunicator::bind("b", &dir).unwrap();
+        a.send("b", b"\xc1 definitely not msgpack").unwrap();
+        for _ in 0..500 {
+            match b.try_recv() {
+                Ok(None) => std::thread::sleep(Duration::from_millis(4)),
+                Ok(Some(_)) => panic!("garbage decoded as a message"),
+                Err(CommError::Decode { len, .. }) => {
+                    assert!(len > 0);
+                    return;
+                }
+                Err(e) => panic!("wrong error: {e}"),
+            }
+        }
+        panic!("frame never arrived");
     }
 
     #[test]

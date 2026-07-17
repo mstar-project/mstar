@@ -9,6 +9,12 @@ from mstar.communication.event import EventWakeup
 
 logger = logging.getLogger(__name__)
 
+#: The ``mstar_rust`` extension version this tree expects (the vendored
+#: ``rust/`` crate's version). Under ``MSTAR_RUST_ZMQ=AUTO`` a mismatching
+#: install - e.g. a stale wheel after an upgrade - takes over the mesh
+#: silently, so the factory warns when the imported version differs.
+EXPECTED_MSTAR_RUST_VERSION = "0.1.0"
+
 
 class CommProtocol(Enum):
     IPC = "IPC"
@@ -110,6 +116,18 @@ class ZMQCommunicator(BaseCommunicator):
         if self.event.fd in events:
             self.event.drain()
 
+    def poll_for_messages(self, timeout_ms=20):
+        """Block until a message is readable, a registered wakeup event
+        fires, or ``timeout_ms`` elapses — whichever comes first. True when
+        a message is available (left queued for ``get_all_new_messages``);
+        a wakeup ends the poll early with False (the event is drained,
+        exactly as in ``wait_for_work``). Mirrors the Rust communicator's
+        method so call sites work against either transport."""
+        events = dict(self.poller.poll(timeout=timeout_ms))
+        if self.event is not None and self.event.fd in events:
+            self.event.drain()
+        return self.pull_socket in events
+
     # def get_session_id(self) -> str:
     #     return self.session_id
 
@@ -176,11 +194,27 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
         raise ValueError(f"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got {choice!r}")
     if choice != "0":
         try:
+            import mstar_rust
+
             from mstar.communication.rust_communicator import RustZMQCommunicator
         except ImportError:
             if choice == "1":
                 raise
             logger.debug("MSTAR_RUST_ZMQ=AUTO: mstar_rust not installed, using pyzmq")
         else:
+            # A support bundle must be able to tell what a mesh was running,
+            # and an old wheel left in an env must not silently take over
+            # the whole mesh under AUTO after an upgrade.
+            version = getattr(mstar_rust, "__version__", "<pre-versioning>")
+            logger.info(
+                "control mesh transport: rust %s (MSTAR_RUST_ZMQ=%s)",
+                version, choice)
+            if version != EXPECTED_MSTAR_RUST_VERSION:
+                logger.warning(
+                    "mstar_rust version %s does not match this tree's "
+                    "expected %s — a stale wheel may be shadowing the "
+                    "vendored rust/ build (rebuild with `maturin develop "
+                    "--release`)", version, EXPECTED_MSTAR_RUST_VERSION)
             return RustZMQCommunicator(*args, **kwargs)
+    logger.info("control mesh transport: pyzmq (MSTAR_RUST_ZMQ=%s)", choice)
     return ZMQCommunicator(*args, **kwargs)

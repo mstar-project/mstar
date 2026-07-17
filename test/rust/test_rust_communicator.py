@@ -103,3 +103,21 @@ def test_blocking_receive_timeout_bounds_the_wait(pair, receiver):
     t0 = _t.monotonic()
     assert dst.get_all_new_messages(blocking=True, timeout_s=0.15) == []
     assert 0.1 < _t.monotonic() - t0 < 2.0
+
+
+def test_poll_for_messages_parity(tmp_path):
+    """Both transports expose poll_for_messages with the same contract, so a
+    call site written against the factory works on either (the drop-in
+    guarantee): True leaves the message queued for get_all_new_messages."""
+    from mstar.communication.communicator import ZMQCommunicator
+    from mstar.communication.rust_communicator import RustZMQCommunicator
+
+    for cls, tag in ((ZMQCommunicator, "py"), (RustZMQCommunicator, "rs")):
+        a = cls(f"pfm_{tag}_a", [f"pfm_{tag}_b"],
+                ipc_socket_path_prefix=str(tmp_path) + "/")
+        b = cls(f"pfm_{tag}_b", [f"pfm_{tag}_a"],
+                ipc_socket_path_prefix=str(tmp_path) + "/")
+        assert b.poll_for_messages(timeout_ms=10) is False
+        a.send(f"pfm_{tag}_b", {"hello": tag})
+        assert b.poll_for_messages(timeout_ms=2000) is True
+        assert b.get_all_new_messages() == [{"hello": tag}]

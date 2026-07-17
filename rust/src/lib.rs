@@ -82,23 +82,31 @@ impl PyZmqCommunicator {
             .map(|b| PyBytes::new(py, &b))
     }
 
-    /// ("msg", bytes) | ("wake", None) | ("timeout", None).
+    /// ("msg", bytes) | ("wake", None) | ("timeout", None). Raises if a
+    /// registered wakeup fd is closed/invalid (the registrant's bug — loud,
+    /// instead of degrading blocking waits into an instant-timeout spin).
     fn recv_or_wake<'py>(
         &self,
         py: Python<'py>,
         timeout_ms: u64,
-    ) -> (&'static str, Option<Bound<'py, PyBytes>>) {
+    ) -> PyResult<(&'static str, Option<Bound<'py, PyBytes>>)> {
         let ev = py.allow_threads(|| self.inner.recv_or_wake(Duration::from_millis(timeout_ms)));
-        match ev {
+        Ok(match ev {
             RecvEvent::Message(b) => ("msg", Some(PyBytes::new(py, &b))),
             RecvEvent::Wake => ("wake", None),
+            RecvEvent::WakeFdError => {
+                return Err(PyRuntimeError::new_err(
+                    "a registered wakeup fd is closed/invalid (POLLERR/\
+                     POLLNVAL): fix the EventWakeup lifetime"));
+            }
             RecvEvent::Timeout => ("timeout", None),
-        }
+        })
     }
 }
 
 #[pymodule]
 fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PyZmqCommunicator>()?;
     Ok(())
 }
