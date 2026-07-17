@@ -149,6 +149,9 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
     axum::serve(listener, app)
+        // Disable Nagle: SSE/NDJSON streams write many small chunks, and
+        // Nagle + delayed ACK turns each flush into a ~40 ms stall.
+        .tcp_nodelay(true)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
