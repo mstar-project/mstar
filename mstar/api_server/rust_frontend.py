@@ -40,6 +40,11 @@ from mstar.communication.rust_communicator import (
 
 logger = logging.getLogger(__name__)
 
+#: Upper bound on one blocking receive, so ``stop()`` is noticed promptly and
+#: the loop stays responsive to shutdown. Not a latency knob: an arriving
+#: message ends the wait immediately.
+BRIDGE_RECV_WAIT_S = 0.05
+
 
 
 
@@ -134,8 +139,17 @@ class RustFrontendBridge:
 
     async def _serve(self) -> None:
         logger.info("Rust-frontend bridge serving")
+        loop = asyncio.get_running_loop()
+        # Blocking receive on an executor thread: the wait happens inside the
+        # transport (GIL released), so an arriving submit is picked up
+        # immediately instead of on the next tick of a sleep/poll loop — and
+        # an idle bridge costs no wakeups. The event loop itself stays free
+        # to run the per-request relay tasks; `send` is safe from those
+        # concurrently (the transport serializes its push sockets internally).
+        recv = lambda: self.comm.get_all_new_messages(  # noqa: E731
+            blocking=True, timeout_s=BRIDGE_RECV_WAIT_S)
         while self.running:
-            for msg in self.comm.get_all_new_messages():
+            for msg in await loop.run_in_executor(None, recv):
                 t = msg.get("t")
                 if t == "submit":
                     self._submit(msg)
@@ -147,7 +161,6 @@ class RustFrontendBridge:
                     self._send({"t": "pong", "rid": msg["rid"]})
                 else:
                     logger.warning("bridge: unknown message type %r", t)
-            await asyncio.sleep(0.002)
 
     def run(self) -> None:
         """Blocking serve loop (the ``uvicorn.run`` replacement)."""
