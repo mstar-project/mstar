@@ -93,7 +93,7 @@ def test_arena_grows_then_spills(tmp_path):
         uuids = [i.uuid for i in infos["big"]]
         prod.register_for_send("r3", uuids)
         assert prod._arena.num_segments > 1
-        st = prod.stats()
+        st = prod.stats_summary()
         assert st["segments"] == prod._arena.num_segments
         assert 0 < st["largest_free_block"] <= st["free_bytes"]
         # ...and past the cap, further tensors spill to files instead of
@@ -142,7 +142,7 @@ def test_mixed_edge_and_fragmentation_signature(tmp_path, caplog):
         # contiguous block larger than ~300 KB.
         for info in fill["fill"][::2]:
             prod._cleanup_by_uuid("r6", info.uuid)
-        st = prod.stats()
+        st = prod.stats_summary()
         assert st["free_bytes"] > 500_000 > st["largest_free_block"]
 
         # A small tensor fits a hole (arena); a 500 KB one has the total
