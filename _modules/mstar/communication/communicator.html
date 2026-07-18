@@ -568,7 +568,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 12, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 18, 2026"/>
   </head>
   
   
@@ -744,6 +744,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../environment_variables.html">Environment variables</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
 <ul class="nav bd-sidenav">
@@ -906,6 +907,22 @@ window.runMermaid = runMermaid;</script>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
+<span class="c1">#: The ``mstar_rust`` extension version this tree expects (the vendored</span>
+<span class="c1">#: ``rust/`` crate&#39;s version). Under ``MSTAR_RUST_ZMQ=AUTO`` a mismatching</span>
+<span class="c1">#: install - e.g. a stale wheel after an upgrade - takes over the mesh</span>
+<span class="c1">#: silently, so the factory warns when the imported version differs.</span>
+<span class="n">EXPECTED_MSTAR_RUST_VERSION</span> <span class="o">=</span> <span class="s2">&quot;0.1.0&quot;</span>
+
+
+<div class="viewcode-block" id="CommProtocol">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.CommProtocol">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">CommProtocol</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+    <span class="n">IPC</span> <span class="o">=</span> <span class="s2">&quot;IPC&quot;</span>
+    <span class="n">TCP</span> <span class="o">=</span> <span class="s2">&quot;TCP&quot;</span>
+    <span class="n">RDMA</span> <span class="o">=</span> <span class="s2">&quot;RDMA&quot;</span>
+    <span class="n">SHM</span> <span class="o">=</span> <span class="s2">&quot;SHM&quot;</span></div>
+
+
 
 <div class="viewcode-block" id="BaseCommunicator">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator">[docs]</a>
@@ -925,22 +942,38 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_all_new_messages</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
         <span class="k">pass</span></div>
-</div>
+
+
+    <span class="c1"># -- endpoint scheme (shared by every ZMQ-based communicator) ------------</span>
+    <span class="c1"># Subclasses set ``self.protocol`` and ``self.ipc_socket_path_prefix``.</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_endpoint</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">IPC</span><span class="p">:</span>
+            <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;ipc://</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">ipc_socket_path_prefix</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">entity_id</span><span class="si">}</span><span class="s2">.ipc&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">:</span>
+            <span class="n">host</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;MSTAR_ZMQ_TCP_HOST&quot;</span><span class="p">,</span> <span class="s2">&quot;127.0.0.1&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;tcp://</span><span class="si">{</span><span class="n">host</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_tcp_port</span><span class="p">(</span><span class="n">entity_id</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Protocol </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">protocol</span><span class="si">}</span><span class="s2"> not yet supported yet&quot;</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_tcp_port</span><span class="p">(</span><span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="n">base_port</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;MSTAR_ZMQ_TCP_BASE_PORT&quot;</span><span class="p">,</span> <span class="s2">&quot;19000&quot;</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">entity_id</span> <span class="o">==</span> <span class="s2">&quot;api_server&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">base_port</span>
+        <span class="k">if</span> <span class="n">entity_id</span> <span class="o">==</span> <span class="s2">&quot;conductor&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">base_port</span> <span class="o">+</span> <span class="mi">1</span>
+        <span class="k">if</span> <span class="n">entity_id</span> <span class="o">==</span> <span class="s2">&quot;api_server_preprocess_worker&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">base_port</span> <span class="o">+</span> <span class="mi">2</span>
+        <span class="k">if</span> <span class="n">entity_id</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;worker_&quot;</span><span class="p">):</span>
+            <span class="n">rank</span> <span class="o">=</span> <span class="n">entity_id</span><span class="o">.</span><span class="n">removeprefix</span><span class="p">(</span><span class="s2">&quot;worker_&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">rank</span><span class="o">.</span><span class="n">isdigit</span><span class="p">():</span>
+                <span class="k">return</span> <span class="n">base_port</span> <span class="o">+</span> <span class="mi">100</span> <span class="o">+</span> <span class="nb">int</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">base_port</span> <span class="o">+</span> <span class="mi">1000</span> <span class="o">+</span> <span class="p">(</span><span class="nb">sum</span><span class="p">(</span><span class="n">entity_id</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">&quot;utf-8&quot;</span><span class="p">))</span> <span class="o">%</span> <span class="mi">1000</span><span class="p">)</span></div>
 
 
     <span class="c1"># @abstractmethod</span>
     <span class="c1"># def get_session_id(self) -&gt; str:</span>
     <span class="c1">#     pass</span>
-
-
-<div class="viewcode-block" id="CommProtocol">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.CommProtocol">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">CommProtocol</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
-    <span class="n">IPC</span> <span class="o">=</span> <span class="s2">&quot;IPC&quot;</span>
-    <span class="n">TCP</span> <span class="o">=</span> <span class="s2">&quot;TCP&quot;</span>
-    <span class="n">RDMA</span> <span class="o">=</span> <span class="s2">&quot;RDMA&quot;</span>
-    <span class="n">SHM</span> <span class="o">=</span> <span class="s2">&quot;SHM&quot;</span></div>
-
 
 
 <div class="viewcode-block" id="ZMQCommunicator">
@@ -1001,28 +1034,20 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">drain</span><span class="p">()</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_endpoint</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">IPC</span><span class="p">:</span>
-            <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;ipc://</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">ipc_socket_path_prefix</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">entity_id</span><span class="si">}</span><span class="s2">.ipc&quot;</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">:</span>
-            <span class="n">host</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;MSTAR_ZMQ_TCP_HOST&quot;</span><span class="p">,</span> <span class="s2">&quot;127.0.0.1&quot;</span><span class="p">)</span>
-            <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;tcp://</span><span class="si">{</span><span class="n">host</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_tcp_port</span><span class="p">(</span><span class="n">entity_id</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
-        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Protocol </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">protocol</span><span class="si">}</span><span class="s2"> not yet supported yet&quot;</span><span class="p">)</span>
+<div class="viewcode-block" id="ZMQCommunicator.poll_for_messages">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.poll_for_messages">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">poll_for_messages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="mi">20</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Block until a message is readable, a registered wakeup event</span>
+<span class="sd">        fires, or ``timeout_ms`` elapses — whichever comes first. True when</span>
+<span class="sd">        a message is available (left queued for ``get_all_new_messages``);</span>
+<span class="sd">        a wakeup ends the poll early with False (the event is drained,</span>
+<span class="sd">        exactly as in ``wait_for_work``). Mirrors the Rust communicator&#39;s</span>
+<span class="sd">        method so call sites work against either transport.&quot;&quot;&quot;</span>
+        <span class="n">events</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">poller</span><span class="o">.</span><span class="n">poll</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout_ms</span><span class="p">))</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">event</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">fd</span> <span class="ow">in</span> <span class="n">events</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">drain</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span> <span class="ow">in</span> <span class="n">events</span></div>
 
-    <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">_tcp_port</span><span class="p">(</span><span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-        <span class="n">base_port</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;MSTAR_ZMQ_TCP_BASE_PORT&quot;</span><span class="p">,</span> <span class="s2">&quot;19000&quot;</span><span class="p">))</span>
-        <span class="k">if</span> <span class="n">entity_id</span> <span class="o">==</span> <span class="s2">&quot;api_server&quot;</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">base_port</span>
-        <span class="k">if</span> <span class="n">entity_id</span> <span class="o">==</span> <span class="s2">&quot;conductor&quot;</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">base_port</span> <span class="o">+</span> <span class="mi">1</span>
-        <span class="k">if</span> <span class="n">entity_id</span> <span class="o">==</span> <span class="s2">&quot;api_server_preprocess_worker&quot;</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">base_port</span> <span class="o">+</span> <span class="mi">2</span>
-        <span class="k">if</span> <span class="n">entity_id</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;worker_&quot;</span><span class="p">):</span>
-            <span class="n">rank</span> <span class="o">=</span> <span class="n">entity_id</span><span class="o">.</span><span class="n">removeprefix</span><span class="p">(</span><span class="s2">&quot;worker_&quot;</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">rank</span><span class="o">.</span><span class="n">isdigit</span><span class="p">():</span>
-                <span class="k">return</span> <span class="n">base_port</span> <span class="o">+</span> <span class="mi">100</span> <span class="o">+</span> <span class="nb">int</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">base_port</span> <span class="o">+</span> <span class="mi">1000</span> <span class="o">+</span> <span class="p">(</span><span class="nb">sum</span><span class="p">(</span><span class="n">entity_id</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">&quot;utf-8&quot;</span><span class="p">))</span> <span class="o">%</span> <span class="mi">1000</span><span class="p">)</span>
 
     <span class="c1"># def get_session_id(self) -&gt; str:</span>
     <span class="c1">#     return self.session_id</span>
@@ -1045,8 +1070,18 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="ZMQCommunicator.get_all_new_messages">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.get_all_new_messages">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_all_new_messages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">blocking</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_all_new_messages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">blocking</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">timeout_s</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
         <span class="n">messages</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">if</span> <span class="n">blocking</span><span class="p">:</span>
+            <span class="c1"># Wait until the pull socket is readable before draining. A</span>
+            <span class="c1"># registered wakeup event also ends the wait (and is drained</span>
+            <span class="c1"># here, exactly as in wait_for_work), so a completed compute</span>
+            <span class="c1"># future can interrupt a blocking receive. `timeout_s` bounds</span>
+            <span class="c1"># the wait (None = indefinitely); on expiry, drain what&#39;s there.</span>
+            <span class="n">timeout_ms</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">timeout_s</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">int</span><span class="p">(</span><span class="n">timeout_s</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
+            <span class="n">events</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">poller</span><span class="o">.</span><span class="n">poll</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout_ms</span><span class="p">))</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">event</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">fd</span> <span class="ow">in</span> <span class="n">events</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">drain</span><span class="p">()</span>
         <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="c1"># zmq.NOBLOCK means zmq doesn&#39;t wait for a new message to be</span>
@@ -1064,6 +1099,55 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">break</span>
         <span class="k">return</span> <span class="n">messages</span></div>
 </div>
+
+
+
+<div class="viewcode-block" id="make_communicator">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.make_communicator">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">make_communicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BaseCommunicator</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Construct the process&#39;s communicator, selecting the transport.</span>
+
+<span class="sd">    ``MSTAR_RUST_ZMQ`` selects it (see ``docs/environment_variables.rst``):</span>
+
+<span class="sd">    * ``AUTO`` (default) — the Rust-backed ``RustZMQCommunicator`` (vendored</span>
+<span class="sd">      ``rust/`` extension; see ``communication/rust_communicator.py``) when</span>
+<span class="sd">      the extension imports successfully, pyzmq otherwise.</span>
+<span class="sd">    * ``1`` — the Rust communicator; raises if the extension is missing.</span>
+<span class="sd">    * ``0`` — always the pyzmq ``ZMQCommunicator``.</span>
+
+<span class="sd">    The two are wire-compatible (same endpoints, same pickle frames), so the</span>
+<span class="sd">    flag can be set per-process — one entity at a time — while the rest of</span>
+<span class="sd">    the mesh stays on pyzmq.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">choice</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;MSTAR_RUST_ZMQ&quot;</span><span class="p">,</span> <span class="s2">&quot;AUTO&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">choice</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;0&quot;</span><span class="p">,</span> <span class="s2">&quot;1&quot;</span><span class="p">,</span> <span class="s2">&quot;AUTO&quot;</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got </span><span class="si">{</span><span class="n">choice</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">choice</span> <span class="o">!=</span> <span class="s2">&quot;0&quot;</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="kn">import</span><span class="w"> </span><span class="nn">mstar_rust</span>
+
+            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.rust_communicator</span><span class="w"> </span><span class="kn">import</span> <span class="n">RustZMQCommunicator</span>
+        <span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">choice</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span><span class="p">:</span>
+                <span class="k">raise</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">&quot;MSTAR_RUST_ZMQ=AUTO: mstar_rust not installed, using pyzmq&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># A support bundle must be able to tell what a mesh was running,</span>
+            <span class="c1"># and an old wheel left in an env must not silently take over</span>
+            <span class="c1"># the whole mesh under AUTO after an upgrade.</span>
+            <span class="n">version</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">mstar_rust</span><span class="p">,</span> <span class="s2">&quot;__version__&quot;</span><span class="p">,</span> <span class="s2">&quot;&lt;pre-versioning&gt;&quot;</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="s2">&quot;control mesh transport: rust </span><span class="si">%s</span><span class="s2"> (MSTAR_RUST_ZMQ=</span><span class="si">%s</span><span class="s2">)&quot;</span><span class="p">,</span>
+                <span class="n">version</span><span class="p">,</span> <span class="n">choice</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">version</span> <span class="o">!=</span> <span class="n">EXPECTED_MSTAR_RUST_VERSION</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">&quot;mstar_rust version </span><span class="si">%s</span><span class="s2"> does not match this tree&#39;s &quot;</span>
+                    <span class="s2">&quot;expected </span><span class="si">%s</span><span class="s2"> — a stale wheel may be shadowing the &quot;</span>
+                    <span class="s2">&quot;vendored rust/ build (rebuild with `maturin develop &quot;</span>
+                    <span class="s2">&quot;--release`)&quot;</span><span class="p">,</span> <span class="n">version</span><span class="p">,</span> <span class="n">EXPECTED_MSTAR_RUST_VERSION</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">RustZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;control mesh transport: pyzmq (MSTAR_RUST_ZMQ=</span><span class="si">%s</span><span class="s2">)&quot;</span><span class="p">,</span> <span class="n">choice</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">ZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
 
 </pre></div>
 
@@ -1112,7 +1196,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 12, 2026.
+  Last updated on Jul 18, 2026.
   <br/>
 </p>
   </div>

@@ -29,5 +29,6 @@
 
    communicator
    event
+   rust_communicator
    tensors
 

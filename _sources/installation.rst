@@ -248,6 +248,30 @@ Verify the install
    mstar --help
    mstar-serve --help
 
+Optional: the Rust ZMQ transport
+--------------------------------
+
+The ZeroMQ control mesh can run over a Rust transport (vendored in ``rust/``)
+instead of pyzmq — same endpoints, same wire format, selectable per process
+with ``MSTAR_RUST_ZMQ`` (see :doc:`environment_variables`). It is optional:
+without it, everything runs on pyzmq as before.
+
+Build the extension into your environment with `maturin
+<https://www.maturin.rs>`_ (needs a Rust toolchain; ``rustup`` works):
+
+.. code-block:: bash
+
+   uv pip install maturin
+   maturin develop --release -m rust/Cargo.toml
+
+Build with ``--release`` — an unoptimized debug build (maturin's default)
+costs real latency on the hot receive path. Verify with:
+
+.. code-block:: bash
+
+   python -c "import mstar_rust; print('mstar_rust OK')"
+   pytest test/rust/test_rust_communicator.py
+
 Troubleshooting
 ---------------
 
