@@ -48,8 +48,12 @@ Communication
        existing segments never move (registrations stay valid).
    * - ``MSTAR_SHM_ARENA_MAX_SEGMENTS``
      - ``32``
-     - Growth cap per producer entity. At the cap, sends backpressure
-       until consumers ACK and space is reclaimed.
+     - Growth cap PER ENTITY. Every entity (workers + the api-server data
+       worker) creates its own arena, so node-wide /dev/shm demand can
+       reach ``MAX_SEGMENTS x SEGMENT_MB x num_entities`` — size against
+       ``df -h /dev/shm`` (tmpfs defaults to ~50% of RAM). Construction
+       fails fast if one entity's ceiling exceeds /dev/shm. At the cap,
+       sends backpressure until consumers ACK, then spill.
    * - ``MSTAR_SHM_ARENA_FULL_TIMEOUT_S``
      - ``30``
      - Strict mode only (``MSTAR_SHM_ARENA_SPILL=0``): how long a send
@@ -71,10 +75,12 @@ Communication
        stay asynchronous. ``0`` disables (pageable copies).
    * - ``MSTAR_SHM_ARENA_PIN_MAX_MB``
      - ``4096``
-     - Budget for TOTAL pinned host memory, distinct from the segment cap
-       (pinned pages come out of the OS's pageable pool system-wide).
-       Segments past the budget stay unpinned: copies work, without
-       async overlap.
+     - Budget for TOTAL pinned host memory PER PROCESS, distinct from the
+       segment cap (pinned pages come out of the OS's pageable pool
+       system-wide). Node-wide pinned demand is approx
+       ``PIN_MAX_MB x num_entities`` — a consumer pins peer segments too,
+       so one process can pin more than its own arena holds. Segments
+       past the budget stay unpinned: copies work, without async overlap.
    * - ``MSTAR_SHM_ARENA_STATS_INTERVAL_S``
      - ``60``
      - Under ``--log-stats``: how often the arena logs its occupancy /

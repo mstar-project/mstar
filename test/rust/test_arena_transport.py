@@ -46,8 +46,7 @@ def test_producer_to_consumer_roundtrip(tmp_path):
         "empty": [torch.empty(0, 3)],
     }
     infos = prod.store_and_return_tensor_info("r1", tensors)
-    uuids = [i.uuid for il in infos.values() for i in il]
-    prod.register_for_send("r1", uuids)
+    prod.register_for_send("r1", [i for il in infos.values() for i in il])
 
     # The location was stamped onto the shipped descriptors.
     for il in infos.values():
@@ -71,7 +70,7 @@ def test_reclaim_frees_arena_slots(tmp_path):
     infos = prod.store_and_return_tensor_info(
         "r2", {"x": [torch.randn(16)]})
     (info,) = infos["x"]
-    prod.register_for_send("r2", [info.uuid])
+    prod.register_for_send("r2", [info])
     assert prod._arena_locs
     prod._cleanup_by_uuid("r2", info.uuid)
     assert not prod._arena_locs
@@ -90,8 +89,7 @@ def test_arena_grows_then_spills(tmp_path):
         infos = prod.store_and_return_tensor_info(
             "r3", {"big": [torch.zeros(300_000, dtype=torch.uint8)
                            for _ in range(12)]})
-        uuids = [i.uuid for i in infos["big"]]
-        prod.register_for_send("r3", uuids)
+        prod.register_for_send("r3", list(infos["big"]))
         assert prod._arena.num_segments > 1
         st = prod.stats_summary()
         assert st["segments"] == prod._arena.num_segments
@@ -101,7 +99,7 @@ def test_arena_grows_then_spills(tmp_path):
         vals = [torch.full((300_000,), i, dtype=torch.uint8)
                 for i in range(6)]
         more = prod.store_and_return_tensor_info("r3", {"more": vals})
-        prod.register_for_send("r3", [i.uuid for i in more["more"]])
+        prod.register_for_send("r3", list(more["more"]))
         spilled = [i for i in more["more"] if i.shm_segment is None]
         assert spilled, "expected at least one spill past the cap"
         assert all(u in prod._shm_files for u in
@@ -137,7 +135,7 @@ def test_mixed_edge_and_fragmentation_signature(tmp_path, caplog):
         fill = prod.store_and_return_tensor_info(
             "r6", {"fill": [torch.zeros(300_000, dtype=torch.uint8)
                             for _ in range(12)]})
-        prod.register_for_send("r6", [i.uuid for i in fill["fill"]])
+        prod.register_for_send("r6", list(fill["fill"]))
         # ...then free ALTERNATE allocations: ~1.2 MB total free, but no
         # contiguous block larger than ~300 KB.
         for info in fill["fill"][::2]:
@@ -153,7 +151,7 @@ def test_mixed_edge_and_fragmentation_signature(tmp_path, caplog):
             "r6", {"mixed": [small, big]})
         with caplog.at_level(logging.WARNING,
                              logger="mstar.communication.arena"):
-            prod.register_for_send("r6", [i.uuid for i in mixed["mixed"]])
+            prod.register_for_send("r6", list(mixed["mixed"]))
         s_info, b_info = mixed["mixed"]
         assert s_info.shm_segment is not None      # staged in a hole
         assert b_info.shm_segment is None          # spilled
@@ -183,12 +181,12 @@ def test_strict_mode_backpressures_then_fails(tmp_path):
         infos = prod.store_and_return_tensor_info(
             "r5", {"big": [torch.zeros(300_000, dtype=torch.uint8)
                            for _ in range(12)]})
-        prod.register_for_send("r5", [i.uuid for i in infos["big"]])
+        prod.register_for_send("r5", list(infos["big"]))
         more = prod.store_and_return_tensor_info(
             "r5", {"more": [torch.zeros(300_000, dtype=torch.uint8)
                             for _ in range(6)]})
         with pytest.raises(RuntimeError, match="arena full"):
-            prod.register_for_send("r5", [i.uuid for i in more["more"]])
+            prod.register_for_send("r5", list(more["more"]))
     finally:
         del os.environ["MSTAR_SHM_ARENA_SPILL"]
         del os.environ["MSTAR_SHM_ARENA_FULL_TIMEOUT_S"]
@@ -205,7 +203,7 @@ def test_transport_mismatch_fails_loudly(tmp_path):
         communicator=_NullCommunicator(), shm_dir=str(tmp_path))
     infos = arena_prod.store_and_return_tensor_info(
         "rm", {"x": [torch.randn(4)]})
-    arena_prod.register_for_send("rm", [infos["x"][0].uuid])
+    arena_prod.register_for_send("rm", [infos["x"][0]])
     edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
     with pytest.raises(RuntimeError, match="MSTAR_SHM_ARENA"):
         file_cons.start_read_tensors("rm", [edge])
@@ -219,7 +217,7 @@ def test_transport_mismatch_fails_loudly(tmp_path):
     arena_cons = _manager("mx3", tmp_path)
     y = torch.randn(4)
     infos = file_prod.store_and_return_tensor_info("rm2", {"y": [y]})
-    file_prod.register_for_send("rm2", [infos["y"][0].uuid])
+    file_prod.register_for_send("rm2", [infos["y"][0]])
     edge = GraphEdge(next_node="B", name="y", tensor_info=infos["y"])
     arena_cons.start_read_tensors("rm2", [edge])
     got = arena_cons.tensor_store.get_tensor("rm2", infos["y"][0].uuid)

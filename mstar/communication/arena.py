@@ -16,8 +16,17 @@ Capacity degrades in layers: grow by segments up to
 ``MSTAR_SHM_ARENA_MAX_SEGMENTS``; at the cap, briefly backpressure for
 consumer ACKs; then spill the tensor to the per-uuid file protocol
 (``MSTAR_SHM_ARENA_SPILL``, default on) — slower, never fails, like the old
-transport at saturation. ``stats()`` exposes occupancy and the fragmentation
-gauge (largest contiguous free block).
+transport at saturation. ``stats_summary()`` exposes occupancy and the
+fragmentation gauge (largest contiguous free block); ``--log-stats`` logs it
+periodically.
+
+Ceilings are PER-ENTITY and multiply across a node: with E entities
+(workers + the api-server data worker), /dev/shm demand can reach
+``MAX_SEGMENTS x SEGMENT_MB x E`` and pinned host RAM approx
+``PIN_MAX_MB x E`` (consumers pin peer segments too, so one process can pin
+more than its own arena holds). Construction fails fast when one entity's
+ceiling already exceeds /dev/shm, and warns when it exceeds current free
+space or when the pin budget is an outsized share of physical RAM.
 
 Selection: ``create_tensor_communication_manager`` picks this manager for
 the SHM protocol when ``MSTAR_SHM_ARENA`` is ``1`` (require) or ``AUTO``
@@ -167,6 +176,46 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self._stats_interval_s = float(
             os.getenv("MSTAR_SHM_ARENA_STATS_INTERVAL_S", "60"))
         self._stats_last = 0.0
+        # CEILINGS ARE PER-ENTITY and multiply across a node: every entity
+        # (workers + the api-server data worker) creates its own arena, so
+        # node /dev/shm demand can reach
+        #     MAX_SEGMENTS x SEGMENT_MB x num_entities
+        # and node pinned RAM approx PIN_MAX_MB x num_entities (a consumer
+        # pins peer segments too, so one process's pinned bytes can exceed
+        # its own arena). Check the static tmpfs ceiling NOW instead of
+        # surfacing as ENOSPC on a growth mid-run.
+        per_entity_max = (segment_mb << 20) * max_segments
+        try:
+            st = os.statvfs("/dev/shm")
+            shm_total = st.f_frsize * st.f_blocks
+            shm_avail = st.f_frsize * st.f_bavail
+        except OSError:
+            shm_total = shm_avail = None
+        if shm_total is not None:
+            if per_entity_max > shm_total:
+                raise RuntimeError(
+                    f"SHM arena ceiling for ONE entity "
+                    f"({per_entity_max >> 20} MiB = "
+                    f"MSTAR_SHM_ARENA_MAX_SEGMENTS x _SEGMENT_MB) exceeds "
+                    f"/dev/shm ({shm_total >> 20} MiB) — and every entity "
+                    f"multiplies this. Lower the knobs or grow tmpfs.")
+            if per_entity_max > shm_avail:
+                logger.warning(
+                    "ARENA: this entity's ceiling (%d MiB) exceeds current "
+                    "/dev/shm free space (%d MiB); ceilings are per-entity "
+                    "and multiply across workers — growth may hit ENOSPC "
+                    "under load", per_entity_max >> 20, shm_avail >> 20)
+        try:
+            phys = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        except (ValueError, OSError):
+            phys = None
+        if (self._pin_segments and phys is not None
+                and self._pin_budget > phys // 4):
+            logger.warning(
+                "ARENA: MSTAR_SHM_ARENA_PIN_MAX_MB (%d MiB) exceeds a "
+                "quarter of physical RAM (%d MiB) FOR ONE ENTITY; pinned "
+                "budgets multiply across entities and come out of the OS's "
+                "pageable pool", self._pin_budget >> 20, phys >> 20)
         self._arena = SegmentedShmArena.create(
             f"mstar_arena_{my_entity_id}", segment_mb << 20, max_segments)
         # Producer-side segment views (memoryviews are stable: segments
@@ -306,7 +355,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         return infos
 
     def register_for_send(
-        self, request_id: str, uuids: list[str],
+        self, request_id: str, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
         if not skip_cuda_sync and torch.cuda.is_available():
@@ -319,7 +368,8 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         queued = False
         self._maybe_log_stats()
         with ctx:
-            for uuid in uuids:
+            for info_arg in tensor_infos:
+                uuid = info_arg.uuid
                 if self.tensor_store.is_registered(request_id, uuid):
                     continue
                 tensor = self.tensor_store.get_tensor(request_id, uuid)
@@ -356,7 +406,8 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     queued = True
                 self._arena_locs[uuid] = (seg, off)
                 seg_name = self._arena.segment_name(seg)
-                for info in self._infos_by_uuid.get(uuid, ()):
+                for info in {id(i): i for i in (
+                        *self._infos_by_uuid.get(uuid, ()), info_arg)}.values():
                     info.shm_segment = seg_name
                     info.shm_offset = off
                 self.tensor_store.set_metadata(
