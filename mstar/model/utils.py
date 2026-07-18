@@ -245,16 +245,27 @@ def load_weights_from_hf_shards(
     device: str = "cpu",
     conv: list[WeightConverter] | None=None
 ):
-    """Load weights from a sharded HuggingFace checkpoint (multiple safetensors files).
+    """Load weights from a HuggingFace safetensors checkpoint.
 
     Reads model.safetensors.index.json to find which shard each key lives in,
-    then loads from each shard file.
+    then loads from each shard file. Checkpoints that ship a single unsharded
+    ``model.safetensors`` (no index — e.g. whisper-large-v3) are handled by
+    treating that one file as the whole weight map.
     """
     repo_dir = Path(repo_dir)
     index_path = repo_dir / "model.safetensors.index.json"
-    with open(index_path) as f:
-        index = json.load(f)
-    weight_map = index["weight_map"]
+    if index_path.exists():
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+    else:
+        single = repo_dir / "model.safetensors"
+        if not single.exists():
+            raise FileNotFoundError(
+                f"No model.safetensors.index.json or model.safetensors in {repo_dir}"
+            )
+        with safe_open(str(single), framework="pt", device="cpu") as f:
+            weight_map = {k: "model.safetensors" for k in f.keys()}
 
     mod_key_to_hf_keys = _apply_key_pattern(weight_map.keys(), conv)
     mod_key_to_idx = {}
@@ -315,3 +326,41 @@ def load_weights_from_hf_shards(
         missing_keys, _ = mod.module.load_state_dict(state_dict, strict=False, assign=True)
         if mod.enforce_missing_keys and missing_keys:
             raise KeyError(f"Missing keys when loading state_dict with prefix {mod.prefix!r}: {missing_keys}")
+
+
+class ByteLevelDetokenizer:
+    """Byte-faithful per-token detokenization for byte-level BPE tokenizers
+    (GPT-2 / Whisper / Qwen).
+
+    Streaming models emit one token per step to the client, so a
+    multi-byte UTF-8 character split across tokens must be emitted as raw
+    bytes and reassembled client-side — per-token ``tokenizer.decode``
+    would yield U+FFFD for each partial character.
+    """
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.special_ids = set(tokenizer.all_special_ids)
+        # GPT-2's bytes_to_unicode: printable unicode char <-> raw byte.
+        printable = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(ord("\xa1"), ord("\xac") + 1))
+            + list(range(ord("\xae"), ord("\xff") + 1))
+        )
+        chars = printable[:]
+        n = 0
+        for b in range(256):
+            if b not in printable:
+                printable.append(b)
+                chars.append(256 + n)
+                n += 1
+        self.byte_decoder = {chr(c): b for b, c in zip(printable, chars, strict=True)}
+
+    def to_bytes(self, token_ids: list[int]) -> bytes:
+        raw = bytearray()
+        tokens = self.tokenizer.convert_ids_to_tokens(
+            [i for i in token_ids if i not in self.special_ids]
+        )
+        for token in tokens:
+            raw.extend(self.byte_decoder[c] for c in token)
+        return bytes(raw)

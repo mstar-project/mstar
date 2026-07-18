@@ -282,12 +282,45 @@ class VJepa2AC(Model):
         return {}
 
 
+class WhisperLarge(Model):
+    def get_hf_url(self):
+        return "openai/whisper-large-v3"
+
+    def get_supported_modalities(self):
+        return {RequestType.A2T}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {
+            "temperature": 0.0,
+            "max_tokens": 448,
+            "max_output_tokens": 448,
+        }
+
+
+class HiggsAudio(Model):
+    def get_hf_url(self):
+        # v3-stt is the ASR checkpoint; the v2 models are TTS/generation.
+        return "bosonai/higgs-audio-v3-stt"
+
+    def get_supported_modalities(self):
+        return {RequestType.A2T}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {
+            "temperature": 0.0,
+            "max_tokens": 448,
+            "max_output_tokens": 448,
+        }
+
+
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
     QWEN3OMNI = "qwen3omni"
     PI05 = "pi05"
     VJEPA2AC = "vjepa2ac"
+    WHISPER_LARGE = "whisper_large"
+    HIGGS_AUDIO = "higgs_audio"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -300,4 +333,8 @@ class ModelType(Enum):
             return Pi05(**kwargs)
         if self == ModelType.VJEPA2AC:
             return VJepa2AC(**kwargs)
+        if self == ModelType.WHISPER_LARGE:
+            return WhisperLarge(**kwargs)
+        if self == ModelType.HIGGS_AUDIO:
+            return HiggsAudio(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")

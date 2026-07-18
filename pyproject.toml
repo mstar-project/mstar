@@ -128,6 +128,19 @@ vjepa2_ac = [
     "torchcodec",
 ]
 
+# ASR models: Whisper-large-v3, Higgs Audio
+asr = [
+    "einops",
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "mooncake-transfer-engine",
+    "safetensors",
+    "torchcodec==0.8.*",
+    "transformers",
+    "datasets",
+    "jiwer",  # WER computation for asr_eval.py
+]
+
 all = [
     "ruff",
     "pytest",
@@ -153,6 +166,7 @@ all = [
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
     # separately, see docs/installation.rst.
+    "jiwer",
 ]
 
 [tool.setuptools.packages.find]

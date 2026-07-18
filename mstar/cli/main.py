@@ -32,6 +32,9 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
+    # ASR (Beta, un-optimized) — audio in, transcript out.
+    "whisper_large": "whisper_large.yaml",
+    "higgs_audio": "higgs_audio.yaml",
 }
 
 
@@ -90,6 +93,10 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
+    if model in ("whisper_large", "higgs_audio"):
+        lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
+                     "input_modalities=(\"audio\",\"text\"))")
+        lines.append("    print(res.text)  # transcript")
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
     if model in ("bagel", "qwen3_omni", "orpheus", "cosmos3", "cosmos3_super"):

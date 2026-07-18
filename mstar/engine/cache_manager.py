@@ -2,13 +2,76 @@ import functools
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
-from mstar.engine.kv_store import KVCacheConfig, KVRequestState, PagedAllocationManager
+from mstar.engine.kv_store import (
+    CrossAttnPool,
+    KVCacheConfig,
+    KVRequestState,
+    PagedAllocationManager,
+)
 from mstar.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPrefillWrapper
 
 logger = logging.getLogger(__name__)
+
+
+def cross_attn_label(label: str, source: str = "default") -> str:
+    """Resolve the cache label under which a cross-attention plan/state for
+    ``source`` is stored, relative to the base (self-attention) label."""
+    return f"{label}::CROSS_ATTN::{source}"
+
+
+class PagedIndptrs(NamedTuple):
+    """The four int32 index tensors a FlashInfer prefill/decode wrapper's
+    ``plan`` consumes, built on CPU (so wrapper.plan's ``.to("cpu")`` is a
+    no-op — see ``_plan_attention_impl``)."""
+    qo_indptr: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    paged_kv_indices: torch.Tensor
+    paged_kv_last_page_len: torch.Tensor
+
+
+def build_paged_indptrs(
+    q_seq_lens: list[int],
+    page_indices_per_request: list[list[int]],
+    context_lens: list[int],
+    page_size: int,
+) -> PagedIndptrs:
+    """Assemble FlashInfer paged-attention index tensors from per-request
+    query lengths + already-allocated page lists. Shared by the self- and
+    cross-attention plan paths (the difference is only where the pages come
+    from: self grows them per step, cross reads a fixed context)."""
+    qo_indptr = [0]
+    kv_indptr = [0]
+    all_pages: list[int] = []
+    last_page_lens: list[int] = []
+    for q_len, pages, ctx_len in zip(
+        q_seq_lens, page_indices_per_request, context_lens, strict=True,
+    ):
+        qo_indptr.append(qo_indptr[-1] + q_len)
+        all_pages.extend(pages)
+        kv_indptr.append(kv_indptr[-1] + len(pages))
+        last_page_lens.append(ctx_len % page_size or page_size)
+    return PagedIndptrs(
+        qo_indptr=torch.tensor(qo_indptr, dtype=torch.int32),
+        paged_kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
+        paged_kv_indices=torch.tensor(all_pages, dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor(last_page_lens, dtype=torch.int32),
+    )
+
+
+class PlanCacheKey(NamedTuple):
+    """Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged
+    between steps the re-plan is skippable. Used by cross-attention (context
+    pages are immutable after encode); the mechanism is label-generic, so a
+    fixed-shape self-attention label could reuse it (see the field on
+    ``_PlanState``)."""
+    q_seq_lens: tuple
+    page_indices: tuple
+    last_page_lens: tuple
+    dtype: torch.dtype
 
 
 @dataclass
@@ -40,6 +103,21 @@ class _PlanState:
     seq_lens: list[int] | None = None
     write_store: bool = True
     custom_pos_advance: list[int] | None = None
+    # Plan memo: fingerprint of the last wrapper.plan() inputs for this label;
+    # when it matches, the re-plan is skipped. Only the cross-attention path
+    # sets it today (its context pages are immutable after add_cross_attn_kv),
+    # and only where plan states persist across steps (the CUDA-graph runner);
+    # the eager path rebuilds the cache manager per step and still re-plans.
+    #
+    # Future reference — this is a general-purpose tool, not cross-attn only.
+    # A regular (self-attention) label can memo its plan too; the extra care
+    # there is invalidation, since self-attn pages grow every decode step.
+    # The fingerprint would need to include the per-request seq_len (so appending
+    # a token misses the memo and re-plans), and any page-table remap (eviction /
+    # reallocation) must also bust the key. Given that, decode could skip the
+    # re-plan on the common "seq_len += 1, same pages" step. Deferred until a
+    # model needs it; the eager-path persistence noted above is the prerequisite.
+    plan_cache_key: "PlanCacheKey | None" = None
     # Set when DenseGenCacheManager planned this label dense: the per-segment
     # gather indices + varlen cu_seqlens needed to attend each generation
     # segment over its contiguous frozen prefix. None on paged plans, which
@@ -98,6 +176,7 @@ class BatchedCacheManager(ABC):
         cuda_graph_plan_states: dict[str, _PlanState] | None = None,
         auto_write_store: bool=False,
         enable_nvtx: bool=False,
+        cross_pools: dict[str, CrossAttnPool] | None = None,
     ):
         self.request_ids = request_ids
         self.active_labels = active_labels_per_request  # {req_id: label}
@@ -108,6 +187,8 @@ class BatchedCacheManager(ABC):
         self.device = device
         self.layer_idx = 0
         self.enable_nvtx = enable_nvtx
+        # source name -> CrossAttnPool (see KVCacheConfig.cross_attn)
+        self.cross_pools = cross_pools or {}
 
         self.auto_write_store = auto_write_store
 
@@ -973,6 +1054,208 @@ class FlashInferCacheManager(BatchedCacheManager):
 
         return ps.wrapper.run(q, self.kv_cache[layer_idx]).to(orig_dtype)
 
+    # ------------------------------------------------------------------
+    # Cross-attention (issue #160)
+    #
+    # Cross-attention is non-causal attention over a separate, fixed
+    # encoder-context KV: written once at encode time (add_cross_attn_kv),
+    # planned per step against the decoder's query lengths
+    # (plan_cross_attention), and executed per layer (run_cross_attn). The
+    # context KV lives in per-source pools (KVCacheConfig.cross_attn) whose
+    # head config may differ from the decoder's self-attention; plan/run
+    # state rides the existing per-label _PlanState machinery under the
+    # resolved ``{label}::CROSS_ATTN::{source}`` label. Cross labels never
+    # plan RoPE — context positions, if any, are baked in at encode time.
+    # ------------------------------------------------------------------
+
+    def _get_cross_pool(self, source: str) -> CrossAttnPool:
+        pool = self.cross_pools.get(source)
+        if pool is None:
+            raise KeyError(
+                f"No cross-attention pool for source {source!r}; declare it in "
+                f"KVCacheConfig.cross_attn (available: {list(self.cross_pools)})"
+            )
+        return pool
+
+    def _active_base_label(self, label: str | None) -> str:
+        if label is not None:
+            return label
+        labels = list(self.active_labels.values())
+        assert len(set(labels)) == 1, f"All active labels must be the same, got {labels}"
+        return next(iter(self.active_labels.values()))
+
+    @torch.compiler.disable
+    def add_cross_attn_kv(
+        self,
+        request_ids: list[str],
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_idx: int,
+        seq_lens: list[int] | None = None,
+        source: str = "default",
+        label: str | None = None,
+    ) -> None:
+        """Write encoder-context K/V for one layer into ``source``'s pool.
+
+        Called once per request per layer at encode time. ``k``/``v`` are
+        packed ``(total_context_tokens, num_kv_heads, head_dim)`` across
+        ``request_ids``; ``seq_lens`` gives per-request context lengths
+        (defaults to a single request owning the whole tensor). Pages are
+        allocated on first write (layer 0) and reused for the rest.
+        """
+        pool = self._get_cross_pool(source)
+        base_label = self._active_base_label(label)
+        cross_label = cross_attn_label(base_label, source)
+        page_size = pool.alloc_config.page_size
+
+        if seq_lens is None:
+            assert len(request_ids) == 1, (
+                "add_cross_attn_kv needs seq_lens for multi-request batches"
+            )
+            seq_lens = [k.shape[0]]
+
+        offset = 0
+        for rid, ctx_len in zip(request_ids, seq_lens, strict=True):
+            state = pool.alloc_manager.get_state(rid, cross_label)
+            if state.seq_len == 0:
+                pool.alloc_manager.alloc(rid, label=cross_label, seq_len=ctx_len)
+                state.seq_len = ctx_len
+            else:
+                assert state.seq_len == ctx_len, (
+                    f"cross-attn context for {rid!r}/{source!r} already written "
+                    f"with length {state.seq_len}, got {ctx_len}"
+                )
+
+            positions = torch.arange(ctx_len, device=self.device)
+            page_indices = torch.tensor(
+                state.page_indices, dtype=torch.long, device=self.device,
+            )
+            token_to_page = page_indices[
+                torch.div(positions, page_size, rounding_mode="floor")
+            ]
+            token_to_cache = positions % page_size
+
+            layer_cache = pool.kv_cache[layer_idx]
+            dtype = pool.kv_cache.dtype
+            layer_cache[token_to_page, 0, token_to_cache] = \
+                k[offset:offset + ctx_len].to(dtype)
+            layer_cache[token_to_page, 1, token_to_cache] = \
+                v[offset:offset + ctx_len].to(dtype)
+            offset += ctx_len
+
+    def plan_cross_attention(
+        self,
+        q_seq_lens: list[int],
+        dtype: torch.dtype | None = None,
+        source: str = "default",
+        label: str | None = None,
+    ) -> None:
+        """Plan the cross-attention wrapper for this step's decoder queries.
+
+        ``q_seq_lens`` is the number of decoder query tokens per request
+        (matches the self-attention plan's seq_lens). The context side is
+        read from the pool state written by ``add_cross_attn_kv`` — pages
+        are fixed, so unlike ``plan_attention`` nothing is allocated here.
+        ``label`` is the base (self-attention) label; the plan is stored
+        under the resolved cross label. Always uses the prefill wrapper
+        with ``causal=False`` (decode-style single queries still attend to
+        the full context).
+        """
+        pool = self._get_cross_pool(source)
+        base_label = self._active_base_label(label)
+        cross_label = cross_attn_label(base_label, source)
+        cfg = pool.alloc_config
+        page_size = cfg.page_size
+
+        if dtype is None:
+            dtype = pool.kv_cache.dtype
+
+        page_indices_per_request: list[list[int]] = []
+        context_lens: list[int] = []
+        for rid in self.request_ids:
+            state = pool.alloc_manager.get_state(rid, cross_label)
+            assert state.seq_len > 0, (
+                f"plan_cross_attention before add_cross_attn_kv for {rid!r} "
+                f"(source {source!r})"
+            )
+            page_indices_per_request.append(state.page_indices)
+            context_lens.append(state.seq_len)
+
+        indptrs = build_paged_indptrs(
+            q_seq_lens, page_indices_per_request, context_lens, page_size,
+        )
+
+        # Skip the re-plan when its inputs are unchanged (common decode case).
+        # Keyed on the page indices so a reused request id with a new context
+        # can't alias a stale plan.
+        plan_key = PlanCacheKey(
+            q_seq_lens=tuple(q_seq_lens),
+            page_indices=tuple(indptrs.paged_kv_indices.tolist()),
+            last_page_lens=tuple(indptrs.paged_kv_last_page_len.tolist()),
+            dtype=dtype,
+        )
+
+        ps = self._plan_states.get(cross_label)
+        if ps is not None and ps.wrapper is not None and ps.plan_cache_key == plan_key:
+            # plan_key carries q_seq_lens, so a match means ps.seq_lens (set at
+            # plan time below) already equals the current q_seq_lens.
+            return
+        if ps is None or ps.wrapper is None:
+            wrapper = FlashInferPrefillWrapper(
+                workspace_buffer=self.buffer_manager.get(cross_label),
+                num_qo_heads=cfg.num_qo_heads,
+                num_kv_heads=cfg.num_kv_heads,
+                head_dim=cfg.head_dim,
+                page_size=page_size,
+                device=self.device,
+                enable_nvtx=self.enable_nvtx,
+            )
+            ps = _PlanState(wrapper=wrapper)
+            self._plan_states[cross_label] = ps
+
+        ps.wrapper.plan(
+            qo_indptr=indptrs.qo_indptr,
+            paged_kv_indptr=indptrs.paged_kv_indptr,
+            paged_kv_indices=indptrs.paged_kv_indices,
+            paged_kv_last_page_len=indptrs.paged_kv_last_page_len,
+            causal=False,
+            dtype=dtype,
+        )
+        ps.seq_lens = q_seq_lens
+        ps.write_store = False
+        ps.plan_cache_key = plan_key
+
+    # Like run_attention: kept out of the compiled decoder — its query's leading
+    # dim varies per step, which would blow dynamo's recompile limit (#160).
+    @torch.compiler.disable
+    def run_cross_attn(
+        self,
+        q: torch.Tensor,
+        layer_idx: int | None = None,
+        source: str = "default",
+    ) -> torch.Tensor:
+        """Run pre-planned cross-attention against ``source``'s context pool.
+
+        Unlike ``run_attention``, the context K/V were written once by
+        ``add_cross_attn_kv`` — nothing is written here.
+
+        Args:
+            q: [total_query_tokens, num_qo_heads, head_dim]
+        Returns:
+            output: [total_query_tokens, num_qo_heads, head_dim]
+        """
+        if layer_idx is None:
+            layer_idx = self.layer_idx
+        pool = self._get_cross_pool(source)
+        base_label = self._active_base_label(None)
+        cross_label = cross_attn_label(base_label, source)
+
+        orig_dtype = q.dtype
+        ps = self._plan_states.get(cross_label)
+        assert ps is not None and ps.wrapper is not None, (
+            f"run_cross_attn before plan_cross_attention (label {cross_label!r})"
+        )
+        return ps.wrapper.run(q, pool.kv_cache[layer_idx]).to(orig_dtype)
 
 class DenseGenCacheManager(FlashInferCacheManager):
     """FlashInfer backend with a dense generation-attention fast path.
