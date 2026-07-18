@@ -108,6 +108,15 @@ class _PlanState:
     # sets it today (its context pages are immutable after add_cross_attn_kv),
     # and only where plan states persist across steps (the CUDA-graph runner);
     # the eager path rebuilds the cache manager per step and still re-plans.
+    #
+    # Future reference — this is a general-purpose tool, not cross-attn only.
+    # A regular (self-attention) label can memo its plan too; the extra care
+    # there is invalidation, since self-attn pages grow every decode step.
+    # The fingerprint would need to include the per-request seq_len (so appending
+    # a token misses the memo and re-plans), and any page-table remap (eviction /
+    # reallocation) must also bust the key. Given that, decode could skip the
+    # re-plan on the common "seq_len += 1, same pages" step. Deferred until a
+    # model needs it; the eager-path persistence noted above is the prerequisite.
     plan_cache_key: "PlanCacheKey | None" = None
     # Set when DenseGenCacheManager planned this label dense: the per-segment
     # gather indices + varlen cu_seqlens needed to attend each generation
