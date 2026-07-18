@@ -110,6 +110,12 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         self.config = config
         self._suppress_ids: torch.Tensor | None = None
         self._begin_suppress_ids: torch.Tensor | None = None
+        # Compile-inline cross-attn fast path (#160 recovery): contiguous
+        # per-request encoder K/V, computed once at prefill and fed into the
+        # torch.compiled decoder forward every step so cross-attn is traced
+        # inline (see WhisperCrossAttention). Keyed by request_id; freed in
+        # check_stop. Each entry is (cross_k, cross_v), stacked over layers.
+        self._cross_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def _apply_suppress(self, logits: torch.Tensor, is_first_token: bool) -> torch.Tensor:
         """HF generate parity: mask the always-suppressed token set, plus
@@ -171,8 +177,11 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         # No plan_rope: Whisper has no RoPE (learned absolute positions).
 
         # Prefill: compute per-layer cross-attn K/V from the encoder output
-        # and write them into the engine's context pool — once per request;
-        # they are static for the whole generation.
+        # once per request (static for the whole generation) and stash them
+        # contiguous, stacked over layers. Fed into the compiled decoder every
+        # step for the inline-SDPA cross-attn fast path (#160 recovery) — no
+        # engine cross-attention pool write / per-step plan on this path.
+        request_id = engine_inputs.request_ids[0]
         encoder_states = inputs[0].tensor_inputs.get("encoder_states")
         if encoder_states is not None:
             device = self.decoder.embed_tokens.weight.device
@@ -180,27 +189,31 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             encoder_states = encoder_states.to(device=device, dtype=dtype)
             with torch.no_grad():
                 cross_kvs = self.decoder.compute_cross_kv(encoder_states)
-            for layer_idx, (k, v) in enumerate(cross_kvs):
-                cache_manager.add_cross_attn_kv(
-                    engine_inputs.request_ids, k, v,
-                    layer_idx=layer_idx, label="main",
-                )
+            cross_k = torch.stack([k for k, _ in cross_kvs]).contiguous()
+            cross_v = torch.stack([v for _, v in cross_kvs]).contiguous()
+            self._cross_kv[request_id] = (cross_k, cross_v)
 
-        # Both prefill and decode attend to the full (fixed) context.
-        cache_manager.plan_cross_attention(q_seq_lens=seq_lens, label="main")
-
-        return {"input_embeds": inputs[0].input_embeds}
+        cross_k, cross_v = self._cross_kv[request_id]
+        return {
+            "input_embeds": inputs[0].input_embeds,
+            "cross_k": cross_k,
+            "cross_v": cross_v,
+        }
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor,
+        cross_k: torch.Tensor,
+        cross_v: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
         hidden = self.decoder(
             input_embeds=input_embeds,
             cache_handle=engine_inputs.cache_manager,
+            cross_k=cross_k,
+            cross_v=cross_v,
         )
         logits = self.decoder.lm_head(hidden[-1:])
         # The prefill step samples the first generated token.
@@ -238,4 +251,12 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 decoded_tokens >= request_info.max_tokens:
             return {"decode_loop"}
         return set()
+
+    def cleanup_request(self, request_id: str):
+        # Free the request's stashed contiguous cross-attn K/V. Done here (not
+        # in check_stop) because a pipelined next-step preprocess can still run
+        # for a just-finished request; the engine calls cleanup_request only
+        # after the request is fully torn down.
+        self._cross_kv.pop(request_id, None)
+        super().cleanup_request(request_id)
 

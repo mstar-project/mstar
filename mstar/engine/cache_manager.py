@@ -1225,6 +1225,9 @@ class FlashInferCacheManager(BatchedCacheManager):
         ps.write_store = False
         ps.plan_cache_key = plan_key
 
+    # Like run_attention: kept out of the compiled decoder — its query's leading
+    # dim varies per step, which would blow dynamo's recompile limit (#160).
+    @torch.compiler.disable
     def run_cross_attn(
         self,
         q: torch.Tensor,

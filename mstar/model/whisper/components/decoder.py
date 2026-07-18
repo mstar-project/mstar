@@ -44,7 +44,42 @@ class WhisperSelfAttention(Attention):
 
 class WhisperCrossAttention(CrossAttention):
     """Shared ``CrossAttention`` with Whisper's bias layout (the default:
-    q/v/o biased, k unbiased), attending the single encoder context."""
+    q/v/o biased, k unbiased), attending the single encoder context.
+
+    Fast path (#160 recovery): when the caller supplies the request's
+    contiguous per-layer encoder K/V (``cross_kv``), cross-attention runs as
+    an inline ``scaled_dot_product_attention`` so it is *traced into the
+    torch.compiled decoder graph* — avoiding the per-layer graph break and
+    eager FlashInfer wrapper of ``cache_handle.run_cross_attn``. When
+    ``cross_kv`` is ``None`` it falls back to the engine cross-attention pool
+    (batched / concurrent serving still uses that path).
+
+    The inline path relies on whisper decode NOT being CUDA-graphed, so the
+    per-request K/V can ride in as compiled-forward args. Once the decode step
+    is CUDA-graphed (the #160 batching follow-up), captured tensor addresses are
+    fixed, so that path takes the ``cross_kv=None`` FlashInfer pool branch (or a
+    static capture buffer) rather than these varying-address args."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_handle: BatchedCacheManager,
+        cross_kv: CrossKV | None = None,
+    ) -> torch.Tensor:
+        if cross_kv is None:
+            return super().forward(hidden_states, cache_handle)
+        num_tokens = hidden_states.shape[0]
+        q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
+        k, v = cross_kv  # each (enc_len, num_heads, head_dim), static per request
+        # SDPA wants (batch, heads, seq, dim); single stream -> batch 1.
+        q = q.transpose(0, 1).unsqueeze(0)
+        k = k.transpose(0, 1).unsqueeze(0)
+        v = v.transpose(0, 1).unsqueeze(0)
+        attn = F.scaled_dot_product_attention(q, k, v)  # non-causal, full context
+        attn = attn.squeeze(0).transpose(0, 1).reshape(
+            num_tokens, self.num_heads * self.head_dim
+        )
+        return self.out_proj(attn)
 
 
 class WhisperDecoderLayer(nn.Module):
@@ -73,6 +108,7 @@ class WhisperDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cache_handle: BatchedCacheManager,
+        cross_kv: CrossKV | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -80,7 +116,7 @@ class WhisperDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.encoder_attn_layer_norm(hidden_states)
-        hidden_states = residual + self.encoder_attn(hidden_states, cache_handle)
+        hidden_states = residual + self.encoder_attn(hidden_states, cache_handle, cross_kv)
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -129,10 +165,17 @@ class WhisperDecoderModel(nn.Module):
         self,
         input_embeds: torch.Tensor,
         cache_handle: BatchedCacheManager,
+        cross_k: torch.Tensor | None = None,
+        cross_v: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # cross_k/cross_v (when given): stacked contiguous encoder K/V,
+        # (num_layers, enc_len, num_heads, head_dim). Supplying them routes
+        # cross-attention through the inline SDPA fast path (compile-inline,
+        # #160 recovery) instead of the engine cross-attention pool.
         hidden_states = input_embeds
         for layer_idx, layer in enumerate(self.layers):
             cache_handle.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states, cache_handle)
+            cross_kv = None if cross_k is None else (cross_k[layer_idx], cross_v[layer_idx])
+            hidden_states = layer(hidden_states, cache_handle, cross_kv)
         cache_handle.advance_seq_lens()
         return self.layer_norm(hidden_states)
