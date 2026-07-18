@@ -530,6 +530,17 @@ class PureRustWorkerGraphIO:
             a_i, a_t = after.get(ln, (0, False))
             if a_t and not b_t:  # terminated now: filter its loop-backs
                 completion.filtered_signals |= self.loops[ln]._loop_back_inputs
+                # A dead loop's nodes must show no stale readiness (the EOS
+                # contract: termination clears ready signals): drop their
+                # buffered inputs and blank the views.
+                for member in self._loop_members.get(ln, ()):
+                    view = self.nodes.get(member)
+                    if view is None:
+                        continue
+                    view.ready_signals.clear()
+                    view.ready_next_iter.clear()
+                    for inp in view.input_names:
+                        self._pending.pop((member, inp), None)
                 # loop outputs with captured values (uuids -> stored edges)
                 for kind, name, _tgt, uuids in events:
                     del kind, name, uuids
