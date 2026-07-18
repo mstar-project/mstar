@@ -16,7 +16,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.engine.kv_cache_engine import BatchedCacheManager
 from mstar.model.components import DecoderLayer, RMSNorm
 from mstar.model.components.distributed import (
@@ -29,7 +29,7 @@ from mstar.model.higgs_audio.config import HiggsAudioModelConfig
 
 
 def _build_decoder_layer(
-    config: HiggsAudioModelConfig, comm_group: TPCommGroup | None = None,
+    config: HiggsAudioModelConfig, comm_group: CommGroup | None = None,
 ) -> DecoderLayer:
     return DecoderLayer(
         self_attn=ParallelAttention(
@@ -57,11 +57,11 @@ def _build_decoder_layer(
 class HiggsAudioLLM(nn.Module):
     """Qwen3 causal LM; parameter paths mirror the (flat) HF checkpoint."""
 
-    def __init__(self, config: HiggsAudioModelConfig, comm_group: TPCommGroup | None = None):
+    def __init__(self, config: HiggsAudioModelConfig, comm_group: CommGroup | None = None):
         super().__init__()
         self.config = config
         if comm_group is None:
-            comm_group = TPCommGroup.trivial()
+            comm_group = CommGroup.trivial()
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
