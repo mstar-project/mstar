@@ -121,7 +121,7 @@ def _shutdown_conductor_process(
         return
 
     try:
-        conductor_proc.send_signal(signal.SIGINT)
+        os.kill(conductor_proc.pid, signal.SIGINT)
         conductor_proc.join(timeout=timeout)
     except BaseException:
         logger.exception("Failed graceful conductor shutdown")
