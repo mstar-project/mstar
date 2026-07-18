@@ -73,6 +73,10 @@ Communication
      - ``4096``
      - Budget for TOTAL pinned host memory, distinct from the segment cap
        (pinned pages come out of the OS's pageable pool system-wide).
-       Segments past the budget — and oversized dedicated segments, whose
-       one-shot transfer doesn't amortize the registration — stay
-       unpinned: copies work, without async overlap.
+       Segments past the budget stay unpinned: copies work, without
+       async overlap.
+   * - ``MSTAR_SHM_ARENA_STATS_INTERVAL_S``
+     - ``60``
+     - Under ``--log-stats``: how often the arena logs its occupancy /
+       fragmentation snapshot (segments, free bytes, largest contiguous
+       free block, pinned bytes).
