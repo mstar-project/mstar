@@ -827,8 +827,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--rust-frontend", action="store_true",
         help="Serve HTTP from the Rust mstar-server binary instead of "
-             "uvicorn/FastAPI (RFC #130 Step 3); the Python process keeps "
-             "preprocessing and the conductor protocol",
+             "uvicorn/FastAPI; the Python process keeps preprocessing "
+             "and the conductor protocol",
     )
     parser.add_argument(
         "--rust-frontend-bin", type=str, default=None,
