@@ -370,8 +370,8 @@ class TensorCommunicationManager(ABC):
 
         self.req_rx_info: dict[str, SourceAndEdgeToRxInfo] = {}
         self.req_tx_info: dict[str, EdgeNameToTxInfo] = {}
-        # uuid -> edge/signal name, so register_for_send (which only sees uuids)
-        # can attribute TX bytes/time to the right edge. Only tracked under
+        # uuid -> edge/signal name, so register_for_send (which doesn't see
+        # edge names) can attribute TX bytes/time to the right edge. Only tracked under
         # ``enable_prof``.
         self.uuid_to_edge_name: dict[str, str] = {}
 
@@ -540,16 +540,16 @@ class TensorCommunicationManager(ABC):
 
     @abstractmethod
     def register_for_send(
-        self, request_id: str, uuids: list[str],
+        self, request_id: str, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
-        """Mark these uuids ready for remote consumers to RDMA-read.
+        """Mark these tensors ready for remote consumers to RDMA-read.
 
         ``skip_cuda_sync=True`` skips the default-stream sync this call normally
         issues to ensure the source tensors' writes are visible before their
         addresses are shared with peers. Callers must have already synced on
         their own (e.g. before a batched loop) — meant to cut N serialized
-        syncs to 1 when registering many uuids in a row.
+        syncs to 1 when registering many tensors in a row.
 
         If self.enable_prof is set, this should also update self.req_tx_info
         """
@@ -864,10 +864,11 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             enable_prof=enable_prof
         )
 
-    def register_for_send(self, request_id, uuids, skip_cuda_sync=False):
+    def register_for_send(self, request_id, tensor_infos, skip_cuda_sync=False):
         if not skip_cuda_sync:
             torch.cuda.default_stream().synchronize()
-        for uuid in uuids:
+        for info in tensor_infos:
+            uuid = info.uuid
             already_registered = self.tensor_store.is_registered(request_id, uuid)
             if self.protocol == CommProtocol.RDMA:
                 if already_registered:
@@ -989,7 +990,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 def _serialize_tensor(tensor: torch.Tensor) -> bytes:
     """Serialize a tensor to bytes: header + contiguous raw data."""
     t = tensor.detach().contiguous().cpu()
-    return t.view(torch.uint8).numpy().tobytes()
+    # reshape(-1) so 0-dim (scalar) tensors can be byte-viewed: PyTorch
+    # disallows viewing a 0-dim tensor to a dtype with a different element size.
+    return t.reshape(-1).view(torch.uint8).numpy().tobytes()
 
 
 def _deserialize_tensor(
@@ -1061,7 +1064,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         return os.path.join(self.shm_dir, f"mstar_{entity_id}_{uuid}")
 
     def register_for_send(
-        self, request_id: str, uuids: list[str],
+        self, request_id: str, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
         if not skip_cuda_sync and torch.cuda.is_available():
@@ -1076,7 +1079,8 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
             else _nullcontext()
         )
         with ctx:
-            for uuid in uuids:
+            for info in tensor_infos:
+                uuid = info.uuid
                 if self.tensor_store.is_registered(request_id, uuid):
                     continue
                 tensor = self.tensor_store.get_tensor(request_id, uuid)

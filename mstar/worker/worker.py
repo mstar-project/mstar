@@ -936,18 +936,17 @@ class Worker:
         """
         for request_id, _node in batch.node_objects.items():
             routing = routing_per_request[request_id]
-            uuids = set()
+            infos_by_uuid = {}
             for edge in (
                 routing.persist +
                 sum(routing.to_workers.values(), start=[]) +
                 routing.emit_to_client +
                 sum(routing.streaming_to_workers.values(), start=[])
             ):
-                uuids.update([
-                    info.uuid for info in edge.tensor_info
-                ])
+                for info in edge.tensor_info:
+                    infos_by_uuid[info.uuid] = info
             self.tensor_manager.register_for_send(
-                request_id=request_id, uuids=uuids,
+                request_id=request_id, tensor_infos=list(infos_by_uuid.values()),
                 skip_cuda_sync=True,
             )
 
