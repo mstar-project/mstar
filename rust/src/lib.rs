@@ -259,14 +259,14 @@ impl PySegmentedShmArena {
     /// GIL released: the growth path creates + maps a new shm segment
     /// (file create, ftruncate, mmap — milliseconds), which must not stall
     /// other Python threads (the serve loop, stream relays).
-    fn reserve(&mut self, py: Python<'_>, nbytes: usize) -> PyResult<(usize, usize)> {
+    fn reserve(&self, py: Python<'_>, nbytes: usize) -> PyResult<(usize, usize)> {
         py.allow_threads(|| self.arena.reserve(nbytes))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Reserve and record under `uuid` (uuid-grouped reclaim). GIL released
     /// (same growth path as `reserve`).
-    fn reserve_for(&mut self, py: Python<'_>, uuid: u64, nbytes: usize) -> PyResult<(usize, usize)> {
+    fn reserve_for(&self, py: Python<'_>, uuid: u64, nbytes: usize) -> PyResult<(usize, usize)> {
         py.allow_threads(|| self.arena.reserve_for(uuid, nbytes))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }

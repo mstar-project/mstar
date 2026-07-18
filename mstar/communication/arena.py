@@ -59,7 +59,10 @@ class _CudaEventFuture:
     host synchronize."""
 
     def __init__(self, stream):
-        self._event = torch.cuda.Event()
+        # blocking=True: `synchronize` SLEEPS until the event fires. The
+        # default (False) busy-waits — the watcher thread that turns these
+        # into wake futures would burn a full core per wait.
+        self._event = torch.cuda.Event(blocking=True)
         self._event.record(stream)
 
     def done(self) -> bool:
@@ -69,11 +72,37 @@ class _CudaEventFuture:
         self._event.synchronize()
 
 
+_CUDART = None
+
+
+def _cudart():
+    """libcudart via ctypes: unlike the torch binding, a ctypes call
+    RELEASES the GIL, so registering a 256 MiB segment (tens of ms) on the
+    send path cannot stall the process's other Python threads (serve loop,
+    stream relays, the wake watcher)."""
+    global _CUDART
+    if _CUDART is None:
+        import ctypes
+        import ctypes.util
+
+        name = ctypes.util.find_library("cudart") or "libcudart.so"
+        lib = ctypes.CDLL(name)
+        lib.cudaHostRegister.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+        lib.cudaHostRegister.restype = ctypes.c_int
+        _CUDART = lib
+    return _CUDART
+
+
 def _pin(ptr: int, nbytes: int) -> bool:
-    """cudaHostRegister a mapped segment (idempotent). Returns success."""
+    """cudaHostRegister a mapped segment (idempotent). Returns success.
+    GIL released for the duration (see ``_cudart``)."""
     if not torch.cuda.is_available():
         return False
-    rc = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, 0)
+    try:
+        rc = _cudart().cudaHostRegister(ptr, nbytes, 0)
+    except OSError:  # no loadable libcudart: fall back to the torch binding
+        rc = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, 0)
     ok = rc in (0, _CUDA_HOST_ALREADY_REGISTERED)
     if not ok:
         logger.warning("cudaHostRegister(%#x, %d) failed rc=%d — copies fall "
@@ -132,6 +161,12 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # h2d completion watcher: turns a CUDA event into a real Future so
         # the worker's eventfd wakes the moment reads finish (no 10 ms tick).
         self._wake_q: queue.Queue | None = None
+        self._wake_lock = threading.Lock()
+        # Periodic occupancy/fragmentation logging, tied to --log-stats
+        # (enable_prof) and time-gated.
+        self._stats_interval_s = float(
+            os.getenv("MSTAR_SHM_ARENA_STATS_INTERVAL_S", "60"))
+        self._stats_last = 0.0
         self._arena = SegmentedShmArena.create(
             f"mstar_arena_{my_entity_id}", segment_mb << 20, max_segments)
         # Producer-side segment views (memoryviews are stable: segments
@@ -151,13 +186,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     # -- segments --------------------------------------------------------
 
     def _maybe_pin(self, ptr: int, nbytes: int) -> None:
+        # Oversized dedicated segments ARE pinned (within budget): freed
+        # segments are reused for later large tensors, so the registration
+        # amortizes over the segment's lifetime, not one transfer.
         if not self._pin_segments:
-            return
-        if nbytes > self._segment_bytes:
-            logger.info(
-                "ARENA: leaving oversized segment unpinned (%d MiB): a "
-                "one-shot transfer doesn't amortize cudaHostRegister",
-                nbytes >> 20)
             return
         if self._pinned_bytes + nbytes > self._pin_budget:
             if not self._pin_budget_warned:
@@ -187,10 +219,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 self._arena.num_segments, total >> 20, free >> 20,
                 largest >> 20, self._pinned_bytes >> 20)
 
-    def stats(self) -> dict:
-        """Occupancy/fragmentation snapshot for periodic stats logging.
-        The fragmentation signature is `largest_free_block` collapsing while
-        `free_bytes` stays high."""
+    def stats_summary(self) -> dict:
+        """Occupancy/fragmentation snapshot (named apart from the raw
+        ``SegmentedShmArena.stats`` tuple). The fragmentation signature is
+        `largest_free_block` collapsing while `free_bytes` stays high."""
         total, free, largest = self._arena.stats()
         return {
             "segments": self._arena.num_segments,
@@ -199,6 +231,18 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             "largest_free_block": largest,
             "pinned_bytes": self._pinned_bytes,
         }
+
+    def _maybe_log_stats(self) -> None:
+        """Under ``--log-stats`` (enable_prof), log the snapshot at most
+        once per MSTAR_SHM_ARENA_STATS_INTERVAL_S so a long soak leaves an
+        occupancy/fragmentation time series in the logs."""
+        if not self.enable_prof:
+            return
+        now = time.monotonic()
+        if now - self._stats_last < self._stats_interval_s:
+            return
+        self._stats_last = now
+        logger.info("ARENA stats: %s", self.stats_summary())
 
     def _peer_view(self, segment_name: str) -> memoryview:
         entry = self._peer_segments.get(segment_name)
@@ -273,6 +317,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             else _nullcontext()
         )
         queued = False
+        self._maybe_log_stats()
         with ctx:
             for uuid in uuids:
                 if self.tensor_store.is_registered(request_id, uuid):
@@ -409,11 +454,12 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         return [self._wake_when_done(future)]
 
     def _wake_when_done(self, cuda_future) -> Future:
-        if self._wake_q is None:
-            self._wake_q = queue.Queue()
-            threading.Thread(
-                target=self._watch_wakes, daemon=True,
-                name=f"arena-h2d-wake-{self.my_entity_id}").start()
+        with self._wake_lock:   # two callers must not race the create
+            if self._wake_q is None:
+                self._wake_q = queue.Queue()
+                threading.Thread(
+                    target=self._watch_wakes, daemon=True,
+                    name=f"arena-h2d-wake-{self.my_entity_id}").start()
         fut: Future = Future()
         self._wake_q.put((cuda_future, fut))
         return fut

@@ -274,7 +274,12 @@ pub struct SegmentedShmArena {
     base: String,
     segment_size: usize,
     max_segments: usize,
-    segments: Vec<std::sync::Arc<ShmArena>>,
+    // Behind a Mutex so every method takes `&self` (interior mutability):
+    // the Python binding releases the GIL across reserve's growth path, and
+    // a `&mut` PyO3 borrow held there would make any concurrent `&self`
+    // call (stats, free, free_uuid) raise "Already mutably borrowed".
+    // Growth serializes on this lock instead of the PyCell borrow.
+    segments: Mutex<Vec<std::sync::Arc<ShmArena>>>,
     // uuid -> allocations it holds. Multi-tensor uuids supported.
     ledger: Mutex<HashMap<u64, Vec<(usize, usize)>>>, // (segment idx, offset)
 }
@@ -296,7 +301,7 @@ impl SegmentedShmArena {
             base: base.to_string(),
             segment_size,
             max_segments,
-            segments: vec![std::sync::Arc::new(first)],
+            segments: Mutex::new(vec![std::sync::Arc::new(first)]),
             ledger: Mutex::new(HashMap::new()),
         })
     }
@@ -304,30 +309,31 @@ impl SegmentedShmArena {
     /// Reserve `nbytes`; returns `(segment_index, offset)`. Tries existing
     /// segments first-fit, then grows by one segment (a dedicated one when
     /// `nbytes` exceeds the segment size), up to `max_segments`.
-    pub fn reserve(&mut self, nbytes: usize) -> Result<(usize, usize), ShmError> {
-        for (i, seg) in self.segments.iter().enumerate() {
+    pub fn reserve(&self, nbytes: usize) -> Result<(usize, usize), ShmError> {
+        let mut segments = self.segments.lock().expect("segments lock");
+        for (i, seg) in segments.iter().enumerate() {
             if let Ok(off) = seg.reserve(nbytes) {
                 return Ok((i, off));
             }
         }
-        if self.segments.len() >= self.max_segments {
+        if segments.len() >= self.max_segments {
             return Err(ShmError::Full {
                 need: nbytes,
-                free: self.segments.iter().map(|s| s.bytes_free()).sum(),
-                total: self.segments.iter().map(|s| s.size()).sum(),
+                free: segments.iter().map(|s| s.bytes_free()).sum(),
+                total: segments.iter().map(|s| s.size()).sum(),
             });
         }
-        let idx = self.segments.len();
+        let idx = segments.len();
         let size = self.segment_size.max(align_up(nbytes.max(1)));
         let seg = ShmArena::create(&format!("{}.seg{idx}", self.base), size)?;
         let off = seg.reserve(nbytes)?; // fresh segment sized to fit: infallible
-        self.segments.push(std::sync::Arc::new(seg));
+        segments.push(std::sync::Arc::new(seg));
         Ok((idx, off))
     }
 
     /// Reserve `nbytes` and record the allocation under `uuid` (mstar's
     /// uuid-based reclaim). One uuid may hold many allocations.
-    pub fn reserve_for(&mut self, uuid: u64, nbytes: usize) -> Result<(usize, usize), ShmError> {
+    pub fn reserve_for(&self, uuid: u64, nbytes: usize) -> Result<(usize, usize), ShmError> {
         let (seg, off) = self.reserve(nbytes)?;
         self.ledger
             .lock()
@@ -347,9 +353,10 @@ impl SegmentedShmArena {
             .expect("ledger lock")
             .remove(&uuid)
             .unwrap_or_default();
+        let segments = self.segments.lock().expect("segments lock");
         let mut n = 0;
         for (seg, off) in allocs {
-            if self.segments.get(seg).is_some_and(|s| s.free(off)) {
+            if segments.get(seg).is_some_and(|s| s.free(off)) {
                 n += 1;
             }
         }
@@ -359,12 +366,14 @@ impl SegmentedShmArena {
     /// Release one offset (embedder-tracked descriptors). Idempotent.
     pub fn free(&self, segment: usize, offset: usize) -> bool {
         self.segments
+            .lock()
+            .expect("segments lock")
             .get(segment)
             .is_some_and(|s| s.free(offset))
     }
 
     pub fn num_segments(&self) -> usize {
-        self.segments.len()
+        self.segments.lock().expect("segments lock").len()
     }
 
     /// Occupancy + fragmentation snapshot across all segments:
@@ -373,10 +382,10 @@ impl SegmentedShmArena {
     /// high — allocations then fail (or force segment growth) even though
     /// total free space looks healthy.
     pub fn stats(&self) -> (usize, usize, usize) {
-        let total = self.segments.iter().map(|s| s.size()).sum();
-        let free = self.segments.iter().map(|s| s.bytes_free()).sum();
-        let largest = self
-            .segments
+        let segments = self.segments.lock().expect("segments lock");
+        let total = segments.iter().map(|s| s.size()).sum();
+        let free = segments.iter().map(|s| s.bytes_free()).sum();
+        let largest = segments
             .iter()
             .map(|s| s.largest_free_block())
             .max()
@@ -392,13 +401,17 @@ impl SegmentedShmArena {
 
     /// A shared handle to segment `i` (buffer views, registration hooks).
     pub fn segment(&self, i: usize) -> Option<std::sync::Arc<ShmArena>> {
-        self.segments.get(i).cloned()
+        self.segments.lock().expect("segments lock").get(i).cloned()
     }
 
     /// `(base_ptr, len)` of segment `i` — the registration hook: the embedder
     /// `cudaHostRegister`s each new segment ONCE; the mapping never moves.
     pub fn segment_ptr_len(&self, i: usize) -> Option<(*mut u8, usize)> {
-        self.segments.get(i).map(|s| (s.as_mut_ptr(), s.size()))
+        self.segments
+            .lock()
+            .expect("segments lock")
+            .get(i)
+            .map(|s| (s.as_mut_ptr(), s.size()))
     }
 }
 
