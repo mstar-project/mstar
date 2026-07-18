@@ -13,7 +13,7 @@ import torch
 import yaml
 
 from mstar.api_server.request_types import APIServerMessage, RequestComplete
-from mstar.communication.communicator import CommProtocol, ZMQCommunicator
+from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
@@ -306,7 +306,7 @@ class Conductor:
         self._derive_worker_info()
         self._launch_workers()
 
-        self.communicator = ZMQCommunicator(
+        self.communicator = make_communicator(
             my_id="conductor",
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,

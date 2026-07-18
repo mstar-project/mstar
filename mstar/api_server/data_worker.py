@@ -22,7 +22,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
 )
-from mstar.communication.communicator import CommProtocol, ZMQCommunicator
+from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.model.base import Model
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
@@ -74,7 +74,7 @@ class PreprocessWorker:
         # The socket is only *used* from the worker thread, but owning the
         # tensor manager here lets the main thread read its tx/rx profiling
         # directly once a request is done (no cross-thread queue / race).
-        self.communicator = ZMQCommunicator(
+        self.communicator = make_communicator(
             my_id="api_server_preprocess_worker",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
@@ -233,7 +233,7 @@ class PreprocessWorkerThread:
         abort_request_queue: queue.Queue,
         discard_tensor_queue: queue.Queue,
         stop_event: threading.Event,
-        communicator: ZMQCommunicator,
+        communicator: BaseCommunicator,
         tensor_manager,
         device: str = "cpu",
         model: Model | None = None,
