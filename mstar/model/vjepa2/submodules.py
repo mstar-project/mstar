@@ -1209,6 +1209,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             cache_handle=engine_inputs.cache_manager,
             extrinsics=extrinsics,
             request_ids=engine_inputs.request_ids,
+            runner=engine_inputs.piecewise_runners.get("block_loop"),
         )
 
         return {

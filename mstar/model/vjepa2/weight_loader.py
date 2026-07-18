@@ -248,7 +248,12 @@ def download_vjepa2_ac_upstream_pt(
     ignored (we don't need an HF repo ID for the S3 path).
     """
     del model_path_hf  # not used — S3 path is unique, not keyed by repo ID.
-    cache_root = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "mstar_vjepa2"
+    import os
+    cache_home = Path(os.environ.get(
+        "XDG_CACHE_HOME",
+        Path.home() / ".cache"
+    ))
+    cache_root = Path(cache_dir) if cache_dir else cache_home / "mstar_vjepa2"
     cache_root.mkdir(parents=True, exist_ok=True)
 
     pt_path = cache_root / "vjepa2-ac-vitg.pt"
