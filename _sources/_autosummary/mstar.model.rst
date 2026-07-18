@@ -30,6 +30,7 @@
    base
    components
    cosmos3
+   higgs_audio
    loader
    orpheus
    pi05
@@ -38,4 +39,5 @@
    submodule_base
    utils
    vjepa2
+   whisper
 

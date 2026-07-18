@@ -193,6 +193,11 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -207,6 +212,11 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
 </ul>
 </details></li>
 </ul>
@@ -571,10 +581,30 @@ constructor receives <code class="docutils literal notranslate"><span class="pre
 typically loads the tokenizer and stores a config dataclass. Defer heavy weight loading
 to <code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> so the conductor process never allocates GPU memory.</p>
 <p>The abstract methods you <strong>must</strong> implement:</p>
-<dl class="simple">
+<dl>
 <dt><code class="docutils literal notranslate"><span class="pre">get_kv_cache_config(self)</span> <span class="pre">-&gt;</span> <span class="pre">list[KVCacheConfig]</span></code></dt><dd><p>Per-node KV cache configs for autoregressive nodes (<code class="docutils literal notranslate"><span class="pre">num_layers</span></code>,
 <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code>, <code class="docutils literal notranslate"><span class="pre">head_dim</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>). Return a single
 config if all AR nodes share one. Models with no AR node may return an empty list.</p>
+<p><strong>Cross-attention (encoder-decoder models).</strong> For a decoder that attends to a
+fixed encoder context (Whisper, etc.), declare one or more context pools via
+<code class="docutils literal notranslate"><span class="pre">KVCacheConfig.cross_attn</span></code>, a <code class="docutils literal notranslate"><span class="pre">{source_name:</span> <span class="pre">CrossAttnKVConfig}</span></code> map.
+<code class="docutils literal notranslate"><span class="pre">CrossAttnKVConfig</span></code> carries only what differs from the decoder’s
+self-attention — <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code>, <code class="docutils literal notranslate"><span class="pre">head_dim</span></code>, <code class="docutils literal notranslate"><span class="pre">max_context_len</span></code> (per-request
+context capacity in tokens) and <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> (page budget); <code class="docutils literal notranslate"><span class="pre">page_size</span></code>,
+<code class="docutils literal notranslate"><span class="pre">num_layers</span></code> and <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code> are inherited from the parent config. The
+submodule then writes the context K/V once at prefill with
+<code class="docutils literal notranslate"><span class="pre">cache_handle.add_cross_attn_kv(...)</span></code> and, every step, calls
+<code class="docutils literal notranslate"><span class="pre">cache_handle.plan_cross_attention(...)</span></code> (in <code class="docutils literal notranslate"><span class="pre">preprocess</span></code>) and
+<code class="docutils literal notranslate"><span class="pre">cache_handle.run_cross_attn(q,</span> <span class="pre">source=...)</span></code> (in the layer forward). A
+single-source model uses <code class="docutils literal notranslate"><span class="pre">source=&quot;default&quot;</span></code> and can omit the argument.</p>
+<p><em>Pool sharing.</em> Sources whose <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code> / <code class="docutils literal notranslate"><span class="pre">head_dim</span></code> / <code class="docutils literal notranslate"><span class="pre">max_context_len</span></code>
+match share <strong>one physical pool</strong>, and that pool’s page budget is the <strong>sum</strong> of
+the sharing sources’ <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> — so two same-geometry sources (“audio”,
+“image”) asking for 256 pages each get a 512-page shared pool. Sources with
+differing geometry get separate pools.</p>
+<p><em>YAML override.</em> Like the flat KV fields, cross-attention pools are overridable
+from the model config’s <code class="docutils literal notranslate"><span class="pre">kv_cache:</span></code> block via a nested <code class="docutils literal notranslate"><span class="pre">cross_attn:</span></code> map,
+e.g. <code class="docutils literal notranslate"><span class="pre">kv_cache:</span> <span class="pre">{cross_attn:</span> <span class="pre">{default:</span> <span class="pre">{max_num_pages:</span> <span class="pre">384}}}</span></code>.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">get_node_engine_types(self)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">EngineType]</span></code></dt><dd><p>Maps each graph-node name to an <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.engine.base.EngineType</span></code>
 (<code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code> or <code class="docutils literal notranslate"><span class="pre">STATELESS</span></code>). See <a class="reference internal" href="#step-6-choose-engine-types">Step 6 — Choose engine types</a> below.</p>
