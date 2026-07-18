@@ -1,7 +1,11 @@
-//! mstar's Rust core: the ZMQ PUSH/PULL control mesh and the
-//! shared-memory tensor arena. `communicator.rs` is the transport + codec
-//! split; `shm.rs` is the arena; this file is the PyO3 surface the Python
-//! wrappers drive. Build: `maturin develop --release` in rust/.
+//! mstar's Rust components, one crate: each module is an independent
+//! capability behind its own opt-in flag, and this file is the PyO3
+//! surface the Python wrappers drive. Currently: `communicator.rs` (the
+//! ZMQ PUSH/PULL control mesh, as a transport + codec split) and `shm.rs`
+//! (the shared-memory tensor arena). The crate is not limited to these —
+//! new components land as new modules with their own bindings. Also
+//! usable as a plain Rust library (rlib) by Rust-side consumers.
+//! Build: `maturin develop --release` in rust/.
 
 pub mod communicator;
 pub mod shm;
