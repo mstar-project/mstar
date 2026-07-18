@@ -140,6 +140,17 @@ single-GPU or fully disaggregated by changing only the YAML `node_groups`. Four 
 primitives — `Sequential`, `Parallel`, `Loop`, and a cross-partition
 `StreamingGraphEdge` — express every model family above. See the [paper](https://arxiv.org/abs/2606.12688) for the full design.
 
+### Optional: Rust ZMQ transport
+
+The ZeroMQ control mesh can run over a Rust transport (vendored in [`rust/`](rust/)) instead of
+pyzmq — wire-compatible, selectable per process with `MSTAR_RUST_ZMQ` (default `AUTO`).
+Note what AUTO-by-default means: on any machine where the extension is built, the whole
+mesh switches to the Rust transport with no configuration change — each process logs its
+choice at startup (`control mesh transport: ...`), and `MSTAR_RUST_ZMQ=0` pins pyzmq. Build it with
+[maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
+See the [installation docs](https://m-star.org/mstar/installation.html) and
+[environment variables](https://m-star.org/mstar/environment_variables.html).
+
 ## Performance
 
 Across every model we benchmark, M\* matches or beats the system specialized for that family — unified

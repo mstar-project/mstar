@@ -23,7 +23,7 @@ from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
-from mstar.communication.communicator import CommProtocol, ZMQCommunicator
+from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
@@ -207,7 +207,7 @@ class APIServer:
         self.running = True
 
         # ZMQ channel shared with conductor / workers
-        self.communicator = ZMQCommunicator(
+        self.communicator = make_communicator(
             my_id="api_server",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,

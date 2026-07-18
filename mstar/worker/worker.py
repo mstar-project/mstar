@@ -13,7 +13,7 @@ from time import sleep
 import torch
 
 from mstar.api_server.request_types import APIServerMessage, ResultTensors
-from mstar.communication.communicator import CommProtocol, ZMQCommunicator
+from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -168,7 +168,7 @@ class Worker:
                         for node_name in section.get_nodes():
                             node_to_partition[node_name] = pdef.name
 
-        self.communicator = ZMQCommunicator(
+        self.communicator = make_communicator(
             my_id=worker_id,
             push_ids=worker_ids + ["conductor", "api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
