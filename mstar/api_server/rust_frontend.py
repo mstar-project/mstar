@@ -2,7 +2,7 @@
 
 ``mstar-server`` (``rust/server/``) owns the HTTP surface — routes, OpenAI
 translation, SSE/NDJSON streaming, uploads, CORS — and speaks a flattened
-msgpack protocol over the Step-1 Rust ZMQ transport to this bridge, which
+msgpack protocol over the Rust ZMQ transport to this bridge, which
 drives the existing Python data plane (``APIServer.submit_request`` /
 ``iter_result_chunks`` / ``abort_request``; preprocessing and the conductor
 protocol are untouched):
@@ -80,7 +80,7 @@ class RustFrontendBridge:
 
     def __init__(self, server, bridge_dir: str):
         self.server = server
-        # Step-1 transport with the msgpack codec: we bind as "conductor" in
+        # Rust transport with the msgpack codec: we bind as "conductor" in
         # the PRIVATE bridge dir (that is who the frontend's bridge sends to).
         self.comm = RustZMQCommunicator(
             "conductor", push_ids=["frontend"], protocol=CommProtocol.IPC,
