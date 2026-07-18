@@ -37,7 +37,7 @@ SCENARIOS = [
     _tg.test_nested_loops,
     _tg.test_eos_clears_ready_signals,
 ]
-MODES = ["shadow", "1"]
+MODES = ["shadow", "1", "pure"]
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda f: f.__name__)
