@@ -1211,17 +1211,13 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             request_ids=engine_inputs.request_ids,
         )
 
-        outputs: NameToTensorList = {
-            "encoder_hidden": [new_tg],
-            "predicted_hidden": [new_tg],
-        }
-
-        per_rid = {
+        return {
             rid: {
-                name: tensor[i:i+1] for name, tensor in outputs.items()
-                } for i, rid in enumerate(request_ids)
+                "encoder_hidden": [new_tg[i : i + 1]],
+                "predicted_hidden": [new_tg[i : i + 1]],
+            }
+            for i, rid in enumerate(request_ids)
         }
-        return per_rid
 
     def check_stop(
         self, request_id: str,
