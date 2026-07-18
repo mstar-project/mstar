@@ -2572,7 +2572,7 @@ class PiecewiseCudaGraphRunner:
             self.alloc_manager.add_request(rid, labels=self.cache_labels)
 
         plan_states = self._build_persistent_wrappers(shape)
-        static_cm = BatchedCacheManager(
+        static_cm = create_cache_manager(
             request_ids=dummy_rids,
             active_labels_per_request={rid: self.cache_labels[0] for rid in dummy_rids},
             kv_cache=self.alloc_manager.kv_cache,
