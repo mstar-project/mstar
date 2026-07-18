@@ -1216,11 +1216,8 @@ class FlashInferCacheManager(BatchedCacheManager):
         ps.write_store = False
         ps.plan_cache_key = plan_key
 
-    # Match run_attention: keep this out of the torch.compiled decoder region.
-    # The decoder's compiled forward calls run_cross_attn with a query whose
-    # leading dim varies (1 on decode, prefill batch on prefill); tracing it
-    # blows dynamo's recompile_limit ("tensor 'q' size mismatch") and drops the
-    # whole decoder to eager — a large whisper throughput regression (#160).
+    # Like run_attention: kept out of the compiled decoder — its query's leading
+    # dim varies per step, which would blow dynamo's recompile limit (#160).
     @torch.compiler.disable
     def run_cross_attn(
         self,
