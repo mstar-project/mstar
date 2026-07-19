@@ -18,8 +18,10 @@ else
     exit 1
 fi
 
+export MSTAR_SHM_ARENA=0
+# export MSTAR_SHM_ARENA_STATS_INTERVAL_S=10
 CUDA_VISIBLE_DEVICES=$DEVICES python mstar/api_server/entrypoint.py \
-    --config configs/qwen3omni_thinker_tp2.yaml \
+    --config configs/qwen3omni_2gpu.yaml --log-stats \
     --cache-dir $QWEN3OMNI_CACHE_DIR \
     --socket-path-prefix /tmp/mstar_${WHO}/ \
     --upload-dir /tmp/mstar_uploads_${WHO}/ \

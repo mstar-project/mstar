@@ -21,15 +21,12 @@ VBENCH_CACHE_DIR=${VBENCH_CACHE_DIR:-./vbench_cache}
 
 python -m benchmark.runner \
     --url "${URL:-http://${HOST}:${PORT}}" \
-    --model "${MODEL:-bagel}" \
-    --profiling-type "${PROF_TYPE:-offline}" \
-    --request-type "${TASK:-text_to_image}" \
-    --vbench-cache-dir "$VBENCH_CACHE_DIR" \
-    --local-cache "$BENCHMARK_LOCAL_DIR" \
+    --model "${MODEL:-qwen3omni}" \
+    --profiling-type "${PROF_TYPE:-closed_loop}" \
+    --request-type "${TASK:-video_to_text}" \
     --num-requests "${NUM_REQUESTS:-10}" \
     --inference-system "${INF_SYS:-ours}" \
     --num-warmup "${WARMUP:-3}" \
-    ${DATASET:+--dataset "$dataset"} \
-    ${BATCH_SIZE:+--batch-size "$BATCH_SIZE"} \
-    ${RATE:+--rate "$RATE"} \
-    ${EXTRA_ARGS:+"$EXTRA_ARGS"}
+    --max-concurrency 1 \
+    --dataset video_mme \
+    --output-dir .bench_outs

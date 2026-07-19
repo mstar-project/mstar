@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import random
 import time
 
@@ -63,6 +64,22 @@ def _pick(rng: random.Random, cfg: SoakConfig):
     return rng.choices(cfg.requests, weights=cfg.weights, k=1)[0]
 
 
+def _piecewise_rate(points: list, elapsed: float) -> float:
+    """Linear interpolation of λ over [[elapsed_s, rate], …]; holds the ends."""
+    if not points:
+        return 1.0
+    pts = sorted((float(t), float(r)) for t, r in points)
+    if elapsed <= pts[0][0]:
+        return pts[0][1]
+    if elapsed >= pts[-1][0]:
+        return pts[-1][1]
+    for (t0, r0), (t1, r1) in zip(pts, pts[1:]):
+        if t0 <= elapsed <= t1:
+            f = (elapsed - t0) / (t1 - t0) if t1 > t0 else 0.0
+            return r0 + (r1 - r0) * f
+    return pts[-1][1]
+
+
 class Soaker:
     def __init__(self, cfg: SoakConfig, url: str, metrics_jsonl: str | None):
         self.cfg = cfg
@@ -84,6 +101,34 @@ class Soaker:
         self._stop = asyncio.Event()
         self._backlog_warned = 0.0
         self._id = 0
+
+    def _rate_at(self, elapsed: float) -> float:
+        """Arrival rate λ at `elapsed` seconds. Constant `rate` unless a
+        `rate_profile` is set (non-homogeneous Poisson). Floored above 0 so
+        expovariate() is always valid."""
+        p = self.cfg.rate_profile
+        if not p:
+            return self.cfg.rate
+        shape = p.get("shape", "constant")
+        if shape == "constant":
+            return self.cfg.rate
+        lo = float(p.get("min", self.cfg.rate))
+        hi = float(p.get("max", self.cfg.rate))
+        if shape == "ramp":  # one-shot lo->hi across the whole run
+            frac = min(1.0, elapsed / max(self.cfg.duration_s, 1e-9))
+            r = lo + (hi - lo) * frac
+        elif shape == "piecewise":
+            r = _piecewise_rate(p.get("points", []), elapsed)
+        else:
+            period = float(p.get("period_s", 600.0))
+            phase = (elapsed % period) / period  # 0..1
+            if shape == "sine":  # smooth, starts at lo, peaks mid-period
+                r = lo + (hi - lo) * (1 - math.cos(2 * math.pi * phase)) / 2
+            elif shape == "square":
+                r = hi if phase < float(p.get("duty", 0.5)) else lo
+            else:  # triangle
+                r = lo + (hi - lo) * (1 - abs(2 * phase - 1))
+        return max(r, 1e-3)
 
     async def _run_one(
         self, session: aiohttp.ClientSession, req: RequestInput,
@@ -120,10 +165,12 @@ class Soaker:
 
     async def _arrivals(self, session: aiohttp.ClientSession) -> None:
         cfg = self.cfg
-        deadline = time.monotonic() + cfg.duration_s
+        start = time.monotonic()
+        deadline = start + cfg.duration_s
         tasks: set[asyncio.Task] = set()
         while time.monotonic() < deadline:
-            await asyncio.sleep(self.rng.expovariate(cfg.rate))
+            await asyncio.sleep(
+                self.rng.expovariate(self._rate_at(time.monotonic() - start)))
             # Bound outstanding client memory. If we can't get a backlog slot
             # promptly the server is behind — pause arrivals (Poisson breaks,
             # logged) rather than accumulate unbounded tasks.
@@ -171,9 +218,12 @@ class Soaker:
                 jsonl.close()
 
     async def run(self) -> dict:
+        rate_desc = (
+            f"rate={self.cfg.rate}/s" if not self.cfg.rate_profile
+            else f"rate_profile={self.cfg.rate_profile}")
         print(
             f"[soak] model={self.cfg.model} system={self.cfg.system} "
-            f"rate={self.cfg.rate}/s max_in_flight={self.cfg.max_in_flight} "
+            f"{rate_desc} max_in_flight={self.cfg.max_in_flight} "
             f"duration={self.cfg.duration_s}s window={self.cfg.window_s}s\n"
             f"[soak] mixture: "
             + ", ".join(f"{r.label}={r.weight:g}" for r in self.cfg.requests),

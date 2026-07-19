@@ -61,6 +61,36 @@ Generation resolution goes in `model_kwargs`, passed straight through `/generate
 - **cosmos3** reads `size` (`"WxH"`), `num_frames`, `num_inference_steps`,
   `fps`, `guidance_scale` (`mstar/model/cosmos3/cosmos3_model.py`).
 
+## Time-varying load (`rate_profile`)
+
+A constant Poisson rate settles into a steady-state occupancy that hides the
+arena behaviors most worth watching: whether fragmentation and `live_slots`
+**reset to baseline on drain** (vs ratchet across cycles), whether grown segments
+stay pinned while idle, and whether spill/backpressure **recovers** once load
+drops. A cycling load makes the troughs diagnostic. Omit `rate_profile` for a
+flat `rate`; otherwise (non-homogeneous Poisson, λ sampled per arrival):
+
+```yaml
+rate: 8.0                     # base/constant rate; still the fallback
+rate_profile:
+  shape: square               # sine | square | triangle | ramp | piecewise
+  min: 2                      # trough λ (req/s)
+  max: 40                     # peak λ (drive this above what max_in_flight sustains)
+  period_s: 900               # one full cycle (sine/square/triangle)
+  duty: 0.5                   # square only: fraction of the period at `max`
+```
+
+- **square** — burst/quiet; the most diagnostic (troughs should drain the arena).
+- **sine** / **triangle** — smooth diurnal-like oscillation for multi-hour drift.
+- **ramp** — one-shot `min`→`max` across the whole `duration_s`; sweeps the
+  saturation knee (watch where spill/backpressure first appears).
+- **piecewise** — `points: [[0, 2], [600, 40], [1200, 2]]`, linear-interpolated
+  (elapsed_s, λ), ends held. Full control of an arbitrary load shape.
+
+Push `max` above what `max_in_flight` can sustain so the peaks actually saturate
+(admission delay + server-side spill/backpressure), then confirm the troughs
+recover — that recover/drain transition is the point of varying the load.
+
 ## Metrics (all rolling over `window_s`)
 
 Printed each `report_interval_s` and appended to `--metrics-jsonl`:
@@ -94,13 +124,30 @@ python -m benchmark.long.server_monitor \
 Everything after `--` runs verbatim. Per parsed sample it derives and logs, per
 producer entity (`api_server` data worker + each `worker_N`):
 
-- `segments`, `free_bytes`, `largest_free_block`, `pinned_bytes` (raw);
+- every field the server logs, passed through (`segments`, `free_bytes`,
+  `largest_free_block`, `pinned_bytes`, `live_slots`, `spill_files`, …);
 - **`free / total`** (occupancy);
 - **`largest_free_block / free`** (fragmentation gauge — collapsing toward 0
   while `free/total` stays high is the fragmentation signature, and triggers a
   `--frag-warn` warning);
 - **node aggregates**: `Σ total_bytes` (/dev/shm), `Σ pinned_bytes` across all
   entities, with an >80%-of-`--shm-size-gb` warning.
+- stress canaries: `spill_files > 0` (arena saturated → file transport, logged
+  once per entity) and `live_slots` climbing while requests finish (reclaim
+  leaking).
+- **between-sample events**: the stats dict is logged only once per
+  `MSTAR_SHM_ARENA_STATS_INTERVAL_S` (default **60 s**), but the arena also logs
+  at the moment they happen — `fragmentation`, `at_capacity`, `pin_budget_reached`,
+  `ttl_reclaim` (with a running total), `grew`, `over_80pct_shm`,
+  `register_failed`. The monitor counts these per entity, timestamps each into
+  the JSONL (`{"kind": "event", ...}`), and tallies them in the report + peaks
+  summary, so a sub-minute spike isn't invisible until the next stats sample.
+
+> **Tip:** for a soak, export `MSTAR_SHM_ARENA_STATS_INTERVAL_S=10` (or lower)
+> before launching so the occupancy/fragmentation/pinned *time series* is
+> finer-grained than the 60 s default. The event lines above fire regardless of
+> this interval. JSONL rows are tagged `"kind": "stats"` vs `"kind": "event"`
+> for downstream filtering.
 
 `--stats-jsonl` shares the `t_wall` field with the client's `--metrics-jsonl`,
 so the two series line up on one time axis for run (a) and run (b).
