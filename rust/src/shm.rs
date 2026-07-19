@@ -9,7 +9,6 @@
 //!   D2H bytes into `arena[off..off+n]`, send the offset as a descriptor,
 //!   [`ShmArena::free`] the offset once the tensor is reclaimed. The conductor
 //!   drives reclaim per-tensor: the runtime reports a tensor unreachable
-//!   (`Event::Free`) and the conductor frees the owning arena's offset (its
 //!   own directly, a worker's via a `free` message), with a per-request sweep
 //!   as the backstop.
 //! - Consumer: [`ShmArena::open`] the same name, read `arena[off..off+n]`
@@ -263,13 +262,9 @@ impl Drop for ShmArena {
 /// named [`ShmArena`] (`{base}.seg{i}`), so consumers keep opening arenas
 /// lazily by name — a consumer never needs to know segmentation exists.
 ///
-/// Reclaim is uuid-based (mstar's cleanup contract): [`Self::reserve_for`]
-/// records the allocation under the caller's uuid and [`Self::free_uuid`]
-/// releases everything held by that uuid, idempotently. Offset-based
-/// [`Self::free`] remains for embedders that track descriptors themselves.
-///
-/// Allocations larger than the segment size get a dedicated segment of
-/// exactly that size (freed segments are reused like any other).
+/// Reclaim is offset-based: the embedder tracks each allocation's
+/// `(segment, offset)` and calls [`Self::free`] when the consumer has
+/// ACKed the transfer.
 pub struct SegmentedShmArena {
     base: String,
     segment_size: usize,
@@ -277,11 +272,9 @@ pub struct SegmentedShmArena {
     // Behind a Mutex so every method takes `&self` (interior mutability):
     // the Python binding releases the GIL across reserve's growth path, and
     // a `&mut` PyO3 borrow held there would make any concurrent `&self`
-    // call (stats, free, free_uuid) raise "Already mutably borrowed".
+    // call (stats, free) raise "Already mutably borrowed".
     // Growth serializes on this lock instead of the PyCell borrow.
     segments: Mutex<Vec<std::sync::Arc<ShmArena>>>,
-    // uuid -> allocations it holds. Multi-tensor uuids supported.
-    ledger: Mutex<HashMap<u64, Vec<(usize, usize)>>>, // (segment idx, offset)
 }
 
 impl SegmentedShmArena {
@@ -302,7 +295,6 @@ impl SegmentedShmArena {
             segment_size,
             max_segments,
             segments: Mutex::new(vec![std::sync::Arc::new(first)]),
-            ledger: Mutex::new(HashMap::new()),
         })
     }
 
@@ -329,38 +321,6 @@ impl SegmentedShmArena {
         let off = seg.reserve(nbytes)?; // fresh segment sized to fit: infallible
         segments.push(std::sync::Arc::new(seg));
         Ok((idx, off))
-    }
-
-    /// Reserve `nbytes` and record the allocation under `uuid` (mstar's
-    /// uuid-based reclaim). One uuid may hold many allocations.
-    pub fn reserve_for(&self, uuid: u64, nbytes: usize) -> Result<(usize, usize), ShmError> {
-        let (seg, off) = self.reserve(nbytes)?;
-        self.ledger
-            .lock()
-            .expect("ledger lock")
-            .entry(uuid)
-            .or_default()
-            .push((seg, off));
-        Ok((seg, off))
-    }
-
-    /// Free everything held by `uuid`. Idempotent: an unknown uuid frees
-    /// nothing. Returns the number of allocations released.
-    pub fn free_uuid(&self, uuid: u64) -> usize {
-        let allocs = self
-            .ledger
-            .lock()
-            .expect("ledger lock")
-            .remove(&uuid)
-            .unwrap_or_default();
-        let segments = self.segments.lock().expect("segments lock");
-        let mut n = 0;
-        for (seg, off) in allocs {
-            if segments.get(seg).is_some_and(|s| s.free(off)) {
-                n += 1;
-            }
-        }
-        n
     }
 
     /// Release one offset (embedder-tracked descriptors). Idempotent.
@@ -517,17 +477,4 @@ mod tests {
         assert!(matches!(a.reserve(500), Ok((0, 0))));
     }
 
-    #[test]
-    fn uuid_reclaim_is_grouped_and_idempotent() {
-        let base = name("uuid");
-        let mut a = SegmentedShmArena::create(&base, 4096, 4).unwrap();
-        a.reserve_for(7, 100).unwrap();
-        a.reserve_for(7, 100).unwrap(); // same uuid holds two allocations
-        a.reserve_for(8, 100).unwrap();
-        assert_eq!(a.free_uuid(7), 2);
-        assert_eq!(a.free_uuid(7), 0); // idempotent
-        assert_eq!(a.free_uuid(999), 0); // unknown uuid: no-op
-        assert_eq!(a.free_uuid(8), 1);
-        assert_eq!(a.segment(0).unwrap().bytes_free(), 4096);
-    }
 }
