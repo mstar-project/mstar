@@ -1,0 +1,30 @@
+# Qwen3-Omni soak mixture: heterogeneous multimodal inputs, text + audio outputs.
+# Exercises the SHM arena with varied tensor shapes (image / audio / video
+# encoder outputs of different sizes) at high concurrency — the "run (a)" soak.
+#
+#   python -m benchmark.long.soak --config benchmark/long/configs/qwen3omni.yaml \
+#       --url http://127.0.0.1:8000 --duration-s 7200 \
+#       --metrics-jsonl soak_qwen.jsonl
+
+model: qwen3omni
+system: ours                 # native /generate (streams text + audio chunks)
+rate: 8.0                    # Poisson arrivals/sec
+max_in_flight: 32            # admission cap (server-facing concurrency)
+duration_s: 7200             # 2h soak (override with --duration-s)
+request_timeout_s: 300
+pool_size: 64                # prompts/inputs materialised per entry
+window_s: 60                 # moving-average window
+report_interval_s: 15
+cache_dir: ./.soak_cache
+seed: 0
+
+requests:
+  # --- text/audio outputs (AR decode; steady tensor sizes) ---
+  - { req_type: text_to_speech,  dataset: seed_tts,  weight: 0.22 }
+  - { req_type: image_to_speech, dataset: food101,   weight: 0.15 }
+  - { req_type: audio_to_speech, dataset: libri,     weight: 0.13 }
+  - { req_type: video_to_speech, dataset: video_mme, weight: 0.10 }
+  # --- text outputs (understanding; heterogeneous encoder-output shapes) ---
+  - { req_type: image_to_text,   dataset: food101,   weight: 0.20 }
+  - { req_type: audio_to_text,   dataset: libri,     weight: 0.12 }
+  - { req_type: video_to_text,   dataset: video_mme, weight: 0.08 }

@@ -13,6 +13,7 @@ class RequestType(Enum):
     # Text input
     T2T = "text_to_text"
     T2I = "text_to_image"
+    T2V = "text_to_video"
     T2S = "text_to_speech"
 
     # Robotics
@@ -39,7 +40,7 @@ class RequestType(Enum):
             return "audio"
         if self == RequestType.VLA:
             return "action"
-        if self == RequestType.V2V:
+        if self in [RequestType.V2V, RequestType.T2V]:
             return "video"
         return "text"
 

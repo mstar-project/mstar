@@ -1,0 +1,39 @@
+# Cosmos3 large-tensor stress: image + video generation at varied resolutions.
+# The video tensors here are the largest single transfers in the suite — the
+# "run (b)" that drives pinned host bytes and /dev/shm toward the arena cap.
+# Lowest concurrency (video gen is the heaviest per request).
+#
+#   python -m benchmark.long.soak --config benchmark/long/configs/cosmos3.yaml \
+#       --url http://127.0.0.1:8000 --duration-s 3600 --metrics-jsonl soak_cosmos.jsonl
+#
+# Cosmos3 reads size ("WxH"), num_frames, num_inference_steps, fps, guidance_scale
+# from model_kwargs over /generate (mstar/model/cosmos3/cosmos3_model.py:621+).
+# cosmos3 is not a registered ModelType, so the harness drives it with a generic
+# passthrough model (empty defaults; resolution/steps come from model_kwargs).
+
+model: cosmos3
+system: ours
+rate: 0.5
+max_in_flight: 6
+duration_s: 3600
+request_timeout_s: 1800     # 720p video gen is slow
+pool_size: 32
+window_s: 120
+report_interval_s: 30
+cache_dir: ./.soak_cache
+seed: 0
+
+requests:
+  # --- image generation (t2i defaults to 50 steps) ---
+  - { req_type: text_to_image, dataset: text, weight: 0.25,
+      model_kwargs: { size: 512x512,  num_inference_steps: 50 } }
+  - { req_type: text_to_image, dataset: text, weight: 0.15,
+      model_kwargs: { size: 1024x1024, num_inference_steps: 50 } }
+
+  # --- video generation across resolution + length (the large tensors) ---
+  - { req_type: text_to_video, dataset: text, weight: 0.25, label: t2v-256p,
+      model_kwargs: { size: 320x192, num_frames: 17, num_inference_steps: 35, fps: 24 } }
+  - { req_type: text_to_video, dataset: text, weight: 0.20, label: t2v-480p,
+      model_kwargs: { size: 832x480, num_frames: 17, num_inference_steps: 35, fps: 24 } }
+  - { req_type: text_to_video, dataset: text, weight: 0.15, label: t2v-480p-long,
+      model_kwargs: { size: 832x480, num_frames: 33, num_inference_steps: 35, fps: 24 } }
