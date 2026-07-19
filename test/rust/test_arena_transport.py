@@ -276,3 +276,30 @@ def test_orphan_sweep(tmp_path):
                 os.unlink(f)
             except FileNotFoundError:
                 pass
+
+
+def test_dead_peer_segments_evicted(tmp_path):
+    """A consumer must not accumulate mappings for peer segments whose
+    backing file is gone (instance-unique names mean every producer restart
+    mints NEW names — a never-evicting cache leaks a generation of mappings
+    per restart)."""
+    prod = _manager("evp", tmp_path)
+    x = torch.arange(64, dtype=torch.uint8)
+    infos = prod.store_and_return_tensor_info("re", {"x": [x]})
+    prod.register_for_send("re", list(infos["x"]))
+    cons = _manager("evc", tmp_path)
+    edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
+    cons.start_read_tensors("re", [edge])
+    seg = infos["x"][0].shm_segment
+    assert seg in cons._peer_segments
+    cons.pending.clear()               # no in-flight reads
+    # Producer goes away gracefully: Drop unlinks its segments.
+    prod._cleanup_by_uuid("re", infos["x"][0].uuid)
+    del prod
+    import gc
+
+    gc.collect()
+    assert not os.path.exists(f"/dev/shm/{seg}")
+    cons._peer_evict_last = 0.0        # bypass the time gate
+    cons.start_read_tensors("re", [])  # triggers the eviction sweep
+    assert seg not in cons._peer_segments

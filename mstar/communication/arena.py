@@ -103,6 +103,23 @@ def _cudart():
     return _CUDART
 
 
+def _unpin(ptr: int) -> bool:
+    """cudaHostUnregister a previously pinned mapping (GIL released via
+    ctypes). Returns success."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        lib = _cudart()
+        import ctypes
+
+        lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+        lib.cudaHostUnregister.restype = ctypes.c_int
+        rc = lib.cudaHostUnregister(ptr)
+    except OSError:
+        rc = torch.cuda.cudart().cudaHostUnregister(ptr)
+    return rc == 0
+
+
 def _pin(ptr: int, nbytes: int) -> bool:
     """cudaHostRegister a mapped segment (idempotent). Returns success.
     GIL released for the duration (see ``_cudart``)."""
@@ -245,8 +262,15 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # (register_for_send receives the TensorPointerInfos directly and
         # stamps them in place — no side-table needed.)
         self._arena_locs: dict[str, tuple[int, int]] = {}
-        # Consumer-side: peer segment name -> (arena, memoryview).
-        self._peer_segments: dict[str, tuple[object, memoryview]] = {}
+        # Consumer-side: peer segment name -> (arena, memoryview,
+        # pinned_nbytes) — pinned_nbytes 0 when the segment wasn't pinned.
+        # Entries are EVICTED (unpin + unmap) once the backing file is gone
+        # (producer finished or restarted): with instance-unique names a
+        # restarting producer mints new names every generation, so a
+        # never-evicting cache would grow mappings and pinned bytes without
+        # bound on any long-lived consumer.
+        self._peer_segments: dict[str, tuple[object, memoryview, int]] = {}
+        self._peer_evict_last = 0.0
 
     # -- segments --------------------------------------------------------
 
@@ -338,10 +362,32 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         entry = self._peer_segments.get(segment_name)
         if entry is None:
             arena = self._ShmArena.open(segment_name)
+            before = self._pinned_bytes
             self._maybe_pin(*arena.ptr_len())
             entry = self._peer_segments[segment_name] = (
-                arena, memoryview(arena))
+                arena, memoryview(arena), self._pinned_bytes - before)
         return entry[1]
+
+    def _evict_dead_peers(self) -> None:
+        """Drop cached peer segments whose backing file is gone. Gated on
+        `self.pending` being empty: an mmap must outlive any in-flight h2d
+        copy that reads from it, and pending futures are exactly those
+        copies. Time-gated to keep the existence checks off the hot path."""
+        now = time.monotonic()
+        if self.pending or now - self._peer_evict_last < 10.0:
+            return
+        self._peer_evict_last = now
+        for name in list(self._peer_segments):
+            if os.path.exists(f"/dev/shm/{name}"):
+                continue
+            arena, view, pinned = self._peer_segments.pop(name)
+            view.release()
+            if pinned:
+                ptr, _len = arena.ptr_len()
+                if _unpin(ptr):
+                    self._pinned_bytes -= pinned
+            logger.debug("ARENA: evicted dead peer segment %s "
+                         "(%d MiB pinned released)", name, pinned >> 20)
 
     # -- producer ---------------------------------------------------------
 
@@ -460,6 +506,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self, request_id: str, graph_edges: list[GraphEdge],
         graph_walk: str | None = None,
     ):
+        self._evict_dead_peers()
         h2d_did_work = False
         read_edges: list[tuple[GraphEdge, float]] = []
         ctx = (
