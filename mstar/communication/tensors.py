@@ -657,8 +657,14 @@ class TensorCommunicationManager(ABC):
 
         final_ready: dict[str, list[GraphEdge]] = {}
         for req_id, edges in ready.items():
-            self._collect_and_send_acks(req_id, edges)
             seen_uuids = self.read_finished.setdefault(req_id, set())
+            # ACK only edges not already emitted once: a re-surfaced edge
+            # (re-delivery / retry) must not double-decrement the producer's
+            # refcount — that frees the slot while another consumer in the
+            # fanout may still hold the descriptor.
+            self._collect_and_send_acks(req_id, [
+                e for e in edges
+                if not any(i.uuid in seen_uuids for i in e.tensor_info)])
             rx_infos = self.req_rx_info.setdefault(req_id, {})
             for edge in edges:
                 if not edge.tensor_info:
