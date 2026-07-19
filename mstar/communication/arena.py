@@ -272,6 +272,18 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # (register_for_send receives the TensorPointerInfos directly and
         # stamps them in place — no side-table needed.)
         self._arena_locs: dict[str, tuple[int, int]] = {}
+        # uuid -> stage time, for the TTL backstop: a request aborted after
+        # staging but before every consumer ACKs defers reclaim forever
+        # (cleanup_request waits for ACKs that will never come). A slot
+        # older than the REQUEST timeout cannot have a legitimate reader —
+        # the request is dead by contract — so freeing past a bound safely
+        # above it cannot race a real consumer. Default OFF pending review
+        # discussion; enable with MSTAR_SHM_ARENA_SLOT_TTL_S (recommend
+        # >= 2x the request timeout).
+        self._arena_ts: dict[str, float] = {}
+        self._slot_ttl_s = float(
+            os.getenv("MSTAR_SHM_ARENA_SLOT_TTL_S", "0"))
+        self._ttl_reclaimed_total = 0
         # Consumer-side: peer segment name -> (arena, memoryview,
         # pinned_nbytes) — pinned_nbytes 0 when the segment wasn't pinned.
         # Entries are EVICTED (unpin + unmap) once the backing file is gone
@@ -373,6 +385,35 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             "pinned_bytes": self._pinned_bytes,
         }
 
+    def _reclaim_expired(self) -> int:
+        """TTL backstop for abort-orphaned slots (see _arena_ts). Returns
+        the number of slots/files reclaimed."""
+        if not self._slot_ttl_s:
+            return 0
+        now = time.monotonic()
+        n = 0
+        for uuid, ts in list(self._arena_ts.items()):
+            if now - ts < self._slot_ttl_s:
+                continue
+            self._arena_ts.pop(uuid, None)
+            if (loc := self._arena_locs.pop(uuid, None)) is not None:
+                self._arena.free(*loc)
+                n += 1
+            if (path := self._shm_files.pop(uuid, None)) is not None:
+                try:
+                    os.unlink(path)
+                    n += 1
+                except FileNotFoundError:
+                    pass
+        if n:
+            self._ttl_reclaimed_total += n
+            logger.warning(
+                "ARENA: TTL-reclaimed %d slot(s)/file(s) older than %.0fs "
+                "(%d total) — requests aborted without consumer ACKs; "
+                "the ACK path is leaking",
+                n, self._slot_ttl_s, self._ttl_reclaimed_total)
+        return n
+
     def _maybe_log_stats(self) -> None:
         """Under ``--log-stats`` (enable_prof), log the snapshot at most
         once per MSTAR_SHM_ARENA_STATS_INTERVAL_S so a long soak leaves an
@@ -383,6 +424,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         if now - self._stats_last < self._stats_interval_s:
             return
         self._stats_last = now
+        self._reclaim_expired()
         st = self.stats_summary()
         # live_slots/spill_files climbing while requests finish = reclaim
         # being deferred (e.g. aborts without ACKs) — the soak's leak canary.
@@ -454,6 +496,8 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             try:
                 seg, off = self._arena.reserve(max(nbytes, 1))
             except RuntimeError:
+                if self._reclaim_expired():
+                    continue   # expired slots freed: retry the reserve
                 total, free, largest = self._arena.stats()
                 if free >= nbytes and not self._frag_warned:
                     # The fragmentation signature: enough TOTAL free space,
@@ -522,6 +566,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     with open(path, "wb") as f:
                         f.write(data)
                     self._shm_files[uuid] = path
+                    self._arena_ts[uuid] = time.monotonic()
                     self.tensor_store.set_metadata(
                         request_id, uuid, mem_registered=True)
                     if self.enable_prof:
@@ -545,6 +590,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                             t, non_blocking=self._d2h_stream is not None)
                         queued = True
                     self._arena_locs[uuid] = (seg, off)
+                    self._arena_ts[uuid] = time.monotonic()
                 except BaseException:
                     # Anything that unwinds between reserve and the
                     # _arena_locs record would orphan the slot forever
@@ -724,6 +770,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # Grandparent cleanup (refcounts): skip the file manager's unlink.
         super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(
             request_id, uuid)
+        self._arena_ts.pop(uuid, None)
         if (loc := self._arena_locs.pop(uuid, None)) is not None:
             self._arena.free(*loc)
             logger.debug("ARENA: freed %s at %s", uuid, loc)

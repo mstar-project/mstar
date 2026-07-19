@@ -84,6 +84,15 @@ Communication
        ``PIN_MAX_MB x num_entities`` — a consumer pins peer segments too,
        so one process can pin more than its own arena holds. Segments
        past the budget stay unpinned: copies work, without async overlap.
+   * - ``MSTAR_SHM_ARENA_SLOT_TTL_S``
+     - ``0``
+     - TTL backstop for abort-orphaned slots (a request aborted after
+       staging but before all consumer ACKs defers reclaim forever).
+       A slot older than the request timeout cannot have a legitimate
+       reader, so a bound safely above it (recommend >= 2x the request
+       timeout) cannot race a real consumer. ``0`` disables (default,
+       pending review discussion); reclaims run under capacity pressure
+       and with the periodic stats sweep, logging loudly.
    * - ``MSTAR_SHM_ARENA_STATS_INTERVAL_S``
      - ``60``
      - Under ``--log-stats``: how often the arena logs its occupancy /
