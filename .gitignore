@@ -28,3 +28,8 @@ mstar/worker/ASYNC_REDESIGN.md
 # local AI-assistant context (kept local, not published — cf. vllm-omni)
 CLAUDE.md
 AGENTS.md
+mstar_traces/
+.claude/skills/
+
+# local golden-extraction harness (Kimi-K2.7 port dev tooling; not for main)
+tools/kimi_goldens/
