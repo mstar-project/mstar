@@ -9,6 +9,12 @@
 model: qwen3omni
 system: ours                 # native /generate (streams text + audio chunks)
 rate: 8.0                    # Poisson arrivals/sec
+rate_profile:
+  shape: square               # sine | square | triangle | ramp | piecewise
+  min: 1                      # trough λ (req/s)
+  max: 25                     # peak λ (drive this above what max_in_flight sustains)
+  period_s: 600               # one full cycle (sine/square/triangle)
+  duty: 0.5  
 max_in_flight: 32            # admission cap (server-facing concurrency)
 duration_s: 7200             # 2h soak (override with --duration-s)
 request_timeout_s: 300

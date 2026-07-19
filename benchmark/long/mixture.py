@@ -146,7 +146,14 @@ class ReqConfig:
 class SoakConfig:
     model: str
     system: str = "ours"  # "ours" (/generate) | "ours_openai" (/v1/*)
-    rate: float = 8.0  # Poisson arrival rate, requests/sec
+    rate: float = 8.0  # Poisson arrival rate, requests/sec (the constant/base rate)
+    # Optional time-varying arrival rate (non-homogeneous Poisson). Omit for a
+    # constant `rate`. Shapes: sine | square | triangle (cycle every period_s
+    # between min..max), ramp (one-shot min->max across duration_s, for a
+    # saturation-knee sweep), piecewise (linear interp over [[elapsed_s, rate], …]).
+    # A cycling load is what exposes drain/recover and the leak/fragmentation
+    # reset-to-baseline that a flat rate hides.
+    rate_profile: dict[str, Any] | None = None
     max_in_flight: int = 32  # admission cap (server-facing concurrency)
     duration_s: float = 3600.0
     request_timeout_s: float = 300.0
@@ -180,7 +187,7 @@ def load_config(path: str, overrides: dict[str, Any] | None = None) -> SoakConfi
 
     overrides = {k: v for k, v in (overrides or {}).items() if v is not None}
     known = {
-        "model", "system", "rate", "max_in_flight", "duration_s",
+        "model", "system", "rate", "rate_profile", "max_in_flight", "duration_s",
         "request_timeout_s", "pool_size", "cache_dir", "report_interval_s",
         "window_s", "warmup_s", "seed",
     }
@@ -190,6 +197,14 @@ def load_config(path: str, overrides: dict[str, Any] | None = None) -> SoakConfi
     merged = {**raw, **overrides}
     if "model" not in merged:
         raise ValueError(f"{path}: 'model' is required")
+
+    profile = merged.get("rate_profile")
+    if profile is not None:
+        shape = profile.get("shape", "constant")
+        valid = {"constant", "sine", "square", "triangle", "ramp", "piecewise"}
+        if shape not in valid:
+            raise ValueError(
+                f"{path}: rate_profile.shape {shape!r} not in {sorted(valid)}")
 
     cfg = SoakConfig(**merged)
 
