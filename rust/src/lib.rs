@@ -264,21 +264,24 @@ impl PySegmentedShmArena {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    fn free(&self, segment: usize, offset: usize) -> bool {
-        self.arena.free(segment, offset)
+    /// GIL released: growth (in `reserve`) holds the segments mutex
+    /// across an mmap for milliseconds; blocking on that mutex with the
+    /// GIL held would freeze every Python thread for the duration.
+    fn free(&self, py: Python<'_>, segment: usize, offset: usize) -> bool {
+        py.allow_threads(|| self.arena.free(segment, offset))
     }
 
     #[getter]
-    fn num_segments(&self) -> usize {
-        self.arena.num_segments()
+    fn num_segments(&self, py: Python<'_>) -> usize {
+        py.allow_threads(|| self.arena.num_segments())
     }
 
     /// `(total_bytes, free_bytes, largest_free_block)` across all segments.
     /// `largest_free_block` collapsing while `free_bytes` stays high is the
     /// fragmentation signature (allocations fail / segments grow despite
     /// healthy total free space).
-    fn stats(&self) -> (usize, usize, usize) {
-        self.arena.stats()
+    fn stats(&self, py: Python<'_>) -> (usize, usize, usize) {
+        py.allow_threads(|| self.arena.stats())
     }
 
     fn segment_name(&self, i: usize) -> String {

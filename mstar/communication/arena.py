@@ -193,6 +193,15 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # the worker's eventfd wakes the moment reads finish (no 10 ms tick).
         self._wake_q: queue.Queue | None = None
         self._wake_lock = threading.Lock()
+        # Serializes pin accounting and peer-map insertion: _pin releases
+        # the GIL (ctypes), so unlocked read-modify-write of _pinned_bytes
+        # tears, and check-then-insert on _peer_segments can map+pin the
+        # same segment twice (the loser leaking forever).
+        self._pin_lock = threading.Lock()
+        # Concurrent start_read_tensors calls (threaded api-server): used to
+        # keep eviction from unmapping a segment another thread is copying
+        # from before its future lands in `pending`.
+        self._reads_active = 0
         # Periodic occupancy/fragmentation logging, tied to --log-stats
         # (enable_prof) and time-gated.
         self._stats_interval_s = float(
@@ -213,6 +222,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             shm_avail = st.f_frsize * st.f_bavail
         except OSError:
             shm_total = shm_avail = None
+        self._shm_total = shm_total
         if shm_total is not None:
             if per_entity_max > shm_total:
                 raise RuntimeError(
@@ -299,12 +309,19 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             except OSError as e:
                 logger.debug("ARENA: cannot sweep %s: %s", name, e)
 
-    def _maybe_pin(self, ptr: int, nbytes: int) -> None:
+    def _maybe_pin(self, ptr: int, nbytes: int) -> int:
+        """Pin within budget; returns the bytes actually pinned (0 if
+        skipped/failed). Runs under _pin_lock: _pin releases the GIL, so
+        budget check + register + accounting must be one atomic unit."""
         # Oversized dedicated segments ARE pinned (within budget): freed
         # segments are reused for later large tensors, so the registration
         # amortizes over the segment's lifetime, not one transfer.
         if not self._pin_segments:
-            return
+            return 0
+        with self._pin_lock:
+            return self._pin_locked(ptr, nbytes)
+
+    def _pin_locked(self, ptr: int, nbytes: int) -> int:
         if self._pinned_bytes + nbytes > self._pin_budget:
             if not self._pin_budget_warned:
                 logger.warning(
@@ -313,10 +330,12 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     "unpinned — copies work but lose async overlap",
                     self._pin_budget >> 20)
                 self._pin_budget_warned = True
-            return
+            return 0
         if _pin(ptr, nbytes):
             self._pinned_bytes += nbytes
             self._pinned_segments += 1
+            return nbytes
+        return 0
 
     def _sync_segments(self) -> None:
         grew = False
@@ -327,6 +346,14 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             grew = True
         if grew:
             total, free, largest = self._arena.stats()
+            if (self._shm_total is not None
+                    and total > self._shm_total * 0.8):
+                logger.warning(
+                    "ARENA: this entity's segments now total %d MiB — over "
+                    "80%% of /dev/shm (%d MiB). Oversized dedicated "
+                    "segments grow past the static ceiling; other entities "
+                    "multiply this further.",
+                    total >> 20, self._shm_total >> 20)
             logger.info(
                 "ARENA: grew to %d segments (%d MiB total, %d MiB free, "
                 "largest free block %d MiB, %d MiB pinned)",
@@ -356,16 +383,24 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         if now - self._stats_last < self._stats_interval_s:
             return
         self._stats_last = now
-        logger.info("ARENA stats: %s", self.stats_summary())
+        st = self.stats_summary()
+        # live_slots/spill_files climbing while requests finish = reclaim
+        # being deferred (e.g. aborts without ACKs) — the soak's leak canary.
+        st["live_slots"] = len(self._arena_locs)
+        st["spill_files"] = len(self._shm_files)
+        logger.info("ARENA stats: %s", st)
 
     def _peer_view(self, segment_name: str) -> memoryview:
         entry = self._peer_segments.get(segment_name)
         if entry is None:
-            arena = self._ShmArena.open(segment_name)
-            before = self._pinned_bytes
-            self._maybe_pin(*arena.ptr_len())
-            entry = self._peer_segments[segment_name] = (
-                arena, memoryview(arena), self._pinned_bytes - before)
+            with self._pin_lock:
+                entry = self._peer_segments.get(segment_name)
+                if entry is None:   # lost the race: another thread mapped it
+                    arena = self._ShmArena.open(segment_name)
+                    pinned = (self._pin_locked(*arena.ptr_len())
+                              if self._pin_segments else 0)
+                    entry = self._peer_segments[segment_name] = (
+                        arena, memoryview(arena), pinned)
         return entry[1]
 
     def _evict_dead_peers(self) -> None:
@@ -374,18 +409,32 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         copy that reads from it, and pending futures are exactly those
         copies. Time-gated to keep the existence checks off the hot path."""
         now = time.monotonic()
-        if self.pending or now - self._peer_evict_last < 10.0:
+        # _reads_active > 1: another thread may have queued an async H2D
+        # copy whose future hasn't reached `pending` yet — unmapping under
+        # it would be a use-after-free. Only the sole active reader evicts.
+        if (self.pending or self._reads_active > 1
+                or now - self._peer_evict_last < 10.0):
             return
         self._peer_evict_last = now
         for name in list(self._peer_segments):
             if os.path.exists(f"/dev/shm/{name}"):
                 continue
-            arena, view, pinned = self._peer_segments.pop(name)
-            view.release()
-            if pinned:
-                ptr, _len = arena.ptr_len()
-                if _unpin(ptr):
+            with self._pin_lock:
+                arena, view, pinned = self._peer_segments[name]
+                if pinned:
+                    # Unregister BEFORE unmapping: tearing down a mapping
+                    # CUDA still holds registered leaves a dangling pinned
+                    # range. On failure keep the entry (retry next sweep)
+                    # so accounting stays truthful.
+                    ptr, _len = arena.ptr_len()
+                    if not _unpin(ptr):
+                        logger.warning(
+                            "ARENA: cudaHostUnregister failed for dead peer "
+                            "%s; keeping mapping until it succeeds", name)
+                        continue
                     self._pinned_bytes -= pinned
+                del self._peer_segments[name]
+            view.release()
             logger.debug("ARENA: evicted dead peer segment %s "
                          "(%d MiB pinned released)", name, pinned >> 20)
 
@@ -457,6 +506,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 t = tensor.detach().contiguous()
                 nbytes = t.numel() * t.element_size()
                 loc = self._reserve(nbytes)
+                if loc is not None and self.tensor_store.is_registered(
+                        request_id, uuid):
+                    # Lost a concurrent-duplicate race: another thread
+                    # registered this uuid while our reserve released the
+                    # GIL. Return our slot instead of orphaning it.
+                    self._arena.free(*loc)
+                    continue
                 if loc is None:
                     # Arena saturated: spill THIS tensor to the per-uuid file
                     # protocol (infos keep shm_segment=None — the consumer
@@ -475,16 +531,26 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                                  uuid, path, len(data))
                     continue
                 seg, off = loc
-                if nbytes:
-                    host = torch.frombuffer(
-                        self._seg_views[seg][off:off + nbytes],
-                        dtype=torch.uint8,
-                    ).view(t.dtype).reshape(t.shape)
-                    # Async D2H into the pinned segment; one stream sync
-                    # below covers the batch.
-                    host.copy_(t, non_blocking=True)
-                    queued = True
-                self._arena_locs[uuid] = (seg, off)
+                try:
+                    if nbytes:
+                        host = torch.frombuffer(
+                            self._seg_views[seg][off:off + nbytes],
+                            dtype=torch.uint8,
+                        ).view(t.dtype).reshape(t.shape)
+                        # Async D2H into the pinned segment when a copy
+                        # stream exists (one sync below covers the batch);
+                        # blocking otherwise, so the descriptor can never
+                        # ship ahead of the bytes.
+                        host.copy_(
+                            t, non_blocking=self._d2h_stream is not None)
+                        queued = True
+                    self._arena_locs[uuid] = (seg, off)
+                except BaseException:
+                    # Anything that unwinds between reserve and the
+                    # _arena_locs record would orphan the slot forever
+                    # (cleanup can only free what is recorded).
+                    self._arena.free(seg, off)
+                    raise
                 seg_name = self._arena.segment_name(seg)
                 info_arg.shm_segment = seg_name
                 info_arg.shm_offset = off
@@ -506,6 +572,16 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self, request_id: str, graph_edges: list[GraphEdge],
         graph_walk: str | None = None,
     ):
+        # Increment races are benign here: a torn count can only make
+        # eviction OVER-cautious (skip a sweep), never unsafe.
+        self._reads_active += 1
+        try:
+            return self._start_read_tensors(request_id, graph_edges,
+                                            graph_walk)
+        finally:
+            self._reads_active -= 1
+
+    def _start_read_tensors(self, request_id, graph_edges, graph_walk):
         self._evict_dead_peers()
         h2d_did_work = False
         read_edges: list[tuple[GraphEdge, float]] = []
@@ -587,22 +663,38 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         with self._wake_lock:   # two callers must not race the create
             if self._wake_q is None:
                 self._wake_q = queue.Queue()
+                # staticmethod target closing over ONLY the queue: a bound
+                # method would pin the whole manager (and its arena — so
+                # segments never unlink) for the daemon thread's lifetime.
                 threading.Thread(
-                    target=self._watch_wakes, daemon=True,
+                    target=self._watch_wakes, args=(self._wake_q,),
+                    daemon=True,
                     name=f"arena-h2d-wake-{self.my_entity_id}").start()
         fut: Future = Future()
         self._wake_q.put((cuda_future, fut))
         return fut
 
-    def _watch_wakes(self) -> None:
+    @staticmethod
+    def _watch_wakes(q: queue.Queue) -> None:
         # Events are queued in stream order, so sequential waits are exact.
+        # None is the close() sentinel.
         while True:
-            cuda_future, fut = self._wake_q.get()
+            item = q.get()
+            if item is None:
+                return
+            cuda_future, fut = item
             try:
                 cuda_future.result()   # event.synchronize (GIL released)
-            except Exception:          # noqa: BLE001 — wake regardless
-                pass
-            fut.set_result(None)
+                fut.set_result(None)
+            except Exception:          # noqa: BLE001 — wake best-effort;
+                # a cancelled/already-resolved future must not kill the
+                # watcher (its death silently downgrades every later wake
+                # to the poll tick and grows the queue unboundedly).
+                if not fut.done():
+                    try:
+                        fut.set_result(None)
+                    except Exception:  # noqa: BLE001
+                        pass
 
     def _read_from_arena(self, info: TensorPointerInfo) -> torch.Tensor:
         if info.nbytes == 0:
@@ -619,6 +711,14 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         return t.clone()  # CPU consumer: own the bytes past reclaim
 
     # -- reclaim ----------------------------------------------------------
+
+    def close(self) -> None:
+        """Stop the wake watcher (segments/pins release with the arena's
+        Drop once the manager is garbage collected)."""
+        with self._wake_lock:
+            if self._wake_q is not None:
+                self._wake_q.put(None)
+                self._wake_q = None
 
     def _cleanup_by_uuid(self, request_id: str, uuid: str):
         # Grandparent cleanup (refcounts): skip the file manager's unlink.
