@@ -1,0 +1,12 @@
+model: "kimi_k2_7"
+# Kimi-K2.7 text backbone (DeepSeek-V3). This single-GPU config (tp_size 1) is the
+# bring-up / reduced-model deployment. The real 1T-param MoE needs TP8 across a
+# node — set `ranks: [0,1,2,3,4,5,6,7]` and `tp_size: 8` — and, being >1 GPU, the
+# single-node tensor transport TENSOR_PROTOCOL=SHM (or TCP; never RDMA on
+# coriander). One KV_CACHE LLM node with the prefill + decode(Loop) walks.
+max_seq_len: 262144
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]
+    tp_size: 1
+    graph_walks: [prefill, decode]
