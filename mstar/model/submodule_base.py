@@ -199,6 +199,13 @@ class ModelInputsFromEngine:
     # The batch's per-request states, injected by the engine (None on paths
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
     per_request_states: dict[str, PerRequestState] | None = None
+    # Under CUDA-graph replay ``request_ids`` holds the fixed capture-slot
+    # placeholders (``dummy_rids``), not the live request ids. Submodules that
+    # own per-request state keyed by real id (e.g. Zonos2's sampler buffers)
+    # need the real ids to gather that state before replay; the runner sets
+    # this to the real ids (length ``real_bs``) on the captured path. ``None``
+    # on the eager paths, where ``request_ids`` is already the real list.
+    real_request_ids: list[str] | None = None
     # Request ids whose consumed streaming input was the final chunk (producer
     # done, buffer drained). Lets streaming-codec nodes flush per-request tail
     # state (e.g. a vocoder's withheld crossfade tail) on the last call.
