@@ -74,7 +74,6 @@ def test_reclaim_frees_arena_slots(tmp_path):
     assert prod._arena_locs
     prod._cleanup_by_uuid("r2", info.uuid)
     assert not prod._arena_locs
-    assert not prod._infos_by_uuid
 
 
 def test_arena_grows_then_spills(tmp_path):
@@ -238,3 +237,42 @@ def test_factory_flag(tmp_path, monkeypatch):
     assert type(make("AUTO")) is ArenaShmCommunicationManager
     with pytest.raises(ValueError):
         make("yes")
+
+
+def test_instance_unique_names_no_collision(tmp_path):
+    """Two servers with the SAME entity id must not share /dev/shm names —
+    a fixed name would let the second create() truncate the first's live
+    segments (silent corruption, observed on a shared cluster)."""
+    a = _manager("dup", tmp_path)
+    x = torch.arange(64, dtype=torch.uint8)
+    infos = a.store_and_return_tensor_info("r", {"x": [x]})
+    a.register_for_send("r", list(infos["x"]))
+    b = _manager("dup", tmp_path)   # same entity id, second instance
+    assert b._arena.segment_name(0) != a._arena.segment_name(0)
+    # a's staged data survives b's creation; the descriptor still resolves.
+    cons = _manager("dupc", tmp_path)
+    edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
+    cons.start_read_tensors("r", [edge])
+    assert torch.equal(
+        cons.tensor_store.get_tensor("r", infos["x"][0].uuid), x)
+
+
+def test_orphan_sweep(tmp_path):
+    """A SIGKILLed server's segments (owner pid gone) are reclaimed by the
+    next construction's sweep; live owners' files are left alone."""
+    dead = "/dev/shm/mstar_arena_zombie_999999999_deadbeef.seg0"
+    keep = f"/dev/shm/mstar_arena_alive_{os.getpid()}_cafebabe.seg0"
+    with open(dead, "wb") as f:
+        f.write(b"x" * 64)
+    with open(keep, "wb") as f:
+        f.write(b"x")
+    try:
+        _manager("sweeper", tmp_path)
+        assert not os.path.exists(dead), "dead-owner orphan not swept"
+        assert os.path.exists(keep), "live-owner file wrongly swept"
+    finally:
+        for f in (dead, keep):
+            try:
+                os.unlink(f)
+            except FileNotFoundError:
+                pass

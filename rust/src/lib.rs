@@ -264,20 +264,6 @@ impl PySegmentedShmArena {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Reserve and record under `uuid` (uuid-grouped reclaim). GIL released
-    /// (same growth path as `reserve`).
-    fn reserve_for(&self, py: Python<'_>, uuid: u64, nbytes: usize) -> PyResult<(usize, usize)> {
-        py.allow_threads(|| self.arena.reserve_for(uuid, nbytes))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Free everything held by `uuid` (idempotent); returns count released.
-    /// GIL released: one uuid can hold many allocations (multi-tensor
-    /// requests), each a lock + free-list merge.
-    fn free_uuid(&self, py: Python<'_>, uuid: u64) -> usize {
-        py.allow_threads(|| self.arena.free_uuid(uuid))
-    }
-
     fn free(&self, segment: usize, offset: usize) -> bool {
         self.arena.free(segment, offset)
     }
