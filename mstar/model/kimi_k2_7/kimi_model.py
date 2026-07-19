@@ -70,8 +70,26 @@ class KimiK2Model(Model):
         **kwargs,
     ):
         self.cache_dir = cache_dir
-        self.model_path_hf = model_path_hf
-        self.config = KimiK2Config()
+        # ``model_kwargs`` from the serving YAML arrive here as ``**kwargs`` (see
+        # api_server/entrypoint.py). They let a config redirect this model at a
+        # local (reduced/synthetic) checkpoint without touching the shared
+        # registry, so a runnable text serve is possible before the 1T weights
+        # exist. All three are optional and default to the full-size behaviour.
+        #   * ``checkpoint_path`` — local HF-format dir/file to load instead of
+        #     the ``HF_MODELS`` repo id (used as-is by ``_resolve_checkpoint``).
+        #   * ``config_variant`` — ``"reduced"`` selects ``KimiK2Config.reduced()``
+        #     (tiny, GPU-runnable shape); anything else keeps the 1T config.
+        #   * ``tokenizer_mode`` — ``"byte"`` swaps the HF tokenizer for a trivial
+        #     UTF-8 byte identity tokenizer, the pragmatic fit for the reduced
+        #     ``vocab_size=256`` model (the real Kimi tokenizer emits ids ≫ 256).
+        checkpoint_path = kwargs.get("checkpoint_path")
+        self.model_path_hf = checkpoint_path or model_path_hf
+        self._config_variant = kwargs.get("config_variant", "full")
+        if self._config_variant == "reduced":
+            self.config = KimiK2Config.reduced()
+        else:
+            self.config = KimiK2Config()
+        self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         # Tokenizer is loaded lazily: the modular (dummy-mode) tests build the
         # model via ``object.__new__`` and never call ``__init__``, so we avoid
         # forcing a network/tokenizer dependency into the scaffold path.
@@ -262,6 +280,15 @@ class KimiK2Model(Model):
         # Text-only for M0; raw multimodal tensors (MoonViT) are a later milestone.
         if prompt is None:
             return {}
+        if self._tokenizer_mode == "byte":
+            # Trivial UTF-8 byte identity tokenizer for the reduced vocab_size=256
+            # serve: each prompt byte is already a valid token id in [0, 256), so
+            # no HF tokenizer / network dependency is needed. Clamped defensively
+            # in case a smaller reduced vocab is ever used.
+            vocab = self.config.vocab_size
+            byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
+            input_ids = torch.tensor(byte_ids, dtype=torch.long)
+            return {"text_inputs": [input_ids]}
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
         return {"text_inputs": [input_ids]}
 
@@ -290,6 +317,13 @@ class KimiK2Model(Model):
     ) -> bytes:
         if modality == "text":
             token_ids = output.tolist() if output.numel() else []
+            if self._tokenizer_mode == "byte":
+                # Inverse of the byte identity tokenizer: reduced-vocab ids map
+                # straight back to raw bytes. The synthetic model emits arbitrary
+                # ids in [0, 256), so the bytes are not guaranteed valid UTF-8 —
+                # decode leniently (the point is to prove tokens stream, not to
+                # produce meaningful text on random weights).
+                return bytes((t & 0xFF) for t in token_ids)
             text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
             return text.encode("utf-8")
         raise ValueError(f"Unsupported modality for Kimi-K2.7: {modality!r}")

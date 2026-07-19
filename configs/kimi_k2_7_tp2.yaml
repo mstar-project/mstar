@@ -1,0 +1,39 @@
+model: "kimi_k2_7"
+# Kimi-K2.7 text backbone — REDUCED / synthetic TP=2 repro config (Phase 3 gap-3
+# TP correctness). Same tiny synthetic model as kimi_k2_7_repro.yaml, but the LLM
+# node runs tensor-parallel across 2 ranks so the MLA head-shard + MoE
+# intermediate-shard paths execute end-to-end. NOT a real deployment — the 1T
+# model needs TP8 / multi-node (see kimi_k2_7.yaml).
+#
+# `model_kwargs` (forwarded to KimiK2Model.__init__) redirect this model at a
+# local synthetic checkpoint + reduced config + a trivial byte tokenizer:
+#   * config_variant: reduced   -> KimiK2Config.reduced() (vocab 256, 2 layers,
+#                                   4 attention heads -> 2/rank, moe_inter 64 -> 32/rank)
+#   * checkpoint_path            -> the dir written by
+#                                   tools/kimi_goldens/make_repro_checkpoint.py
+#   * tokenizer_mode: byte       -> UTF-8 byte identity tokenizer (ids in [0,256))
+#
+# Generate the checkpoint first (writes tools/kimi_goldens/repro/checkpoint, which
+# is gitignored):
+#   python tools/kimi_goldens/make_repro_checkpoint.py
+# `checkpoint_path` is relative to the mstar package root — run `mstar-serve` from
+# there. Make it absolute if you launch from elsewhere.
+#
+# On this cluster (coriander) RDMA is unavailable, so launch with a non-RDMA
+# tensor transport, e.g. TENSOR_PROTOCOL=SHM (single node) — see mstar/.sample.env.
+max_seq_len: 512
+model_kwargs:
+  config_variant: reduced
+  checkpoint_path: tools/kimi_goldens/repro/checkpoint
+  tokenizer_mode: byte
+kv_cache:
+  max_num_pages: 256
+  page_size: 128
+# The LLM node is the tensor-parallel node (mirrors configs/orpheus_tp2.yaml):
+# ranks [0, 1] with tp_size 2 for both the prefill and decode walks. The model
+# code is TP-agnostic — the per-rank shard degree comes from here.
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2
+    graph_walks: [prefill, decode]

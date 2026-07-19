@@ -56,7 +56,13 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
 
-    # -- CUDA-graph capture buckets (mirror OrpheusLLMSubmodule) ------------
+    # -- CUDA-graph prefill capture grid (full-size defaults) --------------
+    # Overridable per-config via ``config.prefill_token_buckets`` /
+    # ``config.prefill_capture_batch_sizes``: ``KimiK2Config.reduced()`` sets a
+    # tiny grid for the synthetic bring-up serve, while the full model leaves them
+    # ``None`` and uses these defaults. Capturing the full 6x5 compiled grid is
+    # slow, and buckets above a small model's ``max_position_embeddings`` do not
+    # fit — hence the reduced config trims it (config-driven, not env-driven).
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
@@ -88,9 +94,13 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         above. ``inv_freq`` is lazily cached on first (warmup) forward, so its
         address is stable across replay.
         """
+        prefill_buckets = self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS
+        prefill_batch_sizes = (
+            self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
+        )
         prefill_packed = {
             num_tokens: self._build_prefill_packed(num_tokens, device)
-            for num_tokens in self.PREFILL_TOKEN_BUCKETS
+            for num_tokens in prefill_buckets
         }
         return [
             BasicBatchedCudaGraphConfig(
@@ -110,7 +120,7 @@ class KimiLLMSubmodule(ARNodeSubmodule):
                 labels=[_MAIN],
                 compile=True,
                 causal_attention=True,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                capture_batch_sizes=prefill_batch_sizes,
             ),
         ]
 

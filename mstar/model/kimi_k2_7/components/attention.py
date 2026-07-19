@@ -23,8 +23,11 @@ Dv=v_head_dim, L=kv_lora_rank):
 
 Cache config for this node: ``num_kv_heads == num_qo_heads == num_attention_heads``,
 ``head_dim == padded_head_dim`` (256 for the real Dqk=192, 64 for the reduced
-Dqk=24). Weight-absorbed MLA (native latent dims, no pad) and the
-``fused_qkv_a_proj`` weight fusion are deferred to the perf backlog.
+Dqk=24). Under tensor parallelism each rank materializes only its
+``num_attention_heads // tp_size`` local heads (K/V and Q both shard on the head
+axis — there is no separate KV-head group in the naive path), and the paged cache
+reports the matching per-rank count. Weight-absorbed MLA (native latent dims, no
+pad) and the ``fused_qkv_a_proj`` weight fusion are deferred to the perf backlog.
 """
 from __future__ import annotations
 
@@ -50,8 +53,27 @@ class KimiMLAAttention(nn.Module):
         if comm_group is None:
             comm_group = CommGroup.trivial()
 
-        # TODO(M6): shard num_heads across TP; naive path assumes local == total.
-        self.num_heads = config.num_attention_heads
+        # MLA shards on the head dim under TP, mirroring vLLM
+        # ``DeepseekV2MLAAttention``: the query/kv UP-projections (``q_b_proj`` /
+        # ``kv_b_proj``) are ColumnParallel and ``o_proj`` is RowParallel, so each
+        # rank owns a contiguous block of ``num_heads // tp_size`` attention heads.
+        # The latent DOWN-projections (``q_a_proj`` / ``kv_a_proj_with_mqa``) and
+        # their RMSNorms are REPLICATED (small shared latent, no head structure).
+        # ``num_heads`` below is this rank's LOCAL head count used for every
+        # forward reshape / RoPE / pad / run_attention; the parallel linears are
+        # given the TOTAL width and divide by tp_size internally, and their
+        # per-rank ``weight_loader`` slices this rank's head block — so one weight
+        # path serves tp=1 and tp>1. The paged cache reports the matching per-rank
+        # head count: ``KVCacheConfig.shard`` divides ``num_qo/kv_heads`` by the
+        # node's instance world size (tp*sp), exactly like the Orpheus TP path.
+        self.tp_size = comm_group.world_size
+        self.total_num_heads = config.num_attention_heads
+        if self.total_num_heads % self.tp_size != 0:
+            raise ValueError(
+                f"num_attention_heads={self.total_num_heads} is not divisible by "
+                f"tp_size={self.tp_size}"
+            )
+        self.num_heads = self.total_num_heads // self.tp_size
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.qk_head_dim = config.qk_head_dim
@@ -61,7 +83,9 @@ class KimiMLAAttention(nn.Module):
         # zero-padded to this width for the paged run_attention (M6 mitigation);
         # the attention output is sliced back to v_head_dim. See config docstring.
         self.padded_head_dim = config.padded_head_dim
-        h = self.num_heads
+        # Parallel linears take the TOTAL head width (they divide by tp_size);
+        # the forward uses ``self.num_heads`` (local).
+        h = self.total_num_heads
 
         # Q: two-stage low-rank (q_a down -> norm -> q_b up). Down-projections are
         # replicated (small rank); up-projections shard over heads under TP.
