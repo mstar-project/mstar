@@ -303,3 +303,23 @@ def test_dead_peer_segments_evicted(tmp_path):
     cons._peer_evict_last = 0.0        # bypass the time gate
     cons.start_read_tensors("re", [])  # triggers the eviction sweep
     assert seg not in cons._peer_segments
+
+
+def test_ttl_backstop_reclaims_abort_orphans(tmp_path):
+    """A slot staged but never ACKed (abort) is force-freed once older
+    than MSTAR_SHM_ARENA_SLOT_TTL_S, letting a full arena recover instead
+    of spilling forever. Off by default."""
+    os.environ["MSTAR_SHM_ARENA_SLOT_TTL_S"] = "0.05"
+    try:
+        prod = _manager("wt", tmp_path)
+        infos = prod.store_and_return_tensor_info(
+            "rt", {"x": [torch.zeros(300_000, dtype=torch.uint8)]})
+        prod.register_for_send("rt", list(infos["x"]))
+        assert prod._arena_locs
+        import time as _t
+
+        _t.sleep(0.06)
+        assert prod._reclaim_expired() >= 1
+        assert not prod._arena_locs
+    finally:
+        del os.environ["MSTAR_SHM_ARENA_SLOT_TTL_S"]
