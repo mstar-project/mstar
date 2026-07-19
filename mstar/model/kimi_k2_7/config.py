@@ -87,6 +87,14 @@ class KimiK2Config:
     # -- MTP (multi-token prediction) — deferred, declared for completeness -
     num_nextn_predict_layers: int = 0
 
+    # -- Serving: CUDA-graph prefill capture grid (optional overrides) ------
+    # ``None`` => ``KimiLLMSubmodule`` uses its full-size class-default grid.
+    # ``reduced()`` sets a tiny grid so the synthetic bring-up serve captures a
+    # single short-prompt graph instead of the full 6x5 compiled grid (this was
+    # an env knob during bring-up; it now lives in the config).
+    prefill_token_buckets: list[int] | None = None
+    prefill_capture_batch_sizes: list[int] | None = None
+
     # ---------------------------------------------------------------------
     # Derived dims (read by get_kv_cache_config / attention)
     # ---------------------------------------------------------------------
@@ -148,4 +156,10 @@ class KimiK2Config:
             n_group=1,
             topk_group=1,
             first_k_dense_replace=1,
+            # Tiny CUDA-graph prefill capture grid for the synthetic bring-up serve:
+            # one short-prompt bucket at batch size 1 (the full 6x5 grid is slow and
+            # its larger buckets exceed this 512-token model). Serve/CUDA-graph path
+            # only — the golden tests call forward() directly and are unaffected.
+            prefill_token_buckets=[64],
+            prefill_capture_batch_sizes=[1],
         )

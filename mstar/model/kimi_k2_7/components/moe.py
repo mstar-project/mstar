@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.distributed.utils import divide
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.components.moe import (
     _dispatch,
@@ -158,9 +159,26 @@ class KimiSparseMoeBlock(nn.Module):
     ``shared`` is a plain dense SwiGLU MLP added ungated (no sigmoid gate, no
     ``routed_scaling_factor``).
 
-    Expert weights use the fused layout reused from ``model.components.moe``:
-      - ``experts.gate_up_proj``: ``(E, 2 * moe_intermediate_size, hidden)``
-      - ``experts.down_proj``:   ``(E, hidden, moe_intermediate_size)``
+    **TP sharding (intermediate-parallel).** Under tensor parallelism the router
+    (:class:`KimiMoEGate`) stays REPLICATED — every rank computes the full
+    ``(top_k_ids, weights)`` — and only the expert GEMMs shard, exactly like
+    mstar's own ``ParallelSparseMoeBlock``: each rank holds every expert but only
+    a ``moe_intermediate_size // tp_size`` slice of its SwiGLU intermediate
+    (``gate_up_proj`` column-parallel, ``down_proj`` row-parallel). The per-rank
+    partial hidden contributions are summed with a single all-reduce before the
+    top-k sum-reduce. The shared expert is a ``ParallelGatedMLP`` on the same comm
+    group, so it shards its intermediate and all-reduces internally. This reuses
+    the existing fused-expert machinery verbatim and is trivially goldenable
+    (tp>1 == tp=1). Its tradeoff: every rank still stores ALL experts' weights, so
+    it does NOT reduce per-rank expert memory — the 1T fit needs true
+    token-dispatch expert parallelism (all-to-all), which is a Phase-4 concern and
+    is deliberately not built here.
+
+    Expert weights use the fused layout reused from ``model.components.moe``,
+    sharded to this rank (``full == moe_intermediate_size``,
+    ``shard == full // tp_size``):
+      - ``experts.gate_up_proj``: ``(E, 2 * shard, hidden)``
+      - ``experts.down_proj``:   ``(E, hidden, shard)``
     """
 
     def __init__(
@@ -170,9 +188,13 @@ class KimiSparseMoeBlock(nn.Module):
         if comm_group is None:
             comm_group = CommGroup.trivial()
         self.comm_group = comm_group
+        self.tp_size = comm_group.world_size
+        self.tp_rank = comm_group.rank
         self.hidden_size = config.hidden_size
         self.num_experts = config.n_routed_experts
         self.moe_intermediate_size = config.moe_intermediate_size
+        # Per-rank slice of each expert's SwiGLU intermediate (== full at tp=1).
+        shard_inter = divide(config.moe_intermediate_size, self.tp_size)
 
         self.gate = KimiMoEGate(
             hidden_size=config.hidden_size,
@@ -190,7 +212,7 @@ class KimiSparseMoeBlock(nn.Module):
         self.experts.gate_up_proj = nn.Parameter(
             torch.empty(
                 config.n_routed_experts,
-                2 * config.moe_intermediate_size,
+                2 * shard_inter,
                 config.hidden_size,
             )
         )
@@ -198,15 +220,16 @@ class KimiSparseMoeBlock(nn.Module):
             torch.empty(
                 config.n_routed_experts,
                 config.hidden_size,
-                config.moe_intermediate_size,
+                shard_inter,
             )
         )
         # The fused expert params are plain nn.Parameters, so they carry no
         # per-shard ``weight_loader`` by default. The M5 stacked-param rules route
         # each checkpoint expert via a ``"gate:N"/"up:N"/"down:N"`` shard id, so we
         # attach the same fused-expert loaders ``ParallelSparseMoeBlock`` uses.
-        # Experts are held full-size here (no expert/TP sharding yet — TODO(M6)),
-        # hence ``tp_rank=0, tp_size=1`` and ``full_inter == moe_intermediate_size``.
+        # The loaders take ``(tp_rank, tp_size, full_inter)`` and slice this rank's
+        # intermediate stripe out of the full-size checkpoint expert — so a single
+        # weight path serves tp=1 (full) and tp>1 (sharded).
         self._attach_expert_weight_loaders()
 
         # Ungated shared expert: a dense SwiGLU MLP with the shared intermediate
@@ -230,10 +253,10 @@ class KimiSparseMoeBlock(nn.Module):
         from functools import partial
 
         self.experts.gate_up_proj.weight_loader = partial(
-            _gate_up_weight_loader, 0, 1, self.moe_intermediate_size,
+            _gate_up_weight_loader, self.tp_rank, self.tp_size, self.moe_intermediate_size,
         )
         self.experts.down_proj.weight_loader = partial(
-            _down_proj_weight_loader, 0, 1, self.moe_intermediate_size,
+            _down_proj_weight_loader, self.tp_rank, self.tp_size, self.moe_intermediate_size,
         )
 
     def _apply(self, fn, recurse=True):
@@ -245,14 +268,53 @@ class KimiSparseMoeBlock(nn.Module):
         input_shape = hidden_states.shape
         flat = hidden_states.view(-1, self.hidden_size).contiguous()
 
+        # Router is replicated: every rank computes the full top-k selection.
         topk_weights, topk_ids = self.gate(flat)
-        routed = _dispatch(
+        topk_weights = topk_weights.to(flat.dtype)
+        if self.tp_size == 1:
+            routed = _dispatch(
+                flat,
+                self.experts.gate_up_proj,
+                self.experts.down_proj,
+                self.num_experts,
+                topk_ids,
+                topk_weights,
+            )
+        else:
+            routed = self._dispatch_tp(flat, topk_weights, topk_ids)
+        # Shared expert is a ParallelGatedMLP on the same comm group: at tp>1 it
+        # holds its own intermediate stripe and all-reduces inside its down_proj.
+        shared = self.shared_expert(flat)
+        return (routed + shared).view(input_shape)
+
+    def _dispatch_tp(
+        self,
+        flat: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Intermediate-sharded routed dispatch (mirrors
+        ``ParallelSparseMoeBlock._dispatch_tp``).
+
+        Each rank's ``fused_experts`` produces its partial hidden contribution per
+        (token, top-k slot); an all-reduce sums the intermediate-dim partials
+        across ranks, then ``moe_sum_reduce_triton`` folds the top-k dim. The
+        combine weights already carry ``routed_scaling_factor`` (folded in by
+        :class:`KimiMoEGate`), so the sum-reduce passes ``routed_scaling_factor=1.0``.
+        """
+        from mstar.utils.fused_moe import fused_experts, moe_sum_reduce_triton
+
+        # (tokens, top_k, hidden) partials — reduce_results=False keeps the
+        # per-slot rows so we can all-reduce the intermediate-parallel partials.
+        cache3 = fused_experts(
             flat,
             self.experts.gate_up_proj,
             self.experts.down_proj,
-            self.num_experts,
+            topk_weights,
             topk_ids,
-            topk_weights.to(flat.dtype),
+            reduce_results=False,
         )
-        shared = self.shared_expert(flat)
-        return (routed + shared).view(input_shape)
+        self.comm_group.all_reduce(cache3)
+        output = torch.empty_like(flat)
+        moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
+        return output
