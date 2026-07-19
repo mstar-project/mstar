@@ -53,21 +53,24 @@ Communication
        reach ``MAX_SEGMENTS x SEGMENT_MB x num_entities`` — size against
        ``df -h /dev/shm`` (tmpfs defaults to ~50% of RAM). Construction
        fails fast if one entity's ceiling exceeds /dev/shm. At the cap,
-       sends backpressure until consumers ACK, then spill.
+       sends spill (see ``MSTAR_SHM_ARENA_SPILL``).
    * - ``MSTAR_SHM_ARENA_FULL_TIMEOUT_S``
      - ``30``
      - Strict mode only (``MSTAR_SHM_ARENA_SPILL=0``): how long a send
        backpressures on a full arena before failing.
    * - ``MSTAR_SHM_ARENA_SPILL``
      - ``1``
-     - Degrade gracefully at the segment cap: after a short backpressure
-       grace (``MSTAR_SHM_ARENA_SPILL_AFTER_S``, default ``0.05``), stage
-       the tensor through the per-uuid file protocol instead — slower,
-       never fails, matching the file transport's saturation behavior.
-       ``0`` restores strict backpressure + timeout.
+     - Degrade gracefully at the segment cap: stage the tensor through the
+       per-uuid file protocol instead — slower, never fails, matching the
+       file transport's saturation behavior. ``0`` restores strict
+       backpressure + timeout — only meaningful where ANOTHER thread
+       drains consumer ACKs (the threaded api-server); on a worker the
+       ACKs arrive on the very thread that would be waiting.
    * - ``MSTAR_SHM_ARENA_SPILL_AFTER_S``
-     - ``0.05``
-     - How long a send waits for consumer ACKs before spilling.
+     - ``0``
+     - Optional grace before spilling, for deployments where another
+       thread frees slots concurrently. Default 0: spill immediately
+       (a worker cannot receive ACKs while it waits).
    * - ``MSTAR_SHM_ARENA_PIN``
      - ``1``
      - ``cudaHostRegister`` each mapped segment (both sides) so D2H/H2D

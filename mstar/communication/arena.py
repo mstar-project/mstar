@@ -164,8 +164,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # fails" behavior. MSTAR_SHM_ARENA_SPILL=0 restores strict
         # backpressure + timeout.
         self._spill = os.getenv("MSTAR_SHM_ARENA_SPILL", "1") == "1"
+        # Default 0: on a worker, TENSOR_RECEIVED ACKs (which free slots)
+        # are processed by the SAME thread that would sit in this grace
+        # wait, so waiting is pure dead time there — spill immediately.
+        # Deployments where another thread drains the communicator (the
+        # threaded api_server) can set a small grace to ride out bursts.
         self._spill_after_s = float(
-            os.getenv("MSTAR_SHM_ARENA_SPILL_AFTER_S", "0.05"))
+            os.getenv("MSTAR_SHM_ARENA_SPILL_AFTER_S", "0"))
         self._frag_warned = False
         # h2d completion watcher: turns a CUDA event into a real Future so
         # the worker's eventfd wakes the moment reads finish (no 10 ms tick).
@@ -216,23 +221,59 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 "quarter of physical RAM (%d MiB) FOR ONE ENTITY; pinned "
                 "budgets multiply across entities and come out of the OS's "
                 "pageable pool", self._pin_budget >> 20, phys >> 20)
+        # INSTANCE-UNIQUE base name: a fixed per-entity name in the global
+        # /dev/shm namespace collides across servers (a second server's
+        # create() truncates the first's live segments — silent corruption)
+        # and across users (permission-denied at startup). pid + random
+        # token makes each instance's names unique; wire-compatibility is
+        # free because consumers open whatever segment name the descriptor
+        # carries. The pid embedded in the name also enables the orphan
+        # sweep below.
+        import secrets
+
+        self._sweep_orphans()
+        base = (f"mstar_arena_{my_entity_id}_{os.getpid()}_"
+                f"{secrets.token_hex(4)}")
         self._arena = SegmentedShmArena.create(
-            f"mstar_arena_{my_entity_id}", segment_mb << 20, max_segments)
+            base, segment_mb << 20, max_segments)
         # Producer-side segment views (memoryviews are stable: segments
         # never move or resize) + how many segments are already pinned.
         self._seg_views: list[memoryview] = []
         self._pinned_segments = 0
         self._sync_segments()
-        # uuid -> (segment_idx, offset) for sender-side reclaim, and
-        # uuid -> [TensorPointerInfo] to stamp locations at register time
-        # (infos are created in store_and_return_tensor_info but serialize
-        # to the wire only after register_for_send).
+        # uuid -> (segment_idx, offset) for sender-side reclaim.
+        # (register_for_send receives the TensorPointerInfos directly and
+        # stamps them in place — no side-table needed.)
         self._arena_locs: dict[str, tuple[int, int]] = {}
-        self._infos_by_uuid: dict[str, list[TensorPointerInfo]] = {}
         # Consumer-side: peer segment name -> (arena, memoryview).
         self._peer_segments: dict[str, tuple[object, memoryview]] = {}
 
     # -- segments --------------------------------------------------------
+
+    def _sweep_orphans(self) -> None:
+        """A SIGKILLed server never runs Drop, orphaning up to its full
+        arena in /dev/shm until reboot. Names embed the owning pid, so a
+        startup sweep can reclaim any segment whose owner is gone. Files we
+        cannot judge (foreign naming) or cannot remove (another user's)
+        are left with a debug note."""
+        try:
+            names = os.listdir("/dev/shm")
+        except OSError:
+            return
+        for name in names:
+            if not name.startswith("mstar_arena_"):
+                continue
+            parts = name.split(".")[0].rsplit("_", 2)
+            if len(parts) != 3 or not parts[1].isdigit():
+                continue   # pre-uniquification or foreign naming: skip
+            if os.path.exists(f"/proc/{parts[1]}"):
+                continue   # owner alive
+            try:
+                os.unlink(f"/dev/shm/{name}")
+                logger.info("ARENA: swept orphaned segment %s "
+                            "(owner pid %s is gone)", name, parts[1])
+            except OSError as e:
+                logger.debug("ARENA: cannot sweep %s: %s", name, e)
 
     def _maybe_pin(self, ptr: int, nbytes: int) -> None:
         # Oversized dedicated segments ARE pinned (within budget): freed
@@ -347,13 +388,6 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             self._sync_segments()
             return seg, off
 
-    def store_and_return_tensor_info(self, *args, **kwargs):
-        infos = super().store_and_return_tensor_info(*args, **kwargs)
-        for info_list in infos.values():
-            for info in info_list:
-                self._infos_by_uuid.setdefault(info.uuid, []).append(info)
-        return infos
-
     def register_for_send(
         self, request_id: str, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
@@ -406,10 +440,8 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     queued = True
                 self._arena_locs[uuid] = (seg, off)
                 seg_name = self._arena.segment_name(seg)
-                for info in {id(i): i for i in (
-                        *self._infos_by_uuid.get(uuid, ()), info_arg)}.values():
-                    info.shm_segment = seg_name
-                    info.shm_offset = off
+                info_arg.shm_segment = seg_name
+                info_arg.shm_offset = off
                 self.tensor_store.set_metadata(
                     request_id, uuid, mem_registered=True)
                 if self.enable_prof:
@@ -545,7 +577,6 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # Grandparent cleanup (refcounts): skip the file manager's unlink.
         super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(
             request_id, uuid)
-        self._infos_by_uuid.pop(uuid, None)
         if (loc := self._arena_locs.pop(uuid, None)) is not None:
             self._arena.free(*loc)
             logger.debug("ARENA: freed %s at %s", uuid, loc)
