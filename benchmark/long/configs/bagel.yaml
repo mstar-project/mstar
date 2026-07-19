@@ -1,0 +1,40 @@
+# BAGEL soak mixture: image understanding + generation at varied resolutions.
+# Generation resolutions 512²…1024² produce highly heterogeneous latent/image
+# tensors — the prefill-heavy, varied-shape workload most likely to fragment the
+# arena. Lower concurrency than Qwen (diffusion requests are heavier).
+#
+#   python -m benchmark.long.soak --config benchmark/long/configs/bagel.yaml \
+#       --url http://127.0.0.1:8000 --duration-s 7200 --metrics-jsonl soak_bagel.jsonl
+#
+# BAGEL generation reads width/height from model_kwargs (mstar/model/bagel/
+# bagel_model.py; default 1024x1024). I2I additionally resizes the input to fit.
+
+model: bagel
+system: ours
+rate: 2.0
+max_in_flight: 12
+duration_s: 7200
+request_timeout_s: 600
+pool_size: 48
+window_s: 90
+report_interval_s: 20
+cache_dir: ./.soak_cache
+seed: 0
+
+requests:
+  # --- understanding (varied input image shapes → text) ---
+  - { req_type: image_to_text, dataset: food101, weight: 0.30 }
+
+  # --- text→image generation across the resolution range ---
+  - { req_type: text_to_image, dataset: text, weight: 0.15,
+      model_kwargs: { width: 512,  height: 512 } }
+  - { req_type: text_to_image, dataset: text, weight: 0.15,
+      model_kwargs: { width: 768,  height: 768 } }
+  - { req_type: text_to_image, dataset: text, weight: 0.15,
+      model_kwargs: { width: 1024, height: 1024 } }
+  - { req_type: text_to_image, dataset: text, weight: 0.10,
+      model_kwargs: { width: 1024, height: 512 } }   # non-square
+
+  # --- image→image editing (input + generated output both large) ---
+  - { req_type: image_to_image, dataset: food101, weight: 0.15,
+      model_kwargs: { width: 1024, height: 1024 } }
