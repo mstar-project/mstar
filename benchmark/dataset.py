@@ -993,6 +993,12 @@ class VideoMMEDataset(BaseDataset):
 
         self.items: list[RequestInput] = []
         for row in rows:
+            # Materialise at most num_requests items: RequestInput.__post_init__
+            # eagerly reads + base64-encodes the referenced mp4, so building one
+            # per row would load the entire Video-MME corpus (~900 mp4s, many
+            # shared across QA rows) just to keep num_requests of them.
+            if self._num_requests and len(self.items) >= self._num_requests:
+                break
             video_path = os.path.join(data_dir, row["video_path"])
             if not os.path.exists(video_path):
                 continue

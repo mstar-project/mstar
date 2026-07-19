@@ -121,6 +121,11 @@ class ReqConfig:
     weight: float
     model_kwargs: dict[str, Any] = field(default_factory=dict)
     dataset_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Optional per-entry override of the global pool_size. Keep this small for
+    # heavy media (e.g. video): the whole pool is materialised up front and its
+    # base64 is held in RAM for the run, so a large video pool is slow to load
+    # and memory-heavy.
+    pool_size: int | None = None
     label: str = ""  # human-readable tag for per-entry reporting
     pool: list[RequestInput] = field(default_factory=list, repr=False)
 
@@ -197,6 +202,7 @@ def load_config(path: str, overrides: dict[str, Any] | None = None) -> SoakConfi
             weight=float(e["weight"]),
             model_kwargs=e.get("model_kwargs", {}) or {},
             dataset_kwargs=e.get("dataset_kwargs", {}) or {},
+            pool_size=e.get("pool_size"),
             label=e.get("label") or f"{req_type.value}:{e['dataset']}",
         )
         total_w += rc.weight
@@ -213,7 +219,7 @@ def load_config(path: str, overrides: dict[str, Any] | None = None) -> SoakConfi
         rc.pool = _build_dataset_requests(
             dataset=rc.dataset,
             req_type=rc.req_type,
-            pool_size=cfg.pool_size,
+            pool_size=rc.pool_size or cfg.pool_size,
             cache_dir=cfg.cache_dir,
             dataset_kwargs=rc.dataset_kwargs,
         )
