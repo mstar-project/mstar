@@ -332,15 +332,19 @@ class KVCacheEngine(BaseEngine):
                 continue
 
             try:
+                from mstar.engine import RECOMPILE_LIMIT
+
                 submodule.forward = torch.compile(
                     submodule.forward,
                     fullgraph=False,
                     dynamic=None,
+                    recompile_limit=RECOMPILE_LIMIT,
                 )
                 submodule.forward_batched = torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
                     dynamic=None,
+                    recompile_limit=RECOMPILE_LIMIT,
                 )
                 logger.info("KVCacheEngine: torch.compile applied to %s language_model", node_name)
             except Exception:

@@ -609,11 +609,14 @@ class CudaGraphRunner:
                 # graph (finished in the submodule ``postprocess``).
                 forward = getattr(submodule, config.capture_forward_method)
                 if config.compile:
+                    from mstar.engine import RECOMPILE_LIMIT
+
                     forward = torch.compile(
                         forward,
                         mode="max-autotune-no-cudagraphs",
                         fullgraph=False,
                         dynamic=False,
+                        recompile_limit=RECOMPILE_LIMIT,
                     )
                 spec.engine_inputs.sampler.applied_penalty_in_graph = False
 
@@ -2184,11 +2187,14 @@ class StatelessCudaGraphRunner:
 
         fwd = submodule.forward_batched
         if config.compile:
+            from mstar.engine import RECOMPILE_LIMIT
+
             fwd = torch.compile(
                 fwd,
                 mode="max-autotune-no-cudagraphs",
                 fullgraph=False,
                 dynamic=False,
+                recompile_limit=RECOMPILE_LIMIT,
             )
 
         # Warmup and capture on the shared side stream (see warmup_and_capture
@@ -2509,11 +2515,14 @@ class PiecewiseCudaGraphRunner:
 
         fn = self.config.capture_fn
         if self.config.compile:
+            from mstar.engine import RECOMPILE_LIMIT
+
             fn = torch.compile(
                 fn,
                 mode="max-autotune-no-cudagraphs",
                 fullgraph=False,
                 dynamic=False,
+                recompile_limit=RECOMPILE_LIMIT,
             )
 
         def run_fn():
