@@ -209,9 +209,11 @@ def sample_frame(
 
         # An over-aggressive filter can zero a whole row; fall back to greedy
         # (argmax of the filtered logits) there so the draw stays well-defined.
+        # Applied unconditionally (no ``bool(invalid.any())`` host sync): where
+        # nothing is invalid the ``torch.where`` returns ``next_ids`` unchanged,
+        # so this is bit-identical to the guarded form but graph-capture-safe.
         invalid = probs.sum(dim=-1) <= 0  # (B, C)
-        if bool(invalid.any()):
-            next_ids = torch.where(invalid, logits.argmax(dim=-1), next_ids)
+        next_ids = torch.where(invalid, logits.argmax(dim=-1), next_ids)
 
     text_col = torch.full(
         (B, 1), text_placeholder, dtype=next_ids.dtype, device=device

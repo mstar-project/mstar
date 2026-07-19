@@ -19,7 +19,9 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mstar.engine.kv_cache_engine import BatchedCacheManager
+from mstar.model.components.moe import _HAS_FUSED
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -27,6 +29,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.model.zonos2.sampler_buffers import Zonos2SamplerBuffers
 from mstar.model.zonos2.tts_sampling import TTSSamplingParams, sample_frame
 from mstar.model.zonos2.vocoder import StreamingDacDecoder
 
@@ -38,6 +41,10 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
     sample the last position's per-codebook logits). Returns ``new_token``:
     the sampled frame ``(1, n_codebooks + 1)``.
     """
+
+    # Default per-step batch capacity for the lazily-allocated sampler buffers
+    # (grown on demand in the eager path; Phase 3 pre-sizes to the capture max).
+    _DEFAULT_MAX_BS = 256
 
     def __init__(
         self,
@@ -54,9 +61,54 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         self.eoa_id = eoa_id
         self.params = params
 
-        # Per-request state.
-        self._history: dict[str, torch.Tensor] = {}   # (N, n_codebooks) recent codes
+        # Per-request state. Repetition history + RNG step live in slot-indexed
+        # static buffers (graph-safe); allocated lazily in ``preprocess`` (or
+        # pre-sized in ``get_cuda_graph_configs``) once the device is known.
+        # ``_eos`` is host-side stop tracking.
+        self._sampler_buffers: Zonos2SamplerBuffers | None = None
         self._eos: dict[str, dict] = {}               # EOS countdown tracking
+        # Real request ids whose per-step ``buf`` rows are written but not yet
+        # synced back to ``master``. Phase 3 defers the sync to the *next*
+        # step's ``preprocess`` (before that step's register/gather) so the
+        # write-back stays outside the captured graph. See ``preprocess``.
+        self._pending_sync_rids: list[str] | None = None
+
+    # -- CUDA-graph capture --------------------------------------------
+    def get_cuda_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[BasicBatchedCudaGraphConfig]:
+        """Declare the decode capture, with the multi-codebook sampler folded
+        into the captured ``forward_batched`` (Phase 3).
+
+        Gated on the fused-MoE path: only that dispatch is proven graph-safe
+        (Phase 1); the naive path is left to run eager. Prefill capture is a
+        follow-on (needs a ``FlashInferPackedCudaGraphConfig`` plus a static
+        ``last_indices`` buffer).
+
+        Must stay side-effect-free: the eligibility gate
+        (``ARNodeSubmodule.can_use_cuda_graphs``) calls this with a dummy CPU
+        device just to read the declared walks. The sampler buffers are instead
+        allocated lazily in ``preprocess`` — which the runner invokes on the real
+        device during capture warmup, before the graph records their addresses —
+        and their ``_DEFAULT_MAX_BS`` floor already covers every capture bucket,
+        so ``ensure_batch_capacity`` never fires inside a capture epoch.
+        """
+        if not _HAS_FUSED:
+            return []
+        frame_w = self.n_codebooks + 1
+        return [
+            BasicBatchedCudaGraphConfig(
+                capture_graph_walk="decode",
+                requires_cfg=False,
+                labels=["main"],
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(
+                        1, frame_w, dtype=torch.long, device=device,
+                    ),
+                    input_seq_len=1,
+                ),
+            ),
+        ]
 
     # -- input plumbing ------------------------------------------------
     def prepare_inputs(
@@ -92,7 +144,51 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         last_indices = torch.tensor(
             seq_lens, device=self.get_device(), dtype=torch.long
         ).cumsum(0) - 1
+        # Host-side sampler lifecycle (runs in every path — eager, capture warmup
+        # and captured replay — always outside the graph). Prepares the static
+        # buffers that the in-graph sampler in ``forward``/``forward_batched``
+        # reads; ``padded_bs`` matches the (possibly capture-padded) logits batch.
+        self._prepare_sampler_step(engine_inputs, padded_bs=len(inputs))
         return {"input_ids": input_ids, "last_indices": last_indices}
+
+    def _prepare_sampler_step(
+        self, engine_inputs: ModelInputsFromEngine, padded_bs: int,
+    ) -> None:
+        """Deferred-sync + lazy-register + gather for this step (never captured).
+
+        The ordering is load-bearing:
+
+        1. **sync** the *previous* step's ``buf`` rows back to ``master`` (using
+           that step's slot indices, still resident in ``_slot_idx_gpu`` because
+           this step's gather runs afterwards),
+        2. **register** any new requests (assigns + resets a master slot),
+        3. **gather** every request's slot into the per-step ``buf``.
+
+        Sync MUST precede register: when a finishing request frees a slot that a
+        new request immediately reuses, the new request's fresh reset (step 2)
+        must land *after* the departing request's deferred write-back (step 1),
+        or the reset is clobbered by stale state.
+        """
+        bufs = self._ensure_buffers(self.get_device(), padded_bs)
+        # (1) flush the previous step's writes to master.
+        if self._pending_sync_rids:
+            bufs.sync_after_step(self._pending_sync_rids)
+            self._pending_sync_rids = None
+        # (2) recover the real request ids. Under CUDA-graph replay
+        # ``request_ids`` holds dummy capture slots, so prefer
+        # ``real_request_ids``; the ``__cg_`` filter additionally drops the
+        # placeholder ids seen during capture itself (no real request exists
+        # there — register/gather become no-ops onto slot 0).
+        rids = engine_inputs.real_request_ids
+        if rids is None:
+            rids = engine_inputs.request_ids
+        real_rids = [r for r in rids if not r.startswith("__cg_")]
+        for rid in real_rids:
+            bufs.register_request(rid)                        # idempotent lazy join
+        # (3) gather real slots into buf[:len(real_rids)]; padding rows -> slot 0.
+        bufs.gather_for_request_ids(real_rids, padded_bs=padded_bs)
+        # Retain the real rows for the next step's deferred sync.
+        self._pending_sync_rids = real_rids
 
     # -- forward + sampling --------------------------------------------
     def can_batch(self, batch, model_inputs) -> bool:
@@ -110,7 +206,7 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         cache_handle: BatchedCacheManager = engine_inputs.cache_manager
         hidden = self.model(input_ids, cache_handle)          # (num_frames, hidden)
         logits = self.model.compute_logits(hidden[-1:])       # (1, C, V)
-        frame = self._sample(logits, engine_inputs.request_ids)  # (1, C + 1)
+        frame = self._sample_in_graph(logits)                 # (1, C + 1)
         return {"new_token": [frame]}
 
     def forward_batched(
@@ -125,95 +221,61 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         hidden = self.model(input_ids, cache_handle)          # (total_frames, hidden)
         last_hidden = hidden.index_select(0, last_indices.to(hidden.device))
         logits = self.model.compute_logits(last_hidden)       # (B, C, V)
-        frames = self._sample(logits, engine_inputs.request_ids)  # (B, C + 1)
+        frames = self._sample_in_graph(logits)                # (B, C + 1)
         return {
             rid: {"new_token": [frames[i:i + 1]]}
             for i, rid in enumerate(engine_inputs.request_ids)
         }
 
-    @torch.compiler.disable
-    def _sample(self, logits: torch.Tensor, rids: list[str]) -> torch.Tensor:
-        """Sample one frame per request and append each to its history.
+    def _sample_in_graph(self, logits: torch.Tensor) -> torch.Tensor:
+        """In-graph portion of sampling — fixed-shape, capture-safe.
 
-        Reproducibility is per-request via ``(seed, step)`` where ``step`` is
-        the request's frame count so far — independent of batch position, so
-        batched and sequential execution draw identically.
+        Reads the per-step repetition window + RNG step from the static buffers
+        that ``preprocess`` (via ``_prepare_sampler_step``) already gathered,
+        samples a frame, and writes it back into the ring. All ops are
+        fixed-shape / in-place, so this runs *inside* the captured
+        ``forward_batched`` graph — no host sync, no ``@torch.compiler.disable``.
 
-        ``@torch.compiler.disable``: the engine ``torch.compile``s
-        ``forward``/``forward_batched``, but the host-side sampling here is
-        data-dependent Python (growing rep-penalty windows, list building) that
-        would graph-break and recompile every step. Kept eager like the
-        engine's own ``Sampler.sample``; the transformer forward still compiles.
+        Reproducibility is per-request via ``(seed, step)`` where ``step`` is the
+        request's frame count so far (``Zonos2SamplerBuffers.offset``),
+        independent of batch position, so batched and sequential draw identically.
+
+        The batch size is read from ``logits`` (``pb`` = padded batch), so this
+        needs no request-id list: register/gather/sync are handled host-side.
         """
-        device = logits.device
-        steps = torch.tensor(
-            [self._step_for(rid) for rid in rids], device=device, dtype=torch.long
-        )
+        bufs = self._sampler_buffers
+        pb = logits.shape[0]
         frames = sample_frame(
             logits,
             self.params,
-            repetition_token_ids=self._rep_ids_batched(rids, device),
+            repetition_token_ids=bufs.repetition_ids(pb),
             text_placeholder=self.text_vocab,
             seed=self.params.seed,
-            steps=steps,
-        )                                                     # (B, C + 1)
-        for i, rid in enumerate(rids):
-            self._append_history(rid, frames[i:i + 1])
+            steps=bufs.steps(pb),
+        )                                                     # (pb, C + 1)
+        bufs.write_frame(frames, padded_bs=pb)
         return frames
 
-    # -- repetition history / step -------------------------------------
-    def _step_for(self, rid: str) -> int:
-        """Frames already produced for ``rid`` = its next step index."""
-        hist = self._history.get(rid)
-        return 0 if hist is None else hist.shape[0]
+    def _ensure_buffers(self, device, padded_bs: int) -> Zonos2SamplerBuffers:
+        """Lazily allocate (and grow) the per-request sampler buffers.
 
-    def _rep_ids_batched(self, rids: list[str], device) -> torch.Tensor | None:
-        """Stack per-request ``_rep_ids`` into ``(B, C, W_max)``, right-padding
-        shorter windows with ``-1`` (ignored by the penalty). Returns None when
-        no request has an active penalty window.
+        Sized to ``max(padded_bs, _DEFAULT_MAX_BS)`` on first use.
+        ``get_cuda_graph_configs`` calls this ahead of capture with the largest
+        capture bucket so the buffers exist (and their addresses are fixed)
+        before the graph is recorded; ``ensure_batch_capacity`` then only ever
+        grows ``buf`` on the eager path, never inside a capture epoch.
         """
-        per = [self._rep_ids(rid) for rid in rids]
-        widths = [p.shape[-1] for p in per if p is not None]
-        if not widths:
-            return None
-        w_max = max(widths)
-        rows = []
-        for p in per:
-            if p is None:
-                rows.append(torch.full(
-                    (1, self.n_codebooks, w_max), -1, dtype=torch.long, device=device
-                ))
-                continue
-            p = p.to(device)
-            if p.shape[-1] < w_max:
-                pad = torch.full(
-                    (1, self.n_codebooks, w_max - p.shape[-1]),
-                    -1, dtype=p.dtype, device=device,
-                )
-                p = torch.cat([p, pad], dim=-1)
-            rows.append(p)
-        return torch.cat(rows, dim=0)                         # (B, C, W_max)
-
-    def _rep_ids(self, rid: str) -> torch.Tensor | None:
-        hist = self._history.get(rid)
-        if (
-            hist is None
-            or self.params.repetition_window <= 0
-            or self.params.repetition_penalty == 1.0
-        ):
-            return None
-        window = hist[-self.params.repetition_window:]        # (w, C)
-        ids = window.t().unsqueeze(0).contiguous()            # (1, C, w)
-        rc = self.params.repetition_codebooks
-        if 0 <= rc < self.n_codebooks:
-            ids = ids.clone()
-            ids[:, rc:, :] = -1  # codebooks past rc are excluded from the penalty
-        return ids
-
-    def _append_history(self, rid: str, frame: torch.Tensor) -> None:
-        codes = frame[:, : self.n_codebooks]                 # (1, C)
-        prev = self._history.get(rid)
-        self._history[rid] = codes if prev is None else torch.cat([prev, codes], dim=0)
+        if self._sampler_buffers is None:
+            self._sampler_buffers = Zonos2SamplerBuffers.allocate(
+                max_batch_size=max(padded_bs, self._DEFAULT_MAX_BS),
+                n_codebooks=self.n_codebooks,
+                window=self.params.repetition_window,
+                repetition_codebooks=self.params.repetition_codebooks,
+                device=device,
+            )
+        else:
+            self._sampler_buffers.ensure_batch_capacity(padded_bs)
+        return self._sampler_buffers
 
     # -- graph routing + stop ------------------------------------------
     def postprocess(
@@ -263,7 +325,8 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         return {"decode_loop"} if finished else set()
 
     def cleanup_request(self, request_id: str):
-        self._history.pop(request_id, None)
+        if self._sampler_buffers is not None:
+            self._sampler_buffers.unregister_request(request_id)
         self._eos.pop(request_id, None)
 
 
