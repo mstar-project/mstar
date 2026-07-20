@@ -1165,6 +1165,19 @@ class Worker:
         engine = self.engine_manager.get_engine(spec_node_batch.node_name)
         engine.reset_pre_plan_for_batch(spec_node_batch)
 
+    def _init_cuda_executor_thread(self) -> None:
+        """Pin this executor thread to the worker's CUDA device.
+
+        The CUDA current device is per-thread and defaults to 0. PyTorch
+        ops carry per-tensor device guards, but raw Triton launches and
+        bare ``torch.cuda.current_stream()`` / ``synchronize()`` calls
+        resolve against the THREAD's device — on a worker whose model
+        lives on a non-zero device, work issued from an unpinned thread
+        lands on device 0's stream, unordered with the real compute.
+        """
+        if self.device.type == "cuda" and self.device.index is not None:
+            torch.cuda.set_device(self.device)
+
     def _execute_on_gpu_thread(
         self,
         batch: ScheduledBatch,
@@ -1975,7 +1988,8 @@ class Worker:
         # with GPU execution. Run the engine unconditionally on a dedicated
         # 1-worker GPU thread.
         gpu_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"mstar-gpu-{self.worker_id}"
+            max_workers=1, thread_name_prefix=f"mstar-gpu-{self.worker_id}",
+            initializer=self._init_cuda_executor_thread,
         )
         logger.info(
             "Worker %s: engine runs on dedicated GPU thread",
@@ -1998,7 +2012,8 @@ class Worker:
         plan_executor = None
         if pre_plan_spec:
             plan_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix=f"mstar-plan-{self.worker_id}"
+                max_workers=1, thread_name_prefix=f"mstar-plan-{self.worker_id}",
+                initializer=self._init_cuda_executor_thread,
             )
             logger.info(
                 "Worker %s: plan_executor enabled — speculative plan() "
