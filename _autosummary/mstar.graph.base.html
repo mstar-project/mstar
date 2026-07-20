@@ -27,18 +27,18 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
-    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=3c74b3bc" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=4418a689" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
   
   <!-- So that users can add custom icons -->
-  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
     <script src="../_static/documentation_options.js?v=7f7c277e"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
@@ -47,6 +47,7 @@
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_autosummary/mstar.graph.base';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.graph.graph_io" href="mstar.graph.graph_io.html" />
@@ -54,21 +55,27 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 18, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 20, 2026"/>
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
   </head>
-  
-  
-  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
-
+  <body data-default-mode="">
   
   
   <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
   
   <div id="pst-scroll-pixel-helper"></div>
   
   <button type="button" class="btn rounded-pill" id="pst-back-to-top">
     <i class="fa-solid fa-arrow-up"></i>Back to top</button>
-
+  
+  
+  
   
   <dialog id="pst-search-dialog">
     
@@ -94,7 +101,51 @@
 </div>
 
   
-    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
     </header>
   
 
@@ -419,11 +470,18 @@
 
 
 
-<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
-  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
-  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
-  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
-</button>
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
 
 
 <button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
@@ -451,8 +509,8 @@
                 <h2> Contents </h2>
             </div>
             <nav aria-label="Page">
-                <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge"><code class="docutils literal notranslate"><span class="pre">GraphEdge</span></code></a><ul class="visible nav section-nav flex-column">
+                <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge"><code class="docutils literal notranslate"><span class="pre">GraphEdge</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge.clone"><code class="docutils literal notranslate"><span class="pre">GraphEdge.clone()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge.conductor_new_token"><code class="docutils literal notranslate"><span class="pre">GraphEdge.conductor_new_token</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge.is_streaming"><code class="docutils literal notranslate"><span class="pre">GraphEdge.is_streaming</span></code></a></li>
@@ -463,7 +521,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge.tensor_info"><code class="docutils literal notranslate"><span class="pre">GraphEdge.tensor_info</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode"><code class="docutils literal notranslate"><span class="pre">GraphNode</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode"><code class="docutils literal notranslate"><span class="pre">GraphNode</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.clear"><code class="docutils literal notranslate"><span class="pre">GraphNode.clear()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.complete"><code class="docutils literal notranslate"><span class="pre">GraphNode.complete()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.consumes_stream"><code class="docutils literal notranslate"><span class="pre">GraphNode.consumes_stream</span></code></a></li>
@@ -481,13 +539,13 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.reset_outputs"><code class="docutils literal notranslate"><span class="pre">GraphNode.reset_outputs()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphSection"><code class="docutils literal notranslate"><span class="pre">GraphSection</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphSection"><code class="docutils literal notranslate"><span class="pre">GraphSection</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphSection.get_inputs_outputs"><code class="docutils literal notranslate"><span class="pre">GraphSection.get_inputs_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphSection.get_loops"><code class="docutils literal notranslate"><span class="pre">GraphSection.get_loops()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphSection.get_nodes"><code class="docutils literal notranslate"><span class="pre">GraphSection.get_nodes()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry.clear"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry.clear()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry.managed_entities"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry.managed_entities</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry.mark_entity_complete"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry.mark_entity_complete()</span></code></a></li>
@@ -495,7 +553,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry.reset_for_iter"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry.reset_for_iter()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop"><code class="docutils literal notranslate"><span class="pre">Loop</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop"><code class="docutils literal notranslate"><span class="pre">Loop</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop.accumulated_outputs"><code class="docutils literal notranslate"><span class="pre">Loop.accumulated_outputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop.clear"><code class="docutils literal notranslate"><span class="pre">Loop.clear()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop.complete_iter"><code class="docutils literal notranslate"><span class="pre">Loop.complete_iter()</span></code></a></li>
@@ -515,35 +573,35 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop.section"><code class="docutils literal notranslate"><span class="pre">Loop.section</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.LoopStateRegistry"><code class="docutils literal notranslate"><span class="pre">LoopStateRegistry</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.LoopStateRegistry"><code class="docutils literal notranslate"><span class="pre">LoopStateRegistry</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.LoopStateRegistry.mark_entity_complete"><code class="docutils literal notranslate"><span class="pre">LoopStateRegistry.mark_entity_complete()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.LoopStateRegistry.register_ingested_input"><code class="docutils literal notranslate"><span class="pre">LoopStateRegistry.register_ingested_input()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeAndGraphWalk"><code class="docutils literal notranslate"><span class="pre">NodeAndGraphWalk</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeAndGraphWalk"><code class="docutils literal notranslate"><span class="pre">NodeAndGraphWalk</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeAndGraphWalk.graph_walk"><code class="docutils literal notranslate"><span class="pre">NodeAndGraphWalk.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeAndGraphWalk.node"><code class="docutils literal notranslate"><span class="pre">NodeAndGraphWalk.node</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeCompletionOutput"><code class="docutils literal notranslate"><span class="pre">NodeCompletionOutput</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeCompletionOutput"><code class="docutils literal notranslate"><span class="pre">NodeCompletionOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeCompletionOutput.filtered_signals"><code class="docutils literal notranslate"><span class="pre">NodeCompletionOutput.filtered_signals</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeCompletionOutput.output_edges"><code class="docutils literal notranslate"><span class="pre">NodeCompletionOutput.output_edges</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeInputsOutputs"><code class="docutils literal notranslate"><span class="pre">NodeInputsOutputs</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeInputsOutputs"><code class="docutils literal notranslate"><span class="pre">NodeInputsOutputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeInputsOutputs.ext_inputs"><code class="docutils literal notranslate"><span class="pre">NodeInputsOutputs.ext_inputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeInputsOutputs.ext_outputs"><code class="docutils literal notranslate"><span class="pre">NodeInputsOutputs.ext_outputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeInputsOutputs.loop_back"><code class="docutils literal notranslate"><span class="pre">NodeInputsOutputs.loop_back</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel"><code class="docutils literal notranslate"><span class="pre">Parallel</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel"><code class="docutils literal notranslate"><span class="pre">Parallel</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel.get_inputs_outputs"><code class="docutils literal notranslate"><span class="pre">Parallel.get_inputs_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel.get_loops"><code class="docutils literal notranslate"><span class="pre">Parallel.get_loops()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel.get_nodes"><code class="docutils literal notranslate"><span class="pre">Parallel.get_nodes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel.sections"><code class="docutils literal notranslate"><span class="pre">Parallel.sections</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals"><code class="docutils literal notranslate"><span class="pre">ReadySignals</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals"><code class="docutils literal notranslate"><span class="pre">ReadySignals</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals.clear"><code class="docutils literal notranslate"><span class="pre">ReadySignals.clear()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals.input_names"><code class="docutils literal notranslate"><span class="pre">ReadySignals.input_names</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals.is_ready"><code class="docutils literal notranslate"><span class="pre">ReadySignals.is_ready</span></code></a></li>
@@ -557,20 +615,20 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals.update"><code class="docutils literal notranslate"><span class="pre">ReadySignals.update()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential"><code class="docutils literal notranslate"><span class="pre">Sequential</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential"><code class="docutils literal notranslate"><span class="pre">Sequential</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential.get_inputs_outputs"><code class="docutils literal notranslate"><span class="pre">Sequential.get_inputs_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential.get_loops"><code class="docutils literal notranslate"><span class="pre">Sequential.get_loops()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential.get_nodes"><code class="docutils literal notranslate"><span class="pre">Sequential.get_nodes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential.sections"><code class="docutils literal notranslate"><span class="pre">Sequential.sections</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.SpeculativeNodeInfo"><code class="docutils literal notranslate"><span class="pre">SpeculativeNodeInfo</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.SpeculativeNodeInfo"><code class="docutils literal notranslate"><span class="pre">SpeculativeNodeInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.SpeculativeNodeInfo.is_new_loop_iter"><code class="docutils literal notranslate"><span class="pre">SpeculativeNodeInfo.is_new_loop_iter</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.SpeculativeNodeInfo.loop_name"><code class="docutils literal notranslate"><span class="pre">SpeculativeNodeInfo.loop_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.SpeculativeNodeInfo.node_name"><code class="docutils literal notranslate"><span class="pre">SpeculativeNodeInfo.node_name</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo.address"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo.address</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo.clone"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo.clone()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo.dims"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo.dims</span></code></a></li>
@@ -585,7 +643,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo.uuid"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo.uuid</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry.clear"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry.clear()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry.mark_entity_complete"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry.mark_entity_complete()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry.register_ingested_input"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry.register_ingested_input()</span></code></a></li>
@@ -1585,8 +1643,8 @@ _loop_back_inputs. Not for runtime introspection.</p>
     <i class="fa-solid fa-list"></i> Contents
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
-    <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge"><code class="docutils literal notranslate"><span class="pre">GraphEdge</span></code></a><ul class="visible nav section-nav flex-column">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge"><code class="docutils literal notranslate"><span class="pre">GraphEdge</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge.clone"><code class="docutils literal notranslate"><span class="pre">GraphEdge.clone()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge.conductor_new_token"><code class="docutils literal notranslate"><span class="pre">GraphEdge.conductor_new_token</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge.is_streaming"><code class="docutils literal notranslate"><span class="pre">GraphEdge.is_streaming</span></code></a></li>
@@ -1597,7 +1655,7 @@ _loop_back_inputs. Not for runtime introspection.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphEdge.tensor_info"><code class="docutils literal notranslate"><span class="pre">GraphEdge.tensor_info</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode"><code class="docutils literal notranslate"><span class="pre">GraphNode</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode"><code class="docutils literal notranslate"><span class="pre">GraphNode</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.clear"><code class="docutils literal notranslate"><span class="pre">GraphNode.clear()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.complete"><code class="docutils literal notranslate"><span class="pre">GraphNode.complete()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.consumes_stream"><code class="docutils literal notranslate"><span class="pre">GraphNode.consumes_stream</span></code></a></li>
@@ -1615,13 +1673,13 @@ _loop_back_inputs. Not for runtime introspection.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.reset_outputs"><code class="docutils literal notranslate"><span class="pre">GraphNode.reset_outputs()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphSection"><code class="docutils literal notranslate"><span class="pre">GraphSection</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphSection"><code class="docutils literal notranslate"><span class="pre">GraphSection</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphSection.get_inputs_outputs"><code class="docutils literal notranslate"><span class="pre">GraphSection.get_inputs_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphSection.get_loops"><code class="docutils literal notranslate"><span class="pre">GraphSection.get_loops()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphSection.get_nodes"><code class="docutils literal notranslate"><span class="pre">GraphSection.get_nodes()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry.clear"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry.clear()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry.managed_entities"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry.managed_entities</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry.mark_entity_complete"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry.mark_entity_complete()</span></code></a></li>
@@ -1629,7 +1687,7 @@ _loop_back_inputs. Not for runtime introspection.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphStateRegistry.reset_for_iter"><code class="docutils literal notranslate"><span class="pre">GraphStateRegistry.reset_for_iter()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop"><code class="docutils literal notranslate"><span class="pre">Loop</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop"><code class="docutils literal notranslate"><span class="pre">Loop</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop.accumulated_outputs"><code class="docutils literal notranslate"><span class="pre">Loop.accumulated_outputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop.clear"><code class="docutils literal notranslate"><span class="pre">Loop.clear()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop.complete_iter"><code class="docutils literal notranslate"><span class="pre">Loop.complete_iter()</span></code></a></li>
@@ -1649,35 +1707,35 @@ _loop_back_inputs. Not for runtime introspection.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Loop.section"><code class="docutils literal notranslate"><span class="pre">Loop.section</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.LoopStateRegistry"><code class="docutils literal notranslate"><span class="pre">LoopStateRegistry</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.LoopStateRegistry"><code class="docutils literal notranslate"><span class="pre">LoopStateRegistry</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.LoopStateRegistry.mark_entity_complete"><code class="docutils literal notranslate"><span class="pre">LoopStateRegistry.mark_entity_complete()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.LoopStateRegistry.register_ingested_input"><code class="docutils literal notranslate"><span class="pre">LoopStateRegistry.register_ingested_input()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeAndGraphWalk"><code class="docutils literal notranslate"><span class="pre">NodeAndGraphWalk</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeAndGraphWalk"><code class="docutils literal notranslate"><span class="pre">NodeAndGraphWalk</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeAndGraphWalk.graph_walk"><code class="docutils literal notranslate"><span class="pre">NodeAndGraphWalk.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeAndGraphWalk.node"><code class="docutils literal notranslate"><span class="pre">NodeAndGraphWalk.node</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeCompletionOutput"><code class="docutils literal notranslate"><span class="pre">NodeCompletionOutput</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeCompletionOutput"><code class="docutils literal notranslate"><span class="pre">NodeCompletionOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeCompletionOutput.filtered_signals"><code class="docutils literal notranslate"><span class="pre">NodeCompletionOutput.filtered_signals</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeCompletionOutput.output_edges"><code class="docutils literal notranslate"><span class="pre">NodeCompletionOutput.output_edges</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeInputsOutputs"><code class="docutils literal notranslate"><span class="pre">NodeInputsOutputs</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeInputsOutputs"><code class="docutils literal notranslate"><span class="pre">NodeInputsOutputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeInputsOutputs.ext_inputs"><code class="docutils literal notranslate"><span class="pre">NodeInputsOutputs.ext_inputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeInputsOutputs.ext_outputs"><code class="docutils literal notranslate"><span class="pre">NodeInputsOutputs.ext_outputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.NodeInputsOutputs.loop_back"><code class="docutils literal notranslate"><span class="pre">NodeInputsOutputs.loop_back</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel"><code class="docutils literal notranslate"><span class="pre">Parallel</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel"><code class="docutils literal notranslate"><span class="pre">Parallel</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel.get_inputs_outputs"><code class="docutils literal notranslate"><span class="pre">Parallel.get_inputs_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel.get_loops"><code class="docutils literal notranslate"><span class="pre">Parallel.get_loops()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel.get_nodes"><code class="docutils literal notranslate"><span class="pre">Parallel.get_nodes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Parallel.sections"><code class="docutils literal notranslate"><span class="pre">Parallel.sections</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals"><code class="docutils literal notranslate"><span class="pre">ReadySignals</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals"><code class="docutils literal notranslate"><span class="pre">ReadySignals</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals.clear"><code class="docutils literal notranslate"><span class="pre">ReadySignals.clear()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals.input_names"><code class="docutils literal notranslate"><span class="pre">ReadySignals.input_names</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals.is_ready"><code class="docutils literal notranslate"><span class="pre">ReadySignals.is_ready</span></code></a></li>
@@ -1691,20 +1749,20 @@ _loop_back_inputs. Not for runtime introspection.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.ReadySignals.update"><code class="docutils literal notranslate"><span class="pre">ReadySignals.update()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential"><code class="docutils literal notranslate"><span class="pre">Sequential</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential"><code class="docutils literal notranslate"><span class="pre">Sequential</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential.get_inputs_outputs"><code class="docutils literal notranslate"><span class="pre">Sequential.get_inputs_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential.get_loops"><code class="docutils literal notranslate"><span class="pre">Sequential.get_loops()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential.get_nodes"><code class="docutils literal notranslate"><span class="pre">Sequential.get_nodes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.Sequential.sections"><code class="docutils literal notranslate"><span class="pre">Sequential.sections</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.SpeculativeNodeInfo"><code class="docutils literal notranslate"><span class="pre">SpeculativeNodeInfo</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.SpeculativeNodeInfo"><code class="docutils literal notranslate"><span class="pre">SpeculativeNodeInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.SpeculativeNodeInfo.is_new_loop_iter"><code class="docutils literal notranslate"><span class="pre">SpeculativeNodeInfo.is_new_loop_iter</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.SpeculativeNodeInfo.loop_name"><code class="docutils literal notranslate"><span class="pre">SpeculativeNodeInfo.loop_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.SpeculativeNodeInfo.node_name"><code class="docutils literal notranslate"><span class="pre">SpeculativeNodeInfo.node_name</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo.address"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo.address</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo.clone"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo.clone()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo.dims"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo.dims</span></code></a></li>
@@ -1719,7 +1777,7 @@ _loop_back_inputs. Not for runtime introspection.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.TensorPointerInfo.uuid"><code class="docutils literal notranslate"><span class="pre">TensorPointerInfo.uuid</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry</span></code></a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry.clear"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry.clear()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry.mark_entity_complete"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry.mark_entity_complete()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry.register_ingested_input"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry.register_ingested_input()</span></code></a></li>
@@ -1759,7 +1817,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 18, 2026.
+  Last updated on Jul 20, 2026.
   <br/>
 </p>
   </div>
@@ -1777,8 +1835,8 @@ By M* Team
   </div>
   
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
   <footer class="bd-footer">
   </footer>
