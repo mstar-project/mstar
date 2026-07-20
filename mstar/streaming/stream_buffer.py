@@ -83,7 +83,7 @@ class StreamBuffer:
 
         if not self._producer_done_and_all_read():
             return self.policy.is_ready(buf_len)
-        
+
         # When continue_after_producer_done is set, keep producing empty
         # chunks after the producer finishes and all items are consumed.
         # This allows the consumer to keep running (e.g., Talker continues
