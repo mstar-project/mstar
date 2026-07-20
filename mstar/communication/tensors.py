@@ -367,6 +367,8 @@ class TensorCommunicationManager(ABC):
         self.tensor_store = TensorStore()
         self.pending: list[FutureAndPointers] = []
         self.read_finished: dict[str, set[str]] = {}
+        # (uuid, edge name, dest node) triples already ACKed per request
+        self.acked_refs: dict[str, set] = {}
 
         self.req_rx_info: dict[str, SourceAndEdgeToRxInfo] = {}
         self.req_tx_info: dict[str, EdgeNameToTxInfo] = {}
@@ -658,13 +660,30 @@ class TensorCommunicationManager(ABC):
         final_ready: dict[str, list[GraphEdge]] = {}
         for req_id, edges in ready.items():
             seen_uuids = self.read_finished.setdefault(req_id, set())
-            # ACK only edges not already emitted once: a re-surfaced edge
-            # (re-delivery / retry) must not double-decrement the producer's
-            # refcount — that frees the slot while another consumer in the
-            # fanout may still hold the descriptor.
-            self._collect_and_send_acks(req_id, [
-                e for e in edges
-                if not any(i.uuid in seen_uuids for i in e.tensor_info)])
+            # ACK exactly once per (uuid, edge name, destination node): a
+            # re-surfaced edge (re-delivery / retry) repeats its triple and
+            # must not double-decrement the producer's refcount — that would
+            # free the slot while another consumer in the fanout still holds
+            # the descriptor. But the SAME uuid consumed by a DIFFERENT node
+            # is a distinct reference the fanout counted, and suppressing
+            # its ACK leaks the slot forever (observed in soak as one leaked
+            # slot per request).
+            acked = self.acked_refs.setdefault(req_id, set())
+            ack_edges: list[GraphEdge] = []
+            for e in edges:
+                fresh = [i for i in e.tensor_info
+                         if (i.uuid, e.name, e.next_node) not in acked]
+                if not fresh:
+                    continue
+                acked.update(
+                    (i.uuid, e.name, e.next_node) for i in fresh)
+                if len(fresh) == len(e.tensor_info):
+                    ack_edges.append(e)
+                else:
+                    ack_edges.append(GraphEdge(
+                        next_node=e.next_node, name=e.name,
+                        tensor_info=fresh))
+            self._collect_and_send_acks(req_id, ack_edges)
             rx_infos = self.req_rx_info.setdefault(req_id, {})
             for edge in edges:
                 if not edge.tensor_info:
@@ -812,6 +831,7 @@ class TensorCommunicationManager(ABC):
 
     def cleanup_request(self, request_id: str):
         self.read_finished.pop(request_id, None)
+        self.acked_refs.pop(request_id, None)
         self.buffered_shards.pop(request_id, None)
         self.sharding_configs.pop(request_id, None)
         self.req_rx_info.pop(request_id, None)
