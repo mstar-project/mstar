@@ -323,3 +323,94 @@ def test_ttl_backstop_reclaims_abort_orphans(tmp_path):
         assert not prod._arena_locs
     finally:
         del os.environ["MSTAR_SHM_ARENA_SLOT_TTL_S"]
+
+
+class _AckCapture(_NullCommunicator):
+    """Collects TENSOR_RECEIVED messages instead of raising."""
+
+    def __init__(self):
+        self.acks = []
+
+    def send(self, entity_id, msg):
+        self.acks.append((entity_id, msg))
+
+    def get_all_new_messages(self):
+        return []
+
+
+def _ack_count(comm, uuid):
+    return sum(msg.body.successful_tensors.get(uuid, 0)
+               for _e, msg in comm.acks)
+
+
+def test_shared_uuid_across_edges_acks_fanout(tmp_path):
+    """One tensor consumed by TWO nodes (staggered readiness): the producer
+    counted fanout 2, so both references must ACK — a bare per-uuid gate
+    suppresses the second and leaks the slot forever (the soak's
+    one-slot-per-request signature). A re-DELIVERY of the same edge must
+    still be suppressed."""
+    from mstar.communication.tensors import FutureAndPointers
+
+    comm = _AckCapture()
+    cons = ArenaShmCommunicationManager(
+        my_entity_id="ack1", hostname="localhost", device="cpu",
+        communicator=comm, shm_dir=str(tmp_path))
+    prod = _manager("ack0", tmp_path)
+    x = torch.arange(64, dtype=torch.uint8)
+    infos = prod.store_and_return_tensor_info("ra", {"x": [x]})
+    (info,) = infos["x"]
+    prod.register_for_send("ra", [info])
+
+    e1 = GraphEdge(next_node="B", name="x", tensor_info=[info])
+    cons.start_read_tensors("ra", [e1])
+    cons.get_ready_tensors()
+    assert _ack_count(comm, info.uuid) == 1
+
+    e2 = GraphEdge(next_node="C", name="x", tensor_info=[info])
+    cons.start_read_tensors("ra", [e2])
+    cons.get_ready_tensors()
+    assert _ack_count(comm, info.uuid) == 2, "second reference not ACKed"
+
+    cons.pending.append(FutureAndPointers(
+        future=None, graph_edges=[e1], request_id="ra", rx_time=0.0))
+    cons.get_ready_tensors()
+    assert _ack_count(comm, info.uuid) == 2, "re-delivered edge re-ACKed"
+
+
+def test_segments_unlinked_at_interpreter_exit(tmp_path):
+    """A worker exits with its manager still referenced (no explicit
+    cleanup path), so the Rust Drop never runs — the exit finalizer must
+    unlink the segments anyway."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = str(Path(__file__).resolve().parents[2])
+    code = f"""
+import sys
+sys.path.insert(0, {repo_root!r})
+import os
+os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "2"
+import torch
+from mstar.communication.arena import ArenaShmCommunicationManager
+
+class _C:
+    def send(self, *a): pass
+    def get_all_new_messages(self): return []
+
+m = ArenaShmCommunicationManager(
+    my_entity_id="exitcase", hostname="localhost", device="cpu",
+    communicator=_C(), shm_dir={repr(str(tmp_path))})
+infos = m.store_and_return_tensor_info(
+    "r", {{"x": [torch.arange(64, dtype=torch.uint8)]}})
+m.register_for_send("r", [infos["x"][0]])
+print(m._own_segment_paths[0])
+KEEP_ALIVE = m   # global reference survives to interpreter exit
+"""
+    out = subprocess.run([sys.executable, "-c", code],
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-500:]
+    seg_path = out.stdout.strip().splitlines()[-1]
+    assert seg_path.startswith("/dev/shm/mstar_arena_exitcase_")
+    assert not os.path.exists(seg_path), "segment survived interpreter exit"

@@ -41,6 +41,7 @@ import os
 import queue
 import threading
 import time
+import weakref
 from concurrent.futures import Future
 
 import torch
@@ -101,6 +102,19 @@ def _cudart():
         lib.cudaHostRegister.restype = ctypes.c_int
         _CUDART = lib
     return _CUDART
+
+
+def _unlink_paths(paths: list) -> None:
+    """Exit-time segment unlink (weakref.finalize target — must not
+    reference the manager). Workers exit with the manager still alive, so
+    the interpreter never garbage-collects it and the Rust Drop (which
+    unlinks) never runs; without this, every worker run leaks its full
+    segments in /dev/shm until swept by a later start."""
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _unpin(ptr: int) -> bool:
@@ -263,6 +277,14 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 f"{secrets.token_hex(4)}")
         self._arena = SegmentedShmArena.create(
             base, segment_mb << 20, max_segments)
+        # Guaranteed exit-time unlink: weakref.finalize runs at interpreter
+        # shutdown even when the manager is still referenced (the worker
+        # case — no explicit cleanup path runs there, so the Rust Drop
+        # never fires). The callback captures only the mutable name list,
+        # which _sync_segments extends as the arena grows.
+        self._own_segment_paths: list[str] = []
+        self._finalizer = weakref.finalize(
+            self, _unlink_paths, self._own_segment_paths)
         # Producer-side segment views (memoryviews are stable: segments
         # never move or resize) + how many segments are already pinned.
         self._seg_views: list[memoryview] = []
@@ -352,7 +374,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     def _sync_segments(self) -> None:
         grew = False
         while len(self._seg_views) < self._arena.num_segments:
-            seg = self._arena.segment(len(self._seg_views))
+            i = len(self._seg_views)
+            seg = self._arena.segment(i)
+            self._own_segment_paths.append(
+                f"/dev/shm/{self._arena.segment_name(i)}")
             self._seg_views.append(memoryview(seg))
             self._maybe_pin(*seg.ptr_len())
             grew = True
