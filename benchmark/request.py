@@ -218,11 +218,15 @@ class RequestMetrics:
         if self.expected_output_modalities and any(
             mod not in self._output_modalities_recvd for mod in self.expected_output_modalities
         ):
-            print(
+            error = (
                 f"ERROR [req {self.request_id}]: expected modalities "
-                f"{self.expected_output_modalities}, received {self._output_modalities_recvd}",
+                f"{self.expected_output_modalities}, received {self._output_modalities_recvd}"
+            )
+            print(
+                error,
                 file=sys.stderr,
             )
+            self.error = error
             self.status = Status.FAILED
             return
         self.status = Status.SUCCESS
