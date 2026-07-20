@@ -40,6 +40,10 @@ class StreamBuffer:
     _consumed: int = 0
     _chunks_popped: int = 0
     producer_done: bool = False
+    # Set once a chunk has been popped with ``is_final=True`` (the terminal
+    # flush). Guards the empty-buffer final flush below so it fires exactly
+    # once and ``has_chunk_ready`` doesn't spin returning True forever.
+    _final_chunk_emitted: bool = False
 
     _num_tensors_registered = 0
     _num_buffer_writes = 0
@@ -86,6 +90,17 @@ class StreamBuffer:
                 and buf_len == 0
                 and self.policy.continue_after_producer_done()):
             return True
+        # Producer done and the buffer already drained to empty (all items
+        # were consumed in earlier chunks — happens when the total item count
+        # is an exact multiple of the chunk size and the consumer kept up).
+        # No chunk was ever marked final, so the consumer never runs its
+        # terminal flush and the request would hang. Emit exactly one final
+        # (empty) chunk so ``is_final`` propagates and the stream closes.
+        if (self._producer_done_and_all_read()
+                and buf_len == 0
+                and not self._final_chunk_emitted
+                and not self.policy.continue_after_producer_done()):
+            return True
         return self.policy.is_ready(buf_len)
 
     def pop_chunk(self) -> StreamChunk:
@@ -120,6 +135,8 @@ class StreamBuffer:
         # consumer decides when it's done via its own model logic.
         if self.policy.continue_after_producer_done():
             is_final = False
+        if is_final:
+            self._final_chunk_emitted = True
 
         chunk = StreamChunk(
             data=self._collate(items),
