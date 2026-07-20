@@ -14,14 +14,13 @@ time).
 These tests exercise ``Worker._init_cuda_executor_thread`` exactly as
 ``Worker.run`` wires it into its executors.
 """
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
 from mstar.worker.worker import Worker
+
+torch = pytest.importorskip("torch")
 
 
 def _worker_with_device(device: torch.device) -> Worker:
