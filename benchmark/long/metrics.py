@@ -25,6 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from benchmark.base import Status
 from benchmark.request import RequestMetrics, _audio_duration_seconds
 
 
@@ -134,11 +135,18 @@ class SoakMetrics:
                 self.timed_out += 1
                 self.errors_by_label[label] = self.errors_by_label.get(label, 0) + 1
                 return
-            if metrics.error is not None:
+            if metrics.error is not None or metrics.status != Status.SUCCESS:
                 self.failed += 1
                 self.errors_by_label[label] = self.errors_by_label.get(label, 0) + 1
                 return
 
+            # Known limitation: this only distinguishes *empty* streams from
+            # healthy ones. record_completion flags a request FAILED when an
+            # expected output modality is entirely missing (received []), but a
+            # stream that returns *some* output and is then truncated under
+            # overload still passes that check and lands in completed_ok. So
+            # ok/failed detect total drops, not partial/short completions —
+            # watch the throughput moving averages for the latter.
             self.completed_ok += 1
             e2e = metrics.e2e_latency or 0.0
             ttft = metrics.ttft.get(out_mod, e2e)
