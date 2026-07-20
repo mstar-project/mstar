@@ -486,6 +486,34 @@ class PreprocessWorkerThread:
             did_work = False
             try:
                 did_work = self._process_messages()
+                # Output delivery is latency-sensitive: the API server holds a
+                # finished request open for its final chunks only briefly, so
+                # queued read-starts / acks / cleanups must never wait behind a
+                # multi-second media preprocess. Drain them fully every pass
+                # and take at most one preprocess item afterwards.
+                while not self.result_tensor_queue.empty():
+                    did_work = True
+                    self._read_result_tensor(self.result_tensor_queue.get())
+                while not self.abort_request_queue.empty():
+                    did_work = True
+                    self.communicator.send(
+                        "conductor",
+                        ConductorMessage(
+                            message_type=ConductorMessageType.ABORT_REQUEST,
+                            body=AbortRequest(request_id=self.abort_request_queue.get()),
+                        ),
+                    )
+                while not self.discard_tensor_queue.empty():
+                    did_work = True
+                    self._discard_result_tensor(self.discard_tensor_queue.get())
+                while not self.cleanup_request_queue.empty():
+                    did_work = True
+                    req_id = self.cleanup_request_queue.get()
+                    self.tensor_manager.cleanup_request(req_id)
+                    if req_id in self.tensor_uuid_to_metadata_per_request:
+                        del self.tensor_uuid_to_metadata_per_request[req_id]
+                    self.request_model_kwargs.pop(req_id, None)
+                did_work = self._process_read_tensors() or did_work
                 if not self.in_queue.empty():
                     did_work = True
                     pre_input = self.in_queue.get()
@@ -509,29 +537,6 @@ class PreprocessWorkerThread:
                         ))
                         self.tensor_manager.cleanup_request(pre_input.request_id)
                         self.request_model_kwargs.pop(pre_input.request_id, None)
-                if not self.result_tensor_queue.empty():
-                    did_work = True
-                    self._read_result_tensor(self.result_tensor_queue.get())
-                if not self.abort_request_queue.empty():
-                    did_work = True
-                    self.communicator.send(
-                        "conductor",
-                        ConductorMessage(
-                            message_type=ConductorMessageType.ABORT_REQUEST,
-                            body=AbortRequest(request_id=self.abort_request_queue.get()),
-                        ),
-                    )
-                if not self.discard_tensor_queue.empty():
-                    did_work = True
-                    self._discard_result_tensor(self.discard_tensor_queue.get())
-                if not self.cleanup_request_queue.empty():
-                    did_work = True
-                    req_id = self.cleanup_request_queue.get()
-                    self.tensor_manager.cleanup_request(req_id)
-                    if req_id in self.tensor_uuid_to_metadata_per_request:
-                        del self.tensor_uuid_to_metadata_per_request[req_id]
-                    self.request_model_kwargs.pop(req_id, None)
-                did_work = did_work or self._process_read_tensors()
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
 

@@ -320,12 +320,28 @@ class APIServer:
                     rid, req.final_outputs
                 )
             )
-            if drained or req is None or (now - ts) >= self._recently_completed_ttl:
-                stale.append(rid)
-        for rid in stale:
+            if drained or req is None:
+                stale.append((rid, False))
+            elif (now - ts) >= self._recently_completed_ttl:
+                stale.append((rid, True))
+        for rid, lost_outputs in stale:
             # only set the event when there are no more pending chunks
             req = self.pending_requests.get(rid)
             if req is not None:
+                if lost_outputs:
+                    # The TTL is a last resort for chunks that never arrive;
+                    # closing the request as a silent success would hand the
+                    # client a truncated (possibly empty) response.
+                    logger.error(
+                        "Request %s finished but its result chunks were not "
+                        "delivered within %.0fs; failing the request",
+                        rid, self._recently_completed_ttl,
+                    )
+                    if req.error is None:
+                        req.error = (
+                            "result delivery timed out; response is incomplete"
+                        )
+                        req.error_status = 500
                 req.event.set()
                 # Snapshot the data worker's tx/rx now: the request is done (all
                 # final chunks received), so the worker thread is no longer mutating
@@ -507,6 +523,17 @@ class APIServer:
                         self._finalize_profile(finished_req)
                     for chunk in remaining:
                         yield chunk
+                    # A request can fail after the stream is already open
+                    # (preprocess error, result-delivery timeout); the HTTP
+                    # status is committed by then, so the error must travel
+                    # in-band as the final chunk.
+                    if finished_req is not None and finished_req.error is not None:
+                        yield ResultChunk(
+                            request_id=request_id,
+                            modality="error",
+                            data=str(finished_req.error).encode("utf-8"),
+                            metadata={"status": finished_req.error_status},
+                        )
                     finished = True
                     break
 
