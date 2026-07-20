@@ -13,9 +13,6 @@ import collections
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
-
-import pytest
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.entrypoint import APIServer, PendingRequest
