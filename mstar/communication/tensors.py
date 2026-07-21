@@ -369,6 +369,16 @@ class TensorCommunicationManager(ABC):
         self.read_finished: dict[str, set[str]] = {}
         # (uuid, edge name, dest node) triples already ACKed per request
         self.acked_refs: dict[str, set] = {}
+        # request -> uuid -> number of persist references currently held.
+        # `set_output_ref_counts` counts each persist edge in the fanout, so
+        # a persisted tensor carries one reference per persist edge ON TOP
+        # of the persist flag. Nothing released those references: clearing
+        # the flag (unpersist, or request cleanup) left the count above
+        # zero forever, so the tensor was never collectable — one leaked
+        # arena slot (or shm file, on the file transport) per persisted
+        # tensor, for the life of the process. They are released here, in
+        # step with the flag that was set alongside them.
+        self._persist_holds: dict[str, dict[str, int]] = {}
 
         self.req_rx_info: dict[str, SourceAndEdgeToRxInfo] = {}
         self.req_tx_info: dict[str, EdgeNameToTxInfo] = {}
@@ -663,11 +673,19 @@ class TensorCommunicationManager(ABC):
             # ACK exactly once per (uuid, edge name, destination node): a
             # re-surfaced edge (re-delivery / retry) repeats its triple and
             # must not double-decrement the producer's refcount — that would
-            # free the slot while another consumer in the fanout still holds
-            # the descriptor. But the SAME uuid consumed by a DIFFERENT node
-            # is a distinct reference the fanout counted, and suppressing
-            # its ACK leaks the slot forever (observed in soak as one leaked
-            # slot per request).
+            # free the buffer while another consumer in the fanout still
+            # holds the descriptor (silent wrong bytes on the arena). The
+            # SAME uuid consumed by a DIFFERENT node is a distinct reference
+            # the fanout counted, so it ACKs normally.
+            #
+            # KNOWN LIMITATION: a graph that legitimately routes the same
+            # tensor to the same node under the same edge name TWICE in one
+            # request (e.g. a hypothetical prefill_text -> prefill_image ->
+            # prefill_text walk feeding `text_inputs` to the LLM twice) is
+            # indistinguishable from a re-delivery here, so the second ACK
+            # is suppressed and that buffer leaks. No current model has that
+            # shape; distinguishing the two would need the reference's
+            # identity (not just the tensor's) carried in TensorReceived.
             acked = self.acked_refs.setdefault(req_id, set())
             ack_edges: list[GraphEdge] = []
             for e in edges:
@@ -817,7 +835,16 @@ class TensorCommunicationManager(ABC):
         return self._undo_leading_shard_dim(shard_dim, tensor)
 
     def set_persist(self, request_id: str, uuid: str, persist: bool):
-        self.tensor_store.set_metadata(request_id, uuid, persist=persist)
+        holds = self._persist_holds.setdefault(request_id, {})
+        if persist:
+            # One call per persist edge — the same edges `routed_edges`
+            # counted, so this mirrors the references they contributed.
+            holds[uuid] = holds.get(uuid, 0) + 1
+            self.tensor_store.set_metadata(request_id, uuid, persist=True)
+        else:
+            self.tensor_store.set_metadata(request_id, uuid, persist=False)
+            if (held := holds.pop(uuid, 0)):
+                self.tensor_store.dereference(request_id, uuid, n=held)
         if self.tensor_store.can_gc(request_id, uuid):
             self._cleanup_by_uuid(request_id, uuid)
 
@@ -838,7 +865,9 @@ class TensorCommunicationManager(ABC):
         self.req_tx_info.pop(request_id, None)
         for uuid in self.tensor_store.get_all_uuids(request_id):
             self.uuid_to_shard_dim.pop(uuid, None)
-            self.tensor_store.set_metadata(request_id, uuid, persist=False)
+            # via set_persist (not raw metadata) so the persist references
+            # are released with the flag
+            self.set_persist(request_id, uuid, False)
             if not self.tensor_store.can_gc(request_id, uuid):
                 logger.warning(
                     "Deferring cleanup of tensor uuid %s "
@@ -852,6 +881,7 @@ class TensorCommunicationManager(ABC):
             sum([ep.graph_edges for ep in self.pending if ep.request_id == request_id], start=[]),
         )
         self.pending = [ep for ep in self.pending if ep.request_id != request_id]
+        self._persist_holds.pop(request_id, None)
 
 
 # ---------------------------------------------------------------------------
