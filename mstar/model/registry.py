@@ -61,10 +61,10 @@ HF_MODELS: dict[str, dict] = {
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
-    # Zonos2 multi-codebook TTS. Point ``$ZONOS2_MODEL_PATH`` at a checkpoint
-    # in the reference layout (a dir with ``params.json`` + ``model.pth``, or an
-    # HF repo id); see ``mstar/model/zonos2/weight_loader.py``. The DAC vocoder
-    # additionally needs ``descript-audio-codec`` installed.
+    # Zonos2 multi-codebook TTS. Point ``$ZONOS2_MODEL_PATH`` at a checkpoint in
+    # the reference layout. This is a directory with ``params.json`` and
+    # ``model.pth``, or an HF repo id. See ``mstar/model/zonos2/weight_loader.py``.
+    # The DAC vocoder also needs ``descript-audio-codec`` installed.
     "zonos2": {
         "model_path_hf": os.environ.get("ZONOS2_MODEL_PATH", "Zyphra/ZONOS2"),
     },

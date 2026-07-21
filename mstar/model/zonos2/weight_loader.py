@@ -1,16 +1,16 @@
 """Checkpoint loading for Zonos2 (reference ``params.json`` + ``model.pth``).
 
-Zonos2 release checkpoints are a directory holding:
-  * ``params.json`` — the model/training config (see
+Zonos2 release checkpoints are a directory. It holds:
+  * ``params.json`` — the model and training config (see
     :func:`mstar.model.zonos2.config.load_zonos2_config`).
-  * ``model.pth`` (or ``model.pt`` / ``consolidated/consolidated.pth``) — a
+  * ``model.pth`` (or ``model.pt`` or ``consolidated/consolidated.pth``) — a
     torch ``state_dict`` (optionally nested under a ``"model"`` key).
 
-This is *not* the HuggingFace safetensors layout the generic
-``mstar.model.loader`` handles, so Zonos2 loads its own checkpoint here.
+This is *not* the HuggingFace safetensors layout that the generic
+``mstar.model.loader`` handles. So Zonos2 loads its own checkpoint here.
 Adapted from ``../ZONOS2/python/zonos2/models/weight.py`` and
-``utils/hf.py``. Tensor-parallel sharding is left to the model's
-per-parameter ``weight_loader`` hooks (we feed full checkpoint tensors).
+``utils/hf.py``. The model's per-parameter ``weight_loader`` hooks handle
+tensor-parallel sharding. We feed them full checkpoint tensors.
 """
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ def _find_state_dict_file(checkpoint_dir: str) -> Path | None:
 
 
 def load_zonos2_state_dict(checkpoint_dir: str) -> dict[str, torch.Tensor]:
-    """Load the raw torch ``state_dict`` (CPU); unwraps a ``"model"`` key."""
+    """Load the raw torch ``state_dict`` on CPU. It unwraps a ``"model"`` key."""
     sd_file = _find_state_dict_file(checkpoint_dir)
     if sd_file is None:
         raise FileNotFoundError(
@@ -83,11 +83,11 @@ def load_zonos2_state_dict(checkpoint_dir: str) -> dict[str, torch.Tensor]:
 def normalize_zonos2_state_dict(
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Training -> inference key cleanup (matches the reference).
+    """Clean up training keys for inference (matches the reference).
 
     * Unwrap weight-norm reparametrization: ``x.parametrizations.w.original``
       -> ``x.w``.
-    * Drop training-only router stats (``router.ent_denom`` /
+    * Drop training-only router stats (``router.ent_denom`` and
       ``router.normalized_entropy``).
     """
     out: dict[str, torch.Tensor] = {}
@@ -105,8 +105,8 @@ def load_zonos2_config_from_checkpoint(
 ) -> Zonos2Config:
     """Read ``params.json`` -> :class:`Zonos2Config` (``overrides`` win).
 
-    If ``text_vocab`` is absent from ``params.json`` (some training-run
-    checkpoints), it is inferred from the text embedder's row count.
+    Some training-run checkpoints lack ``text_vocab`` in ``params.json``.
+    Then the code infers it from the text embedder's row count.
     """
     params = _read_params_json(checkpoint_dir)
     if params is None:
@@ -137,10 +137,10 @@ def _infer_text_vocab(checkpoint_dir: str, n_codebooks: int) -> int | None:
 def load_zonos2_weights(
     model: torch.nn.Module, checkpoint_dir: str, device: torch.device | str = "cpu",
 ) -> set[str]:
-    """Load + normalize the checkpoint into ``model`` via its ``load_weights``.
+    """Load and normalize the checkpoint into ``model`` via its ``load_weights``.
 
-    Tensors are streamed from CPU; the model's ``load_weights`` copies each
-    into its (already on-device) parameters, so peak VRAM stays ~1x.
+    The code streams tensors from CPU. The model's ``load_weights`` copies
+    each one into its (already on-device) parameters. So peak VRAM stays ~1x.
     """
     state_dict = normalize_zonos2_state_dict(load_zonos2_state_dict(checkpoint_dir))
     loaded = model.load_weights(state_dict.items())

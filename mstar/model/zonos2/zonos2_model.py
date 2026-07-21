@@ -1,15 +1,16 @@
 """Zonos2 TTS model: LLM (multi-codebook AR decoder) + DAC vocoder.
 
-The ``Model`` ABC implementation that wires Zonos2 into the mstar serving
-stack. Structurally mirrors ``mstar/model/orpheus/orpheus_model.py`` (an
-autoregressive LLM partition streaming tokens to an audio-codec partition),
-adapted for Zonos2's multi-codebook frames and DAC vocoder.
+This is the ``Model`` ABC implementation. It wires Zonos2 into the mstar
+serving stack. It mirrors ``mstar/model/orpheus/orpheus_model.py`` in
+structure. That model streams tokens from an autoregressive LLM partition to
+an audio-codec partition. This one adapts it for Zonos2's multi-codebook
+frames and DAC vocoder.
 
 Two async partitions:
-  * ``LLM``  (KV-cache engine)  — prefill then a decode loop; each step
+  * ``LLM``  (KV-cache engine)  — prefill, then a decode loop. Each step
     samples a frame ``[cb0..cb8, text]`` and streams it to ``DAC``.
-  * ``DAC``  (stateless engine) — accumulates streamed frames, ``shear_up``,
-    and DAC-decodes to PCM, emitted to the client.
+  * ``DAC``  (stateless engine) — it accumulates streamed frames, runs
+    ``shear_up``, and DAC-decodes to PCM. It emits the PCM to the client.
 
 Graph walks: ``prefill`` -> ``decode`` (Loop) on LLM; ``dac_chunk`` on DAC.
 """
@@ -57,8 +58,8 @@ class Zonos2Model(Model):
     ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
-        # Extra kwargs come from the serving YAML's ``model_kwargs`` and win
-        # over the checkpoint config (matches the pi05 pattern).
+        # Extra kwargs come from the serving YAML's ``model_kwargs``. They win
+        # over the checkpoint config. This matches the pi05 pattern.
         self._yaml_overrides = dict(kwargs)
         self.config = config or self._load_config()
         self.sampling_params = TTSSamplingParams()
@@ -70,8 +71,8 @@ class Zonos2Model(Model):
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}
 
     def _load_config(self) -> Zonos2Config:
-        """Build the config from the checkpoint's ``params.json`` (with YAML
-        ``model_kwargs`` overrides); fall back to defaults if unavailable."""
+        """Build the config from the checkpoint's ``params.json``, with YAML
+        ``model_kwargs`` overrides. Fall back to defaults if unavailable."""
         if self.model_path_hf:
             try:
                 from mstar.model.zonos2.weight_loader import (

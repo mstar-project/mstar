@@ -19,6 +19,8 @@ from mstar.model.components.moe import (
     SparseMoeBlock,
     SparseMoeBlockWithSharedExpert,
     TopKRouter,
+    # Re-export the shared MoE dispatch. The Zonos2 MoE block calls it, so it
+    # picks up the fused Triton kernel through the same entry point.
     dispatch_experts,
     dispatch_experts_fused,
 )
