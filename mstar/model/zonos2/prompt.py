@@ -1,18 +1,18 @@
 """Byte-level prompt construction for Zonos2 TTS.
 
-Ported from ``../ZONOS2/python/zonos2/tts/prompt.py`` (trimmed to the
-default path: UTF-8 byte tokenization + a sheared silence tail; the
-optional speaking-rate / quality / speaker-background conditioning tokens
-are omitted here).
+Ported from ``../ZONOS2/python/zonos2/tts/prompt.py``. It is trimmed to
+the default path: UTF-8 byte tokenization plus a sheared silence tail. It
+omits the optional speaking-rate, quality, and speaker-background
+conditioning tokens.
 
-# TODO: add the optional speaking-rate / quality / speaker-background 
+# TODO: add the optional speaking-rate, quality, and speaker-background
 conditioning
 
 A prompt is a 2-D int tensor of shape ``(num_frames, n_codebooks + 1)``.
-For each text/byte token the audio columns are filled with
-``audio_pad_id`` and the final (text) column carries the byte-token id.
-A pre-computed 0.2 s silence tail (17 frames) with the inter-codebook
-shear pattern applied is appended so generation starts from silence.
+For each byte token the audio columns hold ``audio_pad_id``. The final
+(text) column carries the byte-token id. The code appends a pre-computed
+0.2 s silence tail (17 frames) with the inter-codebook shear pattern. So
+generation starts from silence.
 """
 from __future__ import annotations
 
@@ -52,10 +52,10 @@ def text_to_byte_ids(text: str) -> list[int]:
 
 
 def shear(x: torch.Tensor, pad: int) -> torch.Tensor:
-    """Apply the inter-codebook delay: column ``j`` shifted down by ``j``.
+    """Apply the inter-codebook delay: shift column ``j`` down by ``j``.
 
-    ``x`` is ``(T, C)``; the output is ``(C - 1 + T, C)`` with ``pad`` filling
-    the delayed positions. Inverse of ``vocoder.shear_up``.
+    ``x`` is ``(T, C)``. The output is ``(C - 1 + T, C)``. ``pad`` fills the
+    delayed positions. This is the inverse of ``vocoder.shear_up``.
     """
     T, C = x.shape
     padded = x.new_full((C - 1 + T, C), pad)
@@ -77,7 +77,7 @@ def silence_prompt_tokens(
 
 
 class TTSPromptBuilder:
-    """Builds the 2-D prompt frame tensor for a text string."""
+    """Build the 2-D prompt frame tensor for a text string."""
 
     def __init__(
         self,

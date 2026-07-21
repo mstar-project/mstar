@@ -84,7 +84,8 @@ def _next_steps(model: str, host: str, port: int) -> str:
         voice = "tara" if model == "orpheus" else "Ethan"
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
     if model == "zonos2":
-        # Zonos2 has no built-in voices yet (speaker conditioning is disabled).
+        # Zonos2 has no built-in voices yet. It disables speaker conditioning.
+        # So the hint shows no voice argument.
         lines.append("    client.tts(\"Hello there\").to_wav(\"out.wav\")")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +

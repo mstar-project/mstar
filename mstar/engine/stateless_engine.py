@@ -429,6 +429,8 @@ class StatelessEngine(BaseEngine):
         engine_inputs = ModelInputsFromEngine(
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
+            # Forward the final-chunk ids so a streaming-codec submodule (the
+            # Zonos2 vocoder) can flush its per-request tail on the last call.
             final_stream_rids=batch.final_stream_rids,
         )
 
@@ -474,6 +476,8 @@ class StatelessEngine(BaseEngine):
             engine_inputs = ModelInputsFromEngine(
                 request_ids=[rid],
                 per_request_info={rid: fwd_info},
+                # Same as the batched path: carry the final-chunk ids so the
+                # vocoder can flush its per-request tail on the last call.
                 final_stream_rids=batch.final_stream_rids,
             )
 

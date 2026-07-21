@@ -137,15 +137,16 @@ class ModelInputsFromEngine:
     preallocated_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
     sampler: BaseSampler | None = None
     # Under CUDA-graph replay ``request_ids`` holds the fixed capture-slot
-    # placeholders (``dummy_rids``), not the live request ids. Submodules that
-    # own per-request state keyed by real id (e.g. Zonos2's sampler buffers)
-    # need the real ids to gather that state before replay; the runner sets
-    # this to the real ids (length ``real_bs``) on the captured path. ``None``
-    # on the eager paths, where ``request_ids`` is already the real list.
+    # placeholders (``dummy_rids``), not the live request ids. A submodule that
+    # owns per-request state keyed by real id (the Zonos2 sampler buffers)
+    # needs the real ids to gather that state before replay. The runner sets
+    # this to the real ids (length ``real_bs``) on the captured path. It stays
+    # ``None`` on the eager paths, where ``request_ids`` is already the real list.
     real_request_ids: list[str] | None = None
-    # Request ids whose consumed streaming input was the final chunk (producer
-    # done, buffer drained). Lets streaming-codec nodes flush per-request tail
-    # state (e.g. a vocoder's withheld crossfade tail) on the last call.
+    # Request ids whose consumed streaming input was the final chunk. The
+    # producer is done and the buffer is drained. This lets a streaming-codec
+    # node flush its per-request tail state on the last call (for example, a
+    # vocoder's withheld crossfade tail).
     final_stream_rids: set[str] = field(default_factory=set)
 
     @property

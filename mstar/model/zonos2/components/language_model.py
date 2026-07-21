@@ -30,20 +30,20 @@ from mstar.model.components.distributed import (
 from mstar.model.components.moe import dispatch_experts
 from mstar.model.zonos2.config import Zonos2Config
 
-# QK-norm epsilon is hardcoded in the reference attention (F.rms_norm(..., eps=1e-6)).
+# The reference attention hardcodes the QK-norm epsilon (F.rms_norm(..., eps=1e-6)).
 _QK_NORM_EPS = 1e-6
 
 
 def softcap(x: torch.Tensor, cap: float) -> torch.Tensor:
-    """tanh-based logit soft-capping: ``cap * tanh(x / cap)``."""
+    """Soft-cap logits with tanh: ``cap * tanh(x / cap)``."""
     return cap * torch.tanh(x / cap)
 
 
 class MultiEmbedding(nn.Module):
     """Sum of per-column token embeddings (9 audio codebooks + text).
 
-    Maintains one :class:`VocabParallelEmbedding` per column and sums their
-    lookups element-wise into a single hidden state. Checkpoint layout:
+    The module keeps one :class:`VocabParallelEmbedding` per column. It sums
+    their lookups element-wise into a single hidden state. Checkpoint layout:
     ``multi_embedder.embedders.{i}.weight`` (audio columns first, text last).
     """
 
@@ -52,7 +52,7 @@ class MultiEmbedding(nn.Module):
         self.n_codebooks = config.n_codebooks
 
         embedders: list[nn.Module] = []
-        # Audio codebook tables (padding_idx = audio_pad_id).
+        # Audio codebook tables. Each uses padding_idx = audio_pad_id.
         for _ in range(config.n_codebooks):
             embedders.append(
                 VocabParallelEmbedding(
@@ -62,7 +62,7 @@ class MultiEmbedding(nn.Module):
                     padding_idx=config.audio_pad_id,
                 )
             )
-        # Optional text table (padding_idx = text_vocab), appended last.
+        # Optional text table, appended last. It uses padding_idx = text_vocab.
         if config.text_vocab is not None:
             embedders.append(
                 VocabParallelEmbedding(
@@ -75,8 +75,8 @@ class MultiEmbedding(nn.Module):
         self.embedders = nn.ModuleList(embedders)
 
     def forward(self, codes: torch.Tensor) -> torch.Tensor:
-        # codes: (tokens, num_columns). Column i is looked up in embedder i.
-        # ``.contiguous()`` because codes[..., i] is a strided view.
+        # codes: (tokens, num_columns). Embedder i looks up column i.
+        # Call ``.contiguous()`` because codes[..., i] is a strided view.
         out = self.embedders[0](codes[..., 0].contiguous())
         for i in range(1, codes.shape[-1]):
             out = out + self.embedders[i](codes[..., i].contiguous())
@@ -87,16 +87,16 @@ class Zonos2Attention(nn.Module):
     """Self-attention with parameter-free QK-norm, a learnable per-head
     temperature, interleaved RoPE, and headwise sigmoid gating.
 
-    Differs from the shared :class:`Attention`, so it is written out 
-    here rather than subclassed:
+    This differs from the shared :class:`Attention`. So the code writes it
+    out here instead of a subclass:
 
-    - QK-norm is *parameter-free* (``F.rms_norm`` with no weight), and the
-      query is then scaled by a learnable per-head ``|temp|``.
+    - QK-norm is *parameter-free* (``F.rms_norm`` with no weight). The code
+      then scales the query by a learnable per-head ``|temp|``.
     - RoPE uses the interleaved (``is_neox=False``) layout.
-    - The attention output is gated headwise by ``sigmoid(gater(x))``.
+    - The code gates the attention output headwise by ``sigmoid(gater(x))``.
 
-    Projections reuse the TP-aware parallel linears:
-    ``wq``/``gater`` (column), ``wkv`` (merged K||V column), ``wo`` (row).
+    The projections reuse the TP-aware parallel linears:
+    ``wq`` and ``gater`` (column), ``wkv`` (merged K||V column), ``wo`` (row).
     """
 
     def __init__(self, config: Zonos2Config, comm_group: TPCommGroup):
@@ -120,7 +120,7 @@ class Zonos2Attention(nn.Module):
             output_size=q_dim,
             bias=False,
         )
-        # Fused K||V; MergedColumnParallelLinear shards K and V heads
+        # Fused K||V. MergedColumnParallelLinear shards the K and V heads
         # independently (shard 0 = K, shard 1 = V).
         self.wkv = MergedColumnParallelLinear(
             comm_group=comm_group,
@@ -136,7 +136,7 @@ class Zonos2Attention(nn.Module):
             input_is_parallel=True,
             reduce_results=True,
         )
-        # Headwise gate: hidden -> num_heads, sharded over heads like wq.
+        # Headwise gate: hidden -> num_heads. It shards over heads like wq.
         self.gater = ColumnParallelLinear(
             comm_group=comm_group,
             input_size=config.hidden_size,
@@ -144,8 +144,8 @@ class Zonos2Attention(nn.Module):
             bias=False,
         )
 
-        # Learnable per-head temperature, shape (1, local_num_heads, 1),
-        # broadcast over tokens and head_dim. Sharded across TP ranks.
+        # Learnable per-head temperature, shape (1, local_num_heads, 1).
+        # It broadcasts over tokens and head_dim. It shards across TP ranks.
         self.temp = nn.Parameter(torch.ones(1, self.local_num_heads, 1))
         self._attach_temp_loader()
 
@@ -158,7 +158,7 @@ class Zonos2Attention(nn.Module):
         return result
 
     def _temp_loader(self, param, loaded_weight, loaded_shard_id=None):
-        # Checkpoint temp is (1, num_heads, 1)
+        # The checkpoint temp is (1, num_heads, 1).
         start = self.comm_group.rank * self.local_num_heads
         shard = loaded_weight.narrow(1, start, self.local_num_heads)
         assert param.data.shape == shard.shape, (
@@ -173,7 +173,7 @@ class Zonos2Attention(nn.Module):
     ) -> torch.Tensor:
         num_tokens = x.shape[0]
 
-        # Headwise gate from the (normed) input; applied after attention.
+        # Headwise gate from the normed input. The code applies it after attention.
         gate = torch.sigmoid(self.gater(x))  # (tokens, local_num_heads)
 
         q = self.wq(x).view(num_tokens, self.local_num_heads, self.head_dim)
@@ -183,18 +183,18 @@ class Zonos2Attention(nn.Module):
         k = k.view(num_tokens, self.local_num_kv_heads, self.head_dim)
         v = v.view(num_tokens, self.local_num_kv_heads, self.head_dim).contiguous()
 
-        # Parameter-free QK-norm; query additionally scaled by |temp| per head.
+        # Parameter-free QK-norm. The code also scales the query by |temp| per head.
         q = F.rms_norm(q, (self.head_dim,), eps=_QK_NORM_EPS) * self.temp.abs().to(q.dtype)
         k = F.rms_norm(k, (self.head_dim,), eps=_QK_NORM_EPS)
 
-        # Interleaved RoPE (is_neox=False). No llama3 scaling kwargs so the
+        # Interleaved RoPE (is_neox=False). Pass no llama3 scaling kwargs. So the
         # cache handle stays on the plain rope path.
         q, k = cache_handle.apply_rope(
             q, k, rope_theta=self.rope_theta, interleave=True,
         )
 
-        # Standard scaled-dot-product attention (softmax scale = 1/sqrt(dim);
-        # the temperature above is an additional learned multiplier on q).
+        # Standard scaled-dot-product attention (softmax scale = 1/sqrt(dim)).
+        # The temperature above is an extra learned multiplier on q.
         o = cache_handle.run_attention(q=q, k=k, v=v)  # (tokens, heads, dim)
         o = o * gate.unsqueeze(-1)
         o = o.reshape(num_tokens, self.local_num_heads * self.head_dim)
@@ -204,15 +204,15 @@ class Zonos2Attention(nn.Module):
 class Zonos2Router(nn.Module):
     """MoE router with Expert-Dropout-Augmentation (EDA) state threading.
 
-    Down-projects the hidden state to ``router_dim``, optionally blends in
-    the previous MoE layer's router state (EDA), RMS-normalizes, runs a
-    3-layer GELU MLP to per-expert logits, softmaxes, and selects a
-    bias-aware top-k. Returns the routing weights, expert indices, and the
-    *pre-norm* router state for the next MoE layer's EDA.
+    The router down-projects the hidden state to ``router_dim``. It optionally
+    blends in the previous MoE layer's router state (EDA). It RMS-normalizes,
+    runs a 3-layer GELU MLP to per-expert logits, applies softmax, and selects
+    a bias-aware top-k. It returns the routing weights, the expert indices, and
+    the *pre-norm* router state for the next MoE layer's EDA.
 
     Checkpoint layout:
         router.down_proj.{weight,bias}
-        router.router_mlp.{0,2,4}.{weight,bias}   # GELU at indices 1, 3
+        router.router_mlp.{0,2,4}.{weight,bias}   # GELU sits at indices 1, 3
         router.rmsnorm_eda.weight
         router.router_states_scale               # EDA layers only
         router.balancing_biases
@@ -221,8 +221,8 @@ class Zonos2Router(nn.Module):
     def __init__(self, config: Zonos2Config, layer_id: int):
         super().__init__()
         self.num_experts = config.moe_n_experts
-        # Per-layer top-k (``special_topk_layers`` overrides the global default,
-        # e.g. layer 26 -> top-2 in the reference checkpoint).
+        # Per-layer top-k. ``special_topk_layers`` overrides the global default.
+        # For example, layer 26 -> top-2 in the reference checkpoint.
         self.top_k = config.get_num_experts_per_tok(layer_id)
 
         self.use_eda = layer_id != config.moe_start_from_layer
@@ -255,7 +255,7 @@ class Zonos2Router(nn.Module):
         hidden = self.down_proj(x)
         if self.use_eda and router_states is not None:
             hidden = hidden + router_states * self.router_states_scale
-        # Pre-norm state threaded to the next MoE layer's EDA.
+        # The code threads this pre-norm state to the next MoE layer's EDA.
         router_states_next = hidden.clone()
 
         hidden = self.rmsnorm_eda(hidden)
@@ -264,7 +264,7 @@ class Zonos2Router(nn.Module):
         bias = self.balancing_biases.detach().float()
         scores = expert_prob - bias if self.subtract_bias else expert_prob + bias
         _, expert_choice = torch.topk(scores, self.top_k, dim=-1)
-        # weights are NOT renormalized
+        # The code does NOT renormalize the weights.
         route_prob = torch.gather(expert_prob, dim=-1, index=expert_choice)
         return route_prob, expert_choice.to(torch.int64), router_states_next
 
@@ -272,13 +272,13 @@ class Zonos2Router(nn.Module):
 class Zonos2MoEFeedForward(nn.Module):
     """Sparse MoE feed-forward: EDA router + fused SwiGLU experts.
 
-    Expert weights use the fused checkpoint layout shared with
+    The expert weights use the fused checkpoint layout shared with
     :class:`SparseMoeBlock`:
       - ``experts.gate_up_proj``: (num_experts, 2 * inter, hidden)  # w1 || w3
       - ``experts.down_proj``:    (num_experts, hidden, inter)      # w2
-    Dispatch reuses :func:`dispatch_experts`, which prefers the fused Triton
-    grouped-GEMM kernel when available and falls back to the naive per-expert
-    SwiGLU loop otherwise.
+    Dispatch reuses :func:`dispatch_experts`. That function prefers the fused
+    Triton grouped-GEMM kernel when available. Else it falls back to the naive
+    per-expert SwiGLU loop.
     """
 
     def __init__(self, config: Zonos2Config, layer_id: int):
@@ -288,8 +288,8 @@ class Zonos2MoEFeedForward(nn.Module):
         inter = config.moe_inter
 
         self.router = Zonos2Router(config, layer_id)
-        # Held on a bare Module so the params are named
-        # ``experts.gate_up_proj`` / ``experts.down_proj``.
+        # A bare Module holds these. So the params get the names
+        # ``experts.gate_up_proj`` and ``experts.down_proj``.
         self.experts = nn.Module()
         self.experts.gate_up_proj = nn.Parameter(
             torch.empty(self.num_experts, 2 * inter, hidden)
@@ -316,11 +316,11 @@ class Zonos2MoEFeedForward(nn.Module):
 
 
 class Zonos2DecoderLayer(nn.Module):
-    """Pre-norm transformer block; MoE layers thread the EDA router state.
+    """Pre-norm transformer block. MoE layers thread the EDA router state.
 
-    Equivalent to the reference ``TransformerBlock`` (whose fused
-    add+norm is unrolled here into explicit residual adds around plain
-    :class:`RMSNorm`). Dense layers use :class:`ParallelGatedMLP`.
+    This equals the reference ``TransformerBlock``. That block fuses add and
+    norm; here the code unrolls it into explicit residual adds around plain
+    :class:`RMSNorm`. Dense layers use :class:`ParallelGatedMLP`.
     """
 
     def __init__(self, config: Zonos2Config, layer_id: int, comm_group: TPCommGroup):
@@ -368,9 +368,9 @@ class Zonos2ForCausalLM(nn.Module):
     """Zonos2 multi-codebook TTS causal LM.
 
     ``forward`` maps a frame tensor ``input_ids`` of shape
-    ``(tokens, n_codebooks[+1])`` to final hidden states; ``compute_logits``
+    ``(tokens, n_codebooks[+1])`` to final hidden states. ``compute_logits``
     projects those to per-codebook logits ``(tokens, n_codebooks,
-    audio_vocab)`` with soft-capping. Parameter names follow the reference
+    audio_vocab)`` and soft-caps them. Parameter names follow the reference
     checkpoint (no ``model.`` prefix): ``multi_embedder.*``, ``layers.{i}.*``,
     ``out_norm.weight``, ``multi_output.weight``.
     """
@@ -387,10 +387,10 @@ class Zonos2ForCausalLM(nn.Module):
 
         self.multi_embedder = MultiEmbedding(config, comm_group)
 
-        # Optional speaker conditioning (voice cloning). Raw speaker embeddings
-        # are optionally reduced by an LDA affine projection, then projected to
-        # hidden size and written into the embedded sequence at the speaker
-        # token position(s).
+        # Optional speaker conditioning (voice cloning). An LDA affine
+        # projection optionally reduces the raw speaker embeddings. The code
+        # then projects them to hidden size. It writes them into the embedded
+        # sequence at the speaker token position(s).
         self.speaker_lda_projection: nn.Linear | None = None
         self.speaker_projection: nn.Linear | None = None
         if config.speaker_enabled:
@@ -409,8 +409,8 @@ class Zonos2ForCausalLM(nn.Module):
             [Zonos2DecoderLayer(config, i, comm_group) for i in range(config.num_layers)]
         )
         self.out_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # Multi-codebook head: hidden -> (audio_vocab * n_codebooks), sharded
-        # over the output vocab and all-gathered so callers see full
+        # Multi-codebook head: hidden -> (audio_vocab * n_codebooks). It shards
+        # over the output vocab. It all-gathers so callers see full
         self.multi_output = ColumnParallelLinear(
             comm_group=comm_group,
             input_size=config.hidden_size,
@@ -429,9 +429,10 @@ class Zonos2ForCausalLM(nn.Module):
         # Multi-codebook embedding (sum of per-column tables).
         x = self.multi_embedder(input_ids)
 
-        # Inject projected speaker embeddings at the speaker token position(s),
-        # after embedding and before emb_norm. No-op unless the model is speaker-
-        # enabled and values/positions are supplied.
+        # Inject the projected speaker embeddings at the speaker token
+        # position(s), after embedding and before emb_norm. This does nothing
+        # unless the model is speaker-enabled and the caller supplies values
+        # and positions.
         if (
             self.speaker_projection is not None
             and speaker_emb_values is not None
@@ -453,7 +454,7 @@ class Zonos2ForCausalLM(nn.Module):
                 projected.to(x.dtype),
             )
 
-        # emb_norm: parameter-free RMSNorm
+        # emb_norm: parameter-free RMSNorm.
         x = F.rms_norm(x, (x.shape[-1],), eps=self._emb_norm_eps)
 
         router_states: torch.Tensor | None = None
@@ -465,7 +466,7 @@ class Zonos2ForCausalLM(nn.Module):
         return self.out_norm(x)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project hidden states to per-codebook logits + soft-cap.
+        """Project hidden states to per-codebook logits, then soft-cap.
 
         Returns ``(*hidden_states.shape[:-1], n_codebooks, audio_vocab)``.
         """
@@ -483,19 +484,20 @@ class Zonos2ForCausalLM(nn.Module):
     def load_weights(self, weights) -> set[str]:
         """Load a Zonos2 checkpoint stream ``(name, tensor)`` into this model.
 
-        Handles the layout differences between the reference checkpoint and
-        the fused component parameters used here:
+        This handles the layout differences between the reference checkpoint
+        and the fused component parameters used here:
 
         * ``attention.wkv.weight`` ``(2, kv_dim, hidden)`` -> merged K||V
           (shard 0 = K, shard 1 = V).
-        * dense ``feed_forward.w_in.weight`` ``(2, inter, hidden)`` is stored
-          ``[up, gate]``; the fused ``gate_up_proj`` wants ``[gate, up]`` so
-          the two halves are swapped on load.
+        * The dense ``feed_forward.w_in.weight`` ``(2, inter, hidden)`` stores
+          ``[up, gate]``. The fused ``gate_up_proj`` wants ``[gate, up]``. So
+          the code swaps the two halves on load.
         * ``feed_forward.w_out`` -> ``down_proj``.
-        * MoE experts in the unfused grouped format (``experts.w1/w2/w3``)
-          are fused into ``experts.gate_up_proj`` (``w1`` gate half, ``w3``
-          up half) and ``experts.down_proj`` (``w2``); the already-fused
-          ``experts.gate_up_proj`` / ``experts.down_proj`` load directly.
+        * The code fuses MoE experts in the unfused grouped format
+          (``experts.w1/w2/w3``) into ``experts.gate_up_proj`` (``w1`` gate
+          half, ``w3`` up half) and ``experts.down_proj`` (``w2``). The
+          already-fused ``experts.gate_up_proj`` and ``experts.down_proj``
+          load directly.
 
         All other keys (embedders, norms, router, wq/wo/gater/temp,
         out_norm, multi_output) already line up by name.
@@ -522,11 +524,11 @@ class Zonos2ForCausalLM(nn.Module):
             elif target in buffers and shard_id is None:
                 buffers[target].copy_(tensor)
                 loaded.add(target)
-            # unknown key -> ignore (caller can diff against named_parameters)
+            # Unknown key -> ignore. The caller can diff against named_parameters.
 
         for name, tensor in weights:
             if name.startswith("emb_norm"):
-                continue  # parameter-free RMSNorm; nothing to load
+                continue  # parameter-free RMSNorm. Nothing to load.
 
             m = re.match(r"(layers\.\d+\.attention\.wkv)\.weight$", name)
             if m and tensor.dim() == 3:
@@ -536,7 +538,7 @@ class Zonos2ForCausalLM(nn.Module):
 
             m = re.match(r"(layers\.\d+\.feed_forward)\.w_in\.weight$", name)
             if m and tensor.dim() == 3:
-                # reference w_in is [up, gate]; fused gate_up wants [gate, up].
+                # The reference w_in is [up, gate]. The fused gate_up wants [gate, up].
                 _copy(m.group(1) + ".gate_up_proj.weight", tensor[1].contiguous(), shard_id=0)
                 _copy(m.group(1) + ".gate_up_proj.weight", tensor[0].contiguous(), shard_id=1)
                 continue

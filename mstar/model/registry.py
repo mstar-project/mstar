@@ -36,10 +36,10 @@ HF_MODELS: dict[str, dict] = {
     # ``download_vjepa2_ac_upstream_pt`` — the ``model_path_hf`` string is
     # kept as a logical identifier but isn't resolved against HuggingFace.
     "vjepa2_ac": {"model_path_hf": "vjepa2-ac-vitg"},
-    # Zonos2 multi-codebook TTS. Point ``$ZONOS2_MODEL_PATH`` at a checkpoint
-    # in the reference layout (a dir with ``params.json`` + ``model.pth``, or an
-    # HF repo id); see ``mstar/model/zonos2/weight_loader.py``. The DAC vocoder
-    # additionally needs ``descript-audio-codec`` installed.
+    # Zonos2 multi-codebook TTS. Point ``$ZONOS2_MODEL_PATH`` at a checkpoint in
+    # the reference layout. This is a directory with ``params.json`` and
+    # ``model.pth``, or an HF repo id. See ``mstar/model/zonos2/weight_loader.py``.
+    # The DAC vocoder also needs ``descript-audio-codec`` installed.
     "zonos2": {
         "model_path_hf": os.environ.get("ZONOS2_MODEL_PATH", "Zyphra/ZONOS2"),
     },

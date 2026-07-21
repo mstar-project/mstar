@@ -1307,9 +1307,10 @@ class CudaGraphRunner:
                 request_ids=dummy_rids,
                 per_request_info=real_metadata,
                 cache_manager=static_cm,
-                # Real ids (length real_bs) so submodules owning per-request
-                # state keyed by id can gather it before replay; dummy_rids
-                # above are the fixed capture slots, not the live requests.
+                # These are the real ids (length real_bs). A submodule that owns
+                # per-request state keyed by id needs them to gather that state
+                # before replay. The dummy_rids above are the fixed capture
+                # slots, not the live requests.
                 real_request_ids=list(request_ids),
                 sampler=self._get_sampler(
                     per_request_info=per_request_info,
@@ -1538,9 +1539,10 @@ class CudaGraphRunner:
                 request_ids=dummy_rids,
                 per_request_info=real_metadata,
                 cache_manager=static_cm,
-                # Real ids (length real_bs) so submodules owning per-request
-                # state keyed by id can gather it before replay; dummy_rids
-                # above are the fixed capture slots, not the live requests.
+                # These are the real ids (length real_bs). A submodule that owns
+                # per-request state keyed by id needs them to gather that state
+                # before replay. The dummy_rids above are the fixed capture
+                # slots, not the live requests.
                 real_request_ids=list(request_ids),
                 sampler=self._get_sampler(
                     per_request_info=per_request_info,

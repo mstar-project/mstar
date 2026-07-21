@@ -1,36 +1,37 @@
 """Graph-safe per-request sampler state for Zonos2's multi-codebook sampler.
 
-Phase 2 of the CUDA-graph work. Replaces the dict-of-growing-tensors state in
-:class:`Zonos2LLMSubmodule` (``_history`` grown by ``torch.cat`` every step,
-read back as a variable-length window) with fixed-shape, slot-indexed static
-buffers — the prerequisite for running ``_sample`` inside a captured
-``forward_batched``.
+Phase 2 of the CUDA-graph work. It replaces the dict-of-growing-tensors state
+in :class:`Zonos2LLMSubmodule`. That old state grew ``_history`` with
+``torch.cat`` every step and read it back as a variable-length window. This
+module uses fixed-shape, slot-indexed static buffers instead. These buffers are
+the prerequisite to run ``_sample`` inside a captured ``forward_batched``.
 
-Mirrors the three-tier storage of :class:`mstar.utils.sampling.SamplerBuffers`
-(single-codebook), extended to the multi-codebook, windowed-repetition-penalty
-case:
+It mirrors the three-tier storage of
+:class:`mstar.utils.sampling.SamplerBuffers` (single-codebook). It extends that
+storage to the multi-codebook, windowed-repetition-penalty case:
 
-* ``master`` — ``[capacity, ...]`` slot-indexed canonical state, one row per
-  live request; grown by doubling.
-* ``buf`` — ``[max_bs, ...]`` per-step tensor with a stable address (read/written
-  inside the graph); populated each step by gathering the active requests' slots.
+* ``master`` — ``[capacity, ...]`` slot-indexed canonical state. It holds one
+  row per live request. It grows by doubling.
+* ``buf`` — ``[max_bs, ...]`` per-step tensor with a stable address. The graph
+  reads and writes it. Each step gathers the active requests' slots into it.
 * pinned ``_slot_idx`` staging for the single H2D slot-index copy.
 
 Two pieces of per-request state:
 
 * **repetition ring** ``ring[cap, C, W]`` (int32) — the last ``W`` frames' codes
-  per codebook, written in place with a wrapping ``cursor``. A ``-1`` sentinel
-  marks not-yet-written positions (a real code is always ``>= 0``), so the ring
-  is a drop-in for ``_rep_ids_batched``'s ``[B, C, W]`` output without a separate
-  fill count. The repetition penalty only tests token *presence*
-  (``counts > 0`` in :func:`apply_repetition_penalty`), so the ring's set of
+  per codebook. A wrapping ``cursor`` writes it in place. A ``-1`` sentinel
+  marks not-yet-written positions. A real code is always ``>= 0``. So the ring
+  is a drop-in for ``_rep_ids_batched``'s ``[B, C, W]`` output. It needs no
+  separate fill count. The repetition penalty only tests token *presence*
+  (``counts > 0`` in :func:`apply_repetition_penalty`). So the ring's set of
   windowed ids reproduces the dict window's penalty bit-for-bit.
-* **offset** ``offset[cap]`` (int64) — per-request frame count = the RNG ``step``
-  index (replaces ``_step_for``'s ``hist.shape[0]``). Read *before* the write,
-  incremented in place after, so it stays independent of batch position and keeps
-  the sampler's stateless RNG reproducible.
+* **offset** ``offset[cap]`` (int64) — per-request frame count. This equals the
+  RNG ``step`` index. It replaces ``_step_for``'s ``hist.shape[0]``. The code
+  reads it *before* the write and increments it in place after. So it stays
+  independent of batch position. This keeps the sampler's stateless RNG
+  reproducible.
 
-All per-step mutation is in place (``scatter_``/``add_``/``remainder_``) so the
+All per-step mutation is in place (``scatter_``/``add_``/``remainder_``). So the
 buffer addresses stay stable across graph replays.
 """
 from __future__ import annotations
@@ -45,9 +46,10 @@ class Zonos2SamplerBuffers:
     max_batch_size: int
     n_codebooks: int
     window: int
-    # Repetition penalty applies to codebooks ``0..repetition_codebooks-1``; a
-    # negative value applies it to all codebooks. Codebooks at/after the cutoff
-    # are masked to ``-1`` on read (ignored by the penalty), matching ``_rep_ids``.
+    # The repetition penalty applies to codebooks ``0..repetition_codebooks-1``.
+    # A negative value applies it to all codebooks. The code masks codebooks at
+    # or after the cutoff to ``-1`` on read. The penalty ignores them. This
+    # matches ``_rep_ids``.
     repetition_codebooks: int
 
     # Repetition ring (int32, sentinel -1 = empty).
@@ -55,11 +57,12 @@ class Zonos2SamplerBuffers:
     ring_buf: torch.Tensor       # [max_bs, C, W]
     cursor_master: torch.Tensor  # [capacity] int32, next write column mod W
     cursor_buf: torch.Tensor     # [max_bs] int32
-    # Per-request frame count / RNG step (int64).
+    # Per-request frame count and RNG step (int64).
     offset_master: torch.Tensor  # [capacity]
     offset_buf: torch.Tensor     # [max_bs]
 
-    # Static penalty-input staging (rc-masked copy of ring_buf) + rc mask.
+    # Static penalty-input staging and rc mask. pen_buf is an rc-masked copy of
+    # ring_buf.
     pen_buf: torch.Tensor        # [max_bs, C, W] int32
     _rc_exclude: torch.Tensor | None  # [1, C, 1] bool, True where codebook is excluded
 
@@ -120,7 +123,7 @@ class Zonos2SamplerBuffers:
 
     # -- slot lifecycle -------------------------------------------------
     def register_request(self, rid: str) -> None:
-        """Assign a slot to ``rid`` and reset its master state (outside graph)."""
+        """Assign a slot to ``rid`` and reset its master state. Runs outside the graph."""
         if rid in self._rid_to_slot:
             return
         if not self._free_slots:
@@ -132,13 +135,13 @@ class Zonos2SamplerBuffers:
         self.offset_master[slot] = 0
 
     def unregister_request(self, rid: str) -> None:
-        """Release ``rid``'s slot (no GPU writes; state is reset on reuse)."""
+        """Release ``rid``'s slot. It does no GPU writes; reuse resets the state."""
         slot = self._rid_to_slot.pop(rid, None)
         if slot is not None:
             self._free_slots.append(slot)
 
     def _grow_master(self, new_capacity: int) -> None:
-        """Double-and-copy the master buffers when live requests exceed capacity."""
+        """Double and copy the master buffers when live requests exceed capacity."""
         old = self._master_capacity
         C, W = self.n_codebooks, self.window
         dev = self.ring_master.device
@@ -161,11 +164,12 @@ class Zonos2SamplerBuffers:
     def ensure_batch_capacity(self, padded_bs: int) -> None:
         """Grow the per-step (``buf``) tensors to hold ``padded_bs`` rows.
 
-        For the eager path, where batch size varies step-to-step before any
-        capture. ``buf`` contents are transient (re-gathered every step), so
-        this just reallocates them larger; ``master`` (canonical per-slot state)
-        is untouched. MUST NOT be called inside a capture epoch — buffer
-        addresses must stay stable there; Phase 3 pre-sizes to the capture max.
+        This serves the eager path. There the batch size varies step to step
+        before any capture. The ``buf`` contents are transient. The code
+        re-gathers them every step. So this method just reallocates them larger.
+        It leaves ``master`` (the canonical per-slot state) untouched. Do not
+        call it inside a capture epoch. The buffer addresses must stay stable
+        there. Phase 3 pre-sizes to the capture max.
         """
         if padded_bs <= self.max_batch_size:
             return
@@ -183,9 +187,9 @@ class Zonos2SamplerBuffers:
     def gather_for_request_ids(self, request_ids: list[str], padded_bs: int) -> None:
         """Populate the per-step buffers for ``request_ids`` from their slots.
 
-        Padding rows (``i >= len(request_ids)``) reuse slot 0 — their sampled
-        outputs are discarded by the runner's dummy-rid remap, so their contents
-        only need to be well-formed.
+        Padding rows (``i >= len(request_ids)``) reuse slot 0. The runner's
+        dummy-rid remap discards their sampled outputs. So their contents only
+        need to be well-formed.
         """
         assert padded_bs <= self.max_batch_size, (
             f"padded_bs={padded_bs} exceeds max_batch_size={self.max_batch_size}"
@@ -210,8 +214,9 @@ class Zonos2SamplerBuffers:
     def repetition_ids(self, padded_bs: int) -> torch.Tensor:
         """``[padded_bs, C, W]`` recent ids for :func:`apply_repetition_penalty`.
 
-        rc-excluded codebooks are set to ``-1`` (ignored). Recomputed into a
-        static buffer each step (fixed shape, in-place) so it is capture-safe.
+        The code sets rc-excluded codebooks to ``-1``. The penalty ignores them.
+        It recomputes into a static buffer each step, with a fixed shape and in
+        place. So it is capture-safe.
         """
         pb = padded_bs
         self.pen_buf[:pb].copy_(self.ring_buf[:pb])
@@ -221,11 +226,11 @@ class Zonos2SamplerBuffers:
 
     # -- write (graph-safe) ---------------------------------------------
     def write_frame(self, codes: torch.Tensor, padded_bs: int) -> None:
-        """Write this step's sampled codes into the ring and advance state.
+        """Write this step's sampled codes into the ring and advance the state.
 
-        ``codes``: ``[padded_bs, >=C]`` (the sampled frame; only the first ``C``
-        audio-codebook columns are stored). All ops are in place so buffer
-        addresses stay stable inside a captured graph.
+        ``codes``: ``[padded_bs, >=C]`` is the sampled frame. The code stores
+        only the first ``C`` audio-codebook columns. All ops are in place. So
+        the buffer addresses stay stable inside a captured graph.
         """
         pb = padded_bs
         C = self.n_codebooks

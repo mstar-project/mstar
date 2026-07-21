@@ -149,11 +149,11 @@ def _dispatch(
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Pick fused-Triton if available, otherwise the naive loop.
+    """Use the fused Triton kernel if it is available, or the naive loop.
 
-    The fused kernel requires a bf16/fp16, CUDA ``hidden_states`` (see
-    :func:`mstar.utils.fused_moe.fused_experts`); the ``is_cuda`` guard here
-    covers device, and callers are expected to run in an autocast dtype.
+    The fused kernel needs a bf16 or fp16 ``hidden_states`` on CUDA (see
+    :func:`mstar.utils.fused_moe.fused_experts`). The ``is_cuda`` guard here
+    checks the device. The caller must run in an autocast dtype.
     """
     if _HAS_FUSED and hidden_states.is_cuda:
         return _fused_experts(
@@ -166,14 +166,25 @@ def _dispatch(
     )
 
 
-# Public alias: the fused-preferring dispatch is the entry point external
-# blocks (e.g. Zonos2's MoE) should call, so they pick up the Triton kernel
-# when available and only fall back to the naive loop otherwise. Kept as an
-# alias of the module-internal ``_dispatch`` used by the blocks below.
+# Public alias for the fused-preferring dispatch. External blocks (the Zonos2
+# MoE) call this entry point. They then get the Triton kernel when it is
+# available, and fall back to the naive loop only if it is not. This is an
+# alias of the module-internal ``_dispatch`` that the blocks below use.
 #
-# The fused kernel autotunes (and syncs on the host) the first time it sees a
-# new key ``(M, E, N, K, top_k)``; that happens during the CUDA-graph runner's
-# eager warmup forwards, before capture, so no dedicated warmup hook is needed.
+# Zonos2 needs this one function, but it cannot reuse a whole block such as
+# :class:`SparseMoeBlock`. Its MoE uses a stateful EDA router
+# (``Zonos2Router``) that threads ``router_states`` from one layer to the next.
+# The blocks here own a stateless :class:`TopKRouter` and a fixed forward
+# signature, so they do not fit. Zonos2 keeps its own router and block, and
+# reuses only the expert dispatch (the fused kernel plus the fallback loop).
+# The alias gives that reuse a public, correctly named handle: ``_dispatch`` is
+# private, and the obvious public name ``dispatch_experts_fused`` is already
+# the naive fallback loop, not this fused-preferring path.
+#
+# The fused kernel autotunes the first time it sees a new key
+# ``(M, E, N, K, top_k)``. This step also syncs on the host. It runs during the
+# CUDA-graph runner's eager warmup forwards, before capture. So it needs no
+# dedicated warmup hook.
 dispatch_experts = _dispatch
 
 
