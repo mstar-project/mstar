@@ -408,9 +408,57 @@ m.register_for_send("r", [infos["x"][0]])
 print(m._own_segment_paths[0])
 KEEP_ALIVE = m   # global reference survives to interpreter exit
 """
-    out = subprocess.run([sys.executable, "-c", code],
+    out = subprocess.run([sys.executable, "-c", code], check=False,
                          capture_output=True, text=True, timeout=120)
     assert out.returncode == 0, out.stderr[-500:]
     seg_path = out.stdout.strip().splitlines()[-1]
     assert seg_path.startswith("/dev/shm/mstar_arena_exitcase_")
     assert not os.path.exists(seg_path), "segment survived interpreter exit"
+
+
+def test_persisted_tensor_reclaims_at_request_end(tmp_path):
+    """A tensor that is both emitted and PERSISTED must reclaim when the
+    request ends. Each persist edge contributes a reference to the fanout
+    (set_output_ref_counts counts routing.persist), and nothing released
+    them: clearing the flag left the count above zero, so the slot leaked
+    once per persisted tensor — one per request in the BAGEL soak."""
+    prod = _manager("pst", tmp_path)
+    rid = "rp"
+    emit_edge = GraphEdge(next_node="EMIT", name="tok", tensor_info=[])
+    persist_edge = GraphEdge(next_node="PERSIST", name="tok", tensor_info=[])
+    gni = prod.store_and_populate_graph_edges(
+        request_id=rid, tensors={"tok": [torch.arange(8)]},
+        graph_edges=[emit_edge, persist_edge], node_name="LLM",
+        graph_walk="w", skip_cuda_sync=True, skip_ref_count=True)
+    (info,) = gni["tok"]
+    prod.register_for_send(rid, [info])
+    # Worker order: fanout counts first, then the persist flag is set.
+    prod.set_output_ref_counts(rid, {info.uuid}, [emit_edge, persist_edge])
+    prod.set_persist(rid, info.uuid, True)
+    assert prod._arena_locs
+    prod.dereference(rid, info.uuid, n=1)      # the emit consumer ACKs
+    assert prod._arena_locs, "freed while still persisted"
+    prod.cleanup_request(rid)
+    assert not prod._arena_locs, "persisted tensor leaked its arena slot"
+
+
+def test_unpersist_then_consume_reclaims(tmp_path):
+    """The re-route path: unpersist hands the tensor to N new consumers
+    (increment_ref(N) + flag cleared); once they ACK it must reclaim."""
+    prod = _manager("pst2", tmp_path)
+    rid = "ru"
+    persist_edge = GraphEdge(next_node="PERSIST", name="kv", tensor_info=[])
+    gni = prod.store_and_populate_graph_edges(
+        request_id=rid, tensors={"kv": [torch.arange(8)]},
+        graph_edges=[persist_edge], node_name="LLM", graph_walk="w",
+        skip_cuda_sync=True, skip_ref_count=True)
+    (info,) = gni["kv"]
+    prod.register_for_send(rid, [info])
+    prod.set_output_ref_counts(rid, {info.uuid}, [persist_edge])
+    prod.set_persist(rid, info.uuid, True)
+    # Conductor routes it to 2 consumers later (UNPERSIST_TENSORS).
+    prod.increment_ref(rid, info.uuid, n=2)
+    prod.set_persist(rid, info.uuid, False)
+    assert prod._arena_locs, "freed before the new consumers read"
+    prod.dereference(rid, info.uuid, n=2)      # both ACK
+    assert not prod._arena_locs, "slot leaked after unpersist consumers ACKed"
