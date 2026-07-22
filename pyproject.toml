@@ -95,6 +95,16 @@ qwen3_omni = [
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
 ]
 
+qwen3_tts = [
+    "einops",
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "mooncake-transfer-engine",
+    "qwen-tts==0.1.1",
+    "safetensors",
+    "transformers>=4.57.3",
+]
+
 orpheus = [
     "einops",
     "flashinfer-python>=0.6.4",
@@ -162,6 +172,7 @@ all = [
     "safetensors",
     "triton",
     "qwen-omni-utils",
+    "qwen-tts==0.1.1",
     "numba>=0.61",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it

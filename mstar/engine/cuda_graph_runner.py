@@ -351,6 +351,7 @@ class CudaGraphRunner:
                     device=self.device,
                     use_cuda_graph=True,
                     enable_nvtx=self.enable_nvtx,
+                    backend=cfg.flashinfer_backend,
                 )
             else:
                 wrapper = FlashInferPrefillWrapper(
@@ -365,6 +366,7 @@ class CudaGraphRunner:
                     device=self.device,
                     use_cuda_graph=True,
                     enable_nvtx=self.enable_nvtx,
+                    backend=cfg.flashinfer_backend,
                 )
 
             # Static pos_ids buffer for RoPE — also per-slot (captured into
@@ -2604,6 +2606,7 @@ class PiecewiseCudaGraphRunner:
                 max_num_pages=cfg.max_num_pages,
                 device=self.device,
                 use_cuda_graph=True,
+                backend=cfg.flashinfer_backend,
             )
             plan_states[label] = _PlanState(wrapper=wrapper)
         return plan_states
