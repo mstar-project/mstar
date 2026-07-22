@@ -346,10 +346,19 @@ class WorkerGraphsManager:
         return inputs
 
     def get_worker_graph_id_for_node(
-        self, request_id: str, node_name: str
+        self, request_id: str, node_name: str,
+        graph_walk: str | None = None,
     ) -> str:
-        partition = self.get_partition_for_node(node_name)
-        graph_walk = self.get_graph_walk(request_id, partition)
+        """Worker graph that owns ``node_name`` for this request.
+
+        ``graph_walk`` defaults to the node's partition's current walk. Pass it
+        explicitly when the walk is dictated by someone else (e.g. a TP
+        follower acting on the leader's ``ScheduleTPNode``), since this
+        worker's own partition state may have advanced past it.
+        """
+        if graph_walk is None:
+            partition = self.get_partition_for_node(node_name)
+            graph_walk = self.get_graph_walk(request_id, partition)
         wg_id = self.walk_node_to_worker_graph_id.get((graph_walk, node_name))
         if wg_id is None:
             raise RuntimeError(

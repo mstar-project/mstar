@@ -950,12 +950,6 @@ class Worker:
                 skip_cuda_sync=True,
             )
 
-            for edge in routing.persist:
-                for info in edge.tensor_info:
-                    self.tensor_manager.set_persist(
-                        request_id=request_id, uuid=info.uuid, persist=True
-                    )
-
 
     def _send_outputs(
         self, request_id: str, outputs: NodeOutputRouting,
@@ -1506,11 +1500,30 @@ class Worker:
         )
 
         if fresh_batch is not None:
+            # The merge below relabels these node objects with the spec
+            # target's name/walk, so a batch for any other node must not be
+            # merged in.
+            assert fresh_batch.node_name == spec_node_info.node_name, (
+                f"Speculation asked for {spec_node_info.node_name!r} but the "
+                f"scheduler returned {fresh_batch.node_name!r}"
+            )
             for rid, node in fresh_batch.node_objects.items():
                 if rid in new_node_objects:
                     # Shouldn't happen — continuing rids are held by the
                     # in-flight step and shouldn't be in ready queues —
                     # but if it does, the in-flight rid wins.
+                    #
+                    # KNOWN GAP (latent): if fresh_batch ever came from the
+                    # TP-follow path, ``_try_schedule_tp_follow`` has already
+                    # popped the leader's ScheduleTPNode. Pushing the node
+                    # back onto the ready queue does not undo that, and this
+                    # worker is a follower for that node so nothing will
+                    # reschedule it — the TP group stalls. Unreachable today
+                    # (spec targets exclude ``parallel_nodes``, so the
+                    # target_node_name filter never matches a TP batch), but
+                    # any future overlap needs the scheduler to re-queue the
+                    # message, or to defer the popleft until the caller
+                    # commits to the batch.
                     wg_id = fresh_batch.request_to_worker_graph[rid]
                     self.worker_graphs_manager.queues[wg_id].push_back_node(rid, node)
                     continue
@@ -1783,9 +1796,20 @@ class Worker:
 
             if rid in per_request_uuids:
                 routing = routing_per_request[rid]
+
+                for edge in routing.persist:
+                    for info in edge.tensor_info:
+                        self.tensor_manager.set_persist(
+                            request_id=rid, uuid=info.uuid, persist=True
+                        )
+
+                # NOTE: routing.persist is not included here because the tensors are
+                # (1) kept alive by the persist marker, and (2) would otherwise be
+                #  double-counted (e.g., we should not be incrementing the refcount of
+                # a persist signal that has EMPTY_DESTINATION; that's the conductor's
+                # job to properly compute the reference when unpersisting the signal)
                 routed_edges = (
                     routing.routed_to_this_worker_graph
-                    + routing.persist
                     + routing.emit_to_client
                     + routing.streaming_local
                     + sum(routing.to_workers.values(), start=[])
