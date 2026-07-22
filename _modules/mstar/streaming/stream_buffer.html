@@ -408,7 +408,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 20, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 22, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -846,6 +846,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">_consumed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">_chunks_popped</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">producer_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Set once a chunk has been popped with ``is_final=True`` (the terminal</span>
+    <span class="c1"># flush). Guards the empty-buffer final flush below so it fires exactly</span>
+    <span class="c1"># once and ``has_chunk_ready`` doesn&#39;t spin returning True forever.</span>
+    <span class="n">_final_chunk_emitted</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="n">_num_tensors_registered</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">_num_buffer_writes</span> <span class="o">=</span> <span class="mi">0</span>
@@ -896,17 +900,23 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">has_chunk_ready</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_update_buffer</span><span class="p">()</span>
         <span class="n">buf_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_producer_done_and_all_read</span><span class="p">()</span> <span class="ow">and</span> <span class="n">buf_len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">return</span> <span class="kc">True</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_producer_done_and_all_read</span><span class="p">():</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span><span class="o">.</span><span class="n">is_ready</span><span class="p">(</span><span class="n">buf_len</span><span class="p">)</span>
+
         <span class="c1"># When continue_after_producer_done is set, keep producing empty</span>
         <span class="c1"># chunks after the producer finishes and all items are consumed.</span>
         <span class="c1"># This allows the consumer to keep running (e.g., Talker continues</span>
         <span class="c1"># generating codec tokens after the Thinker hits text EOS).</span>
-        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_producer_done_and_all_read</span><span class="p">()</span>
-                <span class="ow">and</span> <span class="n">buf_len</span> <span class="o">==</span> <span class="mi">0</span>
-                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span><span class="o">.</span><span class="n">continue_after_producer_done</span><span class="p">()):</span>
-            <span class="k">return</span> <span class="kc">True</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span><span class="o">.</span><span class="n">is_ready</span><span class="p">(</span><span class="n">buf_len</span><span class="p">)</span></div>
+        <span class="c1"># Producer done and the buffer already drained to empty (all items</span>
+        <span class="c1"># were consumed in earlier chunks. Emit exactly one final</span>
+        <span class="c1"># (empty) chunk so ``is_final`` propagates and the stream closes.</span>
+
+        <span class="k">return</span> <span class="p">(</span>
+            <span class="n">buf_len</span> <span class="o">&gt;</span> <span class="mi">0</span>
+            <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span><span class="o">.</span><span class="n">continue_after_producer_done</span><span class="p">()</span>
+            <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_final_chunk_emitted</span>
+        <span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="StreamBuffer.pop_chunk">
@@ -943,6 +953,8 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># consumer decides when it&#39;s done via its own model logic.</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span><span class="o">.</span><span class="n">continue_after_producer_done</span><span class="p">():</span>
             <span class="n">is_final</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">if</span> <span class="n">is_final</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_final_chunk_emitted</span> <span class="o">=</span> <span class="kc">True</span>
 
         <span class="n">chunk</span> <span class="o">=</span> <span class="n">StreamChunk</span><span class="p">(</span>
             <span class="n">data</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_collate</span><span class="p">(</span><span class="n">items</span><span class="p">),</span>
@@ -1016,7 +1028,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 20, 2026.
+  Last updated on Jul 22, 2026.
   <br/>
 </p>
   </div>
