@@ -714,7 +714,10 @@ async def generate(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
                 )
-            save_name = f"{uuid.uuid4()}_{f.filename}"
+            # Sanitize: only the final path component of the client name;
+            # embedded separators (../) would escape upload_dir.
+            base = os.path.basename(f.filename or "") or "upload"
+            save_name = f"{uuid.uuid4()}_{base}"
             save_path = api_server.upload_dir / save_name
             content = await f.read()
             await run_in_threadpool(save_path.write_bytes, content)
@@ -851,6 +854,17 @@ def main(argv: list[str] | None = None):
         "--log-stats-file", type=str, default=None,
         help="Append per-request profiling stats to this file (implies --log-stats)",
     )
+    parser.add_argument(
+        "--rust-frontend", action="store_true",
+        help="Serve HTTP from the Rust mstar-server binary instead of "
+             "uvicorn/FastAPI; the Python process keeps preprocessing "
+             "and the conductor protocol",
+    )
+    parser.add_argument(
+        "--rust-frontend-bin", type=str, default=None,
+        help="Path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
+             "$PATH, then rust/server/target/release)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -910,15 +924,42 @@ def main(argv: list[str] | None = None):
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
 
+    rust_proc = None
+    bridge_dir = None
     try:
         # Block until all workers have finished setup, so the server only binds
         # (and logs "Starting…") once it can actually serve requests.
         api_server.finalize_setup()
-        logger.info("Starting mstar API server on %s:%s", args.host, args.port)
-        uvicorn.run(app, host=args.host, port=args.port, access_log=False)
+        if args.rust_frontend:
+            import tempfile
+
+            from mstar.api_server.rust_frontend import (
+                RustFrontendBridge,
+                find_server_binary,
+                launch_rust_server,
+            )
+
+            bridge_dir = tempfile.mkdtemp(prefix="mstar_rust_frontend_")
+            # Forward --host to the Rust frontend (it binds 127.0.0.1 by
+            # default; --host 0.0.0.0 for the multi-node / container case).
+            os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
+            rust_proc = launch_rust_server(
+                find_server_binary(args.rust_frontend_bin), model_name,
+                args.port, bridge_dir, args.upload_dir)
+            logger.info("Starting mstar API server (Rust frontend) on port %s",
+                        args.port)
+            RustFrontendBridge(api_server, bridge_dir).run()
+        else:
+            logger.info("Starting mstar API server on %s:%s", args.host, args.port)
+            uvicorn.run(app, host=args.host, port=args.port, access_log=False)
     except KeyboardInterrupt:
         pass
     finally:
+        if rust_proc is not None:
+            rust_proc.terminate()
+        if bridge_dir is not None:
+            import shutil
+            shutil.rmtree(bridge_dir, ignore_errors=True)
         if api_server is not None:
             api_server.cleanup()
         _shutdown_conductor_process(conductor_proc)

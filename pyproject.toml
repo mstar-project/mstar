@@ -14,6 +14,7 @@ dependencies = [
     "numpy",
     "PyYAML",
     "pyzmq",
+    "msgpack",
     "python-multipart",
     "requests",
     "torch>=2.9.1",
@@ -212,6 +213,8 @@ ignore = [
 "mstar/graph/graph_io.py" = ["F403", "F405"]
 # Imports are deliberately placed after a module-level pytest.skip().
 "test/modular/test_phase1.py" = ["E402"]
+# Imports are deliberately placed after module-level pytest.importorskip().
+"test/rust/*.py" = ["E402"]
 
 [tool.ruff.format]
 quote-style = "double"
