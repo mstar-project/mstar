@@ -79,11 +79,20 @@ class RustFrontendBridge:
     """The serve loop between the Rust frontend and ``APIServer``."""
 
     def __init__(self, server, bridge_dir: str):
+        # Fail fast: the frontend tokenizes when MSTAR_TOKENIZER is set and
+        # ships token ids, which this backend cannot ingest (it owns
+        # tokenization). Reject at launch rather than 500 every request.
+        if os.getenv("MSTAR_TOKENIZER"):
+            raise RuntimeError(
+                "MSTAR_TOKENIZER is set, but the Rust-frontend bridge does "
+                "not support frontend-tokenized (pre-tokenized) ingest — the "
+                "model side owns tokenization. Unset MSTAR_TOKENIZER.")
         self.server = server
-        # Rust transport with the msgpack codec: we bind as "conductor" in
-        # the PRIVATE bridge dir (that is who the frontend's bridge sends to).
+        # Rust transport with the msgpack codec: we bind as "bridge" in the
+        # PRIVATE bridge dir (that is who the frontend sends to). Named
+        # "bridge", not "conductor", to avoid confusion with M*'s Conductor.
         self.comm = RustZMQCommunicator(
-            "conductor", push_ids=["frontend"], protocol=CommProtocol.IPC,
+            "bridge", push_ids=["frontend"], protocol=CommProtocol.IPC,
             ipc_socket_path_prefix=bridge_dir, codec=MsgpackCodec)
         self.running = True
 

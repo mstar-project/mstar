@@ -145,7 +145,11 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    let addr = format!("127.0.0.1:{port}");
+    // Bind host: MSTAR_SERVER_HOST (the launcher forwards --host here);
+    // 127.0.0.1 by default. 0.0.0.0 for the multi-node / container case.
+    let host = std::env::var("MSTAR_SERVER_HOST")
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
     axum::serve(listener, app)
@@ -187,17 +191,32 @@ async fn admission(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    match permits.clone().try_acquire_owned() {
-        Ok(_permit) => next.run(req).await,
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": {
-                "message": "server saturated: too many concurrent requests",
-                "type": "overloaded_error"
-            }})),
-        )
-            .into_response(),
-    }
+    let permit = match permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": {
+                    "message": "server saturated: too many concurrent requests",
+                    "type": "overloaded_error"
+                }})),
+            )
+                .into_response()
+        }
+    };
+    // Hold the permit until the RESPONSE BODY is fully sent, not just until
+    // the Response is built. A streaming handler returns as soon as
+    // Body::from_stream is constructed, so dropping the permit here would
+    // free the slot while the stream is still being served — the cap would
+    // not bound concurrent streams at all. Moving it into the body drops it
+    // at end-of-body, uniformly for streaming and non-streaming handlers.
+    let resp = next.run(req).await;
+    let (parts, body) = resp.into_parts();
+    let guarded = body.into_data_stream().map(move |chunk| {
+        let _hold = &permit; // keep the permit alive for the stream's life
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(guarded))
 }
 
 // ---- shared helpers -------------------------------------------------------
@@ -536,7 +555,14 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     let mut prompt = String::new();
     let mut extra: Map<String, Value> = Map::new();
 
-    while let Ok(Some(field)) = mp.next_field().await {
+    loop {
+        let field = match mp.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => return error(
+                400, &format!("malformed multipart body: {e}"),
+                "invalid_request_error"),
+        };
         let name = field.name().unwrap_or("").to_string();
         let has_file = field.file_name().is_some();
         if name == "image" {
@@ -603,7 +629,14 @@ async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
     let mut request_id: Option<String> = None;
     let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
-    while let Ok(Some(field)) = mp.next_field().await {
+    loop {
+        let field = match mp.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => return error(
+                400, &format!("malformed multipart body: {e}"),
+                "invalid_request_error"),
+        };
         let name = field.name().unwrap_or("").to_string();
         if name == "files" {
             let filename = field.file_name().unwrap_or("").to_string();
@@ -618,7 +651,17 @@ async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
             if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
                 return error(500, &e.to_string(), "server_error");
             }
-            let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), filename));
+            // Sanitize: take ONLY the final path component of the
+            // client-supplied name. `join` treats embedded separators as
+            // separators, so `../../x` would escape upload_dir (arbitrary
+            // write — and the cleanup filter is component-based, so it would
+            // then arbitrary-delete). file_name() strips any directory parts.
+            let safe = std::path::Path::new(&filename)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("upload");
+            let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe));
             if let Err(e) = std::fs::write(&save_path, &bytes) {
                 return error(500, &e.to_string(), "server_error");
             }

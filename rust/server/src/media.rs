@@ -123,10 +123,18 @@ pub fn save_base64(
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|e| format!("input_audio base64 decode failed: {e}"))?;
-    let ext = if fmt.is_empty() {
+    // Sanitize the client-controlled `format`: keep only alphanumerics, so
+    // a value like `../../etc/x` cannot inject path separators into the
+    // upload path (arbitrary write, mirroring the multipart filename fix).
+    let clean: String = fmt
+        .trim_start_matches('.')
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    let ext = if clean.is_empty() {
         ".bin".to_string()
     } else {
-        format!(".{}", fmt.trim_start_matches('.'))
+        format!(".{clean}")
     };
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext));
     std::fs::write(&path, &raw).map_err(|e| e.to_string())?;

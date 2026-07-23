@@ -687,7 +687,10 @@ async def generate(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
                 )
-            save_name = f"{uuid.uuid4()}_{f.filename}"
+            # Sanitize: only the final path component of the client name;
+            # embedded separators (../) would escape upload_dir.
+            base = os.path.basename(f.filename or "") or "upload"
+            save_name = f"{uuid.uuid4()}_{base}"
             save_path = api_server.upload_dir / save_name
             content = await f.read()
             await run_in_threadpool(save_path.write_bytes, content)
@@ -895,6 +898,7 @@ def main(argv: list[str] | None = None):
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
 
     rust_proc = None
+    bridge_dir = None
     try:
         # Block until all workers have finished setup, so the server only binds
         # (and logs "Starting…") once it can actually serve requests.
@@ -909,6 +913,9 @@ def main(argv: list[str] | None = None):
             )
 
             bridge_dir = tempfile.mkdtemp(prefix="mstar_rust_frontend_")
+            # Forward --host to the Rust frontend (it binds 127.0.0.1 by
+            # default; --host 0.0.0.0 for the multi-node / container case).
+            os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
             rust_proc = launch_rust_server(
                 find_server_binary(args.rust_frontend_bin), model_name,
                 args.port, bridge_dir, args.upload_dir)
@@ -923,6 +930,9 @@ def main(argv: list[str] | None = None):
     finally:
         if rust_proc is not None:
             rust_proc.terminate()
+        if bridge_dir is not None:
+            import shutil
+            shutil.rmtree(bridge_dir, ignore_errors=True)
         if api_server is not None:
             api_server.cleanup()
         _shutdown_conductor_process(conductor_proc)
