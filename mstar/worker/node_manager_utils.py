@@ -346,10 +346,19 @@ class WorkerGraphsManager:
         return inputs
 
     def get_worker_graph_id_for_node(
-        self, request_id: str, node_name: str
+        self, request_id: str, node_name: str,
+        graph_walk: str | None = None,
     ) -> str:
-        partition = self.get_partition_for_node(node_name)
-        graph_walk = self.get_graph_walk(request_id, partition)
+        """Worker graph that owns ``node_name`` for this request.
+
+        ``graph_walk`` defaults to the node's partition's current walk. Pass it
+        explicitly when the walk is dictated by someone else (e.g. a TP
+        follower acting on the leader's ``ScheduleTPNode``), since this
+        worker's own partition state may have advanced past it.
+        """
+        if graph_walk is None:
+            partition = self.get_partition_for_node(node_name)
+            graph_walk = self.get_graph_walk(request_id, partition)
         wg_id = self.walk_node_to_worker_graph_id.get((graph_walk, node_name))
         if wg_id is None:
             raise RuntimeError(
@@ -673,10 +682,23 @@ class WorkerGraphsManager:
                 self.queues[queue_id].remove_request(request_id)
             del self.per_request_info[request_id]
 
-    def get_dyn_loop_workers(self, request_id: str, partition_name: str, loop_name: str):
-        return self.per_request_info[request_id].dyn_loop_to_workers[NodeAndGraphWalk(
+    def check_dyn_loop(self, request_id: str, partition_name: str, loop_name: str) -> bool:
+        ngw = NodeAndGraphWalk(
             node=loop_name, graph_walk=self.get_graph_walk(request_id, partition_name)
-        )]
+        )
+        if ngw not in self.per_request_info[request_id].dyn_loop_to_workers:
+            logger.error((
+                f"Tried to stop loop {loop_name} from graph walk {ngw.graph_walk}, which does not include this loop! "
+                "Ignoring this signal. This indicates a potential logical bug in the model."
+            ))
+            return False
+        return True
+
+    def get_dyn_loop_workers(self, request_id: str, partition_name: str, loop_name: str):
+        ngw = NodeAndGraphWalk(
+            node=loop_name, graph_walk=self.get_graph_walk(request_id, partition_name)
+        )
+        return self.per_request_info[request_id].dyn_loop_to_workers[ngw]
 
     def buffer_persist_signals(
             self, request_id: str,
