@@ -51,6 +51,15 @@ except Exception as e:  # pragma: no cover -- exercised only when triton missing
 class TopKRouter(nn.Module):
     """Softmax top-k router shared by all MoE blocks.
 
+    Implements the router contract expected by the MoE blocks::
+
+        router(hidden_states, router_states=None)
+            -> (routing_weights, selected_experts, router_states_next)
+
+    This router is stateless: ``router_states`` is ignored and
+    ``router_states_next`` is always ``None``. Stateful routers (e.g. the
+    ZONOS2 EDA router) can be injected into a block in its place.
+
     Args:
         hidden_size: input hidden dimension.
         num_experts: total number of routed experts.
@@ -74,14 +83,21 @@ class TopKRouter(nn.Module):
         self.weight = nn.Parameter(torch.zeros(num_experts, hidden_size))
 
     def forward(
-        self, hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        hidden_states: torch.Tensor,
+        router_states: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
         """
+        Args:
+            hidden_states: ``(tokens, hidden_size)`` router input.
+            router_states: unused (stateless router); accepted for
+                interface compatibility with stateful routers.
+
         Returns:
-            router_logits: ``(tokens, num_experts)`` softmax distribution.
             routing_weights: ``(tokens, top_k)`` top-k probabilities
                 (optionally renormalized).
             selected_experts: ``(tokens, top_k)`` int64 indices.
+            router_states_next: always ``None`` (stateless).
         """
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         router_logits = F.linear(hidden_states, self.weight)
@@ -92,7 +108,7 @@ class TopKRouter(nn.Module):
             router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
 
         routing_weights = router_top_value.to(router_logits.dtype)
-        return router_logits, routing_weights, router_indices
+        return routing_weights, router_indices, None
 
 
 def dispatch_experts_fused(
@@ -175,6 +191,7 @@ class SparseMoeBlock(nn.Module):
         num_experts_per_tok: int,
         moe_intermediate_size: int,
         norm_topk_prob: bool = True,
+        router: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -182,7 +199,7 @@ class SparseMoeBlock(nn.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
 
-        self.gate = TopKRouter(
+        self.gate = router if router is not None else TopKRouter(
             hidden_size=hidden_size,
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
@@ -196,16 +213,23 @@ class SparseMoeBlock(nn.Module):
             torch.empty(num_experts, hidden_size, moe_intermediate_size)
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_states: torch.Tensor | None = None,
+        *,
+        return_router_states: bool = False,
+    ):
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
-        _, routing_weights, selected_experts = self.gate(flat)
+        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
         out = _dispatch(
             flat, self.experts.gate_up_proj, self.experts.down_proj,
             self.num_experts, selected_experts, routing_weights,
         )
-        return out.view(input_shape)
+        out = out.view(input_shape)
+        return (out, router_states_next) if return_router_states else out
 
 
 class SparseMoeBlockWithSharedExpert(nn.Module):
@@ -228,6 +252,7 @@ class SparseMoeBlockWithSharedExpert(nn.Module):
         moe_intermediate_size: int,
         shared_expert: nn.Module,
         norm_topk_prob: bool = False,
+        router: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -235,7 +260,7 @@ class SparseMoeBlockWithSharedExpert(nn.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
 
-        self.gate = TopKRouter(
+        self.gate = router if router is not None else TopKRouter(
             hidden_size=hidden_size,
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
@@ -251,20 +276,27 @@ class SparseMoeBlockWithSharedExpert(nn.Module):
         self.shared_expert = shared_expert
         self.shared_expert_gate = nn.Linear(hidden_size, 1, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_states: torch.Tensor | None = None,
+        *,
+        return_router_states: bool = False,
+    ):
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
 
         shared = self.shared_expert(flat)
 
-        _, routing_weights, selected_experts = self.gate(flat)
+        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
         routed = _dispatch(
             flat, self.experts.gate_up_proj, self.experts.down_proj,
             self.num_experts, selected_experts, routing_weights,
         )
         shared_gate = torch.sigmoid(self.shared_expert_gate(flat))
-        return (routed + shared_gate * shared).view(input_shape)
+        out = (routed + shared_gate * shared).view(input_shape)
+        return (out, router_states_next) if return_router_states else out
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +363,7 @@ class ParallelSparseMoeBlock(nn.Module):
         num_experts_per_tok: int,
         moe_intermediate_size: int,
         norm_topk_prob: bool = True,
+        router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__()
@@ -345,7 +378,7 @@ class ParallelSparseMoeBlock(nn.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
 
-        self.gate = TopKRouter(
+        self.gate = router if router is not None else TopKRouter(
             hidden_size=hidden_size,
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
@@ -380,11 +413,17 @@ class ParallelSparseMoeBlock(nn.Module):
         )
         return result
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_states: torch.Tensor | None = None,
+        *,
+        return_router_states: bool = False,
+    ):
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
-        _, routing_weights, selected_experts = self.gate(flat)
+        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
 
         if self.comm_group.world_size == 1:
             out = _dispatch(
@@ -393,7 +432,8 @@ class ParallelSparseMoeBlock(nn.Module):
             )
         else:
             out = self._dispatch_tp(flat, routing_weights, selected_experts)
-        return out.view(input_shape)
+        out = out.view(input_shape)
+        return (out, router_states_next) if return_router_states else out
 
     def _dispatch_tp(
         self, flat: torch.Tensor,
@@ -428,6 +468,7 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         moe_intermediate_size: int,
         shared_expert: nn.Module,
         norm_topk_prob: bool = False,
+        router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__()
@@ -442,7 +483,7 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
 
-        self.gate = TopKRouter(
+        self.gate = router if router is not None else TopKRouter(
             hidden_size=hidden_size,
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
@@ -479,14 +520,20 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         )
         return result
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_states: torch.Tensor | None = None,
+        *,
+        return_router_states: bool = False,
+    ):
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
 
         shared = self.shared_expert(flat)
 
-        _, routing_weights, selected_experts = self.gate(flat)
+        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
         if self.comm_group.world_size == 1:
             routed = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
@@ -495,7 +542,8 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         else:
             routed = self._dispatch_tp(flat, routing_weights, selected_experts)
         shared_gate = torch.sigmoid(self.shared_expert_gate(flat))
-        return (routed + shared_gate * shared).view(input_shape)
+        out = (routed + shared_gate * shared).view(input_shape)
+        return (out, router_states_next) if return_router_states else out
 
     def _dispatch_tp(
         self, flat: torch.Tensor,
