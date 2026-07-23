@@ -1,0 +1,9 @@
+model: "qwen3_tts"
+max_seq_len: 32768
+node_groups:
+  - node_names: [Talker]
+    ranks: [0]
+    graph_walks: [talker_prefill, talker_decode]
+  - node_names: [Codec]
+    ranks: [0]
+    graph_walks: [codec_chunk]

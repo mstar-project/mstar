@@ -33,7 +33,7 @@ def run_rms_norm(
     if rms_norm_dtype is not None:
         input = input.to(rms_norm_dtype)
     elif torch.is_autocast_enabled():
-        dtype = torch.get_autocast_gpu_dtype()
+        dtype = torch.get_autocast_dtype("cuda")
         input = input.to(dtype)
     elif input.dtype == torch.float32:
         # Unsupported dtype; must recast
@@ -100,6 +100,7 @@ class FlashInferPrefillWrapper:
         device: torch.device = torch.device("cuda"),
         use_cuda_graph: bool = False,
         enable_nvtx: bool = False,
+        backend: str = "auto",
     ):
         self.device = device
         self.use_cuda_graph = use_cuda_graph
@@ -141,6 +142,7 @@ class FlashInferPrefillWrapper:
                 paged_kv_indptr_buf=self._paged_kv_indptr_buf,
                 paged_kv_indices_buf=self._paged_kv_indices_buf,
                 paged_kv_last_page_len_buf=self._paged_kv_last_page_len_buf,
+                backend=backend,
             )
 
             # Static buffers for vectorized KV cache writes
@@ -152,7 +154,7 @@ class FlashInferPrefillWrapper:
             )
         else:
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD"
+                workspace_buffer, "NHD", backend=backend
             )
             self.token_to_page = None
             self.token_to_cache = None
@@ -318,6 +320,7 @@ class FlashInferDecodeWrapper:
         device: torch.device = torch.device("cuda"),
         use_cuda_graph: bool = False,
         enable_nvtx: bool = False,
+        backend: str = "auto",
     ):
         self.device = device
         self.use_cuda_graph = use_cuda_graph
@@ -353,6 +356,7 @@ class FlashInferDecodeWrapper:
                 paged_kv_indptr_buffer=self._paged_kv_indptr_buf,
                 paged_kv_indices_buffer=self._paged_kv_indices_buf,
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len_buf,
+                backend=backend,
             )
 
             # Static buffer for KV write locations: [batch_size, 2] = (page_idx, pos_idx)
@@ -363,6 +367,7 @@ class FlashInferDecodeWrapper:
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD",
                 use_tensor_cores=True,
+                backend=backend,
             )
             self.kv_cache_locations = None
 
