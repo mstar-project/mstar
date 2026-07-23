@@ -49,7 +49,7 @@ class SubmitArgs:
 
 
 def flatten_messages(
-    messages: list, upload_dir: Path, allow_remote: bool = True
+    messages: list, upload_dir: Path, allow_remote: bool = False
 ) -> tuple[str | None, dict[str, list[str]], list[str]]:
     """Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities).
 

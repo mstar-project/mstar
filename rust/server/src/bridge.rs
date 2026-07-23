@@ -155,7 +155,7 @@ impl Bridge {
         self.routes
             .lock()
             .expect("routes lock")
-            .insert(request_id.to_string(), tx);
+            .insert(request_id.to_string(), tx.clone());
         let msg = SubmitMsg {
             t: "submit",
             rid: request_id,
@@ -169,7 +169,15 @@ impl Bridge {
             streaming,
         };
         let payload = rmp_serde::to_vec_named(&msg).expect("encode submit");
-        let _ = self.mbox.send("conductor", &payload);
+        if self.mbox.send("bridge", &payload).is_err() {
+            // Backend bridge unreachable: fail the request now instead of
+            // leaving the client hanging until request_timeout with no
+            // signal. The receiver is already routed to `tx`.
+            let _ = tx.send(StreamItem::Error(
+                "backend unreachable (bridge send failed)".to_string(),
+            ));
+            self.routes.lock().expect("routes lock").remove(request_id);
+        }
         rx
     }
 
@@ -185,7 +193,7 @@ impl Bridge {
             .insert(rid.clone(), tx);
         let msg = serde_json::json!({"t": "ping", "rid": rid});
         if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
-            let _ = self.mbox.send("conductor", &payload);
+            let _ = self.mbox.send("bridge", &payload);
         }
         let ok = tokio::time::timeout(timeout, rx.recv()).await.is_ok();
         self.routes.lock().expect("routes lock").remove(&rid);
@@ -199,7 +207,7 @@ impl Bridge {
         self.routes.lock().expect("routes lock").remove(request_id);
         let msg = serde_json::json!({"t": "abort", "rid": request_id});
         if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
-            let _ = self.mbox.send("conductor", &payload);
+            let _ = self.mbox.send("bridge", &payload);
         }
     }
 }

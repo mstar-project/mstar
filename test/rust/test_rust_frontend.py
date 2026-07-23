@@ -177,3 +177,29 @@ def test_admission_control_returns_503_when_saturated():
         bridge.stop()
         proc.terminate()
         proc.wait(timeout=10)
+
+
+def test_tokenizer_env_fails_fast(tmp_path, monkeypatch):
+    """MSTAR_TOKENIZER set -> the bridge refuses at construction (the model
+    side owns tokenization), instead of 500-ing every request."""
+    from mstar.api_server.rust_frontend import RustFrontendBridge
+
+    monkeypatch.setenv("MSTAR_TOKENIZER", "/some/tokenizer.json")
+    with pytest.raises(RuntimeError, match="MSTAR_TOKENIZER"):
+        RustFrontendBridge(_StubAPIServer(), str(tmp_path))
+
+
+def test_upload_filename_traversal_is_contained(tmp_path):
+    """A multipart filename with `../` must not escape the upload dir
+    (arbitrary write, amplified to arbitrary delete by cleanup)."""
+    import os
+
+    from mstar.api_server import media_io
+
+    # save_base64's format field is client-controlled: a traversal format
+    # must be sanitized to a plain extension, keeping the file in upload_dir.
+    modality, path = media_io.save_base64(
+        "AAAA", "../../../../tmp/evil", "audio", tmp_path)
+    resolved = os.path.realpath(path)
+    assert resolved.startswith(os.path.realpath(str(tmp_path)) + os.sep), path
+    assert ".." not in os.path.basename(path)

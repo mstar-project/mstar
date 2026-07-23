@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import os
 import wave
 from pathlib import Path
 from urllib.parse import urlparse
@@ -110,7 +111,10 @@ def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tup
     upload_dir = Path(upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
     raw = base64.b64decode(b64)
-    ext = "." + fmt.lstrip(".") if fmt else ".bin"
+    # Sanitize the client-controlled fmt: alphanumerics only, so it cannot
+    # inject path separators into the upload path.
+    clean = "".join(c for c in fmt.lstrip(".") if c.isalnum())
+    ext = "." + clean if clean else ".bin"
     path = upload_dir / f"{uuid4()}{ext}"
     path.write_bytes(raw)
     return modality_hint, str(path)
@@ -135,7 +139,7 @@ def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[
     return _save_bytes(raw, mime, upload_dir)
 
 
-def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = True) -> tuple[str, str]:
+def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False) -> tuple[str, str]:
     """Resolve a media reference (data URL, http(s) URL, or local path).
 
     Returns ``(modality, path)``. Local paths are passed through unchanged
@@ -145,6 +149,7 @@ def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = True) 
         return save_data_url(ref, upload_dir)
     scheme = urlparse(ref).scheme.lower()
     if scheme in ("http", "https"):
+        allow_remote = allow_remote or os.getenv("MSTAR_ALLOW_REMOTE", "0") == "1"
         if not allow_remote:
             raise ValueError("Remote media fetch is disabled on this server")
         return save_remote_url(ref, upload_dir)
