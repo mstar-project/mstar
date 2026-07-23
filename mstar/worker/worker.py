@@ -1721,6 +1721,12 @@ class Worker:
 
         # Stop loops, if applicable
         for rid, loop_names in new_stops.items():
+            loop_names = set([
+                ln for ln in loop_names if \
+                    self.worker_graphs_manager.check_dyn_loop(rid, batch_N.partition, ln)
+            ])
+            if not loop_names:
+                continue
             self.worker_graphs_manager.stop_loops(
                 rid, partition=batch_N.partition,
                 loop_names=loop_names,
