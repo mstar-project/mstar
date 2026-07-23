@@ -126,6 +126,18 @@ class NodeOutput:
     # side-stream D→H copy of the produced tokens. Set by the worker in
     # _execute_on_gpu_thread; engines don't populate it themselves.
     completion_event: "torch.cuda.Event | None" = None
+    # MSTAR_DIRECT_FEED: the single [bs] sampled-tokens tensor produced this
+    # step (a fresh per-step clone — see the aliasing note in
+    # cuda_graph_runner._sample_and_remap), plus the rid order matching its
+    # rows. Populated only by the CUDA-graph AR decode fast path when the
+    # flag is on; None otherwise. Lets the worker splice loop-back
+    # ``text_inputs`` into the speculative batch straight from this tensor's
+    # per-row views rather than re-reading the per-rid registry, WITHOUT
+    # changing per_request_output_tensors (which still carries the same views
+    # for the store / emit / check_stop paths). See
+    # worker._thread_outputs_to_speculative.
+    batched_sampled_tokens: "torch.Tensor | None" = None
+    batched_sampled_rids: "list[str] | None" = None
 
 
 class BaseEngine(ABC):

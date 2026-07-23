@@ -41,6 +41,12 @@ class StreamBuffer:
     _chunks_popped: int = 0
     producer_done: bool = False
 
+    # MSTAR_CODEC_CHUNK_EMIT: producer-side staging of arrived frames, flushed
+    # into the buffer in one batched put per coalesce boundary. list[(id,item)]
+    # in arrival order. Empty (and unused) unless the producer routes via the
+    # coalesced path.
+    _coalesce_pending: list = field(default_factory=list)
+
     _num_tensors_registered = 0
     _num_buffer_writes = 0
 
@@ -51,6 +57,54 @@ class StreamBuffer:
     def put(self, tensor_id: str, item: torch.Tensor) -> None:
         """Called when a tensor arrives via normal RDMA routing."""
         self._id_to_tensor[tensor_id] = item
+
+    def stage(self, tensor_id: str, item: torch.Tensor) -> None:
+        """MSTAR_CODEC_CHUNK_EMIT: hold an arrived frame for a later batched
+        put instead of writing it into the buffer immediately. Ordering /
+        registration (``pre_read_register``) are unchanged; only the buffer
+        write is deferred to ``flush_pending``."""
+        self._coalesce_pending.append((tensor_id, item))
+
+    def num_pending(self) -> int:
+        return len(self._coalesce_pending)
+
+    def flush_pending(self) -> int:
+        """MSTAR_CODEC_CHUNK_EMIT: write all staged frames into the buffer in
+        one batched put. Returns the number of frames flushed (0 if none).
+
+        Byte-identical to having called ``put`` for each staged frame in
+        arrival order: the buffered item sequence, and hence every popped
+        window, is the same. The batched fast path skips the per-frame
+        ``_id_to_tensor`` insert+delete churn when the staged ids are exactly
+        the next-in-order registered ids; otherwise it falls back to the
+        per-frame ``put`` path, which is identical by construction."""
+        pending = self._coalesce_pending
+        if not pending:
+            return 0
+        self._coalesce_pending = []
+        ids = [tid for tid, _ in pending]
+        # Fast path: staged ids are exactly the head of the registration order
+        # and nothing earlier is still awaiting arrival. Then draining them is
+        # exactly what _update_buffer would do after N puts, so append straight
+        # to _buffer and skip the id->tensor dict round-trip.
+        n = len(ids)
+        head_matches = (
+            not self._id_to_tensor
+            and len(self._tensor_ids_in_order) >= n
+            and all(self._tensor_ids_in_order[i] == ids[i] for i in range(n))
+        )
+        if head_matches:
+            for _ in range(n):
+                self._tensor_ids_in_order.popleft()
+            for _, item in pending:
+                self._buffer.append(item)
+                self._num_buffer_writes += 1
+        else:
+            # Safe fallback: identical to arrival-order puts + lazy drain.
+            for tid, item in pending:
+                self._id_to_tensor[tid] = item
+            self._update_buffer()
+        return n
 
     def _update_buffer(self):
         while len(self._tensor_ids_in_order) > 0:
@@ -64,6 +118,9 @@ class StreamBuffer:
 
     def signal_done(self) -> None:
         """Producer signals no more items will arrive."""
+        # Flush any coalesced remainder (< coalesce_size frames) before marking
+        # done, so the tail chunk isn't stranded in staging.
+        self.flush_pending()
         self.producer_done = True
 
     def _producer_done_and_all_read(self) -> bool:

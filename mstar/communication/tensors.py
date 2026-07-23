@@ -44,6 +44,58 @@ class TensorAndReferenceInfo:
     mem_registered: bool = False
 
 
+@dataclass
+class _CachedTensorPlan:
+    """Per-tensor memoized derivation for the MSTAR_FAST_POSTPROC replay path.
+
+    Captures everything ``store_and_return_tensor_info`` derives from
+    *invariants* (sharding config, node/walk, edge shape/dtype) on the first
+    decode step, so a continuing steady-state step can rebuild an identical
+    ``TensorPointerInfo`` by cloning ``info_template`` and patching only the
+    two things that genuinely change per step: a fresh uuid and the new
+    tensor's ``data_ptr()``.
+
+    ``shard_dim`` is retained so replay can (a) re-run ``_ensure_leading_shard_dim``
+    exactly as the slow path would and (b) re-populate ``uuid_to_shard_dim``.
+    ``expected_*`` fields are the fingerprint the replay verifies against the
+    live tensor; ANY mismatch invalidates the plan and forces the slow path
+    (see ``store_and_populate_graph_edges_fast``).
+    """
+    shard_dim: int | None
+    info_template: TensorPointerInfo
+    # Fingerprint of the canonical (post-_ensure_leading_shard_dim) tensor that
+    # produced info_template. Replay must reproduce this exactly or bail.
+    expected_shape: tuple
+    expected_dtype: "torch.dtype"
+    expected_stride: tuple
+    expected_nbytes: int
+    expected_device_type: str
+
+
+@dataclass
+class _FastPopulatePlan:
+    """Memoized ``store_and_populate_graph_edges`` plan for one (rid, node,
+    graph_walk) in steady-state decode. See ``store_and_populate_graph_edges_fast``.
+
+    Invariants captured here and asserted-by-reconstruction on every replay:
+      * the set/order of output tensor names,
+      * how many tensors each name carries,
+      * which GraphEdge objects each name maps to (by identity — the same
+        ``node.outputs`` objects are reused every step),
+      * the per-tensor sharding + TensorPointerInfo template.
+
+    The plan holds *references* to the live GraphEdge objects (edge.tensor_info
+    is overwritten every step by design, both on slow and fast paths). It never
+    caches tensor payloads or uuids — those are per-step.
+    """
+    # name -> list of the SAME GraphEdge objects the slow path groups
+    name_to_graph_edges: dict[str, list[GraphEdge]]
+    # name -> per-tensor cached plans, index-aligned with the tensor list
+    name_to_tensor_plans: dict[str, list[_CachedTensorPlan]]
+    source_tp_size: int
+    source_tp_rank: int
+
+
 NameToTensorList = dict[str, list[torch.Tensor]]
 UuidToTensorAndRef = dict[str, TensorAndReferenceInfo]
 
@@ -381,6 +433,33 @@ class TensorCommunicationManager(ABC):
         self.buffered_shards: dict[str, dict[str, BufferedShards]] = {}
         self.uuid_to_shard_dim: dict[str, int | None] = {}
 
+        # MSTAR_FAST_POSTPROC replay cache: (request_id, node_name, graph_walk)
+        # -> _FastPopulatePlan. Populated on the first decode step for an rid and
+        # replayed on subsequent steps. ONLY consulted through
+        # store_and_populate_graph_edges_fast; the default path never touches it.
+        # Invalidated by invalidate_populate_plan (worker-driven, on any
+        # structural change) and by cleanup_request (rid teardown).
+        self._fast_populate_plans: dict[
+            tuple[str, str | None, str | None], _FastPopulatePlan
+        ] = {}
+
+        # MSTAR_INT_UUID: the per-tensor storage handle was str(uuid4()), which
+        # measurably adds to decode-step self-time (uuid4 CSPRNG + hex format,
+        # per tensor per rid per step). It is a pure internal key (per_req_tensors[rid][uuid],
+        # uuid_to_shard_dim, uuid_to_edge_name) looked up only against its
+        # originating store, so a monotonic counter suffices. Namespaced by pid
+        # so keys stay unique per-worker AND per-boot (uuids ride SHM to peers).
+        # Default off returns str(uuid4()) = byte-identical wire semantics.
+        self._int_uuid = os.environ.get("MSTAR_INT_UUID", "0") == "1"
+        self._uuid_prefix = f"{os.getpid()}-"
+        self._uuid_ctr = 0
+
+    def _new_tensor_uuid(self) -> str:
+        if self._int_uuid:
+            self._uuid_ctr += 1
+            return self._uuid_prefix + str(self._uuid_ctr)
+        return str(uuid4())
+
     # ---- shared: store ----
     def _ensure_leading_shard_dim(self, shard_dim: int | None, tensor: torch.Tensor):
         """Move ``shard_dim`` to dim 0, preserving the relative order of the
@@ -437,7 +516,7 @@ class TensorCommunicationManager(ABC):
 
             shard_dim = cfg.shard_dim.get(name) if cfg is not None else None
             for tensor in tensor_list:
-                tensor_uuid = str(uuid4())
+                tensor_uuid = self._new_tensor_uuid()
                 # TODO: only rearrange when (1) the tensor will be sent and
                 # (2) it may be split along the shard dim in transport. Doing
                 # it here unconditionally so TensorPointerInfo dims/strides
@@ -505,6 +584,190 @@ class TensorCommunicationManager(ABC):
                             e for e in edges if e.next_node != EMPTY_DESTINATION
                         ])
                     )
+            for edge in edges:
+                edge.tensor_info = graph_node_info[name]
+        return graph_node_info
+
+    # ------------------------------------------------------------------
+    # MSTAR_FAST_POSTPROC: memoized store_and_populate for steady-state decode
+    # ------------------------------------------------------------------
+    def invalidate_populate_plan(
+        self, request_id: str,
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+    ):
+        """Drop the fast-populate replay plan for an rid.
+
+        Conservative by design: with ``node_name``/``graph_walk`` omitted,
+        every plan for the rid is dropped. Called by the worker on ANY
+        structural change (loop stop, request removal, spec drop, fallback)
+        and on rid teardown. Dropping a plan simply means the next step
+        rebuilds it from the slow path — never a correctness hazard.
+        """
+        if node_name is None:
+            for key in [k for k in self._fast_populate_plans if k[0] == request_id]:
+                self._fast_populate_plans.pop(key, None)
+        else:
+            self._fast_populate_plans.pop(
+                (request_id, node_name, graph_walk), None
+            )
+
+    def store_and_populate_graph_edges_fast(
+        self, request_id: str, tensors: NameToTensorList,
+        graph_edges: list[GraphEdge],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+    ):
+        """Fast-path equivalent of
+        ``store_and_populate_graph_edges(..., skip_cuda_sync=True, skip_ref_count=True)``.
+
+        First call for a (rid, node, graph_walk): runs the slow path AND records a
+        ``_FastPopulatePlan`` capturing the derived, step-invariant metadata.
+        Subsequent calls: if the live ``graph_edges``/``tensors`` still match the
+        plan's fingerprint, rebuild identical ``TensorPointerInfo`` by cloning the
+        cached template and patching only uuid + address (the only per-step-varying
+        fields), skipping the sharding-config lookups, name grouping, tp-group
+        resolution and TensorPointerInfo construction. On ANY mismatch the plan is
+        dropped and the slow path runs (repopulating the plan), so behaviour is
+        provably identical to the slow path modulo the (equivalent) memoized
+        metadata. Only ever hit under the MSTAR_FAST_POSTPROC worker gate.
+
+        Contract vs the slow path (byte-identical results):
+          * same uuids-per-name count, same ref increments (safety hold = 1 each),
+          * same ``edge.tensor_info`` assignment (each edge gets the shared
+            per-name list, exactly as the slow path does),
+          * same ``uuid_to_shard_dim`` / ``uuid_to_edge_name`` bookkeeping,
+          * same canonicalization (``_ensure_leading_shard_dim``).
+        """
+        key = (request_id, node_name, graph_walk)
+        plan = self._fast_populate_plans.get(key)
+
+        if plan is not None and self._plan_matches(plan, tensors):
+            return self._replay_populate_plan(request_id, plan, tensors)
+
+        # Miss / mismatch: run the slow path and (re)build the plan.
+        graph_node_info = self.store_and_populate_graph_edges(
+            request_id=request_id, tensors=tensors, graph_edges=graph_edges,
+            node_name=node_name, graph_walk=graph_walk,
+            skip_cuda_sync=True, skip_ref_count=True,
+        )
+        self._fast_populate_plans[key] = self._build_populate_plan(
+            request_id, tensors, graph_edges, graph_node_info,
+            node_name=node_name, graph_walk=graph_walk,
+        )
+        return graph_node_info
+
+    def _plan_matches(
+        self, plan: "_FastPopulatePlan", tensors: NameToTensorList
+    ) -> bool:
+        """True iff the live tensors still match the cached plan's fingerprint.
+
+        Verifies against the *canonical* (post-_ensure_leading_shard_dim) tensor
+        because that is what the template was derived from. Any structural
+        difference (name set, tensor count, shape, dtype, stride, device,
+        non-contiguity after canonicalization) forces a rebuild.
+        """
+        if tensors.keys() != plan.name_to_tensor_plans.keys():
+            return False
+        for name, tensor_list in tensors.items():
+            tplans = plan.name_to_tensor_plans[name]
+            if len(tensor_list) != len(tplans):
+                return False
+            for tensor, tplan in zip(tensor_list, tplans, strict=False):
+                # No-op (returns `tensor`) on the replicated hot path
+                # (shard_dim is None); only allocates in the rare sharded case,
+                # where correctness matters more than the extra permute.
+                canonical = self._ensure_leading_shard_dim(tplan.shard_dim, tensor)
+                if (
+                    tuple(canonical.shape) != tplan.expected_shape
+                    or canonical.dtype != tplan.expected_dtype
+                    or tuple(canonical.stride()) != tplan.expected_stride
+                    or canonical.nbytes != tplan.expected_nbytes
+                    or canonical.device.type != tplan.expected_device_type
+                ):
+                    return False
+        return True
+
+    def _build_populate_plan(
+        self, request_id: str, tensors: NameToTensorList,
+        graph_edges: list[GraphEdge],
+        graph_node_info: dict[str, list[TensorPointerInfo]],
+        node_name: str | None, graph_walk: str | None,
+    ) -> "_FastPopulatePlan":
+        name_to_graph_edges: dict[str, list[GraphEdge]] = {}
+        for edge in graph_edges:
+            name_to_graph_edges.setdefault(edge.name, []).append(edge)
+
+        cfg = self.sharding_configs.get(request_id)
+        if cfg is not None:
+            source_group = cfg.get_sharding_group(node_name, graph_walk)
+        else:
+            source_group = None
+        if source_group is not None:
+            source_tp_size = source_group.tp_size
+            source_tp_rank = source_group._tp_rank or 0
+        else:
+            source_tp_size, source_tp_rank = 1, 0
+
+        name_to_tensor_plans: dict[str, list[_CachedTensorPlan]] = {}
+        for name, tensor_list in tensors.items():
+            shard_dim = cfg.shard_dim.get(name) if cfg is not None else None
+            infos = graph_node_info[name]
+            plans: list[_CachedTensorPlan] = []
+            for tensor, info in zip(tensor_list, infos, strict=False):
+                canonical = self._ensure_leading_shard_dim(shard_dim, tensor)
+                plans.append(_CachedTensorPlan(
+                    shard_dim=shard_dim,
+                    info_template=info.clone(),
+                    expected_shape=tuple(canonical.shape),
+                    expected_dtype=canonical.dtype,
+                    expected_stride=tuple(canonical.stride()),
+                    expected_nbytes=canonical.nbytes,
+                    expected_device_type=canonical.device.type,
+                ))
+            name_to_tensor_plans[name] = plans
+
+        return _FastPopulatePlan(
+            name_to_graph_edges=name_to_graph_edges,
+            name_to_tensor_plans=name_to_tensor_plans,
+            source_tp_size=source_tp_size,
+            source_tp_rank=source_tp_rank,
+        )
+
+    def _replay_populate_plan(
+        self, request_id: str, plan: "_FastPopulatePlan",
+        tensors: NameToTensorList,
+    ) -> dict[str, list[TensorPointerInfo]]:
+        """Rebuild ``graph_node_info`` from the cached plan, patching only the
+        per-step-varying uuid + address. Mirrors the store/increment/assign
+        sequence of the slow path (skip_ref_count=True mode) exactly.
+        """
+        graph_node_info: dict[str, list[TensorPointerInfo]] = {}
+        for name, tensor_list in tensors.items():
+            tplans = plan.name_to_tensor_plans[name]
+            infos: list[TensorPointerInfo] = []
+            for tensor, tplan in zip(tensor_list, tplans, strict=False):
+                canonical = self._ensure_leading_shard_dim(tplan.shard_dim, tensor)
+                tensor_uuid = self._new_tensor_uuid()
+                self.tensor_store.put_tensor(
+                    request_id=request_id, uuid=tensor_uuid, tensor=canonical,
+                )
+                if tplan.shard_dim is not None:
+                    self.uuid_to_shard_dim[tensor_uuid] = tplan.shard_dim
+                if self.enable_prof:
+                    self.uuid_to_edge_name[tensor_uuid] = name
+                # Clone the invariant template, patch only what changes per step.
+                info = tplan.info_template.clone()
+                info.uuid = tensor_uuid
+                info.address = canonical.data_ptr()
+                infos.append(info)
+            graph_node_info[name] = infos
+
+        # Safety hold (ref=1 each): identical to skip_ref_count=True slow path.
+        for name in tensors:
+            edges = plan.name_to_graph_edges.get(name, [])
+            for info in graph_node_info[name]:
+                self.tensor_store.increment_ref(request_id, info.uuid, n=1)
             for edge in edges:
                 edge.tensor_info = graph_node_info[name]
         return graph_node_info
@@ -577,7 +840,7 @@ class TensorCommunicationManager(ABC):
             start = info.offset // bytes_per_row
             end = start + info.nbytes // bytes_per_row
             slice_view = canonical_tensor[start:end]
-            new_uuid = str(uuid4())
+            new_uuid = self._new_tensor_uuid()
             self.tensor_store.put_tensor(request_id, new_uuid, slice_view)
             self.uuid_to_shard_dim[new_uuid] = shard_dim
             # Release this edge's stake on the producer's UUID — the slice now
@@ -726,7 +989,7 @@ class TensorCommunicationManager(ABC):
                         consolidated = buf.consolidate()
                         new_infos: list[TensorPointerInfo] = []
                         for uuid_, tensor in (
-                            (str(uuid4()), t) for t in consolidated
+                            (self._new_tensor_uuid(), t) for t in consolidated
                         ):
                             self.tensor_store.put_tensor(req_id, uuid_, tensor)
                             # +1 for graph-node usage (released by the
@@ -808,6 +1071,7 @@ class TensorCommunicationManager(ABC):
         self.read_finished.pop(request_id, None)
         self.buffered_shards.pop(request_id, None)
         self.sharding_configs.pop(request_id, None)
+        self.invalidate_populate_plan(request_id)
         self.req_rx_info.pop(request_id, None)
         self.req_tx_info.pop(request_id, None)
         for uuid in self.tensor_store.get_all_uuids(request_id):

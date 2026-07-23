@@ -1,11 +1,13 @@
 import functools
 import logging
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
 
+from mstar.engine import compile_ops  # registers mstar::* custom ops on import
 from mstar.engine.kv_store import (
     CrossAttnPool,
     KVCacheConfig,
@@ -132,13 +134,21 @@ class WorkspaceBufferManager:
         self.size = size
         self.device = device
         self.buffers = {}
+        # Guards the lazy per-label buffer allocation below. With
+        # MSTAR_SIDE_PREFILL the side prefill path (eager, label "main")
+        # plans on a second executor thread while the main GPU thread plans
+        # decode (per-slot labels), so two threads can hit this
+        # check-then-create concurrently for different labels in the same
+        # dict. The lock makes the allocate-and-insert atomic.
+        self._lock = threading.Lock()
 
     def get(self, label: str="main"):
-        if label not in self.buffers:
-            self.buffers[label] = torch.empty(
-                self.size, dtype=torch.uint8, device=self.device
-            )
-        return self.buffers[label]
+        with self._lock:
+            if label not in self.buffers:
+                self.buffers[label] = torch.empty(
+                    self.size, dtype=torch.uint8, device=self.device
+                )
+            return self.buffers[label]
 
 
 @dataclass
@@ -232,6 +242,11 @@ class BatchedCacheManager(ABC):
         # pre-plan was applied.
         self._plan_done_event: "torch.cuda.Event | None" = None
 
+        # Publish as the active manager for the custom-op forward-context.
+        # A weak default only: the just-in-time set in plan_attention and in
+        # CudaGraphRunner's capture loop is what guarantees the correct manager
+        # is active for each specific forward.
+        compile_ops.set_active_manager(self)
         self._batched_cfg_info: BatchedCfgInfo | None = None
 
     @torch.compiler.disable
@@ -281,6 +296,7 @@ class BatchedCacheManager(ABC):
         is_causal=True,
         write_store: bool=True,
         label: str | None = None,
+        publish_manager: bool = True,
         **kwargs,
     ):
         """Pre-compute the attention plan for a cache label.
@@ -687,6 +703,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         is_causal=True,
         write_store: bool=True,
         label: str | None = None,
+        publish_manager: bool = True,
         **kwargs,
     ):
         """Pre-compute FlashInfer plan and page positions for a cache label.
@@ -700,10 +717,34 @@ class FlashInferCacheManager(BatchedCacheManager):
         updates static buffers via .copy_(). In eager mode, creates a new
         wrapper each call.
 
+        Args:
+            seq_lens: number of new tokens per request.
+            dtype: query data type for FlashInfer.
+            is_causal: whether attention is causal.
+            label: cache label to plan for. If None, uses the current active label.
+            publish_manager: if False, skip set_active_manager. The
+                plan_executor's speculative pre-plan (pre_plan_for_batch)
+                MUST pass False: it plans on a different thread than the
+                forward, and publishing from there races the custom-op
+                _ACTIVE_MANAGER global read by any concurrently executing
+                EAGER forward (e.g. the MSTAR_UNCAP_PREFILL packed prefill)
+                on the gpu thread — mid-forward the ops would resolve the
+                decode slot's manager/plan and read wrong FlashInfer state
+                (illegal memory access). Captured replays never re-run the
+                custom-op Python, which is why this race is invisible in
+                the all-captured shipping config.
+
         Planning hints for other backends arriving via **kwargs are ignored.
         """
         from mstar.utils.profiler import range_pop, range_push
         self._batched_cfg_info = None
+
+        # plan_attention runs (outside the graph) before every forward that
+        # will read this manager, so it is the reliable per-forward hook to make
+        # this manager the one the custom ops resolve to. The forward and this
+        # publish must be on the SAME thread (see publish_manager above).
+        if publish_manager:
+            compile_ops.set_active_manager(self)
 
         if self.enable_nvtx:
             range_push("cache.plan_attention", synchronize=False)
@@ -1288,6 +1329,7 @@ class DenseGenCacheManager(FlashInferCacheManager):
         write_store: bool=True,
         label: str | None = None,
         dense_gen: bool = False,
+        publish_manager: bool = True,
         **kwargs,
     ):
         """As ``FlashInferCacheManager.plan_attention``, plus ``dense_gen``:
@@ -1300,10 +1342,15 @@ class DenseGenCacheManager(FlashInferCacheManager):
                 is_causal=is_causal,
                 write_store=write_store,
                 label=label,
+                publish_manager=publish_manager,
                 **kwargs,
             )
         from mstar.utils.profiler import range_pop, range_push
         self._batched_cfg_info = None
+        # Same custom-op contract as the base path: make this manager the one
+        # the custom ops resolve to (skipped only for the off-thread pre-plan).
+        if publish_manager:
+            compile_ops.set_active_manager(self)
 
         if self.enable_nvtx:
             range_push("cache.plan_attention", synchronize=False)

@@ -42,6 +42,7 @@ class Qwen3OmniAttention(ParallelAttention):
         rms_norm_eps: float = 1e-6,
         use_mrope: bool = False,
         comm_group: CommGroup | None = None,
+        layer_idx: int | None = None,
     ):
         super().__init__(
             comm_group=comm_group,
@@ -56,6 +57,11 @@ class Qwen3OmniAttention(ParallelAttention):
             rope_theta=rope_theta,
         )
         self.use_mrope = use_mrope
+        # Set (to this layer's stack index) only where the compiled-op path is
+        # wired -- currently the Thinker. Left None elsewhere (Talker / code
+        # predictor), which keeps those modules on the legacy cache-handle call
+        # even when MSTAR_CUSTOM_OPS is on. See compile_ops.run_attention.
+        self.layer_idx = layer_idx
 
     def forward(
         self,
@@ -75,6 +81,15 @@ class Qwen3OmniAttention(ParallelAttention):
         else:
             q, k = self._apply_rope(q, k, cache_handle)
 
-        attn_output = cache_handle.run_attention(q=q, k=k, v=v)
+        from mstar.engine.compile_ops import custom_ops_enabled
+
+        if custom_ops_enabled() and self.layer_idx is not None:
+            # Opaque, no-graph-break equivalent of cache_handle.run_attention.
+            # The manager is fetched from the active-manager global inside the
+            # op; layer_idx is threaded explicitly so the per-loop set_layer_idx
+            # break is unnecessary. See compile_ops.run_attention.
+            attn_output = torch.ops.mstar.run_attention(q, k, v, self.layer_idx)
+        else:
+            attn_output = cache_handle.run_attention(q=q, k=k, v=v)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)

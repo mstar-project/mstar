@@ -1,4 +1,5 @@
 import logging
+import os as _os
 from copy import deepcopy
 from dataclasses import dataclass, field
 
@@ -21,6 +22,52 @@ from mstar.streaming.stream_buffer import StreamBuffer
 
 logger = logging.getLogger(__name__)
 
+# MSTAR_FAST_ROUTE2 (default OFF): memoize the per-(rid, node, graph_walk)
+# route classification in WorkerGraphsManager.process_node_outputs. Read once
+# at import.
+_FAST_ROUTE2 = _os.environ.get("MSTAR_FAST_ROUTE2", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+
+def _refresh_route2_flag() -> None:
+    """Re-read MSTAR_FAST_ROUTE2 (safe: plan replay is value-identical;
+    flipping only toggles whether the plan cache is consulted/built)."""
+    global _FAST_ROUTE2
+    _FAST_ROUTE2 = _os.environ.get(
+        "MSTAR_FAST_ROUTE2", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass
+class _RoutePlan:
+    """MSTAR_FAST_ROUTE2: memoized per-edge classification for one
+    (request_id, node_name, graph_walk) in steady-state decode.
+
+    Everything cached here derives from state that is invariant between
+    invalidations: ``walk_node_to_worker_graph_id`` / ``queues`` (static
+    post-init), the request's ``node_to_workers`` + sharding config (static
+    after add_request; add_request for an EXISTING rid invalidates), and the
+    edge flags (baked into the graph definition, carried in the signature).
+    The plan never holds GraphEdge objects — replay always operates on the
+    caller's fresh clones.
+    """
+    # Full classification key: the SET of per-edge
+    # (name, next_node, is_streaming, persist, conductor_new_token) tuples.
+    # Any change (loop terminal outputs, walk-change fallout, new edge set)
+    # is a miss -> full path + rebuild.
+    edge_signature: frozenset
+    # signature tuple -> (bucket, wg_id). Buckets: "local" (fanout + ingest
+    # into queues[wg_id]), "external" (cross-worker fanout), "emit"
+    # (EMIT_TO_CLIENT fanout), "drop" (special/persist-only destination: the
+    # slow path computes-and-discards the fanout), "streaming" (fanout with
+    # dest_graph_walk=None; the local/worker split is per-fanout-result and
+    # stays runtime).
+    per_edge: dict[tuple, tuple[str, str | None]]
+    is_first_tp_rank: bool
+    # The request's worker_graph_ids active for this walk (is_done sweep).
+    relevant_wg_ids: list[str]
+
 
 @dataclass
 class NodeOutputRouting:
@@ -33,6 +80,13 @@ class NodeOutputRouting:
     completed_worker_graph_ids: list[str] = field(default_factory=list)
     streaming_to_workers: dict[str, list[GraphEdge]] = field(default_factory=dict)  # streaming edges to other workers
     streaming_local: list[GraphEdge] = field(default_factory=list)  # streaming edges staying on this worker
+    # MSTAR_FAST_SEND: the worker's _register_outputs stashes its
+    # _inline_emit_uuids result here so _send_outputs (same routing object,
+    # same prem dict, same step) reuses it instead of re-deriving the same
+    # set per rid — and so the send-side inline decision can never diverge
+    # from the register-side SHM-skip decision. None = not stashed (flag
+    # off): the reader recomputes.
+    inline_emit_uuids: "set[str] | None" = None
 
 
 @dataclass
@@ -52,7 +106,23 @@ class WorkerGraphQueues:
         self.nodes = set(self.worker_graph.section.get_nodes().keys())
         self.loops = set(self.worker_graph.section.get_loops().keys())
 
+        # _native_bridge stays None (no C++ state-machine bridge on this path);
+        # every method below takes the untouched Python path (guarded by a
+        # single ``is None`` check).
+        self._native_bridge = None
+
     def process_new_inputs(
+        self, request_id: str, inputs: list[GraphEdge],
+        can_buffer: bool=True
+    ) -> list[GraphEdge]:
+        if self._native_bridge is None:
+            return self._py_process_new_inputs(request_id, inputs, can_buffer)
+        return self._native_bridge.process_new_inputs(
+            request_id, inputs, can_buffer,
+            lambda: self._py_process_new_inputs(request_id, inputs, can_buffer),
+        )
+
+    def _py_process_new_inputs(
         self, request_id: str, inputs: list[GraphEdge],
         can_buffer: bool=True
     ) -> list[GraphEdge]:
@@ -77,6 +147,17 @@ class WorkerGraphQueues:
         self, request_id: str, inputs: list[GraphEdge],
         can_buffer: bool=True
     ) -> list[GraphEdge]:
+        if self._native_bridge is None:
+            return self._py_process_new_streaming_inputs(request_id, inputs, can_buffer)
+        return self._native_bridge.process_new_streaming_inputs(
+            request_id, inputs, can_buffer,
+            lambda: self._py_process_new_streaming_inputs(request_id, inputs, can_buffer),
+        )
+
+    def _py_process_new_streaming_inputs(
+        self, request_id: str, inputs: list[GraphEdge],
+        can_buffer: bool=True
+    ) -> list[GraphEdge]:
         assert request_id in self.per_request_queues, \
             f"Tried to process new inputs for unknown request ID {request_id}"
         queue = self.per_request_queues[request_id]
@@ -87,6 +168,13 @@ class WorkerGraphQueues:
         return not_ingested
 
     def is_done(self, request_id) -> bool:
+        if self._native_bridge is None:
+            return self._py_is_done(request_id)
+        return self._native_bridge.is_done(
+            request_id, lambda: self._py_is_done(request_id),
+        )
+
+    def _py_is_done(self, request_id) -> bool:
         assert request_id in self.per_request_queues, \
             f"Tried to check queue done state for unknown request ID {request_id}"
         queue = self.per_request_queues[request_id]
@@ -102,14 +190,25 @@ class WorkerGraphQueues:
             self.tensor_manager, request_id
         )
         self.per_request_queues[request_id] = queue
+        if self._native_bridge is not None:
+            self._native_bridge.add_request(request_id, queue)
 
     def remove_request(self, request_id: str):
         """
         Delete queues for a completed/removed request (saw EOS)
         """
+        if self._native_bridge is not None:
+            self._native_bridge.remove_request(request_id)
         self.per_request_queues.pop(request_id, None)
 
     def get_ready_node_names(self) -> dict[str, set[str]]:
+        if self._native_bridge is None:
+            return self._py_get_ready_node_names()
+        return self._native_bridge.get_ready_node_names(
+            self._py_get_ready_node_names,
+        )
+
+    def _py_get_ready_node_names(self) -> dict[str, set[str]]:
         """
         Returns mapping of request id to ready node names for that request
         """
@@ -119,11 +218,28 @@ class WorkerGraphQueues:
         }
 
     def get_ready_for_streaming(self, request_id: str):
+        if self._native_bridge is None:
+            return self._py_get_ready_for_streaming(request_id)
+        return self._native_bridge.get_ready_for_streaming(
+            request_id, lambda: self._py_get_ready_for_streaming(request_id),
+        )
+
+    def _py_get_ready_for_streaming(self, request_id: str):
         assert request_id in self.per_request_queues, \
             f"Tried to check ready for streaming for unknown request ID {request_id}"
         return self.per_request_queues[request_id].ready_for_streaming
 
     def pop_ready_nodes(
+        self, request_id: str, node_names: list[str]
+    ) -> list[GraphNode]:
+        if self._native_bridge is None:
+            return self._py_pop_ready_nodes(request_id, node_names)
+        return self._native_bridge.pop_ready_nodes(
+            request_id, node_names,
+            lambda: self._py_pop_ready_nodes(request_id, node_names),
+        )
+
+    def _py_pop_ready_nodes(
         self, request_id: str, node_names: list[str]
     ) -> list[GraphNode]:
         """
@@ -142,10 +258,26 @@ class WorkerGraphQueues:
         self, request_id: str, node: GraphNode
     ) -> None:
         """Push a previously popped node back onto the ready queue (e.g., after OOM hold)."""
+        if self._native_bridge is None:
+            return self._py_push_back_node(request_id, node)
+        return self._native_bridge.push_back_node(
+            request_id, node, lambda: self._py_push_back_node(request_id, node),
+        )
+
+    def _py_push_back_node(
+        self, request_id: str, node: GraphNode
+    ) -> None:
         if request_id in self.per_request_queues:
             self.per_request_queues[request_id].ready_node_names.add(node.name)
 
     def reset(self, request_id):
+        if self._native_bridge is None:
+            return self._py_reset(request_id)
+        return self._native_bridge.reset(
+            request_id, lambda: self._py_reset(request_id),
+        )
+
+    def _py_reset(self, request_id):
         """
         At the end of a worker graph, reset the queues for a request so it can
         be used for the next full model forward pass.
@@ -153,6 +285,16 @@ class WorkerGraphQueues:
         self.per_request_queues[request_id].clear()
 
     def stop_loops(
+        self, request_id: str, loop_names: set[str]
+    ) -> set[NameAndDest]:
+        if self._native_bridge is None:
+            return self._py_stop_loops(request_id, loop_names)
+        return self._native_bridge.stop_loops(
+            request_id, loop_names,
+            lambda: self._py_stop_loops(request_id, loop_names),
+        )
+
+    def _py_stop_loops(
         self, request_id: str, loop_names: set[str]
     ) -> set[NameAndDest]:
         """Register a finish signal for each named loop and return the union
@@ -171,6 +313,16 @@ class WorkerGraphQueues:
         return loop_back_signals
 
     def mark_node_complete(
+        self, request_id: str, node_name: str
+    ) -> NodeCompletionOutput:
+        if self._native_bridge is None:
+            return self._py_mark_node_complete(request_id, node_name)
+        return self._native_bridge.mark_node_complete(
+            request_id, node_name,
+            lambda: self._py_mark_node_complete(request_id, node_name),
+        )
+
+    def _py_mark_node_complete(
         self, request_id: str, node_name: str
     ) -> NodeCompletionOutput:
         """Complete a node in this worker graph's per-request io and return
@@ -256,6 +408,14 @@ class WorkerGraphsManager:
     # all_worker_graph_ids_to_nodes. Lets get_worker_graph_id_for_node skip
     # the linear scan over the request's worker_graph_ids.
     walk_node_to_worker_graph_id: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    # MSTAR_FAST_ROUTE2 plan cache: (request_id, node_name, graph_walk) ->
+    # _RoutePlan. ONLY consulted in process_node_outputs under the module
+    # flag; the default path never touches it. Invalidated by
+    # invalidate_route_plan (worker-driven, mirrors the FAST_POSTPROC
+    # invalidation sites), by add_request growing an existing rid's
+    # worker_graph_ids, and by remove_request (rid teardown).
+    _route_plans: dict[tuple[str, str, str], _RoutePlan] = field(default_factory=dict)
 
     def __post_init__(self):
         for wg_id, walks in self.all_worker_graph_ids_to_graph_walks.items():
@@ -390,6 +550,27 @@ class WorkerGraphsManager:
         Updates ready/waiting state in worker graphs on this worker, and
         builds the cross-worker routing map for edges destined elsewhere.
         """
+        # MSTAR_FAST_ROUTE2: replay the memoized classification when the edge
+        # signature is unchanged (steady-state decode). Replay still EXECUTES
+        # every stateful part with the fresh edges — sharding fanout, local
+        # process_new_inputs, the is_done sweep — and builds NodeOutputRouting
+        # from fresh edge objects; only the per-edge bucket decisions are read
+        # from the plan. Any signature change: full path + rebuild.
+        if _FAST_ROUTE2:
+            plan_key = (request_id, node_name, graph_walk)
+            plan = self._route_plans.get(plan_key)
+            if plan is not None:
+                signature = frozenset(
+                    (edge.name, edge.next_node, edge.is_streaming,
+                     edge.persist, edge.conductor_new_token)
+                    for edge in outputs
+                )
+                if signature == plan.edge_signature:
+                    return self._replay_route_plan(
+                        request_id, node_name, outputs, graph_walk, plan,
+                    )
+                self._route_plans.pop(plan_key, None)
+
         # (0) separate streaming edges — they bypass the queue system
         streaming_edges = [edge for edge in outputs if edge.is_streaming]
         non_streaming_outputs = [edge for edge in outputs if not edge.is_streaming]
@@ -514,6 +695,16 @@ class WorkerGraphsManager:
         if completed_worker_graph_ids:
             logger.debug("Completed %d worker graphs", len(completed_worker_graph_ids))
 
+        if _FAST_ROUTE2:
+            # Slow path completed without raising, so every edge classified
+            # cleanly; record the decisions for replay.
+            self._route_plans[(request_id, node_name, graph_walk)] = (
+                self._build_route_plan(
+                    request_id, outputs, graph_walk,
+                    is_first_tp_rank,
+                )
+            )
+
         return NodeOutputRouting(
             routed_to_this_worker_graph=routed_to_this_worker,
             persist=to_conductor,
@@ -524,6 +715,199 @@ class WorkerGraphsManager:
             streaming_to_workers=streaming_to_workers,
             streaming_local=streaming_local,
             is_first_tp_rank=is_first_tp_rank
+        )
+
+    # ------------------------------------------------------------------
+    # MSTAR_FAST_ROUTE2: memoized route classification for steady-state decode
+    # ------------------------------------------------------------------
+    def invalidate_route_plan(self, request_id: str):
+        """Drop the MSTAR_FAST_ROUTE2 route plans for an rid.
+
+        Conservative by design: every plan for the rid is dropped. Called at
+        the known invalidation sites — the worker's loop-stop handling (the
+        same sites that call invalidate_populate_plan), add_request when an
+        existing rid's worker_graph_ids grows, and remove_request. This is not
+        the only safety net: any OTHER structural change shows up as a changed
+        per-edge signature on the next call, and process_node_outputs' own
+        edge-signature check (not this method) is what catches that case and
+        falls back to the slow path. Dropping a plan here simply means the
+        next step rebuilds it from the slow path — never a correctness hazard.
+        No-op when the cache is empty / flag off.
+        """
+        if not self._route_plans:
+            return
+        for key in [k for k in self._route_plans if k[0] == request_id]:
+            self._route_plans.pop(key, None)
+
+    def _build_route_plan(
+        self, request_id: str,
+        outputs: list[GraphEdge], graph_walk: str,
+        is_first_tp_rank: bool,
+    ) -> _RoutePlan:
+        """Derive the per-edge buckets with the exact predicates the slow path
+        used (wg-index lookup, node_to_workers membership,
+        SPECIAL_DESTINATIONS/persist). Only called right after a slow-path run
+        that did not raise, so the "unknown destination" ValueError case
+        cannot be reached here."""
+        req_info = self.per_request_info[request_id]
+        per_edge: dict[tuple, tuple[str, str | None]] = {}
+        for edge in outputs:
+            key = (
+                edge.name, edge.next_node, edge.is_streaming,
+                edge.persist, edge.conductor_new_token,
+            )
+            if edge.is_streaming:
+                per_edge[key] = ("streaming", None)
+                continue
+            wg_id = self.walk_node_to_worker_graph_id.get(
+                (graph_walk, edge.next_node)
+            )
+            if wg_id is not None and wg_id in self.queues:
+                per_edge[key] = ("local", wg_id)
+            elif NodeAndGraphWalk(
+                node=edge.next_node, graph_walk=graph_walk
+            ) not in req_info.node_to_workers:
+                if edge.next_node == EMIT_TO_CLIENT:
+                    per_edge[key] = ("emit", None)
+                else:
+                    per_edge[key] = ("drop", None)
+            else:
+                per_edge[key] = ("external", None)
+        return _RoutePlan(
+            edge_signature=frozenset(per_edge.keys()),
+            per_edge=per_edge,
+            is_first_tp_rank=is_first_tp_rank,
+            relevant_wg_ids=[
+                wg_id for wg_id in req_info.worker_graph_ids
+                if graph_walk in self.all_worker_graph_ids_to_graph_walks[wg_id]
+            ],
+        )
+
+    def _replay_route_plan(
+        self, request_id: str, node_name: str,
+        outputs: list[GraphEdge], graph_walk: str,
+        plan: _RoutePlan,
+    ) -> NodeOutputRouting:
+        """Execute process_node_outputs with classification read from ``plan``.
+
+        Phase order mirrors the slow path exactly — local fanout+ingest, then
+        the is_done sweep, then external fanout, then streaming fanout — so
+        every stateful call (process_new_inputs, is_done/reset) fires in the
+        same order with the same arguments and every output list preserves the
+        slow path's ordering. "drop" edges skip their fanout: the slow path
+        computes and discards it, and fanout_graph_edges is side-effect-free
+        beyond its own memo, so skipping is value-identical.
+        """
+        sharding_config = self.per_request_info[request_id].sharding_config
+
+        to_conductor: list[GraphEdge] = []
+        new_token_outputs: list[GraphEdge] = []
+        local_edges: list[tuple[GraphEdge, str]] = []
+        external_edges: list[tuple[GraphEdge, str]] = []
+        streaming_edges: list[GraphEdge] = []
+        for edge in outputs:
+            bucket, wg_id = plan.per_edge[(
+                edge.name, edge.next_node, edge.is_streaming,
+                edge.persist, edge.conductor_new_token,
+            )]
+            if edge.is_streaming:
+                streaming_edges.append(edge)
+                continue
+            if edge.persist:
+                to_conductor.append(edge)
+            if edge.conductor_new_token:
+                new_token_outputs.append(edge)
+            if bucket == "local":
+                local_edges.append((edge, wg_id))
+            else:
+                external_edges.append((edge, bucket))
+
+        routed_to_this_worker: list[GraphEdge] = []
+        to_workers: dict[str, list[GraphEdge]] = {}
+        for edge, wg_id in local_edges:
+            fanout = sharding_config.fanout_graph_edges(
+                edge, source_node=node_name,
+                source_graph_walk=graph_walk,
+                dest_graph_walk=graph_walk,
+            )
+            this_worker_edge = fanout.pop(self.worker_id, None)
+            if this_worker_edge is not None:
+                leftover = self.queues[wg_id].process_new_inputs(
+                    request_id, [this_worker_edge], can_buffer=True,
+                )
+                if leftover:
+                    # local wg declined (state-dependent, deliberately NOT in
+                    # the plan); same self-routing fallback as the slow path.
+                    to_workers.setdefault(self.worker_id, []).extend(leftover)
+                else:
+                    routed_to_this_worker.append(this_worker_edge)
+            for (wkr, wkr_edge) in fanout.items():
+                to_workers.setdefault(wkr, []).append(wkr_edge)
+
+        # is_done sweep — stateful, executed on every hit exactly as the slow
+        # path does (over the same walk-filtered wg id list, cached in-plan).
+        completed_worker_graph_ids: list[str] = []
+        for wg_id in plan.relevant_wg_ids:
+            queue = self.queues[wg_id]
+            if queue.is_done(request_id):
+                completed_worker_graph_ids.append(wg_id)
+                queue.reset(request_id)
+
+        emit_to_client: list[GraphEdge] = []
+        for edge, bucket in external_edges:
+            if bucket == "drop":
+                continue
+            fanout = sharding_config.fanout_graph_edges(
+                edge, source_node=node_name,
+                source_graph_walk=graph_walk,
+                dest_graph_walk=graph_walk,
+            )
+            if bucket == "emit":
+                emit_to_client.extend(fanout.values())
+            else:
+                for (wkr, wkr_edge) in fanout.items():
+                    to_workers.setdefault(wkr, []).append(wkr_edge)
+
+        streaming_to_workers: dict[str, list[GraphEdge]] = {}
+        streaming_local: list[GraphEdge] = []
+        for edge in streaming_edges:
+            fanout = sharding_config.fanout_graph_edges(
+                edge, source_node=node_name,
+                source_graph_walk=graph_walk,
+                dest_graph_walk=None,
+            )
+            this_worker_edge = fanout.pop(self.worker_id, None)
+            if this_worker_edge:
+                streaming_local.append(this_worker_edge)
+            for (wkr, wkr_edge) in fanout.items():
+                streaming_to_workers.setdefault(wkr, []).append(wkr_edge)
+
+        # The slow path's debug logs evaluate format_graph_edge_list eagerly;
+        # on the hot replay path only pay that when DEBUG is actually on.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                ("Finished processing outputs from rid %s. \n"
+                 "Routed to this worker: %s; sent to others: %s; persist signals: %s; streaming: %d"),
+                request_id, format_graph_edge_list(routed_to_this_worker),
+                format_graph_edge_list([edge for edge, _ in external_edges]),
+                format_graph_edge_list(to_conductor),
+                len(streaming_edges),
+            )
+            if completed_worker_graph_ids:
+                logger.debug(
+                    "Completed %d worker graphs", len(completed_worker_graph_ids)
+                )
+
+        return NodeOutputRouting(
+            routed_to_this_worker_graph=routed_to_this_worker,
+            persist=to_conductor,
+            to_workers=to_workers,
+            emit_to_client=emit_to_client,
+            new_token_outputs=new_token_outputs,
+            completed_worker_graph_ids=completed_worker_graph_ids,
+            streaming_to_workers=streaming_to_workers,
+            streaming_local=streaming_local,
+            is_first_tp_rank=plan.is_first_tp_rank,
         )
 
     def stop_loops(
@@ -658,6 +1042,9 @@ class WorkerGraphsManager:
         else:
             # Just do partition-specific work: updating worker_graph_ids, instantiating PerPartitionInfo
             req_info = self.per_request_info[request_id]
+            # MSTAR_FAST_ROUTE2: worker_graph_ids grows here, which feeds the
+            # plans' cached is_done sweep list — invalidate.
+            self.invalidate_route_plan(request_id)
             req_info.worker_graph_ids += my_worker_graph_ids
             req_info.per_partition_info[partition_name] = PerPartitionInfo(
                 graph_walk_worker_graph_ids=[
@@ -668,6 +1055,8 @@ class WorkerGraphsManager:
             )
 
     def remove_request(self, request_id: str):
+        # MSTAR_FAST_ROUTE2: rid teardown drops its route plans.
+        self.invalidate_route_plan(request_id)
         if request_id in self.per_request_info:
             for queue_id in self.per_request_info[request_id].worker_graph_ids:
                 self.queues[queue_id].remove_request(request_id)

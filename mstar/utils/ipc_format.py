@@ -36,6 +36,10 @@ class WorkerMessageType(Enum):
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
+    # MSTAR_WGD_PACK: envelope for a batch of WorkerMessage,
+    # coalesced by the conductor into one send per destination worker per
+    # main-loop iteration. See PackedWorkerMessage.
+    PACKED = "packed"
 
 
 @dataclass
@@ -99,6 +103,24 @@ class WorkerMessage:
     body: MessageBody
 
 
+@dataclass
+class PackedWorkerMessage(MessageBody):
+    """MSTAR_WGD_PACK: a batch of ``WorkerMessage`` envelopes,
+    coalesced by the conductor into ONE ``communicator.send`` per
+    destination worker per main-loop iteration instead of one send per
+    partition/request. The receiver unpacks ``messages`` and dispatches each
+    one through the SAME per-message handler it would have used had they
+    arrived unpacked, in the SAME order — this changes only the wire framing
+    (N ZMQ frames -> 1), never message content, order, or semantics.
+
+    Only emitted when MSTAR_WGD_PACK=1 on the sender; the receiver
+    understands WorkerMessageType.PACKED unconditionally (not gated by its
+    own copy of the flag), so a flag-refresh lag between the conductor
+    and a worker can never desync the wire protocol.
+    """
+    messages: list["WorkerMessage"] = field(default_factory=list)
+
+
 ######################################
 # Requests to conductor
 ######################################
@@ -108,6 +130,9 @@ class ConductorMessageType(Enum):
     WORKER_GRAPHS_DONE = "worker_graphs_done"
     SETUP_DONE = "setup_done"
     ABORT_REQUEST = "abort_request"
+    # MSTAR_WGD_PACK: envelope for a batch of ConductorMessage,
+    # coalesced by a worker into one send per step. See PackedConductorMessage.
+    PACKED = "packed"
 
 
 @dataclass
@@ -152,3 +177,14 @@ class AbortRequest(MessageBody):
 class ConductorMessage:
     message_type: ConductorMessageType
     body: MessageBody
+
+
+@dataclass
+class PackedConductorMessage(MessageBody):
+    """MSTAR_WGD_PACK twin of ``PackedWorkerMessage`` for the
+    worker-to-conductor direction: a batch of ``ConductorMessage`` envelopes
+    (typically WORKER_GRAPHS_DONE, one per rid whose graph completed this
+    step) coalesced into one send instead of one per rid. Unpacked and
+    dispatched in order on the conductor side; transport-only, never
+    semantic."""
+    messages: list["ConductorMessage"] = field(default_factory=list)

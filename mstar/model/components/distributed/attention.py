@@ -126,6 +126,17 @@ class ParallelAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Standard 1D RoPE via ``cache_handle.apply_rope``. Override for
         non-standard schemes (3D MRoPE, etc.)."""
+        from mstar.engine.compile_ops import custom_ops_enabled
+
+        if custom_ops_enabled():
+            # Opaque, no-graph-break equivalent; pos_ids come from the active
+            # manager inside the op. See compile_ops.apply_rope.
+            return torch.ops.mstar.apply_rope(
+                q, k,
+                self.rope_theta, self.rope_scale,
+                self.rope_low_freq_factor, self.rope_high_freq_factor,
+                self.rope_old_context_len,
+            )
         return cache_handle.apply_rope(
             q, k,
             rope_theta=self.rope_theta,
