@@ -1218,6 +1218,7 @@ class Worker:
                 f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
                 synchronize=False,
             )
+
         try:
             output = engine.execute_with_max_batch_size(node_batch)
             if torch.cuda.is_available():
