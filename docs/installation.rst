@@ -67,6 +67,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[orpheus]``
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+   * - ``.[zonos2]``
+     - Zonos2 TTS runtime: ``flashinfer-python``, ``safetensors``, ``huggingface-hub``,
+       ``mooncake-transfer-engine``. **Also needs** ``descript-audio-codec`` (the DAC
+       vocoder), which is installed separately — see `descript-audio-codec (Zonos2)`_.
    * - ``.[pi05]``
      - Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``.
@@ -81,8 +85,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[all]``
      - The union of every model extra above — installs the full runtime for all model
        families in one shot. Convenient for a machine that serves multiple models; heavier
-       and slower to install than a single family's extra. (Still excludes ``flash-attn`` —
-       see `flash-attn (Qwen3-Omni)`_.)
+       and slower to install than a single family's extra. (Still excludes ``flash-attn``
+       and ``descript-audio-codec`` — see `flash-attn (Qwen3-Omni)`_ and
+       `descript-audio-codec (Zonos2)`_.)
 
 Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
@@ -204,6 +209,43 @@ Three things to get right:
    uv pip install psutil
    FLASH_ATTN_CUDA_ARCHS="90" uv pip install flash-attn==2.8.3.post1 --no-build-isolation
    python -c "import flash_attn; print(flash_attn.__version__)"
+
+descript-audio-codec (Zonos2)
+-----------------------------
+
+Zonos2 decodes audio codes with the **DAC** vocoder, which comes from the
+``descript-audio-codec`` package. Like ``flash-attn``, it is **not** pulled in by
+``.[zonos2]`` or ``.[all]`` — install it as a separate step:
+
+.. code-block:: bash
+
+   pip install descript-audio-codec
+
+It is kept out of the extras because ``descript-audio-codec`` depends on
+``descript-audiotools``, which hard-pins ``protobuf<3.20`` — letting it into a shared
+resolution (e.g. ``.[all]``) forces that old ``protobuf`` across every other model. On a
+machine that only serves Zonos2, install it last with a plain ``pip install
+descript-audio-codec``.
+
+Multi-model (``.[all]``): keep modern protobuf
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Install the DAC packages without their dependency closure, then add back the deps
+``import dac`` needs at import time (it imports the whole ``audiotools`` package). The
+``protobuf>=4`` floor blocks the downgrade; already-present deps are skipped.
+
+.. code-block:: bash
+
+   pip install --no-deps descript-audio-codec descript-audiotools argbind
+   pip install "protobuf>=4" \
+       flatten-dict julius docstring-parser ffmpy importlib-resources \
+       randomname tensorboard soundfile absl-py dill pynvml markdown-it-py
+
+Verify:
+
+.. code-block:: bash
+
+   python -c "import dac; print('dac ok')"
 
 Matching your CUDA toolkit
 --------------------------

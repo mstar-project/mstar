@@ -37,7 +37,8 @@ Or via the SDK:
 from mstar import MStarClient
 MStarClient("http://localhost:20002").tts("Hello there.").to_wav("out.wav")
 ```
-OpenAI-compatible `POST /v1/audio/speech` also works.
+Zonos2 is reachable via the native `/generate` endpoint and the SDK `client.tts(...)`.
+It has no OpenAI `/v1/audio/speech` adapter yet (unlike Orpheus/Qwen3-Omni).
 
 ## Configs
 - `configs/zonos2_colocated.yaml` — 1 GPU (LLM + DAC on rank 0); the

@@ -20,6 +20,7 @@ It listens on ``http://localhost:8000`` by default. Other models:
    mstar serve bagel_cfg_parallel   # BAGEL with CFG branches split across GPUs (faster image gen)
    mstar serve qwen3_omni           # omni: text/image/audio/video in, text/speech out
    mstar serve orpheus              # text-to-speech
+   mstar serve zonos2               # multi-codebook text-to-speech (needs descript-audio-codec)
    mstar serve pi05                 # vision-language-action (robotics)
    mstar serve vjepa2               # video world model
 
@@ -58,6 +59,7 @@ that supports it, so run the matching server first:
    print(client.chat("What is the capital of France?").text)              # text  (BAGEL / Qwen3-Omni)
    open("cat.png", "wb").write(client.generate_image("a cat in a hat"))   # image (BAGEL)
    client.tts("Hello there", voice="tara").to_wav("out.wav")             # speech (Orpheus)
+   client.tts("Hello there").to_wav("out.wav")                          # speech (Zonos2; no voice arg)
 
 Streaming yields typed chunks (``TextChunk`` / ``ImageChunk`` / ``AudioChunk``):
 
