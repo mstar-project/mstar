@@ -86,6 +86,17 @@ orpheus = [
     "transformers",
 ]
 
+zonos2 = [
+    # NOTE: the DAC vocoder (`descript-audio-codec`) is required at runtime but is
+    # NOT listed here — it transitively pins `protobuf<3.20` (via
+    # `descript-audiotools`), which can poison the shared resolution for the other
+    # model extras. Install it as a separate step; see docs/installation.rst.
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "mooncake-transfer-engine",
+    "safetensors",
+]
+
 pi05 = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
@@ -130,8 +141,8 @@ all = [
     "qwen-omni-utils",
     "numba>=0.61",
     "sgl-kernel",
-    # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
-    # separately, see docs/installation.rst.
+    # flash-attn (Qwen3-Omni) and descript-audio-codec (Zonos2) are intentionally
+    # omitted — both need a separate install step, see docs/installation.rst.
 ]
 
 [tool.setuptools.packages.find]

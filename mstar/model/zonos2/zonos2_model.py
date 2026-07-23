@@ -152,7 +152,15 @@ class Zonos2Model(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            # Hard safety ceiling only. The graph is built once at init, so this
+            # value is baked in and CANNOT see per-request model_kwargs; calling
+            # get_max_output_tokens() here silently pinned every request to the
+            # global TTSSamplingParams.max_tokens default (1024), truncating any
+            # utterance longer than ~1024 frames. The real per-request bound
+            # (natural EOS + request max_tokens) is enforced in check_stop, so
+            # this only needs to be a ceiling the sequence can never physically
+            # exceed: the KV-cache / position capacity.
+            max_iters=self.config.max_position_embeddings,
             outputs=[],
         )
 

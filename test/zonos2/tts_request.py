@@ -39,7 +39,10 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:20002/generate")
     ap.add_argument("--text", default="And now for something completely different.")
     ap.add_argument("--output", default="zonos2_out.wav")
-    ap.add_argument("--max-tokens", type=int, default=1000)
+    # Generous safety cap only — the model stops at its natural EOS well before
+    # this. Raise it if you feed very long text; it is not a target length.
+    ap.add_argument("--max-tokens", type=int, default=4096,
+                    help="generous upper bound on frames; natural EOS stops first")
     args = ap.parse_args()
 
     pcm = b""
@@ -49,7 +52,11 @@ def main() -> int:
         data={
             "text": args.text,
             "output_modalities": "audio",
-            "model_kwargs": json.dumps({"max_output_tokens": args.max_tokens}),
+            # ignore_eos=False => natural EOS (not forced-length). max_output_tokens
+            # is only a generous cap.
+            "model_kwargs": json.dumps(
+                {"max_output_tokens": args.max_tokens, "ignore_eos": False}
+            ),
         },
         stream=True,
     ) as resp:
@@ -72,8 +79,11 @@ def main() -> int:
         print("No audio received.", file=sys.stderr)
         return 1
     write_wav(pcm, args.output)
+    audio_s = len(pcm) / (SAMPLE_RATE * SAMPLE_WIDTH)
+    frames = len(pcm) // (SAMPLE_WIDTH * 512)  # 512 audio samples per frame
+    capped = " (HIT CAP — raise --max-tokens)" if frames >= args.max_tokens else ""
     print(f"Received {chunks} chunks, {len(pcm)} bytes, "
-          f"{len(pcm) / (SAMPLE_RATE * SAMPLE_WIDTH):.2f}s -> {args.output}")
+          f"{audio_s:.2f}s (~{frames} frames){capped} -> {args.output}")
     return 0
 
 
