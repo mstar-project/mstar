@@ -2254,7 +2254,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if "new_token" not in outputs:
+        if "new_token" not in outputs or request_info.graph_walk != "thinker_decode":
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.sampling_config["Thinker"].ignore_eos
