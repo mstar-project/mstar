@@ -201,6 +201,7 @@ ignore = [
     "PLR0911", # Too many return statements
     "PLR0912", # Too many branches
     "PLR0913", # Too many arguments in function definition
+    "PLR0917", # Too many positional arguments
     "PLR0915", # Too many statements
     "PLR2004", # Magic value used in comparison
     "PLW0603", # Using the global statement
@@ -212,6 +213,12 @@ ignore = [
 "mstar/graph/graph_io.py" = ["F403", "F405"]
 # Imports are deliberately placed after a module-level pytest.skip().
 "test/modular/test_phase1.py" = ["E402"]
+# CPU parity tests: imports follow a module-level pytest.importorskip("torch").
+"test/modular/test_merged_prefill_audio_autogate.py" = ["E402"]
+"test/modular/test_mixed_chunk_grid.py" = ["E402"]
+"test/modular/test_qwen3_omni_chunked_prefill_v2.py" = ["E402"]
+"test/modular/test_qwen3_omni_merged_prefill.py" = ["E402"]
+"test/modular/test_qwen3_omni_mixed_batch_vision.py" = ["E402"]
 
 [tool.ruff.format]
 quote-style = "double"

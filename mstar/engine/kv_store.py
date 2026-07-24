@@ -522,10 +522,17 @@ class PagedAllocationManager:
         return state
 
     def get_state(self, request_id: str, label: str):
-        if label not in self.request_states[request_id]:
-
-            self.request_states[request_id][label] = self._new_state()
-        return self.request_states[request_id][label]
+        # Guard the lazy per-label insert: with MSTAR_SIDE_PREFILL a side
+        # prefill batch plans on a second executor thread while the main GPU
+        # thread is planning decode, so two threads can hit this
+        # check-then-insert concurrently for different (request_id, label)
+        # keys sharing the same request_states[request_id] dict. The RLock
+        # (re-entrant so nested guarded calls like alloc() don't deadlock)
+        # makes the insert atomic.
+        with self._lock:
+            if label not in self.request_states[request_id]:
+                self.request_states[request_id][label] = self._new_state()
+            return self.request_states[request_id][label]
 
     def alloc(
         self, request_id: str, label: str, seq_len: int
