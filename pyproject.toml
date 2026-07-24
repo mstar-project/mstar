@@ -30,7 +30,7 @@ mstar-serve = "mstar.api_server.entrypoint:main"
 
 [project.optional-dependencies]
 dev = [
-    "ruff",
+    "ruff<=0.16",
     "pytest",
 ]
 
@@ -205,6 +205,7 @@ ignore = [
     "PLR2004", # Magic value used in comparison
     "PLW0603", # Using the global statement
     "PLW2901", # Loop variable overwritten by assignment target
+    "PLR0917", # Too many positional arguments
 ]
 
 [tool.ruff.lint.per-file-ignores]
