@@ -248,13 +248,20 @@ Verify the install
    mstar --help
    mstar-serve --help
 
-Optional: the Rust ZMQ transport
---------------------------------
+Optional: Rust support
+----------------------
 
-The ZeroMQ control mesh can run over a Rust transport (vendored in ``rust/``)
-instead of pyzmq — same endpoints, same wire format, selectable per process
-with ``MSTAR_RUST_ZMQ`` (see :doc:`environment_variables`). It is optional:
-without it, everything runs on pyzmq as before.
+Parts of the runtime can run on Rust components (vendored in ``rust/``),
+each optional and selectable per process — without the extension everything
+runs on the pure-Python paths as before. Migrated so far (see
+:doc:`environment_variables` for the flags):
+
+* **ZeroMQ control mesh** — ``MSTAR_RUST_ZMQ``: same endpoints, same wire
+  format as pyzmq.
+* **SHM tensor arena** — ``MSTAR_SHM_ARENA``: replaces the per-tensor file
+  transport; requires the extension, interoperates on the same descriptor
+  wire (and depends on the transport above only in the sense that both ship
+  in the same extension).
 
 Build the extension into your environment with `maturin
 <https://www.maturin.rs>`_ (needs a Rust toolchain; ``rustup`` works):

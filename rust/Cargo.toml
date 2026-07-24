@@ -6,12 +6,14 @@ license = "Apache-2.0"
 
 [lib]
 name = "mstar_rust"
-# cdylib: the Python extension module. rlib: the same crate as a Rust
-# library, so the migration's later steps (Rust conductor / API server)
-# consume the typed `ZmqCommunicator<M, C>` layer directly.
+# cdylib: the Python extension module. rlib: the same code as a plain Rust
+# library, so other Rust components (servers, services, tools) can consume
+# any of this crate's modules directly — typed messaging today, and
+# whatever the crate grows to hold — without going through Python.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1.3"
 thiserror = "2"
