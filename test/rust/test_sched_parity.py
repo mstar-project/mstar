@@ -70,7 +70,7 @@ class _World:
             get_partition_for_node=lambda n: "p0",
             get_graph_walk=lambda rid, part: self.ready[rid][1],
             get_fwd_info=lambda rid, part: None,
-            get_worker_graph_id_for_node=lambda rid, node: "wg0",
+            get_worker_graph_id_for_node=lambda rid, node, graph_walk=None: "wg0",
         )
         em = SimpleNamespace(
             node_to_engine=self.engines,
