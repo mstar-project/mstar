@@ -29,6 +29,12 @@ class TensorPointerInfo:
     source_tp_size: int = 1
     source_tp_rank: int = 0
 
+    # SHM-arena transport (MSTAR_SHM_ARENA): the producer wrote this tensor's
+    # bytes at `shm_offset` inside the named arena segment. None for the
+    # other transports (per-uuid files, Mooncake).
+    shm_segment: str | None = None
+    shm_offset: int = 0
+
     _source_node_name: str | None = None
     _source_graph_walk: str | None = None
 
@@ -45,6 +51,8 @@ class TensorPointerInfo:
             offset=self.offset,
             source_tp_size=self.source_tp_size,
             source_tp_rank=self.source_tp_rank,
+            shm_segment=self.shm_segment,
+            shm_offset=self.shm_offset,
             _source_node_name=self._source_node_name,
             _source_graph_walk=self._source_graph_walk
         )
