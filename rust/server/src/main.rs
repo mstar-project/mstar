@@ -35,8 +35,8 @@ use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Multipart, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, FromRequest, Multipart, State},
+    http::{header::CONTENT_TYPE, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -619,7 +619,7 @@ fn images_response(chunks: Vec<ResultChunk>) -> Value {
 
 // ---- POST /generate (native multipart -> NDJSON) -------------------------
 
-async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
+async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Response {
     let mut text: Option<String> = None;
     let mut in_mods_raw: Option<String> = None;
     let mut out_mods_raw = "text".to_string();
@@ -628,6 +628,60 @@ async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
     let mut mk_raw: Option<String> = None;
     let mut request_id: Option<String> = None;
     let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    // The FastAPI endpoint this replaces uses `Form(...)` fields, which
+    // Starlette parses from EITHER `multipart/form-data` (with file uploads)
+    // OR `application/x-www-form-urlencoded` (what `requests.post(data=...)`
+    // sends when there are no files). axum's `Multipart` extractor only
+    // accepts the former, so dispatch on Content-Type to keep parity.
+    let content_type = req
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        // No file uploads on this path (files force multipart), matching how
+        // these clients already behave.
+        let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+            Ok(b) => b,
+            Err(e) => {
+                return error(400, &format!("reading form body: {e}"),
+                             "invalid_request_error")
+            }
+        };
+        for (k, v) in form_urlencoded::parse(&body) {
+            match k.as_ref() {
+                "text" => text = Some(v.into_owned()),
+                "input_modalities" => in_mods_raw = Some(v.into_owned()),
+                "output_modalities" => out_mods_raw = v.into_owned(),
+                "streaming" => streaming = matches!(v.as_ref(), "true" | "True" | "1"),
+                "tokenize" => tokenize = matches!(v.as_ref(), "true" | "True" | "1"),
+                "model_kwargs" => mk_raw = Some(v.into_owned()),
+                "request_id" => request_id = Some(v.into_owned()),
+                _ => {}
+            }
+        }
+        return generate_finish(
+            st, text, in_mods_raw, out_mods_raw, streaming, tokenize, mk_raw,
+            request_id, file_paths,
+        )
+        .await;
+    }
+    if !content_type.starts_with("multipart/form-data") {
+        return error(
+            400,
+            &format!(
+                "unsupported Content-Type for /generate: {content_type:?}                  (expected multipart/form-data or                  application/x-www-form-urlencoded)"
+            ),
+            "invalid_request_error",
+        );
+    }
+    let mut mp = match Multipart::from_request(req, &st).await {
+        Ok(m) => m,
+        Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+    };
 
     loop {
         let field = match mp.next_field().await {
@@ -684,6 +738,27 @@ async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
         }
     }
 
+    generate_finish(
+        st, text, in_mods_raw, out_mods_raw, streaming, tokenize, mk_raw,
+        request_id, file_paths,
+    )
+    .await
+}
+
+/// Shared tail of `/generate` once the form fields are parsed (from either
+/// multipart or urlencoded): build the request and stream NDJSON.
+#[allow(clippy::too_many_arguments)]
+async fn generate_finish(
+    st: AppState,
+    mut text: Option<String>,
+    in_mods_raw: Option<String>,
+    out_mods_raw: String,
+    streaming: bool,
+    tokenize: bool,
+    mk_raw: Option<String>,
+    request_id: Option<String>,
+    file_paths: BTreeMap<String, Vec<String>>,
+) -> Response {
     let output_modalities: Vec<String> = out_mods_raw
         .split(',')
         .map(str::trim)

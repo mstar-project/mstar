@@ -203,3 +203,39 @@ def test_upload_filename_traversal_is_contained(tmp_path):
     resolved = os.path.realpath(path)
     assert resolved.startswith(os.path.realpath(str(tmp_path)) + os.sep), path
     assert ".." not in os.path.basename(path)
+
+
+def _generate(port, urlencoded: bool, timeout=30):
+    """POST /generate with either content type; returns (status, ndjson)."""
+    import urllib.parse
+
+    fields = {"text": "hi", "output_modalities": "text",
+              "streaming": "false", "model_kwargs": '{"foo": 1}'}
+    if urlencoded:
+        data = urllib.parse.urlencode(fields).encode()
+        ctype = "application/x-www-form-urlencoded"
+    else:
+        boundary = "----genboundary"
+        data = ("".join(
+            f"--{boundary}\r\nContent-Disposition: form-data; "
+            f'name="{k}"\r\n\r\n{v}\r\n' for k, v in fields.items())
+            + f"--{boundary}--\r\n").encode()
+        ctype = f"multipart/form-data; boundary={boundary}"
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/generate",
+                                 data=data, headers={"Content-Type": ctype})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read()
+
+
+def test_generate_accepts_both_content_types(stack):
+    """The FastAPI /generate accepts multipart AND urlencoded form bodies
+    (the latter is what `requests.post(data=...)` sends with no files); the
+    Rust handler must too, or file-less clients regress to 400."""
+    port, stub, _bridge, _proc = stack
+    for urlencoded in (False, True):
+        status, _ = _generate(port, urlencoded)
+        assert status == 200, ("urlencoded" if urlencoded else "multipart")
+    # both landed as real submits with the text + model_kwargs parsed
+    texts = [s["text"] for s in stub.submitted]
+    assert texts.count("hi") == 2, stub.submitted
+    assert all(s["mk"] == {"foo": 1} for s in stub.submitted)
