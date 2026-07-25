@@ -908,13 +908,16 @@ class DROIDDataset(BaseDataset):
         step    = max(1, len(local_indices) // n_video)
         video_local_indices = local_indices[::step][:n_video]
 
-        chunk_video = download_fn(
-            self._chunk_video_path(ep_id, camera_keys[0], chunks_size)
-        )
         mp4_path = os.path.join(self.local_file_dir, f"ep{ep_id}.mp4")
-        _decode_frames_to_png_and_video(
-            chunk_video, video_local_indices, png_path=None, mp4_path=mp4_path
-        )
+        # Reuse an existing clip: mp4 encoding is not byte-deterministic, so
+        # re-extracting on every run feeds run-dependent bytes to the server.
+        if not os.path.exists(mp4_path):
+            chunk_video = download_fn(
+                self._chunk_video_path(ep_id, camera_keys[0], chunks_size)
+            )
+            _decode_frames_to_png_and_video(
+                chunk_video, video_local_indices, png_path=None, mp4_path=mp4_path
+            )
 
         actions = [_to_float_list(f.get(action_col), self.action_dim)
                    for f in frames[:n_actions]]
