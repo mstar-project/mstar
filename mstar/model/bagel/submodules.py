@@ -509,6 +509,7 @@ class LLMSubmodule(ARNodeSubmodule):
         image_gen / decode+cfg captures are unaffected (they don't depend
         on this capture's snapshot semantics).
         """
+
         dummy = ARNodeInputs(
             input_ids=torch.zeros(1, dtype=torch.long, device=device),
             input_seq_len=1
@@ -542,17 +543,30 @@ class LLMSubmodule(ARNodeSubmodule):
         self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
     ) -> list[str] | None:
         cfg = any([info.requires_cfg for info in per_request_info.values()])
-        return self._get_active_labels(graph_walk, cfg)
+        use_cfg_img = self._batch_use_cfg_img(per_request_info)
+        return self._get_active_labels(graph_walk, cfg, use_cfg_img)
 
     def _get_active_labels(
-        self, graph_walk: str, cfg: bool
+        self, graph_walk: str, cfg: bool, use_cfg_img: bool = True
     ):
         if graph_walk in {"prefill_text", "decode"}:
             if cfg:
+                # NOTE: when cfg_img_scale <= 1 (use_cfg_img False) the cfg_img
+                # cache is unused end-to-end — image_gen already drops it — so
+                # populating it here is redundant work. We keep the whole-forward
+                # cuda-graph path for now, which bakes [main, cfg_img] into one
+                # capture and can't skip a branch at replay. Migrating the text
+                # phase to the piecewise runner (main + cfg_img as separately
+                # captured graphs, invoked conditionally) would let this drop to
+                # [main] when use_cfg_img is False.
                 return ["main", "cfg_img"]
         elif graph_walk == "image_gen":
             if cfg:
-                return ["main", "cfg_text", "cfg_img"]
+                # Drop the cfg_img branch when image CFG is inactive
+                # (cfg_img_scale <= 1): v_cfg_img has zero weight in the
+                # velocity combine, so we run 2-branch CFG (main, cfg_text).
+                return ["main", "cfg_text", "cfg_img"] if use_cfg_img \
+                    else ["main", "cfg_text"]
         elif graph_walk == "image_gen_cfg":
             # Parallel CFG: each LLM node handles one label only
             return [self._NODE_TO_CFG_LABEL.get(self.node_name, "main")]
@@ -655,7 +669,8 @@ class LLMSubmodule(ARNodeSubmodule):
         requires_cfg = self._batch_get_requires_cfg(
             engine_inputs.per_request_info
         )
-        labels = self._get_active_labels(graph_walk, requires_cfg)
+        use_cfg_img = self._batch_use_cfg_img(engine_inputs.per_request_info)
+        labels = self._get_active_labels(graph_walk, requires_cfg, use_cfg_img)
         seq_lens = [inp.input_seq_len for inp in inputs]
         per_label_custom_pos_ids = {
             label: [
@@ -671,8 +686,10 @@ class LLMSubmodule(ARNodeSubmodule):
             assert len(inputs) == 1 , "Batching not supported for image gen"
 
         if graph_walk == "image_gen" and requires_cfg:
-            # Batched CFG: plan a single FlashInfer batch across all 3 labels
-            # so that image_gen can run one forward pass instead of 3.
+            # Batched CFG: plan a single FlashInfer batch across all active
+            # labels so image_gen runs one forward pass instead of one per
+            # branch. ``labels`` is 3 (main, cfg_text, cfg_img) normally, or 2
+            # (main, cfg_text) when cfg_img_scale <= 1 for the batch.
             cache_manager.plan_attention_batched_cfg(
                 labels=labels,
                 seq_lens=seq_lens,
@@ -1004,6 +1021,14 @@ class LLMSubmodule(ARNodeSubmodule):
             cfg_img_scale = kwargs.pop("cfg_img_scale", self.config.cfg_img_scale)
             renorm_type = kwargs.pop("cfg_renorm_type", self.config.cfg_renorm_type)
 
+            # cfg_img_scale <= 1 zeroes the v_cfg_img term below, so drop the
+            # cfg_img branch entirely (2-branch CFG). Must match the label set
+            # planned in preprocess (``_batch_use_cfg_img``); image_gen is
+            # single-request, so the per-request scale and the batch decision
+            # coincide.
+            use_cfg_img = cfg_img_scale > 1.0
+            n_branches = 3 if use_cfg_img else 2
+
             # CFG interval: only apply guidance when timestep is within interval
             cfg_interval = kwargs.pop("cfg_interval", self.config.cfg_interval)
             cfg_lo, cfg_hi = cfg_interval
@@ -1014,20 +1039,22 @@ class LLMSubmodule(ARNodeSubmodule):
             effective_text_scale = cfg_text_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
             effective_img_scale = cfg_img_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
 
-            # Batched CFG: run all 3 branches in a single LLM forward.
+            # Batched CFG: run all active branches in a single LLM forward.
             # plan_attention_batched_cfg created a single FlashInfer plan
-            # treating (main, cfg_text, cfg_img) as 3 "virtual requests".
+            # treating each (label, request) as a "virtual request" — 3 branches
+            # (main, cfg_text, cfg_img) normally, or 2 (main, cfg_text) when
+            # cfg_img is dropped.
             S = empty_combined_emb.shape[0]
-            batched_emb = empty_combined_emb.repeat(3, 1)  # [3S, hidden]
+            batched_emb = empty_combined_emb.repeat(n_branches, 1)  # [n_branches*S, hidden]
 
             # Expand MoT indexes with absolute offsets for each copy
             batched_text_indexes = torch.cat([
-                text_indexes + i * S for i in range(3)
+                text_indexes + i * S for i in range(n_branches)
             ])
             batched_vae_indexes = torch.cat([
-                vae_token_indexes + i * S for i in range(3)
+                vae_token_indexes + i * S for i in range(n_branches)
             ])
-            batched_text_mask = text_mask.repeat(3)
+            batched_text_mask = text_mask.repeat(n_branches)
 
             cache_handle.set_active_label("_cfg_batched")
             hidden = self.language_model(
@@ -1039,10 +1066,10 @@ class LLMSubmodule(ARNodeSubmodule):
                 **kwargs,
             )
 
-            # Split output back to 3 branches and project to VAE space
+            # Split output back to per-branch velocities and project to VAE space
             v_main = self.llm2vae(hidden[:S])[1:-1]
             v_cfg_text = self.llm2vae(hidden[S:2*S])[1:-1]
-            v_cfg_img = self.llm2vae(hidden[2*S:])[1:-1]
+            v_cfg_img = self.llm2vae(hidden[2*S:])[1:-1] if use_cfg_img else None
 
             # Two-node CFG velocity combination + renormalization
             cfg_renorm_min = kwargs.pop("cfg_renorm_min", self.config.cfg_renorm_min)
@@ -1054,14 +1081,14 @@ class LLMSubmodule(ARNodeSubmodule):
                 norm_v_text = torch.norm(v_text_guided, dim=-1, keepdim=True)
                 scale = (norm_v / (norm_v_text + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
                 v_text_renormed = v_text_guided * scale
-                if effective_img_scale > 1.0:
+                if use_cfg_img and effective_img_scale > 1.0:
                     v_final = v_cfg_img + effective_img_scale * (v_text_renormed - v_cfg_img)
                 else:
                     v_final = v_text_renormed
             else:
                 # global / channel: apply both text+image CFG, THEN renorm
                 v_text_guided = v_cfg_text + effective_text_scale * (v_main - v_cfg_text)
-                if effective_img_scale > 1.0:
+                if use_cfg_img and effective_img_scale > 1.0:
                     v_combined = v_cfg_img + effective_img_scale * (v_text_guided - v_cfg_img)
                 else:
                     v_combined = v_text_guided
@@ -1178,6 +1205,20 @@ class LLMSubmodule(ARNodeSubmodule):
     def _batch_get_requires_cfg(self, per_request_info: dict[str, CurrentForwardPassInfo]):
         return any(
             info.requires_cfg
+            for info in per_request_info.values()
+        )
+
+    def _batch_use_cfg_img(self, per_request_info: dict[str, CurrentForwardPassInfo]):
+        """Whole-batch: does any cfg request actually use image CFG?
+
+        cfg_img_scale <= 1 zeroes the v_cfg_img term in the velocity combine,
+        so the cfg_img branch/cache can be dropped for the whole batch.
+        """
+        return any(
+            info.requires_cfg
+            and info.step_metadata.get(
+                "cfg_img_scale", self.config.cfg_img_scale
+            ) > 1.0
             for info in per_request_info.values()
         )
 
