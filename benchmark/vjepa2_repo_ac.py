@@ -60,6 +60,7 @@ import statistics
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -220,10 +221,11 @@ def parse_args() -> argparse.Namespace:
                    default=os.environ.get("VJEPA2_REPO", str(Path.home() / "vjepa2")),
                    help="Path to the upstream vjepa2 repo clone (default $VJEPA2_REPO or ~/vjepa2).")
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--dtype", default="bfloat16",
+    p.add_argument("--dtype", default="float32",
                    choices=["bfloat16", "float16", "float32"],
-                   help="Inference dtype. Upstream notebook defaults to fp32; "
-                        "we default to bf16 to match deployment.")
+                   help="Inference dtype. float32 matches the upstream "
+                        "notebook; bfloat16/float16 cast the weights and run "
+                        "under torch.autocast, matching serving deployments.")
     p.add_argument("--output-dir", default="/tmp/vjepa2_repo_ac")
     p.add_argument("--local-cache", default="./mstar-benchmark-cache/",
                    help="Same default as runner.py so DROIDDataset reuses extracted clips.")
@@ -296,6 +298,17 @@ def main() -> None:
     )
     encoder = encoder.to(args.device).eval()
     predictor = predictor.to(args.device).eval()
+
+    model_dtype = getattr(torch, args.dtype)
+    if model_dtype is not torch.float32:
+        encoder = encoder.to(model_dtype)
+        predictor = predictor.to(model_dtype)
+
+    def amp_ctx():
+        if model_dtype is torch.float32:
+            return nullcontext()
+        return torch.autocast("cuda", dtype=model_dtype)
+
     tokens_per_frame = int((CROP_SIZE // encoder.patch_size) ** 2)
     print(f"  loaded encoder + AC predictor ({time.perf_counter() - t0:.1f}s)")
     print(f"  tokens_per_frame = {tokens_per_frame}")
@@ -418,35 +431,37 @@ def main() -> None:
 
     def _run_rollout(clip_t, actions_t, states_t):
         """Cell 6 verbatim: h = forward_target(clips) → rollout body from Cell 5."""
-        h = forward_target(clip_t)
-        z_hat = h[:, :tokens_per_frame]      # 1 frame of context (notebook convention)
-        s_hat = states_t[:, :1]
-        a_hat = actions_t[:, :1]
-        preds = []
-        for n in range(args.rollout_horizon):
-            _z, _s = step_predictor(z_hat, a_hat, s_hat)
-            z_hat = torch.cat([z_hat, _z], dim=1)
-            s_hat = torch.cat([s_hat, _s], dim=1)
-            preds.append(_z)
-            if n + 1 < args.rollout_horizon:
-                a_hat = torch.cat([a_hat, actions_t[:, n + 1:n + 2]], dim=1)
+        with amp_ctx():
+            h = forward_target(clip_t)
+            z_hat = h[:, :tokens_per_frame]  # 1 frame of context (notebook convention)
+            s_hat = states_t[:, :1]
+            a_hat = actions_t[:, :1]
+            preds = []
+            for n in range(args.rollout_horizon):
+                _z, _s = step_predictor(z_hat, a_hat, s_hat)
+                z_hat = torch.cat([z_hat, _z], dim=1)
+                s_hat = torch.cat([s_hat, _s], dim=1)
+                preds.append(_z)
+                if n + 1 < args.rollout_horizon:
+                    a_hat = torch.cat([a_hat, actions_t[:, n + 1:n + 2]], dim=1)
         return h, preds
     # === END VERBATIM COPY ===
 
     def _run_rollout_kv(clip_t, actions_t, states_t):
         """KV-cache variant of _run_rollout: prefill once, then one step per iteration."""
-        h = forward_target(clip_t)
-        z_new = h[:, :tokens_per_frame]
-        s_cur = states_t[:, :1]
-        a_cur = actions_t[:, :1]
-        kv_cache = predictor.init_kv_cache()
-        preds = []
-        for n in range(args.rollout_horizon):
-            _z, _s = step_predictor_kv(z_new, a_cur, s_cur, kv_cache)
-            preds.append(_z)
-            z_new, s_cur = _z, _s
-            if n + 1 < args.rollout_horizon:
-                a_cur = actions_t[:, n + 1:n + 2]
+        with amp_ctx():
+            h = forward_target(clip_t)
+            z_new = h[:, :tokens_per_frame]
+            s_cur = states_t[:, :1]
+            a_cur = actions_t[:, :1]
+            kv_cache = predictor.init_kv_cache()
+            preds = []
+            for n in range(args.rollout_horizon):
+                _z, _s = step_predictor_kv(z_new, a_cur, s_cur, kv_cache)
+                preds.append(_z)
+                z_new, s_cur = _z, _s
+                if n + 1 < args.rollout_horizon:
+                    a_cur = actions_t[:, n + 1:n + 2]
         return h, preds
 
     # ------------------------------------------------------------------
@@ -477,39 +492,41 @@ def main() -> None:
             clip_t, actions_t, states_t = _prepare_request_inputs(req)
 
             t0 = time.perf_counter()
-            h = forward_target(clip_t)
+            with amp_ctx():
+                h = forward_target(clip_t)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_enc_done = time.perf_counter()
 
-            if args.kv_cache:
-                # KV-cache rollout body (mirrors _run_rollout_kv), inlined for
-                # timing precision. Same work granularity as the default path:
-                # one predictor call per rollout iteration.
-                z_new = h[:, :tokens_per_frame]
-                s_cur = states_t[:, :1]
-                a_cur = actions_t[:, :1]
-                kv_cache = predictor.init_kv_cache()
-                preds = []
-                for n in range(args.rollout_horizon):
-                    _z, _s = step_predictor_kv(z_new, a_cur, s_cur, kv_cache)
-                    preds.append(_z)
-                    z_new, s_cur = _z, _s
-                    if n + 1 < args.rollout_horizon:
-                        a_cur = actions_t[:, n + 1:n + 2]
-            else:
-                # Cell 5 `forward_actions` rollout body, inlined for timing precision.
-                z_hat = h[:, :tokens_per_frame]
-                s_hat = states_t[:, :1]
-                a_hat = actions_t[:, :1]
-                preds = []
-                for n in range(args.rollout_horizon):
-                    _z, _s = step_predictor(z_hat, a_hat, s_hat)
-                    z_hat = torch.cat([z_hat, _z], dim=1)
-                    s_hat = torch.cat([s_hat, _s], dim=1)
-                    preds.append(_z)
-                    if n + 1 < args.rollout_horizon:
-                        a_hat = torch.cat([a_hat, actions_t[:, n + 1:n + 2]], dim=1)
+            with amp_ctx():
+                if args.kv_cache:
+                    # KV-cache rollout body (mirrors _run_rollout_kv), inlined for
+                    # timing precision. Same work granularity as the default path:
+                    # one predictor call per rollout iteration.
+                    z_new = h[:, :tokens_per_frame]
+                    s_cur = states_t[:, :1]
+                    a_cur = actions_t[:, :1]
+                    kv_cache = predictor.init_kv_cache()
+                    preds = []
+                    for n in range(args.rollout_horizon):
+                        _z, _s = step_predictor_kv(z_new, a_cur, s_cur, kv_cache)
+                        preds.append(_z)
+                        z_new, s_cur = _z, _s
+                        if n + 1 < args.rollout_horizon:
+                            a_cur = actions_t[:, n + 1:n + 2]
+                else:
+                    # Cell 5 `forward_actions` rollout body, inlined for timing precision.
+                    z_hat = h[:, :tokens_per_frame]
+                    s_hat = states_t[:, :1]
+                    a_hat = actions_t[:, :1]
+                    preds = []
+                    for n in range(args.rollout_horizon):
+                        _z, _s = step_predictor(z_hat, a_hat, s_hat)
+                        z_hat = torch.cat([z_hat, _z], dim=1)
+                        s_hat = torch.cat([s_hat, _s], dim=1)
+                        preds.append(_z)
+                        if n + 1 < args.rollout_horizon:
+                            a_hat = torch.cat([a_hat, actions_t[:, n + 1:n + 2]], dim=1)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_done = time.perf_counter()
