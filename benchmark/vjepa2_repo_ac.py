@@ -111,6 +111,7 @@ class BenchmarkResult:
     completed: int = 0
     failed: int = 0
     rollout_horizon: int = 4
+    kv_cache: bool = False
     # JCT (E2E latency, externally timed) stats (ms)
     jct_mean_ms: float = 0.0
     jct_median_ms: float = 0.0
@@ -230,6 +231,11 @@ def parse_args() -> argparse.Namespace:
                    help="HuggingFace cache directory for lerobot/droid_100.")
     p.add_argument("--normalize-reps", type=int, default=1,
                    help="Apply LayerNorm after each predictor output (matches notebook Cell 5).")
+    p.add_argument("--kv-cache", action="store_true",
+                   help="Roll out with the AC predictor's inference KV cache "
+                        "(prefill once, then one incremental step per iteration) "
+                        "instead of re-running the full growing sequence each "
+                        "step. Same outputs/filenames as the default path.")
     p.add_argument("--upstream-commit", default=None,
                    help="Optional: git SHA of the vjepa2 repo at run time. "
                         "Logged into results.json for paper provenance.")
@@ -277,6 +283,7 @@ def main() -> None:
     print(f"  num_warmup   : {args.num_warmup}")
     print(f"  rollout_H    : {args.rollout_horizon}")
     print(f"  num_frames   : {args.num_frames}  (encoder workload per request)")
+    print(f"  kv_cache     : {bool(args.kv_cache)}")
 
     # ------------------------------------------------------------------
     # Model + transform load (mirrors notebook Cell 2)
@@ -334,6 +341,23 @@ def main() -> None:
         _s = compute_new_pose(_s[:, -1:], _a[:, -1:])
         return _z, _s
     # === END VERBATIM COPY ===
+
+    # =========================================================================
+    # KV-cache variant of the Cell 5 rollout above (enabled with --kv-cache).
+    # Same math as `step_predictor`: the predictor's `forward_cached` appends
+    # each layer's post-RoPE K/V for the new frame's [action, state, tokens]
+    # and attends the new queries over the whole cache, so per-step outputs
+    # match the full-sequence forward that recomputes every frame. The first
+    # call prefills the cache with the context frame. Inputs hold only the
+    # newest frame, so no growing-history concatenation is needed.
+    # =========================================================================
+    @torch.inference_mode()
+    def step_predictor_kv(_z, _a, _s, _cache):
+        _z = predictor.forward_cached(_z, _a, _s, _cache)
+        if normalize_reps:
+            _z = F.layer_norm(_z, (_z.size(-1),))
+        _s = compute_new_pose(_s, _a)
+        return _z, _s
 
     # ------------------------------------------------------------------
     # Dataset (same DROIDDataset as our HTTP harness)
@@ -409,6 +433,22 @@ def main() -> None:
         return h, preds
     # === END VERBATIM COPY ===
 
+    def _run_rollout_kv(clip_t, actions_t, states_t):
+        """KV-cache variant of _run_rollout: prefill once, then one step per iteration."""
+        h = forward_target(clip_t)
+        z_new = h[:, :tokens_per_frame]
+        s_cur = states_t[:, :1]
+        a_cur = actions_t[:, :1]
+        kv_cache = predictor.init_kv_cache()
+        preds = []
+        for n in range(args.rollout_horizon):
+            _z, _s = step_predictor_kv(z_new, a_cur, s_cur, kv_cache)
+            preds.append(_z)
+            z_new, s_cur = _z, _s
+            if n + 1 < args.rollout_horizon:
+                a_cur = actions_t[:, n + 1:n + 2]
+        return h, preds
+
     # ------------------------------------------------------------------
     # Warmup
     # ------------------------------------------------------------------
@@ -416,7 +456,10 @@ def main() -> None:
     if args.num_warmup > 0 and requests:
         for _ in range(args.num_warmup):
             clip_t, actions_t, states_t = _prepare_request_inputs(requests[0])
-            _run_rollout(clip_t, actions_t, states_t)
+            if args.kv_cache:
+                _run_rollout_kv(clip_t, actions_t, states_t)
+            else:
+                _run_rollout(clip_t, actions_t, states_t)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     print("  done")
@@ -439,18 +482,34 @@ def main() -> None:
                 torch.cuda.synchronize()
             t_enc_done = time.perf_counter()
 
-            # Cell 5 `forward_actions` rollout body, inlined for timing precision.
-            z_hat = h[:, :tokens_per_frame]
-            s_hat = states_t[:, :1]
-            a_hat = actions_t[:, :1]
-            preds = []
-            for n in range(args.rollout_horizon):
-                _z, _s = step_predictor(z_hat, a_hat, s_hat)
-                z_hat = torch.cat([z_hat, _z], dim=1)
-                s_hat = torch.cat([s_hat, _s], dim=1)
-                preds.append(_z)
-                if n + 1 < args.rollout_horizon:
-                    a_hat = torch.cat([a_hat, actions_t[:, n + 1:n + 2]], dim=1)
+            if args.kv_cache:
+                # KV-cache rollout body (mirrors _run_rollout_kv), inlined for
+                # timing precision. Same work granularity as the default path:
+                # one predictor call per rollout iteration.
+                z_new = h[:, :tokens_per_frame]
+                s_cur = states_t[:, :1]
+                a_cur = actions_t[:, :1]
+                kv_cache = predictor.init_kv_cache()
+                preds = []
+                for n in range(args.rollout_horizon):
+                    _z, _s = step_predictor_kv(z_new, a_cur, s_cur, kv_cache)
+                    preds.append(_z)
+                    z_new, s_cur = _z, _s
+                    if n + 1 < args.rollout_horizon:
+                        a_cur = actions_t[:, n + 1:n + 2]
+            else:
+                # Cell 5 `forward_actions` rollout body, inlined for timing precision.
+                z_hat = h[:, :tokens_per_frame]
+                s_hat = states_t[:, :1]
+                a_hat = actions_t[:, :1]
+                preds = []
+                for n in range(args.rollout_horizon):
+                    _z, _s = step_predictor(z_hat, a_hat, s_hat)
+                    z_hat = torch.cat([z_hat, _z], dim=1)
+                    s_hat = torch.cat([s_hat, _s], dim=1)
+                    preds.append(_z)
+                    if n + 1 < args.rollout_horizon:
+                        a_hat = torch.cat([a_hat, actions_t[:, n + 1:n + 2]], dim=1)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_done = time.perf_counter()
@@ -492,6 +551,7 @@ def main() -> None:
         completed=len(per_request),
         failed=failed,
         rollout_horizon=args.rollout_horizon,
+        kv_cache=bool(args.kv_cache),
         per_request=per_request,
     )
     if jcts:
