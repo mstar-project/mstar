@@ -64,14 +64,27 @@ def build_paged_indptrs(
 
 class PlanCacheKey(NamedTuple):
     """Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged
-    between steps the re-plan is skippable. Used by cross-attention (context
-    pages are immutable after encode); the mechanism is label-generic, so a
-    fixed-shape self-attention label could reuse it (see the field on
-    ``_PlanState``)."""
+    between steps the re-plan is skippable.
+
+    Used by both cross-attention (context pages are immutable after encode)
+    and self-attention. For self-attention the memo only pays off on walks
+    that re-plan an unchanged sequence every step — diffusion/flow denoise,
+    where the KV is frozen and only the latents change; a decode step
+    appends a token, which moves ``context_lens`` (and, on a page boundary,
+    ``page_indices``) and so always misses.
+
+    ``context_lens`` is the post-append KV length per request, so a grown
+    sequence misses even if the advance-time invalidation
+    (``_invalidate_plan_memo``) were somehow bypassed; ``page_indices``
+    covers page-table remaps (eviction / reallocation / offload-reload),
+    which move no sequence length at all.
+    """
     q_seq_lens: tuple
     page_indices: tuple
     last_page_lens: tuple
     dtype: torch.dtype
+    is_causal: bool
+    context_lens: tuple
 
 
 @dataclass
@@ -104,20 +117,29 @@ class _PlanState:
     write_store: bool = True
     custom_pos_advance: list[int] | None = None
     # Plan memo: fingerprint of the last wrapper.plan() inputs for this label;
-    # when it matches, the re-plan is skipped. Only the cross-attention path
-    # sets it today (its context pages are immutable after add_cross_attn_kv),
-    # and only where plan states persist across steps (the CUDA-graph runner);
-    # the eager path rebuilds the cache manager per step and still re-plans.
+    # when it matches, the re-plan is skipped. Set by every plan path
+    # (self-attention, batched CFG, cross-attention). Only useful where plan
+    # states persist across steps: the CUDA-graph runner's static managers, and
+    # the eager managers KVCacheEngine keeps alive across batches with the same
+    # request ids (see KVManagement.last_cache_manager) — without that reuse
+    # the manager is rebuilt per step and the memo is always cold.
     #
-    # Future reference — this is a general-purpose tool, not cross-attn only.
-    # A regular (self-attention) label can memo its plan too; the extra care
-    # there is invalidation, since self-attn pages grow every decode step.
-    # The fingerprint would need to include the per-request seq_len (so appending
-    # a token misses the memo and re-plans), and any page-table remap (eviction /
-    # reallocation) must also bust the key. Given that, decode could skip the
-    # re-plan on the common "seq_len += 1, same pages" step. Deferred until a
-    # model needs it; the eager-path persistence noted above is the prerequisite.
+    # Invalidation is explicit: anything that moves a label's sequence
+    # (advance_seq_len/advance_seq_lens, snapshot_all) drops the memo for that
+    # label, so a stale plan can never be reused after the KV grows. The key's
+    # own fields (see PlanCacheKey) are the second line of defense — they also
+    # catch page-table remaps (eviction / reallocation / offload-reload) that
+    # change nothing about seq_len. Note the memo covers only
+    # ``wrapper.plan()`` — page allocation and the per-label bookkeeping
+    # (seq_lens / write_store / dense_gen) still run on every call.
     plan_cache_key: "PlanCacheKey | None" = None
+    # Whether ``wrapper`` is the decode-specialized wrapper. Tracked so a
+    # reused eager plan state whose walk switched between prefill and decode
+    # rebuilds the right kind instead of silently keeping the other one
+    # (correct either way, but the decode wrapper is much faster at seq_len=1).
+    # Never consulted in CUDA-graph mode: there the wrapper is the persistent
+    # one the graph was captured against and must not be swapped.
+    wrapper_is_decode: bool | None = None
     # Set when DenseGenCacheManager planned this label dense: the per-segment
     # gather indices + varlen cu_seqlens needed to attend each generation
     # segment over its contiguous frozen prefix. None on paged plans, which
@@ -144,6 +166,10 @@ class WorkspaceBufferManager:
 @dataclass
 class BatchedCfgInfo:
     per_label_seq_len: dict[str, list[int]]
+    # Label the combined plan state lives under. The per-label entries above
+    # own the KV; the wrapper plan (and its memo) is stored once under this
+    # key, so advancing has to invalidate here too.
+    combined_label: str = "_cfg_batched"
 
 
 class BatchedCacheManager(ABC):
@@ -233,6 +259,36 @@ class BatchedCacheManager(ABC):
         self._plan_done_event: "torch.cuda.Event | None" = None
 
         self._batched_cfg_info: BatchedCfgInfo | None = None
+
+    @torch.compiler.disable
+    def reset_for_new_batch(
+        self,
+        request_ids: list[str],
+        active_labels_per_request: dict[str, str],
+        auto_write_store: bool,
+    ) -> None:
+        """Re-arm this manager for another batch instead of building a new one.
+
+        Lets a caller keep a manager alive across batches so per-label plan
+        state survives — the FlashInfer wrappers and, more importantly, the
+        ``plan_cache_key`` memo, which is what makes a denoise loop's
+        identical re-plans free. Used by ``KVCacheEngine._create_cache_manager``
+        when the next batch has the same request ids.
+
+        Resets everything a freshly-constructed manager would start with,
+        including ``write_store`` on every existing plan state: a new manager
+        has no plan state at all for labels this batch doesn't plan, so
+        ``flush_to_store`` would skip them. Each plan call re-sets it for the
+        labels it does plan.
+        """
+        self.request_ids = request_ids
+        self.active_labels = active_labels_per_request
+        self.auto_write_store = auto_write_store
+        self.layer_idx = 0
+        self._batched_cfg_info = None
+        for ps in self._plan_states.values():
+            ps.write_store = False
+            ps.custom_pos_advance = None
 
     @torch.compiler.disable
     def _get_state(self, request_id: str, label: str | None = None) -> KVRequestState:
@@ -536,6 +592,20 @@ class BatchedCacheManager(ABC):
         return q.to(orig_dtype), k.to(orig_dtype)
 
     @torch.compiler.disable
+    def _invalidate_plan_memo(self, label: str) -> None:
+        """Drop ``label``'s plan memo so the next plan_attention re-plans.
+
+        Called wherever a label's KV sequence moves (advance / snapshot): the
+        memoized wrapper plan describes the pre-advance page table and last-page
+        lengths, so reusing it after an append would attend over the wrong
+        range. Cheap enough to call unconditionally — the memo is only a
+        latency optimization for walks that re-plan an unchanged sequence.
+        """
+        ps = self._plan_states.get(label)
+        if ps is not None:
+            ps.plan_cache_key = None
+
+    @torch.compiler.disable
     def advance_seq_len(self, n: int | None = None, pos_id_n: int | None = None) -> None:
         """Advance seq_len for all requests.
 
@@ -549,6 +619,7 @@ class BatchedCacheManager(ABC):
             state = self._get_state(rid)
             state.seq_len += n
             state.position_id_start += (pos_id_n if pos_id_n is not None else n)
+            self._invalidate_plan_memo(self.active_labels.get(rid, "main"))
 
     @torch.compiler.disable
     def set_custom_pos_advance(
@@ -596,7 +667,9 @@ class BatchedCacheManager(ABC):
         """
 
         if self._batched_cfg_info:
+            self._invalidate_plan_memo(self._batched_cfg_info.combined_label)
             for label, seq_lens in self._batched_cfg_info.per_label_seq_len.items():
+                self._invalidate_plan_memo(label)
                 for i, rid in enumerate(self.request_ids):
                     n = seq_lens[i]
                     state = self._get_state(rid, label=label)
@@ -612,6 +685,7 @@ class BatchedCacheManager(ABC):
                 label = self.active_labels[rid]
                 ps = self._plan_states[label]
                 n = ps.seq_lens[i]
+                ps.plan_cache_key = None
                 state = self._get_state(rid, label=label)
                 state.seq_len += n
                 if pos_id_ns is None:
@@ -636,6 +710,8 @@ class BatchedCacheManager(ABC):
         write_store: bool=True
     ) -> None:
         """Snapshot KV cache for all requests in batch."""
+        # to_label's sequence and (with realloc) its page table both move here.
+        self._invalidate_plan_memo(to_label)
         for rid in self.request_ids:
             from_state = self._get_state(rid, from_label)
 
@@ -780,6 +856,7 @@ class FlashInferCacheManager(BatchedCacheManager):
             all_page_indices = []
             kv_last_page_lens = []
             kv_cache_locations_list = []
+            context_lens = []
 
             for i, rid in enumerate(self.request_ids):
                 state = self._get_state(rid, effective_label)
@@ -796,11 +873,42 @@ class FlashInferCacheManager(BatchedCacheManager):
 
                 last_page_len = total_len % page_size or page_size
                 kv_last_page_lens.append(last_page_len)
+                context_lens.append(total_len)
                 if sl == 1:
                     kv_cache_locations_list.append([state.page_indices[-1], last_page_len - 1])
         finally:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
+
+        is_decode = all(sl == 1 for sl in seq_lens)
+        ps = self._plan_states.get(effective_label)
+
+        # Plan memo. A walk that re-plans an identical sequence every step
+        # (diffusion/flow denoise: the KV is frozen, only the latents change)
+        # gets the whole FlashInfer plan — its host-side scheduling plus the
+        # per-token page-map kernels — for free after the first step. Only the
+        # ``wrapper.plan()`` call is skipped; pages were allocated above and the
+        # per-label bookkeeping is still written below. Requires the manager to
+        # outlive the batch (CUDA-graph static managers, or the engine's reuse
+        # of an eager manager across same-request batches).
+        plan_key = PlanCacheKey(
+            q_seq_lens=tuple(seq_lens),
+            page_indices=tuple(all_page_indices),
+            last_page_lens=tuple(kv_last_page_lens),
+            dtype=dtype,
+            is_causal=is_causal,
+            context_lens=tuple(context_lens),
+        )
+        if (
+            ps is not None and ps.wrapper is not None
+            and ps.dense_gen is None and ps.plan_cache_key == plan_key
+        ):
+            ps.seq_lens = seq_lens
+            ps.write_store = write_store
+            if self.enable_nvtx:
+                range_push("cache.plan_attention.skipped_memo", synchronize=False)
+                range_pop(synchronize=False)
+            return
 
         # Build batched FlashInfer index tensors on CPU so wrapper.plan()
         # doesn't trigger a synchronous D→H inside its body. FlashInfer
@@ -831,12 +939,19 @@ class FlashInferCacheManager(BatchedCacheManager):
                 range_pop(synchronize=False)
 
 
-        is_decode = all([sl == 1 for sl in seq_lens])
-        ps = self._plan_states.get(effective_label)
+        # Keep the existing wrapper when there is one. In CUDA-graph mode that
+        # is mandatory — it's the persistent wrapper the graph was captured
+        # against. In eager mode the manager may now be reused across batches
+        # (KVManagement.last_cache_manager), so a label can switch between
+        # prefill and decode shapes; rebuild in that case rather than run
+        # decode on the prefill wrapper, which is correct but much slower.
+        wrapper = None
         if ps is not None and ps.wrapper is not None:
-            wrapper = ps.wrapper
-        elif is_decode:
-            wrapper = FlashInferDecodeWrapper(
+            if self._cuda_graph_mode or ps.wrapper_is_decode == is_decode:
+                wrapper = ps.wrapper
+        if wrapper is None:
+            wrapper_cls = FlashInferDecodeWrapper if is_decode else FlashInferPrefillWrapper
+            wrapper = wrapper_cls(
                 workspace_buffer=self.buffer_manager.get(effective_label),
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=num_kv_heads,
@@ -845,19 +960,12 @@ class FlashInferCacheManager(BatchedCacheManager):
                 device=self.device,
                 enable_nvtx=self.enable_nvtx,
             )
-            ps = _PlanState(wrapper=wrapper)
-            self._plan_states[effective_label] = ps
-        else:
-            wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=self.buffer_manager.get(effective_label),
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                page_size=page_size,
-                device=self.device,
-                enable_nvtx=self.enable_nvtx,
+            # Carries over pos_ids: plan_rope may already have run for this
+            # label, and dropping its buffer would strand apply_rope.
+            pos_ids = ps.pos_ids if ps is not None else None
+            ps = _PlanState(
+                wrapper=wrapper, pos_ids=pos_ids, wrapper_is_decode=is_decode,
             )
-            ps = _PlanState(wrapper=wrapper)
             self._plan_states[effective_label] = ps
 
         if self.enable_nvtx:
@@ -892,6 +1000,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         # A paged plan clears any prior dense plan (set by DenseGenCacheManager)
         # so run_attention routes this label back through the wrapper.
         ps.dense_gen = None
+        ps.plan_cache_key = plan_key
 
     @torch.compiler.disable
     def plan_attention_batched_cfg(
@@ -917,7 +1026,8 @@ class FlashInferCacheManager(BatchedCacheManager):
             }
 
         self._batched_cfg_info = BatchedCfgInfo(
-            per_label_seq_len=seq_lens
+            per_label_seq_len=seq_lens,
+            combined_label=combined_label,
         )
 
         cfg = self.kv_cache_config
@@ -933,6 +1043,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         all_page_indices = []
         kv_last_page_lens = []
         combined_seq_lens = []
+        context_lens = []
 
         for label in labels:
             for i, rid in enumerate(self.request_ids):
@@ -951,6 +1062,29 @@ class FlashInferCacheManager(BatchedCacheManager):
                 last_page_len = total_len % page_size or page_size
                 kv_last_page_lens.append(last_page_len)
                 combined_seq_lens.append(sl)
+                context_lens.append(total_len)
+
+        ps = self._plan_states.get(combined_label)
+
+        # Plan memo — see ``_plan_attention_impl``. This is the path that
+        # matters for CFG diffusion: every denoise step re-plans the same
+        # (labels x requests) batch over frozen KV, so after the first step
+        # only the bookkeeping below runs.
+        plan_key = PlanCacheKey(
+            q_seq_lens=tuple(combined_seq_lens),
+            page_indices=tuple(all_page_indices),
+            last_page_lens=tuple(kv_last_page_lens),
+            dtype=dtype,
+            is_causal=is_causal,
+            context_lens=tuple(context_lens),
+        )
+        if (
+            ps is not None and ps.wrapper is not None
+            and ps.dense_gen is None and ps.plan_cache_key == plan_key
+        ):
+            ps.seq_lens = combined_seq_lens
+            ps.write_store = write_store
+            return
 
         # CPU tensors — see comment in ``plan_attention`` above. FlashInfer
         # async-H2Ds these inside ``plan()``; passing GPU tensors would
@@ -961,11 +1095,12 @@ class FlashInferCacheManager(BatchedCacheManager):
         paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
         paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
 
-        ps = self._plan_states.get(combined_label)
-        if self._cuda_graph_mode and ps is not None and ps.wrapper is not None:
-            # CUDA-graph mode: reuse the persistent wrapper across denoise steps.
-            # plan() updates its static buffers via .copy_() so the captured
+        if ps is not None and ps.wrapper is not None:
+            # Reuse the persistent wrapper across denoise steps. plan() updates
+            # its buffers in place (via .copy_() under CUDA graph) so the
             # kernel picks up each step's page table without reallocating.
+            # Eager managers reach here too when the engine keeps one alive
+            # across batches (KVManagement.last_cache_manager).
             wrapper = ps.wrapper
         elif self._cuda_graph_mode:
             # First call under capture: build the persistent wrapper sized for the
@@ -986,8 +1121,7 @@ class FlashInferCacheManager(BatchedCacheManager):
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[combined_label] = ps
         else:
-            # Eager mode: a fresh wrapper each call (the cache manager is rebuilt
-            # per forward, so there is nothing persistent to reuse).
+            # Eager mode, first plan on this manager.
             wrapper = FlashInferPrefillWrapper(
                 workspace_buffer=self.buffer_manager.get(combined_label),
                 num_qo_heads=num_qo_heads,
@@ -1012,6 +1146,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         # A paged plan clears any prior dense plan (set by DenseGenCacheManager)
         # so run_attention routes this label back through the wrapper.
         ps.dense_gen = None
+        ps.plan_cache_key = plan_key
 
     @torch.compiler.disable
     def run_attention(
@@ -1193,6 +1328,8 @@ class FlashInferCacheManager(BatchedCacheManager):
             page_indices=tuple(indptrs.paged_kv_indices.tolist()),
             last_page_lens=tuple(indptrs.paged_kv_last_page_len.tolist()),
             dtype=dtype,
+            is_causal=False,
+            context_lens=tuple(context_lens),
         )
 
         ps = self._plan_states.get(cross_label)
@@ -1320,6 +1457,9 @@ class DenseGenCacheManager(FlashInferCacheManager):
             ps.seq_lens = seq_lens
             ps.write_store = write_store
             ps.dense_gen = self._build_dense_gen_plan([effective_label], seq_lens)
+            # No wrapper.plan() happened, so whatever the wrapper was last
+            # planned for no longer describes this label's state.
+            ps.plan_cache_key = None
         finally:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
@@ -1354,7 +1494,8 @@ class DenseGenCacheManager(FlashInferCacheManager):
             }
 
         self._batched_cfg_info = BatchedCfgInfo(
-            per_label_seq_len=seq_lens
+            per_label_seq_len=seq_lens,
+            combined_label=combined_label,
         )
 
         # Lean dense generation-attention path (see plan_attention): skip the
@@ -1366,6 +1507,8 @@ class DenseGenCacheManager(FlashInferCacheManager):
         ps.seq_lens = seq_lens
         ps.write_store = write_store
         ps.dense_gen = self._build_dense_gen_plan(labels, seq_lens)
+        # See plan_attention: no wrapper.plan() ran, so drop the memo.
+        ps.plan_cache_key = None
 
     @torch.compiler.disable
     def run_attention(
