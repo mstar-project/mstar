@@ -56,6 +56,11 @@ class KVManagement:
     # sources); precomputed at build time since it can't change after
     # startup, so per-request add/remove doesn't re-walk cross_pools.
     cross_alloc_managers: list[PagedAllocationManager] = field(default_factory=list)
+    # Last cache manager handed out, reused when the next batch has the same
+    # request ids so per-label plan state (wrappers + plan memo) survives
+    # across steps — what makes a denoise loop's identical re-plans free.
+    last_request_ids: tuple[str, ...] | None = None
+    last_cache_manager: "BatchedCacheManager | None" = None
 
 
 def _build_cross_pools(
@@ -297,16 +302,28 @@ class KVCacheEngine(BaseEngine):
         self, request_ids: list[str],
         node_name: str
     ) -> BatchedCacheManager:
-        """Create a CacheHandle for a single request."""
+        """Get the cache manager for this batch, reusing the last one when the
+        request ids match (see ``KVManagement.last_cache_manager``)."""
         submod_mgmt = self.submodule_management[node_name]
         cache_mgmt = submod_mgmt.kv_management
 
-        from mstar.engine.kv_store import StoreWritePolicy
         autowrite = (cache_mgmt.alloc_manager.write_policy == StoreWritePolicy.ALWAYS)
+        active_labels = {rid: "main" for rid in request_ids}
 
-        return create_cache_manager(
+        if (
+            cache_mgmt.last_cache_manager is not None
+            and cache_mgmt.last_request_ids == tuple(request_ids)
+        ):
+            cache_mgmt.last_cache_manager.reset_for_new_batch(
+                request_ids=list(request_ids),
+                active_labels_per_request=active_labels,
+                auto_write_store=autowrite,
+            )
+            return cache_mgmt.last_cache_manager
+
+        cache_manager = create_cache_manager(
             request_ids=request_ids,
-            active_labels_per_request={rid: "main" for rid in request_ids},
+            active_labels_per_request=active_labels,
             kv_cache=cache_mgmt.kv_cache,
             alloc_manager=cache_mgmt.alloc_manager,
             buffer_manager=cache_mgmt.buffer_manager,
@@ -316,6 +333,9 @@ class KVCacheEngine(BaseEngine):
             enable_nvtx=self.enable_nvtx,
             cross_pools=cache_mgmt.cross_pools,
         )
+        cache_mgmt.last_request_ids = tuple(request_ids)
+        cache_mgmt.last_cache_manager = cache_manager
+        return cache_manager
 
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
@@ -1203,6 +1223,14 @@ class KVCacheEngine(BaseEngine):
             if cache_mgmt.cpu_page_pool is not None:
                 cache_mgmt.cpu_page_pool.remove_request(request_id)
             cache_mgmt.alloc_manager.remove_request(request_id)
+            # Drop a cached manager that still names this request: its plan
+            # state describes pages that are about to be freed.
+            if (
+                cache_mgmt.last_request_ids is not None
+                and request_id in cache_mgmt.last_request_ids
+            ):
+                cache_mgmt.last_request_ids = None
+                cache_mgmt.last_cache_manager = None
             for cross_mgr in cache_mgmt.cross_alloc_managers:
                 cross_mgr.remove_request(request_id)
             submodule_mgmt.sampler.remove_request(request_id)
@@ -1290,4 +1318,6 @@ class KVCacheEngine(BaseEngine):
             cache_mgmt = submodule_mgmt.kv_management
             cache_mgmt.kv_cache = None
             cache_mgmt.buffer_manager = None
+            cache_mgmt.last_request_ids = None
+            cache_mgmt.last_cache_manager = None
             cache_mgmt.alloc_manager.cleanup()
