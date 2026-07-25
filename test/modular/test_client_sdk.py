@@ -1,7 +1,9 @@
 """Unit tests for the mstar Python SDK parsing/encoding (no live server)."""
 
 import base64
+import io
 import json
+from unittest import mock
 
 import pytest
 
@@ -53,6 +55,25 @@ def test_coerce_and_build_files():
     c = MStarClient("http://x")
     assert c._coerce_file("images", 0, b"\x89PNG") == ("image_0.png", b"\x89PNG")
     assert c._build_files(None, b"\x00\x01", None) == [("files", ("audio_0.wav", b"\x00\x01"))]
+
+
+def test_stream_without_content_type_charset():
+    """Content-Type without a charset must still yield events (issue #163)."""
+    requests = pytest.importorskip("requests")
+    line = json.dumps({"modality": "text", "data": base64.b64encode(b"hi").decode(), "metadata": {}})
+
+    resp = requests.Response()
+    resp.status_code = 200
+    resp.headers["Content-Type"] = "application/x-ndjson"  # no charset
+    resp.raw = io.BytesIO((line + "\n").encode())
+    assert resp.encoding is None
+
+    c = MStarClient("http://x")
+    ctx = mock.MagicMock()
+    ctx.__enter__.return_value = resp
+    with mock.patch.object(c._session, "post", return_value=ctx):
+        events = list(c._stream("http://x/generate", {}, None))
+    assert [e.text for e in events] == ["hi"]
 
 
 def test_audiobuffer_wav_bytes():
