@@ -131,6 +131,11 @@ class Bagel(Model):
                 "cfg_interval": [0.0, 1.0],
                 "cfg_renorm_type": "text_channel",
             })
+        elif request_type == RequestType.T2I:
+            kwargs.update({
+                "cfg_text_scale": 4.0,
+                "cfg_img_scale": 1.0,   # no input image → image-CFG off (server default 1.5 is wrong for T2I)
+            })
         return kwargs
 
     def get_hf_url(self):

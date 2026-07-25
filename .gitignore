@@ -11,6 +11,8 @@ uv.lock
 *.json
 profiler/
 traces/
+benchmark_results/
+vbench_cache/
 
 # per-user env config
 .env
