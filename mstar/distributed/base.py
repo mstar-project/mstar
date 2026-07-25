@@ -1,8 +1,24 @@
 import math
+import os as _os
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk
+
+# MSTAR_FAST_ROUTE (default OFF): memoize replicated fanout decisions per
+# request instance in fanout_graph_edges. Read once at import.
+_FAST_ROUTE = _os.environ.get("MSTAR_FAST_ROUTE", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+
+def _refresh_route_flags() -> None:
+    """Re-read MSTAR_FAST_ROUTE (safe: memo replay is value-identical;
+    flipping only toggles whether the memo is consulted/built)."""
+    global _FAST_ROUTE
+    _FAST_ROUTE = _os.environ.get(
+        "MSTAR_FAST_ROUTE", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -263,6 +279,31 @@ class ShardingConfig:
         dest_graph_walk: str | None,
         source_tp_rank: int | None = None,
     ) -> dict[str, GraphEdge]: # dest worker to graph edge
+        # MSTAR_FAST_ROUTE: for the un-sharded steady state (every fanout item
+        # full_tensor, no shard dim — all text decode edges on non-TP configs)
+        # the routing math (compute_fanout + compute_fanin + group lookups) is
+        # identical every step for the same (name, nodes, walks) key. Memoize
+        # the DECISION on this per-request instance and replay it with a fresh
+        # clone; sharded/partial fanouts always take the full path. Measured
+        # target: route_outputs 2.5 ms/step main-thread at i2t B32.
+        if _FAST_ROUTE:
+            memo_key = (
+                graph_edge.name, graph_edge.next_node, source_node,
+                source_graph_walk, dest_graph_walk, source_tp_rank,
+            )
+            memo = getattr(self, "_fanout_memo", None)
+            if memo is None:
+                memo = self._fanout_memo = {}
+            hit = memo.get(memo_key)
+            if hit is not None:
+                result = {}
+                for (worker, shard_dim, total_fanin) in hit:
+                    new_edge = graph_edge.clone()
+                    new_edge._shard_dim = shard_dim
+                    new_edge._total_fanin = total_fanin
+                    result[worker] = new_edge
+                return result
+
         # canonical form: leading shard dim
         shard_dim_sizes = [
             info.dims[0] for info in graph_edge.tensor_info
@@ -318,6 +359,15 @@ class ShardingConfig:
 
                     new_edge.tensor_info.append(new_info)
             result[item.worker] = new_edge
+
+        if _FAST_ROUTE:
+            # Cache only the fully-replicated shape (see above): every item
+            # full_tensor and no shard dim on the edge name.
+            if all(item.full_tensor for item in fanout) and \
+                    self.shard_dim.get(graph_edge.name) is None:
+                memo[memo_key] = [
+                    (w, e._shard_dim, e._total_fanin) for w, e in result.items()
+                ]
         return result
 
     def compute_fanin(

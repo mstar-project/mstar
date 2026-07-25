@@ -371,7 +371,25 @@ class Qwen3OmniModelConfig:
     code_predictor: CodePredictorConfig = field(default_factory=CodePredictorConfig)
     code2wav: Code2WavConfig = field(default_factory=Code2WavConfig)
 
+    # Native mstar encoders (default on); False falls back to the HF wrapper.
+    native_audio_encoder: bool = True
+    native_vision_encoder: bool = True
+
     def __post_init__(self) -> None:
+        # Env overrides: MSTAR_QWEN3_NATIVE_{AUDIO,VISION}_ENCODER=0/1; unset keeps the default.
+        import os as _os
+
+        def _envflag(name: str, current: bool) -> bool:
+            raw = _os.environ.get(name)
+            if raw is None:
+                return current
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+
+        self.native_audio_encoder = _envflag(
+            "MSTAR_QWEN3_NATIVE_AUDIO_ENCODER", self.native_audio_encoder)
+        self.native_vision_encoder = _envflag(
+            "MSTAR_QWEN3_NATIVE_VISION_ENCODER", self.native_vision_encoder)
+
         # Sanity check: all codec special token IDs must be < the Talker's
         # codec_embedding vocab size (talker_text.vocab_size, typically 3072).
         # HF's class-level defaults for Qwen3OmniMoeTalkerConfig put these

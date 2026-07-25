@@ -204,6 +204,190 @@ def fused_temperature_softmax(
     return probs
 
 
+# MSTAR_SAMPLER_CFG_CACHE (default ON): cache the per-batch device config
+# tensors in Sampler.sample keyed by batch membership. Each uncached call
+# does SIX pageable H2D copies, each forcing a cudaStreamSynchronize that
+# drains the in-flight decode pipeline.
+# Off-switch kept for A/B only; outputs are byte-identical either way.
+import os as _os  # noqa: E402  (feature-flag import kept beside its rationale)
+
+# DEFAULT OFF after evaluation: killing the syncs regressed end-to-end
+# performance despite being faster in isolation and token-identical. The
+# blocked GPU-thread RELEASED THE GIL during those pipeline-drain waits,
+# and the main thread's per-step postprocess Python ran in that window;
+# without the waits the two threads contend and wall time gets worse.
+# Lesson: on this two-thread GIL architecture, removing GPU-thread waits
+# only pays off if main-thread Python work is removed or moved off-GIL
+# FIRST. Keep for re-test after postprocess work shrinks.
+_SAMPLER_CFG_CACHE = _os.environ.get(
+    "MSTAR_SAMPLER_CFG_CACHE", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# MSTAR_SAMPLER_CFG_CACHE_V2 (default OFF): membership-CHURN-proof successor.
+# The V1 cache keys on tuple(request_ids) — exact membership — so under
+# closed-loop admission churn the cache misses nearly every step and the six
+# pageable H2D syncs come back (profiling showed this cost a significant
+# share of per-step wall time). V2 holds each config field in a PERSISTENT
+# per-request-SLOT device tensor (written once at admission/set_config via
+# pinned non_blocking, no per-step H2D) and assembles the batch by
+# index_select on a slot-index tensor — the
+# slot-index is the only per-step device object, rebuilt sync-free (pinned +
+# non_blocking) on a membership change, else cached. rand_offset is an
+# on-device per-slot counter (index_add each step). No pageable sync on any
+# path. Byte-identical outputs to V1/off (same per-rid values, same
+# u(T)=T-1 rand_offset). Supersedes _SAMPLER_CFG_CACHE when on.
+_SAMPLER_CFG_CACHE_V2 = _os.environ.get(
+    "MSTAR_SAMPLER_CFG_CACHE_V2", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# MSTAR_ARGMAX_FAST (default OFF): when EVERY request in the batch is greedy
+# (temperature == 0) and no repetition penalty is active, the next token is just
+# argmax(logits) per row. Skip the per-batch config-tensor assembly (the six
+# pageable H2D copies / their syncs), the fused temperature+softmax Triton
+# kernel, and the FlashInfer top-k/top-p sampler entirely (vLLM does this —
+# sampler.py:239). Byte-identical token VALUES to the current greedy path, which
+# builds a one-hot at argmax and samples it deterministically: torch.argmax and
+# the kernel's tl.argmax both break ties to the lowest index, and dtype is int32
+# to match FlashInfer's output. Only the eager ``Sampler`` takes this branch —
+# the CUDA-graph ``CudaGraphableSampler`` encodes greedy as (temp=1, top_k=1)
+# and cannot branch on CPU values, so it is deliberately left untouched (the
+# flag is read once in ``Sampler.sample``, never inside a captured region).
+_ARGMAX_FAST = _os.environ.get(
+    "MSTAR_ARGMAX_FAST", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+# MSTAR_SLIM_SAMPLE (default OFF): per-step Python-body reduction around
+# sampling. Two things, both output-preserving:
+#
+#  1. ``Sampler.sample`` fuses the up-to-six separate ``any()``/``all()``
+#     generator scans over the per-request config list (the ARGMAX_FAST
+#     eligibility check, plus any_rep_pen/any_greedy/any_top_k_zero/
+#     all_top_k_zero) into one pass — see ``_scan_sampling_configs``.
+#  2. The engine's two "sample the batched logits, then build a per-rid
+#     new_token map" bodies — ``kv_cache_engine._execute_batched`` (pure
+#     eager forward) and ``cuda_graph_runner._sample_and_remap`` (CUDA-graph
+#     post-replay) — had drifted into two independently-maintained copies of
+#     the same slice/index_select + sample + clone + split logic (down to an
+#     identical FlashInfer-buffer-aliasing comment in both files). They now
+#     both call ``sample_batched_and_unpack`` in this module.
+#
+# Read per-call (not cached) so a runtime flag flip applies immediately,
+# matching the ``_envflag`` convention in qwen3_omni_model.py — no
+# register_cache_clear needed since nothing here is cached across calls.
+# Flag off takes the untouched original code path at every call site: same
+# operations, same order, so outputs are byte-identical either way.
+def _slim_sample_enabled() -> bool:
+    return _os.environ.get(
+        "MSTAR_SLIM_SAMPLE", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _scan_sampling_configs(
+    configs: list["SamplingConfig"],
+) -> tuple[bool, bool, bool, bool, bool]:
+    """One pass over ``configs`` computing every per-batch predicate the
+    ``Sampler.sample`` hot path needs, replacing up to six separate
+    ``any()``/``all()`` scans (each re-walking the same B-sized list) with
+    one. B is small (<=32 in practice) so the per-call saving is a handful
+    of microseconds, but this runs on every decode step — pure interpreter
+    overhead, not device work — so it composes with the rest of the
+    per-step CPU cuts.
+
+    Returns:
+        ``(all_greedy, any_greedy, any_rep_pen, any_top_k_zero, all_top_k_zero)``
+    """
+    all_greedy = True
+    any_greedy = False
+    any_rep_pen = False
+    any_top_k_zero = False
+    all_top_k_zero = True
+    for c in configs:
+        if c.temperature == 0:
+            any_greedy = True
+        else:
+            all_greedy = False
+        if c.repetition_penalty != 1.0:
+            any_rep_pen = True
+        if c.top_k == 0:
+            any_top_k_zero = True
+        else:
+            all_top_k_zero = False
+    return all_greedy, any_greedy, any_rep_pen, any_top_k_zero, all_top_k_zero
+
+
+def sample_batched_and_unpack(
+    sampler: "BaseSampler",
+    request_ids: list[str],
+    batched_logits: torch.Tensor,
+    slot_map: list[int] | None = None,
+) -> tuple[torch.Tensor, dict[str, dict[str, list[torch.Tensor]]]]:
+    """Shared sample+unpack body for the two engine call sites that sample a
+    stacked ``[padded_bs, V]`` batched-logits tensor and build a per-rid
+    ``new_token`` map: ``kv_cache_engine._execute_batched`` (pure eager
+    forward) and ``cuda_graph_runner._sample_and_remap`` (CUDA-graph
+    post-replay, ``__batched_logits__`` fast path). Both independently
+    duplicated: slice/index_select to the real request rows, call
+    ``sampler.sample()``, ``.clone()`` to break FlashInfer's reused
+    sampling-output-buffer alias (the same tokens-doubling bug is
+    reachable from either call site — see the clone comments this
+    replaces), ``.split(1)`` into per-rid views, and zip into a
+    ``{rid: {"new_token": [view]}}`` map. One copy removes that drift risk
+    and cuts one per-wave Python body.
+
+    Args:
+        sampler: anything with a ``.sample(request_ids, logits)`` method —
+            in practice the eager ``Sampler`` (sampling itself is always
+            eager at both call sites; ``cuda_graph_runner`` only replays the
+            *forward* under CUDA graph, then samples afterwards in Python).
+        request_ids: real (non-dummy) request ids for this wave.
+        batched_logits: ``[padded_bs, V]`` stacked logits from one batched
+            forward.
+        slot_map: optional per-request source row into ``batched_logits``
+            (MSTAR_MIXED_SPLIT_ATTN chunk rows); ``None`` uses the first
+            ``len(request_ids)`` rows in order.
+
+    Returns:
+        ``(sampled, new_token_map)`` — ``sampled`` is the cloned ``[B]``
+        token tensor (callers that also need the whole-batch tensor, e.g.
+        MSTAR_DIRECT_FEED, get it without a second sample/clone);
+        ``new_token_map`` is ``{rid: {"new_token": [view]}}`` where each
+        view is a row-slice of ``sampled`` (no extra copy).
+    """
+    if slot_map is not None:
+        idx = torch.tensor(
+            slot_map, dtype=torch.long, device=batched_logits.device
+        )
+        stacked_logits = batched_logits.index_select(0, idx)
+    else:
+        stacked_logits = batched_logits[: len(request_ids)]
+    sampled = sampler.sample(request_ids, stacked_logits).clone()
+    new_token_map = {
+        rid: {"new_token": [view]}
+        for rid, view in zip(request_ids, sampled.split(1), strict=True)
+    }
+    return sampled, new_token_map
+
+
+def _refresh_sampler_flags() -> None:
+    """Re-read the cache flags at runtime (safe — both
+    caches are semantics-free; flipping only changes assembly, not values.
+    MSTAR_ARGMAX_FAST is likewise output-preserving: it only fires on all-greedy
+    batches, where its argmax equals the sampled token either way)."""
+    global _SAMPLER_CFG_CACHE, _SAMPLER_CFG_CACHE_V2, _ARGMAX_FAST
+    _SAMPLER_CFG_CACHE = _os.environ.get(
+        "MSTAR_SAMPLER_CFG_CACHE", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    _SAMPLER_CFG_CACHE_V2 = _os.environ.get(
+        "MSTAR_SAMPLER_CFG_CACHE_V2", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    _ARGMAX_FAST = _os.environ.get(
+        "MSTAR_ARGMAX_FAST", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+
+
 @dataclass
 class SamplingConfig:
     # Sizes the per-request seen-token mask for the repetition penalty. When set,
@@ -303,7 +487,179 @@ class Sampler(BaseSampler):
     # (seeded) sampling draws a fresh number each step — otherwise identical
     # (seed, offset=0) draws repeat forever and stable logits never reach EOS.
     _step_offset: dict[str, int] = field(default_factory=dict)
+    # Per-batch-membership cache of the six device config tensors (see
+    # sample()). Invalidated on set_config; bounded in sample().
+    _batch_cfg_cache: dict = field(default_factory=dict)
+    # upstream renamed TPCommGroup -> CommGroup (#154 SP generalization).
     tp_group: "CommGroup | None" = None  # noqa: F821
+    # --- MSTAR_SAMPLER_CFG_CACHE_V2 slot machinery (lazy; unused when off) ---
+    _v2_rid_to_slot: dict = field(default_factory=dict)   # rid -> slot int
+    _v2_free_slots: list = field(default_factory=list)    # reusable slot ids
+    _v2_n_slots: int = 0
+    _v2_dev: dict = field(default_factory=dict)           # field -> device [n_slots]
+    _v2_cpu: dict = field(default_factory=dict)           # field -> pinned CPU [n_slots]
+    _v2_slot_index_cache: dict = field(default_factory=dict)  # membership -> device idx
+    _v2_pinned_idx: "torch.Tensor | None" = None          # [RING, n] pinned staging
+    _v2_idx_ring: int = 0                                 # rotates pinned staging rows
+    _v2_ones: "torch.Tensor | None" = None                # device ones for rand advance
+    _v2_stats: dict = field(default_factory=dict)         # periodic-logging counters
+    _v2_was_on: bool = False                              # last-seen V2 flag (flip detect)
+
+    # Static per-request config fields carried in per-slot device tensors, plus
+    # the on-device rand_offset counter. (name, dtype, SamplingConfig attr|None)
+    _V2_FIELDS = (
+        ("temperature", "float32", "temperature"),
+        ("top_k", "int32", "top_k"),
+        ("top_p", "float32", "top_p"),
+        ("r_pen", "float32", "repetition_penalty"),
+        ("seed", "int64", "seed"),
+        ("rand", "int64", None),  # advanced on-device each step
+    )
+    # Pinned slot-index staging depth: a fresh row per membership-miss build so
+    # the CPU never overwrites a row whose non_blocking H2D is still in flight.
+    # 4 covers the current spec pipeline (~1-deep speculation + double-buffer, so
+    # at most ~3 sample() H2Ds can be outstanding). If the engine ever deepens
+    # the pipeline past ~3, GROW this (power of two — the ring mask assumes it)
+    # OR gate each row's reuse on a recorded CUDA event.
+    _V2_IDX_RING = 4
+
+    def _v2_ensure_capacity(self, need: int) -> None:
+        """Grow the per-slot device+pinned tensors to hold >= ``need`` slots."""
+        if need <= self._v2_n_slots:
+            return
+        new_n = max(need, 64, self._v2_n_slots * 2)
+        pin = torch.cuda.is_available()
+        for name, dt, _ in self._V2_FIELDS:
+            dtype = getattr(torch, dt)
+            dev = torch.zeros(new_n, dtype=dtype, device=self.device)
+            cpu = torch.zeros(new_n, dtype=dtype, device="cpu", pin_memory=pin)
+            if name in self._v2_dev:
+                dev[: self._v2_n_slots] = self._v2_dev[name]
+                cpu[: self._v2_n_slots] = self._v2_cpu[name]
+            self._v2_dev[name] = dev
+            self._v2_cpu[name] = cpu
+        # Ring of pinned staging rows so the CPU never overwrites a row whose
+        # non_blocking H2D (into a fresh cached device tensor) may still be
+        # in flight — the membership-miss build runs ~every step at churn.
+        self._v2_pinned_idx = torch.zeros(
+            (self._V2_IDX_RING, new_n), dtype=torch.int64,
+            device="cpu", pin_memory=pin,
+        )
+        self._v2_ones = torch.ones(new_n, dtype=torch.int64, device=self.device)
+        # New slot ids become free (reused LIFO).
+        self._v2_free_slots.extend(range(self._v2_n_slots, new_n))
+        self._v2_n_slots = new_n
+
+    def _v2_slot_for(self, rid: str) -> int:
+        """Slot for ``rid``, assigning + initializing one on first use."""
+        slot = self._v2_rid_to_slot.get(rid)
+        if slot is not None:
+            return slot
+        if not self._v2_free_slots:
+            self._v2_ensure_capacity(self._v2_n_slots + 1)
+        slot = self._v2_free_slots.pop()
+        self._v2_rid_to_slot[rid] = slot
+        self._v2_write_slot(rid, slot)
+        self._v2_inc("cfgv2_slot_miss")
+        return slot
+
+    def _v2_write_slot(self, rid: str, slot: int | None = None) -> None:
+        """Write ``rid``'s current SamplingConfig into its slot, sync-free
+        (pinned CPU write + single-element non_blocking H2D). rand_offset is
+        seeded from the Python _step_offset so it matches V1/off exactly."""
+        if slot is None:
+            slot = self._v2_rid_to_slot.get(rid)
+            if slot is None:
+                return
+        cfg = self._sampling_config[rid]
+        vals = {
+            "temperature": cfg.temperature,
+            "top_k": cfg.top_k,
+            "top_p": cfg.top_p,
+            "r_pen": cfg.repetition_penalty,
+            "seed": cfg.seed,
+            "rand": self._step_offset.get(rid, 0),
+        }
+        for name, v in vals.items():
+            self._v2_cpu[name][slot] = v
+            self._v2_dev[name][slot : slot + 1].copy_(
+                self._v2_cpu[name][slot : slot + 1], non_blocking=True
+            )
+        # A slot's config changed → any cached slot-index for a membership
+        # containing rid is still valid (slot id unchanged); only the field
+        # tensors moved, which are read fresh each step. No cache invalidation
+        # needed (unlike V1, whose cached VALUES would go stale).
+
+    def _v2_free_slot(self, rid: str) -> None:
+        slot = self._v2_rid_to_slot.pop(rid, None)
+        if slot is not None:
+            self._v2_free_slots.append(slot)
+        # Drop cached slot-index tensors whose membership included rid.
+        if self._v2_slot_index_cache:
+            self._v2_slot_index_cache = {
+                k: t for k, t in self._v2_slot_index_cache.items() if rid not in k
+            }
+
+    def _v2_resync_rand(self) -> None:
+        """OFF→ON flip repair: while V2 is off the per-slot device rand counter
+        freezes (index_add runs only on the V2 path) but _step_offset keeps
+        advancing (its loop is unconditional), so a rid that survived the off
+        interval would read a stale rand. Re-seed every live slot's rand from
+        _step_offset on the transition (rids admitted while off have no slot yet
+        and get seeded correctly at their first _v2_slot_for). Sync-free."""
+        for rid, slot in self._v2_rid_to_slot.items():
+            self._v2_cpu["rand"][slot] = self._step_offset.get(rid, 0)
+            self._v2_dev["rand"][slot : slot + 1].copy_(
+                self._v2_cpu["rand"][slot : slot + 1], non_blocking=True
+            )
+
+    def _v2_inc(self, key: str) -> None:
+        self._v2_stats[key] = self._v2_stats.get(key, 0) + 1
+
+    def _assemble_cfg_v2(self, request_ids: list[str], device):
+        """Assemble the six batch config tensors by gathering per-slot device
+        tensors — no pageable H2D on any path. Returns
+        (temperature, top_k, top_p, r_pen, seed, rand_offset)."""
+        slots = [self._v2_slot_for(rid) for rid in request_ids]
+        key = tuple(request_ids)
+        slot_index = self._v2_slot_index_cache.get(key)
+        if slot_index is None:
+            self._v2_inc("cfgv2_rebuilds")
+            B = len(slots)
+            ring = self._v2_idx_ring & (self._V2_IDX_RING - 1)
+            self._v2_idx_ring += 1
+            stage = self._v2_pinned_idx[ring, :B]
+            stage.copy_(torch.tensor(slots, dtype=torch.int64))  # CPU->pinned
+            slot_index = torch.empty(B, dtype=torch.int64, device=device)
+            slot_index.copy_(stage, non_blocking=True)  # sync-free H2D (fresh dst)
+            if len(self._v2_slot_index_cache) > 64:
+                self._v2_slot_index_cache.clear()
+            self._v2_slot_index_cache[key] = slot_index
+        # Direct index_select gathers (no per-call lambda closure — profiling
+        # showed it as a hot line at small batch sizes: sample() runs per step
+        # so the closure allocated repeatedly per request).
+        dev = self._v2_dev
+        temperature = dev["temperature"].index_select(0, slot_index)
+        top_k = dev["top_k"].index_select(0, slot_index)
+        top_p = dev["top_p"].index_select(0, slot_index)
+        r_pen = dev["r_pen"].index_select(0, slot_index)
+        seed = dev["seed"].index_select(0, slot_index)
+        # rand_offset: gather the PRE-advance value (u(T)=T-1, matches V1/off),
+        # then advance the per-slot counter on-device (+1 per rid this step).
+        rand_offset = dev["rand"].index_select(0, slot_index)
+        self._v2_dev["rand"].index_add_(0, slot_index, self._v2_ones[: len(slots)])
+        self._v2_inc("cfgv2_calls")
+        if self._v2_stats["cfgv2_calls"] % 2000 == 0:
+            # Surface the churn counters in server.log periodically:
+            # cfgv2_rebuilds/cfgv2_calls ~ the miss rate the V1 cache suffered;
+            # a healthy V2 keeps this high (churn) but sync-free (no regression).
+            logger.warning(
+                "CFGV2 %s slots=%d free=%d",
+                dict(sorted(self._v2_stats.items())),
+                self._v2_n_slots,
+                len(self._v2_free_slots),
+            )
+        return temperature, top_k, top_p, r_pen, seed, rand_offset
 
     def add_request(self, request_id: str):
         self._sampling_config[request_id] = SamplingConfig()
@@ -324,8 +680,21 @@ class Sampler(BaseSampler):
         if request_id in self._seen_token_mask:
             del self._seen_token_mask[request_id]
         self._step_offset.pop(request_id, None)
+        # V2: return the slot to the pool + drop its cached slot-indices.
+        if self._v2_rid_to_slot:
+            self._v2_free_slot(request_id)
 
     def set_config(self, request_id: str, **kwargs):
+        # Config change with unchanged batch membership must not serve stale
+        # cached tensors (see _batch_cfg_cache in sample()). Scoped to
+        # memberships containing this rid — a global clear() combined with
+        # prepare_batch's per-step per-rid set_config calls kept the cache
+        # permanently empty (fixed in tandem with the change-detect there).
+        if self._batch_cfg_cache:
+            self._batch_cfg_cache = {
+                k: v for k, v in self._batch_cfg_cache.items()
+                if request_id not in k
+            }
         old_vocab_size = self._sampling_config[request_id].vocab_size
         curr_config = asdict(self._sampling_config[request_id])
         kwargs = {k: arg for k, arg in kwargs.items() if k in curr_config.keys()}
@@ -340,6 +709,11 @@ class Sampler(BaseSampler):
                 vocab_size=new_vocab_size,
                 device=self.device
             )
+        # V2: the config VALUES for this rid changed → refresh its slot's
+        # device tensors (sync-free). Slot id is unchanged, so cached
+        # slot-index tensors stay valid; only the field values are updated.
+        if request_id in self._v2_rid_to_slot:
+            self._v2_write_slot(request_id)
 
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
@@ -352,20 +726,92 @@ class Sampler(BaseSampler):
         the hot path doesn't need.
         """
         configs = [self._sampling_config[rid] for rid in request_ids]
-        temperature = torch.tensor([c.temperature for c in configs], device=logits.device)
-        top_k = torch.tensor([c.top_k for c in configs], device=logits.device, dtype=torch.int32)
-        top_p = torch.tensor([c.top_p for c in configs], device=logits.device)
-        r_pen = torch.tensor([c.repetition_penalty for c in configs], device=logits.device)
-        seed = torch.tensor([c.seed for c in configs], device=logits.device, dtype=torch.long)
-        rand_offset = torch.tensor(
-            [self._step_offset.get(rid, 0) for rid in request_ids],
-            device=logits.device, dtype=torch.long,
-        )
+        # MSTAR_SLIM_SAMPLE: fuse the boolean scans over `configs` below (this
+        # ARGMAX_FAST check plus the four any()/all() calls further down) into
+        # one pass over the batch instead of up to six. See
+        # _scan_sampling_configs / MSTAR_SLIM_SAMPLE's module docstring.
+        # Flag off leaves every original any()/all() call untouched below —
+        # same statements, same order, byte-identical output either way.
+        slim_sample = _slim_sample_enabled()
+        if slim_sample:
+            all_greedy, any_greedy, any_rep_pen, any_top_k_zero, all_top_k_zero = (
+                _scan_sampling_configs(configs)
+            )
+        # MSTAR_ARGMAX_FAST: whole-batch greedy shortcut. When every request is
+        # greedy (temperature == 0) and none carries a repetition penalty (which
+        # would shift the argmax), the sampled token is exactly argmax(logits)
+        # per row — no config tensors, no softmax, no FlashInfer. int32 matches
+        # FlashInfer's output dtype so the return is drop-in for the full path.
+        if _ARGMAX_FAST and (
+            all_greedy if slim_sample
+            else all(c.temperature == 0 for c in configs)
+        ) and not (
+            any_rep_pen if slim_sample
+            else any(c.repetition_penalty != 1.0 for c in configs)
+        ):
+            tokens = logits.argmax(dim=-1).to(torch.int32)
+            tokens = self._broadcast_tokens(tokens)
+            # Keep the per-request RNG offset advancing in lockstep with the full
+            # path: greedy never reads it, but if a request's temperature later
+            # changes the cached/V2 rand is re-seeded from _step_offset, so it
+            # must not fall behind while the fast path is active.
+            for rid in request_ids:
+                self._step_offset[rid] = self._step_offset.get(rid, 0) + 1
+            return tokens
+        # Per-batch config tensors. Building these from Python lists with
+        # torch.tensor(..., device=...) does a PAGEABLE H2D copy each — torch
+        # issues cudaStreamSynchronize per copy, and on the decode hot path
+        # each such sync drains the whole in-flight pipeline (confirmed with
+        # set_sync_debug_mode). Configs are static per request, so cache
+        # the FIVE static tensors keyed by batch membership; rand_offset
+        # advances by exactly 1 for every rid on every sample() call (the
+        # loop at the bottom), so the cached device tensor is add_(1)'d
+        # in-place — no H2D at steady state. Any membership change → new key
+        # → one rebuild (its syncs are amortized to churn events).
+        if _SAMPLER_CFG_CACHE_V2:
+            # Churn-proof path: gather per-slot device tensors (no pageable H2D
+            # on any path). Byte-identical values to the branches below.
+            if not self._v2_was_on:
+                # OFF→ON transition (incl. first-ever use, when the slot map is
+                # empty and this is a no-op): re-sync frozen per-slot rand.
+                self._v2_was_on = True
+                self._v2_resync_rand()
+            temperature, top_k, top_p, r_pen, seed, rand_offset = (
+                self._assemble_cfg_v2(request_ids, logits.device)
+            )
+        else:
+            self._v2_was_on = False
+            key = tuple(request_ids)
+            cached = (
+                self._batch_cfg_cache.get(key) if _SAMPLER_CFG_CACHE else None
+            )
+            if cached is None:
+                temperature = torch.tensor([c.temperature for c in configs], device=logits.device)
+                top_k = torch.tensor([c.top_k for c in configs], device=logits.device, dtype=torch.int32)
+                top_p = torch.tensor([c.top_p for c in configs], device=logits.device)
+                r_pen = torch.tensor([c.repetition_penalty for c in configs], device=logits.device)
+                seed = torch.tensor([c.seed for c in configs], device=logits.device, dtype=torch.long)
+                rand_offset = torch.tensor(
+                    [self._step_offset.get(rid, 0) for rid in request_ids],
+                    device=logits.device, dtype=torch.long,
+                )
+                # Keep the cache from growing over a long server life: batch
+                # membership churn creates a new key per admission wave. Bound it.
+                if len(self._batch_cfg_cache) > 64:
+                    self._batch_cfg_cache.clear()
+                self._batch_cfg_cache[key] = (
+                    temperature, top_k, top_p, r_pen, seed, rand_offset,
+                )
+            else:
+                temperature, top_k, top_p, r_pen, seed, rand_offset = cached
+                rand_offset.add_(1)
 
-        any_rep_pen = any(c.repetition_penalty != 1.0 for c in configs)
-        any_greedy = any(c.temperature == 0 for c in configs)
-        any_top_k_zero = any(c.top_k == 0 for c in configs)
-        all_top_k_zero = all(c.top_k == 0 for c in configs)
+        if not slim_sample:
+            any_rep_pen = any(c.repetition_penalty != 1.0 for c in configs)
+            any_greedy = any(c.temperature == 0 for c in configs)
+            any_top_k_zero = any(c.top_k == 0 for c in configs)
+            all_top_k_zero = all(c.top_k == 0 for c in configs)
+        # else: already computed by the fused _scan_sampling_configs() above.
 
         for rid in request_ids:
             if self._seen_token_mask[rid]._seen_token_mask is None:
@@ -396,8 +842,8 @@ class Sampler(BaseSampler):
 
         # TODO: make this scatter async. Currently runs 2 kernels per rid
         # (broadcast-True + index_put) on the default stream, serializing N=bs
-        # small launches that add up (~500 µs at bs=8 for Orpheus with
-        # repetition_penalty=1.3). Two options to fix:
+        # small launches that add up measurably for larger batches with
+        # repetition penalty enabled. Two options to fix:
         #   (a) Shared [max_concurrent, V] buffer with rid→slot mapping; replace
         #       the loop with a single batched `buf[slots, tokens] = True`
         #       scatter — one launch instead of N.
@@ -644,8 +1090,8 @@ class CudaGraphableSampler(BaseSampler):
         # depth loop). ``deterministic=True`` should already produce
         # bit-equal output, but tied-probability sorts can still resolve
         # differently across GPUs in edge cases — one diverging code
-        # cascades into garbled audio with no recovery, so we pay the
-        # ~5µs in-place broadcast (no-op for trivial groups) to guarantee
+        # cascades into garbled audio with no recovery, so we pay the small
+        # in-place broadcast cost (no-op for trivial groups) to guarantee
         # agreement. Mirrors ``CudaGraphableSampler.sample``.
         return self._broadcast_tokens(tokens)
 

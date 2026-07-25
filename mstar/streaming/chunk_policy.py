@@ -51,6 +51,21 @@ class ChunkPolicy(ABC):
         """
         return False
 
+    def coalesce_size(self) -> int:
+        """Producer-side coalescing granularity (MSTAR_CODEC_CHUNK_EMIT).
+
+        Frames may be staged on the producer and written into the buffer in
+        one batched put every ``coalesce_size`` items instead of one put per
+        item. Default ``1`` = no coalescing (put each item as it arrives).
+
+        A policy returns >1 only when coalescing at that granularity leaves the
+        buffered item sequence — and therefore every popped window — byte
+        identical AND does not change WHEN a chunk first becomes ready (so
+        first-chunk / first-audio latency is preserved). See
+        ``LeftContextChunkPolicy.coalesce_size``.
+        """
+        return 1
+
 
 class SlidingWindowChunkPolicy(ChunkPolicy):
     """Fixed-size sliding window that advances by a stride.
@@ -120,6 +135,15 @@ class LeftContextChunkPolicy(ChunkPolicy):
         if not self.first_chunk_read:
             return self._chunk
         return self._window
+
+    def coalesce_size(self) -> int:
+        # Flush one batched put every ``chunk`` frames. A chunk only ever
+        # becomes ready at a multiple of ``chunk`` buffered items (first pop at
+        # ``chunk``, every later pop at ``chunk + left_context`` == 2*chunk when
+        # left_context==chunk, etc.), so flushing on that exact cadence puts the
+        # frames into the buffer at the same instant the per-frame path would
+        # have made the chunk poppable — identical windows, identical timing.
+        return self._chunk
 
 
 class FixedChunkPolicy(ChunkPolicy):

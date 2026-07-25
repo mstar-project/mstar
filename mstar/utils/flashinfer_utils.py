@@ -482,3 +482,168 @@ class FlashInferDecodeWrapper:
         positions = self.kv_cache_locations[:n, 1]
         kv_cache_layer[pages, 0, positions] = k[:n].to(self.dtype)
         kv_cache_layer[pages, 1, positions] = v[:n].to(self.dtype)
+
+
+class FlashInferSplitMixedWrapper:
+    """Split attention for a captured thinker_mixed step (MSTAR_MIXED_SPLIT_ATTN).
+
+    A mixed batch's rows are laid out in FIXED regions so a static CUDA graph
+    can slice them: rows [0, bs-1) are decode rows (real requests padded with
+    qo=1 dummies), row bs-1 is the single prefill-chunk row whose tokens occupy
+    q[bs-1 : bs-1+C]. Measured on H200: one BatchPrefill plan over that mixed
+    shape is measurably slower per forward than planning the decode rows on a
+    (tensor-core) decode wrapper and the chunk row on its own prefill
+    wrapper, in-graph. This class exposes the same plan/run/set_kv_cache
+    surface as the single wrappers and does the split at the fixed boundary
+    internally, so BatchedCacheManager treats it as just another persistent
+    wrapper.
+
+    ``n_decode_rows`` = bs-1 is FIXED at construction (capture) time: run()
+    always slices q at the same offsets, which is what makes it replayable.
+    Variable real batch composition is handled the same way the decode graphs
+    handle padding — per-step plan() re-writes both sub-wrappers' static
+    buffers; dummy decode rows attend to their own dummy pages.
+
+    Sub-wrappers get SEPARATE workspaces (plan scheduling state lives there).
+    """
+
+    def __init__(
+        self,
+        decode_workspace: torch.Tensor,
+        prefill_workspace: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        batch_size: int,
+        max_total_tokens: int,
+        max_num_pages: int,
+        device: torch.device = torch.device("cuda"),
+        use_cuda_graph: bool = False,
+        enable_nvtx: bool = False,
+    ):
+        assert batch_size >= 2, "split mixed needs >=1 decode row + the chunk row"
+        self.n_decode_rows = batch_size - 1
+        self.chunk_window = max_total_tokens - self.n_decode_rows
+        assert self.chunk_window > 0, (
+            f"packed bucket too small for split: bs={batch_size} "
+            f"num_tokens={max_total_tokens}"
+        )
+        self.device = device
+        self.dtype = None
+        self.enable_nvtx = enable_nvtx
+
+        self.decode = FlashInferDecodeWrapper(
+            workspace_buffer=decode_workspace,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            batch_size=self.n_decode_rows,
+            max_num_pages=max_num_pages,
+            device=device,
+            use_cuda_graph=use_cuda_graph,
+            enable_nvtx=enable_nvtx,
+        )
+        self.prefill = FlashInferPrefillWrapper(
+            workspace_buffer=prefill_workspace,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            batch_size=1,
+            max_total_tokens=self.chunk_window,
+            max_num_pages=max_num_pages,
+            device=device,
+            use_cuda_graph=use_cuda_graph,
+            enable_nvtx=enable_nvtx,
+        )
+
+        # Synthetic full-layout qo_indptr, consumed by the submodule's
+        # in-graph last-token gather (cache_manager.get_qo_indptr_buf →
+        # wrapper._qo_indptr_buf). Static device buffer; plan() rewrites it
+        # per step so the captured index_select follows the real chunk len.
+        self._qo_indptr_buf = torch.zeros(
+            batch_size + 1, dtype=torch.int32, device=device
+        )
+
+    def plan(
+        self,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        causal: bool = True,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        """Split the full (bs-row) plan at the fixed boundary.
+
+        Expects the fixed-region shape: qo lens [1]*(bs-1) + [C]. All inputs
+        are CPU tensors (see the single wrappers' plan docstrings). The decode
+        part re-plans rows [0, bs-1); the chunk part is rebased to a 1-row
+        prefill plan.
+        """
+        nd = self.n_decode_rows
+        qo_lens = qo_indptr[1:] - qo_indptr[:-1]
+        assert int(qo_lens[:nd].max()) <= 1 and int(qo_lens[:nd].min()) >= 1, (
+            f"split plan expects qo=1 decode rows, got {qo_lens[:nd].tolist()}"
+        )
+        c = int(qo_lens[nd])
+        assert 0 < c <= self.chunk_window, (
+            f"chunk len {c} outside window {self.chunk_window}"
+        )
+
+        # Decode part: rows [0, nd). kv lists are per-row prefixes.
+        kv_split = int(paged_kv_indptr[nd])
+        self.decode.plan(
+            paged_kv_indptr=paged_kv_indptr[: nd + 1],
+            paged_kv_indices=paged_kv_indices[:kv_split],
+            paged_kv_last_page_len=paged_kv_last_page_len[:nd],
+            dtype=dtype,
+        )
+
+        # Chunk part: single row, rebased indptrs.
+        chunk_kv_indptr = (
+            paged_kv_indptr[nd : nd + 2] - kv_split
+        ).to(torch.int32)
+        self.prefill.plan(
+            qo_indptr=torch.tensor([0, c], dtype=torch.int32),
+            paged_kv_indptr=chunk_kv_indptr,
+            paged_kv_indices=paged_kv_indices[kv_split:],
+            paged_kv_last_page_len=paged_kv_last_page_len[nd:],
+            causal=causal,
+            dtype=dtype,
+        )
+
+        # Full-layout qo_indptr for the in-graph last-token gather.
+        full = qo_indptr
+        if full.device.type != "cuda":
+            self._qo_indptr_buf[: full.shape[0]].copy_(
+                full.to(torch.int32), non_blocking=True
+            )
+        else:
+            self._qo_indptr_buf[: full.shape[0]].copy_(full.to(torch.int32))
+        self.dtype = dtype
+
+    @torch.compiler.disable
+    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+        """q: [total_tokens, H, D] in fixed-region layout. Returns same shape.
+
+        The slice offsets are constants of this wrapper, so the captured graph
+        replays them; per-step variability lives entirely in the sub-wrappers'
+        planned static buffers (exactly like padded decode graphs).
+        """
+        nd = self.n_decode_rows
+        out_dec = self.decode.run(q[:nd], kv_cache_layer)
+        out_chunk = self.prefill.run(q[nd:], kv_cache_layer)
+        return torch.cat([out_dec, out_chunk], dim=0)
+
+    def set_kv_cache(
+        self,
+        kv_cache_layer: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        nd = self.n_decode_rows
+        self.decode.set_kv_cache(kv_cache_layer, k[:nd], v[:nd])
+        self.prefill.set_kv_cache(kv_cache_layer, k[nd:], v[nd:])

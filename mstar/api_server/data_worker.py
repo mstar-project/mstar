@@ -1,5 +1,6 @@
 
 
+import collections
 import logging
 import os
 import queue
@@ -16,8 +17,11 @@ try:
 except (ImportError, RuntimeError, OSError):
     VideoDecoder = None
 
+from mstar.api_server.detok_proc import DetokClient
+from mstar.api_server.preproc_proc import PreprocClient, preprocess_tensors
 from mstar.api_server.request_types import (
     DataWorkerProfile,
+    PendingDetok,
     PreprocessInput,
     ResultChunk,
     ResultTensors,
@@ -55,7 +59,11 @@ class PreprocessWorker:
         socket_path_prefix: str = "/tmp/mstar",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         tcp_transfer_device="",
-        enable_prof: bool=False
+        enable_prof: bool=False,
+        model_name: str = "dummy",
+        cache_dir: str | None = None,
+        model_kwargs: dict | None = None,
+        log_level: str = "INFO",
     ):
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -89,6 +97,64 @@ class PreprocessWorker:
             enable_prof=enable_prof,
         )
 
+        # MSTAR_DETOK_PROC (#13, default OFF): move the CPU-heavy per-chunk text
+        # detokenization (``model.postprocess``) off this (uvicorn/serve) process
+        # into a dedicated child, so it stops contending for the serve GIL. Read
+        # ONCE here: the child is spawned now and cannot follow MSTAR_DYNFLAGS
+        # (process topology is boot-time; see detok_proc.py). A/B via two boots.
+        # Requires a real model with a tokenizer (postprocess); skipped for the
+        # dummy/None model so tests and dummy configs are untouched.
+        self.detok_client: DetokClient | None = None
+        detok_on = os.environ.get("MSTAR_DETOK_PROC", "0") == "1"
+        if detok_on and model is not None:
+            self.detok_client = DetokClient(
+                model=model,
+                model_name=model_name,
+                cache_dir=cache_dir,
+                model_kwargs=model_kwargs,
+                out_queue=self.output_queue,
+                log_level=log_level,
+            )
+        elif detok_on:
+            logger.warning(
+                "MSTAR_DETOK_PROC=1 but no model with a tokenizer is available; "
+                "keeping detok inline",
+            )
+
+        # MSTAR_PREPROC_PROC (default OFF): move the CPU-heavy request-side
+        # multimodal preprocessing (image decode/resize/patchify via load_image +
+        # process_prompt) off this (uvicorn/serve) process into a pool of child
+        # processes, so a burst of image requests stops spiking the serve process
+        # and starving the uvicorn/ZMQ-drain threads of the GIL. Read ONCE here
+        # (process topology is boot-time; see preproc_proc.py). Requires a real
+        # model with process_prompt; skipped for the dummy/None model. Composes
+        # with MSTAR_DETOK_PROC (both children coexist). A/B via two boots.
+        self.preproc_client: PreprocClient | None = None
+        preproc_on = os.environ.get("MSTAR_PREPROC_PROC", "0") == "1"
+        if preproc_on and model is not None:
+            num_procs = int(os.environ.get("MSTAR_PREPROC_PROCS", "4"))
+            # Per-child intra-op thread cap. Default: split the box across the
+            # pool so N children * threads ~= cores (0 in the env => auto here;
+            # a positive MSTAR_PREPROC_THREADS overrides). The preprocess is a
+            # torch/torchvision multi-thread burst, so an uncapped pool would
+            # oversubscribe and inflate latency.
+            num_threads = int(os.environ.get("MSTAR_PREPROC_THREADS", "0"))
+            if num_threads <= 0:
+                num_threads = max(1, (os.cpu_count() or num_procs) // max(1, num_procs))
+            self.preproc_client = PreprocClient(
+                model_name=model_name,
+                cache_dir=cache_dir,
+                model_kwargs=model_kwargs,
+                num_procs=num_procs,
+                num_threads=num_threads,
+                log_level=log_level,
+            )
+        elif preproc_on:
+            logger.warning(
+                "MSTAR_PREPROC_PROC=1 but no model with process_prompt is "
+                "available; keeping preprocessing inline",
+            )
+
         self.thread = threading.Thread(
             target=_preprocess_loop,
             kwargs=dict(
@@ -103,7 +169,9 @@ class PreprocessWorker:
                 communicator=self.communicator,
                 tensor_manager=self.tensor_manager,
                 model=model,
-                enable_prof=enable_prof
+                enable_prof=enable_prof,
+                detok_client=self.detok_client,
+                preproc_client=self.preproc_client,
             )
         )
         self.thread.start()
@@ -168,21 +236,25 @@ class PreprocessWorker:
         results = []
         while not self.output_queue.empty():
             result: ResultChunk = self.output_queue.get()
-            # A request can be cleaned up (its result already returned) while a
-            # late chunk is still in the queue -- common when several requests
-            # complete in the same step. Mirror new_result_tensors' guard and
-            # drop the straggler rather than KeyError, which would otherwise
-            # abort the whole drain and lose the other requests' chunks.
-            if result.request_id not in self.per_request_reading_tensors:
-                logger.warning(
-                    "Late result chunk for cleaned-up request %s, ignoring",
+            # Tolerant decrement: a LATE chunk can land after cleanup_request
+            # popped this rid's counter (in-flight SHM read completing in the
+            # main-thread-pop -> worker-thread-cleanup window; ordered emit
+            # widens it by holding+late-flushing chunks). A bare subscript
+            # here raised KeyError and aborted the whole drain loop, dropping
+            # every other request's queued chunks with it. (upstream #181 fixed
+            # the same straggler race; this keeps the cnt binding the debug log
+            # below reads.)
+            cnt = self.per_request_reading_tensors.get(result.request_id)
+            if cnt is None:
+                logger.debug(
+                    "Dropping late chunk for cleaned-up request %s",
                     result.request_id,
                 )
                 continue
-            self.per_request_reading_tensors[result.request_id] -= 1
+            self.per_request_reading_tensors[result.request_id] = cnt - 1
             logger.debug(
                 "Data worker reading queue for request %s decreased to length %d",
-                result.request_id,  self.per_request_reading_tensors[result.request_id]
+                result.request_id, cnt - 1,
             )
             results.append(result)
         return results
@@ -220,6 +292,16 @@ class PreprocessWorker:
         self.stop_event.set()
         if self.thread.is_alive():
             self.thread.join()
+        # After the worker thread has stopped submitting, tear down the detok
+        # child; any still-outstanding chunks are recovered inline in shutdown().
+        if self.detok_client is not None:
+            self.detok_client.shutdown()
+        # Tear down the preproc pool. Outstanding preproc jobs are simply
+        # dropped at shutdown (the server is going down; those requests are
+        # aborted/timed out by the normal shutdown path — the transport state
+        # they would need is being torn down too).
+        if self.preproc_client is not None:
+            self.preproc_client.shutdown()
 
 
 class PreprocessWorkerThread:
@@ -237,7 +319,9 @@ class PreprocessWorkerThread:
         tensor_manager,
         device: str = "cpu",
         model: Model | None = None,
-        enable_prof: bool=False
+        enable_prof: bool=False,
+        detok_client: DetokClient | None = None,
+        preproc_client: PreprocClient | None = None,
     ):
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
@@ -252,6 +336,29 @@ class PreprocessWorkerThread:
         self.model = model
         self.enable_prof = enable_prof
 
+        # MSTAR_DETOK_PROC: when set, text chunks are built WITHOUT running
+        # postprocess inline (a PendingDetok is attached instead) and emitted via
+        # _emit_chunk, which hands them to this child. None => flag off / no
+        # tokenizer model => every path stays exactly as before.
+        self.detok_client = detok_client
+        self._detok_enabled = detok_client is not None
+
+        # MSTAR_PREPROC_PROC: when set, request-side multimodal preprocessing
+        # (load_* + process_prompt) runs in the child pool and its produced
+        # tensors come back here for admission. None => flag off / no model =>
+        # every request preprocesses inline exactly as before.
+        self.preproc_client = preproc_client
+        self._preproc_enabled = preproc_client is not None
+        # An audio-input request is NOT offloaded while the serve process would
+        # compute the log-mel on the GPU (MSTAR_GPU_MEL default on + CUDA
+        # present): a CUDA-hidden child would produce a CPU mel that is not
+        # bit-identical, so such requests stay inline (byte-identical). i2t
+        # (image+text) is unaffected — its preprocessing is CPU-deterministic.
+        self._serve_uses_gpu_mel = (
+            os.environ.get("MSTAR_GPU_MEL", "1") in ("1", "true", "True")
+            and torch.cuda.is_available()
+        )
+
         self.tensor_uuid_to_metadata_per_request = {}
         # The request's model_kwargs, kept so output postprocessing can
         # honor per-request parameters (e.g. the video container fps).
@@ -261,64 +368,79 @@ class PreprocessWorkerThread:
         self.communicator = communicator
         self.tensor_manager = tensor_manager
 
+        # MSTAR_ORDERED_EMIT: emit ResultChunks per (rid, modality) in ARRIVAL
+        # order rather than read-completion order. Without this, a mixed
+        # inline/SHM stream reorders: inline items (decode new-token ints)
+        # emit synchronously in _read_result_tensor while an SHM item (the
+        # prefill step's first token — its uuid also feeds the prefill→decode
+        # loop-back edge, so it is excluded from the inline transport and must
+        # be fetched) emits only when its async read completes. Under load the
+        # fetch lands 1..k decode tokens late, so the client stream shows the
+        # FIRST generated token displaced mid-sentence (or, when the request
+        # finishes first, missing entirely). Default OFF = current behavior.
+        self._ordered_emit = os.environ.get("MSTAR_ORDERED_EMIT", "0") == "1"
+        self._ordered_emit_debug = (
+            os.environ.get("MSTAR_ORDERED_EMIT_DEBUG", "0") == "1"
+        )
+        # (rid, modality) -> deque of entries in arrival order. Entry:
+        # {"ready": bool, "uuid_order": [uuid,...], "chunks": {uuid: chunk},
+        #  "pending": set[uuid]}   (inline entries: ready=True, uuid_order
+        # ordered as built, pending empty).
+        self._emit_fifos: dict[tuple[str, str], collections.deque] = {}
+        # (rid, uuid) -> [(fifo_key, entry), ...] so read completions find every
+        # entry waiting on the uuid (aliased/re-sent uuids: one read must satisfy
+        # all waiters).
+        self._uuid_to_emit_entry: dict[tuple[str, str], list] = {}
+
+    def _should_offload(self, input: PreprocessInput) -> bool:
+        """Whether this request's preprocessing can go to the child pool.
+
+        Off unless the flag is on and the pool is healthy. Audio-input requests
+        stay inline while the serve process uses GPU mel (byte-identity — see
+        __init__). Everything else (i2t: image+text) is offloaded."""
+        if not self._preproc_enabled:
+            return False
+        if self._serve_uses_gpu_mel and "audio" in (input.input_modalities or []):
+            return False
+        return True
+
+    def _on_new_input(self, input: PreprocessInput):
+        """Dispatch a new request: to the pool when eligible, else inline."""
+        if self._should_offload(input) and self.preproc_client.submit(input):
+            return
+        # Flag off, not offloadable, or the pool has permanently failed.
+        self._process_input(input)
+
+    def _complete_preproc(self, comp: tuple):
+        """Admit a request whose preprocessing finished (pool or inline recovery)."""
+        kind = comp[0]
+        if kind == "ok":
+            _, input, tensors, input_metadata = comp
+            self._admit_request(input, tensors, input_metadata)
+        else:  # "inline" — child error or fallback recovery: run the full path
+            self._process_input(comp[1])
+
     def _process_input(
         self, input: PreprocessInput
     ):
-        tensors: NameToTensorList = {}
-        input_metadata = {}
+        # Inline path: load raw modality tensors + process_prompt, then admit.
+        # The load/process_prompt work is the exact same implementation the
+        # preproc child runs (shared preprocess_tensors — no drift, so an
+        # offloaded request produces byte-identical tensors).
+        tensors, input_metadata = preprocess_tensors(
+            self.model, input, self.device
+        )
+        self._admit_request(input, tensors, input_metadata)
 
-        # First, load raw modality tensors from file_paths (images, audio, video)
-        # so they can be passed to process_prompt() below.
-        if input.file_paths is not None:
-            for modality in input.file_paths:
-                key = f"{modality}_inputs"
-                tensors[key] = []
-                # TODO: maybe make a class of tensors_and_metadata later (figure out how to use metadata)
-                input_metadata[key] = []
-
-                for filepath in input.file_paths[modality]:
-                    # ---- Image ----
-                    if modality == "image":
-                        out = self.model.load_image(filepath, self.device)
-                        tensors[key].append(out.data)
-                        input_metadata[key].append(out.metadata)
-
-                    # ---- Audio ----
-                    elif modality == "audio":
-                        out = self.model.load_audio(filepath, self.device)
-                        tensors[key].append(out.data)
-                        input_metadata[key].append(out.metadata)
-
-                    # ---- Video ----
-                    elif modality == "video":
-                        out = self.model.load_video(filepath, self.device)
-                        tensors[key].append(out.data)
-                        input_metadata[key].append(out.metadata)
-
-
-        # Then, tokenize the prompt and let the model augment/transform the
-        # tensors dict (e.g., Qwen3-Omni needs to compute pixel_values,
-        # image_grid_thw, audio_features, audio_seqlens from the raw tensors
-        # loaded above).  process_prompt receives the raw multimodal tensors
-        # and returns any additional tensors to merge into the final dict.
-        if self.model is not None:
-            prompt_tensors = self.model.process_prompt(
-                input.text,
-                input.input_modalities,
-                input.output_modalities,
-                tensors=tensors,
-                input_metadata=input_metadata,
-                **(input.model_kwargs or {}),
-            )
-            if prompt_tensors:
-                tensors.update(prompt_tensors)
-        elif input.text is not None:
-            # Fallback: encode as UTF-8 bytes -> uint8 tensor
-            byte_data = input.text.encode("utf-8")
-            tensors["text_inputs"] = [torch.tensor(
-                list(byte_data), dtype=torch.uint8, device=self.device
-            )]
-
+    def _admit_request(
+        self,
+        input: PreprocessInput,
+        tensors: NameToTensorList,
+        input_metadata: dict,
+    ):
+        # Transport + conductor handoff. ALWAYS runs on this worker thread (it
+        # owns the tensor_manager and communicator), whether the tensors were
+        # produced inline or in the child pool.
         initial_signals = self.tensor_manager.store_and_return_tensor_info(
             request_id=input.request_id,
             tensors=tensors # dict(modality_input: list[tensors])
@@ -396,6 +518,32 @@ class PreprocessWorkerThread:
         self, result: ResultTensors
     ):
         result.graph_edge.name = f"{result.modality}_output"
+        # Inline fast path: token values arrived in the message metadata, so
+        # there is no SHM tensor to fetch and no producer ack to send. The
+        # producer already released its tensor_store ref locally.
+        if result.metadata and "inline_values" in result.metadata:
+            if self._ordered_emit:
+                # Enqueue at the FIFO tail; emits only once every earlier
+                # arrival for this (rid, modality) has emitted.
+                key = (result.request_id, result.modality)
+                chunks = self._build_inline_chunks(result)
+                entry = {
+                    "ready": True,
+                    "uuid_order": list(range(len(chunks))),
+                    "chunks": dict(enumerate(chunks)),
+                    "pending": set(),
+                }
+                self._emit_fifos.setdefault(key, collections.deque()).append(entry)
+                if self._ordered_emit_debug:
+                    logger.warning(
+                        "ORDEMIT arrival INLINE rid=%s n_chunks=%d fifo_len=%d",
+                        result.request_id, len(chunks),
+                        len(self._emit_fifos[key]),
+                    )
+                self._flush_emit_fifo(key)
+            else:
+                self._emit_inline_result(result)
+            return
         self.tensor_manager.start_read_tensors(
             request_id=result.request_id,
             graph_edges=[result.graph_edge],
@@ -405,10 +553,174 @@ class PreprocessWorkerThread:
         for tensor_info in result.graph_edge.tensor_info:
             self.tensor_uuid_to_metadata_per_request[result.request_id][
                 tensor_info.uuid] = result.metadata
+        if self._ordered_emit:
+            key = (result.request_id, result.modality)
+            uuids = [info.uuid for info in result.graph_edge.tensor_info]
+            entry = {
+                # A signal-only emit edge (no tensor_info — e.g. the leading
+                # text_output marker) transports nothing: it is trivially
+                # ready, else it wedges the FIFO head forever (no read will
+                # ever complete it) and every later chunk is held until the
+                # request's TTL drops them (observed: all-empty responses).
+                "ready": not uuids,
+                "uuid_order": uuids,
+                "chunks": {},
+                "pending": set(uuids),
+            }
+            self._emit_fifos.setdefault(key, collections.deque()).append(entry)
+            for u in uuids:
+                waiters = self._uuid_to_emit_entry.setdefault(
+                    (result.request_id, u), []
+                )
+                if waiters and self._ordered_emit_debug:
+                    logger.warning(
+                        "ORDEMIT alias (multi-waiter) rid=%s uuid=%s n=%d",
+                        result.request_id, u, len(waiters) + 1,
+                    )
+                # List-valued: the SAME uuid can be referenced by MULTIPLE
+                # arrival entries (aliased emit edges / re-sends); one read
+                # completion must satisfy every waiter or the orphaned
+                # earlier entry wedges the FIFO head forever.
+                waiters.append((key, entry))
+            if self._ordered_emit_debug:
+                logger.warning(
+                    "ORDEMIT arrival SHM rid=%s uuids=%s fifo_len=%d",
+                    result.request_id, uuids, len(self._emit_fifos[key]),
+                )
+            if entry["ready"]:
+                # Signal-only entry: pop it (and any ready run) promptly so
+                # it never lingers at the head.
+                self._flush_emit_fifo(key)
+
+    def _emit_chunk(self, chunk: ResultChunk):
+        """Single emit choke point for every ResultChunk.
+
+        Flag off (or a chunk with no deferred detok — e.g. audio/image): put it
+        straight on the output queue, exactly as before. Flag on with a deferred
+        text chunk: hand it to the detok child (it fills ``data`` off-process and
+        the child's receiver thread does the ``out_queue.put`` in submit order).
+        If the child is unavailable, postprocess inline right here so nothing
+        hangs — identical bytes, just on this process.
+        """
+        dc = self.detok_client
+        if dc is not None and chunk.pending_detok is not None:
+            if dc.submit(chunk):
+                return
+            pd = chunk.pending_detok
+            chunk.data = self.model.postprocess(
+                torch.tensor(pd.ints, dtype=pd.dtype).reshape(pd.dims),
+                chunk.modality,
+            )
+            chunk.pending_detok = None
+        self.out_queue.put(chunk)
+
+    def _emit_inline_result(self, result: ResultTensors):
+        """Produce ResultChunk(s) directly from inline token values.
+
+        Mirrors _process_read_tensors' emission but skips the transport
+        fetch: one chunk per tensor_info entry (so per_request_reading_tensors,
+        bumped by len(tensor_info) in new_result_tensors, balances exactly),
+        each reconstructed as a byte-identical tensor from the inline ints
+        using the tensor_info dtype/shape and run through the same postprocess.
+        """
+        for chunk in self._build_inline_chunks(result):
+            self._emit_chunk(chunk)
+
+    def _build_inline_chunks(self, result: ResultTensors) -> list[ResultChunk]:
+        """Construct the ResultChunk list for an inline-values message
+        (shared by the immediate path and MSTAR_ORDERED_EMIT's FIFO path)."""
+        modality = result.graph_edge.name.replace("_output", "")
+        # The producer keys inline_values by the pre-rename edge name; there is
+        # exactly one entry (this edge). Fall back to the single value list.
+        inline_map: dict = result.metadata["inline_values"]
+        values = next(iter(inline_map.values())) if inline_map else []
+        chunk_metadata = {
+            k: v for k, v in (result.metadata or {}).items()
+            if k != "inline_values"
+        }
+        # Keep parity with _process_read_tensors' audio enrichment: an audio
+        # item emitted inline must carry sample_rate too, or clients fall
+        # back to a hardcoded rate and mis-wrap the PCM. (Today only integer
+        # text tokens ride inline, but the two chunk-assembly paths must not
+        # diverge on this field.)
+        if modality == "audio" and self.model is not None:
+            chunk_metadata = {
+                **chunk_metadata,
+                "sample_rate": self.model.get_output_sample_rate("audio"),
+            }
+        chunks: list[ResultChunk] = []
+        for tensor_info in result.graph_edge.tensor_info:
+            n = 1
+            for d in tensor_info.dims:
+                n *= int(d)
+            ints = values[:n]
+            values = values[n:]
+            if self._detok_enabled and modality == "text":
+                # Defer detok: carry exactly what postprocess needs (ints, dtype,
+                # dims). The detok child reconstructs the identical tensor, so the
+                # bytes match the inline branch below. Only text is offloaded.
+                chunks.append(ResultChunk(
+                    request_id=result.request_id,
+                    modality=modality,
+                    data=b"",
+                    metadata=chunk_metadata,
+                    pending_detok=PendingDetok(
+                        ints=list(ints),
+                        dtype=tensor_info.dtype,
+                        dims=tuple(tensor_info.dims),
+                    ),
+                ))
+            else:
+                tensor = torch.tensor(ints, dtype=tensor_info.dtype).reshape(
+                    tensor_info.dims
+                )
+                postprocessed = self.model.postprocess(tensor, modality)
+                chunks.append(ResultChunk(
+                    request_id=result.request_id,
+                    modality=modality,
+                    data=postprocessed,
+                    metadata=chunk_metadata,
+                ))
+        return chunks
+
+    def _flush_emit_fifo(self, key: tuple[str, str]) -> None:
+        """Emit the head-run of ready entries for one (rid, modality) FIFO.
+
+        Arrival order == the producing worker's send order (single ZMQ FIFO
+        per rid), so draining ready heads preserves true token order; an
+        unread SHM entry at the head holds everything behind it until its
+        read lands (at most the transport latency — the same latency that
+        today reorders instead).
+        """
+        fifo = self._emit_fifos.get(key)
+        if fifo is None:
+            return
+        n_emitted = 0
+        while fifo and fifo[0]["ready"]:
+            entry = fifo.popleft()
+            for u in entry["uuid_order"]:
+                chunk = entry["chunks"].get(u)
+                if chunk is not None:
+                    self._emit_chunk(chunk)
+                    n_emitted += 1
+        if self._ordered_emit_debug:
+            logger.warning(
+                "ORDEMIT flush key=%s emitted=%d held=%d head_pending=%s",
+                key, n_emitted, len(fifo),
+                (sorted(fifo[0]["pending"]) if fifo else None),
+            )
+        if not fifo:
+            self._emit_fifos.pop(key, None)
 
     def _discard_result_tensor(
         self, result: ResultTensors
     ):
+        # Inline messages carry no transported tensors: the producer never
+        # registered them for send and already released its ref locally, so
+        # there is nothing to ack. Acking would deref uuids the producer
+        # doesn't hold — make discard a no-op for inline-only messages.
+        if result.metadata and "inline_values" in result.metadata:
+            return
         # The request is gone, so don't start a read — just ack the tensors back
         # to the producing worker so it can free the source buffers.
         self.tensor_manager.ack_unread_tensors(
@@ -429,13 +741,20 @@ class PreprocessWorkerThread:
                         request_id=request_id,
                         uuid=tensor_info.uuid
                     )
-                    postprocessed = self.model.postprocess(
-                        tensor, modality,
-                        request_kwargs=self.request_model_kwargs.get(request_id),
-                    )
-
-                    chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
-                        tensor_info.uuid] or {}
+                    # Tolerant metadata lookup: a duplicate completion for an
+                    # aliased/re-sent uuid (or a completion racing cleanup)
+                    # finds the key already deleted below — a bare double
+                    # subscript raised KeyError and killed the whole
+                    # ready-tensor sweep for every other request. (We keep the
+                    # postprocess call inline at the ResultChunk below rather
+                    # than upstream's precompute, so the MSTAR detok-defer path
+                    # for text can skip postprocess entirely; upstream's
+                    # request_kwargs is threaded into that inline call.)
+                    chunk_metadata = (
+                        self.tensor_uuid_to_metadata_per_request
+                        .get(request_id, {})
+                        .get(tensor_info.uuid)
+                    ) or {}
                     # Audio is emitted as headerless 16-bit PCM; surface the
                     # model's output sample rate + channel count so clients can
                     # wrap it.
@@ -446,14 +765,72 @@ class PreprocessWorkerThread:
                             "num_channels": self.model.get_output_audio_channels("audio"),
                         }
 
-                    self.out_queue.put(ResultChunk(
-                        request_id=request_id,
-                        modality=modality,
-                        data=postprocessed,
-                        metadata=chunk_metadata,
-                    ))
-                    del self.tensor_uuid_to_metadata_per_request[request_id][
-                        tensor_info.uuid]
+                    if self._detok_enabled and modality == "text":
+                        # Defer detok (SHM text path — e.g. the prefill first
+                        # token, excluded from the inline transport). Ship the
+                        # flat ints + dtype + dims; the child rebuilds the same
+                        # tensor. Non-text (audio/image) stays inline.
+                        chunk = ResultChunk(
+                            request_id=request_id,
+                            modality=modality,
+                            data=b"",
+                            metadata=chunk_metadata,
+                            pending_detok=PendingDetok(
+                                ints=tensor.flatten().tolist(),
+                                dtype=tensor.dtype,
+                                dims=tuple(tensor.shape),
+                            ),
+                        )
+                    else:
+                        chunk = ResultChunk(
+                            request_id=request_id,
+                            modality=modality,
+                            data=self.model.postprocess(
+                                tensor, modality,
+                                request_kwargs=self.request_model_kwargs.get(request_id),
+                            ),
+                            metadata=chunk_metadata,
+                        )
+                    waiters = (
+                        self._uuid_to_emit_entry.pop(
+                            (request_id, tensor_info.uuid), None,
+                        )
+                        if self._ordered_emit else None
+                    )
+                    if self._ordered_emit and self._ordered_emit_debug:
+                        logger.warning(
+                            "ORDEMIT completion rid=%s uuid=%s waiters=%s",
+                            request_id, tensor_info.uuid,
+                            len(waiters) if waiters else 0,
+                        )
+                    if waiters:
+                        # MSTAR_ORDERED_EMIT: attach to every arrival-ordered
+                        # entry waiting on this uuid; flush each FIFO whose
+                        # entry became ready at the head.
+                        for key, entry in waiters:
+                            entry["chunks"][tensor_info.uuid] = chunk
+                            entry["pending"].discard(tensor_info.uuid)
+                            if not entry["pending"]:
+                                entry["ready"] = True
+                                self._flush_emit_fifo(key)
+                    elif not self._ordered_emit:
+                        # Flag off: emit directly, as before ordered emit.
+                        self._emit_chunk(chunk)
+                    else:
+                        # Ordered emit ON but no waiters: every SHM arrival
+                        # registers waiters under the flag, so this is either
+                        # a DUPLICATE completion for an aliased/re-sent uuid
+                        # (the first completion already emitted for every
+                        # waiter — emitting again would deliver a duplicate
+                        # token) or an entry dropped by request cleanup (rid
+                        # dead). Drop, don't emit.
+                        logger.debug(
+                            "ORDEMIT dropping waiterless completion rid=%s "
+                            "uuid=%s", request_id, tensor_info.uuid,
+                        )
+                    self.tensor_uuid_to_metadata_per_request.get(
+                        request_id, {}
+                    ).pop(tensor_info.uuid, None)
                     self.tensor_manager.dereference(
                         request_id=request_id,
                         uuid=tensor_info.uuid
@@ -490,17 +867,25 @@ class PreprocessWorkerThread:
                 # finished request open for its final chunks only briefly, so
                 # queued read-starts / acks / cleanups must never wait behind a
                 # multi-second media preprocess. Drain them fully every pass
-                # and take at most one preprocess item afterwards.
+                # (upstream #181 drain-ahead) and admit input afterwards.
                 while not self.result_tensor_queue.empty():
                     did_work = True
                     self._read_result_tensor(self.result_tensor_queue.get())
                 while not self.abort_request_queue.empty():
                     did_work = True
+                    abort_rid = self.abort_request_queue.get()
+                    # MSTAR_PREPROC_PROC: if this request is still being
+                    # preprocessed in the pool (not yet admitted), cancel it so
+                    # get_ready drops its completion instead of sending a
+                    # NEW_REQUEST *after* this ABORT (which would leave it
+                    # admitted-but-un-aborted). No-op when the flag is off.
+                    if self.preproc_client is not None:
+                        self.preproc_client.cancel_rid(abort_rid)
                     self.communicator.send(
                         "conductor",
                         ConductorMessage(
                             message_type=ConductorMessageType.ABORT_REQUEST,
-                            body=AbortRequest(request_id=self.abort_request_queue.get()),
+                            body=AbortRequest(request_id=abort_rid),
                         ),
                     )
                 while not self.discard_tensor_queue.empty():
@@ -512,13 +897,52 @@ class PreprocessWorkerThread:
                     self.tensor_manager.cleanup_request(req_id)
                     if req_id in self.tensor_uuid_to_metadata_per_request:
                         del self.tensor_uuid_to_metadata_per_request[req_id]
+                    # MSTAR_DETOK_PROC: free the child's per-rid state (complete
+                    # or abort). Outstanding items still return normally and are
+                    # dropped as late chunks if the rid is gone (tolerant path in
+                    # get_result_chunks). No-op when the flag is off.
+                    if self.detok_client is not None:
+                        self.detok_client.drop_rid(req_id)
+                    if self._ordered_emit:
+                        # Drop this rid's held-back entries and uuid refs; a
+                        # late read for a dropped entry falls back to the
+                        # direct out_queue path above (harmless for dead rid).
+                        fifo_keys = [
+                            k for k in self._emit_fifos if k[0] == req_id
+                        ]
+                        uuid_keys = [
+                            k for k in self._uuid_to_emit_entry
+                            if k[0] == req_id
+                        ]
+                        for key in fifo_keys:
+                            if self._ordered_emit_debug:
+                                fifo = self._emit_fifos.get(key)
+                                logger.warning(
+                                    "ORDEMIT cleanup-drop key=%s held=%d "
+                                    "head_pending=%s",
+                                    key, len(fifo) if fifo else 0,
+                                    (sorted(fifo[0]["pending"])
+                                     if fifo else None),
+                                )
+                            self._emit_fifos.pop(key, None)
+                        for uk in uuid_keys:
+                            self._uuid_to_emit_entry.pop(uk, None)
                     self.request_model_kwargs.pop(req_id, None)
+                # Always call _process_read_tensors (upstream order): a plain
+                # `did_work or ...` would short-circuit the call once other work
+                # already flipped did_work True.
                 did_work = self._process_read_tensors() or did_work
+                # Input admission LAST (upstream #181 drain-ahead): result
+                # delivery above drains ahead of media preprocess so a slow
+                # media load can't starve output. One input per pass.
                 if not self.in_queue.empty():
                     did_work = True
                     pre_input = self.in_queue.get()
                     try:
-                        self._process_input(pre_input)
+                        # MSTAR_PREPROC_PROC: _on_new_input offloads to the pool
+                        # when eligible, else processes inline. No-op offload
+                        # when the flag is off (falls through to _process_input).
+                        self._on_new_input(pre_input)
                     except Exception as exc:  # noqa: BLE001 — any failure must reach the client
                         # A request whose media load or prompt processing fails
                         # never reaches the conductor, so nothing downstream
@@ -537,6 +961,30 @@ class PreprocessWorkerThread:
                         ))
                         self.tensor_manager.cleanup_request(pre_input.request_id)
                         self.request_model_kwargs.pop(pre_input.request_id, None)
+                # MSTAR_PREPROC_PROC: admit any requests whose off-process
+                # preprocessing finished (in submit order). No-op when the flag
+                # is off. Kept in the loop so completions drain promptly; each
+                # wrapped so a child-side failure fails its request (error chunk)
+                # rather than hanging the client (upstream #181 intent).
+                if self.preproc_client is not None:
+                    for comp in self.preproc_client.get_ready():
+                        did_work = True
+                        try:
+                            self._complete_preproc(comp)
+                        except Exception as exc:  # noqa: BLE001
+                            rid = comp[1].request_id
+                            logger.exception(
+                                "Preprocessing failed for request %s", rid
+                            )
+                            status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
+                            self.out_queue.put(ResultChunk(
+                                request_id=rid,
+                                modality="error",
+                                data=str(exc).encode("utf-8"),
+                                metadata={"status": status},
+                            ))
+                            self.tensor_manager.cleanup_request(rid)
+                            self.request_model_kwargs.pop(rid, None)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
 

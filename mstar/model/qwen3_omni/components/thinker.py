@@ -68,6 +68,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
             rms_norm_eps=tc.rms_norm_eps,
             use_mrope=True,
             comm_group=comm_group,
+            layer_idx=layer_idx,
         )
 
         # Post-attention layernorm
@@ -221,8 +222,14 @@ class Qwen3OmniThinkerModel(nn.Module):
         layer_0_embed = hidden_states.clone()
         layer_n_hidden = None
 
+        from mstar.engine.compile_ops import custom_ops_enabled
+        _use_ops = custom_ops_enabled()
         for layer_idx, decoder_layer in enumerate(self.model.layers):
-            cache_handle.set_layer_idx(layer_idx)
+            # Under the custom-op path each attention call receives its
+            # layer_idx explicitly (self_attn.layer_idx), so this per-layer
+            # disabled call -- a graph break of its own -- is skipped.
+            if not _use_ops:
+                cache_handle.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
                 hidden_states,
                 cache_handle=cache_handle,

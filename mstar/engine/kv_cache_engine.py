@@ -23,6 +23,7 @@ from mstar.engine.cache_manager import (
 )
 from mstar.engine.cpu_page_pool import CPUPagePool
 from mstar.engine.cuda_graph_runner import (
+    _DIRECT_FEED_KEY,
     CudaGraphRunner,
     PiecewiseCudaGraphRunner,
     build_piecewise_runners,
@@ -37,7 +38,7 @@ from mstar.engine.kv_store import (
 )
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
 from mstar.utils.profiler import range_pop, range_push
-from mstar.utils.sampling import Sampler, SamplingConfig
+from mstar.utils.sampling import Sampler, SamplingConfig, _slim_sample_enabled, sample_batched_and_unpack
 
 logger = logging.getLogger(__name__)
 
@@ -447,11 +448,58 @@ class KVCacheEngine(BaseEngine):
     def get_max_batch_size(self, node_name, graph_walk):
         if node_name not in self.submodule_management:
             return
+        # Merged multimodal prefill walks are SINGLE-REQUEST by contract (the
+        # submodule asserts it): they reuse the prefill_vision/text CAPTURES,
+        # so with an expanded capture grid (MSTAR_VIS/PREFILL_BATCH_SIZES) the
+        # capture-derived cap below would let the scheduler pack several
+        # merged walks into one step and crash every step ("Batching not
+        # implemented for merged multimodal prefill" — observed as a worker
+        # main-loop assert storm at boot). Cap them at 1 here until
+        # a batched merge is actually implemented.
+        if str(graph_walk) in ("prefill_multimodal", "prefill_multimodal_audio"):
+            return 1
         submod_max_bs = self.submodule_management[node_name].submodule.max_batch_size(graph_walk)
         submod_mg = self.submodule_management[node_name]
         if submod_mg.cuda_graph_runner is None:
             return submod_max_bs
 
+        # Bounded packed prefill: MSTAR_UNCAP_PREFILL=<N>
+        # raises the per-step prefill batch from the captured-graph cap (<=4) to N, so up
+        # to N ready requests run as ONE eager varlen forward (vLLM-style) instead of
+        # ceil(count/4) serial captured steps. BOUNDED (not None/unbounded): the FlashInfer
+        # prefill workspace is a fixed buffer, so an unbounded packed forward overflows it
+        # on large audio prefills (an illegal-memory-access failure mode for multi-request
+        # audio batches). Parity-safe for text/audio: per-request causal via qo_indptr;
+        # minibatching a varlen prefill is identical per request. Not applied to vision
+        # prefill (asserts single-request unless BATCH_VISION).
+        # Exclude prefill_audio: the eager packed AUDIO prefill path illegal-accesses
+        # (untested multi-request audio KV layout). The audio-output path already performs
+        # well without this batching, so gating it out costs nothing and keeps the
+        # text/vision prefill path — where this batching is actually needed — packing
+        # safely.
+        # ALLOWLIST, not a name-prefix blacklist: new prefill walks (e.g. the
+        # merged prefill_multimodal, whose audio variant carries the exact
+        # multi-request audio KV layout the exclusion exists for) must OPT IN
+        # after their packed layout is verified, instead of silently
+        # qualifying because their name starts with "prefill". prefill_vision
+        # qualifies ONLY under MSTAR_BATCH_VISION_PREFILL — without it the
+        # submodule asserts one request per vision step, so an uncapped
+        # multi-request vision batch is a guaranteed step crash.
+        _uncap = os.environ.get("MSTAR_UNCAP_PREFILL", "")
+        _walk_s = str(graph_walk)
+        if _uncap and _walk_s == "prefill_vision":
+            from mstar.model.qwen3_omni.qwen3_omni_model import (
+                batch_vision_prefill_enabled,
+            )
+            if not batch_vision_prefill_enabled():
+                _uncap = ""
+        if _uncap and _walk_s in ("prefill_text", "prefill_vision"):
+            try:
+                _n = int(_uncap)
+            except ValueError:
+                _n = 0
+            if _n > 0:
+                return _n if submod_max_bs is None else min(_n, submod_max_bs)
         runner = submod_mg.cuda_graph_runner
         configs = [
             cfg for cfg in runner.capture_configs \
@@ -562,12 +610,48 @@ class KVCacheEngine(BaseEngine):
             range_push("ar.batched.sample", synchronize=False)
         if batched_logits is not None:
             sampler = self.submodule_management[batch.node_name].sampler
-            sampled = sampler.sample(batch.request_ids, batched_logits)
-            for rid, view in zip(batch.request_ids, sampled.split(1), strict=True):
-                rid_out = batched_output[rid]
-                rid_out["new_token"] = [view]
-                del rid_out["logits"]
-            output = NodeOutput(per_request_output_tensors=batched_output)
+            # The packed prefill forward returns ONLY the __batched_* sentinels
+            # (no per-rid dicts), and __batched_logits__ is [padded_bs, V]. Mirror
+            # cuda_graph_runner.sample_and_remap: slice to the real request count,
+            # sample once (.clone() to break FlashInfer's reused output-buffer alias),
+            # BUILD per-rid outputs fresh (reuse any existing per-rid entry), then
+            # unpack packed sentinels (e.g. __batched_thinker_states__) at real
+            # seq-len boundaries via the submodule hook. Fixes the KeyError when the
+            # uncapped (MSTAR_UNCAP_PREFILL) batch routes prefill through this path.
+            if _slim_sample_enabled():
+                # MSTAR_SLIM_SAMPLE: slice+sample+clone+split is shared with
+                # cuda_graph_runner._sample_and_remap's identical fast path —
+                # see sample_batched_and_unpack. The per-rid merge below (reuse
+                # existing entries, drop "logits") stays call-site-specific.
+                _, new_token_map = sample_batched_and_unpack(
+                    sampler, batch.request_ids, batched_logits,
+                )
+            else:
+                stacked = batched_logits[:len(batch.request_ids)]
+                sampled = sampler.sample(batch.request_ids, stacked).clone()
+                new_token_map = {
+                    rid: {"new_token": [view]}
+                    for rid, view in zip(batch.request_ids, sampled.split(1), strict=True)
+                }
+            per_rid = {}
+            for rid, rid_new_token in new_token_map.items():
+                rid_out = batched_output.get(rid) or {}
+                rid_out["new_token"] = rid_new_token["new_token"]
+                rid_out.pop("logits", None)
+                per_rid[rid] = rid_out
+            _unpack = getattr(submodule, "unpack_packed_outputs", None)
+            if _unpack is not None:
+                unpacked = _unpack(
+                    static_output=batched_output,
+                    request_ids=batch.request_ids,
+                    real_seq_lens=[inp.input_seq_len for inp in inputs],
+                    inputs=inputs,
+                    per_request_info=batch.per_request_info,
+                )
+                if unpacked:
+                    for rid, ro in unpacked.items():
+                        per_rid.setdefault(rid, {}).update(ro)
+            output = NodeOutput(per_request_output_tensors=per_rid)
         else:
             output = NodeOutput(per_request_output_tensors=batched_output)
             output = self._sample_decode_outputs(batch.node_name, output)
@@ -659,6 +743,18 @@ class KVCacheEngine(BaseEngine):
         implementation on NodeSubmodule derives this from
         ``get_cuda_graph_configs`` (graph_walk membership).
         """
+        # MSTAR_SIDE_PREFILL: batches dispatched to the side stream must NEVER
+        # replay a captured graph. The captured decode graph shares interned
+        # static input buffers across its slots and mutates a single
+        # ``next_slot`` RMW counter under a single-writer (main GPU thread)
+        # assumption; a concurrent side replay would race both. The eager /
+        # batched path this forces uses FlashInfer workspace label "main",
+        # disjoint from decode's per-slot "..._cugraph_slotN" labels, so it is
+        # safe to run concurrently with decode replays. Side prefill batches
+        # aren't decode shapes anyway (they'd miss the captured graph), but
+        # gate explicitly so the invariant doesn't depend on shape luck.
+        if batch.metadata.get("side_stream"):
+            return False
         submod_mgmt = self.submodule_management[batch.node_name]
         submodule = submod_mgmt.submodule
         if submodule is None:
@@ -765,6 +861,21 @@ class KVCacheEngine(BaseEngine):
             launch_started_event=batch.metadata.get("launch_started_event"),
             exec_timings=batch.exec_timings if self.enable_profile else None,
         )
+
+        # MSTAR_DIRECT_FEED: the runner may stash (batched_sampled_tokens,
+        # rid_order) under a private sentinel key in the per-rid map. Pop it off
+        # here — never let it reach the worker's rid-keyed
+        # per_request_output_tensors — and hoist it onto the NodeOutput.
+        # Absent (flag off, or non-fast-path) → NodeOutput carries None and the
+        # per-rid map is byte-identical.
+        direct_feed = batched_output.pop(_DIRECT_FEED_KEY, None)
+        if direct_feed is not None:
+            sampled, rid_order = direct_feed
+            return NodeOutput(
+                per_request_output_tensors=batched_output,
+                batched_sampled_tokens=sampled,
+                batched_sampled_rids=rid_order,
+            )
 
         return NodeOutput(per_request_output_tensors=batched_output)
 
@@ -885,6 +996,23 @@ class KVCacheEngine(BaseEngine):
         runner = submod_mgmt.cuda_graph_runner
         for rid, info in batch.per_request_info.items():
             sampling_config = info.sampling_config.get(batch.node_name)
+            # Change-detect BEFORE set_config: this loop runs per rid per
+            # step, and set_config both rebuilds the SamplingConfig (two
+            # asdicts + ctor, ~14µs/rid) AND clears the sampler's
+            # _batch_cfg_cache — which structurally prevented
+            # MSTAR_SAMPLER_CFG_CACHE from ever hitting at steady state
+            # (every prior cache A/B measured a dead cache). Dataclass ==
+            # is ~1µs and covers the vocab_size mask-realloc case; configs
+            # are static per request at steady state, so the eq path is the
+            # common one. Byte-identical behavior on change.
+            if (
+                sampling_config is not None
+                and submod_mgmt.sampler._sampling_config.get(rid)
+                == sampling_config
+            ):
+                if runner is not None:
+                    runner.update_request_config(rid, sampling_config)
+                continue
             sampling_kwargs = {} if sampling_config is None else asdict(sampling_config)
             submod_mgmt.sampler.set_config(rid, **sampling_kwargs)
             # Mirror into the cuda-graph runner's master GPU buffers.
@@ -899,24 +1027,45 @@ class KVCacheEngine(BaseEngine):
         skipped_rids: set[str] = set()
         if self.enable_nvtx:
             range_push("kv_cache.prepare_inputs")
+        pos_infos = []
         for rid in batch.request_ids:
             labels = cache_mgmt.alloc_manager.get_labels(rid)
-            pos_info = {
+            pos_infos.append({
                 label: cache_mgmt.alloc_manager.get_state(
                     rid, label
                 ).get_pos_info() for label in labels
-            }
-            req_inputs = submodule.prepare_inputs(
+            })
+        prep_batched = getattr(submodule, "prepare_inputs_batched", None)
+        batched_inputs = None
+        if prep_batched is not None and len(batch.request_ids) > 1:
+            batched_inputs = prep_batched(
                 graph_walk=batch.graph_walk,
-                fwd_info=batch.per_request_info[rid],
-                inputs=batch.per_request_input_tensors[rid],
-                pos_info=pos_info,
-                seen_token_mask=submod_mgmt.sampler.get_token_mask(rid)
+                inputs_list=[
+                    batch.per_request_input_tensors[rid]
+                    for rid in batch.request_ids
+                ],
+                pos_infos=pos_infos,
             )
-            if req_inputs is None:
-                skipped_rids.add(rid)
-            else:
-                node_inputs.append(req_inputs)
+        if batched_inputs is not None:
+            # MSTAR batched-prepare fast path: returns a full input list (no
+            # per-rid skips). upstream's skip-None handling (below) applies to
+            # the per-rid sequential fallback only.
+            node_inputs = batched_inputs
+        else:
+            for rid, pos_info in zip(batch.request_ids, pos_infos, strict=False):
+                # upstream (#176): prepare_inputs may return None when a
+                # submodule elects to skip a rid this step; collect and prune.
+                req_inputs = submodule.prepare_inputs(
+                    graph_walk=batch.graph_walk,
+                    fwd_info=batch.per_request_info[rid],
+                    inputs=batch.per_request_input_tensors[rid],
+                    pos_info=pos_info,
+                    seen_token_mask=submod_mgmt.sampler.get_token_mask(rid)
+                )
+                if req_inputs is None:
+                    skipped_rids.add(rid)
+                else:
+                    node_inputs.append(req_inputs)
 
         if skipped_rids:
             batch.request_ids = [rid for rid in batch.request_ids if rid not in skipped_rids]
@@ -1078,6 +1227,20 @@ class KVCacheEngine(BaseEngine):
                 result[rid] = stops
         return result
 
+    @staticmethod
+    def _mixed_preplan_params(batch: NodeBatch) -> dict | None:
+        """Return the packed pre-plan params the worker stashed at fold time,
+        or ``None`` for a non-mixed batch (or when MSTAR_MIXED_PREPLAN is off).
+
+        The worker sets ``batch.metadata['mixed_preplan'] = {'num_tokens': ...,
+        'seq_lens': [1]*n_decode + [C]}`` ONLY when it folds a chunk into a
+        thinker_mixed spec step under the flag. Its presence is the sole switch
+        that routes the reserve / pre-plan / reset trio to the packed runner
+        methods; absent (the default and every non-mixed batch), the trio keeps
+        its BASIC_BATCHED-only behavior byte-identical.
+        """
+        return batch.metadata.get("mixed_preplan")
+
     def reserve_replay_slot(self, batch: NodeBatch) -> int | None:
         """Allocate the next double-buffer slot for this batch and stash it
         on ``batch.metadata['cuda_graph_slot']``.
@@ -1086,6 +1249,11 @@ class KVCacheEngine(BaseEngine):
         BEFORE submitting both pre-plan and replay so they target the same
         slot (and the OPPOSITE slot from the in-flight replay). Returns the
         slot index, or ``None`` if no captured graph matches (eager path).
+
+        For a chain-folded thinker_mixed batch (MSTAR_MIXED_PREPLAN — detected
+        via ``mixed_preplan`` metadata) the reservation goes through the packed
+        runner surface, which keys on num_tokens (the token bucket) rather than
+        the BASIC_BATCHED-only key lookup.
         """
         runner = self.submodule_management[batch.node_name].cuda_graph_runner
         if runner is None or not runner.graphs:
@@ -1094,15 +1262,24 @@ class KVCacheEngine(BaseEngine):
             info.requires_cfg for info in batch.per_request_info.values()
         )
         bs = len(batch.request_ids)
-        # Don't pass num_tokens — the runner derives it from the captured
-        # BASIC_BATCHED config. Non-decode (prefill) batches don't speculate
-        # and don't pre-reserve, so they go through ``run`` which advances
-        # the per-key counter itself.
-        slot = runner.reserve_slot(
-            graph_walk=batch.graph_walk,
-            requires_cfg=has_cfg,
-            batch_size=bs,
-        )
+        mixed = self._mixed_preplan_params(batch)
+        if mixed is not None:
+            slot = runner.reserve_packed_slot(
+                graph_walk=batch.graph_walk,
+                requires_cfg=has_cfg,
+                batch_size=bs,
+                num_tokens=mixed["num_tokens"],
+            )
+        else:
+            # Don't pass num_tokens — the runner derives it from the captured
+            # BASIC_BATCHED config. Non-decode (prefill) batches don't speculate
+            # and don't pre-reserve, so they go through ``run`` which advances
+            # the per-key counter itself.
+            slot = runner.reserve_slot(
+                graph_walk=batch.graph_walk,
+                requires_cfg=has_cfg,
+                batch_size=bs,
+            )
         if slot is not None:
             batch.metadata["cuda_graph_slot"] = slot
         return slot
@@ -1112,6 +1289,10 @@ class KVCacheEngine(BaseEngine):
         targeted for this batch. Used to recover from speculation drops
         or pre-plan failures without disturbing other slots' valid
         pre-plan state. No-op if no captured graph matches.
+
+        Routes to the packed reset for a chain-folded thinker_mixed batch
+        (``mixed_preplan`` metadata present), matching how the reserve /
+        pre-plan targeted it.
         """
         runner = self.submodule_management[batch.node_name].cuda_graph_runner
         if runner is None or not runner.graphs:
@@ -1121,12 +1302,22 @@ class KVCacheEngine(BaseEngine):
         )
         bs = len(batch.request_ids)
         slot = batch.metadata.get("cuda_graph_slot")
-        runner.reset_pre_plan_state_for_slot(
-            graph_walk=batch.graph_walk,
-            requires_cfg=has_cfg,
-            batch_size=bs,
-            slot=slot,
-        )
+        mixed = self._mixed_preplan_params(batch)
+        if mixed is not None:
+            runner.reset_packed_pre_plan_for_slot(
+                graph_walk=batch.graph_walk,
+                requires_cfg=has_cfg,
+                batch_size=bs,
+                num_tokens=mixed["num_tokens"],
+                slot=slot,
+            )
+        else:
+            runner.reset_pre_plan_state_for_slot(
+                graph_walk=batch.graph_walk,
+                requires_cfg=has_cfg,
+                batch_size=bs,
+                slot=slot,
+            )
 
     def pre_plan_for_batch(
         self,
@@ -1142,6 +1333,13 @@ class KVCacheEngine(BaseEngine):
         We forward it to the runner so plan() targets the inactive slot's
         wrapper (the one replay(N) is NOT using).
 
+        For a chain-folded thinker_mixed batch (``mixed_preplan`` metadata) the
+        packed pre-plan runs instead: it needs num_tokens (the bucket) and the
+        reconstructed per-row seq_lens ([1]*n_decode + [C]), both stashed by the
+        worker at fold time — the seq_lens can't be re-derived here without the
+        prepared inputs, and the decode rows' KV length depends on advance(N)
+        having run, which the worker's advance_event gate guarantees.
+
         Returns True if pre-planning was applied (caller's GPU thread should
         wait on the plan future before running this batch). False if no
         captured graph matches, in which case the GPU thread plans inline.
@@ -1153,6 +1351,20 @@ class KVCacheEngine(BaseEngine):
             info.requires_cfg for info in batch.per_request_info.values()
         )
         slot = batch.metadata.get("cuda_graph_slot")
+        mixed = self._mixed_preplan_params(batch)
+        if mixed is not None:
+            if slot is None:
+                # Reservation didn't match a captured packed graph (eager
+                # fallback). Nothing to pre-plan; GPU thread runs inline.
+                return False
+            return runner.pre_plan_packed_batch(
+                graph_walk=batch.graph_walk,
+                requires_cfg=has_cfg,
+                request_ids=list(batch.request_ids),
+                seq_lens=list(mixed["seq_lens"]),
+                num_tokens=mixed["num_tokens"],
+                slot=slot,
+            )
         return runner.pre_plan_for_batch(
             graph_walk=batch.graph_walk,
             requires_cfg=has_cfg,

@@ -50,6 +50,21 @@ class RMSNorm(nn.Module):
             normed = x * torch.rsqrt(var + self.variance_epsilon)
             normed = normed * (1.0 + self.weight.to(torch.float32))
             return normed.to(orig_dtype)
+        if torch.compiler.is_compiling():
+            # Under torch.compile the FlashInfer call below is untraceable and
+            # graph-breaks at EVERY norm (measured as a large number of breaks
+            # per boot), which prevents Inductor from fusing the
+            # norm->residual->proj chains.
+            # The pure-torch form traces cleanly and fuses; Inductor's fused
+            # kernel replaces FlashInfer's here. Numerics: float32 rsqrt path,
+            # same as the gemma branch — ULP-level drift vs FlashInfer is
+            # expected (same class as chunked-prefill drift).
+            orig_dtype = hidden_states.dtype
+            x = hidden_states.to(torch.float32)
+            var = x.square().mean(dim=-1, keepdim=True)
+            normed = x * torch.rsqrt(var + self.variance_epsilon)
+            normed = normed * self.weight.to(torch.float32)
+            return normed.to(orig_dtype)
         # FlashInfer's rmsnorm wants 2D input — reshape/restore around the
         # call so callers can pass arbitrary leading dims (e.g. the talker
         # code_predictor's [bs, seq_len, hidden_size] batched path).

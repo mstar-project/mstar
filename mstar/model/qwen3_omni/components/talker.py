@@ -81,6 +81,7 @@ class Qwen3OmniTalkerLayer(nn.Module):
             rms_norm_eps=rms_norm_eps,
             use_mrope=False,
             comm_group=comm_group,
+            layer_idx=layer_idx,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
 
@@ -157,9 +158,14 @@ class Qwen3OmniTalkerLanguageModel(nn.Module):
         input_embeds: torch.Tensor,
         cache_handle: BatchedCacheManager,
     ) -> torch.Tensor:
+        from mstar.engine.compile_ops import custom_ops_enabled
+        _use_ops = custom_ops_enabled()
         hidden_states = input_embeds
         for layer_idx, decoder_layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
+            # Under the custom-op path attention receives layer_idx explicitly
+            # (self_attn.layer_idx), so this per-layer disabled call is skipped.
+            if not _use_ops:
+                cache_handle.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
                 hidden_states=hidden_states, cache_handle=cache_handle
             )
@@ -260,7 +266,8 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
 
     def __init__(self, hidden_size: int, intermediate_size: int,
                  num_heads: int, num_kv_heads: int, head_dim: int,
-                 rms_norm_eps: float, rope_theta: float):
+                 rms_norm_eps: float, rope_theta: float,
+                 layer_idx: int | None = None):
         super().__init__()
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.self_attn = Qwen3OmniAttention(
@@ -271,6 +278,7 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
             rope_theta=rope_theta,
             rms_norm_eps=rms_norm_eps,
             use_mrope=False,
+            layer_idx=layer_idx,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = ParallelGatedMLP(
@@ -312,8 +320,9 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
                 head_dim=cp.head_dim,
                 rms_norm_eps=cp.rms_norm_eps,
                 rope_theta=cp.rope_theta,
+                layer_idx=_i,
             )
-            for _ in range(cp.num_hidden_layers)
+            for _i in range(cp.num_hidden_layers)
         ])
         self.norm = RMSNorm(cp.hidden_size, eps=cp.rms_norm_eps)
 
@@ -329,8 +338,11 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
         """
         Just runs the inner layers; does NOT run embedding.
         """
+        from mstar.engine.compile_ops import custom_ops_enabled
+        _use_ops = custom_ops_enabled()
         for _layer_idx, decoder_layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(_layer_idx)
+            if not _use_ops:
+                cache_handle.set_layer_idx(_layer_idx)
             hidden_states = decoder_layer(
                 hidden_states,
                 cache_handle

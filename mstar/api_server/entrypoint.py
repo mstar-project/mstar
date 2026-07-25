@@ -22,8 +22,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server.data_worker import PreprocessWorker
-from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
+from mstar.api_server.request_types import (
+    APIServerMessage,
+    PreprocessInput,
+    ResultChunk,
+    ResultTensors,
+    SlimResultTokens,
+)
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
@@ -70,6 +77,11 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    # MSTAR_BURST_CAP (default off): cap the conductor's host-CPU thread
+    # fan-out. Re-applied here (not just inherited) so a per-role override
+    # MSTAR_BURST_THREADS_CONDUCTOR takes effect. No-op when off.
+    from mstar.utils.burst_cap import apply_process_thread_cap
+    apply_process_thread_cap("conductor")
     # Read yaml early to extract optional `model_kwargs:` section for the model
     # constructor. Lets a yaml override init-time model parameters (e.g.
     # Pi05's action_horizon for the DROID benchmark variant) without code
@@ -170,6 +182,9 @@ class APIServer:
         model_name: str = "dummy",
         log_stats: bool = False,
         log_stats_file: str | None = None,
+        cache_dir: str | None = None,
+        model_kwargs: dict | None = None,
+        log_level: str = "INFO",
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -194,7 +209,13 @@ class APIServer:
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
-            enable_prof=self.log_stats
+            enable_prof=self.log_stats,
+            # MSTAR_DETOK_PROC: the detok child rebuilds the SAME tokenizer-only
+            # model from these, so its postprocess is byte-identical to ours.
+            model_name=model_name,
+            cache_dir=cache_dir,
+            model_kwargs=model_kwargs,
+            log_level=log_level,
         )
 
         # Concurrent request tracking
@@ -203,6 +224,10 @@ class APIServer:
             collections.OrderedDict()
         )
         self._recently_completed_ttl = 15.0
+        # MSTAR_SLIM_EMIT template cache: (rid, edge_name) -> first full
+        # ResultTensors seen for that pair; slim items inflate from it.
+        # Pruned with the rid in _prune_recently_completed.
+        self._slim_templates: dict = {}
         self.request_lock = threading.Lock()
         self.running = True
 
@@ -325,6 +350,12 @@ class APIServer:
             elif (now - ts) >= self._recently_completed_ttl:
                 stale.append((rid, True))
         for rid, lost_outputs in stale:
+            # MSTAR_SLIM_EMIT: drop this rid's cached slim-inflate templates
+            # (keyed (rid, modality)) as it leaves recently_completed.
+            if self._slim_templates:
+                self._slim_templates = {
+                    k: v for k, v in self._slim_templates.items() if k[0] != rid
+                }
             # only set the event when there are no more pending chunks
             req = self.pending_requests.get(rid)
             if req is not None:
@@ -356,6 +387,77 @@ class APIServer:
             self.preprocess_worker.cleanup_request(rid)
             self.recently_completed.pop(rid, None)
 
+    def _inflate_slim_item(self, item: "SlimResultTokens"):
+        """Synthesize a full ResultTensors from the cached template.
+
+        Shallow-copies the template's graph_edge (fresh list for tensor_info)
+        so per-item consumers downstream never share mutable state across
+        steps. Returns None (warn) if no template exists — cannot happen on a
+        healthy FIFO stream, but a dropped/racing template must not crash the
+        message loop.
+        """
+        import copy as _copy
+        tmpl = self._slim_templates.get((item.request_id, item.name))
+        if tmpl is None:
+            logger.warning(
+                "SLIM_EMIT: no template for (%s, %s); dropping item",
+                item.request_id, item.name,
+            )
+            return None
+        edge = _copy.copy(tmpl.graph_edge)
+        edge.tensor_info = list(tmpl.graph_edge.tensor_info)
+        loop_indices = item.loop_indices
+        loop_key = getattr(item, "loop_key", None)
+        if loop_key is not None:
+            # MSTAR_SLIM_EMIT2: rebuild the NestedLoopIndices from the
+            # template's layout + the item's ints. The worker only sends
+            # loop_key while the step's layout (loop_name_order content +
+            # loop_indices key order, both preserved through pickle) matches
+            # the template step's, so this is value-identical to the object
+            # it replaced (incl. max / label_context_gt semantics).
+            tmpl_li = tmpl.loop_indices.loop_indices
+            if len(loop_key) - 1 != len(tmpl_li):
+                logger.warning(
+                    "SLIM_EMIT2: loop_key arity mismatch for (%s, %s); dropping item",
+                    item.request_id, item.name,
+                )
+                return None
+            loop_indices = NestedLoopIndices(
+                loop_name_order=list(tmpl.loop_indices.loop_name_order),
+                loop_indices=dict(zip(tmpl_li.keys(), loop_key[1:], strict=False)),
+                wg_fwd_pass_idx=loop_key[0],
+            )
+        return ResultTensors(
+            request_id=item.request_id,
+            modality=tmpl.modality,
+            graph_edge=edge,
+            loop_indices=loop_indices,
+            metadata={"inline_values": {item.name: item.values}},
+        )
+
+    def _route_result_tensors(self, body: "ResultTensors") -> None:
+        """Route one ResultTensors by its own request_id status.
+
+        Caller MUST hold ``self.request_lock``. Shared by the single
+        result_tensors message and each item of a coalesced
+        result_tensors_batch (MSTAR_BATCH_EMIT), so the two paths stay
+        identical per item: pending -> new_result_tensors; recently-completed
+        or unknown -> discard_result_tensors (a no-op for inline-values items).
+        """
+        rid = body.request_id
+        if rid in self.pending_requests:
+            logger.debug(
+                "Got new tensors of %s modality for request %s",
+                body.modality, rid
+            )
+            self.preprocess_worker.new_result_tensors(body)
+        elif rid in self.recently_completed:
+            logger.debug("Late result_tensors for completed %s", rid)
+            self.preprocess_worker.discard_result_tensors(body)
+        else:
+            logger.warning("result_tensors for unknown request %s", rid)
+            self.preprocess_worker.discard_result_tensors(body)
+
     def _process_messages(self) -> None:
         """Drain the ZMQ pull socket and route results to pending requests."""
         while self.running:
@@ -369,18 +471,62 @@ class APIServer:
                         logger.warning("Unexpected message type: %s", type(message))
                         continue
 
+                    if message.message_type == "result_tensors_batch":
+                        # Coalesced inline emit results for one decode step
+                        # (MSTAR_BATCH_EMIT). Each item is an independent
+                        # ResultTensors with its own request_id and rid-status,
+                        # so route each exactly as a standalone result_tensors
+                        # message. Items are inline-values only, so the discard
+                        # path is a per-item no-op. One lock acquisition covers
+                        # the whole step's fan-out (same granularity intent as
+                        # the single-message path: one lock per received
+                        # message).
+                        #
+                        # MSTAR_SLIM_EMIT: SlimResultTokens items are
+                        # synthesized into full ResultTensors from the cached
+                        # per-(rid, name) template. Full items always cache
+                        # their template first (same FIFO stream guarantees
+                        # the template precedes any slim item).
+                        with self.request_lock:
+                            for item in message.body.items:
+                                if isinstance(item, SlimResultTokens):
+                                    full = self._inflate_slim_item(item)
+                                    if full is not None:
+                                        self._route_result_tensors(full)
+                                    continue
+                                # Snapshot the template BEFORE routing: the
+                                # data worker MUTATES graph_edge.name
+                                # (_read_result_tensor renames to
+                                # "<modality>_output") on its own thread, and
+                                # loop-index accounting keys on the ORIGINAL
+                                # name — caching the live object made slim
+                                # items accrue under the renamed key, so
+                                # received_final_chunks never satisfied and
+                                # every request rode the 15s TTL (measured
+                                # jct 16.5s at i2t B32).
+                                import copy as _copy
+                                _tmpl_edge = _copy.copy(item.graph_edge)
+                                _tmpl_edge.tensor_info = list(
+                                    item.graph_edge.tensor_info
+                                )
+                                self._slim_templates[
+                                    (item.request_id, item.graph_edge.name)
+                                ] = ResultTensors(
+                                    request_id=item.request_id,
+                                    modality=item.modality,
+                                    graph_edge=_tmpl_edge,
+                                    loop_indices=item.loop_indices,
+                                    metadata={},
+                                )
+                                self._route_result_tensors(item)
+                        continue
+
                     rid = message.body.request_id
 
                     with self.request_lock:
                         if rid in self.pending_requests:
                             if message.message_type == "result_tensors":
-                                logger.debug(
-                                    "Got new tensors of %s modality for request %s",
-                                    message.body.modality, rid
-                                )
-                                self.preprocess_worker.new_result_tensors(
-                                    message.body
-                                )
+                                self._route_result_tensors(message.body)
                             elif message.message_type == "request_complete":
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
@@ -859,6 +1005,14 @@ def main(argv: list[str] | None = None):
     )
     quiet_noisy_loggers()
 
+    # MSTAR_BURST_CAP (default off): bound this process's torch/OMP thread
+    # fan-out so the preprocess wave (image resize + HF feature-extract) draws
+    # a small, constant host-CPU slice instead of grabbing all cores. No-op
+    # when off. Applied here (not in APIServer.__init__) so the env vars are
+    # set BEFORE the conductor is spawned and inherits them.
+    from mstar.utils.burst_cap import apply_process_thread_cap
+    apply_process_thread_cap("api_server")
+
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
@@ -889,6 +1043,9 @@ def main(argv: list[str] | None = None):
         tcp_transfer_device=args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
+        cache_dir=args.cache_dir,
+        model_kwargs=yaml_model_kwargs,
+        log_level=args.log_level,
     )
 
     # Spawn conductor in a separate process
