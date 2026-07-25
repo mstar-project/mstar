@@ -1180,100 +1180,94 @@ class VLLMOmni(InferenceSystem):
 
         try:
             metrics.start_time = time.monotonic()
-            content = []
-            if req_input.prompt:
-                content.append({"type": "text", "text": req_input.prompt})
 
+            # Both T2I and I2I go through /v1/chat/completions.
             if req_type == RequestType.I2I:
+                # I2I threads the prompt correctly as-is (verified working): the
+                # input image_url carries context and forces image output.
                 if not req_input._image_bytes:
                     raise RuntimeError("I2I request missing input image bytes")
-
+                content = []
+                if req_input.prompt:
+                    content.append({"type": "text", "text": req_input.prompt})
                 content.append({
                     "type": "image_url",
                     "image_url": {
-                        "url": _bytes_to_data_url(
-                            req_input._image_bytes,
-                            req_input.image_path,
-                        )
+                        "url": _bytes_to_data_url(req_input._image_bytes, req_input.image_path)
                     },
                 })
+                modalities = None
+            else:
+                # T2I needs three things or the server produces off-prompt images:
+                #   1. The <|im_start|>...<|im_end|> wrap — BAGEL's
+                #      OmniBagelProcessor needs it to build text conditioning;
+                #      without it the prompt is effectively ignored.
+                #   2. Top-level modalities:["image"] to force image output (a
+                #      text-only chat otherwise returns a text answer).
+                #   3. cfg_text_scale / cfg_img_scale via extra_body (from
+                #      get_model_kwargs). The server default cfg_img_scale=1.5 is
+                #      wrong for T2I (no input image): it spins up a spurious
+                #      image-CFG branch and drops text guidance, so
+                #      get_model_kwargs sets cfg_img_scale=1.0.
+                # /v1/images/generations does NOT thread cfg params for BAGEL and
+                # so can't be used here.
+                content = [{
+                    "type": "text",
+                    "text": f"<|im_start|>{req_input.prompt}<|im_end|>",
+                }]
+                modalities = ["image"]
 
-            messages = [{
-                "role": "user",
-                "content": content if content else req_input.prompt,
-            }]
-            payload = {
-                "model": model.get_hf_url(),
-                "messages": messages,
-            }
-
-            # Match vllm-omni benchmark:
-            # generation parameters go into extra_body.
+            messages = [{"role": "user", "content": content}]
+            # Generation parameters go into extra_body (matches vllm-omni bench).
             extra_body = dict(kwargs)
             extra_body.setdefault("width", 1024)
             extra_body.setdefault("height", 1024)
-            if extra_body:
-                payload["extra_body"] = extra_body
+            payload = {
+                "model": model.get_hf_url(),
+                "messages": messages,
+                "extra_body": extra_body,
+            }
+            if modalities is not None:
+                payload["modalities"] = modalities
 
             async with session.post(
                 f"{base_url}/v1/chat/completions",
                 json=payload,
                 headers={
-                    "Authorization": (
-                        f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"
-                    )
+                    "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"
                 },
                 read_bufsize=2**24,
-                timeout=aiohttp.ClientTimeout(
-                    total=None,
-                    sock_read=300,
-                ),
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
             ) as resp:
                 if resp.status != 200:
-                    raise Exception(
-                        f"HTTP {resp.status}: {await resp.text()}"
-                    )
-
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
                 response_json = await resp.json()
 
             arrival_time = time.monotonic()
             found_image = False
-
             for choice in response_json.get("choices", []):
-                message = choice.get("message", {})
-                content = message.get("content")
-
+                content = choice.get("message", {}).get("content")
                 if not isinstance(content, list):
                     continue
-
                 for item in content:
                     if item.get("type") != "image_url":
                         continue
-
                     url = item["image_url"]["url"]
-
                     if url.startswith("data:image"):
                         _, b64 = url.split(",", 1)
-
                         metrics.record_output_chunk(
                             modality="image",
                             data_b64=b64,
                             arrival_time=arrival_time,
                             n_tokens=1,
                         )
-
                         found_image = True
-
             if not found_image:
-                raise RuntimeError(
-                    f"No image outputs found: {response_json}"
-            )
+                raise RuntimeError(f"No image outputs found: {response_json}")
 
             usage = response_json.get("usage") or {}
-
             if (ct := usage.get("completion_tokens")) is not None:
                 metrics.output_text_tokens = ct
-
             if (pt := usage.get("prompt_tokens")) is not None:
                 metrics.input_tokens = pt
 
