@@ -185,6 +185,12 @@ class MStarClient:
             url, data=data, files=files or None, stream=True, timeout=self.timeout
         ) as resp:
             resp.raise_for_status()
+            # ``decode_unicode=True`` only yields ``str`` when ``resp.encoding``
+            # is set, and that is derived from the Content-Type charset. The
+            # server streams ``application/x-ndjson`` without one, so default to
+            # UTF-8 (the NDJSON encoding) instead of dropping every line.
+            if resp.encoding is None:
+                resp.encoding = "utf-8"
             for line in resp.iter_lines(decode_unicode=True):
                 if not isinstance(line, str):
                     continue
