@@ -176,6 +176,7 @@ class VJepa2Model(Model):
         skip_weight_loading: bool = False,
         predictor_kind: str = "masked",
         ac_predictor_config: dict | None = None,
+        max_rollout_horizon: int | None = None,
         **kwargs,
     ):
         self.model_path_hf = model_path_hf
@@ -183,6 +184,10 @@ class VJepa2Model(Model):
         self.skip_weight_loading = skip_weight_loading
 
         self.config = self._load_config(predictor_kind, ac_predictor_config)
+        if max_rollout_horizon is not None:
+            # Settable via the serve yaml's ``model_kwargs:`` section; caps the
+            # rollout Loop's max_iters (requests above it are clamped).
+            self.config.max_rollout_horizon = int(max_rollout_horizon)
         self._repo_dir: Path | None = None
         self._ac_pt_path: Path | None = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
