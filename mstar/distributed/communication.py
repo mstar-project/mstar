@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 import torch
@@ -233,11 +234,15 @@ class WorkerParallelGroups:
         if not self.any_parallelism:
             return
 
+        # A generous timeout (default is ~10 min). First-time bring-up of a very
+        # large checkpoint — slow weight load, first-ever kernel JIT, and CUDA-graph
+        # capture can leave ranks waiting at this setup barrier past the default.
         dist.init_process_group(
             backend="nccl",
             init_method=init_method,
             world_size=self.num_workers,
             rank=self.global_rank,
+            timeout=timedelta(hours=2),
         )
 
         # One subgroup per distinct rank tuple across BOTH mesh axes —
@@ -247,7 +252,11 @@ class WorkerParallelGroups:
         # an SP group (degenerate meshes) maps to one subgroup.
         rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
-            rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
+            # Same generous timeout as init_process_group above (slow first load,
+            # kernel JIT, and graph capture can stall ranks past the default).
+            rank_tuple_to_pg[rank_tuple] = dist.new_group(
+                ranks=list(rank_tuple), timeout=timedelta(hours=2)
+            )
 
         seen: set[int] = set()
         for comm_group in (

@@ -3,13 +3,11 @@
 MLA rotates only the decoupled ``qk_rope_head_dim`` slice of q/k, with YARN
 (NTK-by-parts) frequency scaling and an ``mscale`` amplitude on cos/sin. mstar's
 ``cache_manager.apply_rope`` (FlashInfer) does not implement YARN, so this is a
-standalone rotary module the MLA attention applies itself (analogous to how
-Qwen3-Omni applies its 3D MRoPE outside the cache handle).
+standalone rotary module the MLA attention applies itself.
 
 Style is **interleaved / GPT-J** (``is_neox_style=False`` in DeepSeek): cos/sin
 are ``repeat_interleave(2)`` and adjacent even/odd pairs are rotated. Mirrors
-vLLM ``layers/rotary_embedding/deepseek_scaling_rope.py::DeepseekScalingRotaryEmbedding``
-and the YARN helpers in ``rotary_embedding/common.py``.
+vLLM ``DeepseekScalingRotaryEmbedding`` and the YARN helpers in ``common.py``.
 
 Two ``mscale`` values (both use the 2-arg ``yarn_get_mscale``):
   - **amplitude** on cos/sin (here): ``get_mscale(f, mscale) / get_mscale(f, mscale_all_dim) * attn_factor``.

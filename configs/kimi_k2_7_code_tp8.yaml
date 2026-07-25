@@ -1,0 +1,47 @@
+model: "kimi_k2_7"
+# FALLBACK ONLY — prefer kimi_k2_7_code_tp8_shm.yaml
+# Kimi-K2.7 text backbone — REAL moonshotai/Kimi-K2.7-Code single-node TP=8 serve
+# config (INT4, text-only). This points at the actual ~595 GB multimodal
+# KimiK25ForConditionalGeneration checkpoint but serves ONLY its DeepSeek-V3 text
+# path: the DeepSeek-V3 dims live under `text_config`, its `quantization_config`
+# (pack-quantized, num_bits=4, group_size=32, routed experts only) is NESTED under
+# `text_config`, and the vision tower (vision_tower.* / mm_projector.*) is dropped
+# on load. Serves the routed experts packed with in-kernel Triton W4A16 dequant —
+# the only path that fits the real weights.
+#
+# `model_kwargs` (forwarded to KimiK2Model.__init__):
+#   * config_variant: k27_code   -> KimiK2Config.k27_code() (full 1T dims +
+#                                    moe_in_kernel_dequant=True; keeps the default
+#                                    beta_fast=32.0 — the K2.7-Code text_config value).
+#                                    The checkpoint's nested
+#                                    `text_config.quantization_config` is auto-read at
+#                                    load, so the routed experts are served packed (int32);
+#                                    the lm_head / MLA / dense-FFN / shared experts /
+#                                    vision stay bf16, matching the checkpoint `ignore`.
+#   * checkpoint_path            -> local HF-format snapshot of the 595 GB download
+#   * tokenizer_mode: hf         -> the real Kimi tokenizer (tiktoken-based; ids >> 256)
+#
+# max_seq_len is trimmed to 8192 for first bring-up (the real max is 262144); keep
+# the paged KV cache modest for a first single-request serve.
+#
+# On this cluster (coriander) RDMA is unavailable, so launch with a non-RDMA tensor
+# transport: TENSOR_PROTOCOL=SHM (single node, all 8 GPUs) — see mstar/.sample.env.
+max_seq_len: 8192
+model_kwargs:
+  config_variant: k27_code
+  checkpoint_path: /m-coriander/coriander/garv901/kimi_k2_7_code
+  tokenizer_mode: hf
+# Paged KV cache sized for the real MLA head dims (num_attention_heads=64 KV heads
+# in the naive/materialized MLA path, padded_head_dim=256). 512 pages * 128 =
+# 65536-token capacity — modest, for a first single-request bring-up serve.
+kv_cache:
+  max_num_pages: 512
+  page_size: 128
+# The LLM node is the tensor-parallel node: all 8 ranks on one node with tp_size 8
+# for both the prefill and decode walks. The model code is TP-agnostic — the
+# per-rank shard degree comes from here.
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

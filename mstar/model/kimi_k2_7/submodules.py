@@ -1,8 +1,8 @@
 """Submodules for Kimi-K2.7 (text backbone).
 
-M6: the real :class:`KimiLLMSubmodule` — the ``ARNodeSubmodule`` that drives the
-DeepSeek-V3 text backbone (MLA attention over the paged cache + fine-grained
-sigmoid-routed MoE) through the engine's ``prepare_inputs -> preprocess ->
+The :class:`KimiLLMSubmodule` ``ARNodeSubmodule`` drives the DeepSeek-V3 text
+backbone (MLA attention over the paged cache + fine-grained sigmoid-routed MoE)
+through the engine's ``prepare_inputs -> preprocess ->
 forward/forward_batched -> postprocess -> check_stop`` lifecycle for the
 ``prefill`` and ``decode`` Loop walks.
 
@@ -59,10 +59,10 @@ class KimiLLMSubmodule(ARNodeSubmodule):
     # -- CUDA-graph prefill capture grid (full-size defaults) --------------
     # Overridable per-config via ``config.prefill_token_buckets`` /
     # ``config.prefill_capture_batch_sizes``: ``KimiK2Config.reduced()`` sets a
-    # tiny grid for the synthetic bring-up serve, while the full model leaves them
+    # tiny grid for a reduced-size serve, while the full model leaves them
     # ``None`` and uses these defaults. Capturing the full 6x5 compiled grid is
     # slow, and buckets above a small model's ``max_position_embeddings`` do not
-    # fit — hence the reduced config trims it (config-driven, not env-driven).
+    # fit — hence the reduced config trims it.
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 

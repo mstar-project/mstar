@@ -1,4 +1,4 @@
-"""Kimi-K2.7 / DeepSeek-V3 decoder layer (M4 assembly).
+"""Kimi-K2.7 / DeepSeek-V3 decoder layer.
 
 One pre-norm transformer block: MLA self-attention then a feed-forward that is
 either the dense SwiGLU MLP (the ``first_k_dense_replace`` early layers) or the

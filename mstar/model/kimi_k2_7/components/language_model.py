@@ -1,21 +1,13 @@
-"""Kimi-K2.7 language-model components (DeepSeek-V3 text backbone).
+"""Kimi-K2.7 language-model builders (DeepSeek-V3 text backbone).
 
-M1 (cheap reuse) wiring: builders that map ``KimiK2Config`` onto mstar's existing
-reused primitives — token embedding, the dense SwiGLU MLP (the
-``first_k_dense_replace`` early layers), RMSNorm, and the LM head. These are the
-pieces DeepSeek-V3 shares verbatim with a standard Llama-style stack; the
-Kimi-specific parts (MLA attention, fine-grained sigmoid-routed MoE, YARN RoPE)
-are separate milestones (M2/M3).
-
-Each builder is thin on purpose: it fixes the config→component mapping (dims,
-``silu`` activation, ``bias=False``, RMSNorm eps, tied-vs-untied LM head) that M4
-assembles into the full ``KimiLanguageModel``. Every builder matches the vLLM
-DeepSeek-V3 reference:
-  - embedding / LM head: ``deepseek_v2.py`` ``DeepseekV2ForCausalLM`` (untied,
-    ``tie_word_embeddings=False``);
-  - dense MLP: ``DeepseekV2MLP`` = ``down_proj(SiluAndMul(gate_up_proj(x)))``,
-    ``bias=False``, silu-only;
-  - RMSNorm: standard Llama-style ``x * rsqrt(mean(x^2)+eps) * weight``.
+Thin builders mapping ``KimiK2Config`` onto reused mstar primitives — token
+embedding, the dense SwiGLU MLP (the ``first_k_dense_replace`` early layers),
+RMSNorm, and the untied LM head — the pieces DeepSeek-V3 shares with a standard
+Llama-style stack (the Kimi-specific MLA attention, sigmoid-routed MoE, and YARN
+RoPE live elsewhere). Each matches the vLLM DeepSeek-V3 reference
+(``deepseek_v2.py``): untied embedding/LM head (``tie_word_embeddings=False``),
+``DeepseekV2MLP`` = ``down_proj(SiluAndMul(gate_up_proj(x)))`` (``bias=False``,
+silu-only), Llama-style RMSNorm.
 """
 from __future__ import annotations
 
@@ -72,7 +64,7 @@ def build_dense_mlp(
     Matches ``DeepseekV2MLP``: fused gate/up projection, ``silu(gate) * up``,
     row-parallel down projection, ``bias=False``. Uses the full
     ``intermediate_size`` (the MoE layers use ``moe_intermediate_size`` per
-    expert instead — that path is M2).
+    expert instead).
     """
     return ParallelGatedMLP(
         hidden_size=config.hidden_size,
@@ -109,7 +101,7 @@ def build_mlp_for_layer(
 
     Returns a ``ParallelGatedMLP`` for the early dense layers, else a
     ``KimiSparseMoeBlock``. Both expose the same ``(x) -> x`` interface, so the
-    decoder layer (M4) is agnostic to which it holds.
+    decoder layer is agnostic to which it holds.
     """
     if is_moe_layer(config, layer_idx):
         return build_moe_block(config, comm_group=comm_group)

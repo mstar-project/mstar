@@ -1,6 +1,6 @@
-"""Kimi-K2.7 / DeepSeek-V3 assembled text backbone (M4 assembly).
+"""Kimi-K2.7 / DeepSeek-V3 assembled text backbone.
 
-Stacks the M4 :class:`KimiDecoderLayer` blocks between a token embedding and a
+Stacks the :class:`KimiDecoderLayer` blocks between a token embedding and a
 final RMSNorm (:class:`KimiLanguageModel`), then wraps that with the untied LM
 head (:class:`KimiForCausalLM`). This is the full text forward: token ids →
 logits.
@@ -87,7 +87,7 @@ class KimiForCausalLM(nn.Module):
         return self.lm_head(hidden_states)
 
     def load_weights(self, weights, **kwargs) -> set[str]:
-        """Load an HF DeepSeek-V3 checkpoint stream (M5).
+        """Load an HF DeepSeek-V3 checkpoint stream.
 
         Called by the shared ``mstar.model.loader.load_weights(model, source,
         device)`` driver (mirrors ``OrpheusForCausalLM.load_weights``). Delegates
@@ -97,6 +97,12 @@ class KimiForCausalLM(nn.Module):
         """
         from mstar.model.kimi_k2_7.weight_loader import load_kimi_hf_weights
 
+        packed_experts = (
+            self.config.quantization_config is not None
+            and self.config.moe_in_kernel_dequant
+        )
         return load_kimi_hf_weights(
             self, weights, self.config.n_routed_experts,
+            quant_config=self.config.quantization_config,
+            packed_experts=packed_experts,
         )

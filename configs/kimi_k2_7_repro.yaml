@@ -1,6 +1,6 @@
 model: "kimi_k2_7"
-# Kimi-K2.7 text backbone — REDUCED / synthetic single-GPU repro config (Phase 2
-# gap-4 serve bring-up). It drives the full serving path (API server -> conductor
+# Kimi-K2.7 text backbone — REDUCED / synthetic single-GPU repro config (serve
+# bring-up). It drives the full serving path (API server -> conductor
 # -> worker -> KV_CACHE engine -> decode loop -> tokens) on a tiny model that runs
 # without the 1T checkpoint. NOT a real deployment — for that use kimi_k2_7.yaml.
 #
