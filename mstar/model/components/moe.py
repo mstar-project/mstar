@@ -19,6 +19,40 @@ Parallel (TP-aware) variants:
 When triton is installed and inputs are on CUDA, dispatch goes through
 the Triton fused-MoE kernel in :mod:`mstar.utils.fused_moe`; otherwise it
 falls back to the naive per-expert loop in :func:`dispatch_experts_fused`.
+
+Router contract
+---------------
+
+Each block computes its expert assignment with a router. The block keeps
+the router in ``self.gate``. The default router is :class:`TopKRouter`.
+
+A router is an ``nn.Module``. A router does not extend a base class. The
+``forward`` method of the router must obey this contract::
+
+    router(hidden_states, router_states=None)
+        -> (routing_weights, selected_experts, router_states_next)
+
+The router reads these inputs:
+
+* ``hidden_states`` is the input tensor. The shape is ``(tokens, hidden_size)``.
+* ``router_states`` is the state from the previous call. A stateless router
+  ignores this input.
+
+The router returns these outputs:
+
+* ``routing_weights`` is the tensor of expert weights. The shape is
+  ``(tokens, top_k)``.
+* ``selected_experts`` is the tensor of expert indices. The shape is
+  ``(tokens, top_k)``. The type is int64.
+* ``router_states_next`` is the state for the next call. A stateless router
+  returns ``None``.
+
+A stateless router ignores ``router_states``. A stateless router returns
+``None`` for ``router_states_next``.
+
+A stateful router reads ``router_states``. A stateful router returns a new
+state. To thread the state through a block, set the ``return_router_states``
+flag on the block.
 """
 from __future__ import annotations
 
@@ -49,16 +83,11 @@ except Exception as e:  # pragma: no cover -- exercised only when triton missing
 
 
 class TopKRouter(nn.Module):
-    """Softmax top-k router shared by all MoE blocks.
+    """Softmax top-k router. This is the default router for all MoE blocks.
 
-    Implements the router contract expected by the MoE blocks::
-
-        router(hidden_states, router_states=None)
-            -> (routing_weights, selected_experts, router_states_next)
-
-    This router is stateless: ``router_states`` is ignored and
-    ``router_states_next`` is always ``None``. Stateful routers (e.g. the
-    ZONOS2 EDA router) can be injected into a block in its place.
+    See the module docstring for the router contract. This router is
+    stateless. It ignores ``router_states``. It returns ``None`` for
+    ``router_states_next``.
 
     Args:
         hidden_size: input hidden dimension.
