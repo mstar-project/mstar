@@ -51,6 +51,21 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_AR_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
+_disable_logged = False
+
+
+def cuda_graphs_disabled() -> bool:
+    """True when MSTAR_DISABLE_CUDA_GRAPH=1/true. Gates every runner's
+    warmup_and_capture; with nothing captured, replay lookups miss and the
+    engines take their eager paths."""
+    global _disable_logged
+    if os.environ.get("MSTAR_DISABLE_CUDA_GRAPH", "").strip().lower() not in ("1", "true"):
+        return False
+    if not _disable_logged:
+        _disable_logged = True
+        logger.info("CUDA graphs disabled via MSTAR_DISABLE_CUDA_GRAPH")
+    return True
+
 
 @dataclass
 class DummyCaptureInput:
@@ -248,6 +263,8 @@ class CudaGraphRunner:
 
     def warmup_and_capture(self) -> None:
         """Capture graphs for all configs and batch sizes."""
+        if cuda_graphs_disabled():
+            return
         if self.device is None or not torch.cuda.is_available():
             logger.warning("CUDA not available, skipping graph capture for %s",
                            self.submodule_name)
@@ -2086,6 +2103,8 @@ class StatelessCudaGraphRunner:
         self.enable_nvtx = False
 
     def warmup_and_capture(self) -> None:
+        if cuda_graphs_disabled():
+            return
         if not torch.cuda.is_available() or self.device is None:
             logger.warning(
                 "CUDA not available, skipping codec graph capture for %s",
@@ -2475,6 +2494,8 @@ class PiecewiseCudaGraphRunner:
     # ------------------------------------------------------------------
 
     def warmup_and_capture(self) -> None:
+        if cuda_graphs_disabled():
+            return
         if not torch.cuda.is_available() or self.device is None:
             logger.warning("CUDA not available — skipping PiecewiseCudaGraphRunner capture")
             return

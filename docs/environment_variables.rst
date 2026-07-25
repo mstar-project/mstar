@@ -35,3 +35,18 @@ Communication
      - ``19000``
      - Base of the deterministic entity-id → TCP port map (``api_server``
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
+
+Engine
+------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_DISABLE_CUDA_GRAPH``
+     - unset
+     - ``1``/``true``: skip all CUDA graph capture (AR, stateless and
+       piecewise runners) so every submodule runs its eager path.
