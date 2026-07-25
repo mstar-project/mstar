@@ -1,22 +1,17 @@
 """KimiK2Model: M* Model contract for Kimi-K2.7 (text backbone).
 
-Kimi-K2.7's text path is DeepSeek-V3 (``model_type: "kimi_k2"`` →
-``DeepseekV3ForCausalLM``). This is the **M0 scaffold**: it declares the full
-serving plumbing — the graph (``prefill`` + ``decode`` Loop), the single
-``KV_CACHE`` LLM node, the KV-cache dims, and the prefill→decode→done state
-machine — with **no GPU compute**. ``get_submodule`` returns ``None`` (dummy
-mode), so ``pytest test/modular/`` exercises the graph/walk/engine-routing
-machinery in isolation, exactly as ``docs/adding_models.rst`` prescribes for a
-new model before touching weights.
+Kimi-K2.7's text path is DeepSeek-V3 (``model_type: "kimi_k2"`` ->
+``DeepseekV3ForCausalLM``). This declares the full serving plumbing — the graph
+(``prefill`` + ``decode`` Loop), the single ``KV_CACHE`` LLM node, the KV-cache
+dims, and the prefill->decode->done state machine — and builds the LLM submodule
+in ``get_submodule``. When ``get_submodule`` returns ``None`` (dummy mode),
+``pytest test/modular/`` exercises the graph/walk/engine-routing machinery in
+isolation, as ``docs/adding_models.rst`` prescribes.
 
 Structurally this mirrors Orpheus's LLM partition (the smallest complete LLM in
 the tree) minus the async SNAC partition: Kimi text-only is a single ``default``
 partition, so it inherits ``Model.get_partitions`` / ``get_partition_topology``
 and only implements the abstract surface.
-
-Later milestones fill in the real compute (M2 MoE router, M3 MLA attention, M5
-weights, M6 the ``KimiLLMSubmodule`` build in ``get_submodule``); none of them
-change the contract declared here.
 """
 from __future__ import annotations
 
@@ -87,6 +82,17 @@ class KimiK2Model(Model):
         self._config_variant = kwargs.get("config_variant", "full")
         if self._config_variant == "reduced":
             self.config = KimiK2Config.reduced()
+        elif self._config_variant == "reduced_quantized":
+            # Reduced shape + a quant config, to exercise dequant-on-load.
+            self.config = KimiK2Config.reduced_quantized()
+        elif self._config_variant == "reduced_quantized_inkernel":
+            # Reduced shape + quant config + packed experts (in-kernel W4A16 dequant).
+            # int32 packed params are auto-exempt from the whole-model ``.to(bf16)``
+            # cast below (PyTorch ``.to(dtype)`` only casts float/complex), no hook.
+            self.config = KimiK2Config.reduced_quantized_inkernel()
+        elif self._config_variant == "k27_code":
+            # Full-size Kimi-K2.7-Code text-only serve config (see KimiK2Config.k27_code).
+            self.config = KimiK2Config.k27_code()
         else:
             self.config = KimiK2Config()
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
@@ -120,10 +126,9 @@ class KimiK2Model(Model):
         # ``padded_head_dim`` — the naive path zero-pads q/k (from ``qk_head_dim``,
         # e.g. 192) and v (from ``v_head_dim``) up to the smallest FlashInfer-SM90
         # supported head_dim >= qk_head_dim (256 real, 64 reduced), because the
-        # Hopper prefill kernel static_asserts head_dim_vo in {64,128,256} (M4
-        # finding). The attention output is sliced back to ``v_head_dim`` in the
-        # submodule (M3/M6). This trades cache size for not needing a weight-absorb
-        # path in the engine (deferred to perf).
+        # Hopper prefill kernel static_asserts head_dim_vo in {64,128,256}. The
+        # attention output is sliced back to ``v_head_dim`` in the submodule. This
+        # trades cache size for not needing a weight-absorb path in the engine.
         return [KVCacheConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_attention_heads,
@@ -337,7 +342,7 @@ class KimiK2Model(Model):
 
         # Kimi is a 1T model — real serving is TP8 / multi-node. The LLM node is
         # the tensor-parallel node; the per-node degree comes from the config
-        # YAML's ``node_groups`` (M6), not from the model code.
+        # YAML's ``node_groups``, not from the model code.
         return ShardingConfig(groups=[], tp_enabled_nodes={LLM_NODE}, shard_dim={})
 
     # -------------------------------------------------------------------
@@ -382,12 +387,15 @@ class KimiK2Model(Model):
             )
             return None
 
+        # If the checkpoint declares a compressed-tensors ``quantization_config``,
+        # route loading through the dequant-on-load parser (weight_loader). An
+        # explicit config (e.g. reduced_quantized) is respected and not clobbered.
+        self._maybe_apply_checkpoint_quant_config(source)
+
         # Real build, mirroring OrpheusModel._create_llm_submodule: construct on the
         # meta device (no allocation), cast to the target dtype on meta (so to_empty
         # allocates directly in bf16, not fp32-then-downcast), materialise storage,
-        # then run the M5 HF loader (remap + fused-expert stacked rules). This is the
-        # path the M5 rope-buffer bug would have bitten — inv_freq is lazy so it does
-        # not survive as garbage.
+        # then run the HF loader (remap + fused-expert stacked rules).
         from mstar.model.kimi_k2_7.components.causal_lm import KimiForCausalLM
         from mstar.model.kimi_k2_7.submodules import KimiLLMSubmodule
         from mstar.model.loader import load_weights
@@ -418,3 +426,47 @@ class KimiK2Model(Model):
         if Path(path).exists():
             return str(path)
         return _resolve_local_hf_snapshot(path, cache_dir=getattr(self, "cache_dir", None))
+
+    def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
+        """Populate ``self.config.quantization_config`` from ``config.json``.
+
+        Reads the checkpoint's ``config.json`` ``quantization_config`` block (a
+        compressed-tensors INT4/fp8 checkpoint carries one) and stores the parsed
+        :class:`CompressedTensorsQuantConfig` on the model config so the weight
+        loader takes the dequant-on-load path. A config set explicitly
+        (e.g. ``reduced_quantized()``) wins and is left untouched; a plain bf16
+        checkpoint (no block, unreadable, or single-file source) is a no-op.
+
+        The real multimodal ``Kimi-K2.7-Code`` repo nests the block under
+        ``text_config`` (the top-level ``quantization_config`` is null), so this
+        reads a top-level block if present, otherwise ``text_config``'s.
+        ``from_hf_config_dict`` parses the same block shape either way.
+        """
+        import json
+        from pathlib import Path
+
+        from mstar.model.kimi_k2_7.quantization import CompressedTensorsQuantConfig
+
+        if self.config.quantization_config is not None:
+            return
+        config_json = Path(source) / "config.json"
+        if not config_json.is_file():
+            return
+        try:
+            with open(config_json) as f:
+                raw = json.load(f)
+        except (OSError, ValueError) as e:  # unreadable / malformed — stay bf16
+            logger.warning("KimiK2Model: could not read %s: %s", config_json, e)
+            return
+        # A top-level ``quantization_config`` if present, else the one nested under
+        # ``text_config`` (the multimodal K2.7-Code layout — top-level is null).
+        quant_raw = raw.get("quantization_config") or (
+            raw.get("text_config") or {}
+        ).get("quantization_config")
+        quant = CompressedTensorsQuantConfig.from_hf_config_dict(quant_raw)
+        if quant is not None:
+            logger.info(
+                "KimiK2Model: compressed-tensors checkpoint (%d-bit, group_size=%d) "
+                "— dequantizing on load.", quant.num_bits, quant.group_size,
+            )
+            self.config.quantization_config = quant

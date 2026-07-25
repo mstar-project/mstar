@@ -1,24 +1,21 @@
 """Configuration dataclass for Kimi-K2.7 (text backbone).
 
 Kimi-K2.7's text architecture *is* DeepSeek-V3 — vLLM serves it as
-``DeepseekV3ForCausalLM`` (``model_type: "kimi_k2"`` maps to
-``DeepseekV3Config``). This dataclass therefore carries the full DeepSeek-V3
-field set: MLA latent dims, fine-grained sigmoid-routed MoE grouping, and
-``deepseek_yarn`` RoPE. Only a handful of these fields are read by the M0
-scaffold (``num_hidden_layers``, the head dims, ``vocab_size``,
-``max_position_embeddings``); the rest are declared now so this stays the single
-source of truth for the later milestones (MoE router, MLA attention, weights).
+``DeepseekV3ForCausalLM`` (``model_type: "kimi_k2"`` -> ``DeepseekV3Config``), so
+this dataclass carries the full DeepSeek-V3 field set: MLA latent dims, sigmoid-
+routed MoE grouping, and ``deepseek_yarn`` RoPE.
 
-The full-size defaults below are the real values from the
-``moonshotai/Kimi-K2.7-Code`` HF ``config.json`` (``model_type: "kimi_k2"`` →
-``DeepseekV3Config``), confirmed field by field against the published checkpoint
-config (the weights themselves are not present in this workspace). M0 does not
-depend on the full-size values being exact — the modular tests build from
-:meth:`KimiK2Config.reduced`, a tiny self-consistent config.
+The full-size defaults are the real ``moonshotai/Kimi-K2.7-Code`` values. That
+repo is the multimodal ``KimiK25ForConditionalGeneration``; the text dims here
+live NESTED under ``config.json``'s ``text_config``, and its ``quantization_config``
+is nested there too (see :meth:`k27_code` and ``kimi_model.py``). The modular tests
+build from :meth:`reduced`, a tiny self-consistent config.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from mstar.model.kimi_k2_7.quantization import CompressedTensorsQuantConfig
 
 
 @dataclass
@@ -65,8 +62,8 @@ class KimiK2Config:
     rope_scaling: dict = field(default_factory=lambda: {
         # from config.json (HF key is "type": "yarn"; mstar's internal id for the
         # DeepSeek/Kimi variant is "deepseek_yarn"). factor=64 yields the 262144
-        # context (4096 * 64). K2.7-Code keeps beta_fast=32 (some other Kimi
-        # checkpoints set beta_fast=1). mscale == mscale_all_dim == 1.0.
+        # context (4096 * 64). K2.7-Code keeps beta_fast=32; mscale ==
+        # mscale_all_dim == 1.0.
         "rope_type": "deepseek_yarn",
         "factor": 64.0,
         "original_max_position_embeddings": 4096,
@@ -87,11 +84,28 @@ class KimiK2Config:
     # -- MTP (multi-token prediction) — deferred, declared for completeness -
     num_nextn_predict_layers: int = 0
 
+    # -- Quantization (compressed-tensors INT4/fp8) -----------------------
+    # ``None`` => native-bf16 checkpoint. When set, the weight loader dequantizes
+    # the checkpoint stream on load (:mod:`mstar.model.kimi_k2_7.quantization`)
+    # before the bf16 remap + stacked rules. Populated from the real checkpoint's
+    # ``config.json`` ``quantization_config`` (``kimi_model.py``) or set directly
+    # for the reduced/synthetic tests (:meth:`reduced_quantized`).
+    quantization_config: CompressedTensorsQuantConfig | None = None
+
+    # -- Quantization: memory-lean packed experts (in-kernel dequant) ----------
+    # ``False`` => quantized routed experts are dequantized to bf16 on load and fed
+    # to the bf16 fused-expert GEMM. ``True`` (only meaningful when
+    # ``quantization_config`` is set) => the routed experts stay PACKED int32 in
+    # VRAM and the W4A16 ``fused_moe_kernel_w4a16`` dequantizes each tile in
+    # registers. MLA / dense-FFN / shared-expert weights are always dequantized on
+    # load. This is the only path that fits the real 1T checkpoint. See
+    # ``components/moe.py`` / ``weight_loader.py``.
+    moe_in_kernel_dequant: bool = False
+
     # -- Serving: CUDA-graph prefill capture grid (optional overrides) ------
     # ``None`` => ``KimiLLMSubmodule`` uses its full-size class-default grid.
     # ``reduced()`` sets a tiny grid so the synthetic bring-up serve captures a
-    # single short-prompt graph instead of the full 6x5 compiled grid (this was
-    # an env knob during bring-up; it now lives in the config).
+    # single short-prompt graph instead of the full 6x5 compiled grid.
     prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
 
@@ -108,14 +122,12 @@ class KimiK2Config:
         """Head dim the naive-MLA q/k/v are zero-padded to for the paged cache.
 
         FlashInfer's SM90 (Hopper) prefill kernel ``static_assert``s
-        ``head_dim_vo ∈ {64, 128, 256}`` (M4 finding), so it will not JIT-build for
-        the real ``qk_head_dim=192`` or the reduced ``qk_head_dim=24``. The
-        correctness-first mitigation (M6) pads q/k (from ``qk_head_dim``) and v
-        (from ``v_head_dim``) up to the smallest supported dim ``>= qk_head_dim``,
-        runs the paged attention there, and slices the output back to
-        ``v_head_dim`` — compensating the softmax scale (see
-        ``KimiMLAAttention.softmax_scale_boost``). Real Kimi 192 -> 256; reduced
-        24 -> 64. Weight-absorbed MLA (which avoids the pad) is deferred to perf.
+        ``head_dim_vo ∈ {64, 128, 256}``, so it will not JIT-build for the real
+        ``qk_head_dim=192`` or the reduced ``qk_head_dim=24``. We pad q/k (from
+        ``qk_head_dim``) and v (from ``v_head_dim``) up to the smallest supported
+        dim ``>= qk_head_dim``, run the paged attention there, and slice the output
+        back to ``v_head_dim`` — compensating the softmax scale (see
+        ``KimiMLAAttention.softmax_scale_boost``). Real Kimi 192 -> 256; reduced 24 -> 64.
         """
         for supported in (64, 128, 256):
             if supported >= self.qk_head_dim:
@@ -163,3 +175,66 @@ class KimiK2Config:
             prefill_token_buckets=[64],
             prefill_capture_batch_sizes=[1],
         )
+
+    @classmethod
+    def reduced_quantized(
+        cls,
+        num_bits: int = 4,
+        group_size: int = 32,
+        symmetric: bool = True,
+    ) -> "KimiK2Config":
+        """:meth:`reduced` plus a compressed-tensors quant config, to exercise the
+        dequant-on-load path on a synthetic quantized checkpoint.
+
+        The reduced dims (``hidden_size=128``, ``moe_intermediate_size=64``,
+        ``intermediate_size=256`` …) are all divisible by the default
+        ``group_size=32`` and by ``pack_factor=8``, so the FFN / expert / MLA
+        weights whose input dim divides ``group_size`` can be quantized while the
+        rest stay bf16 — the mixed checkpoint the streaming parser handles.
+        """
+        cfg = cls.reduced()
+        cfg.quantization_config = CompressedTensorsQuantConfig(
+            num_bits=num_bits, group_size=group_size, symmetric=symmetric,
+        )
+        return cfg
+
+    @classmethod
+    def reduced_quantized_inkernel(
+        cls,
+        num_bits: int = 4,
+        group_size: int = 32,
+        symmetric: bool = True,
+    ) -> "KimiK2Config":
+        """:meth:`reduced_quantized` plus ``moe_in_kernel_dequant=True`` — packed
+        routed experts + in-kernel INT4 dequant on a synthetic quantized checkpoint.
+
+        The reduced dims (``hidden_size=128``, ``moe_intermediate_size=64``) satisfy
+        the packed-expert divisibility asserts (``% pack_factor`` and ``%
+        group_size``) at tp=1 (``shard_inter=64``) and tp=2 (``shard_inter=32``);
+        tp=4 (``shard_inter=16``) fails ``% group_size`` (32), so pin packed-expert
+        goldens to tp<=2.
+        """
+        cfg = cls.reduced_quantized(
+            num_bits=num_bits, group_size=group_size, symmetric=symmetric,
+        )
+        cfg.moe_in_kernel_dequant = True
+        return cfg
+
+    @classmethod
+    def k27_code(cls) -> "KimiK2Config":
+        """Full-size ``moonshotai/Kimi-K2.7-Code`` text-only serve config.
+
+        Full 1T dims plus ``moe_in_kernel_dequant=True``: Kimi-K2.7-Code is a ~1T
+        INT4 ``pack-quantized`` checkpoint (num_bits=4, group_size=32, symmetric,
+        routed experts only), so the routed experts are served packed and
+        dequantized in-kernel — dequantizing them to bf16 would need ~2 TB of VRAM.
+        The ``quantization_config`` is nested under ``text_config`` and auto-read at
+        load by ``kimi_model.py::_maybe_apply_checkpoint_quant_config``; MLA /
+        dense-FFN / shared-expert / lm_head / vision weights stay bf16, matching the
+        checkpoint ``ignore`` list.
+
+        Keeps the default ``beta_fast=32.0``.
+        """
+        cfg = cls()
+        cfg.moe_in_kernel_dequant = True
+        return cfg

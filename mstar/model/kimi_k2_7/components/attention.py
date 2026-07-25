@@ -16,8 +16,8 @@ Dv=v_head_dim, L=kv_lora_rank):
     ``Drope`` slice is the single shared MQA rope key ``k_pe[T,1,Drope]``.
   - YARN RoPE rotates only ``q_pe`` (per head) and ``k_pe`` (broadcast to H heads).
   - assemble ``k = [k_nope | k_pe_broadcast] -> [T,H,Dqk]``; zero-pad ``q``/``k``
-    (Dqk) and ``v`` (Dv) up to ``padded_head_dim`` (M6 mitigation — FlashInfer SM90
-    rejects ``head_dim_vo`` not in {64,128,256}); fold the scale boost into ``q``
+    (Dqk) and ``v`` (Dv) up to ``padded_head_dim`` (FlashInfer SM90 rejects
+    ``head_dim_vo`` not in {64,128,256}); fold the scale boost into ``q``
     (``run_attention`` uses the fixed ``1/sqrt(padded_head_dim)`` scale), attend,
     slice the output back to ``Dv``, ``o_proj``.
 
@@ -26,8 +26,10 @@ Cache config for this node: ``num_kv_heads == num_qo_heads == num_attention_head
 Dqk=24). Under tensor parallelism each rank materializes only its
 ``num_attention_heads // tp_size`` local heads (K/V and Q both shard on the head
 axis — there is no separate KV-head group in the naive path), and the paged cache
-reports the matching per-rank count. Weight-absorbed MLA (native latent dims, no
-pad) and the ``fused_qkv_a_proj`` weight fusion are deferred to the perf backlog.
+reports the matching per-rank count.
+
+TODO: weight-absorbed MLA (native latent dims, no pad) and the ``fused_qkv_a_proj``
+weight fusion are not implemented yet.
 """
 from __future__ import annotations
 
@@ -80,8 +82,8 @@ class KimiMLAAttention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.kv_lora_rank = config.kv_lora_rank
         # FlashInfer SM90 rejects head_dim_vo not in {64,128,256}, so q/k/v are
-        # zero-padded to this width for the paged run_attention (M6 mitigation);
-        # the attention output is sliced back to v_head_dim. See config docstring.
+        # zero-padded to this width for the paged run_attention; the attention
+        # output is sliced back to v_head_dim. See config docstring.
         self.padded_head_dim = config.padded_head_dim
         # Parallel linears take the TOTAL head width (they divide by tp_size);
         # the forward uses ``self.num_heads`` (local).

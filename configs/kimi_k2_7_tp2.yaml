@@ -1,6 +1,6 @@
 model: "kimi_k2_7"
-# Kimi-K2.7 text backbone — REDUCED / synthetic TP=2 repro config (Phase 3 gap-3
-# TP correctness). Same tiny synthetic model as kimi_k2_7_repro.yaml, but the LLM
+# Kimi-K2.7 text backbone — REDUCED / synthetic TP=2 repro config (TP
+# correctness). Same tiny synthetic model as kimi_k2_7_repro.yaml, but the LLM
 # node runs tensor-parallel across 2 ranks so the MLA head-shard + MoE
 # intermediate-shard paths execute end-to-end. NOT a real deployment — the 1T
 # model needs TP8 / multi-node (see kimi_k2_7.yaml).

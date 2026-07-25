@@ -1,106 +1,71 @@
-"""Kimi-K2.7 / DeepSeek-V3 weight loading (M5).
+"""Kimi-K2.7 / DeepSeek-V3 weight loading.
 
-Maps an HF ``DeepseekV3ForCausalLM`` checkpoint onto the mstar Kimi module tree
-using the shared ``load_hf_weights`` machinery — a name remap plus stacked-shard
-rules, exactly mirroring ``qwen3_omni_model.py::_get_thinker_stacked_params`` /
-``_thinker_remap`` (same fused-expert layout). No shared abstraction is modified.
+Maps an HF ``DeepseekV3ForCausalLM`` checkpoint onto the Kimi module tree via the
+shared ``load_hf_weights`` machinery (name remap + stacked-shard rules), mirroring
+``qwen3_omni_model.py``'s thinker remap/stacked params.
 
-Two transforms take the checkpoint keys to the module's ``named_parameters``:
+- :func:`kimi_name_remapper`: strip a ``language_model.`` prefix if present (the
+  multimodal K2.7-Code repo carries it on its text weights);
+  ``shared_experts`` -> ``shared_expert``; tag per-routed-expert projections with
+  an ``__expert{i}__`` marker so one ``shard_id`` carries projection + expert slot.
+  Vision (``vision_tower.*`` / ``mm_projector.*``) and ``weight_shape`` keys fall
+  through and are dropped by the base loader's unknown-key skip.
+- :func:`build_kimi_stacked_params`: fuse per-expert gate/up -> ``gate_up_proj``
+  (w13) and down -> ``down_proj`` (w2); dense/shared gate+up -> ``gate_up_proj``.
+  Dense rules MUST come after the expert rules — ``_apply_stacked`` returns on
+  first match and a remapped expert key also contains ``.gate_proj``.
+- Router bias (``e_score_correction_bias``) is forced fp32 before load so the
+  whole-model ``.to(bf16)`` cast can't downcast this fp32 selection bias.
 
-1. **Name remap** (:func:`kimi_name_remapper`):
-     - ``mlp.shared_experts.*`` -> ``mlp.shared_expert.*`` (HF plural -> our
-       singular ``ParallelGatedMLP`` submodule name);
-     - per-routed-expert ``mlp.experts.{i}.{gate,up,down}_proj.weight`` ->
-       ``mlp.experts.{gate,up,down}_proj.__expert{i}__.weight`` — the
-       ``__expert{i}__`` marker lets the stacked rules carry both the projection
-       *and* the expert slot in one ``shard_id``;
-     - everything else is identity (the checkpoint prefixes ``model.``,
-       ``self_attn.``, ``input_layernorm``, ``lm_head`` … already line up).
+MLA loads strictly by name — the naive path keeps separate ``q_a_proj`` /
+``kv_a_proj_with_mqa``, so no ``fused_qkv_a_proj`` fusion is needed.
 
-2. **Stacked rules** (:func:`build_kimi_stacked_params`):
-     - routed experts: ``.experts.gate_proj.__expert{i}__.weight`` /
-       ``.up_proj.__expert{i}__.weight`` -> fused ``.experts.gate_up_proj``
-       ("w13", gate then up) with ``shard_id="gate:i"/"up:i"``;
-       ``.down_proj.__expert{i}__.weight`` -> ``.experts.down_proj`` ("w2",
-       ``shard_id="down:i"``). The fused params get their per-shard
-       ``weight_loader`` in :class:`KimiSparseMoeBlock`.
-     - dense + shared SwiGLU ``.gate_proj`` / ``.up_proj`` -> merged
-       ``.gate_up_proj`` (shard 0 / 1). These MUST come *after* the expert rules:
-       ``_apply_stacked`` returns on first match and the remapped expert key
-       ``…experts.gate_proj.__expert{i}__.weight`` also contains ``.gate_proj``.
+Compressed-tensors INT4 checkpoints: with a ``quant_config`` the stream is
+dequantized to bf16 on load (see ``quantization.py``); routed experts can instead
+stay packed (``packed_experts=True``) and dequantize inside the fused-expert
+kernel. Both are additive — the remap + stacked rules are unchanged.
 
-**MLA loads strictly by name — NO q_a/kv_a fusion.** M3 built *separate*
-``q_a_proj`` and ``kv_a_proj_with_mqa`` (the naive/materialized path), so their
-checkpoint keys map straight to the identically-named params. Fusing them into a
-single ``fused_qkv_a_proj`` is only needed for the deferred weight-absorbed MLA
-class (``DeepseekV2MLAAttention``); the naive path needs no such fusion. This is
-a deliberate simplification of the earlier plan note.
-
-**Router bias stays fp32.** ``KimiMoEGate.e_score_correction_bias`` is a
-selection-only bias DeepSeek keeps in fp32 for router stability. A whole-model
-``.to(bfloat16)`` would downcast it, so :func:`restore_router_bias_fp32` forces
-every such param back to fp32 immediately before the load (the copy then lands
-fp32 -> fp32). The checkpoint stores this tensor as fp32.
-
-The dense-vs-MoE split follows ``is_moe_layer`` (``first_k_dense_replace`` /
-``moe_layer_freq``): early dense layers carry ``mlp.{gate,up,down}_proj`` into a
-``ParallelGatedMLP``; MoE layers carry the expert-stacked + shared + gate params.
-The routing here is layer-agnostic — a dense layer simply never emits
-``mlp.experts.*`` / ``mlp.gate.*`` keys, and a MoE layer never emits a bare
-``mlp.gate_proj``.
-
-Refs: HF key -> param authority is vLLM
-``model_executor/models/deepseek_v2.py::DeepseekV2ForCausalLM.load_weights``
-(the ``stacked_params_mapping`` + per-expert ``expert_params_mapping`` there);
-the fused ``w13``/``w2`` naming is vLLM's.
-
-----------------------------------------------------------------------------
-DESIGN NOTE — compressed-tensors INT4 / fp8 dequant-on-load (DEFERRED)
-----------------------------------------------------------------------------
-The real Kimi-K2.7 checkpoint ships **compressed-tensors INT4** (fp8 variants
-also exist); ``fused_experts`` is bf16/fp16-only and a full bf16 dequant of the
-1T model is ~2 TB > 8xH200 (see the perf memo). So the real quantized checkpoint
-is **out of scope for M5** (no checkpoint present, would not fit) — this loader is
-the clean **bf16 path**, validated on a synthetic ``reduced()`` checkpoint.
-
-When the checkpoint + a quantized kernel land, dequant-on-load slots in **without
-touching the routing above**, because ``load_hf_weights`` dispatches per parameter
-through each param's ``weight_loader``:
-
-  * compressed-tensors stores, per quantized tensor, a packed ``*.weight_packed``
-    (INT4 nibbles / fp8 bytes) plus ``*.weight_scale`` (+ optional
-    ``*.weight_zero_point``) at a group granularity from the checkpoint's
-    ``quantization_config``.
-  * Hook point A (streaming): wrap the ``(name, tensor)`` iterator with a
-    dequantizer that consumes the ``weight_packed``/``weight_scale`` group, emits
-    a single bf16 ``*.weight`` (unpack nibble -> int -> ``(q - zp) * scale`` per
-    group), and drops the scale/zp/packed keys. Downstream routing is unchanged.
-  * Hook point B (per-param, memory-lean): keep the packed tensor in VRAM and
-    give the *destination* fused param a quant-aware ``weight_loader`` that stores
-    packed shards + scales (extend :class:`KimiSparseMoeBlock` to hold
-    ``gate_up_proj_packed`` / ``_scale``) and swap ``_dispatch`` for a quantized
-    grouped-GEMM. This is the only way to actually *serve* the 1T model and is
-    tracked as the top memory item in the perf backlog — a separate effort from
-    this DeepSeek-V3 port.
-
-Either hook is additive: the bf16 routing (remap + stacked rules) below is the
-substrate both build on.
+Ref: HF key -> param authority is vLLM
+``model_executor/models/deepseek_v2.py::DeepseekV2ForCausalLM.load_weights``.
 """
 from __future__ import annotations
 
 import re
 from collections.abc import Iterable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
 from mstar.model.loader.base import StackedParamRule
 
-# HF checkpoint suffixes for the per-routed-expert projections.
+if TYPE_CHECKING:
+    from mstar.model.kimi_k2_7.quantization import CompressedTensorsQuantConfig
+
+# HF suffixes for the per-routed-expert projections. The trailing alternation
+# covers a native-bf16 ``.weight`` AND the compressed-tensors sub-keys
+# (``.weight_packed`` / ``.weight_scale`` / ``.weight_zero_point``) so a
+# packed-expert stream (which passes those sub-keys through raw) is remapped with
+# its expert index preserved. A dequant-on-load stream only ever carries ``.weight``.
 _EXPERT_RE = re.compile(
-    r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+    r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)"
+    r"\.(weight|weight_packed|weight_scale|weight_zero_point)$"
 )
+
+# Base-name matcher (no suffix) for the routed-expert weights kept packed. Used to
+# build the ``keep_packed`` predicate handed to the dequant stream.
+_EXPERT_BASE_RE = re.compile(r"\.experts\.\d+\.(gate_proj|up_proj|down_proj)$")
+
+
+def _is_routed_expert_base(base: str) -> bool:
+    """True for a routed-expert weight base (``...experts.<i>.<proj>``).
+
+    ``shared_experts`` does not match — there is no ``.experts.<digit>.`` (the HF
+    key is ``mlp.shared_experts.gate_proj``, an underscore not a dotted index), so
+    the shared expert still dequantizes on load while the routed experts stay packed.
+    """
+    return _EXPERT_BASE_RE.search(base) is not None
 
 
 def kimi_name_remapper(name: str) -> str | None:
@@ -108,44 +73,84 @@ def kimi_name_remapper(name: str) -> str | None:
 
     Returns ``None`` to drop a key (precomputed ``rotary_emb`` buffers). See the
     module docstring for the full mapping; MLA / norms / embed / lm_head are all
-    identity.
+    identity. Vision (``vision_tower.*`` / ``mm_projector.*``) and ``.weight_shape``
+    sub-keys are left unmapped and fall through the base loader's unknown-key skip.
     """
     if "rotary_emb" in name:
         return None
+    # Multimodal K2.7-Code text keys carry a ``language_model.`` prefix; strip it
+    # only-if-present (a bare ``model.*`` key is left unchanged).
+    if name.startswith("language_model."):
+        name = name[len("language_model."):]
     # HF names the shared expert plural; our module has one ``shared_expert``.
     name = name.replace(".shared_experts.", ".shared_expert.")
-    # Per-expert fusion marker so the stacked rules can pick up expert index.
+    # Per-expert fusion marker so the stacked rules can pick up expert index. The
+    # suffix (``weight`` for bf16, ``weight_packed``/``weight_scale`` for packed
+    # experts) is carried through so the packed vs bf16 stacked rules can route it.
     m = _EXPERT_RE.match(name)
     if m:
-        prefix, expert_idx, proj = m.groups()
-        return f"{prefix}.experts.{proj}.__expert{expert_idx}__.weight"
+        prefix, expert_idx, proj, suffix = m.groups()
+        return f"{prefix}.experts.{proj}.__expert{expert_idx}__.{suffix}"
     return name
 
 
-def build_kimi_stacked_params(n_routed_experts: int) -> list[StackedParamRule]:
+def build_kimi_stacked_params(
+    n_routed_experts: int, packed_experts: bool = False,
+) -> list[StackedParamRule]:
     """Fused-shard routing for Kimi-K2.7 (mirrors the Qwen3-MoE thinker rules).
 
-    Per-expert ``gate``/``up`` -> ``experts.gate_up_proj`` (w13) and ``down`` ->
-    ``experts.down_proj`` (w2), then the dense/shared SwiGLU gate/up merge.
-    Expert rules precede the dense rules (first-match wins in ``_apply_stacked``).
+    ``packed_experts=False`` (native / dequantized bf16): per-expert ``gate``/``up``
+    -> ``experts.gate_up_proj`` (w13) and ``down`` -> ``experts.down_proj`` (w2).
+
+    ``packed_experts=True``: the per-expert ``.weight_packed`` / ``.weight_scale``
+    sub-keys route to the FOUR packed params
+    (``experts.{gate_up_proj,down_proj}_{packed,scale}``), and the bf16 ``.weight``
+    expert rules are OMITTED — their ``...__expert{i}__.weight`` source substring
+    would spuriously match ``...__expert{i}__.weight_packed`` (first-match wins).
+
+    The dense/shared SwiGLU gate/up merge is appended last in both cases (expert
+    rules precede it so ``.gate_proj`` inside an expert key can't hijack it).
     """
     rules: list[StackedParamRule] = []
     for i in range(n_routed_experts):
-        rules.append(StackedParamRule(
-            target_suffix=".experts.gate_up_proj",
-            source_suffix=f".experts.gate_proj.__expert{i}__.weight",
-            shard_id=f"gate:{i}",
-        ))
-        rules.append(StackedParamRule(
-            target_suffix=".experts.gate_up_proj",
-            source_suffix=f".experts.up_proj.__expert{i}__.weight",
-            shard_id=f"up:{i}",
-        ))
-        rules.append(StackedParamRule(
-            target_suffix=".experts.down_proj",
-            source_suffix=f".experts.down_proj.__expert{i}__.weight",
-            shard_id=f"down:{i}",
-        ))
+        if packed_experts:
+            for proj, sid in (("gate_proj", f"gate:{i}"), ("up_proj", f"up:{i}")):
+                rules.append(StackedParamRule(
+                    target_suffix=".experts.gate_up_proj_packed",
+                    source_suffix=f".experts.{proj}.__expert{i}__.weight_packed",
+                    shard_id=sid,
+                ))
+                rules.append(StackedParamRule(
+                    target_suffix=".experts.gate_up_proj_scale",
+                    source_suffix=f".experts.{proj}.__expert{i}__.weight_scale",
+                    shard_id=sid,
+                ))
+            rules.append(StackedParamRule(
+                target_suffix=".experts.down_proj_packed",
+                source_suffix=f".experts.down_proj.__expert{i}__.weight_packed",
+                shard_id=f"down:{i}",
+            ))
+            rules.append(StackedParamRule(
+                target_suffix=".experts.down_proj_scale",
+                source_suffix=f".experts.down_proj.__expert{i}__.weight_scale",
+                shard_id=f"down:{i}",
+            ))
+        else:
+            rules.append(StackedParamRule(
+                target_suffix=".experts.gate_up_proj",
+                source_suffix=f".experts.gate_proj.__expert{i}__.weight",
+                shard_id=f"gate:{i}",
+            ))
+            rules.append(StackedParamRule(
+                target_suffix=".experts.gate_up_proj",
+                source_suffix=f".experts.up_proj.__expert{i}__.weight",
+                shard_id=f"up:{i}",
+            ))
+            rules.append(StackedParamRule(
+                target_suffix=".experts.down_proj",
+                source_suffix=f".experts.down_proj.__expert{i}__.weight",
+                shard_id=f"down:{i}",
+            ))
     # Dense MLP + shared-expert gate/up fusion — AFTER the expert rules.
     rules.append(StackedParamRule(".gate_up_proj", ".gate_proj", 0))
     rules.append(StackedParamRule(".gate_up_proj", ".up_proj", 1))
@@ -169,21 +174,46 @@ def load_kimi_hf_weights(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
     n_routed_experts: int,
+    quant_config: "CompressedTensorsQuantConfig | None" = None,
+    packed_experts: bool = False,
 ) -> set[str]:
     """Load an HF DeepSeek-V3 weight stream into ``module``.
 
-    Thin wrapper: restore the fp32 router bias, then dispatch through
-    ``load_hf_weights`` with the Kimi remap + stacked rules. Returns the set of
-    param paths that received a tensor (callers can diff against
-    ``named_parameters()`` to assert completeness).
+    Thin wrapper: restore the fp32 router bias, optionally wrap the stream with the
+    dequant-on-load parser (when ``quant_config`` is set — the checkpoint is
+    compressed-tensors quantized), then dispatch through ``load_hf_weights`` with
+    the Kimi remap + stacked rules. The dequant wrapper emits bf16 ``*.weight``
+    keys, so the remap + stacked rules see the same stream as a native-bf16
+    checkpoint. Returns the set of param paths that received a tensor (callers can
+    diff against ``named_parameters()`` to assert completeness).
+
+    ``packed_experts=True``: the routed experts stay PACKED. A ``keep_packed``
+    predicate matching routed-expert bases is handed to the dequant stream so those
+    sub-keys pass through raw (int32 + scale), and the stacked rules route them to
+    the packed params; every other quantized weight (MLA, dense FFN, shared expert)
+    still dequantizes to bf16. Requires ``quant_config``.
     """
     from mstar.model.loader import load_hf_weights
+
+    if quant_config is not None:
+        from mstar.model.kimi_k2_7.quantization import (
+            dequant_compressed_tensors_stream,
+        )
+
+        keep_packed = _is_routed_expert_base if packed_experts else None
+        weights = dequant_compressed_tensors_stream(
+            weights, quant_config, keep_packed=keep_packed,
+        )
+    elif packed_experts:
+        raise ValueError("packed_experts=True requires a quant_config")
 
     restore_router_bias_fp32(module)
     return load_hf_weights(
         module,
         weights,
-        stacked_params=build_kimi_stacked_params(n_routed_experts),
+        stacked_params=build_kimi_stacked_params(
+            n_routed_experts, packed_experts=packed_experts,
+        ),
         name_remapper=kimi_name_remapper,
     )
 
