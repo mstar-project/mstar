@@ -36,7 +36,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     StackingMethod,
 )
-from mstar.utils.sampling import SeenTokenMask
+from mstar.utils.sampling import Sampler, SeenTokenMask
 
 logger = logging.getLogger(__name__)
 
@@ -1246,6 +1246,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 request_ids=request_ids,
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
+                sampler=engine_inputs.sampler
             )
         elif graph_walk == "prefill_text":
             out = self._forward_prefill_text(
@@ -1282,6 +1283,7 @@ class LLMSubmodule(ARNodeSubmodule):
         cache_manager: BatchedCacheManager,
         request_ids: list[str],
         input_ids: torch.Tensor,
+        sampler: Sampler,
         requires_cfg: bool = False,
     ) -> dict[str, NameToTensorList]:
         """Batched decode: all requests generate 1 token each.
@@ -1317,12 +1319,13 @@ class LLMSubmodule(ARNodeSubmodule):
         # 4. Per-request lm_head -> logits (no sampling — done post-forward)
         logits = self.lm_head(hidden)
 
-        # Expose the stacked [B, V] tensor under a sentinel key so the CUDA
-        # graph runner can sample directly without concatenating per-rid slices.
+        new_tokens = sampler.sample(
+            request_ids, logits, apply_penalty=True
+        )
         out: dict = {
-            rid: {"logits": [logits[i:i+1]]} for i, rid in enumerate(request_ids)
+            rid: {"new_token": [new_tokens[i : i + 1]]}
+            for i, rid in enumerate(request_ids)
         }
-        out["__batched_logits__"] = logits
         return out
 
 
