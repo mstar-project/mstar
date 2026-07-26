@@ -487,3 +487,219 @@ class FlashInferDecodeWrapper:
         positions = self.kv_cache_locations[:n, 1]
         kv_cache_layer[pages, 0, positions] = k[:n].to(self.dtype)
         kv_cache_layer[pages, 1, positions] = v[:n].to(self.dtype)
+
+
+class FlashInferMLAWrapper:
+    """Compressed-latent (weight-absorbed) MLA attention over a paged latent cache.
+
+    Wraps ``flashinfer.mla.BatchMLAPagedAttentionWrapper`` (the DeepSeek/Kimi MLA
+    kernel) for the ``MlaAbsorbCacheManager`` fast path. Unlike the standard
+    Prefill/Decode wrappers this consumes a **4D latent cache**
+    ``[max_pages, page_size, head_dim_ckv + head_dim_kpe]`` (one shared MQA latent
+    per token) and takes the query pre-split into its no-rope / rope parts:
+
+        run(q_nope[T, H, ckv], q_pe[T, H, kpe],
+            ckv_cache[pages, page_size, ckv], kpe_cache[pages, page_size, kpe])
+            -> [T, H, ckv]
+
+    ``ckv``/``kpe`` are passed as **strided views** of the combined latent cache
+    (``cache[..., :ckv]`` / ``cache[..., ckv:]``) — the kernel accepts them, so the
+    cache stays a single tensor.
+
+    The kernel is hard-locked to the real Kimi dims (ckv=512, kpe=64): other dims
+    trigger an *uncatchable* illegal memory access, so the caller must gate on dims
+    before constructing this (see ``cache_manager._mla_kernel_available``).
+
+    Mirrors the Prefill/Decode wrappers: ``plan`` computes the per-token latent
+    scatter indices (into static buffers under CUDA graph); ``set_latent`` scatters
+    ``cat([kv_c, k_pe])`` into the cache; ``run`` calls the kernel. CUDA graph mode
+    requires ``batch_size``/``max_num_pages`` and static index buffers so ``plan``
+    updates values via ``.copy_()`` without reallocating.
+    """
+
+    def __init__(
+        self,
+        workspace_buffer: torch.Tensor,
+        *,
+        num_heads: int,
+        head_dim_ckv: int,
+        head_dim_kpe: int,
+        page_size: int,
+        sm_scale: float,
+        batch_size: int | None = None,
+        max_num_pages: int | None = None,
+        max_total_tokens: int | None = None,
+        device: torch.device = torch.device("cuda"),
+        use_cuda_graph: bool = False,
+        backend: str = "auto",
+        enable_nvtx: bool = False,
+    ):
+        self.device = device
+        self.use_cuda_graph = use_cuda_graph
+        self.enable_nvtx = enable_nvtx
+        self.num_heads = num_heads
+        self.head_dim_ckv = head_dim_ckv
+        self.head_dim_kpe = head_dim_kpe
+        self.page_size = page_size
+        self.sm_scale = sm_scale
+        self.batch_size = batch_size
+        self.max_total_tokens = max_total_tokens
+        self.dtype = None
+        self._total_tokens = 0
+
+        import flashinfer
+
+        if self.use_cuda_graph:
+            assert batch_size is not None, "batch_size required for CUDA graph mode"
+            assert max_num_pages is not None, "max_num_pages required for CUDA graph mode"
+            assert max_total_tokens is not None, "max_total_tokens required for CUDA graph mode"
+
+            # Static index buffers the kernel plan copies into (see the wrapper's
+            # __init__ docstring): stable addresses across graph replay.
+            self._qo_indptr_buf = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=device
+            )
+            self._kv_indptr_buf = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=device
+            )
+            self._kv_indices_buf = torch.zeros(
+                max_num_pages, dtype=torch.int32, device=device
+            )
+            self._kv_len_arr_buf = torch.zeros(
+                batch_size, dtype=torch.int32, device=device
+            )
+
+            self.attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                workspace_buffer,
+                use_cuda_graph=True,
+                qo_indptr=self._qo_indptr_buf,
+                kv_indptr=self._kv_indptr_buf,
+                kv_indices=self._kv_indices_buf,
+                kv_len_arr=self._kv_len_arr_buf,
+                backend=backend,
+            )
+
+            # Static buffers for the vectorized latent scatter (page, offset).
+            self.token_to_page = torch.zeros(
+                max_total_tokens, dtype=torch.long, device=device
+            )
+            self.token_to_cache = torch.zeros(
+                max_total_tokens, dtype=torch.long, device=device
+            )
+        else:
+            self.attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                workspace_buffer, backend=backend,
+            )
+            self.token_to_page = None
+            self.token_to_cache = None
+
+    @torch.compiler.disable
+    def plan(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_len_arr: torch.Tensor,
+        *,
+        causal: bool = True,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        """Plan the MLA kernel and compute the per-token latent scatter indices.
+
+        Args (all int32, on ``self.device``):
+            qo_indptr:  [n_req + 1] cumulative NEW query tokens per request.
+            kv_indptr:  [n_req + 1] cumulative pages per request.
+            kv_indices: [total_pages] flattened page indices (per-request order).
+            kv_len_arr: [n_req] total cached length per request AFTER this append.
+
+        In CUDA graph mode, updates the static index + scatter buffers via
+        ``.copy_()`` so the captured replay reads stable addresses.
+        """
+        self.dtype = dtype
+        self.attn_wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            self.num_heads,
+            self.head_dim_ckv,
+            self.head_dim_kpe,
+            self.page_size,
+            causal,
+            self.sm_scale,
+            dtype,
+            dtype,
+        )
+
+        # Per-token (page, offset) for the latent scatter, mirroring
+        # FlashInferPrefillWrapper.plan: token j of request r lands at absolute
+        # position g = old_len_r + j -> page kv_indices[kv_indptr[r] + g//ps],
+        # offset g % ps. old_len_r = kv_len_arr[r] - new_tokens_r.
+        n_req = qo_indptr.shape[0] - 1
+        starts = qo_indptr[:-1].to(torch.int32)
+        lens = (qo_indptr[1:] - qo_indptr[:-1]).to(torch.int32)
+        total_tokens = int(lens.sum().item())
+        self._total_tokens = total_tokens
+
+        seg = torch.repeat_interleave(
+            torch.arange(n_req, dtype=torch.int32, device=self.device), lens
+        )
+        intra = torch.arange(
+            total_tokens, dtype=torch.int32, device=self.device
+        ) - torch.repeat_interleave(starts, lens)
+
+        start_new = kv_len_arr[seg] - lens[seg]
+        g = start_new + intra
+
+        page_off = torch.div(g, self.page_size, rounding_mode="floor").to(torch.int32)
+        off_in_page = (g - page_off * self.page_size).to(torch.int32)
+        abs_page_ptr = kv_indptr[:-1][seg] + page_off
+
+        token_to_page = kv_indices[abs_page_ptr].to(torch.long)
+        token_to_cache = off_in_page.to(torch.long)
+
+        if self.use_cuda_graph:
+            self.token_to_page[:total_tokens].copy_(token_to_page)
+            self.token_to_cache[:total_tokens].copy_(token_to_cache)
+            if total_tokens < self.max_total_tokens:
+                self.token_to_page[total_tokens:] = 0
+                self.token_to_cache[total_tokens:] = 0
+        else:
+            self.token_to_page = token_to_page
+            self.token_to_cache = token_to_cache
+
+    @torch.compiler.disable
+    def set_latent(self, latent_cache_layer: torch.Tensor, latent: torch.Tensor):
+        """Scatter one compressed latent per new token into the paged cache.
+
+        Args:
+            latent_cache_layer: [max_pages, page_size, ckv + kpe]
+            latent: [total_tokens, ckv + kpe] = ``cat([kv_c, k_pe])`` for the new tokens.
+        """
+        n = self._total_tokens
+        page_idx = self.token_to_page[:n]
+        cache_idx = self.token_to_cache[:n]
+        latent_cache_layer[page_idx, cache_idx] = latent[:n].to(latent_cache_layer.dtype)
+
+    @torch.compiler.disable
+    def run(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the planned MLA kernel.
+
+        Args:
+            q_nope: [T, H, ckv]
+            q_pe:   [T, H, kpe]
+            ckv_cache: [max_pages, page_size, ckv] (strided view of the latent cache)
+            kpe_cache: [max_pages, page_size, kpe] (strided view of the latent cache)
+        Returns:
+            [T, H, ckv]
+        """
+        return self.attn_wrapper.run(
+            q_nope.to(self.dtype), q_pe.to(self.dtype),
+            ckv_cache, kpe_cache, return_lse=False,
+        )

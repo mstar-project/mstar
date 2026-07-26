@@ -43,6 +43,26 @@ class KimiK2Config:
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
 
+    # -- MLA weight absorption (DEFAULT) -----------------------------------
+    # ``True`` (default) => weight-absorbed MLA: ``kv_b_proj``'s up-projection is
+    # folded into the Q path (``W_UK``) and the O path (``W_UV``) at load (plus the
+    # ``fused_qkv_a_proj`` down-proj fusion), attention runs as MQA over the
+    # COMPRESSED latent via the ``mla_absorb`` cache backend, and the KV cache
+    # stores only the ``kv_lora_rank + qk_rope_head_dim`` latent (1 KV head) — a
+    # ~57x per-token cache shrink, numerically identical up to fp rounding.
+    # ``False`` => naive/materialized MLA (latent projected up to full per-head
+    # K/V, padded to ``padded_head_dim``, MHA cache): the M4-golden parity
+    # reference / opt-out fallback.
+    #
+    # PERF CAVEAT: the absorbed backend currently runs on a torch SDPA-over-latent
+    # path — correct + memory-lean but EAGER-ONLY (no CUDA-graph capture) and slow
+    # on the real 1T. The FlashInfer MLA kernel + CUDA-graph capture (production
+    # throughput) is a follow-up; until it lands, real large-scale serving should
+    # set ``mla_absorb=False`` (naive) or accept eager execution. See
+    # ``components/attention.py``, ``kimi_model.py::get_kv_cache_config``,
+    # ``engine/cache_manager.py::MlaAbsorbCacheManager``.
+    mla_absorb: bool = True
+
     # -- Fine-grained MoE (sigmoid router, group-limited top-k, noaux_tc) --
     n_routed_experts: int = 384          # from config.json
     n_shared_experts: int = 1
@@ -161,8 +181,15 @@ class KimiK2Config:
         reduced-config golden runs. Keeps the *shape* of Kimi (MLA split heads,
         grouped MoE, one dense layer) while being small enough to run without
         the 1T checkpoint.
+
+        NOTE ``mla_absorb=False``: this fixture pins the NAIVE MLA path, the
+        M4-golden parity reference that the bulk of the reduced test suite
+        validates. The absorbed path (the production default) is exercised by the
+        dedicated ``test_kimi_mla_absorb*`` tests, which flip ``mla_absorb=True``
+        on a reduced() instance explicitly.
         """
         return cls(
+            mla_absorb=False,
             vocab_size=256,
             hidden_size=128,
             intermediate_size=256,
