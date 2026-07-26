@@ -304,13 +304,21 @@ class Conductor:
 
         os.makedirs(socket_path_prefix, exist_ok=True)
         self._derive_worker_info()
-        self._launch_workers()
 
+        # Build the communicator BEFORE launching workers. A worker sends
+        # SETUP_DONE the instant it finishes weight load + graph capture; if the
+        # conductor is not yet listening that message is lost forever and
+        # _wait_for_workers_ready() blocks on a worker that already reported.
+        # Skipping CUDA-graph capture makes workers finish tens of seconds apart
+        # (43 s in the graphs-off arms), which is what made the race reliable.
+        # _derive_worker_info() must still run first -- it populates worker_ids.
         self.communicator = make_communicator(
             my_id="conductor",
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
         )
+
+        self._launch_workers()
 
     def _get_kv_config(self):
         kv_cache_config = self.model.get_kv_cache_config()

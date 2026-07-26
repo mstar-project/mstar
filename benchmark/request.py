@@ -6,6 +6,7 @@ import os
 import statistics
 import sys
 import time
+import wave
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,29 @@ import numpy as np
 
 from benchmark.base import Bagel, Model, Orpheus, RequestType, Status
 from benchmark.utils import _write_wav
+
+
+def _audio_chunk_to_pcm(data: bytes) -> bytes:
+    """Return raw PCM frames from a streamed audio chunk.
+
+    sglang-omni encodes every audio delta as a *complete* WAV file
+    (`sglang_omni/client/audio.py::audio_to_base64` defaults to
+    `output_format="wav"`), so concatenating chunks verbatim splices a 44-byte
+    RIFF header into the PCM stream once per chunk. Played back that is ~22
+    samples of full-scale garbage every chunk — an audible periodic click.
+    sglang-omni's own benchmark client strips these the same way (see
+    `benchmarks/tasks/tts.py::_collect_streaming_audio`).
+
+    Chunks that are already raw PCM (vllm-omni, OurSystem, and sglang-omni's
+    `stream_format="audio"` endpoint) have no RIFF magic and pass through.
+    """
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return data
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wf:
+            return wf.readframes(wf.getnframes())
+    except (wave.Error, EOFError):
+        return data
 
 
 @dataclass
@@ -143,6 +167,14 @@ class RequestMetrics:
         data = base64.b64decode(data_b64)
         if not data:
             return
+
+        if modality == "audio":
+            # Strip the per-chunk WAV container before anything measures or
+            # buffers these bytes, so byte counts and chunk durations describe
+            # audio rather than container overhead.
+            data = _audio_chunk_to_pcm(data)
+            if not data:
+                return
 
         self._output_modalities_recvd.append(modality)
 
@@ -1356,6 +1388,7 @@ class SGLangOmni(InferenceSystem):
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 **model.get_model_kwargs(req_type),
+                **req_input.model_kwargs,
                 **additional_model_kwargs,
             }
             # Top-level multimodal fields (Fix 10a). sglang-omni reads files
