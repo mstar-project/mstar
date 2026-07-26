@@ -15,6 +15,7 @@ from mstar.engine.base import (
     NodeOutput,
     PlannedBatch,
     PreparedBatch,
+    autocast_context,
 )
 from mstar.engine.cache_manager import (
     BatchedCacheManager,
@@ -193,6 +194,11 @@ class KVCacheEngine(BaseEngine):
         )
         if kv_cache_type is None:
             kv_cache_type = self.autocast_dtype
+        if kv_cache_type == torch.float32:
+            # FlashInfer ships no float32 attention kernels, so the paged pool
+            # and the kernel boundary stay bf16; run_attention casts q/k/v in
+            # and the output back to the caller's dtype.
+            kv_cache_type = torch.bfloat16
 
         node_to_kv_mgmt = {}
         for cfg in kv_cache_config:
@@ -838,9 +844,7 @@ class KVCacheEngine(BaseEngine):
         try:
             try:
                 with torch.no_grad():
-                    with torch.amp.autocast(
-                        "cuda", enabled=True, dtype=autocast_dtype
-                    ):
+                    with autocast_context(autocast_dtype):
                         return super().execute_batch(batch)
             except AllocationFailedError as err:
                 logger.warning(

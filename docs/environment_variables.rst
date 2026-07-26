@@ -78,6 +78,17 @@ Engine
        a warning) and that walk runs eager. Use it to isolate a
        batching-dependent correctness bug, or to measure single-request
        latency without queueing effects. Throughput drops accordingly.
+   * - ``MSTAR_AUTOCAST_DTYPE``
+     - unset
+     - Overrides the engines' autocast dtype for every node
+       (``float32``, ``bfloat16`` or ``float16``); wins over both the
+       model's ``get_autocast_dtype`` and the config's
+       ``autocast_dtype``. ``float32`` disables autocast and keeps
+       weights and activations in full precision. Exception: FlashInfer
+       has no float32 attention kernels, so paged-KV pools and the
+       attention-kernel boundary stay bf16 (q/k/v are cast on entry, the
+       output is cast back). Per-submodule ``get_autocast_dtype``
+       overrides still win for their node.
 
 ``MSTAR_DISABLE_CUDA_GRAPH`` and ``MSTAR_DISABLE_TORCH_COMPILE`` are the
 process-wide form of the per-node ``disable_cuda_graph_nodes`` /

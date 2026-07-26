@@ -1,3 +1,4 @@
+import contextlib
 import os
 import time
 from abc import ABC, abstractmethod
@@ -12,6 +13,18 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.kv_store import KVCacheConfig, StoreWritePolicy
 from mstar.profile.worker import ExecTimings
+
+
+def autocast_context(dtype: torch.dtype | None):
+    """Autocast context for the engines' reduced-precision dtypes.
+
+    ``float32`` (and ``None``) return a null context instead — CUDA autocast
+    cannot target float32, and full precision means running ops in the dtypes
+    they already have.
+    """
+    if dtype is None or dtype == torch.float32:
+        return contextlib.nullcontext()
+    return torch.amp.autocast("cuda", enabled=True, dtype=dtype)
 
 
 class EngineType(Enum):

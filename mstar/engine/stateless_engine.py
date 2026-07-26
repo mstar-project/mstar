@@ -314,6 +314,11 @@ class StatelessEngine(BaseEngine):
         """
         dtype = autocast_dtype_override if autocast_dtype_override is not None \
             else self.config.autocast_dtype
+        if dtype == torch.float32:
+            # Full precision: no autocast (CUDA autocast cannot target
+            # float32), but keep no_grad rather than the codec's
+            # inference_mode so only the dtype differs from the autocast path.
+            return torch.no_grad()
         if dtype is not None:
             return _ComposedContext(
                 torch.amp.autocast(

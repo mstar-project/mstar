@@ -182,6 +182,10 @@ class FlashInferPrefillWrapper:
         consume them as CPU and async-H2D copy to the device for our own
         per-token bookkeeping below.
         """
+        if dtype == torch.float32:
+            # FlashInfer has no float32 attention kernels; keep the kernel
+            # boundary bf16 (run() casts q in, callers cast the output back).
+            dtype = torch.bfloat16
         self.dtype = dtype
         self.attn_wrapper.plan(
             qo_indptr=qo_indptr,
@@ -382,6 +386,10 @@ class FlashInferDecodeWrapper:
 
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
+        if dtype == torch.float32:
+            # Same bf16 boundary as the prefill wrapper: FlashInfer has no
+            # float32 attention kernels.
+            dtype = torch.bfloat16
         n_req = paged_kv_indptr.shape[0] - 1
 
         if self.enable_nvtx:
