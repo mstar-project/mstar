@@ -72,11 +72,12 @@ Engine
        *n* single-request forwards
        (``BaseEngine.execute_with_max_batch_size``) instead of one batched
        one. CUDA graphs stay enabled, but each runner captures only its
-       smallest bucket (bs=1 for every default list) — the larger buckets
-       could never be replayed, and skipping them cuts warmup time and
-       capture memory. Use it to isolate a batching-dependent
-       correctness bug, or to measure single-request latency without
-       queueing effects. Throughput drops accordingly.
+       ``bs=1`` bucket — the larger ones could never be replayed, and
+       skipping them cuts warmup time and capture memory. A capture config
+       that doesn't declare ``bs=1`` at all is skipped entirely (logged as
+       a warning) and that walk runs eager. Use it to isolate a
+       batching-dependent correctness bug, or to measure single-request
+       latency without queueing effects. Throughput drops accordingly.
 
 ``MSTAR_DISABLE_CUDA_GRAPH`` and ``MSTAR_DISABLE_TORCH_COMPILE`` are the
 process-wide form of the per-node ``disable_cuda_graph_nodes`` /

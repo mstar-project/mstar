@@ -238,8 +238,8 @@ class CudaGraphRunner:
         self._plan_stream: "torch.cuda.Stream | None" = None
 
         self.max_bs = max(
-            [max(self.capture_sizes_for(config))
-            for config in self.capture_configs] or [1]
+            [max(sizes) for config in self.capture_configs
+             if (sizes := self.capture_sizes_for(config))] or [1]
         )
         self.sampler_buffer: SamplerBuffers = SamplerBuffers.allocate(
             max_batch_size=self.max_bs, device=device,
@@ -254,14 +254,14 @@ class CudaGraphRunner:
     def capture_sizes_for(self, config: CudaGraphConfig) -> list[int]:
         """Batch-size buckets to capture (and look up) for ``config``.
 
-        MSTAR_DISABLE_BATCHING keeps capture on but narrows it to the smallest
-        declared bucket — bs=1 for every default list — since no batch will
-        ever hold more than one request. Both capture and lookup go through
-        here so the two can't disagree.
+        Under MSTAR_DISABLE_BATCHING only bs=1 is reachable, so capture
+        narrows to it — or to nothing if the config doesn't declare it
+        (warned once in warmup_and_capture). Capture and lookup share this
+        so the two can't disagree.
         """
         sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
-        if sizes and batching_disabled_globally():
-            return [min(sizes)]
+        if batching_disabled_globally():
+            return [1] if 1 in sizes else []
         return sizes
 
     def warmup_and_capture(self) -> None:
@@ -281,6 +281,14 @@ class CudaGraphRunner:
 
         for config in self.capture_configs:
             sizes = self.capture_sizes_for(config)
+            if not sizes and batching_disabled_globally():
+                logger.warning(
+                    "%s: MSTAR_DISABLE_BATCHING is set but walk=%s declares "
+                    "capture_batch_sizes=%s (no bs=1) — not capturing it, "
+                    "this walk runs eager",
+                    self.submodule_name, config.capture_graph_walk,
+                    config.capture_batch_sizes,
+                )
             for bs in reversed(sizes):
                 for num_tokens in reversed(sorted(config.get_total_tokens(bs))):
                     key = CudaGraphKey(
@@ -2129,6 +2137,14 @@ class StatelessCudaGraphRunner:
 
         for config in self.capture_configs:
             sizes = self.capture_sizes_for(config)
+            if not sizes and batching_disabled_globally():
+                logger.warning(
+                    "%s: MSTAR_DISABLE_BATCHING is set but walk=%s declares "
+                    "capture_batch_sizes=%s (no bs=1) — not capturing it, "
+                    "this walk runs eager",
+                    self.submodule_name, config.capture_graph_walk,
+                    config.capture_batch_sizes,
+                )
             for bs in reversed(sorted(sizes)):
                 try:
                     self._capture_one(
@@ -2244,8 +2260,8 @@ class StatelessCudaGraphRunner:
         sizes = (
             config.capture_batch_sizes if config is not None else None
         ) or self.DEFAULT_CAPTURE_BATCH_SIZES
-        if sizes and batching_disabled_globally():
-            return [min(sizes)]
+        if batching_disabled_globally():
+            return [1] if 1 in sizes else []
         return sizes
 
     def _sizes_for(self, graph_walk: str) -> list[int]:
@@ -2483,9 +2499,16 @@ class PiecewiseCudaGraphRunner:
         self.capture_batch_sizes = sorted(
             config.capture_batch_sizes or self.DEFAULT_CAPTURE_BATCH_SIZES
         )
-        if batching_disabled_globally() and self.capture_batch_sizes:
-            # Only the bs=1 bucket can ever be replayed; skip the rest.
-            self.capture_batch_sizes = self.capture_batch_sizes[:1]
+        if batching_disabled_globally():
+            # Only bs=1 is reachable; without it there's nothing to capture.
+            self.capture_batch_sizes = [1] if 1 in self.capture_batch_sizes else []
+            if not self.capture_batch_sizes:
+                logger.warning(
+                    "PiecewiseCudaGraphRunner: MSTAR_DISABLE_BATCHING is set but "
+                    "%s declares capture_batch_sizes=%s (no bs=1) — not capturing, "
+                    "this region runs eager",
+                    type(config).__name__, config.capture_batch_sizes,
+                )
         self.cache_labels: list[str] = config.cache_labels
 
         if config.uses_kv_cache:

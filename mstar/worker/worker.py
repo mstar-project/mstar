@@ -2025,6 +2025,8 @@ class Worker:
             "Worker %s: engine runs on dedicated GPU thread",
             self.worker_id,
         )
+
+        disable_spec = os.environ.get("MSTAR_NO_ASYNC", "0") == "1"
         # Dedicated thread that pre-plans FlashInfer attention for the
         # speculatively-built next batch. Runs concurrent with main thread's
         # await_gpu (which releases the GIL), so plan()'s Python work isn't
@@ -2154,7 +2156,7 @@ class Worker:
                         consecutive_spec_steps >= max_consecutive_spec
                         or must_yield_for_fairness
                     )
-                    if not must_yield_away:
+                    if not must_yield_away and not disable_spec:
                         if self.enable_nvtx:
                             range_push("worker.speculate", synchronize=False)
                         _t0 = _time.perf_counter() if phase_period else 0.0
@@ -2163,7 +2165,7 @@ class Worker:
                             _phase_record("speculate", _time.perf_counter() - _t0)
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
-                    if speculation is None:
+                    if speculation is None and not disable_spec:
                         yield_away_from_target = (
                             pending.node_name,
                             pending.graph_walk,
