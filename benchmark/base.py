@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional
@@ -136,6 +137,14 @@ class Bagel(Model):
                 "cfg_text_scale": 4.0,
                 "cfg_img_scale": 1.0,   # no input image → image-CFG off (server default 1.5 is wrong for T2I)
             })
+            # Variant arms only: force a >1.0 image-CFG scale on T2I so
+            # fixed-degree CFG-parallel deployments (branch count baked into
+            # the deployment) accept a mixed workload. This CHANGES T2I
+            # semantics and adds a third CFG branch — never set it for
+            # default-workload comparisons.
+            t2i_img_scale = os.environ.get("BENCH_BAGEL_T2I_CFG_IMG_SCALE")
+            if t2i_img_scale:
+                kwargs["cfg_img_scale"] = float(t2i_img_scale)
         return kwargs
 
     def get_hf_url(self):
