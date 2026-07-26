@@ -76,9 +76,9 @@ class ProfilingType(Enum):
 class BenchmarkConfig:
     url: str
     model: Model
-    dataset: DatasetType
+    dataset: Optional[DatasetType]
     num_requests: int
-    request_type: RequestType
+    request_type: Optional[RequestType]
     local_cache_dir: str
     num_warmup: int = 3
     profiling_type: ProfilingType = ProfilingType.OFFLINE
@@ -122,6 +122,39 @@ class BenchmarkConfig:
     output_len_max: Optional[int] = None
     output_len_seed: int = 0
 
+    # Mixed-type workload: comma-separated TYPE:WEIGHT:DATASET entries; each
+    # request's type is drawn from the weighted mix (seeded by mix_seed so
+    # every inference system sees the identical sequence). Mutually exclusive
+    # with request_type/dataset; offline profiling not supported.
+    request_mix: Optional[str] = None
+    mix_seed: int = 0
+    # Coefficient of variation of ONLINE inter-arrival gaps. 1.0 keeps the
+    # exponential (Poisson) process; other values draw gamma gaps with the
+    # same mean 1/rate (cv > 1 bursty, cv < 1 more regular).
+    arrival_cv: float = 1.0
+
+
+def parse_request_mix(spec: str) -> list[tuple[RequestType, float, DatasetType]]:
+    """Parse a --request-mix spec: comma-separated ``TYPE:WEIGHT:DATASET``.
+
+    e.g. ``text_to_image:1:vbench,image_to_text:2:food101,image_to_image:1:vbench``
+    """
+    entries: list[tuple[RequestType, float, DatasetType]] = []
+    for part in spec.split(","):
+        fields = part.strip().split(":")
+        if len(fields) != 3:
+            raise ValueError(
+                f"--request-mix entries must be TYPE:WEIGHT:DATASET, got {part!r}"
+            )
+        rt, weight, ds = fields
+        w = float(weight)
+        if w <= 0:
+            raise ValueError(f"--request-mix weight must be > 0, got {part!r}")
+        entries.append((RequestType(rt), w, DatasetType(ds)))
+    if not entries:
+        raise ValueError("--request-mix is empty")
+    return entries
+
 
 class Benchmark:
     def __init__(self, config: BenchmarkConfig):
@@ -129,36 +162,46 @@ class Benchmark:
         self.inference_system = config.inference_system.instantiate()
 
     def _get_dataset(self) -> BaseDataset:
-        if self.config.dataset == DatasetType.VBENCH:
+        return self._get_dataset_for(
+            self.config.dataset, self.config.request_type, self.config.num_requests
+        )
+
+    def _get_dataset_for(
+        self,
+        dataset: DatasetType,
+        request_type: RequestType,
+        num_requests: int,
+    ) -> BaseDataset:
+        if dataset == DatasetType.VBENCH:
             return VBenchDataset(
                 cache_dir=self.config.vbench_cache_dir,
-                task=self.config.request_type,
-                num_requests=self.config.num_requests,
+                task=request_type,
+                num_requests=num_requests,
             )
-        elif self.config.dataset == DatasetType.TEXT:
+        elif dataset == DatasetType.TEXT:
             return TxtFileDataset(
                 filename=self.config.request_txt_file,
-                num_requests=self.config.num_requests,
-                req_type=self.config.request_type,
+                num_requests=num_requests,
+                req_type=request_type,
             )
-        elif self.config.dataset == DatasetType.LIBRI:
+        elif dataset == DatasetType.LIBRI:
             return LibriSpeechDataset(
-                num_requests=self.config.num_requests,
-                req_type=self.config.request_type,
+                num_requests=num_requests,
+                req_type=request_type,
                 local_file_dir=self.config.local_cache_dir,
             )
-        elif self.config.dataset == DatasetType.FOOD:
-            return Food101Dataset(num_requests=self.config.num_requests, req_type=self.config.request_type)
-        elif self.config.dataset == DatasetType.UCF:
+        elif dataset == DatasetType.FOOD:
+            return Food101Dataset(num_requests=num_requests, req_type=request_type)
+        elif dataset == DatasetType.UCF:
             # TODO: this is the dataset that vllm-omni reports using, so we have it as an example,
             # but it only has two videos that we're just alternating between... We should replace
             # this with a better dataset
             return UCF101Dataset(
-                num_requests=self.config.num_requests,
-                req_type=self.config.request_type,
+                num_requests=num_requests,
+                req_type=request_type,
                 local_file_dir=self.config.local_cache_dir,
             )
-        elif self.config.dataset == DatasetType.DROID:
+        elif dataset == DatasetType.DROID:
             # DROID supports pi0.5 (VLA → first frames + state) and
             # vjepa2_ac (V2V → video clip + action/state trajectory).
             # The dataset is shared with our HF / openpi baseline scripts so
@@ -166,35 +209,67 @@ class Benchmark:
             task_for_dataset = {
                 RequestType.VLA: "pi05",
                 RequestType.V2V: "vjepa2_ac",
-            }.get(self.config.request_type)
+            }.get(request_type)
             if task_for_dataset is None:
                 raise ValueError(
                     f"DROID dataset only supports VLA (pi05) and V2V (vjepa2_ac) "
-                    f"request types; got {self.config.request_type}"
+                    f"request types; got {request_type}"
                 )
             return DROIDDataset(
                 local_file_dir=self.config.local_cache_dir,
-                num_requests=self.config.num_requests,
+                num_requests=num_requests,
                 task=task_for_dataset,
                 rollout_horizon=self.config.droid_rollout_horizon,
                 cache_dir=self.config.droid_hf_cache,
             )
-        elif self.config.dataset == DatasetType.VIDEO_MME:
+        elif dataset == DatasetType.VIDEO_MME:
             return VideoMMEDataset(
-                num_requests=self.config.num_requests,
-                req_type=self.config.request_type,
+                num_requests=num_requests,
+                req_type=request_type,
                 data_dir=self.config.video_mme_dir,
                 cache_dir=self.config.local_cache_dir,
             )
-        elif self.config.dataset == DatasetType.SEED_TTS:
+        elif dataset == DatasetType.SEED_TTS:
             return SeedTTSDataset(
-                num_requests=self.config.num_requests,
-                req_type=self.config.request_type,
+                num_requests=num_requests,
+                req_type=request_type,
                 locale=self.config.seed_tts_locale,
                 data_dir=self.config.seed_tts_dir,
                 cache_dir=self.config.local_cache_dir,
             )
-        raise ValueError(f"Unknown dataset: {self.config.dataset}")
+        raise ValueError(f"Unknown dataset: {dataset}")
+
+    def _build_mixed_requests(self) -> list[RequestInput]:
+        """Weighted deterministic interleave of per-type request pools.
+
+        Draws ``num_requests`` types i.i.d. from the mix weights with a
+        seeded RNG, consuming each type's pool in order (cycling if a pool is
+        shorter than its share) — every inference system pointed at the same
+        spec + seed benchmarks the identical request sequence.
+        """
+        mix = parse_request_mix(self.config.request_mix)
+        rng = random.Random(self.config.mix_seed)
+        pools: list[list[RequestInput]] = []
+        for rt, _, ds in mix:
+            pool = self._get_dataset_for(ds, rt, self.config.num_requests).get_requests()
+            if not pool:
+                raise ValueError(f"dataset {ds.value} yielded no {rt.value} requests")
+            pools.append(pool)
+        total_w = sum(w for _, w, _ in mix)
+        counters = [0] * len(mix)
+        seq: list[RequestInput] = []
+        for _ in range(self.config.num_requests):
+            r = rng.random() * total_w
+            acc = 0.0
+            for j, (_, w, _) in enumerate(mix):
+                acc += w
+                if r <= acc:
+                    seq.append(pools[j][counters[j] % len(pools[j])])
+                    counters[j] += 1
+                    break
+        drawn = {mix[j][0].value: counters[j] for j in range(len(mix))}
+        print(f"Request mix drawn (seed={self.config.mix_seed}): {drawn}")
+        return seq
 
     def _save_outputs(self, metrics: list[RequestMetrics]) -> None:
         """Save outputs to disk (after timing). Text → .txt, images → .png."""
@@ -254,13 +329,57 @@ class Benchmark:
                 "request_id": m.request_id,
                 "jct_ms": (m.e2e_latency or 0.0) * 1000.0,
                 "type": m.type.value if hasattr(m.type, "value") else str(m.type),
+                "ttft_ms": {mod: t * 1000.0 for mod, t in m.ttft.items()},
                 "output_bytes": dict(m.output_bytes),
             })
+
+        # Per-type breakdown (one entry per request type present) so mixed
+        # workloads report p50/p99 TTFT + JCT per type; goodput at any SLO is
+        # recomputable offline from per_request.
+        by_type: dict[str, list[RequestMetrics]] = {}
+        for m in ok_metrics:
+            t = m.type.value if hasattr(m.type, "value") else str(m.type)
+            by_type.setdefault(t, []).append(m)
+        failed_by_type: dict[str, int] = {}
+        for m in metrics:
+            if m.error is not None or m.e2e_latency is None:
+                t = m.type.value if hasattr(m.type, "value") else str(m.type)
+                failed_by_type[t] = failed_by_type.get(t, 0) + 1
+        per_type = {}
+        for t, ms in sorted(by_type.items()):
+            jcts = sorted((m.e2e_latency or 0.0) * 1000.0 for m in ms)
+            ttft_mods: dict[str, list[float]] = {}
+            for m in ms:
+                for mod, tt in m.ttft.items():
+                    ttft_mods.setdefault(mod, []).append(tt * 1000.0)
+            per_type[t] = {
+                "completed": len(ms),
+                "failed": failed_by_type.get(t, 0),
+                "jct_mean_ms": sum(jcts) / len(jcts) if jcts else 0.0,
+                "jct_p50_ms": _pct(jcts, 50),
+                "jct_p90_ms": _pct(jcts, 90),
+                "jct_p95_ms": _pct(jcts, 95),
+                "jct_p99_ms": _pct(jcts, 99),
+                "ttft_ms": {
+                    mod: {"p50": _pct(sorted(v), 50), "p99": _pct(sorted(v), 99)}
+                    for mod, v in sorted(ttft_mods.items())
+                },
+            }
 
         payload = {
             "system": "ours",
             "model": getattr(self.config.model, "__class__", type(self.config.model)).__name__,
-            "request_type": self.config.request_type.value,
+            "request_type": (
+                self.config.request_type.value
+                if self.config.request_type is not None
+                else f"mix[{self.config.request_mix}]"
+            ),
+            "request_mix": self.config.request_mix,
+            "mix_seed": self.config.mix_seed if self.config.request_mix else None,
+            "arrival": {
+                "rate": self.config.rate,
+                "cv": self.config.arrival_cv,
+            } if self.config.profiling_type == ProfilingType.ONLINE else None,
             "profiling_type": self.config.profiling_type.value,
             "num_requests": self.config.num_requests,
             "num_warmup": self.config.num_warmup,
@@ -273,6 +392,7 @@ class Benchmark:
             "jct_p95_ms": _pct(jcts_ms, 95),
             "jct_p99_ms": _pct(jcts_ms, 99),
             "request_throughput": (agg.request_throughput or 0.0),
+            "per_type": per_type,
             "per_request": per_request,
         }
 
@@ -342,10 +462,18 @@ class Benchmark:
             )
             tasks.append(task)
             if i < len(requests) - 1:
-                # Poisson inter-request times
-                interval = random.expovariate(self.config.rate)
-                await asyncio.sleep(interval)
+                await asyncio.sleep(self._draw_arrival_gap())
         return list(await asyncio.gather(*tasks))
+
+    def _draw_arrival_gap(self) -> float:
+        """Inter-arrival gap: exponential (Poisson) at cv=1, else gamma with
+        the same mean 1/rate and cv^2 = 1/shape (cv > 1 bursty)."""
+        rate = self.config.rate
+        cv = self.config.arrival_cv or 1.0
+        if cv == 1.0:
+            return random.expovariate(rate)
+        shape = 1.0 / (cv * cv)
+        return random.gammavariate(shape, 1.0 / (rate * shape))
 
     async def _run_concurrent_closed_loop(
         self,
@@ -440,12 +568,15 @@ class Benchmark:
                 req.model_kwargs["ignore_eos"] = True
 
     async def run(self) -> tuple[list[RequestMetrics], AggregateMetrics]:
-        dataset = self._get_dataset()
-        if self.config.profiling_type == ProfilingType.OFFLINE:
-            bs = self.config.batch_size
-            # make even multiple of batch size
-            self.config.num_requests = ((self.config.num_requests + bs - 1) // bs) * bs
-        requests = dataset.get_requests()[: self.config.num_requests]
+        if self.config.request_mix:
+            requests = self._build_mixed_requests()
+        else:
+            dataset = self._get_dataset()
+            if self.config.profiling_type == ProfilingType.OFFLINE:
+                bs = self.config.batch_size
+                # make even multiple of batch size
+                self.config.num_requests = ((self.config.num_requests + bs - 1) // bs) * bs
+            requests = dataset.get_requests()[: self.config.num_requests]
         self._assign_output_lengths(requests)
 
         # Bump the connection-pool cap so closed-loop runs at high
@@ -456,7 +587,15 @@ class Benchmark:
             connector=aiohttp.TCPConnector(limit=connector_limit),
             read_bufsize=5 * 2**20,  # 1MB read buffer
         ) as session:
-            await self._warmup(session, requests)
+            warmup_pool = requests
+            if self.config.request_mix:
+                # Warm every type in the mix (round-robin) so no request type
+                # hits cold per-walk paths during measurement.
+                first_of_type: dict = {}
+                for r in requests:
+                    first_of_type.setdefault(r.req_type, r)
+                warmup_pool = list(first_of_type.values())
+            await self._warmup(session, warmup_pool)
 
             wall_start = time.monotonic()
 
@@ -502,6 +641,24 @@ def parse_args() -> BenchmarkConfig:
         "--profiling-type", choices=[p.value for p in ProfilingType], default=ProfilingType.OFFLINE.value
     )
     parser.add_argument("--request-type", choices=[r.value for r in RequestType])
+    parser.add_argument(
+        "--request-mix",
+        default=None,
+        help="Mixed-type workload: comma-separated TYPE:WEIGHT:DATASET, e.g. "
+             "'text_to_image:1:vbench,image_to_text:2:food101,image_to_image:1:vbench'. "
+             "Each request's type is drawn from the weighted mix with a seeded RNG "
+             "(identical sequence for every system). Mutually exclusive with "
+             "--request-type/--dataset; offline profiling unsupported.",
+    )
+    parser.add_argument(
+        "--mix-seed", type=int, default=0,
+        help="Seed for the --request-mix type sequence.",
+    )
+    parser.add_argument(
+        "--arrival-cv", type=float, default=1.0,
+        help="CV of online inter-arrival gaps: 1 = Poisson (exponential), "
+             ">1 bursty / <1 regular (gamma with mean 1/rate).",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--max-concurrency", type=int, default=1, help="Max in-flight requests for closed_loop profiling (default: 1)."
@@ -611,12 +768,22 @@ def parse_args() -> BenchmarkConfig:
 
     args = parser.parse_args()
 
-    dataset = args.dataset
-    if dataset is not None:
-        dataset = DatasetType(dataset)
-    txtfile = args.request_txt_file
-    request_type = RequestType(args.request_type)
-    if dataset is None:
+    if args.request_mix:
+        if args.request_type is not None or args.dataset is not None:
+            parser.error("--request-mix is mutually exclusive with --request-type/--dataset")
+        if ProfilingType(args.profiling_type) == ProfilingType.OFFLINE:
+            parser.error("--request-mix requires online or closed_loop profiling")
+        parse_request_mix(args.request_mix)  # validate early
+        request_type = None
+        dataset = None
+        txtfile = args.request_txt_file
+    else:
+        dataset = args.dataset
+        if dataset is not None:
+            dataset = DatasetType(dataset)
+        txtfile = args.request_txt_file
+        request_type = RequestType(args.request_type)
+    if request_type is not None and dataset is None:
         if request_type in {RequestType.T2I, RequestType.I2I}:
             dataset = DatasetType.VBENCH
             txtfile = None
@@ -679,6 +846,9 @@ def parse_args() -> BenchmarkConfig:
         output_len_min=args.output_len_min,
         output_len_max=args.output_len_max,
         output_len_seed=args.output_len_seed,
+        request_mix=args.request_mix,
+        mix_seed=args.mix_seed,
+        arrival_cv=args.arrival_cv,
     )
 
 
