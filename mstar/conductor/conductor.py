@@ -464,29 +464,26 @@ class Conductor:
         two wgs sharing a TP group could end up on different DP replicas
         and break model topology.
 
-        TODO: smarter assignment that minimizes cross-graph-walk tensor
-        transfer (e.g., bias toward keeping prefill→decode handoff local
-        for the same request).
+        Assignment minimizes cross-graph-walk tensor transfer (e.g., bias
+        toward keeping prefill->decode handoff local, with tie breaks random.
         """
         # _group_id -> chosen DP-replica index within that group's ranks
         group_id_to_replica_idx: dict[int, int] = {}
         result = {}
+
+        chosen_ranks: set[int] = set()
         for wg_id, wg in self.worker_graphs.items():
-            if wg._instance_ranks:
-                # Route to a whole instance (the lockstep unit): every rank of a
-                # tp*sp instance runs the request together, so its TP all-reduce
-                # and SP all-to-all collectives stay in sync. Picking a single TP
-                # row here would desync the SP all-to-all across rows.
-                replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg._instance_ranks)),
-                )
-                ranks = wg._instance_ranks[replica_idx]
-                result[wg_id] = [f"worker_{r}" for r in ranks]
-            else:
-                replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg.ranks)),
-                )
-                result[wg_id] = [f"worker_{wg.ranks[replica_idx]}"]
+            replicas = wg._instance_ranks or [[r] for r in wg.ranks]
+            if wg._group_id not in group_id_to_replica_idx:
+                scores = [len(set(r) & chosen_ranks) for r in replicas]
+                best = max(scores)
+                candidates = [i for i, s in enumerate(scores) if s == best]
+                group_id_to_replica_idx[wg._group_id] = candidates[
+                    int(np.random.randint(len(candidates)))
+                ]
+            ranks = replicas[group_id_to_replica_idx[wg._group_id]]
+            chosen_ranks.update(ranks)
+            result[wg_id] = [f"worker_{r}" for r in ranks]
         return result
 
     def _build_request_sharding_config(
