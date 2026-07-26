@@ -3,6 +3,7 @@ import hashlib
 import logging
 import multiprocessing as mp
 import os
+import signal
 import socket
 import time
 from collections import defaultdict
@@ -100,6 +101,17 @@ def _worker_process_target(
     tcp_transfer_device="",
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
+    # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
+    # no unwinding, no atexit, no finalizers — so a worker's shared-memory
+    # segments were never unlinked and leaked into /dev/shm for the life of
+    # the box. Turning it into SystemExit unwinds the interpreter normally,
+    # which runs the transport's cleanup. The main process gets this for
+    # free from SIGINT -> KeyboardInterrupt, which is why only the workers
+    # leaked.
+    def _graceful_exit(_signum, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _graceful_exit)
     logging.basicConfig(
         level=getattr(logging, log_level),
         format=f"%(asctime)s %(levelname)s [{worker_id}] %(name)s: %(message)s",
@@ -439,13 +451,24 @@ class Conductor:
         atexit.register(self.shutdown)
 
     def shutdown(self):
-        logger.info("Shutting down conductor...")
         """Terminate and join all worker processes."""
+        logger.info("Shutting down conductor...")
+        # SIGTERM is handled in _worker_process_target as a graceful exit so
+        # the transports' cleanup runs (shm segments unlinked). A worker
+        # blocked in a C call cannot service it in time, so escalate to
+        # SIGKILL after the join window rather than hang the shutdown —
+        # the leftover segments are then reclaimed by the next arena
+        # start's orphan sweep.
         for p in self._worker_processes:
             if p.is_alive():
                 p.terminate()
         for p in self._worker_processes:
             p.join(timeout=5)
+            if p.is_alive():
+                logger.warning(
+                    "Worker pid %s did not exit on SIGTERM; killing", p.pid)
+                p.kill()
+                p.join(timeout=5)
         self._worker_processes.clear()
 
     def _assign_worker_graphs_to_workers(self) -> dict[str, list[str]]:
