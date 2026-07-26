@@ -133,6 +133,7 @@ def _serve(args: argparse.Namespace) -> None:
         "--socket-path-prefix", socket_prefix,
         "--upload-dir", upload_dir,
         "--tensor-comm-protocol", args.tensor_comm_protocol,
+        "--tcp-transfer-device", args.tcp_transfer_device,
         "--log-level", args.log_level,
     ]
     if args.cache_dir:
@@ -165,6 +166,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--tensor-comm-protocol", default="SHM",
         help="tensor transfer protocol (SHM is the safe single-node default; also TCP/RDMA)",
+    )
+    serve.add_argument(
+        "--tcp-transfer-device",
+        type=str, default="",
     )
     serve.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
