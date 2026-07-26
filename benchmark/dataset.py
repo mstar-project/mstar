@@ -576,7 +576,10 @@ class UCF101Dataset(BaseDataset):
         import torch
         from datasets import load_dataset
         from torchcodec.decoders import VideoDecoder
-        from torchcodec.encoders import VideoEncoder
+        try:
+            from torchcodec.encoders import VideoEncoder
+        except ImportError:
+            from torchcodec.encoders import Encoder as VideoEncoder
 
         self._num_requests = num_requests
         self.prompt = prompt
@@ -685,7 +688,10 @@ def _decode_frames_to_png_and_video(
         PILImage.fromarray(arr).save(png_path)
 
     if mp4_path is not None:
-        from torchcodec.encoders import VideoEncoder
+        try:
+            from torchcodec.encoders import VideoEncoder
+        except ImportError:
+            from torchcodec.encoders import Encoder as VideoEncoder
         # VideoEncoder expects [T, C, H, W] — same layout as get_frames_at output.
         VideoEncoder(frames=tensors, frame_rate=fps).to_file(mp4_path)
 
