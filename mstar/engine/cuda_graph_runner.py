@@ -26,6 +26,7 @@ import torch
 from torch import nn
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.base import autocast_context
 from mstar.engine.cache_manager import (
     BatchedCacheManager,
     WorkspaceBufferManager,
@@ -648,7 +649,7 @@ class CudaGraphRunner:
                 torch.cuda.set_device(self.device)
                 torch.cuda.synchronize()
                 for _ in range(2):
-                    with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                    with autocast_context(self.autocast_dtype):
                         run_forward()
                     # Reset seq_lens so capture starts from a clean state.
                     for rid in spec.dummy_rids:
@@ -660,7 +661,7 @@ class CudaGraphRunner:
                 torch.cuda.synchronize()
 
                 graph = torch.cuda.CUDAGraph()
-                with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+                with autocast_context(self.autocast_dtype):
                     with torch.cuda.graph(graph, pool=self.memory_pool):
                         output = run_forward()
                 torch.cuda.synchronize()
@@ -2554,14 +2555,14 @@ class PiecewiseCudaGraphRunner:
         # capture starts from a clean state (mirrors CudaGraphRunner).
         torch.cuda.synchronize()
         for _ in range(2):
-            with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+            with autocast_context(self.autocast_dtype):
                 run_fn()
             self._reset_dummy_states(dummy_rids)
             plan()
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
-        with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
+        with autocast_context(self.autocast_dtype):
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 static_out = self._normalize_output(run_fn())
         torch.cuda.synchronize()

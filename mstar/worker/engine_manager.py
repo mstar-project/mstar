@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -95,6 +96,20 @@ class EngineManager:
         autocast_dtype = model.get_autocast_dtype()
         if "autocast_dtype" in model_config:
             autocast_dtype = model_config["autocast_dtype"]
+        env_dtype = os.environ.get("MSTAR_AUTOCAST_DTYPE", "").strip().lower()
+        if env_dtype:
+            try:
+                autocast_dtype = {
+                    "float32": torch.float32,
+                    "bfloat16": torch.bfloat16,
+                    "float16": torch.float16,
+                }[env_dtype]
+            except KeyError:
+                raise ValueError(
+                    "MSTAR_AUTOCAST_DTYPE must be float32, bfloat16 or "
+                    f"float16; got {env_dtype!r}"
+                ) from None
+            logger.info("Autocast dtype overridden via env: %s", autocast_dtype)
 
         # Allocation dtype hint for get_submodule: a node's params should be
         # allocated directly in ``autocast_dtype`` (cast meta -> dtype before

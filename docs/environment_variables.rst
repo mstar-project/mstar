@@ -50,3 +50,14 @@ Engine
      - unset
      - ``1``/``true``: skip all CUDA graph capture (AR, stateless and
        piecewise runners) so every submodule runs its eager path.
+   * - ``MSTAR_AUTOCAST_DTYPE``
+     - unset
+     - Overrides the engines' autocast dtype for every node
+       (``float32``, ``bfloat16`` or ``float16``); wins over both the
+       model's ``get_autocast_dtype`` and the config's
+       ``autocast_dtype``. ``float32`` disables autocast and keeps
+       weights and activations in full precision. Exception: FlashInfer
+       has no float32 attention kernels, so paged-KV pools and the
+       attention-kernel boundary stay bf16 (q/k/v are cast on entry, the
+       output is cast back). Per-submodule ``get_autocast_dtype``
+       overrides still win for their node.
