@@ -21,6 +21,8 @@ Two pieces:
 """
 from __future__ import annotations
 
+import logging
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -34,6 +36,12 @@ from mstar.model.components.moe import (
     _gate_up_weight_loader,
 )
 from mstar.model.kimi_k2_7.config import KimiK2Config
+
+logger = logging.getLogger(__name__)
+
+# Log the resolved routed-expert backend once per process (the block is
+# instantiated per MoE layer, so a per-block log would repeat ~60x).
+_BACKEND_LOGGED = False
 
 # ---------------------------------------------------------------------------
 # Packed-expert weight loaders (int32 weights + bf16 group scales).
@@ -264,6 +272,13 @@ class KimiSparseMoeBlock(nn.Module):
         self.packed_experts = (
             config.quantization_config is not None and config.moe_in_kernel_dequant
         )
+        # Routed-expert W4A16 kernel backend for the packed experts. Marlin layers
+        # on top of the same packed params; the marlin-vs-triton choice is resolved
+        # post-load in :meth:`process_weights_after_loading` (a real device is needed
+        # to probe GPU capability + JIT-build the kernel — ``__init__`` runs on meta).
+        self.quant_kernel = getattr(config, "quant_kernel", "auto")
+        self._marlin_method = None
+        self._use_marlin = False
 
         self.gate = KimiMoEGate(
             hidden_size=config.hidden_size,
@@ -289,6 +304,7 @@ class KimiSparseMoeBlock(nn.Module):
             qc = config.quantization_config
             self.group_size = qc.group_size
             self.pack_factor = qc.pack_factor  # 8 for INT4
+            self.symmetric = qc.symmetric
             hidden, gs, pf = config.hidden_size, self.group_size, self.pack_factor
             # The packed/group axes must divide evenly on BOTH the hidden (gate_up K)
             # and the per-rank intermediate stripe (down K, TP-sharded).
@@ -396,22 +412,27 @@ class KimiSparseMoeBlock(nn.Module):
 
         # Router is replicated: every rank computes the full top-k selection.
         topk_weights, topk_ids = self.gate(flat)
-        topk_weights = topk_weights.to(flat.dtype)
-        if self.packed_experts:
-            # Packed experts: bypass the shared bf16 ``_dispatch`` and run the
-            # W4A16 in-kernel dequant GEMM directly (handles tp=1 and tp>1).
-            routed = self._dispatch_packed_experts(flat, topk_weights, topk_ids)
-        elif self.tp_size == 1:
-            routed = _dispatch(
-                flat,
-                self.experts.gate_up_proj,
-                self.experts.down_proj,
-                self.num_experts,
-                topk_ids,
-                topk_weights,
-            )
+        if self._use_marlin:
+            # Marlin's GEMM takes fp32 combine weights — pass them BEFORE the bf16
+            # cast the other paths need. Otherwise identical TP story.
+            routed = self._dispatch_marlin(flat, topk_weights, topk_ids)
         else:
-            routed = self._dispatch_tp(flat, topk_weights, topk_ids)
+            topk_weights = topk_weights.to(flat.dtype)
+            if self.packed_experts:
+                # Packed experts: bypass the shared bf16 ``_dispatch`` and run the
+                # W4A16 in-kernel dequant GEMM directly (handles tp=1 and tp>1).
+                routed = self._dispatch_packed_experts(flat, topk_weights, topk_ids)
+            elif self.tp_size == 1:
+                routed = _dispatch(
+                    flat,
+                    self.experts.gate_up_proj,
+                    self.experts.down_proj,
+                    self.num_experts,
+                    topk_ids,
+                    topk_weights,
+                )
+            else:
+                routed = self._dispatch_tp(flat, topk_weights, topk_ids)
         # Shared expert is a ParallelGatedMLP on the same comm group: at tp>1 it
         # holds its own intermediate stripe and all-reduces inside its down_proj.
         shared = self.shared_expert(flat)
@@ -448,6 +469,105 @@ class KimiSparseMoeBlock(nn.Module):
             group_size=self.group_size,
             pack_factor=self.pack_factor,
             reduce_results=reduce,
+        )
+        if reduce:
+            return out
+        self.comm_group.all_reduce(out)
+        output = torch.empty_like(flat)
+        moe_sum_reduce_triton(out, output, routed_scaling_factor=1.0)
+        return output
+
+    def process_weights_after_loading(self, device) -> None:
+        """Resolve the routed-expert kernel backend and, for Marlin, repack the
+        loaded packed experts into Marlin layout (freeing the source packed params).
+
+        Invoked by the generic post-load walker
+        (:func:`mstar.model.components.quantization.process_weights_after_loading`)
+        on a real device — a no-op unless the experts are packed and Marlin is both
+        selected (``quant_kernel != "triton"``) and eligible (sm80+, symmetric INT4,
+        Marlin-legal shapes). ``quant_kernel="marlin"`` raises if ineligible so an
+        explicit request never silently downgrades to Triton.
+        """
+        if not self.packed_experts:
+            return
+        from mstar.model.components.quantization import MarlinMoEMethod
+        from mstar.utils.marlin import is_marlin_available
+
+        dev = torch.device(device)
+        shard_inter = divide(self.moe_intermediate_size, self.tp_size)
+        legal_shapes = MarlinMoEMethod.shapes_are_legal(
+            self.hidden_size, shard_inter, self.group_size
+        )
+        eligible = (
+            self.quant_kernel != "triton"
+            and dev.type == "cuda"
+            and torch.cuda.get_device_capability(dev) >= (8, 0)
+            and self.symmetric
+            and legal_shapes
+            and is_marlin_available()
+        )
+        if self.quant_kernel == "marlin" and not eligible:
+            raise RuntimeError(
+                "quant_kernel='marlin' requested but Marlin is ineligible "
+                f"(needs CUDA sm80+, symmetric INT4, legal shapes: hidden="
+                f"{self.hidden_size}, shard_inter={shard_inter}, "
+                f"group_size={self.group_size}, legal={legal_shapes}). "
+                "Use quant_kernel='auto' to fall back to the Triton path."
+            )
+        global _BACKEND_LOGGED
+        if not eligible:
+            if not _BACKEND_LOGGED:
+                logger.info(
+                    "KimiSparseMoeBlock routed-expert backend: Triton W4A16 "
+                    "(quant_kernel=%s, marlin ineligible: legal_shapes=%s).",
+                    self.quant_kernel, legal_shapes,
+                )
+                _BACKEND_LOGGED = True
+            return
+
+        if not _BACKEND_LOGGED:
+            logger.info(
+                "KimiSparseMoeBlock routed-expert backend: Marlin W4A16 "
+                "(quant_kernel=%s, group_size=%d, tp_size=%d).",
+                self.quant_kernel, self.group_size, self.tp_size,
+            )
+            _BACKEND_LOGGED = True
+
+        method = MarlinMoEMethod(num_bits=32 // self.pack_factor, group_size=self.group_size)
+        method.prepare(
+            self.experts.gate_up_proj_packed.data,
+            self.experts.gate_up_proj_scale.data,
+            self.experts.down_proj_packed.data,
+            self.experts.down_proj_scale.data,
+            dev,
+        )
+        # Free the source packed params — Marlin holds the repacked copies now.
+        for name in (
+            "gate_up_proj_packed", "gate_up_proj_scale",
+            "down_proj_packed", "down_proj_scale",
+        ):
+            p = getattr(self.experts, name)
+            p.data = torch.empty(0, dtype=p.dtype, device=dev)
+        self._marlin_method = method
+        self._use_marlin = True
+
+    def _dispatch_marlin(
+        self,
+        flat: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Marlin W4A16 routed dispatch. TP story is identical to
+        :meth:`_dispatch_packed_experts`: tp=1 sum-reduces inside the kernel; tp>1
+        keeps per-slot partials (``reduce_results=False``), all-reduces the
+        intermediate-parallel partials, then folds the top-k dim. ``topk_weights``
+        is fp32 (Marlin requirement) and already carries ``routed_scaling_factor``.
+        """
+        from mstar.utils.fused_moe import moe_sum_reduce_triton
+
+        reduce = self.tp_size == 1
+        out = self._marlin_method.apply(
+            flat, topk_weights, topk_ids, reduce_results=reduce
         )
         if reduce:
             return out

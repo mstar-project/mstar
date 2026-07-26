@@ -102,6 +102,20 @@ class KimiK2Config:
     # ``components/moe.py`` / ``weight_loader.py``.
     moe_in_kernel_dequant: bool = False
 
+    # -- Quantization: routed-expert W4A16 kernel backend ----------------------
+    # Chooses the kernel for the PACKED routed experts (only meaningful when
+    # ``moe_in_kernel_dequant`` is set — Marlin layers on top of the Hook B packed
+    # params). Values:
+    #   "auto"   => Marlin on sm80+ (Ampere/Hopper) when the build succeeds and the
+    #               shapes/group_size are Marlin-legal, else the Triton
+    #               ``fused_moe_kernel_w4a16`` fallback. This is the production default.
+    #   "marlin" => force Marlin; raise if ineligible (must not silently downgrade).
+    #   "triton" => force the Triton in-kernel dequant path (the pre-Marlin behavior).
+    # The final resolution happens post-load in
+    # ``KimiSparseMoeBlock.process_weights_after_loading`` (a real device is needed to
+    # probe capability + build the kernel); ``__init__`` runs on ``meta``.
+    quant_kernel: str = "auto"
+
     # -- Serving: CUDA-graph prefill capture grid (optional overrides) ------
     # ``None`` => ``KimiLLMSubmodule`` uses its full-size class-default grid.
     # ``reduced()`` sets a tiny grid so the synthetic bring-up serve captures a
@@ -218,6 +232,34 @@ class KimiK2Config:
             num_bits=num_bits, group_size=group_size, symmetric=symmetric,
         )
         cfg.moe_in_kernel_dequant = True
+        return cfg
+
+    @classmethod
+    def reduced_marlin(
+        cls,
+        num_bits: int = 4,
+        group_size: int = 32,
+        symmetric: bool = True,
+    ) -> "KimiK2Config":
+        """:meth:`reduced_quantized_inkernel` with Marlin-legal shapes + the Marlin
+        routed-expert backend forced on.
+
+        Marlin's GEMM imposes ``n % 64 == 0`` and ``k % 128 == 0`` on each expert
+        matmul, which the default reduced dims (``hidden_size=128``,
+        ``moe_intermediate_size=64``) do NOT satisfy for the down projection
+        (``k == shard_inter``). This variant bumps ``hidden_size=256`` and
+        ``moe_intermediate_size=256`` so both expert GEMMs are Marlin-legal at
+        tp<=2 (tp=1 ``shard_inter=256``, tp=2 ``shard_inter=128`` — both ``% 128``);
+        tp=4 (``shard_inter=64``) fails ``k % 128``, so pin Marlin goldens to tp<=2.
+        ``group_size=32`` and ``pack_factor=8`` still divide both axes.
+        """
+        cfg = cls.reduced_quantized_inkernel(
+            num_bits=num_bits, group_size=group_size, symmetric=symmetric,
+        )
+        cfg.hidden_size = 256
+        cfg.moe_intermediate_size = 256
+        cfg.intermediate_size = 512
+        cfg.quant_kernel = "marlin"
         return cfg
 
     @classmethod
