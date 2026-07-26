@@ -1,3 +1,4 @@
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -16,6 +17,22 @@ from mstar.profile.worker import ExecTimings
 class EngineType(Enum):
     KV_CACHE = "kv_cache"
     STATELESS = "stateless"
+
+
+# Process-wide equivalents of the per-node disable_*_nodes config lists.
+# Read at warmup, not import, so they can be set late.
+
+def torch_compile_disabled_globally() -> bool:
+    return os.environ.get("MSTAR_DISABLE_TORCH_COMPILE", "0") == "1"
+
+
+def cuda_graphs_disabled_globally() -> bool:
+    return os.environ.get("MSTAR_DISABLE_CUDA_GRAPH", "0") == "1"
+
+
+def batching_disabled_globally() -> bool:
+    """Force every node to one request per forward. No per-node counterpart."""
+    return os.environ.get("MSTAR_DISABLE_BATCHING", "0") == "1"
 
 
 @dataclass(frozen=True)
@@ -136,12 +153,43 @@ class BaseEngine(ABC):
     ):
         self.enable_nvtx = enable_nvtx
         self.enable_profile = enable_profile
+        # Per-node opt-outs; populated by load_model from the config.
+        self.disable_torch_compile_nodes: set[str] = set()
+        self.disable_cuda_graph_nodes: set[str] = set()
+
+    def set_eager_overrides(
+        self,
+        disable_torch_compile_nodes: set[str] | None = None,
+        disable_cuda_graph_nodes: set[str] | None = None,
+    ) -> None:
+        self.disable_torch_compile_nodes = set(disable_torch_compile_nodes or ())
+        self.disable_cuda_graph_nodes = set(disable_cuda_graph_nodes or ())
+
+    def torch_compile_disabled(self, node_name: str) -> bool:
+        """True if engine-owned torch.compile must be skipped for this node."""
+        return (
+            torch_compile_disabled_globally()
+            or node_name in self.disable_torch_compile_nodes
+        )
+
+    def cuda_graphs_disabled(self, node_name: str) -> bool:
+        """True if CUDA-graph capture must be skipped for this node."""
+        return (
+            cuda_graphs_disabled_globally()
+            or node_name in self.disable_cuda_graph_nodes
+        )
+
+    def batching_disabled(self) -> bool:
+        """True if every forward must carry exactly one request."""
+        return batching_disabled_globally()
 
     def has_autocast(self):
         return True
 
     def get_max_batch_size(self, node_name: str, graph_walk: str):
-        return None
+        # 1 caps execute_with_max_batch_size to one request per forward;
+        # None means "no engine-imposed limit".
+        return 1 if self.batching_disabled() else None
 
     @abstractmethod
     def engine_type(self) -> EngineType:
@@ -154,6 +202,8 @@ class BaseEngine(ABC):
         parallel_groups: WorkerParallelGroups,
         kv_cache_config: list[KVCacheConfig],
         device: torch.device,
+        disable_torch_compile_nodes: set[str] | None = None,
+        disable_cuda_graph_nodes: set[str] | None = None,
         **kwargs
     ) -> None:
         """

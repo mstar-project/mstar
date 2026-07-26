@@ -148,6 +148,8 @@ class StatelessEngine(BaseEngine):
         return self.config.autocast_dtype is not None
 
     def get_max_batch_size(self, node_name: str, graph_walk: str):
+        if self.batching_disabled():
+            return 1
         submodule = self.submodules.get(node_name)
         if submodule is None:
             return None
@@ -170,8 +172,14 @@ class StatelessEngine(BaseEngine):
         submodules: dict[str, torch.nn.Module],
         parallel_groups: WorkerParallelGroups,
         device: torch.device,
+        disable_torch_compile_nodes: set[str] | None = None,
+        disable_cuda_graph_nodes: set[str] | None = None,
         **kwargs,
     ) -> None:
+        self.set_eager_overrides(
+            disable_torch_compile_nodes=disable_torch_compile_nodes,
+            disable_cuda_graph_nodes=disable_cuda_graph_nodes,
+        )
         if self.config.force_float32_submodules:
             # Reference parity for numerically sensitive forwards (audio codec).
             self.submodules = {name: mod.float() for name, mod in submodules.items()}
@@ -531,12 +539,25 @@ class StatelessEngine(BaseEngine):
         for node_name, submodule in self.submodules.items():
             if self.config.apply_torch_compile:
                 self._apply_torch_compile(node_name, submodule)
+
+            if self.cuda_graphs_disabled(node_name):
+                logger.info(
+                    "StatelessEngine[%s]: CUDA graph capture disabled for %s",
+                    self.config.name, node_name,
+                )
+                continue
             if self.config.cuda_graph_capable:
                 self._capture_codec_graphs(node_name, submodule)
             if self.config.enable_piecewise_runner:
                 self._install_piecewise_runner(node_name, submodule)
 
     def _apply_torch_compile(self, node_name: str, submodule: NodeSubmodule) -> None:
+        if self.torch_compile_disabled(node_name):
+            logger.info(
+                "StatelessEngine[%s]: torch.compile disabled for %s (config/env)",
+                self.config.name, node_name,
+            )
+            return
         if getattr(submodule, "disable_torch_compile", False):
             logger.info(
                 "StatelessEngine[%s]: torch.compile disabled for %s (submodule opt-out)",
@@ -576,7 +597,8 @@ class StatelessEngine(BaseEngine):
                 submodule_name=node_name,
                 submodule=submodule,
                 device=self.device,
-                tp_group=self.parallel_groups.get_tp_config_for_node(node_name)
+                tp_group=self.parallel_groups.get_tp_config_for_node(node_name),
+                disable_torch_compile=self.torch_compile_disabled(node_name),
             )
             runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()
@@ -609,6 +631,7 @@ class StatelessEngine(BaseEngine):
             autocast_dtype=self.config.autocast_dtype,
             tp_world_size=getattr(tp_config, "world_size", 1),
             tp_group=tp_config,
+            disable_torch_compile=self.torch_compile_disabled(node_name),
         )
 
 

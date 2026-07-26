@@ -96,6 +96,11 @@ class EngineManager:
         if "autocast_dtype" in model_config:
             autocast_dtype = model_config["autocast_dtype"]
 
+        # Per-node opt-outs from the engine-owned acceleration passes. Both
+        # also have process-wide env overrides (see mstar/engine/base.py).
+        disable_torch_compile_nodes = set(model_config.get("disable_torch_compile_nodes", []))
+        disable_cuda_graph_nodes = set(model_config.get("disable_cuda_graph_nodes", []))
+
         # Allocation dtype hint for get_submodule: a node's params should be
         # allocated directly in ``autocast_dtype`` (cast meta -> dtype before
         # ``to_empty``) instead of allocating fp32 then down-casting after
@@ -166,7 +171,9 @@ class EngineManager:
                 default_sampling_config={
                     node: model.get_sampling_config(node, {}) \
                         for node in submodules
-                }
+                },
+                disable_torch_compile_nodes=disable_torch_compile_nodes,
+                disable_cuda_graph_nodes=disable_cuda_graph_nodes,
             )
             log_key = engine_type_str if flavor is None else f"{engine_type_str}.{flavor}"
             logger.info("Engine %s loaded in on device %s", log_key, str(device))

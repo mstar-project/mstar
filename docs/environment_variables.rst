@@ -35,3 +35,52 @@ Communication
      - ``19000``
      - Base of the deterministic entity-id → TCP port map (``api_server``
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
+
+Engine
+------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_DISABLE_CUDA_GRAPH``
+     - ``0``
+     - ``1`` skips CUDA-graph capture for **every** node in the worker
+       process — the paged-KV engine's decode / prefill graphs, the
+       stateless engine's codec graphs, and the piecewise runners — so
+       forwards are dispatched kernel by kernel. ``torch.compile`` is
+       unaffected. Useful for debugging shape or memory issues that
+       capture hides, and for profilers that can't see inside a replayed
+       graph; expect a large decode-latency regression.
+   * - ``MSTAR_DISABLE_TORCH_COMPILE``
+     - ``0``
+     - ``1`` skips every ``torch.compile`` the **engines** apply, for all
+       nodes: the post-warmup compile of ``forward`` / ``forward_batched``
+       and the ``max-autotune-no-cudagraphs`` compile the CUDA-graph
+       runners do before capture. Graph capture still happens, around
+       eager kernels. Use it to cut Inductor warmup time or to rule out a
+       compile-induced numerical difference. It does **not** affect
+       ``torch.compile`` calls inside model code — a submodule opts out of
+       those via its own ``disable_torch_compile`` attribute.
+   * - ``MSTAR_DISABLE_BATCHING``
+     - ``0``
+     - ``1`` forces sequential execution: every engine reports a max batch
+       size of ``1``, so a scheduled batch of *n* requests is split into
+       *n* single-request forwards
+       (``BaseEngine.execute_with_max_batch_size``) instead of one batched
+       one. CUDA graphs stay enabled, but each runner captures only its
+       smallest bucket (bs=1 for every default list) — the larger buckets
+       could never be replayed, and skipping them cuts warmup time and
+       capture memory. Use it to isolate a batching-dependent
+       correctness bug, or to measure single-request latency without
+       queueing effects. Throughput drops accordingly.
+
+``MSTAR_DISABLE_CUDA_GRAPH`` and ``MSTAR_DISABLE_TORCH_COMPILE`` are the
+process-wide form of the per-node ``disable_cuda_graph_nodes`` /
+``disable_torch_compile_nodes`` config keys (see
+:ref:`Running nodes eagerly <eager-node-overrides>`); a node is skipped if
+either its config key or the env var says so. ``MSTAR_DISABLE_BATCHING`` has
+no per-node counterpart — batch composition is a whole-worker property.

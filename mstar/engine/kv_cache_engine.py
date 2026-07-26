@@ -177,9 +177,15 @@ class KVCacheEngine(BaseEngine):
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
         default_sampling_config: dict[str, SamplingConfig],
+        disable_torch_compile_nodes: set[str] | None = None,
+        disable_cuda_graph_nodes: set[str] | None = None,
         kv_cache_type=None,
     ) -> None:
         self.device = device
+        self.set_eager_overrides(
+            disable_torch_compile_nodes=disable_torch_compile_nodes,
+            disable_cuda_graph_nodes=disable_cuda_graph_nodes,
+        )
         if kv_cache_type is None:
             kv_cache_type = self.autocast_dtype
 
@@ -331,6 +337,10 @@ class KVCacheEngine(BaseEngine):
                 logger.info("KVCacheEngine: torch.compile disabled for %s (submodule opt-out)", node_name)
                 continue
 
+            if self.torch_compile_disabled(node_name):
+                logger.info("KVCacheEngine: torch.compile disabled for %s (config/env)", node_name)
+                continue
+
             try:
                 submodule.forward = torch.compile(
                     submodule.forward,
@@ -347,13 +357,16 @@ class KVCacheEngine(BaseEngine):
                 logger.warning("KVCacheEngine: torch.compile failed for %s, using eager mode",
                                node_name, exc_info=True)
 
-    def warmup(self) -> None:
-        """Compile submodules and capture CUDA graphs."""
-        from mstar.engine.cuda_graph_runner import CudaGraphRunner
-
+    def _capture_graphs(self):
         for node_name, submodule_mgmt in self.submodule_management.items():
+            if self.cuda_graphs_disabled(node_name):
+                logger.info("KVCacheEngine: CUDA graph capture disabled for %s", node_name)
+                continue
             kv_mgmt = submodule_mgmt.kv_management
             submodule = submodule_mgmt.submodule
+            # Capture-time compile is the same pass as _compile_submodules from
+            # the config's point of view, so it honors the same opt-out.
+            no_compile = self.torch_compile_disabled(node_name)
 
             # Standard AR decode CUDA graph (CudaGraphRunner).
             runner = CudaGraphRunner(
@@ -367,6 +380,7 @@ class KVCacheEngine(BaseEngine):
                 autocast_dtype=self.autocast_dtype,
                 tp_group=submodule_mgmt.tp_group,
                 default_sampling_config=submodule_mgmt.default_sampling_config,
+                disable_torch_compile=no_compile,
             )
             runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()
@@ -388,7 +402,12 @@ class KVCacheEngine(BaseEngine):
                 kv_cache_config=kv_mgmt.kv_cache_config,
                 alloc_manager=kv_mgmt.alloc_manager,
                 buffer_manager=kv_mgmt.buffer_manager,
+                disable_torch_compile=no_compile,
             )
+
+    def warmup(self) -> None:
+        """Compile submodules and capture CUDA graphs."""
+        self._capture_graphs()
 
         # torch.compile applied after CUDA graph capture so compiled kernels
         # are baked into the graphs.
@@ -445,6 +464,8 @@ class KVCacheEngine(BaseEngine):
                 )
 
     def get_max_batch_size(self, node_name, graph_walk):
+        if self.batching_disabled():
+            return 1
         if node_name not in self.submodule_management:
             return
         submod_max_bs = self.submodule_management[node_name].submodule.max_batch_size(graph_walk)

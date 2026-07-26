@@ -178,6 +178,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``disable_torch_compile_nodes``
+     - *(optional)* List of node names to exempt from ``torch.compile`` (see below).
+   * - ``disable_cuda_graph_nodes``
+     - *(optional)* List of node names to run without CUDA-graph capture (see below).
 
 Node names are model-specific — they are the keys of the model's
 ``get_node_engine_types`` (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``,
@@ -242,6 +246,57 @@ Pi0.5 DROID variant fixes the action horizon:
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`.
+
+.. _eager-node-overrides:
+
+Running nodes eagerly
+---------------------
+
+At warmup each engine applies two independent acceleration passes to every node it owns:
+``torch.compile`` on the submodule's forward paths, and CUDA-graph capture. Two optional
+config keys turn them off per node.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 66
+
+   * - Key
+     - What warmup skips for the listed nodes
+   * - ``disable_torch_compile_nodes``
+     - Every ``torch.compile`` the *engine* applies: the post-warmup compile of
+       ``forward`` / ``forward_batched``, and the ``max-autotune-no-cudagraphs``
+       compile the CUDA-graph runners do just before capture. Graphs are still
+       captured (around eager kernels).
+   * - ``disable_cuda_graph_nodes``
+     - All graph capture: the AR decode / prefill runner, the stateless codec runner,
+       and the piecewise runners. ``torch.compile`` still runs, so forwards are
+       compiled but replayed eagerly.
+
+List both keys for the same node to run it fully eagerly:
+
+.. code-block:: yaml
+
+   model: "bagel"
+   max_seq_len: 32768
+   disable_torch_compile_nodes: [LLM]
+   disable_cuda_graph_nodes: [LLM]
+   node_groups:
+     - {node_names: [vit_encoder], ranks: [0]}
+     - {node_names: [vae_encoder, vae_decoder], ranks: [0]}
+     - {node_names: [LLM], ranks: [1]}
+
+That pairing is what ``configs/bagel_eager.yaml`` ships. Names must match the node names
+used in ``node_groups``; unknown names are ignored. Reach for
+``disable_cuda_graph_nodes`` when a node's shapes vary too much for capture to pay off,
+when a profiler needs to see individual kernels, or to bisect a suspected capture bug to
+one node; reach for ``disable_torch_compile_nodes`` to skip Inductor's warmup cost or to
+rule out a compile-induced numerical difference. Neither key touches ``torch.compile``
+calls made by model code itself (e.g. a submodule that compiles its own denoise step) —
+those are controlled by the submodule's ``disable_torch_compile`` attribute.
+
+Both have process-wide equivalents that apply to every node —
+``MSTAR_DISABLE_TORCH_COMPILE=1`` and ``MSTAR_DISABLE_CUDA_GRAPH=1``
+(see :doc:`environment_variables`).
 
 .. _tensor-transport:
 

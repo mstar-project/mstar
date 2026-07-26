@@ -26,6 +26,7 @@ import torch
 from torch import nn
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.base import batching_disabled_globally
 from mstar.engine.cache_manager import (
     BatchedCacheManager,
     WorkspaceBufferManager,
@@ -181,11 +182,15 @@ class CudaGraphRunner:
         autocast_dtype: torch.dtype,
         default_sampling_config: SamplingConfig,
         tp_group=None,
+        disable_torch_compile: bool = False,
     ):
         from mstar.distributed.communication import CommGroup
 
         self.submodule_name = submodule_name
         self.submodule = submodule
+        # Set by the engine when this node opts out of torch.compile; gates
+        # the pre-capture compile below (config.compile still has to be on).
+        self.disable_torch_compile = disable_torch_compile
         self.tp_group: CommGroup = tp_group or CommGroup.trivial()
         self.capture_configs: list[CudaGraphConfig] = submodule.get_cuda_graph_configs(
             device, self.tp_group.world_size
@@ -233,7 +238,7 @@ class CudaGraphRunner:
         self._plan_stream: "torch.cuda.Stream | None" = None
 
         self.max_bs = max(
-            [max(config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES)
+            [max(self.capture_sizes_for(config))
             for config in self.capture_configs] or [1]
         )
         self.sampler_buffer: SamplerBuffers = SamplerBuffers.allocate(
@@ -245,6 +250,19 @@ class CudaGraphRunner:
             # Qwen3-Omni Talker) can apply it. None => no mask buffers.
             vocab_size=self.default_sampling_config.vocab_size,
         )
+
+    def capture_sizes_for(self, config: CudaGraphConfig) -> list[int]:
+        """Batch-size buckets to capture (and look up) for ``config``.
+
+        MSTAR_DISABLE_BATCHING keeps capture on but narrows it to the smallest
+        declared bucket — bs=1 for every default list — since no batch will
+        ever hold more than one request. Both capture and lookup go through
+        here so the two can't disagree.
+        """
+        sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+        if sizes and batching_disabled_globally():
+            return [min(sizes)]
+        return sizes
 
     def warmup_and_capture(self) -> None:
         """Capture graphs for all configs and batch sizes."""
@@ -262,7 +280,7 @@ class CudaGraphRunner:
         mem_before = torch.cuda.memory_allocated(self.device)
 
         for config in self.capture_configs:
-            sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+            sizes = self.capture_sizes_for(config)
             for bs in reversed(sizes):
                 for num_tokens in reversed(sorted(config.get_total_tokens(bs))):
                     key = CudaGraphKey(
@@ -608,7 +626,7 @@ class CudaGraphRunner:
                 # method so the non-capturable scheduler tail stays out of the
                 # graph (finished in the submodule ``postprocess``).
                 forward = getattr(submodule, config.capture_forward_method)
-                if config.compile:
+                if config.compile and not self.disable_torch_compile:
                     forward = torch.compile(
                         forward,
                         mode="max-autotune-no-cudagraphs",
@@ -905,12 +923,10 @@ class CudaGraphRunner:
     ) -> int | None:
         """Find smallest captured batch size >= batch_size for this config.
 
-        Mirrors warmup_and_capture's fallback: when a config doesn't override
-        capture_batch_sizes (the common case — Bagel et al. just defer to the
-        runner's default), capture iterates self.CAPTURE_BATCH_SIZES, so lookup
-        has to consult the same list to find a match.
+        Goes through ``capture_sizes_for`` — the same list warmup_and_capture
+        iterated — so lookup can't consult a bucket that was never captured.
         """
-        sizes = sorted(config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES)
+        sizes = sorted(self.capture_sizes_for(config))
         idx = bisect.bisect_left(sizes, batch_size)
         if idx >= len(sizes):
             return None
@@ -2067,10 +2083,12 @@ class StatelessCudaGraphRunner:
         submodule: nn.Module,
         device: torch.device,
         tp_group=None,
+        disable_torch_compile: bool = False,
     ):
 
         self.submodule_name = submodule_name
         self.submodule = submodule
+        self.disable_torch_compile = disable_torch_compile
         self.device = device
         tp_world_size = tp_group.world_size if tp_group is not None else 1
         self.capture_configs: list[CudaGraphConfig] = (
@@ -2110,7 +2128,7 @@ class StatelessCudaGraphRunner:
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
 
         for config in self.capture_configs:
-            sizes = config.capture_batch_sizes or self.DEFAULT_CAPTURE_BATCH_SIZES
+            sizes = self.capture_sizes_for(config)
             for bs in reversed(sorted(sizes)):
                 try:
                     self._capture_one(
@@ -2183,7 +2201,7 @@ class StatelessCudaGraphRunner:
             static_inputs[name].copy_(t)
 
         fwd = submodule.forward_batched
-        if config.compile:
+        if config.compile and not self.disable_torch_compile:
             fwd = torch.compile(
                 fwd,
                 mode="max-autotune-no-cudagraphs",
@@ -2221,11 +2239,20 @@ class StatelessCudaGraphRunner:
             self.static_outputs[key] = static_output
             self.dummy_rids[key] = dummy_rids
 
+    def capture_sizes_for(self, config: CudaGraphConfig | None) -> list[int]:
+        """Batch-size buckets to capture / look up. See CudaGraphRunner's."""
+        sizes = (
+            config.capture_batch_sizes if config is not None else None
+        ) or self.DEFAULT_CAPTURE_BATCH_SIZES
+        if sizes and batching_disabled_globally():
+            return [min(sizes)]
+        return sizes
+
     def _sizes_for(self, graph_walk: str) -> list[int]:
         for cfg in self.capture_configs:
             if cfg.capture_graph_walk == graph_walk:
-                return cfg.capture_batch_sizes or self.DEFAULT_CAPTURE_BATCH_SIZES
-        return self.DEFAULT_CAPTURE_BATCH_SIZES
+                return self.capture_sizes_for(cfg)
+        return self.capture_sizes_for(None)
 
     def _get_padded_batch_size(self, batch_size: int, graph_walk: str) -> int | None:
         sizes = self._sizes_for(graph_walk)
@@ -2434,10 +2461,12 @@ class PiecewiseCudaGraphRunner:
         alloc_manager: PagedAllocationManager | None = None,
         buffer_manager: WorkspaceBufferManager | None = None,
         tp_group=None,
+        disable_torch_compile: bool = False,
     ):
         from mstar.distributed.communication import CommGroup
 
         self.config = config
+        self.disable_torch_compile = disable_torch_compile
         self.device = device
         self.autocast_dtype = autocast_dtype
         self.kv_cache_config = kv_cache_config
@@ -2454,6 +2483,9 @@ class PiecewiseCudaGraphRunner:
         self.capture_batch_sizes = sorted(
             config.capture_batch_sizes or self.DEFAULT_CAPTURE_BATCH_SIZES
         )
+        if batching_disabled_globally() and self.capture_batch_sizes:
+            # Only the bs=1 bucket can ever be replayed; skip the rest.
+            self.capture_batch_sizes = self.capture_batch_sizes[:1]
         self.cache_labels: list[str] = config.cache_labels
 
         if config.uses_kv_cache:
@@ -2508,7 +2540,7 @@ class PiecewiseCudaGraphRunner:
         static_cm, dummy_rids = self._setup_cache_manager(shape)
 
         fn = self.config.capture_fn
-        if self.config.compile:
+        if self.config.compile and not self.disable_torch_compile:
             fn = torch.compile(
                 fn,
                 mode="max-autotune-no-cudagraphs",
@@ -2824,6 +2856,7 @@ def build_piecewise_runners(
     kv_cache_config: KVCacheConfig | None = None,
     alloc_manager: PagedAllocationManager | None = None,
     buffer_manager: WorkspaceBufferManager | None = None,
+    disable_torch_compile: bool = False,
 ) -> dict[str, PiecewiseCudaGraphRunner]:
     """Build + warm up one ``PiecewiseCudaGraphRunner`` per label a submodule
     declares via ``get_piecewise_cuda_graph_configs``.
@@ -2848,6 +2881,7 @@ def build_piecewise_runners(
                 alloc_manager=alloc_manager if config.uses_kv_cache else None,
                 buffer_manager=buffer_manager if config.uses_kv_cache else None,
                 tp_group=tp_group,
+                disable_torch_compile=disable_torch_compile,
             )
             runner.warmup_and_capture()
             if runner.graphs:
