@@ -406,6 +406,12 @@ class KimiK2Model(Model):
             language_model = language_model.to(autocast_dtype)
         language_model.to_empty(device=device)
         load_weights(language_model, source, device=device)
+        # Post-load pass: let quantized submodules finalize their kernel layout on
+        # the real device (the routed-expert MoE block repacks its packed experts
+        # into Marlin layout + allocates a workspace). No-op for a plain bf16 build.
+        from mstar.model.components.quantization import process_weights_after_loading
+
+        process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
 
         logger.info("Successfully loaded Kimi-K2.7 submodule for %s", node_name)
