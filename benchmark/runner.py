@@ -452,7 +452,9 @@ class Benchmark:
         # max_concurrency don't bottleneck on aiohttp's default 100/host limit.
         connector_limit = max(100, (self.config.max_concurrency or 1) + 10)
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300),
+            timeout=aiohttp.ClientTimeout(
+                total=float(os.environ.get("MSTAR_BENCH_TIMEOUT_S", "1800"))
+            ),
             connector=aiohttp.TCPConnector(limit=connector_limit),
             read_bufsize=5 * 2**20,  # 1MB read buffer
         ) as session:
