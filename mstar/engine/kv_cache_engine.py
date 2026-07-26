@@ -228,11 +228,23 @@ class KVCacheEngine(BaseEngine):
             )
             num_kv_heads = cfg.num_kv_heads
 
-            kv_cache = torch.zeros(
-                num_layers, max_num_pages, 2,
-                page_size, num_kv_heads, head_dim,
-                dtype=kv_cache_type, device=device,
-            ).contiguous()
+            if cfg.attention_backend == "mla_absorb":
+                # Compressed-latent MLA cache: one latent vector per token of
+                # width head_dim (= kv_lora_rank + qk_rope_head_dim). Drop the
+                # 2-wide K/V axis (a single latent, not a K/V pair) and the
+                # num_kv_heads axis (MQA — one shared latent head), giving a 4D
+                # [num_layers, max_pages, page_size, latent_width] cache that
+                # MlaAbsorbCacheManager scatters into / gathers from.
+                kv_cache = torch.zeros(
+                    num_layers, max_num_pages, page_size, head_dim,
+                    dtype=kv_cache_type, device=device,
+                ).contiguous()
+            else:
+                kv_cache = torch.zeros(
+                    num_layers, max_num_pages, 2,
+                    page_size, num_kv_heads, head_dim,
+                    dtype=kv_cache_type, device=device,
+                ).contiguous()
 
             cpu_page_pool = None
             if cfg.cpu_offload_pages > 0:

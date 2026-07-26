@@ -326,15 +326,32 @@ class CudaGraphRunner:
         can run on plan_stream concurrently with replay(slot 0) on
         default_stream without racing on the wrapper's persistent state.
         """
-        from mstar.engine.cache_manager import _PlanState
+        from mstar.engine.cache_manager import _mla_kernel_available, _PlanState
         from mstar.utils.flashinfer_utils import (
             FlashInferDecodeWrapper,
+            FlashInferMLAWrapper,
             FlashInferPrefillWrapper,
         )
 
         is_decode = (total_tokens == bs)
 
         cfg = self.kv_cache_config
+
+        # Compressed-latent MLA fast path: when the backend is "mla_absorb" and the
+        # FlashInfer MLA kernel is available at these dims (real Kimi dims on sm90),
+        # capture uses a persistent FlashInferMLAWrapper for BOTH decode and prefill
+        # (its run() serves both). This is the only capturable absorbed path — the
+        # SDPA fallback is eager-only, so reduced-dims / non-kernel absorbed serving
+        # runs eager (no capture). See MlaAbsorbCacheManager.
+        use_mla_kernel = (
+            cfg.attention_backend == "mla_absorb"
+            and cfg.mla_ckv_dim is not None
+            and _mla_kernel_available(
+                cfg.mla_ckv_dim,
+                cfg.head_dim - cfg.mla_ckv_dim,
+                torch.cuda.get_device_capability(self.device)[0],
+            )
+        )
 
         # Allocate workspace buffer for CUDA graph wrappers.
         # Each (label, slot) gets its own workspace — slots must NOT share
@@ -344,7 +361,22 @@ class CudaGraphRunner:
         plan_states = {}
         for label in config.labels:
             ws_label = f"{label}_cugraph_slot{slot_idx}"
-            if is_decode:
+            if use_mla_kernel:
+                wrapper = FlashInferMLAWrapper(
+                    workspace_buffer=self.buffer_manager.get(ws_label),
+                    num_heads=cfg.num_qo_heads,
+                    head_dim_ckv=cfg.mla_ckv_dim,
+                    head_dim_kpe=cfg.head_dim - cfg.mla_ckv_dim,
+                    page_size=cfg.page_size,
+                    sm_scale=cfg.softmax_scale,
+                    batch_size=bs,
+                    max_num_pages=cfg.max_num_pages,
+                    max_total_tokens=total_tokens,
+                    device=self.device,
+                    use_cuda_graph=True,
+                    enable_nvtx=self.enable_nvtx,
+                )
+            elif is_decode:
                 wrapper = FlashInferDecodeWrapper(
                     workspace_buffer=self.buffer_manager.get(ws_label),
                     num_qo_heads=cfg.num_qo_heads,

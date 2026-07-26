@@ -119,6 +119,32 @@ class KimiK2Model(Model):
     # -------------------------------------------------------------------
 
     def get_kv_cache_config(self) -> list[KVCacheConfig]:
+        if self.config.mla_absorb:
+            # Weight-absorbed MLA (the default): attention is MQA over the
+            # COMPRESSED latent (kv_b_proj folded into Q/O + the fused_qkv_a_proj
+            # down-proj), so the paged cache stores a single KV "head" of width
+            # ``kv_lora_rank + qk_rope_head_dim`` ([kv_c | k_pe]) per token — a ~57x
+            # shrink vs the naive padded MHA cache (real 2*64*256=32768 -> 512+64=576;
+            # reduced 2*4*64=512 -> 40). Served by ``MlaAbsorbCacheManager`` over the
+            # 4D latent cache. ``softmax_scale`` is DeepSeek's intended MLA scale
+            # ``qk_head_dim**-0.5 * mscale**2``: the absorbed forward folds nothing
+            # into q (unlike naive), so the backend applies this scale directly.
+            from mstar.model.kimi_k2_7.components.rope import yarn_get_mscale
+            rope = self.config.rope_scaling
+            mscale = yarn_get_mscale(rope["factor"], rope.get("mscale_all_dim", 0.0))
+            softmax_scale = self.config.qk_head_dim ** -0.5 * mscale * mscale
+            return [KVCacheConfig(
+                num_layers=self.config.num_hidden_layers,
+                num_kv_heads=1,
+                head_dim=self.config.kv_lora_rank + self.config.qk_rope_head_dim,
+                max_seq_len=self.config.max_position_embeddings,
+                num_qo_heads=self.config.num_attention_heads,
+                attention_backend="mla_absorb",
+                softmax_scale=softmax_scale,
+                # The ckv/kpe split for the FlashInfer MLA kernel fast path
+                # (head_dim = ckv + kpe = kv_lora_rank + qk_rope_head_dim).
+                mla_ckv_dim=self.config.kv_lora_rank,
+            )]
         # Naive/materialized MLA (the first-pass port, per CLAUDE.md): the latent
         # is projected up to full per-head K/V and broadcast to every query head,
         # so from the paged cache's ``[tokens, heads, head_dim]`` point of view
@@ -406,9 +432,13 @@ class KimiK2Model(Model):
             language_model = language_model.to(autocast_dtype)
         language_model.to_empty(device=device)
         load_weights(language_model, source, device=device)
-        # Post-load pass: let quantized submodules finalize their kernel layout on
-        # the real device (the routed-expert MoE block repacks its packed experts
-        # into Marlin layout + allocates a workspace). No-op for a plain bf16 build.
+        # Post-load pass: let any submodule finalize its weights on the real device
+        # now that the checkpoint is resident. The routed-expert MoE block repacks
+        # its packed experts into the Marlin (or Triton) kernel layout + allocates a
+        # workspace; under mla_absorb, KimiMLAAttention builds the absorbed w_kc/w_vc
+        # projections + the fused_qkv_a_proj weight. Generic + idempotent walker
+        # (calls the hook on every module that exposes one); no-op for a plain bf16
+        # module without the hook.
         from mstar.model.components.quantization import process_weights_after_loading
 
         process_weights_after_loading(language_model, torch.device(device))

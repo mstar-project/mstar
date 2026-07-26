@@ -12,7 +12,11 @@ from mstar.engine.kv_store import (
     KVRequestState,
     PagedAllocationManager,
 )
-from mstar.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPrefillWrapper
+from mstar.utils.flashinfer_utils import (
+    FlashInferDecodeWrapper,
+    FlashInferMLAWrapper,
+    FlashInferPrefillWrapper,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +102,7 @@ class _PlanState:
     actually consumes this — the model's inner ``advance_seq_lens(pos_id_ns=...)``
     runs at capture time only and is not replayed.
     """
-    wrapper: FlashInferPrefillWrapper | FlashInferDecodeWrapper | None = None
+    wrapper: FlashInferPrefillWrapper | FlashInferDecodeWrapper | FlashInferMLAWrapper | None = None
     pos_ids: torch.Tensor | None = None
     seq_lens: list[int] | None = None
     write_store: bool = True
@@ -123,6 +127,12 @@ class _PlanState:
     # segment over its contiguous frozen prefix. None on paged plans, which
     # keep the FlashInfer path. See DenseGenCacheManager._build_dense_gen_plan.
     dense_gen: dict | None = None
+    # Set when MlaAbsorbCacheManager planned this label: the compressed-latent
+    # scatter indices (token_to_page/token_to_cache) plus a per-request list of
+    # (q_start, seq_len, total_len, page_indices) that run_attention_mla uses to
+    # gather each request's full cached latent and run its causal SDPA. None on
+    # the standard FlashInfer/dense plans. See MlaAbsorbCacheManager.plan_attention.
+    mla: dict | None = None
 
 
 class WorkspaceBufferManager:
@@ -1488,10 +1498,323 @@ class DenseGenCacheManager(FlashInferCacheManager):
         return out[0] if isinstance(out, tuple) else out
 
 
+@functools.cache
+def _mla_kernel_available(ckv: int, kpe: int, sm_major: int) -> bool:
+    """Whether the FlashInfer MLA kernel fast path can serve these latent dims.
+
+    Gated conservatively: ``flashinfer.mla.BatchMLAPagedAttentionWrapper`` is
+    hard-locked to the real Kimi dims (ckv=512, kpe=64). Off-dim calls trigger an
+    *uncatchable* illegal memory access (it corrupts the CUDA context — not a
+    catchable exception), so this decision MUST be made BEFORE any kernel
+    construction/call. Requires the flashinfer MLA module, exactly ckv=512/kpe=64,
+    and a Hopper (sm90) GPU (``backend="auto"`` -> fa3). Everything else — reduced
+    configs, pre-sm90, Blackwell (sm100, which wants the trtllm MLA path), or a
+    build without flashinfer — returns False and the manager uses the all-dims
+    SDPA fallback.
+    """
+    if not (ckv == 512 and kpe == 64):
+        return False
+    if sm_major != 9:
+        return False
+    try:
+        import flashinfer.mla  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+class MlaAbsorbCacheManager(FlashInferCacheManager):
+    """Compressed-latent (weight-absorbed) MLA attention backend.
+
+    Serves DeepSeek/Kimi MLA over a *latent* paged cache: instead of the
+    standard 6D ``[layers, pages, 2, page_size, kv_heads, head_dim]`` K/V cache,
+    the KV cache is the 4D latent tensor
+    ``[layers, pages, page_size, latent_width]`` allocated by
+    ``KVCacheEngine.load_model`` when ``attention_backend == "mla_absorb"``
+    (``latent_width = kv_lora_rank + qk_rope_head_dim``). One compressed latent
+    vector ``cat([kv_c, k_pe])`` is stored per token (MQA: a single shared latent
+    "head"), which is ~L/head_dim smaller than materialized K/V.
+
+    The standard FlashInfer paged wrappers assume the 6D layout, so this backend
+    does not build one. When the FlashInfer **MLA** kernel is available at the real
+    Kimi dims (see ``_mla_kernel_available``), ``plan_attention`` builds a
+    ``FlashInferMLAWrapper`` (the dedicated ckv=512/kpe=64 kernel) and
+    ``run_attention_mla`` scatters the new latents then runs it over strided
+    ``ckv``/``kpe`` views of the combined cache — this is the production fast path
+    and is CUDA-graph capturable. Otherwise (reduced configs, pre-sm90, no
+    flashinfer) it falls back to an all-dims **SDPA** path: ``plan_attention``
+    records the per-token write (page, offset) indices — the same index math the
+    FlashInfer prefill wrapper's ``plan`` computes — plus the per-request gather
+    layout; ``run_attention_mla`` scatters the new latents, gathers each request's
+    full cached latent, and runs a causal SDPA in which ``value`` is the first
+    ``L`` dims of the same latent that forms ``key`` (weight absorption folds
+    ``k_nope``/``v`` into the query/output projections, so the cache only holds
+    ``kv_c`` + rope). The SDPA path is eager-only.
+    """
+
+    def plan_attention(
+        self,
+        seq_lens: list[int] | None = None,
+        dtype: torch.dtype | None = None,
+        is_causal=True,
+        write_store: bool=True,
+        label: str | None = None,
+        **kwargs,
+    ):
+        """Allocate pages and record the latent attention plan.
+
+        Allocates enough pages for ``seq_len + new_tokens`` per request, then plans
+        one of two paths (chosen by ``_mla_kernel_available``):
+
+        - **Kernel fast path** (real dims + sm90 + flashinfer): build the MLA index
+          tensors (qo_indptr / kv_indptr / kv_indices / kv_len_arr) — the same
+          batch-level tensors ``FlashInferCacheManager._plan_attention_impl`` builds
+          — and plan a persistent (CUDA-graph) or fresh (eager) ``FlashInferMLAWrapper``
+          (stored on ``ps.wrapper``). ``ps.mla`` is cleared; the wrapper owns the
+          scatter indices.
+        - **SDPA fallback** (all dims, eager): record, for every new token, the
+          (page, within-page offset) it will be written to — computed exactly as
+          ``FlashInferPrefillWrapper.plan`` does (absolute position ``g`` maps to
+          page ``page_indices[g // page_size]`` at offset ``g % page_size``) — plus
+          the per-request gather layout, stashed on ``ps.mla``. ``ps.wrapper`` stays
+          None.
+
+        Planning hints for other backends (``**kwargs``) are ignored.
+        """
+        self._batched_cfg_info = None
+
+        effective_label = label if label is not None else self._active_label()
+        # This backend always re-plans (it does not implement the plan-overlap
+        # short-circuit); clear any pre-plan marker so it never causes a stale skip.
+        # The re-plan writes the (per-slot) wrapper's static buffers correctly under
+        # capture — only the overlap perf optimization is forgone (a follow-up).
+        self._pre_planned_labels.discard(effective_label)
+        if effective_label not in self._plan_states:
+            self._plan_states[effective_label] = _PlanState()
+        ps = self._plan_states[effective_label]
+
+        cfg = self.kv_cache_config
+        page_size = cfg.page_size
+        ckv = cfg.mla_ckv_dim
+        kpe = (cfg.head_dim - ckv) if ckv is not None else None
+        sm_major = torch.cuda.get_device_capability(self.device)[0]
+        use_kernel = ckv is not None and _mla_kernel_available(ckv, kpe, sm_major)
+
+        if use_kernel:
+            # ---- Kernel fast path: build batched MLA index tensors + plan wrapper.
+            qo_indptr_list = [0]
+            kv_indptr_list = [0]
+            all_page_indices: list[int] = []
+            kv_len_list: list[int] = []
+            for i, rid in enumerate(self.request_ids):
+                state = self._get_state(rid, effective_label)
+                sl = seq_lens[i]
+                total_len = state.seq_len + sl
+                self.alloc_manager.alloc(rid, label=effective_label, seq_len=total_len)
+                page_indices = state.page_indices
+                qo_indptr_list.append(qo_indptr_list[-1] + sl)
+                all_page_indices.extend(page_indices)
+                kv_indptr_list.append(kv_indptr_list[-1] + len(page_indices))
+                kv_len_list.append(total_len)
+
+            qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32, device=self.device)
+            kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32, device=self.device)
+            kv_indices = torch.tensor(all_page_indices, dtype=torch.int32, device=self.device)
+            kv_len_arr = torch.tensor(kv_len_list, dtype=torch.int32, device=self.device)
+
+            if dtype is None:
+                dtype = self.kv_cache.dtype
+            if ps.wrapper is None:
+                # Eager mode: fresh wrapper each forward (the manager is rebuilt per
+                # forward). CUDA-graph mode passes a persistent wrapper in ps.wrapper.
+                ps.wrapper = FlashInferMLAWrapper(
+                    workspace_buffer=self.buffer_manager.get(effective_label),
+                    num_heads=cfg.num_qo_heads,
+                    head_dim_ckv=ckv,
+                    head_dim_kpe=kpe,
+                    page_size=page_size,
+                    sm_scale=cfg.softmax_scale,
+                    device=self.device,
+                    enable_nvtx=self.enable_nvtx,
+                )
+            ps.wrapper.plan(
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                kv_len_arr=kv_len_arr,
+                causal=is_causal,
+                dtype=dtype,
+            )
+            ps.mla = None
+        else:
+            # ---- SDPA fallback: per-token scatter + per-request gather layout.
+            token_to_page: list[int] = []
+            token_to_cache: list[int] = []
+            requests: list[dict] = []
+            q_start = 0
+            for i, rid in enumerate(self.request_ids):
+                state = self._get_state(rid, effective_label)
+                sl = seq_lens[i]
+                old_len = state.seq_len
+                total_len = old_len + sl
+
+                self.alloc_manager.alloc(
+                    rid, label=effective_label, seq_len=total_len
+                )
+                page_indices = state.page_indices
+
+                # WRITE indices for the sl new tokens: token j lands at absolute
+                # position g = old_len + j -> page page_indices[g // page_size],
+                # offset g % page_size. (Same math as the FlashInfer plan's
+                # token_to_page / token_to_cache, specialized to per-request order.)
+                for j in range(sl):
+                    g = old_len + j
+                    token_to_page.append(page_indices[g // page_size])
+                    token_to_cache.append(g % page_size)
+
+                requests.append({
+                    "q_start": q_start,
+                    "seq_len": sl,
+                    "total_len": total_len,
+                    "page_indices": torch.tensor(
+                        page_indices, dtype=torch.long, device=self.device
+                    ),
+                })
+                q_start += sl
+
+            ps.mla = {
+                "token_to_page": torch.tensor(
+                    token_to_page, dtype=torch.long, device=self.device
+                ),
+                "token_to_cache": torch.tensor(
+                    token_to_cache, dtype=torch.long, device=self.device
+                ),
+                "requests": requests,
+            }
+
+        # Record like the base plan does so advance_seq_lens / flush_to_store
+        # see this label's per-request new-token counts and store policy.
+        ps.seq_lens = seq_lens
+        ps.write_store = write_store
+        ps.dense_gen = None
+
+    @torch.compiler.disable
+    def run_attention_mla(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        layer_idx: int | None = None,
+    ) -> torch.Tensor:
+        """Compressed-latent MLA attention over the paged latent cache.
+
+        Args:
+            q_nope: [T, H, L]        query, no-rope part (L = kv_lora_rank).
+            q_pe:   [T, H, Drope]    query, rope part.
+            kv_c:   [T, 1, L]        compressed KV latent (single MQA head).
+            k_pe:   [T, 1, Drope]    rope key (single MQA head).
+            layer_idx: transformer layer; defaults to self.layer_idx.
+        Returns:
+            [T, H, L] attention output (the ``value`` = ``kv_c`` slice width).
+
+        Writes ``cat([kv_c, k_pe])`` (width L+Drope) as one latent per token into
+        this layer's paged latent cache at the planned (page, offset) locations,
+        then attends. When ``plan_attention`` selected the FlashInfer MLA kernel
+        (``ps.wrapper`` set), the kernel runs over strided ``ckv``/``kpe`` views of
+        the combined cache; otherwise a causal SDPA gathers each request's full
+        cached latent (query ``cat([q_nope, q_pe])``, key = the full latent, value =
+        its first L dims) at ``kv_cache_config.softmax_scale``.
+        """
+        if layer_idx is None:
+            layer_idx = self.layer_idx
+
+        label = self._active_label()
+        ps = self._plan_states[label]
+        assert self.kv_cache is not None
+
+        latent_cache = self.kv_cache[layer_idx]  # [max_pages, page_size, L+Drope]
+        latent = torch.cat([kv_c, k_pe], dim=-1).squeeze(1)  # [T, L+Drope]
+
+        if ps.wrapper is not None:
+            # ---- FlashInfer MLA kernel fast path (CUDA-graph capturable).
+            ps.wrapper.set_latent(latent_cache, latent)
+            L = q_nope.shape[-1]  # ckv width (post-w_kc absorption)
+            ckv_cache = latent_cache[..., :L]
+            kpe_cache = latent_cache[..., L:]
+            return ps.wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache).to(q_nope.dtype)
+
+        # ---- SDPA fallback.
+        mla = ps.mla
+        assert mla is not None
+
+        # Scatter: one latent vector per new token into (page, offset).
+        latent_cache[mla["token_to_page"], mla["token_to_cache"]] = latent.to(
+            latent_cache.dtype
+        )
+
+        T, H, L = q_nope.shape
+        scale = self.kv_cache_config.softmax_scale
+        query_all = torch.cat([q_nope, q_pe], dim=-1)  # [T, H, L+Drope]
+        out = torch.empty(T, H, L, dtype=q_nope.dtype, device=q_nope.device)
+
+        for req in mla["requests"]:
+            q_start = req["q_start"]
+            sl = req["seq_len"]
+            total_len = req["total_len"]
+
+            # Gather this request's full cached latent [total_len, L+Drope]
+            # (mirror the DenseGenCacheManager page-gather).
+            gathered = latent_cache[req["page_indices"]].reshape(
+                -1, latent_cache.shape[-1]
+            )[:total_len]
+            key = gathered                     # [total_len, L+Drope]
+            value = gathered[:, :L]            # [total_len, L]
+
+            q_req = query_all[q_start:q_start + sl]        # [sl, H, L+Drope]
+            out[q_start:q_start + sl] = self._sdpa_mla(
+                q_req, key, value, old_len=total_len - sl, scale=scale
+            )
+        return out
+
+    @staticmethod
+    def _sdpa_mla(
+        q: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        old_len: int,
+        scale: float,
+    ) -> torch.Tensor:
+        """Causal SDPA for one request's MLA step.
+
+        ``q`` is [sl, H, D] (D = L+Drope); ``key`` [total, D] and ``value``
+        [total, L] are the single latent "head" broadcast over the H query heads.
+        Query token j is at absolute position ``old_len + j`` and attends to
+        cached positions ``0 .. old_len + j`` (causal, includes itself). Handles
+        both prefill (old_len=0) and a decode step (sl=1, old_len=total-1).
+        """
+        sl = q.shape[0]
+        total = key.shape[0]
+        qt = q.transpose(0, 1).float()                       # [H, sl, D]
+        scores = torch.einsum("hqd,kd->hqk", qt, key.float()) * scale  # [H, sl, total]
+        q_pos = old_len + torch.arange(sl, device=q.device)
+        k_pos = torch.arange(total, device=q.device)
+        mask = torch.where(
+            k_pos[None, :] <= q_pos[:, None],
+            0.0,
+            torch.tensor(float("-inf"), device=q.device),
+        )
+        scores = scores + mask
+        attn = scores.softmax(-1)
+        out = torch.einsum("hqk,kd->hqd", attn, value.float())  # [H, sl, L]
+        return out.transpose(0, 1).to(q.dtype)                  # [sl, H, L]
+
+
 # Backend registry: KVCacheConfig.attention_backend names one of these.
 ATTENTION_BACKENDS: dict[str, type[BatchedCacheManager]] = {
     "flashinfer": FlashInferCacheManager,
     "dense_gen": DenseGenCacheManager,
+    "mla_absorb": MlaAbsorbCacheManager,
 }
 
 

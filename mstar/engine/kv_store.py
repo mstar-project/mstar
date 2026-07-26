@@ -122,6 +122,18 @@ class KVCacheConfig:
     # FA3 on Hopper; models can pin ``fa2`` when their deployment toolchain
     # cannot compile the Hopper JIT kernels.
     flashinfer_backend: str = "auto"
+    # Softmax scale for the compressed-latent MLA backend ("mla_absorb"). MLA's
+    # intended scale is qk_head_dim**-0.5 * mscale**2, which differs from the
+    # 1/sqrt(head_dim) a standard kernel would apply over the latent width, so
+    # the model passes the correct value here and MlaAbsorbCacheManager reads it
+    # in run_attention_mla. None for the standard paged backends (unused).
+    softmax_scale: float | None = None
+    # For "mla_absorb": the compressed-KV latent width (kv_lora_rank), i.e. the
+    # ``ckv`` half of the combined latent ``head_dim = ckv + kpe``. The FlashInfer
+    # MLA kernel fast path needs this split at plan time to pass head_dim_ckv /
+    # head_dim_kpe. None for the standard paged backends (unused; SDPA fallback
+    # derives the split from the query shapes at run time).
+    mla_ckv_dim: int | None = None
 
     def __post_init__(self):
         if self.num_qo_heads is None:
