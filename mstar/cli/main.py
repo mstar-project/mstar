@@ -137,6 +137,8 @@ def _serve(args: argparse.Namespace) -> None:
     ]
     if args.cache_dir:
         argv += ["--cache-dir", args.cache_dir]
+    if args.timeout is not None:
+        argv += ["--timeout", str(args.timeout)]
     if args.log_stats:
         argv += ["--log-stats"]
     if args.log_stats_file:
@@ -158,6 +160,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
+    # Per-request server-side timeout. The API server defaults to 600 s; that is
+    # far too short when generation is slowed down deliberately (e.g. running a
+    # node eagerly via MSTAR_DISABLE_CUDA_GRAPH), where a single request can take
+    # many minutes and would otherwise abort mid-stream with a 500.
+    serve.add_argument("--timeout", type=float, default=None,
+                       help="Per-request timeout in seconds (server default: 600)")
     serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
     serve.add_argument("--cache-dir", default=None, help="HuggingFace weight cache directory")
     serve.add_argument("--socket-path-prefix", default=None, help="ZMQ IPC socket prefix")
