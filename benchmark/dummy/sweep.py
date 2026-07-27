@@ -184,8 +184,6 @@ def render(
             lines.append("")
             for problem in problems:
                 lines.append(f"   !! {problem}")
-            lines.append("   !! slope withheld — this fit does not measure a per-step cost")
-            continue
 
         lines.append(f"   per-step dispatch overhead      b = {fit.b_us:8.1f} us")
         lines.append(
