@@ -833,7 +833,7 @@ class VoxServe(InferenceSystem):
             async with session.post(
                 f"{base_url}/generate",
                 data=form,
-                timeout=aiohttp.ClientTimeout(total=None, sock_read=30),
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=float(os.environ.get("MSTAR_BENCH_SOCK_READ_S", "600"))),
             ) as resp:
                 resp.raise_for_status()
 
@@ -1101,7 +1101,7 @@ class VLLMOmni(InferenceSystem):
                 json=payload,
                 headers=headers,
                 read_bufsize=2**24,
-                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=float(os.environ.get("MSTAR_BENCH_SOCK_READ_S", "600"))),
             ) as resp:
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status}: {await resp.text()}")
@@ -1258,7 +1258,7 @@ class VLLMOmni(InferenceSystem):
                 read_bufsize=2**24,
                 timeout=aiohttp.ClientTimeout(
                     total=None,
-                    sock_read=300,
+                    sock_read=float(os.environ.get("MSTAR_BENCH_SOCK_READ_S", "600")),
                 ),
             ) as resp:
                 if resp.status != 200:
@@ -1410,7 +1410,7 @@ class SGLangOmni(InferenceSystem):
                 f"{base_url}/v1/chat/completions",
                 json=payload,
                 read_bufsize=2**24,
-                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=float(os.environ.get("MSTAR_BENCH_SOCK_READ_S", "600"))),
             ) as resp:
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status}: {await resp.text()}")
@@ -1571,7 +1571,7 @@ class OursOpenAI(VLLMOmni):
                     data=form,
                     headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"},
                     read_bufsize=2**24,
-                    timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
+                    timeout=aiohttp.ClientTimeout(total=None, sock_read=float(os.environ.get("MSTAR_BENCH_SOCK_READ_S", "600"))),
                 ) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}: {await resp.text()}")
@@ -1594,7 +1594,7 @@ class OursOpenAI(VLLMOmni):
                         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}",
                     },
                     read_bufsize=2**24,
-                    timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
+                    timeout=aiohttp.ClientTimeout(total=None, sock_read=float(os.environ.get("MSTAR_BENCH_SOCK_READ_S", "600"))),
                 ) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}: {await resp.text()}")
@@ -1655,7 +1655,7 @@ class OursOpenAI(VLLMOmni):
                 json=payload,
                 headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"},
                 read_bufsize=2**24,
-                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=float(os.environ.get("MSTAR_BENCH_SOCK_READ_S", "600"))),
             ) as resp:
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status}: {await resp.text()}")
