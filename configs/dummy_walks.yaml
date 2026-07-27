@@ -1,0 +1,12 @@
+# Tiny-node overhead probe: one identity node, re-dispatched as a fresh graph
+# walk K times so every step pays the worker → conductor → worker hop.
+#   mstar serve dummy_walks --log-stats
+model: "dummy_walks"
+max_seq_len: 1024
+max_concurrent_requests: 64
+
+node_groups:
+  - node_names:
+      - node
+    ranks:
+      - 0

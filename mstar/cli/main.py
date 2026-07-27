@@ -27,6 +27,9 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "bagel_cfg_parallel": "bagel_cfg_parallel.yaml",
     "cosmos3": "cosmos3_nano.yaml",
     "cosmos3_super": "cosmos3_super_tp2.yaml",
+    # No-op "tiny node" probes for measuring runtime dispatch overhead.
+    "dummy_loop": "dummy_loop.yaml",
+    "dummy_walks": "dummy_walks.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "pi05": "pi05.yaml",

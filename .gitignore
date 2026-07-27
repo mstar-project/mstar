@@ -22,6 +22,7 @@ mstar-benchmark-cache/
 output.wav
 .bench_outs/
 asr_benchmark_results/
+benchmark_results/
 
 # internal design docs (not for public release)
 mstar/worker/ASYNC_REDESIGN.md

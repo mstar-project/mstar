@@ -1,6 +1,8 @@
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.base import Model
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+from mstar.model.dummy.dummy_loop.dummy_loop import DummyLoop
+from mstar.model.dummy.dummy_walks.dummy_walks import DummyWalks
 from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.model.pi05.pi05_model import Pi05Model
@@ -19,6 +21,10 @@ MODEL_REGISTRY: dict[str, type[Model]] = {
     "vjepa2": VJepa2Model,
     "vjepa2_ac": VJepa2ACModel,
     "whisper_large": WhisperModel,
+
+    # dummy models for debugging
+    "dummy_loop": DummyLoop,
+    "dummy_walks": DummyWalks,
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -51,6 +57,10 @@ HF_MODELS: dict[str, dict] = {
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
+
+    # Dummy models for testing
+    "dummy_loop": {"model_path_hf": ""},
+    "dummy_walks": {"model_path_hf": ""},
 }
 
 

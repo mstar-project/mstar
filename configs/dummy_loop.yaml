@@ -1,0 +1,12 @@
+# Tiny-node overhead probe: one identity node, looped K times on the worker.
+# No weights are loaded, so this serves on any single GPU in a few seconds.
+#   mstar serve dummy_loop --log-stats
+model: "dummy_loop"
+max_seq_len: 1024
+max_concurrent_requests: 64
+
+node_groups:
+  - node_names:
+      - node
+    ranks:
+      - 0
