@@ -160,6 +160,9 @@ class Benchmark:
     def __init__(self, config: BenchmarkConfig):
         self.config = config
         self.inference_system = config.inference_system.instantiate()
+        # Seeded so two systems given the same spec see identical arrival
+        # processes, not just identical request sequences.
+        self._arrival_rng = random.Random(config.mix_seed)
 
     def _get_dataset(self) -> BaseDataset:
         return self._get_dataset_for(
@@ -331,6 +334,11 @@ class Benchmark:
                 "type": m.type.value if hasattr(m.type, "value") else str(m.type),
                 "ttft_ms": {mod: t * 1000.0 for mod, t in m.ttft.items()},
                 "output_bytes": dict(m.output_bytes),
+                "itl_ms": {
+                    mod: [round((b - a) * 1000.0, 3) for a, b in zip(arr, arr[1:])]
+                    for mod, arr in m.chunk_arrivals.items()
+                    if len(arr) >= 2
+                },
             })
 
         # Per-type breakdown (one entry per request type present) so mixed
@@ -352,6 +360,12 @@ class Benchmark:
             for m in ms:
                 for mod, tt in m.ttft.items():
                     ttft_mods.setdefault(mod, []).append(tt * 1000.0)
+            itl_mods: dict[str, list[float]] = {}
+            for m in ms:
+                for mod, arr in m.chunk_arrivals.items():
+                    itl_mods.setdefault(mod, []).extend(
+                        (b - a) * 1000.0 for a, b in zip(arr, arr[1:])
+                    )
             per_type[t] = {
                 "completed": len(ms),
                 "failed": failed_by_type.get(t, 0),
@@ -363,6 +377,11 @@ class Benchmark:
                 "ttft_ms": {
                     mod: {"p50": _pct(sorted(v), 50), "p99": _pct(sorted(v), 99)}
                     for mod, v in sorted(ttft_mods.items())
+                },
+                "itl_ms": {
+                    mod: {"p50": _pct(sorted(v), 50), "p99": _pct(sorted(v), 99)}
+                    for mod, v in sorted(itl_mods.items())
+                    if v
                 },
             }
 
@@ -471,9 +490,9 @@ class Benchmark:
         rate = self.config.rate
         cv = self.config.arrival_cv or 1.0
         if cv == 1.0:
-            return random.expovariate(rate)
+            return self._arrival_rng.expovariate(rate)
         shape = 1.0 / (cv * cv)
-        return random.gammavariate(shape, 1.0 / (rate * shape))
+        return self._arrival_rng.gammavariate(shape, 1.0 / (rate * shape))
 
     async def _run_concurrent_closed_loop(
         self,
