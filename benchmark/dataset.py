@@ -295,6 +295,22 @@ class LibriSpeechDataset(BaseDataset):
             f"LibriSpeechDataset requires an audio input RequestType, got {req_type}"
         )
 
+        wav_dir = os.environ.get("BENCH_LIBRI_WAV_DIR")
+        if wav_dir:
+            # Serve pre-built wavs (e.g. long-form concatenations) from a local
+            # directory instead of fetching openslr/librispeech_asr.
+            paths = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
+            if not paths:
+                raise ValueError(f"BENCH_LIBRI_WAV_DIR has no .wav files: {wav_dir}")
+            self._num_requests = num_requests
+            self.prompt = prompt
+            self.local_file_dir = wav_dir
+            self.items = self._resize_data([
+                RequestInput(req_type=req_type, prompt=prompt, audio_path=p)
+                for p in paths
+            ])
+            return
+
         from datasets import load_dataset
         from torchcodec.decoders import AudioDecoder
 
