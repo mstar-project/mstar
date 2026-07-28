@@ -253,12 +253,16 @@ def get_rope_index_audio(
 ) -> torch.Tensor:
     """Build 3D MRoPE position IDs for an audio-only span.
 
-    For audio the temporal component advances per audio frame and the
-    height/width components are set to ``start_pos`` (i.e. the same
-    base as the temporal component's first position), which matches the
-    HF convention for single-modality audio where h/w track the text
-    position.  The temporal component is time-based via the Qwen3-Omni
-    ``position_id_per_seconds`` constant (default 25 positions/sec).
+    All three components advance together, one per audio token — audio
+    tokens are positioned exactly like text.  Without vision inputs, HF's
+    ``get_rope_index`` takes its non-spatial branch and returns
+    ``(cumsum(attention_mask) - 1).expand(3, -1, -1)``; checked against the
+    real implementation, an audio span comes back as t == h == w ==
+    2, 3, 4, ….
+
+    Pinning h/w to a constant instead (what this did before) leaves the
+    ``mrope_section`` bands that read those components with no positional
+    progression across the span, which degrades long audio the most.
 
     Parameters
     ----------
@@ -269,10 +273,9 @@ def get_rope_index_audio(
     device : torch.device, optional
         Device for the returned tensor.
     position_id_per_seconds : int
-        Unused here -- kept for API symmetry with the HF implementation
-        where audio timestamps map to integer position IDs.  The audio
-        encoder already outputs one token per quantized frame, so the
-        temporal component simply increments by one per token.
+        Unused here -- kept for API symmetry.  It applies to HF's spatial
+        branch (vision present), where audio position IDs come from
+        timestamps rather than token index.
 
     Returns
     -------
@@ -280,16 +283,10 @@ def get_rope_index_audio(
         Shape ``(3, num_audio_tokens)``.  ``dtype=torch.float``.
     """
     del position_id_per_seconds  # kept for API compatibility
-    temporal = torch.arange(
+    positions = torch.arange(
         num_audio_tokens, dtype=torch.float, device=device
     ) + float(start_pos)
-    height = torch.full(
-        (num_audio_tokens,), float(start_pos), dtype=torch.float, device=device
-    )
-    width = torch.full(
-        (num_audio_tokens,), float(start_pos), dtype=torch.float, device=device
-    )
-    return torch.stack([temporal, height, width], dim=0)
+    return positions.unsqueeze(0).expand(3, -1).contiguous()
 
 
 def get_rope_index_vision(
