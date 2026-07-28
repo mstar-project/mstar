@@ -558,15 +558,31 @@ class KVCacheEngine(BaseEngine):
         # fast path in cuda_graph_runner.sample_and_remap).
         batched_logits = batched_output.pop("__batched_logits__", None)
 
+        real_seq_lens = [inp.input_seq_len for inp in inputs]
+        unpacked = submodule.unpack_packed_outputs(
+            static_output=batched_output,
+            request_ids=batch.request_ids,
+            real_seq_lens=real_seq_lens,
+            inputs=inputs,
+            per_request_info=batch.per_request_info,
+        )
+        if unpacked:
+            batched_output = unpacked
+
         if self.enable_nvtx:
             range_push("ar.batched.sample", synchronize=False)
         if batched_logits is not None:
             sampler = self.submodule_management[batch.node_name].sampler
             sampled = sampler.sample(batch.request_ids, batched_logits)
             for rid, view in zip(batch.request_ids, sampled.split(1), strict=True):
-                rid_out = batched_output[rid]
+                if rid not in batched_output:
+                    logger.warning((
+                        f"{rid} not found in output of forward_batched for walk {batch.graph_walk}. "
+                        f"batched_output keys={list(batched_output.keys())}"
+                    ))
+                rid_out = batched_output.get(rid, {})
                 rid_out["new_token"] = [view]
-                del rid_out["logits"]
+                rid_out.pop("logits", None)
             output = NodeOutput(per_request_output_tensors=batched_output)
         else:
             output = NodeOutput(per_request_output_tensors=batched_output)
