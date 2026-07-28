@@ -161,6 +161,10 @@ class KVCacheEngine(BaseEngine):
         # warnings — each unique miss shape is logged at most once.
         self._logged_graph_misses: set[tuple] = set()
 
+        # Dedup set for "forward_batched emitted no entry for this request"
+        # warnings — logged at most once per (node, graph walk).
+        self._logged_missing_rid_outputs: set[tuple[str, str]] = set()
+
     capabilities = EngineCapabilities(
         requires_kv_cache=True,
         supports_cpu_offload=True,
@@ -558,6 +562,12 @@ class KVCacheEngine(BaseEngine):
         # fast path in cuda_graph_runner.sample_and_remap).
         batched_logits = batched_output.pop("__batched_logits__", None)
 
+        # Prefill-style submodules emit batch-wide packed sentinels instead of
+        # per-rid entries, because per-request slice ends depend on the real
+        # seq_lens a fixed-shape captured region can't honor. Slice them here,
+        # merging key-by-key (and dropping the now-consumed sentinels) so this
+        # path matches CudaGraphRunner._merge_unpacked. No-op for decode-style
+        # submodules, whose hook returns {}.
         real_seq_lens = [inp.input_seq_len for inp in inputs]
         unpacked = submodule.unpack_packed_outputs(
             static_output=batched_output,
@@ -566,8 +576,15 @@ class KVCacheEngine(BaseEngine):
             inputs=inputs,
             per_request_info=batch.per_request_info,
         )
-        if unpacked:
-            batched_output = unpacked
+        # Remaining ``__``-prefixed keys are batch-wide sentinels, never request
+        # ids, so drop them unconditionally — otherwise they reach
+        # NodeOutput.per_request_output_tensors as phantom requests (e.g.
+        # talker_prefill's __batched_talker_prefill_hidden__, which the graph
+        # runner also discards).
+        for key in [k for k in batched_output if k.startswith("__")]:
+            del batched_output[key]
+        for rid, rid_out in unpacked.items():
+            batched_output.setdefault(rid, {}).update(rid_out)
 
         if self.enable_nvtx:
             range_push("ar.batched.sample", synchronize=False)
@@ -576,11 +593,19 @@ class KVCacheEngine(BaseEngine):
             sampled = sampler.sample(batch.request_ids, batched_logits)
             for rid, view in zip(batch.request_ids, sampled.split(1), strict=True):
                 if rid not in batched_output:
-                    logger.warning((
-                        f"{rid} not found in output of forward_batched for walk {batch.graph_walk}. "
-                        f"batched_output keys={list(batched_output.keys())}"
-                    ))
-                rid_out = batched_output.get(rid, {})
+                    # Expected when a submodule gates its per-rid emission
+                    # (e.g. Qwen3-Omni skips thinker_states for text-only
+                    # requests); the request still needs its sampled token,
+                    # so start it from an empty dict rather than dropping it.
+                    log_key = (batch.node_name, batch.graph_walk)
+                    if log_key not in self._logged_missing_rid_outputs:
+                        self._logged_missing_rid_outputs.add(log_key)
+                        logger.warning(
+                            "forward_batched emitted no per-request output for %s "
+                            "on walk %s; keys=%s. Emitting sampled token only.",
+                            rid, batch.graph_walk, sorted(batched_output),
+                        )
+                rid_out = batched_output.setdefault(rid, {})
                 rid_out["new_token"] = [view]
                 rid_out.pop("logits", None)
             output = NodeOutput(per_request_output_tensors=batched_output)
