@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 28, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 29, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -566,6 +566,79 @@ process, e.g. to run entities on separate hosts.</p></td>
 <td><p>Base of the deterministic entity-id → TCP port map (<code class="docutils literal notranslate"><span class="pre">api_server</span></code>
 = base, <code class="docutils literal notranslate"><span class="pre">conductor</span></code> = base+1, <code class="docutils literal notranslate"><span class="pre">worker_&lt;rank&gt;</span></code> = base+100+rank).</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>SHM tensor-transport implementation. <code class="docutils literal notranslate"><span class="pre">0</span></code>: per-uuid files.
+<code class="docutils literal notranslate"><span class="pre">1</span></code>: the Rust shared-memory arena (requires the <code class="docutils literal notranslate"><span class="pre">rust/</span></code>
+extension; raises if missing). <code class="docutils literal notranslate"><span class="pre">AUTO</span></code>: the arena when the
+extension imports, files otherwise. Must match across the
+deployment — arena locations ride in the tensor descriptors.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SEGMENT_MB</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+<td><p>Size of each arena segment. The arena grows segment by segment;
+existing segments never move (registrations stay valid).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_MAX_SEGMENTS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">32</span></code></p></td>
+<td><p>Growth cap PER ENTITY. Every entity (workers + the api-server data
+worker) creates its own arena, so node-wide /dev/shm demand can
+reach <code class="docutils literal notranslate"><span class="pre">MAX_SEGMENTS</span> <span class="pre">x</span> <span class="pre">SEGMENT_MB</span> <span class="pre">x</span> <span class="pre">num_entities</span></code> — size against
+<code class="docutils literal notranslate"><span class="pre">df</span> <span class="pre">-h</span> <span class="pre">/dev/shm</span></code> (tmpfs defaults to ~50% of RAM). Construction
+fails fast if one entity’s ceiling exceeds /dev/shm. At the cap,
+sends spill (see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_FULL_TIMEOUT_S</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">30</span></code></p></td>
+<td><p>Strict mode only (<code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL=0</span></code>): how long a send
+backpressures on a full arena before failing.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Degrade gracefully at the segment cap: stage the tensor through the
+per-uuid file protocol instead — slower, never fails, matching the
+file transport’s saturation behavior. <code class="docutils literal notranslate"><span class="pre">0</span></code> restores strict
+backpressure + timeout — only meaningful where ANOTHER thread
+drains consumer ACKs (the threaded api-server); on a worker the
+ACKs arrive on the very thread that would be waiting.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL_AFTER_S</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Optional grace before spilling, for deployments where another
+thread frees slots concurrently. Default 0: spill immediately
+(a worker cannot receive ACKs while it waits).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_PIN</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cudaHostRegister</span></code> each mapped segment (both sides) so D2H/H2D
+copies through the side streams run at page-locked bandwidth and
+stay asynchronous. <code class="docutils literal notranslate"><span class="pre">0</span></code> disables (pageable copies).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_PIN_MAX_MB</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">4096</span></code></p></td>
+<td><p>Budget for TOTAL pinned host memory PER PROCESS, distinct from the
+segment cap (pinned pages come out of the OS’s pageable pool
+system-wide). Node-wide pinned demand is approx
+<code class="docutils literal notranslate"><span class="pre">PIN_MAX_MB</span> <span class="pre">x</span> <span class="pre">num_entities</span></code> — a consumer pins peer segments too,
+so one process can pin more than its own arena holds. Segments
+past the budget stay unpinned: copies work, without async overlap.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SLOT_TTL_S</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>TTL backstop for abort-orphaned slots (a request aborted after
+staging but before all consumer ACKs defers reclaim forever).
+A slot older than the request timeout cannot have a legitimate
+reader, so a bound safely above it (recommend &gt;= 2x the request
+timeout) cannot race a real consumer. <code class="docutils literal notranslate"><span class="pre">0</span></code> disables (default,
+pending review discussion); reclaims run under capacity pressure
+and with the periodic stats sweep, logging loudly.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_STATS_INTERVAL_S</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">60</span></code></p></td>
+<td><p>Under <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>: how often the arena logs its occupancy /
+fragmentation snapshot (segments, free bytes, largest contiguous
+free block, pinned bytes).</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -653,7 +726,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 28, 2026.
+  Last updated on Jul 29, 2026.
   <br/>
 </p>
   </div>

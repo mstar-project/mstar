@@ -408,7 +408,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 28, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 29, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -835,6 +835,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">source_tp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">source_tp_rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
 
+    <span class="c1"># SHM-arena transport (MSTAR_SHM_ARENA): the producer wrote this tensor&#39;s</span>
+    <span class="c1"># bytes at `shm_offset` inside the named arena segment. None for the</span>
+    <span class="c1"># other transports (per-uuid files, Mooncake).</span>
+    <span class="n">shm_segment</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">shm_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+
     <span class="n">_source_node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">_source_graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -853,6 +859,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">offset</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">offset</span><span class="p">,</span>
             <span class="n">source_tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">source_tp_size</span><span class="p">,</span>
             <span class="n">source_tp_rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">source_tp_rank</span><span class="p">,</span>
+            <span class="n">shm_segment</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">shm_segment</span><span class="p">,</span>
+            <span class="n">shm_offset</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">shm_offset</span><span class="p">,</span>
             <span class="n">_source_node_name</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_source_node_name</span><span class="p">,</span>
             <span class="n">_source_graph_walk</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_source_graph_walk</span>
         <span class="p">)</span></div>
@@ -1805,7 +1813,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 28, 2026.
+  Last updated on Jul 29, 2026.
   <br/>
 </p>
   </div>

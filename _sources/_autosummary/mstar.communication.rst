@@ -27,6 +27,7 @@
    :toctree:
    :recursive:
 
+   arena
    communicator
    event
    rust_communicator

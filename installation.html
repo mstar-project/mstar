@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 28, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 29, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -520,7 +520,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-your-cuda-toolkit">Matching your CUDA toolkit</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-the-install">Verify the install</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-the-rust-zmq-transport">Optional: the Rust ZMQ transport</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-rust-support">Optional: Rust support</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudnn-status-sublibrary-version-mismatch"><code class="docutils literal notranslate"><span class="pre">CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH</span></code></a></li>
 </ul>
@@ -774,12 +774,20 @@ mstar-serve<span class="w"> </span>--help
 </pre></div>
 </div>
 </section>
-<section id="optional-the-rust-zmq-transport">
-<h2>Optional: the Rust ZMQ transport<a class="headerlink" href="#optional-the-rust-zmq-transport" title="Link to this heading">#</a></h2>
-<p>The ZeroMQ control mesh can run over a Rust transport (vendored in <code class="docutils literal notranslate"><span class="pre">rust/</span></code>)
-instead of pyzmq — same endpoints, same wire format, selectable per process
-with <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code> (see <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>). It is optional:
-without it, everything runs on pyzmq as before.</p>
+<section id="optional-rust-support">
+<h2>Optional: Rust support<a class="headerlink" href="#optional-rust-support" title="Link to this heading">#</a></h2>
+<p>Parts of the runtime can run on Rust components (vendored in <code class="docutils literal notranslate"><span class="pre">rust/</span></code>),
+each optional and selectable per process — without the extension everything
+runs on the pure-Python paths as before. Migrated so far (see
+<a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a> for the flags):</p>
+<ul class="simple">
+<li><p><strong>ZeroMQ control mesh</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code>: same endpoints, same wire
+format as pyzmq.</p></li>
+<li><p><strong>SHM tensor arena</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>: replaces the per-tensor file
+transport; requires the extension, interoperates on the same descriptor
+wire (and depends on the transport above only in the sense that both ship
+in the same extension).</p></li>
+</ul>
 <p>Build the extension into your environment with <a class="reference external" href="https://www.maturin.rs">maturin</a> (needs a Rust toolchain; <code class="docutils literal notranslate"><span class="pre">rustup</span></code> works):</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>maturin
 maturin<span class="w"> </span>develop<span class="w"> </span>--release<span class="w"> </span>-m<span class="w"> </span>rust/Cargo.toml
@@ -875,7 +883,7 @@ Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 in
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-your-cuda-toolkit">Matching your CUDA toolkit</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-the-install">Verify the install</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-the-rust-zmq-transport">Optional: the Rust ZMQ transport</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-rust-support">Optional: Rust support</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudnn-status-sublibrary-version-mismatch"><code class="docutils literal notranslate"><span class="pre">CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH</span></code></a></li>
 </ul>
@@ -913,7 +921,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 28, 2026.
+  Last updated on Jul 29, 2026.
   <br/>
 </p>
   </div>
