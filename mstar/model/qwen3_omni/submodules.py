@@ -153,8 +153,15 @@ class NativeAudioEncoderSubmodule(NodeSubmodule):
             "req_token_counts": counts,
         }
 
+    def get_piecewise_cuda_graph_configs(self, device, autocast_dtype, tp_world_size=1):
+        cfg = self.audio_encoder.get_piecewise_cuda_graph_config(device, autocast_dtype)
+        return {"layer_loop": cfg} if cfg is not None else {}
+
     def forward_batched(self, graph_walk, engine_inputs, audio_features,
                         audio_seqlens, req_token_counts=None, **kwargs):
+        # Thread the (possibly absent) piecewise runner onto the encoder for this
+        # forward; the encoder's forward reads it via ``_piecewise_runner``.
+        self.audio_encoder._piecewise_runner = engine_inputs.piecewise_runners.get("layer_loop")
         embeds = self.audio_encoder(audio_features, audio_seqlens).last_hidden_state
         if embeds.dim() == 3:
             embeds = embeds.squeeze(0)
@@ -170,6 +177,7 @@ class NativeAudioEncoderSubmodule(NodeSubmodule):
         return results
 
     def forward(self, graph_walk, engine_inputs, audio_features, audio_seqlens, **kwargs):
+        self.audio_encoder._piecewise_runner = engine_inputs.piecewise_runners.get("layer_loop")
         embeds = self.audio_encoder(audio_features, audio_seqlens).last_hidden_state
         if embeds.dim() == 3:
             embeds = embeds.squeeze(0)
@@ -337,8 +345,15 @@ class NativeVisionEncoderSubmodule(NodeSubmodule):
             deepstack = [deepstack]
         return embeds, deepstack
 
+    def get_piecewise_cuda_graph_configs(self, device, autocast_dtype, tp_world_size=1):
+        cfg = self.vision_encoder.get_piecewise_cuda_graph_config(device, autocast_dtype)
+        return {"block_loop": cfg} if cfg is not None else {}
+
     def forward_batched(self, graph_walk, engine_inputs, pixel_values, grid_thw,
                         req_token_counts=None, **kwargs):
+        # Thread the (possibly absent) piecewise runner onto the encoder; its
+        # forward reads it via ``_piecewise_runner`` (``_run`` calls that forward).
+        self.vision_encoder._piecewise_runner = engine_inputs.piecewise_runners.get("block_loop")
         embeds, deepstack = self._run(pixel_values, grid_thw)
         request_ids = engine_inputs.request_ids
         if req_token_counts is None:  # one-image-per-request fallback
@@ -355,6 +370,7 @@ class NativeVisionEncoderSubmodule(NodeSubmodule):
         return results
 
     def forward(self, graph_walk, engine_inputs, pixel_values, grid_thw, **kwargs):
+        self.vision_encoder._piecewise_runner = engine_inputs.piecewise_runners.get("block_loop")
         embeds, deepstack = self._run(pixel_values, grid_thw)
         return {
             "vision_embeds": [embeds],

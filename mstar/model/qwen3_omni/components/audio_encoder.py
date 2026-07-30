@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import os
 from collections import namedtuple
-from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -136,6 +135,96 @@ def make_fi_state(device):
     return {"ws": ws, "wrapper": wrapper, "cu_obj": None}
 
 
+def make_fi_graph_state(device, num_segments):
+    """Capture-safe ragged-prefill wrapper for PiecewiseCudaGraphRunner.
+
+    Fixed [num_segments+1] indptr buffers + use_cuda_graph=True make FlashInfer
+    replan in place, so replanning between replays reallocates nothing the graph
+    captured. Shape is a superset of make_fi_state so one override slot drives
+    both paths."""
+    if not _FLASHINFER_AVAILABLE:
+        return None
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    qo_buf = torch.zeros(num_segments + 1, dtype=torch.int32, device=device)
+    kv_buf = torch.zeros(num_segments + 1, dtype=torch.int32, device=device)
+    wrapper = _flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        ws, kv_layout="NHD", use_cuda_graph=True,
+        qo_indptr_buf=qo_buf, kv_indptr_buf=kv_buf,
+    )
+    return {"ws": ws, "wrapper": wrapper, "cu_obj": None,
+            "external_plan": True, "qo_buf": qo_buf, "kv_buf": kv_buf}
+
+
+def plan_fi_graph_state(state, seq_lens, num_heads, head_dim, scale, q_dtype):
+    """Replan the wrapper with the real per-segment lengths.
+
+    seq_lens arrives zero-padded to the bucket's segment count, so the indptr
+    plateaus over the pad tail and those tokens belong to no segment. Bidirectional
+    self-attention, hence qo_indptr == kv_indptr."""
+    dev = state["qo_buf"].device
+    indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=dev)
+    indptr[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=dev).cumsum(0)
+    Dp = 64 if head_dim <= 64 else (128 if head_dim <= 128 else 256)
+    state["wrapper"].plan(indptr, indptr, num_heads, num_heads, Dp,
+                          causal=False, sm_scale=float(scale), q_data_type=q_dtype)
+
+
+def _encoder_int_list(name, default):
+    """Parse a sorted, de-duplicated int bucket list from an env var."""
+    spec = os.environ.get(name, default)
+    return sorted({int(x) for x in spec.split(",") if x.strip()})
+
+
+def _encoder_probe() -> bool:
+    """Log every distinct layout and force eager, to harvest the real
+    (num_segments, total_tokens) distribution before sizing buckets. Guessed
+    buckets fall back to eager silently, which reads as a regression."""
+    return os.environ.get("MSTAR_ENCODER_CG_PROBE", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+# Capture-path accounting: one dict increment, always on, because "ran and did
+# not regress" and "never ran" look identical in results.json.
+_ENCODER_PATH_COUNTS: dict[str, int] = {}
+_SEEN_LAYOUTS: set[tuple] = set()
+_SEEN_LAYOUTS_CAP = 512          # bounded: a long run must not leak keys
+_WARNED_NO_BUCKET: set[str] = set()
+
+
+def note_encoder_path(path: str) -> None:
+    _ENCODER_PATH_COUNTS[path] = _ENCODER_PATH_COUNTS.get(path, 0) + 1
+
+
+def encoder_path_counts() -> dict[str, int]:
+    """Snapshot of {path: count}, e.g. {"vision.piecewise": 96, "vision.eager": 0}."""
+    return dict(_ENCODER_PATH_COUNTS)
+
+
+def note_encoder_layout(kind: str, n_seg: int, total_tokens: int, fitted: bool) -> None:
+    """Log once per distinct layout; WARN the first time one fits no bucket —
+    the only visible signal that buckets are mis-sized, since the fallback is
+    otherwise silent. Probe mode has no buckets, so it skips the warning."""
+    if not fitted and not _encoder_probe() and kind not in _WARNED_NO_BUCKET:
+        _WARNED_NO_BUCKET.add(kind)
+        logger.warning(
+            "%s encoder: NO capture bucket fits segments=%d total_tokens=%d — "
+            "falling back to eager. Widen MSTAR_ENCODER_CG_BS_%s / "
+            "MSTAR_ENCODER_CG_TOKENS_%s; piecewise numbers from this run are "
+            "NOT measuring the captured path.",
+            kind, n_seg, total_tokens, kind.upper(), kind.upper(),
+        )
+    key = (kind, n_seg, total_tokens)
+    if key in _SEEN_LAYOUTS:
+        return
+    if len(_SEEN_LAYOUTS) < _SEEN_LAYOUTS_CAP:
+        _SEEN_LAYOUTS.add(key)
+    # Probe logs at WARNING: harvesting is the point, and the harness may boot
+    # at --log-level WARNING.
+    emit = logger.warning if _encoder_probe() else logger.info
+    emit("%s encoder layout: segments=%d total_tokens=%d bucket=%s",
+         kind, n_seg, total_tokens, "HIT" if fitted else "MISS")
+
+
 # During CUDA-graph capture, routes _flashinfer_varlen through a dedicated state
 # instead of _FI_STATE so the capture records a wrapper that is never re-planned.
 _fi_override: dict | None = None
@@ -163,7 +252,12 @@ def _flashinfer_varlen(q, k, v, cu_seqlens, scale):
     H, D = q.shape[1], q.shape[2]
     Dp = 64 if D <= 64 else (128 if D <= 128 else 256)   # FlashInfer-supported head_dim
     qp, kp, vp = (_fi_pad_hd(t, Dp).contiguous() for t in (q, k, v))
-    if st["cu_obj"] is not cu_seqlens:          # plan once per forward
+    # external_plan: the PiecewiseCudaGraphRunner planned this wrapper's fixed
+    # index buffers OUTSIDE the graph (plan_attn_fn) before each replay, so a
+    # host-side plan() here — illegal inside a captured/replayed region — must be
+    # skipped. Without the flag (eager / legacy self-capture) behavior is
+    # unchanged: plan once per forward, then run.
+    if not st.get("external_plan") and st["cu_obj"] is not cu_seqlens:
         cu = cu_seqlens.to(torch.int32)
         wrapper.plan(cu, cu, H, H, Dp, causal=False, sm_scale=float(scale),
                      q_data_type=q.dtype)
@@ -312,17 +406,6 @@ class NativeAudioEncoderLayer(nn.Module):
         return residual + hidden_states
 
 
-@dataclass
-class _AudioGraph:
-    """Captured layer-loop graph for one audio-length layout.
-    cu_seqlens and fi_state kept alive so captured kernels' storage outlives the graph."""
-    graph: "torch.cuda.CUDAGraph"
-    static_x: torch.Tensor
-    out: torch.Tensor
-    cu_seqlens: torch.Tensor
-    fi_state: dict
-
-
 class NativeQwen3OmniAudioEncoder(nn.Module):
     """Native AuT. Same I/O contract as HF: forward(input_features, feature_lens)
     -> object with ``.last_hidden_state`` of shape (num_audio_tokens, output_dim)."""
@@ -353,44 +436,6 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
         self.act = ACT2FN[config.activation_function]
         self.proj2 = nn.Linear(d_model, config.output_dim)
 
-        # CUDA-graph cache for the encoder layer-loop tail, keyed on audio-length layout.
-        # Enabled via MSTAR_ENCODER_CUDA_GRAPH=1; requires FlashInfer varlen backend.
-        self._cg_cache: dict = {}
-        self._cg_max_keys = int(os.environ.get("MSTAR_ENCODER_CG_MAX_KEYS", "16"))
-        self._cg_warmed = False
-
-    def _maybe_cg_warmup(self, input_features, feature_lens):
-        """Pre-capture graphs for configured batch sizes before serving (MSTAR_ENCODER_CG_WARMUP).
-        Triggered once on first forward; replicates clip-0 layout to each batch size."""
-        if self._cg_warmed:
-            return
-        self._cg_warmed = True
-        spec = os.environ.get("MSTAR_ENCODER_CG_WARMUP", "1,2,4,8")
-        if not spec or not self._cuda_graph_enabled() or feature_lens is None:
-            return
-        try:
-            batch_sizes = sorted({int(b) for b in spec.split(",") if b.strip()})
-        except ValueError:
-            return
-        fl = feature_lens.reshape(-1)
-        L0 = int(fl[0])                                   # frames in clip 0
-        mel = input_features.shape[0]
-        dev, dt = input_features.device, input_features.dtype
-        logger.info("audio encoder CUDA-graph warmup: pre-capturing batch sizes %s", batch_sizes)
-        for k in batch_sizes:
-            try:
-                lens = torch.full((k,), L0, dtype=torch.long, device=dev)
-                feats = input_features[:, :L0].repeat(1, k) if input_features.shape[1] >= L0 \
-                    else torch.zeros(mel, L0 * k, device=dev, dtype=dt)
-                self.forward(feats, feature_lens=lens)       # triggers capture for key_k
-            except Exception:
-                logger.warning("audio CG warmup failed for bs=%d", k, exc_info=True)
-
-    def _cuda_graph_enabled(self) -> bool:
-        if os.environ.get("MSTAR_ENCODER_CUDA_GRAPH", "1") not in ("1", "true", "True"):
-            return False
-        return _FLASHINFER_AVAILABLE and _VARLEN_BACKEND == "flashinfer"
-
     def _layer_loop_tail(self, hidden_states, cu_seqlens, max_seqlen):
         """The expensive, capture-legal region: encoder layer loop + post-norm /
         projection head. ``cu_seqlens``/``max_seqlen`` depend only on the audio
@@ -403,43 +448,84 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
         hidden_states = self.proj2(hidden_states)
         return hidden_states
 
-    def _capture_graph(self, key, hidden_states, cu_seqlens, max_seqlen):
-        """Capture _layer_loop_tail for one audio-length key with a dedicated FlashInfer
-        wrapper (planned once, never re-planned). Returns _AudioGraph or None on failure."""
-        dev = hidden_states.device
-        fi_state = make_fi_state(dev)
-        if fi_state is None:
+    def get_piecewise_cuda_graph_config(self, device, autocast_dtype):
+        """Build the ``PiecewisePackedConfig`` that migrates the layer-loop CUDA
+        graph onto ``PiecewiseCudaGraphRunner``.
+
+        The captured region is ``_layer_loop_tail`` over a packed ``[total_tokens,
+        d_model]`` hidden state whose windows are delimited by ``cu_seqlens``. The
+        runner buckets on ``(num_segments, total_tokens)`` and pads; the FlashInfer
+        ragged wrapper is re-planned per replay with the real per-segment lengths,
+        which is what lets one captured bucket serve many audio layouts.
+
+        Returns None (eager path) when FlashInfer isn't the active varlen backend.
+        Bucket lists are env-overridable
+        (``MSTAR_ENCODER_CG_BS_AUDIO`` segment counts,
+        ``MSTAR_ENCODER_CG_TOKENS_AUDIO`` token counts); each ``(bs, tokens)``
+        bucket owns a persistent 128 MiB workspace, so keep the product modest."""
+        from mstar.engine.cuda_graph_config import PiecewisePackedConfig
+        if not (_FLASHINFER_AVAILABLE and _VARLEN_BACKEND == "flashinfer"):
             return None
-        static_x = hidden_states.clone()
-        set_fi_override(fi_state)
-        graph = torch.cuda.CUDAGraph()
-        try:
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(3):
-                    self._layer_loop_tail(static_x, cu_seqlens, max_seqlen)
-            torch.cuda.current_stream().wait_stream(stream)
-            with torch.cuda.graph(graph):
-                out = self._layer_loop_tail(static_x, cu_seqlens, max_seqlen)
-        except Exception:
-            logger.warning("audio encoder CUDA-graph capture failed for key=%s; "
-                           "falling back to eager", key, exc_info=True)
+
+        d_model = self.config.d_model
+        num_heads = self.num_heads
+        head_dim = d_model // num_heads
+        scale = head_dim ** -0.5
+
+        def make_static_inputs(shape):
+            # x matches autocast dtype so the per-replay copy_ is a same-dtype
+            # memcpy. cu_seqlens is a static input (not baked) even though the
+            # FI-external path ignores it, so no freed layout tensor is captured.
+            return {
+                "x": torch.zeros(shape.total_tokens, d_model,
+                                 dtype=autocast_dtype, device=device),
+                "cu_seqlens": torch.zeros(shape.bs + 1, dtype=torch.int32,
+                                          device=device),
+            }
+
+        def make_attn_state(shape):
+            return make_fi_graph_state(device, shape.bs)
+
+        def plan_attn_fn(state, shape, seq_lens):
+            plan_fi_graph_state(state, seq_lens, num_heads, head_dim, scale,
+                                autocast_dtype)
+
+        def capture_fn(static_inputs, static_cm=None, attn_state=None, **kw):
+            # Route the block loop's attention through the runner-owned wrapper.
+            # max_seqlen is unused: the FI-external path ignores it and capture
+            # never reaches the flash-attn branch (_fi_override is set).
+            set_fi_override(attn_state)
             try:
-                torch.cuda.synchronize(dev)
-            except Exception:
-                pass
-            return None
-        finally:
-            set_fi_override(None)
-        return _AudioGraph(graph=graph, static_x=static_x, out=out,
-                           cu_seqlens=cu_seqlens, fi_state=fi_state)
+                x = self._layer_loop_tail(
+                    static_inputs["x"], static_inputs["cu_seqlens"], 0)
+            finally:
+                set_fi_override(None)
+            return {"x": x}
+
+        # Buckets are measured (MSTAR_ENCODER_CG_PROBE=1), covering s2t
+        # (segments 1..7, tokens 36..426) AND s2s (1..16, up to ~1057) — sizing
+        # from s2t alone left long audio with no bucket. Token values are
+        # near-continuous, so the ladder is deliberately coarse.
+        # ONE bs value: it is crossed with total_tokens, so each extra multiplies
+        # graphs and 128 MiB workspaces, while padding bs up is free (trailing
+        # segments are zero-length). bs carries headroom, tokens carry resolution.
+        return PiecewisePackedConfig(
+            capture_fn=capture_fn,
+            make_static_inputs=make_static_inputs,
+            make_attn_state=make_attn_state,
+            plan_attn_fn=plan_attn_fn,
+            uses_kv_cache=False,
+            total_tokens=_encoder_int_list(
+                "MSTAR_ENCODER_CG_TOKENS_AUDIO",
+                "48,64,96,128,192,256,384,512,704,896,1088"),
+            capture_batch_sizes=_encoder_int_list("MSTAR_ENCODER_CG_BS_AUDIO",
+                                                  "32"),
+        )
 
     @torch.no_grad()
     def forward(self, input_features, feature_lens=None, return_dict=True, **kwargs):
         # return_dict/**kwargs accepted for HF signature compatibility; always returns AudioEncoderOutput.
         assert feature_lens is not None, "native AuT requires feature_lens"
-        self._maybe_cg_warmup(input_features, feature_lens)
         param_dtype = self.conv2d1.weight.dtype
         input_features = input_features.to(param_dtype)
         padded_feature, chunk_lengths = chunk_and_pad_features(input_features, feature_lens, self.n_window)
@@ -465,18 +551,36 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
 
         max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
 
-        if self._cuda_graph_enabled():
-            # Key on varlen layout: same key => identical cu_seqlens => graph replay valid.
-            key = (int(hidden_states.shape[0]), tuple(cu_seqlens.tolist()))
-            ag = self._cg_cache.get(key)
-            if ag is None and len(self._cg_cache) < self._cg_max_keys:
-                ag = self._capture_graph(key, hidden_states, cu_seqlens, max_seqlen)
-                if ag is not None:
-                    self._cg_cache[key] = ag
-            if ag is not None:
-                ag.static_x.copy_(hidden_states)
-                ag.graph.replay()
-                return AudioEncoderOutput(last_hidden_state=ag.out.clone())
+        # Piecewise path (default): replay the layer loop on a bucketed graph,
+        # re-planning ragged attention with the real per-segment lengths. The
+        # runner is threaded on by the submodule from engine_inputs; absent it
+        # (or if no bucket fits this layout) we fall through to eager.
+        runner = getattr(self, "_piecewise_runner", None)
+        n_seg = cu_seqlens.shape[0] - 1
+        total_tokens = hidden_states.shape[0]
+        if _encoder_probe():
+            # Harvest the layout, capture nothing, run eager.
+            note_encoder_layout("audio", n_seg, total_tokens, fitted=False)
+            note_encoder_path("audio.probe")
+            return AudioEncoderOutput(
+                last_hidden_state=self._layer_loop_tail(
+                    hidden_states, cu_seqlens, max_seqlen))
+        if runner is not None:
+            fitted = runner.can_run(n_seg, total_tokens)
+            note_encoder_layout("audio", n_seg, total_tokens, fitted)
+            if fitted:
+                seg_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+                out = runner.run(
+                    static_inputs={
+                        "x": hidden_states,
+                        "cu_seqlens": cu_seqlens.to(torch.int32),
+                    },
+                    seq_lens=seg_lens,
+                    real_bs=n_seg,
+                )
+                note_encoder_path("audio.piecewise")
+                return AudioEncoderOutput(last_hidden_state=out["x"])
 
+        note_encoder_path("audio.eager")
         hidden_states = self._layer_loop_tail(hidden_states, cu_seqlens, max_seqlen)
         return AudioEncoderOutput(last_hidden_state=hidden_states)
