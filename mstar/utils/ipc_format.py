@@ -126,7 +126,7 @@ class WorkerGraphsDone(MessageBody):
     worker_graph_ids: list[str]
     is_first_tp_rank: bool
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
-    new_tokens: dict[str, list[int]] = field(default_factory=dict) # name to tokens
+    new_token_counts: dict[str, int] = field(default_factory=dict) # name to token counts
     output_signal_names: int = field(default=0)
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")

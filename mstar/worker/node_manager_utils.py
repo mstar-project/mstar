@@ -220,7 +220,7 @@ class PerRequestInfo:
     sharding_config: ShardingConfig
 
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
-    pending_new_tokens: dict[str, list[int]] = field(default_factory=dict)
+    pending_new_token_counts: dict[str, int] = field(default_factory=dict)
     stream_buffers: dict[str, StreamBuffer] = field(default_factory=dict)  # edge_name -> StreamBuffer
     current_output_chunks: list[str] = field(default_factory=list)
     output_loop_indices: dict[str, NestedLoopIndices] = field(default_factory=dict)
@@ -685,15 +685,13 @@ class WorkerGraphsManager:
         """Extend the pending persist signals for a request."""
         self.per_request_info[request_id].pending_persist_signals.extend(signals)
 
-    def buffer_new_tokens(
-        self, request_id: str,
-        new_tokens: dict[str, list[int]]
-    ):
-        """Update the pending new tokens for a request."""
-        for name, tokens in new_tokens.items():
-            if name not in self.per_request_info[request_id].pending_new_tokens:
-                self.per_request_info[request_id].pending_new_tokens[name] = []
-            self.per_request_info[request_id].pending_new_tokens[name].extend(tokens)
+    def buffer_new_token_counts(
+        self, request_id: str, counts: dict[str, int]
+    ) -> None:
+        """Update the pending new token count for a request."""
+        pending = self.per_request_info[request_id].pending_new_token_counts
+        for name, count in counts.items():
+            pending[name] = pending.get(name, 0) + count
 
     def buffer_output_signals(self, request_id: str, out_signals: list[GraphEdge]):
         self.per_request_info[request_id].current_output_chunks += [
@@ -714,12 +712,12 @@ class WorkerGraphsManager:
             result[edge.name] = edge.tensor_info
         return result
 
-    def flush_new_tokens(self, request_id: str) -> dict[str, list[int]]:
-        """Pop and return all buffered new tokens for a request."""
+    def flush_new_token_counts(self, request_id: str) -> dict[str, int]:
+        """Pop and return all buffered new token counts for a request."""
         info = self.per_request_info[request_id]
-        new_tokens = info.pending_new_tokens
-        info.pending_new_tokens = {}
-        return new_tokens
+        counts = info.pending_new_token_counts
+        info.pending_new_token_counts = {}
+        return counts
 
     def flush_output_signals(self, request_id: str) -> list[str]:
         info = self.per_request_info[request_id]
