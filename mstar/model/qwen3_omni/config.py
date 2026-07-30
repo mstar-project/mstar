@@ -75,16 +75,17 @@ class ThinkerTextConfig:
 
 @dataclass
 class ThinkerConfig:
-    audio_token_id: int = 151646
+    # Defaults match Qwen3-Omni's tokenizer; ``thinker_config`` in the HF
+    # config supplies all three, so these only apply to a checkpoint that
+    # omits them.  They are NOT the Qwen2.5-Omni ids — 151646/151647/151648
+    # are ``<|object_ref_start|>`` / ``<|object_ref_end|>`` / ``<|box_start|>``
+    # in this vocab, so inheriting those silently wraps audio spans in the
+    # wrong sentinels.
+    audio_token_id: int = 151675
     image_token_id: int = 151655
     video_token_id: int = 151656
-    audio_start_token_id: int = 151647
-    # NOTE: Qwen3-Omni's HF config explicitly omits ``audio_end_token_id``
-    # (it is marked as ``AttributeError()`` in the modular file), but the
-    # tokenizer still defines ``<|audio_eos|>`` which has the same id as
-    # in Qwen2.5-Omni (151648).  We track it here so we can wrap audio
-    # spans in their sentinel BOS/EOS tokens during prefill.
-    audio_end_token_id: int = 151648
+    audio_start_token_id: int = 151669
+    audio_end_token_id: int = 151670
     vision_start_token_id: int = 151652
     # NOTE: Qwen3-Omni's HF config exposes ``vision_start_token_id`` but
     # not ``vision_end_token_id``; we use the same value as Qwen3-VL /
