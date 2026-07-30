@@ -16,10 +16,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OffloadedState:
-    """Tracks a single (request, label) that has been offloaded to CPU."""
+    """Tracks a single (request, label) that has been offloaded to CPU.
+
+    Carries the full stream bookkeeping (not just seq_len/position) so a
+    reload restores a windowed label's protection/release state exactly,
+    rather than relying on the live KVRequestState object surviving the
+    offload untouched.
+    """
     cpu_page_indices: list[int]
     seq_len: int
     position_id_start: int
+    protected_prefix_tokens: int = 0
+    released_tokens: int = 0
+    prefix_epoch: int = 0
 
 
 class CPUPagePool:
@@ -68,6 +77,9 @@ class CPUPagePool:
         gpu_page_indices: list[int],
         seq_len: int,
         position_id_start: int,
+        protected_prefix_tokens: int = 0,
+        released_tokens: int = 0,
+        prefix_epoch: int = 0,
     ) -> None:
         """Copy GPU pages → CPU pages (async on dedicated stream)."""
         n_pages = len(gpu_page_indices)
@@ -94,6 +106,9 @@ class CPUPagePool:
             cpu_page_indices=cpu_pages,
             seq_len=seq_len,
             position_id_start=position_id_start,
+            protected_prefix_tokens=protected_prefix_tokens,
+            released_tokens=released_tokens,
+            prefix_epoch=prefix_epoch,
         )
 
     def reload_pages(
@@ -102,10 +117,11 @@ class CPUPagePool:
         label: str,
         gpu_kv_cache: torch.Tensor,
         gpu_page_indices: list[int],
-    ) -> tuple[int, int]:
+    ) -> OffloadedState:
         """Copy CPU pages → GPU pages (async), free CPU pages.
 
-        Returns (seq_len, position_id_start) that were saved during offload.
+        Returns the ``OffloadedState`` saved during offload (its
+        ``cpu_page_indices`` are freed and no longer meaningful).
         """
         state = self.offloaded[request_id][label]
 
@@ -117,11 +133,10 @@ class CPUPagePool:
                 )
 
         self.page_allocator.free(state.cpu_page_indices)
-        seq_len, pos_id = state.seq_len, state.position_id_start
         del self.offloaded[request_id][label]
         if not self.offloaded[request_id]:
             del self.offloaded[request_id]
-        return seq_len, pos_id
+        return state
 
     def sync(self) -> None:
         """Wait for all pending GPU↔CPU copies to complete."""

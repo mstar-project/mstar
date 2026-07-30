@@ -548,6 +548,10 @@ class BatchedCacheManager(ABC):
         for rid in self.request_ids:
             state = self._get_state(rid)
             state.seq_len += n
+            if n:
+                # Committed content grew — signal caches of prefix-derived
+                # views (see KVRequestState.prefix_epoch).
+                state.prefix_epoch += 1
             state.position_id_start += (pos_id_n if pos_id_n is not None else n)
 
     @torch.compiler.disable
@@ -601,6 +605,8 @@ class BatchedCacheManager(ABC):
                     n = seq_lens[i]
                     state = self._get_state(rid, label=label)
                     state.seq_len += n
+                    if n:
+                        state.prefix_epoch += 1
                     if pos_id_ns is None:
                         state.position_id_start += n
                     elif isinstance(pos_id_ns, int):
@@ -614,6 +620,8 @@ class BatchedCacheManager(ABC):
                 n = ps.seq_lens[i]
                 state = self._get_state(rid, label=label)
                 state.seq_len += n
+                if n:
+                    state.prefix_epoch += 1
                 if pos_id_ns is None:
                     if ps.custom_pos_advance is not None:
                         state.position_id_start += ps.custom_pos_advance[i]
@@ -627,6 +635,26 @@ class BatchedCacheManager(ABC):
         # bleed into a subsequent walk.
         for ps in self._plan_states.values():
             ps.custom_pos_advance = None
+
+    @torch.compiler.disable
+    def protect_prefix(
+        self, request_id: str, num_tokens: int, label: str | None = None,
+    ) -> None:
+        """Mark the first ``num_tokens`` of the request's stream (active label
+        unless given) as never releasable. See
+        ``PagedAllocationManager.protect_prefix``."""
+        label = label or self.active_labels.get(request_id, "main")
+        self.alloc_manager.protect_prefix(request_id, label, num_tokens)
+
+    @torch.compiler.disable
+    def release_oldest(
+        self, request_id: str, num_tokens: int, label: str | None = None,
+    ) -> int:
+        """Free the oldest unprotected tokens of a live request, whole pages
+        only; returns tokens actually freed. See
+        ``PagedAllocationManager.release_oldest``."""
+        label = label or self.active_labels.get(request_id, "main")
+        return self.alloc_manager.release_oldest(request_id, label, num_tokens)
 
     @torch.compiler.disable
     def snapshot_all(
