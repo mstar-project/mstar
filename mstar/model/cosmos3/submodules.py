@@ -37,6 +37,7 @@ from mstar.engine.cuda_graph_config import (
     BasicBatchedCudaGraphConfig,
     FlashInferPackedCudaGraphConfig,
 )
+from mstar.engine.windowing import WindowSchedule
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
@@ -50,6 +51,7 @@ from mstar.model.cosmos3.constants import (
     PREFILL_COND_VIDEO_WALK,
     PREFILL_COND_WALK,
     PREFILL_WALK,
+    VIDEO_GEN_AR_WALK,
     VIDEO_GEN_WALK,
     VIDEO_SOUND_GEN_WALK,
 )
@@ -66,8 +68,10 @@ logger = logging.getLogger(__name__)
 # image_gen and video_gen run the identical denoise step (the DiT loop is
 # shape-general over the frame count); they differ only in the emitted output
 # modality (a single image frame vs an encoded video), which the graph fixes per
-# walk, so the submodule treats them the same.
-GEN_WALKS = (IMAGE_GEN_WALK, VIDEO_GEN_WALK)
+# walk, so the submodule treats them the same. video_gen_ar runs the same step
+# too, over one window's latents at a time, with per-window state swaps at
+# window boundaries.
+GEN_WALKS = (IMAGE_GEN_WALK, VIDEO_GEN_WALK, VIDEO_GEN_AR_WALK)
 
 # All prefill variants run the same understanding-tower prefill; the conditioned
 # ones additionally VAE-encode an image (prefill_cond) or video
@@ -80,6 +84,7 @@ PREFILL_WALKS = (PREFILL_WALK, PREFILL_COND_WALK, PREFILL_COND_VIDEO_WALK)
 # step count.
 IMAGE_GEN_LOOP = "image_gen_loop"
 VIDEO_GEN_LOOP = "video_gen_loop"
+VIDEO_GEN_AR_LOOP = "video_gen_ar_loop"
 VIDEO_SOUND_GEN_LOOP = "video_sound_gen_loop"
 ACTION_GEN_LOOP = "action_gen_loop"
 ACTION_VIDEO_GEN_LOOP = "action_video_gen_loop"
@@ -300,6 +305,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             t_lat = self._latent_shape(height, width, num_frames)[2]
             noisy_frames = [f for f in range(t_lat) if f not in set(condition_indexes)]
 
+        # Windowed AR video: statics, scheduler and noise are built per window
+        # at the window's own latent shape (window boundaries swap them); the
+        # text prefill below is identical either way — its K/V is written once
+        # and read by every window's steps.
+        if md.get("window_mode") is not None:
+            return self._prepare_windowed_prefill(
+                fwd_info, md, cond_ids, uncond_ids, height, width, fps, gs, steps, device,
+            )
+
         # Opt-in sound: append a jointly denoised AVAE-latent band to the
         # generation block. Video-only (single-frame image and action requests
         # are rejected at request resolution).
@@ -348,6 +362,94 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             st.add("vmask", vmask)
 
         return node_inputs
+
+    def _window_latent_shape(self, height, width, units):
+        s = self.config.vae.scale_factor_spatial
+        return (1, self.config.latent_channel, units, height // s, width // s)
+
+    def _build_window_statics(
+        self, cond_ids, uncond_ids, height, width, units, fps,
+        has_image_condition, cond_units, device,
+    ):
+        """Packed statics for one window of ``units`` latent frames. The
+        leading ``cond_units`` frames are clean overlap conditioning (the
+        previous window's tail); the image anchor applies only to the first
+        window (``cond_units == 0``). A window packs exactly like a clip of
+        the same latent length — per-window positions start at frame 0, so
+        each window is in-distribution for the clip-trained checkpoint."""
+        tf = self.config.vae.scale_factor_temporal
+        num_frames = 1 + (units - 1) * tf
+        noisy = list(range(cond_units, units)) if cond_units else None
+        anchored = has_image_condition and cond_units == 0
+        cond = self._build_static(
+            cond_ids, height, width, num_frames, fps, anchored, device,
+            noisy_frames=noisy,
+        )
+        uncond = None
+        if uncond_ids is not None:
+            uncond = self._build_static(
+                uncond_ids, height, width, num_frames, fps, anchored, device,
+                noisy_frames=noisy,
+            )
+        return cond, uncond
+
+    def _prepare_windowed_prefill(
+        self, fwd_info, md, cond_ids, uncond_ids, height, width, fps, gs, steps, device,
+    ) -> ARNodeInputs:
+        schedule = WindowSchedule(
+            total_units=int(md["total_latent_units"]),
+            window_units=int(md["window_latent_units"]),
+            overlap_units=int(md["overlap_latent_units"]),
+        )
+        w0 = schedule.window(0)
+        has_image_condition = bool(md.get("has_image_condition", False))
+        cond, uncond = self._build_window_statics(
+            cond_ids, uncond_ids, height, width, w0.units, fps,
+            has_image_condition=has_image_condition, cond_units=0, device=device,
+        )
+        node_inputs = self._get_prefill_node_inputs(cond, uncond)
+        self._slim_statics(cond, uncond)
+        st = self.request_state(fwd_info.request_id)
+        st.add_all(
+            cond=cond,
+            uncond=uncond,
+            gs=gs,
+            guidance_interval=md.get("guidance_interval"),
+            scheduler=self._new_scheduler(
+                steps, device, flow_shift=md.get("flow_shift"),
+                use_karras_sigma=md.get("use_karras_sigma"),
+            ),
+            latent_shape=self._window_latent_shape(height, width, w0.units),
+            num_sound=None,
+            ar_schedule=schedule,
+            ar_steps=steps,
+            ar_total_iters=schedule.num_windows * steps,
+            ar_cond_ids=list(cond_ids),
+            ar_uncond_ids=list(uncond_ids) if uncond_ids is not None else None,
+            ar_has_image_condition=has_image_condition,
+            ar_flow_shift=md.get("flow_shift"),
+            ar_karras=md.get("use_karras_sigma"),
+            ar_size=(int(height), int(width)),
+            ar_fps=fps,
+            # (units, cond_units) -> slimmed (cond, uncond); steady and short
+            # final windows reuse their entry across boundaries.
+            ar_statics={},
+        )
+        return node_inputs
+
+    def _window_statics_for(self, st, units, cond_units, device):
+        cached = st["ar_statics"].get((units, cond_units))
+        if cached is not None:
+            return cached
+        height, width = st["ar_size"]
+        cond, uncond = self._build_window_statics(
+            st["ar_cond_ids"], st["ar_uncond_ids"], height, width, units,
+            st["ar_fps"], has_image_condition=st["ar_has_image_condition"],
+            cond_units=cond_units, device=device,
+        )
+        self._slim_statics(cond, uncond)
+        st["ar_statics"][(units, cond_units)] = (cond, uncond)
+        return cond, uncond
 
     @staticmethod
     def _slim_statics(cond: dict, uncond: dict | None) -> None:
@@ -478,9 +580,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def _prepare_image_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
         st = self.request_states[fwd_info.request_id]
+        windowed = "ar_schedule" in st
         if "latents" not in inputs or len(inputs["latents"]) == 0:
             self._ingest_cond_latents(st, inputs, device)
             gen = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
+            if windowed:
+                # Later windows draw their noise from the same generator, so a
+                # seeded windowed request is deterministic end to end.
+                st.add("ar_generator", gen)
             latents = torch.randn(
                 st["latent_shape"], generator=gen, device=device, dtype=self.transformer.proj_in.weight.dtype
             )
@@ -502,15 +609,18 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
-        if step_index >= len(scheduler.timesteps):
+        if windowed:
+            if step_index >= st["ar_total_iters"]:
+                return None
+        elif step_index >= len(scheduler.timesteps):
             return None
         tensors = {"latents": latents, "time_index": time_index}
         # The CUDA-graph capture reads the timestep and rotary positions as static
         # buffers (it can't reach the per-request scheduler at replay), so
         # materialize them here. The eager path ignores these and recomputes from
         # per-request state. Only built in the two-branch guidance regime — the
-        # one the graph captures.
-        if st["uncond"] is not None:
+        # one the graph captures. Windowed requests run eager only.
+        if st["uncond"] is not None and not windowed:
             # The denoise loop may dispatch one extra (discarded) step past this
             # request's step count; clamp so materializing the static timestep
             # buffer can't index past the schedule.
@@ -719,6 +829,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 }
             ti = inputs[0].tensor_inputs["time_index"]
             step_index = int(ti.reshape(-1)[0].item())
+            if "ar_schedule" in st:
+                # Windowed: the loop counter is global; guidance is decided on
+                # the within-window step, matching the forward.
+                step_index %= st["ar_steps"]
             self._plan_gen(
                 cm, st, st["cond"]["num_vision_tokens"], cfg_active=self._cfg_active(st, step_index)
             )
@@ -872,7 +986,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_image_gen(self, cm, st, latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
-        if step_index >= len(scheduler.timesteps):
+        windowed = "ar_schedule" in st
+        if windowed:
+            # The loop counter is global; each window runs its own fresh
+            # scheduler over ar_steps steps.
+            if step_index >= st["ar_total_iters"]:
+                return {"latents": [latents], "time_index": [time_index]}
+            global_index = step_index
+            step_index = global_index % st["ar_steps"]
+        elif step_index >= len(scheduler.timesteps):
             # The loop may dispatch one step past this request's own count
             # before its stop signal lands; that step is a no-op.
             return {"latents": [latents], "time_index": [time_index]}
@@ -916,7 +1038,53 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # scheduler step (the reference pipeline does the same) so scheduler
             # rounding can't drift the pinned latents.
             new_latents = (1.0 - st["vmask"]) * new_latents + st["vmask"] * st["cond_video_latents"]
+        if windowed and (global_index + 1) % st["ar_steps"] == 0:
+            return self._finish_window(st, new_latents, time_index, global_index)
         return {"latents": [new_latents], "time_index": [time_index + 1]}
+
+    def _finish_window(self, st, window_latents, time_index, global_index) -> dict:
+        """Last denoise step of a window: emit the window's clean latents on
+        the streaming edge and stage the next window — fresh scheduler, fresh
+        noise, and the finished tail re-pinned as clean overlap conditioning
+        through the same vmask machinery video-to-video uses."""
+        schedule = st["ar_schedule"]
+        window_index = global_index // st["ar_steps"]
+        outputs = {
+            "latents": [window_latents],
+            "time_index": [time_index + 1],
+            "window_latents": [window_latents],
+        }
+        if window_index + 1 >= schedule.num_windows:
+            return outputs
+        plan = schedule.window(window_index + 1)
+        device = window_latents.device
+        dtype = self.transformer.proj_in.weight.dtype
+        cond, uncond = self._window_statics_for(st, plan.units, plan.cond_units, device)
+        st.add("cond", cond)
+        st.add("uncond", uncond)
+        st.add("scheduler", self._new_scheduler(
+            st["ar_steps"], device, flow_shift=st.get("ar_flow_shift"),
+            use_karras_sigma=st.get("ar_karras"),
+        ))
+        height, width = st["ar_size"]
+        shape = self._window_latent_shape(height, width, plan.units)
+        st.add("latent_shape", shape)
+        next_latents = torch.randn(
+            shape, generator=st["ar_generator"], device=device, dtype=dtype
+        )
+        if plan.cond_units > 0:
+            tail = window_latents[:, :, -plan.cond_units:].to(dtype)
+            vmask = torch.zeros((1, 1, plan.units, 1, 1), device=device, dtype=dtype)
+            vmask[:, :, :plan.cond_units] = 1.0
+            cond_video = torch.zeros(shape, device=device, dtype=dtype)
+            cond_video[:, :, :plan.cond_units] = tail
+            st.add("vmask", vmask)
+            st.add("cond_video_latents", cond_video)
+            next_latents = vmask * cond_video + (1.0 - vmask) * next_latents
+        else:
+            st.remove(["vmask", "cond_video_latents"])
+        outputs["latents"] = [next_latents]
+        return outputs
 
     def _sound_kwargs(self, static, sound_latents, sound_ts) -> dict:
         return dict(
@@ -1131,8 +1299,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ):
             # Image/video batch only in the two-branch guidance regime, so one
             # batched-CFG plan covers them. (Batches are per graph walk, so
-            # sound requests only ever batch with sound requests.)
-            return all(st["uncond"] is not None for st in sts)
+            # sound requests only ever batch with sound requests.) Windowed
+            # requests keep the single-request path: their window boundaries
+            # swap per-request statics/scheduler mid-walk, which the packed
+            # batched forward doesn't model.
+            return all(
+                st["uncond"] is not None and "ar_schedule" not in st for st in sts
+            )
         if batch.graph_walk in ACTION_WALKS:
             # Action batches when all requests share the guidance regime (all
             # single-branch -- guidance-scale-1 inverse/forward-dynamics and base
@@ -1592,10 +1765,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             ACTION_GEN_WALK: ACTION_GEN_LOOP,
             ACTION_VIDEO_GEN_WALK: ACTION_VIDEO_GEN_LOOP,
             VIDEO_GEN_WALK: VIDEO_GEN_LOOP,
+            VIDEO_GEN_AR_WALK: VIDEO_GEN_AR_LOOP,
             VIDEO_SOUND_GEN_WALK: VIDEO_SOUND_GEN_LOOP,
         }.get(request_info.graph_walk, IMAGE_GEN_LOOP)
         iter_idx = request_info.dynamic_loop_iter_counts.get(loop, 0)
-        if iter_idx + 1 >= len(st["scheduler"].timesteps):
+        # Windowed requests run every window's steps in one loop; others stop
+        # at their scheduler's step count.
+        total = (
+            st["ar_total_iters"] if "ar_schedule" in st
+            else len(st["scheduler"].timesteps)
+        )
+        if iter_idx + 1 >= total:
             return {loop}
         return set()
 
@@ -1830,7 +2010,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
                     self._decode_dtype_cached, torch.backends.cudnn.version())
         return self._decode_dtype_cached
 
-    def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
+    def _decode_pixels(self, latents: torch.Tensor) -> torch.Tensor:
+        """Latents -> uint8 pixel frames [1, 3, T, H, W]."""
         vae = self.vae
         vae_dtype = self._decode_dtype()
         if next(vae.parameters()).dtype != vae_dtype:
@@ -1864,7 +2045,10 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # only the uint8 frames cross the SHM edge to the data worker, not a 4x
         # larger fp32 tensor — the decoded video transfer dominates the fixed cost
         # at higher resolutions.
-        image = (decoded / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
+        return (decoded / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
+
+    def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
+        image = self._decode_pixels(latents)
         # Route the decoded tensor to the active walk's emit edge: image_gen
         # emits "image_output" (one frame); the video walks (plain, sound,
         # forward-dynamics) emit "video_output".
@@ -1874,3 +2058,64 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
             else "image_output"
         )
         return {out_name: [image]}
+
+
+class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
+    """Streaming Wan VAE decode for windowed AR video.
+
+    Consumes one committed window's latents per stream chunk. Each window is
+    decoded behind a re-decoded left context (the last few latents of the
+    stream so far) so the causal conv stack is warm at the kept frames; the
+    context- and overlap-derived pixels are trimmed, and the assembled video
+    is emitted once the last window lands. Chunk count is the completion
+    signal — it is known per request up front — so the stream's terminal
+    flush (an empty pass, and the only pass a non-windowed request's idle
+    stream ever delivers) runs as a no-op forward: the pass must complete
+    normally for the partition to report done, so it is not vetoed.
+    """
+
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+        chunks = (inputs or {}).get("window_latents") or []
+        if not chunks:
+            return NodeInputs(tensor_inputs={"latents": torch.empty(0)})
+        return NodeInputs(tensor_inputs={"latents": chunks[0]})
+
+    def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
+        if latents.numel() == 0:
+            return {}
+        rid = engine_inputs.request_ids[0]
+        st = self.request_state(rid)
+        if "ar_chunks" not in st:
+            md = engine_inputs.per_request_info[rid].step_metadata
+            st.add_all(
+                ar_chunks=0,
+                ar_windows=int(md["num_windows"]),
+                ar_overlap=int(md["overlap_latent_units"]),
+                ar_ctx=max(1, int(self.config.windowed_decode_context_latents)),
+                # The schedule may be padded up to whole windows; the request's
+                # frame count is what the assembled video is trimmed to.
+                ar_out_frames=int(md["num_frames"]),
+                ar_pixels=[],
+            )
+        index = st["ar_chunks"]
+        overlap = st["ar_overlap"] if index > 0 else 0
+        new = latents[:, :, overlap:] if overlap else latents
+        tail = st.get("ar_tail")
+        if tail is None:
+            pixels = self._decode_pixels(new)
+        else:
+            ctx = tail[:, :, -st["ar_ctx"]:]
+            pixels = self._decode_pixels(torch.cat([ctx, new.to(ctx.dtype)], dim=2))
+            # A mid-stream latent decodes to scale_factor_temporal frames; the
+            # leading context (and the clip-start special frame, which falls
+            # inside it) is exactly the part being trimmed.
+            keep = new.shape[2] * self.config.vae.scale_factor_temporal
+            pixels = pixels[:, :, -keep:]
+        st["ar_pixels"].append(pixels)
+        stream_tail = new if tail is None else torch.cat([tail, new.to(tail.dtype)], dim=2)
+        st.add("ar_tail", stream_tail[:, :, -st["ar_ctx"]:])
+        st.add("ar_chunks", index + 1)
+        if index + 1 < st["ar_windows"]:
+            return {}
+        video = torch.cat(st["ar_pixels"], dim=2)[:, :, : st["ar_out_frames"]]
+        return {"video_output": [video]}

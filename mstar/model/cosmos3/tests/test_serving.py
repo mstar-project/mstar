@@ -745,6 +745,217 @@ def test_video_postprocess_uses_request_fps(tmp_path) -> None:
     assert abs(float(num) / float(den) - 12.0) < 1e-3
 
 
+def test_windowed_gen_params_and_walk_selection() -> None:
+    """Windowed knobs quantize to latent units, the AR walk is selected at the
+    prefill transition, and every rejection fires at request resolution."""
+    import pytest as _pytest
+
+    from mstar.conductor.request_info import CurrentForwardConductorMetadata
+    from mstar.model.cosmos3 import constants as C
+
+    model = Cosmos3Model(
+        model_path_hf="unused", skip_weight_loading=True, enable_windowed_video=True,
+    )
+    p = model._resolve_gen_params(
+        {"window_mode": "chained", "num_frames": 189, "size": "832x480"}, [], ["video"],
+    )
+    # Default overlap = 2 latent units (the V2V pin count); 48 requested units
+    # pad to 50 so every window is full-size (stride 6).
+    assert p["window_latent_units"] == 8 and p["overlap_latent_units"] == 2
+    assert p["total_latent_units"] == 50 and p["num_windows"] == 8
+    assert p["num_frames"] == 189
+
+    md = CurrentForwardConductorMetadata(
+        input_modalities=[], output_modalities=["video"],
+        graph_walk=C.PREFILL_WALK, is_prefill=True, kwargs=p,
+    )
+    args = model.get_partition_forward_pass_args("default", md, {})
+    assert args.full_metadata.graph_walk == C.VIDEO_GEN_AR_WALK
+    done = model.get_partition_forward_pass_args("default", args.full_metadata, {})
+    assert done.request_done
+
+    dec = model.get_partition_forward_pass_args(
+        C.WINDOW_DECODER_PARTITION,
+        CurrentForwardConductorMetadata(
+            input_modalities=[], output_modalities=["video"],
+            graph_walk=C.VIDEO_DECODE_AR_WALK, is_prefill=False, kwargs=p,
+        ),
+        {},
+    )
+    assert dec.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK
+    assert not dec.request_done and dec.inputs == []
+
+    for bad in (
+        {"window_mode": "kv", "num_frames": 189},
+        {"window_mode": "chained", "num_frames": 1},
+        {"window_mode": "chained"},  # image output below
+    ):
+        with _pytest.raises(ValueError):
+            out_mod = ["video"] if bad.get("num_frames", 0) > 1 or "kv" in str(bad) else ["image"]
+            model._resolve_gen_params(bad, [], out_mod)
+    with _pytest.raises(ValueError):
+        model._resolve_gen_params(
+            {"window_mode": "chained", "num_frames": 189, "generate_sound": True}, [], ["video"],
+        )
+    with _pytest.raises(ValueError):
+        model._resolve_gen_params(
+            {"window_mode": "chained", "num_frames": 9999999}, [], ["video"],
+        )
+    plain = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    with _pytest.raises(ValueError):
+        plain._resolve_gen_params(
+            {"window_mode": "chained", "num_frames": 189}, [], ["video"],
+        )
+    # A windowed-enabled deployment serves non-windowed requests unchanged.
+    q = model._resolve_gen_params({"num_frames": 189}, [], ["video"])
+    assert "window_mode" not in q
+
+
+def test_windowed_check_stop_counts_all_windows() -> None:
+    """The AR loop stops at num_windows x steps, not at one scheduler's
+    length."""
+    from types import SimpleNamespace
+
+    from mstar.engine.windowing import WindowSchedule
+    from mstar.model.cosmos3 import constants as C
+    from mstar.model.cosmos3.submodules import VIDEO_GEN_AR_LOOP, Cosmos3DiTSubmodule
+
+    sub = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
+        model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
+    st = sub.request_state("r")
+    st.add_all(
+        ar_schedule=WindowSchedule(48, 8, overlap_units=1),
+        ar_total_iters=7 * 5,
+        scheduler=SimpleNamespace(timesteps=list(range(5))),
+    )
+    info = SimpleNamespace(
+        graph_walk=C.VIDEO_GEN_AR_WALK,
+        dynamic_loop_iter_counts={VIDEO_GEN_AR_LOOP: 4},
+    )
+    assert sub.check_stop("r", info, {}) == set()
+    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 33
+    assert sub.check_stop("r", info, {}) == set()
+    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 34
+    assert sub.check_stop("r", info, {}) == {VIDEO_GEN_AR_LOOP}
+
+
+def test_windowed_finish_window_bookkeeping(monkeypatch) -> None:
+    """The last step of a window emits the window's latents on the streaming
+    edge, stages the next window (fresh noise, overlap tail pinned clean), and
+    the final window emits without staging."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.engine.windowing import WindowSchedule
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+
+    cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
+    sub = Cosmos3DiTSubmodule(transformer=None, config=cfg, scheduler=None)
+    sub.transformer = SimpleNamespace(
+        proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32))
+    )
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "fresh-sched")
+    monkeypatch.setattr(
+        sub, "_window_statics_for", lambda st, units, cond, dev: ({"u": units}, None)
+    )
+
+    st = sub.request_state("r")
+    schedule = WindowSchedule(total_units=12, window_units=8, overlap_units=1)
+    assert schedule.num_windows == 2
+    st.add_all(
+        ar_schedule=schedule, ar_steps=5, ar_total_iters=10,
+        ar_flow_shift=None, ar_karras=None, ar_size=(64, 64),
+        ar_generator=torch.Generator().manual_seed(0),
+        cond={"u": 8}, uncond=None, scheduler="w0-sched",
+    )
+    w0_shape = sub._window_latent_shape(64, 64, 8)
+    x0 = (
+        torch.arange(8, dtype=torch.float32)
+        .view(1, 1, 8, 1, 1)
+        .expand(w0_shape)
+        .contiguous()
+    )
+    ti = torch.tensor([4])
+    out = sub._finish_window(st, x0, ti, global_index=4)
+    assert torch.equal(out["window_latents"][0], x0)
+    assert int(out["time_index"][0].item()) == 5
+    # Next window: 5 latent units (12 total - 8 + 1 overlap), head pinned to
+    # the previous tail value (7.0), rest fresh noise.
+    nxt = out["latents"][0]
+    assert nxt.shape[2] == 5
+    assert torch.all(nxt[:, :, 0] == 7.0)
+    assert st["scheduler"] == "fresh-sched" and st["cond"] == {"u": 5}
+    assert st["vmask"].shape[2] == 5 and float(st["vmask"][0, 0, 0]) == 1.0
+
+    # Final window: emit only, no staging.
+    st.add("cond", {"u": 5})
+    x1 = torch.zeros(sub._window_latent_shape(64, 64, 5))
+    out = sub._finish_window(st, x1, torch.tensor([9]), global_index=9)
+    assert torch.equal(out["window_latents"][0], x1)
+    assert torch.equal(out["latents"][0], x1)
+
+
+def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
+    """The AR decoder's context-re-decode + trim reproduces the whole-clip
+    decode of the same latent stream, chunk counts drive completion, and the
+    stream's empty terminal flush is skipped."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.model.cosmos3.config import Cosmos3Config
+    from mstar.model.cosmos3.submodules import Cosmos3VAEDecoderARSubmodule
+
+    class _TracingVAE(torch.nn.Module):
+        """Decodes latent value v at latent index i to pixel frames of value
+        v: frame 0 from latent 0, then 4 frames per later latent — the same
+        temporal contract as the Wan VAE, with content that identifies its
+        source latent."""
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+            self.config = SimpleNamespace(latents_mean=[0.0], latents_std=[1.0])
+
+        def decode(self, z):
+            vals = z[0, 0, :, 0, 0]
+            frames = [vals[0].expand(1)]
+            for i in range(1, z.shape[2]):
+                frames.append(vals[i].expand(4))
+            t = torch.cat(frames)
+            sample = t.view(1, 1, -1, 1, 1).expand(1, 3, t.numel(), 4, 4)
+            # forward maps [-1, 1] -> uint8; keep values identity-recoverable.
+            return SimpleNamespace(sample=sample / 127.5 - 1.0)
+
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
+    cfg = Cosmos3Config()
+    cfg.windowed_decode_context_latents = 3
+    sub = Cosmos3VAEDecoderARSubmodule(_TracingVAE(), cfg)
+    sub._decode_dtype_cached = torch.float32
+
+    # Latent stream of 12 units, value = absolute unit index; windows of 8
+    # units with 1-unit overlap: [0..8) then [7..12).
+    stream = torch.arange(12, dtype=torch.float32).view(1, 1, 12, 1, 1).expand(1, 16, 12, 4, 4).contiguous()
+    md = {"num_windows": 2, "overlap_latent_units": 1, "num_frames": 45}
+    engine_inputs = SimpleNamespace(
+        request_ids=["r"],
+        per_request_info={"r": SimpleNamespace(step_metadata=md)},
+    )
+
+    flush = sub.prepare_inputs("video_decode_ar", None, {"window_latents": []})
+    assert flush.tensor_inputs["latents"].numel() == 0
+    assert sub.forward("video_decode_ar", engine_inputs, flush.tensor_inputs["latents"]) == {}
+    out = sub.forward("video_decode_ar", engine_inputs, stream[:, :, 0:8])
+    assert out == {}
+    out = sub.forward("video_decode_ar", engine_inputs, stream[:, :, 7:12])
+    video = out["video_output"][0]
+
+    expected = sub._decode_pixels(stream)
+    assert video.shape == expected.shape  # 1 + 11*4 = 45 frames
+    assert torch.equal(video, expected)
+
+
 if __name__ == "__main__":
     test_adapter_registered_for_images()
     test_gen_params_and_step_metadata()
