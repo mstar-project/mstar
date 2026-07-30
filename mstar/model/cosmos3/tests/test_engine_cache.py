@@ -49,16 +49,26 @@ class _SdpaCacheHandle:
     branches run in one forward, ``run_attention`` receives the two branches
     concatenated and routes each half to its own label's cached prefix, so the
     batched result equals running the branches sequentially.
+
+    Writes follow the paged cache's commit contract: every attended fresh K/V
+    is staged at the label's tail (a new plan supersedes an earlier staging),
+    and only ``advance_seq_lens`` appends it to the committed stream — so
+    denoise steps overwrite their scratch while prefill and windowed commit
+    passes accumulate. ``protect_prefix``/``release_oldest`` mirror the
+    allocator's page-floor front eviction on the stored stream.
     """
 
-    def __init__(self):
+    def __init__(self, page_size=128):
         self.active = "main"
         self.layer = 0
+        self.page_size = page_size
         self.committed: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.pending: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.is_causal: dict[str, bool] = {}
         self.batched_labels: list[str] | None = None
         self.batched_splits: list[int] | None = None
+        self.protected: dict[str, int] = {}
+        self.released: dict[str, int] = {}
 
     def set_active_label(self, label):
         self.active = label
@@ -66,12 +76,19 @@ class _SdpaCacheHandle:
     def set_layer_idx(self, i):
         self.layer = i
 
+    def _clear_pending(self, labels):
+        self.pending = {
+            key: kv for key, kv in self.pending.items() if key[0] not in labels
+        }
+
     def plan_attention(self, seq_lens=None, dtype=None, is_causal=True, write_store=True, label=None, **kwargs):
         self.is_causal[label or self.active] = is_causal
+        self._clear_pending({label or self.active})
 
     def plan_attention_batched_cfg(self, labels, seq_lens, is_causal=False, write_store=False, **kwargs):
         self.batched_labels = list(labels)
         self.is_causal["_cfg_batched"] = is_causal
+        self._clear_pending(set(labels))
         # Per-label token counts of the packed sequence: the prefill plan passes
         # {label: [lens]} (the two prompts differ in length), the denoise plans a
         # shared per-request list (both guidance branches carry the same
@@ -94,10 +111,10 @@ class _SdpaCacheHandle:
 
     def _attend_label(self, label, layer, q, k, v, causal):
         key = (label, layer)
+        self.pending[key] = (k, v)
         if key in self.committed:
             pk, pv = self.committed[key]
             return self._sdpa(q, torch.cat([pk, k], 0), torch.cat([pv, v], 0), causal)
-        self.pending[key] = (k, v)
         return self._sdpa(q, k, v, causal)
 
     def run_attention(self, q, k, v, layer_idx=None):
@@ -113,8 +130,35 @@ class _SdpaCacheHandle:
         return self._attend_label(self.active, layer, q, k, v, self.is_causal[self.active])
 
     def advance_seq_lens(self, pos_id_ns=None):
-        self.committed.update(self.pending)
+        for key, (k, v) in self.pending.items():
+            if key in self.committed:
+                pk, pv = self.committed[key]
+                self.committed[key] = (torch.cat([pk, k], 0), torch.cat([pv, v], 0))
+            else:
+                self.committed[key] = (k, v)
         self.pending = {}
+
+    def protect_prefix(self, request_id, num_tokens, label=None):
+        assert not self.released.get(label), "protect after release"
+        self.protected[label] = int(num_tokens)
+
+    def release_oldest(self, request_id, num_tokens, label=None):
+        ps = self.page_size
+        first = -(-self.protected.get(label, 0) // ps)
+        keys = [key for key in self.committed if key[0] == label]
+        stream_len = self.committed[keys[0]][0].shape[0]
+        releasable = stream_len // ps - first
+        k = min(int(num_tokens) // ps, releasable)
+        if k <= 0:
+            return 0
+        lo, hi = first * ps, first * ps + k * ps
+        for key in keys:
+            ck, cv = self.committed[key]
+            self.committed[key] = (
+                torch.cat([ck[:lo], ck[hi:]], 0), torch.cat([cv[:lo], cv[hi:]], 0),
+            )
+        self.released[label] = self.released.get(label, 0) + k * ps
+        return k * ps
 
 
 def _flashinfer_cache(model, rid, device, dtype, backend=None):
@@ -616,6 +660,175 @@ def test_cross_request_batch_matches_individual() -> None:
     torch.cuda.empty_cache()
 
 
+# Windowed kv-mode oracle geometry: 45 px frames = 12 latent units at 256p
+# (64 tokens per unit, so a 128-token page holds exactly two units), windows
+# of 4 units, a 6-unit context horizon — three windows, with real page-floor
+# evictions after windows 1 and 2. Step count matches the other engine
+# checks: very coarse schedules amplify kernel-level rounding into the
+# latents, which would blur what the parity bars measure.
+WSTEPS = 12
+W_NUM_FRAMES = 45
+W_WINDOW_FRAMES = 13
+W_CONTEXT_FRAMES = 21
+
+
+def _windowed_scenario():
+    """Shared kv-mode context: served knob resolution, token ids, and the
+    block-causal reference's per-window latents."""
+    key = "windowed_kv"
+    if key in _SETUP_CACHE:
+        return _SETUP_CACHE[key]
+    base = _load()
+    if base is None:
+        _SETUP_CACHE[key] = None
+        return None
+    from mstar.model.cosmos3.components.packing import tokenize_prompt
+
+    model, mpipe, device = base["model"], base["mpipe"], base["device"]
+    model.config.enable_windowed_video = True
+    md = model._resolve_gen_params(
+        {
+            "window_mode": "kv", "num_frames": W_NUM_FRAMES, "size": f"{W}x{H}",
+            "window_frames": W_WINDOW_FRAMES, "context_frames": W_CONTEXT_FRAMES,
+            "num_inference_steps": WSTEPS, "guidance_scale": GS,
+        },
+        [], ["video"],
+    )
+    cond_ids, uncond_ids = tokenize_prompt(
+        model.tokenizer, PROMPT, "", num_frames=W_NUM_FRAMES, height=H, width=W
+    )
+    ref = mpipe.windowed_kv(
+        cond_ids, uncond_ids,
+        total_units=md["total_latent_units"],
+        window_units=md["window_latent_units"],
+        context_units=md["context_latent_units"],
+        height=H, width=W, num_inference_steps=WSTEPS, guidance_scale=GS,
+        fps=md["fps"], flow_shift=md.get("flow_shift"),
+        generator=torch.Generator(device=device).manual_seed(SEED),
+    )
+    ctx = dict(md=md, cond=cond_ids, uncond=uncond_ids, ref=ref, **base)
+    _SETUP_CACHE[key] = ctx
+    return ctx
+
+
+@torch.no_grad()
+def _run_windowed_kv_served(model, dit, cm, md, cond_ids, uncond_ids, device):
+    """Drive the served kv path — prefill, then every loop iteration of the
+    AR walk (denoise steps + commit passes) — collecting the streamed
+    per-window latents."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    rid = "r0"
+    fwd = CurrentForwardPassInfo(
+        request_id=rid, graph_walk="prefill", requires_cfg=True, fwd_index=0,
+        random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
+    )
+    ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm)
+    text_inputs = [
+        torch.tensor(cond_ids, dtype=torch.long, device=device),
+        torch.tensor(uncond_ids, dtype=torch.long, device=device),
+    ]
+    ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": text_inputs})
+    dit.forward("prefill", ei, **dit.preprocess("prefill", ei, [ni]))
+
+    fwd.graph_walk = "video_gen_ar"
+    windows = []
+    inputs = {}
+    for _ in range(md["num_windows"] * (md["num_inference_steps"] + 1)):
+        ni = dit.prepare_inputs("video_gen_ar", fwd, inputs)
+        out = dit.forward("video_gen_ar", ei, **dit.preprocess("video_gen_ar", ei, [ni]))
+        if "window_latents" in out:
+            windows.append(out["window_latents"][0].clone())
+        inputs = {"latents": [out["latents"][0]], "time_index": [out["time_index"][0]]}
+    dit.cleanup_request(rid)
+    return windows
+
+
+def test_windowed_kv_matches_reference() -> None:
+    """The served kv path — block-causal denoise over committed context,
+    commit passes, page-floor eviction — must reproduce the hand-rolled
+    reference bit-tightly on the sdpa cache handle (sequential guidance, the
+    bit-exact regime), window by window."""
+    ctx = _windowed_scenario()
+    if ctx is None:
+        print("  (skipped windowed-kv reference parity: needs COSMOS3_NANO_DIR + CUDA)")
+        return
+    dit, prev = ctx["dit"], ctx["dit"].batched_cfg
+    dit.batched_cfg = False
+    try:
+        wins = _run_windowed_kv_served(
+            ctx["model"], dit, _SdpaCacheHandle(), ctx["md"], ctx["cond"],
+            ctx["uncond"], ctx["device"],
+        )
+    finally:
+        dit.batched_cfg = prev
+    assert len(wins) == len(ctx["ref"]) == ctx["md"]["num_windows"]
+    diffs = []
+    for served, ref in zip(wins, ctx["ref"], strict=True):
+        diffs.append((served.float() - ref.reshape(served.shape).float()).abs().max().item())
+    assert max(diffs) <= 1e-3, f"windowed kv vs reference per-window diffs {diffs}"
+    print("  windowed-kv (sdpa) per-window latent abs-max diffs = "
+          + ", ".join(f"{d:.3e}" for d in diffs))
+
+
+def test_windowed_kv_engine_release_and_psnr() -> None:
+    """The served kv path on the real paged cache (production batched-CFG
+    denoise + commit): pages of aged-out context are freed on the live
+    request with exact page accounting, and window 0 matches the reference
+    within the usual FlashInfer-vs-sdpa precision bar. Later windows denoise
+    against committed K/V that already carries the kernels' rounding, so
+    their trajectories legitimately diverge (autoregressive feedback, not an
+    implementation error — implementation fidelity is the bit-exact sdpa
+    check above); they get a corruption floor, not the precision bar."""
+    ctx = _windowed_scenario()
+    if ctx is None:
+        print("  (skipped windowed-kv engine parity: needs COSMOS3_NANO_DIR + CUDA)")
+        return
+    try:
+        cm = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"])
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (skipped windowed-kv engine parity: FlashInfer unavailable: {exc})")
+        return
+    alloc = cm.alloc_manager
+    free0 = alloc.num_free_pages
+    wins = _run_windowed_kv_served(
+        ctx["model"], ctx["dit"], cm, ctx["md"], ctx["cond"], ctx["uncond"], ctx["device"],
+    )
+
+    page_size = alloc.config.page_size
+    frame_tokens = ctx["md"]["total_latent_units"] * 64  # 64 tokens/unit at 256p
+    for label, ids in (("main", ctx["cond"]), ("uncond", ctx["uncond"])):
+        state = alloc.request_states["r0"][label]
+        assert state.protected_prefix_tokens == len(ids)
+        # 12 units committed against a 6-unit horizon -> 6 units (384 tokens,
+        # 3 whole pages) released from the live request per label.
+        assert state.released_tokens == 384, (label, state.released_tokens)
+        expected_pages = -(-(len(ids) + frame_tokens) // page_size) - 3
+        assert len(state.page_indices) == expected_pages
+        assert state.seq_len == len(ids) + frame_tokens - 384
+    held = sum(
+        len(alloc.request_states["r0"][label].page_indices)
+        for label in ("main", "uncond")
+    )
+    assert free0 - alloc.num_free_pages == held
+    alloc.remove_request("r0")
+    assert alloc.num_free_pages == free0
+
+    psnrs = []
+    for served, ref in zip(wins, ctx["ref"], strict=True):
+        assert torch.isfinite(served).all()
+        img_served = ctx["mpipe"]._decode(served).squeeze().float().cpu()
+        img_ref = ctx["mpipe"]._decode(ref.reshape(served.shape)).squeeze().float().cpu()
+        mse = (img_served - img_ref).pow(2).mean().item()
+        psnrs.append(float("inf") if mse == 0 else -10 * math.log10(mse))
+    assert psnrs[0] >= 30, f"windowed-kv engine window-0 PSNR {psnrs[0]:.2f} < 30"
+    assert min(psnrs) >= 12, f"windowed-kv engine per-window PSNRs {psnrs}"
+    print("  windowed-kv engine path (flashinfer, batched commit) per-window PSNR = "
+          + ", ".join(f"{p:.2f}" for p in psnrs)
+          + " dB; released 384 tokens/label on the live request")
+
+
 @torch.no_grad()
 def _run_cuda_graph_denoise(ctx):
     """Capture the image denoise step and run the whole loop through the real
@@ -709,6 +922,8 @@ def _main() -> None:
         ("engine_cache_path_video_psnr", test_engine_cache_path_video_psnr),
         ("dense_fa3_image_psnr", test_dense_fa3_image_psnr),
         ("dense_fa3_video_psnr", test_dense_fa3_video_psnr),
+        ("windowed_kv_matches_reference", test_windowed_kv_matches_reference),
+        ("windowed_kv_engine_release_and_psnr", test_windowed_kv_engine_release_and_psnr),
         ("anchor_encode_matches_full", test_anchor_encode_matches_full),
         ("compile_vae_matches_eager", test_compile_vae_matches_eager),
         ("compile_vae_matches_eager_t2v", test_compile_vae_matches_eager_t2v),

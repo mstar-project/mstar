@@ -828,6 +828,33 @@ class Cosmos3OmniTransformer(nn.Module):
             und_seq = layer.forward_und(und_seq, cos, sin, cache_handle)
         cache_handle.advance_seq_lens()
 
+    def commit_window(
+        self, latents: torch.Tensor, position_ids_per_branch: list[torch.Tensor],
+        cache_handle,
+    ) -> None:
+        """Run the generation tower over a finished window's clean latents and
+        append their K/V to the planned label(s) — the frame-token analogue of
+        ``prefill_und``. Clean conditioning frames receive no timestep
+        embedding, so the committed K/V is denoise-step independent, exactly
+        like i2v/v2v clean frames. ``position_ids_per_branch`` carries one
+        [3, N] mRoPE block per guidance branch (the branches share content but
+        their positions differ with the prompt length); the sequence packs
+        [cond | uncond] to match the batched plan's label order. No velocity
+        is decoded — the pass exists for its cache writes."""
+        packed, _ = self._patchify_and_pack_latents([latents])
+        gen_seq = self.proj_in(packed)
+        if len(position_ids_per_branch) > 1:
+            gen_seq = torch.cat([gen_seq] * len(position_ids_per_branch), dim=0)
+        cos_parts, sin_parts = [], []
+        for pos in position_ids_per_branch:
+            c, s = self._rotary(pos, gen_seq.device, gen_seq.dtype)
+            cos_parts.append(c)
+            sin_parts.append(s)
+        cos = torch.cat(cos_parts, dim=0) if len(cos_parts) > 1 else cos_parts[0]
+        sin = torch.cat(sin_parts, dim=0) if len(sin_parts) > 1 else sin_parts[0]
+        self._sp_run_gen_layers(gen_seq, cos, sin, cache_handle)
+        cache_handle.advance_seq_lens()
+
     def _sp_run_gen_layers(self, gen_seq, cos, sin, cache_handle, prefer_all_gather=False):
         """Run the generation layer stack, sequence-parallel-sharded across the
         SP group when active. ``gen_seq``/``cos``/``sin`` are the FULL sequence

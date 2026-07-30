@@ -148,6 +148,10 @@ class Cosmos3Config:
     # one-frame conditioning visibly degrades the continuation.
     window_frames_default: int = 29
     overlap_frames_default: int = 8
+    # kv-mode committed-context horizon (61 px = 16 latent frames): frames
+    # older than this behind the commit frontier are evicted from the cache.
+    # A request may pass context_frames=0 to retain everything.
+    context_frames_default: int = 61
     # Latent frames of already-generated context re-decoded ahead of each
     # window so the causal VAE's conv stack is warm at the kept frames; the
     # context-derived pixels are trimmed. Raise if window boundaries seam.

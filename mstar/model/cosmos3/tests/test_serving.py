@@ -786,12 +786,15 @@ def test_windowed_gen_params_and_walk_selection() -> None:
     assert not dec.request_done and dec.inputs == []
 
     for bad in (
-        {"window_mode": "kv", "num_frames": 189},
+        {"window_mode": "bogus", "num_frames": 189},
         {"window_mode": "chained", "num_frames": 1},
         {"window_mode": "chained"},  # image output below
+        {"window_mode": "chained", "num_frames": 189, "context_frames": 61},
+        {"window_mode": "kv", "num_frames": 189, "overlap_frames": 8},
+        {"window_mode": "kv", "num_frames": 189, "context_frames": -1},
     ):
         with _pytest.raises(ValueError):
-            out_mod = ["video"] if bad.get("num_frames", 0) > 1 or "kv" in str(bad) else ["image"]
+            out_mod = ["video"] if bad.get("num_frames", 0) > 1 else ["image"]
             model._resolve_gen_params(bad, [], out_mod)
     with _pytest.raises(ValueError):
         model._resolve_gen_params(
@@ -809,6 +812,20 @@ def test_windowed_gen_params_and_walk_selection() -> None:
     # A windowed-enabled deployment serves non-windowed requests unchanged.
     q = model._resolve_gen_params({"num_frames": 189}, [], ["video"])
     assert "window_mode" not in q
+
+    # kv mode: overlap-free windows advancing by the full window, committed
+    # context capped at the (quantized) horizon; context_frames=0 retains all.
+    kv = model._resolve_gen_params(
+        {"window_mode": "kv", "num_frames": 189}, [], ["video"],
+    )
+    assert kv["window_mode"] == "kv"
+    assert kv["overlap_latent_units"] == 0
+    assert kv["context_latent_units"] == 16  # 61 px default -> 16 units
+    assert kv["total_latent_units"] == 48 and kv["num_windows"] == 6
+    keep_all = model._resolve_gen_params(
+        {"window_mode": "kv", "num_frames": 189, "context_frames": 0}, [], ["video"],
+    )
+    assert keep_all["context_latent_units"] == 0
 
 
 def test_windowed_check_stop_counts_all_windows() -> None:
@@ -857,7 +874,7 @@ def test_windowed_finish_window_bookkeeping(monkeypatch) -> None:
     )
     monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "fresh-sched")
     monkeypatch.setattr(
-        sub, "_window_statics_for", lambda st, units, cond, dev: ({"u": units}, None)
+        sub, "_window_statics_for", lambda st, plan, dev: ({"u": plan.units}, None)
     )
 
     st = sub.request_state("r")
@@ -877,7 +894,7 @@ def test_windowed_finish_window_bookkeeping(monkeypatch) -> None:
         .contiguous()
     )
     ti = torch.tensor([4])
-    out = sub._finish_window(st, x0, ti, global_index=4)
+    out = sub._finish_window(st, x0, ti, window_index=0)
     assert torch.equal(out["window_latents"][0], x0)
     assert int(out["time_index"][0].item()) == 5
     # Next window: 5 latent units (12 total - 8 + 1 overlap), head pinned to
@@ -891,9 +908,214 @@ def test_windowed_finish_window_bookkeeping(monkeypatch) -> None:
     # Final window: emit only, no staging.
     st.add("cond", {"u": 5})
     x1 = torch.zeros(sub._window_latent_shape(64, 64, 5))
-    out = sub._finish_window(st, x1, torch.tensor([9]), global_index=9)
+    out = sub._finish_window(st, x1, torch.tensor([9]), window_index=1)
     assert torch.equal(out["window_latents"][0], x1)
     assert torch.equal(out["latents"][0], x1)
+
+
+def test_windowed_kv_prefill_state_and_pacing(monkeypatch) -> None:
+    """A kv request runs steps + 1 loop iterations per window (the +1 is the
+    commit pass); the prefill records the pacing, the release schedule and the
+    per-unit token stride, and check_stop fires after the final commit."""
+    from types import SimpleNamespace
+
+    from mstar.model.cosmos3 import constants as C
+    from mstar.model.cosmos3.submodules import VIDEO_GEN_AR_LOOP, Cosmos3DiTSubmodule
+
+    cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
+    sub = Cosmos3DiTSubmodule(transformer=None, config=cfg, scheduler=None)
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "sched")
+    md = {
+        "window_mode": "kv", "total_latent_units": 12, "window_latent_units": 4,
+        "overlap_latent_units": 0, "context_latent_units": 6,
+    }
+    fwd = SimpleNamespace(request_id="r")
+    sub._prepare_windowed_prefill(
+        fwd, md, list(range(7)), list(range(9)), 64, 64, 24.0, 6.0, 4, "cpu",
+    )
+    st = sub.request_states["r"]
+    assert st["ar_kv_mode"] and st["ar_iters_per_window"] == 5
+    assert st["ar_total_iters"] == 15
+    # 64x64 -> 4x4 latent -> 2x2 patchify -> 4 tokens per latent frame.
+    assert st["ar_tokens_per_unit"] == 4
+    assert st["ar_schedule"].context_units == 6
+
+    info = SimpleNamespace(
+        graph_walk=C.VIDEO_GEN_AR_WALK,
+        dynamic_loop_iter_counts={VIDEO_GEN_AR_LOOP: 13},
+    )
+    assert sub.check_stop("r", info, {}) == set()
+    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 14
+    assert sub.check_stop("r", info, {}) == {VIDEO_GEN_AR_LOOP}
+
+
+def test_windowed_kv_statics_absolute_positions() -> None:
+    """kv window statics carry absolute temporal mRoPE positions: a window
+    starting at latent frame 8 positions its tokens exactly where the full
+    clip would, the image anchor applies only to the first window, and
+    chained statics keep per-window positions from 0."""
+    import torch
+
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+
+    cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
+    sub = Cosmos3DiTSubmodule(transformer=None, config=cfg, scheduler=None)
+    ids = list(range(7))
+    kw = dict(height=64, width=64, units=4, fps=24.0, has_image_condition=True,
+              cond_units=0, device="cpu")
+    w0, _ = sub._build_window_statics(ids, None, first_window=True, start_unit=0, **{
+        k: v for k, v in kw.items()})
+    w2, _ = sub._build_window_statics(ids, None, first_window=False, start_unit=8, **{
+        k: v for k, v in kw.items()})
+
+    full = sub._build_static(
+        ids, 64, 64, 1 + (12 - 1) * cfg.vae.scale_factor_temporal, 24.0,
+        has_image_condition=True, device="cpu",
+    )
+    stride = full["num_vision_tokens"] // 12
+    assert torch.equal(
+        w2["vision_mrope_ids"], full["vision_mrope_ids"][:, 8 * stride: 12 * stride]
+    )
+    # Anchor only on the first window: window 0 keeps latent frame 0 clean,
+    # a later window predicts every frame.
+    assert w0["num_noisy_vision_tokens"] == 3 * stride
+    assert w2["num_noisy_vision_tokens"] == 4 * stride
+    # Chained (start_unit 0) restarts each window's positions at frame 0.
+    ch, _ = sub._build_window_statics(ids, None, first_window=False, start_unit=0, **{
+        k: v for k, v in kw.items()})
+    assert torch.equal(
+        ch["vision_mrope_ids"], full["vision_mrope_ids"][:, : 4 * stride]
+    )
+
+
+def test_windowed_kv_commit_and_lifecycle(monkeypatch) -> None:
+    """The commit iteration appends exactly the window's new units under both
+    guidance branches, protects each branch's text prefix before any release,
+    releases context past the horizon after each commit (page-floored, with
+    the shortfall re-offered), and stages the next window. Denoise plans for
+    kv requests stay paged (dense fast path off)."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.engine.windowing import WindowSchedule
+    from mstar.model.cosmos3.submodules import CFG_BATCHED_LABEL, Cosmos3DiTSubmodule
+
+    cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
+    sub = Cosmos3DiTSubmodule(transformer=None, config=cfg, scheduler=None)
+
+    commits = []
+    sub.transformer = SimpleNamespace(
+        proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)),
+        commit_window=lambda latents, positions, cm: commits.append(
+            (latents.clone(), [p.clone() for p in positions])
+        ),
+    )
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "fresh")
+
+    stride = 64  # tokens per latent frame (256p tier: pages hold 2 frames)
+
+    def fake_statics(plan):
+        n = plan.units * stride
+        base = plan.start * stride
+        ids = (torch.arange(n) + base).view(1, -1).expand(3, -1).contiguous()
+        return (
+            {"vision_mrope_ids": ids, "und_len": 7, "num_vision_tokens": n},
+            {"vision_mrope_ids": ids + 100000, "und_len": 9, "num_vision_tokens": n},
+        )
+
+    monkeypatch.setattr(
+        sub, "_window_statics_for", lambda st, plan, dev: fake_statics(plan)
+    )
+
+    class _CM:
+        def __init__(self):
+            self.plans = []
+            self.labels = []
+            self.protected = []
+            self.released = []
+
+        def set_active_label(self, label):
+            self.labels.append(label)
+
+        def plan_attention(self, **kw):
+            self.plans.append(("single", kw))
+
+        def plan_attention_batched_cfg(self, **kw):
+            self.plans.append(("cfg", kw))
+
+        def protect_prefix(self, rid, n, label=None):
+            assert not self.released, "release before protect"
+            self.protected.append((rid, label, n))
+
+        def release_oldest(self, rid, n, label=None):
+            self.released.append((rid, label, n))
+            return (n // 128) * 128  # page-floored, like the allocator
+
+    cm = _CM()
+    schedule = WindowSchedule(
+        total_units=12, window_units=4, context_units=6, overlap_units=0
+    )
+    st = sub.request_state("r")
+    w0 = schedule.window(0)
+    cond0, uncond0 = fake_statics(w0)
+    st.add_all(
+        ar_schedule=schedule, ar_steps=4, ar_iters_per_window=5,
+        ar_total_iters=15, ar_kv_mode=True, ar_rid="r",
+        ar_tokens_per_unit=stride, ar_size=(64, 64),
+        ar_generator=torch.Generator().manual_seed(0),
+        cond=cond0, uncond=uncond0, scheduler="w0-sched",
+        latent_shape=sub._window_latent_shape(64, 64, 4),
+    )
+
+    # Preprocess maps the loop counter: a commit iteration plans the append
+    # (both labels, the window's 4 new units), a denoise iteration plans
+    # paged with the dense fast path off.
+    ei = SimpleNamespace(cache_manager=cm, request_ids=["r"], per_request_states=None)
+    inp = SimpleNamespace(tensor_inputs={
+        "latents": torch.zeros(1), "time_index": torch.tensor([4]),
+    })
+    sub.preprocess("video_gen_ar", ei, [inp])
+    kind, kw = cm.plans[-1]
+    assert kind == "cfg" and kw["seq_lens"] == [4 * stride] and not kw["is_causal"]
+    inp.tensor_inputs["time_index"] = torch.tensor([2])
+    sub.preprocess("video_gen_ar", ei, [inp])
+    kind, kw = cm.plans[-1]
+    assert kind == "cfg" and kw["dense_gen"] is False
+
+    # Window 0 commit: full window appended, prefixes protected per label,
+    # nothing released yet (the horizon still covers everything committed).
+    x0 = torch.arange(4, dtype=torch.float32).view(1, 1, 4, 1, 1).expand(
+        sub._window_latent_shape(64, 64, 4)).contiguous()
+    out = sub._commit_window(cm, st, x0, torch.tensor([4]), window_index=0)
+    assert torch.equal(out["window_latents"][0], x0)
+    assert cm.labels[-1] == CFG_BATCHED_LABEL
+    latents_c, positions_c = commits[-1]
+    assert torch.equal(latents_c, x0)
+    assert torch.equal(positions_c[0], cond0["vision_mrope_ids"])
+    assert torch.equal(positions_c[1], uncond0["vision_mrope_ids"])
+    assert sorted(cm.protected) == [("r", "main", 7), ("r", "uncond", 9)]
+    assert cm.released == []
+    # Staged window 1: fresh scheduler + absolute-position statics.
+    assert st["scheduler"] == "fresh"
+    assert int(st["cond"]["vision_mrope_ids"][0, 0]) == 4 * stride
+
+    # Window 1 commit: 8 units committed, horizon 6 -> 2 units (128 tokens)
+    # age out of each label.
+    out = sub._commit_window(cm, st, x0, torch.tensor([9]), window_index=1)
+    assert [(r, lbl, n) for r, lbl, n in cm.released] == [
+        ("r", "main", 128), ("r", "uncond", 128),
+    ]
+
+    # Window 2 (final) commit: released target grows to 6 units; the sessions
+    # re-offer only the outstanding 256 tokens. No staging past the end.
+    cm.released.clear()
+    out = sub._commit_window(cm, st, x0, torch.tensor([14]), window_index=2)
+    assert [(r, lbl, n) for r, lbl, n in cm.released] == [
+        ("r", "main", 256), ("r", "uncond", 256),
+    ]
+    assert torch.equal(out["window_latents"][0], x0)
+    assert torch.equal(out["latents"][0], x0)
 
 
 def test_windowed_decoder_assembles_stream(monkeypatch) -> None:

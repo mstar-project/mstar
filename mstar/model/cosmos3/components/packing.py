@@ -355,6 +355,7 @@ def build_vision_segment(
     vae_scale_factor_temporal: int,
     device,
     noisy_frames: list[int] | None = None,
+    start_frame_offset: int = 0,
 ) -> dict[str, Any]:
     """``latent_shape`` is the vision latent tensor shape ``[B, C, T, H, W]``.
 
@@ -362,7 +363,10 @@ def build_vision_segment(
     are clean conditioning context. When ``None`` it defaults to frame 0 clean
     if ``has_image_condition`` else all frames noisy — i.e. the t2i/t2v/i2v
     layouts. Action modes pass an explicit list (e.g. ``[]`` for
-    inverse-dynamics, where the whole video is conditioning)."""
+    inverse-dynamics, where the whole video is conditioning).
+    ``start_frame_offset`` shifts the temporal mRoPE axis so the segment's
+    frames sit at absolute frame indices ``start_frame_offset ..`` — a window
+    of a longer video positions itself exactly where the full clip would."""
     p = config.latent_patch_size
     _, _, latent_t, latent_h, latent_w = latent_shape
     patch_h = math.ceil(latent_h / p)
@@ -392,6 +396,7 @@ def build_vision_segment(
         fps=effective_fps,
         base_fps=float(config.base_fps),
         temporal_compression_factor=vae_scale_factor_temporal,
+        start_frame_offset=start_frame_offset,
     )
 
     return {
@@ -449,6 +454,7 @@ def build_static_inputs(
     has_image_condition: bool = False,
     sound_latent_frames: int | None = None,
     noisy_frames: list[int] | None = None,
+    start_frame_offset: int = 0,
 ) -> dict[str, Any]:
     """Assemble the per-prompt static transformer inputs for image/video
     generation. ``latent_shape`` is ``[B, C, T, H, W]`` (``T == 1`` for images;
@@ -472,6 +478,7 @@ def build_static_inputs(
         vae_scale_factor_temporal=vae_scale_factor_temporal,
         device=device,
         noisy_frames=noisy_frames,
+        start_frame_offset=start_frame_offset,
     )
     parts = [text["text_mrope_ids"], vision["vision_mrope_ids"]]
     static = {**text, **vision}

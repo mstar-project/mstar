@@ -901,18 +901,21 @@ class Cosmos3Model(Model):
             params["generate_sound"] = True
             if mk.get("sound_duration") is not None:
                 params["sound_duration"] = float(mk["sound_duration"])
-        # Opt-in windowed AR video: the clip is generated window by window
-        # (chained mode: each window is a full bidirectional denoise
-        # conditioned on the previous window's tail). Frame-count knobs are
-        # quantized to latent frames here so the whole pipeline agrees on the
-        # schedule; validation up front so malformed requests fail at
+        # Opt-in windowed AR video: the clip is generated window by window.
+        # ``chained`` conditions each window on the previous window's tail
+        # (full bidirectional denoise per window); ``kv`` runs block-causal
+        # cross-window attention through committed K/V, with frames older
+        # than the context horizon evicted from the cache. Frame-count knobs
+        # are quantized to latent frames here so the whole pipeline agrees on
+        # the schedule; validation up front so malformed requests fail at
         # submission.
         window_mode = mk.get("window_mode")
         if window_mode is not None:
             window_mode = str(window_mode).strip().lower()
-            if window_mode != "chained":
+            if window_mode not in ("chained", "kv"):
                 raise ValueError(
-                    f"Cosmos3 window_mode must be 'chained', got {mk.get('window_mode')!r}."
+                    f"Cosmos3 window_mode must be 'chained' or 'kv', got "
+                    f"{mk.get('window_mode')!r}."
                 )
             if not self._windowed_serving_enabled():
                 raise ValueError(
@@ -931,6 +934,11 @@ class Cosmos3Model(Model):
                 raise ValueError(
                     "Cosmos3 windowed generation does not support video conditioning."
                 )
+            is_kv = window_mode == "kv"
+            if not is_kv and mk.get("context_frames") is not None:
+                raise ValueError(
+                    "Cosmos3 context_frames applies to window_mode='kv' only."
+                )
             tf = self.config.vae.scale_factor_temporal
             window_frames = int(mk.get("window_frames", self.config.window_frames_default))
             if window_frames < 1 + tf:
@@ -938,7 +946,17 @@ class Cosmos3Model(Model):
                     f"Cosmos3 window_frames must be at least {1 + tf}, got {window_frames}."
                 )
             window_units = 1 + (window_frames - 1) // tf
-            overlap_frames = int(mk.get("overlap_frames", self.config.overlap_frames_default))
+            # kv windows advance without re-pinned overlap — cross-window
+            # conditioning flows through the committed K/V, and a zero overlap
+            # keeps each commit exactly covering the pages its denoise steps
+            # wrote (the cache stream stays page-exact).
+            default_overlap = 0 if is_kv else self.config.overlap_frames_default
+            overlap_frames = int(mk.get("overlap_frames", default_overlap))
+            if is_kv and overlap_frames:
+                raise ValueError(
+                    "Cosmos3 window_mode='kv' does not support overlap_frames; "
+                    "cross-window conditioning comes from the committed context."
+                )
             overlap_units = min(max(round(overlap_frames / tf), 0), window_units - 1)
             if overlap_units:
                 # Two clean latent frames are the conditioning floor (the V2V
@@ -951,6 +969,18 @@ class Cosmos3Model(Model):
                     f"for its overlap (window {window_units} vs overlap "
                     f"{overlap_units} latent frames)."
                 )
+            context_units = 0
+            if is_kv:
+                context_frames = int(
+                    mk.get("context_frames", self.config.context_frames_default)
+                )
+                if context_frames < 0:
+                    raise ValueError(
+                        f"Cosmos3 context_frames must be >= 0, got {context_frames}."
+                    )
+                # 0 retains all committed frames (no eviction).
+                if context_frames:
+                    context_units = 1 + (context_frames - 1) // tf
             total_units = 1 + (num_frames - 1) // tf
             # Pad the schedule up to whole windows: a short final window can
             # regenerate just a frame or two off almost pure conditioning,
@@ -961,7 +991,8 @@ class Cosmos3Model(Model):
                 rem = (total_units - window_units) % stride
                 total_units += (stride - rem) % stride
             schedule = WindowSchedule(
-                total_units, window_units, overlap_units=overlap_units
+                total_units, window_units,
+                context_units=context_units, overlap_units=overlap_units,
             )
             if schedule.num_windows > self.config.max_windows:
                 raise ValueError(
@@ -971,12 +1002,13 @@ class Cosmos3Model(Model):
             params["window_mode"] = window_mode
             params["window_latent_units"] = window_units
             params["overlap_latent_units"] = overlap_units
+            params["context_latent_units"] = context_units
             params["total_latent_units"] = total_units
             params["num_windows"] = schedule.num_windows
-            # Every window after the first is conditioned generation (the
-            # previous tail pinned clean), which the reference recipe runs at
-            # the V2V flow shift; one shift for all windows keeps the
-            # per-window schedules consistent. Request flow_shift overrides.
+            # Every window after the first is conditioned generation, which
+            # the reference recipe runs at the V2V flow shift; one shift for
+            # all windows keeps the per-window schedules consistent. Request
+            # flow_shift overrides.
             params.setdefault("flow_shift", constants.V2V_DEFAULT_FLOW_SHIFT)
         return params
 
