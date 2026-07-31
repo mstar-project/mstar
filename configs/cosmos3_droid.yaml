@@ -1,0 +1,30 @@
+model: "cosmos3_droid"
+# Sequence-length hint for the scheduler. The conductor only asserts its
+# presence; the real per-request capacity is the KV pool below.
+max_seq_len: 8192
+# KV pool sizing, matching the Nano config: the checkpoint is Nano-sized and
+# still serves the full video paths (forward dynamics decodes a rollout
+# video), so it keeps the pool that covers single-request video at every tier.
+kv_cache:
+  max_num_pages: 1024
+# Denoise CUDA-graph capture knobs (serving). cuda_graph=false serves eager;
+# graph_max_latent_area caps which resolutions are captured (latent H*W). The
+# COSMOS3_DISABLE_CUDA_GRAPH / COSMOS3_GRAPH_MAX_LATENT_AREA env vars override.
+model_kwargs:
+  cuda_graph: true
+  graph_max_latent_area: 2000
+  # The checkpoint ships no sound pathway (sound_gen false, no
+  # sound_tokenizer/); stated here so the yaml documents the served surface.
+  enable_sound: false
+  # Sampling defaults for action requests, matching the released DROID
+  # RoboLab policy serving parameters (4-step denoise, guidance 3.0). The
+  # flow shift stays at the action default (5.0, the 480p training shift).
+  num_inference_steps_action: 4
+  guidance_scale_action: 3.0
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0]
+  # No audio_decoder: the checkpoint has no sound pathway, so the sound walk
+  # (the only consumer of that node) is never built.
+  - node_names: ["vae_encoder", "vae_decoder"]
+    ranks: [0]
